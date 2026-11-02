@@ -130,6 +130,15 @@ namespace vq {
         if (h <= -180.0) h += 360.0;
         return h;
     }
+    double RollDeg(const DriveQuat& q)
+    {
+        const DQ n = NormD(ToDQ(q));
+        const D3 f = RotateD(n, {0, 1, 0}), r = RotateD(n, {1, 0, 0});
+        const double fh = std::sqrt(f.x * f.x + f.y * f.y);
+        if (fh < 1e-6) return 0;                                   // nose straight up / down: no horizon to lean against
+        const D3 r0 = Scale(Cross(f, {0, 0, 1}), 1.0 / fh);        // the level right axis for this heading
+        return std::atan2(DotV(Cross(r0, r), f), DotV(r0, r)) * 180.0 / kPi;
+    }
     bool Finite(const DriveQuat& q) { return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w); }
 }
 
@@ -359,6 +368,9 @@ void VehicleDriveController::Reset()
     started_ = false;
     offAcc_ = 0;
     underFloorMs_ = 0;
+    graceOn_ = false;
+    graceAgeMs_ = cooldownMs_ = 0;
+    haveCmd_ = false;
 }
 
 VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
@@ -385,16 +397,66 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
     o.posErrorM = float(dist);
     o.rotErrorDeg = float(rAng * 180.0 / kPi);
 
+    // ---- contact grace (W9 item 6): open on a contact, age, close ----
+    // A contact is the engine's collision flag, or a loss of speed along the target's direction of travel that the
+    // controller did not command: the velocity it wrote last frame minus the car's own now, projected on the travel
+    // direction, above contactDecelMs. Lateral deviation is not used: tyre grip eats a sideways correction
+    // by itself and a controller pushing a 2 m error would look like a crash.
+    double graceW = 1.0;
+    if (cfg_.contactGraceMs > 0.0f)
+    {
+        if (graceOn_)
+        {
+            graceAgeMs_ += dt;
+            if (graceAgeMs_ >= cfg_.contactGraceMs)
+            {
+                graceOn_ = false;
+                cooldownMs_ = cfg_.contactCooldownMs;
+            }
+        }
+        else if (cooldownMs_ > 0.0)
+            cooldownMs_ = std::fmax(0.0, cooldownMs_ - dt);
+        if (!graceOn_ && cooldownMs_ <= 0.0 && started_ && !tg.teleported)
+        {
+            bool byDecel = false;
+            if (haveCmd_ && dt <= cfg_.contactMaxFrameMs && speed >= cfg_.contactMinSpeedMs)
+            {
+                const D3 dir = Scale(tv, 1.0 / speed);
+                const double lost = DotV(Sub(ToD(lastCmdVel_), ToD(in.localVel)), dir);
+                byDecel = lost > cfg_.contactDecelMs;
+            }
+            if (in.contact || byDecel)
+            {
+                graceOn_ = true;
+                graceAgeMs_ = 0;
+                ++stats_.contacts;
+                if (in.contact) ++stats_.contactsByFlag;
+                else ++stats_.contactsByDecel;
+            }
+        }
+        if (graceOn_)
+        {
+            const double u = std::fmin(1.0, graceAgeMs_ / cfg_.contactGraceMs);
+            graceW = cfg_.contactSoftFloor + (1.0 - cfg_.contactSoftFloor) * (u * u * (3.0 - 2.0 * u));
+        }
+    }
+    else
+        graceOn_ = false;
+    o.graceActive = graceOn_;
+    o.graceWeight = float(graceW);
+
     // ---- snap ----
-    bool snap = !started_ || tg.teleported || dist > std::fmax(cfg_.snapMinM, cfg_.snapTravelS * speed);
-    if (!snap)
+    // Inside a grace only a teleport or a gross error snaps (the crash plays out); the persistent-error accumulator is not fed.
+    const double snapDist = std::fmax(cfg_.snapMinM, cfg_.snapTravelS * speed) * (graceOn_ ? cfg_.contactHardSnapMul : 1.0);
+    bool snap = !started_ || tg.teleported || dist > snapDist;
+    if (!snap && !graceOn_)
     {
         const double tol = cfg_.offToleranceM + cfg_.offTolPerSpeedS * speed;
         offAcc_ += float((dist - tol) * dtS);
         if (offAcc_ < 0.0f) offAcc_ = 0.0f;
         if (offAcc_ >= cfg_.offLimitMs) { snap = true; ++stats_.persistentSnaps; }
     }
-    if (!snap)
+    if (!snap && !graceOn_)
     {
         const double dz = tp.z - lp.z;
         const bool under = dz > cfg_.underFloorMinM && dz < cfg_.underFloorMaxM && std::fabs(tv.z) < cfg_.underFloorVzMs;
@@ -416,6 +478,11 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
         o.angularVelocityBody = ToF(SafeV(RotateD(ConjD(tq), tw)));
         offAcc_ = 0;
         underFloorMs_ = 0;
+        graceOn_ = false;
+        cooldownMs_ = 0;
+        haveCmd_ = false;                               // a snap's velocity is the target's: no deviation test next frame
+        o.graceActive = false;
+        o.graceWeight = 1.0f;
         ++stats_.snaps;
         return o;
     }
@@ -433,11 +500,37 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
         if (cl > cap && cl > 0.0) c = Scale(c, cap / cl);
         o.velocity = ToF(SafeV(Add(tv, c)));
     }
+    if (graceOn_)
+    {
+        // the car's own velocity (the impact's outcome) plus a weight w of the way to the full command
+        const D3 lv = ToD(in.localVel), full = ToD(o.velocity);
+        o.velocity = ToF(SafeV(Add(lv, Scale(Sub(full, lv), graceW))));
+    }
+    lastCmdVel_ = o.velocity;
+    haveCmd_ = true;
 
     // ---- rotation: angular velocity steering, quaternion blend for big errors / a flipped car ----
     const bool flipped = RotateD(tq, {0, 0, 1}).z < 0.0;
     D3 w = tw;
-    if (rAng > cfg_.blendAboveDeg * kPi / 180.0 || flipped)
+    if (graceOn_ && graceW < 0.5)
+    {
+        // the crash plays out: rotation is physics' own until the weight passes a half
+        o.setAngularVelocity = false;
+        o.angularVelocityBody = DriveVec{};
+        return o;
+    }
+    if (graceOn_)
+    {
+        // no quaternion blend inside a grace; angular velocity steering only (below)
+        const double k = cfg_.rotGain;
+        const double kEff = dtS > 0.0 ? (1.0 - std::exp(-k * dtS)) / dtS : k;
+        D3 c = Scale(rErr, kEff * graceW);
+        const double cl = Len(c);
+        if (cl > cfg_.rotCorrMaxRadS && cl > 0.0) c = Scale(c, cfg_.rotCorrMaxRadS / cl);
+        w = SafeV(Add(tw, c));
+        o.angularVelocityBody = ToF(SafeV(RotateD(ConjD(lq), w)));
+    }
+    else if (rAng > cfg_.blendAboveDeg * kPi / 180.0 || flipped)
     {
         const double tau = cfg_.blendTauMs > 0 ? cfg_.blendTauMs : 1.0;
         const DQ q = SlerpD(lq, tq, 1.0 - std::exp(-dt / tau));
@@ -459,6 +552,31 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
     o.setAngularVelocity = true;
     o.angularVelocity = ToF(w);
     return o;
+}
+
+double PresentLead::Weight(const PresentLeadConfig& cfg, double distM)
+{
+    if (!std::isfinite(distM)) return 0.0;
+    if (distM <= cfg.fullWithinM) return 1.0;
+    if (distM >= cfg.zeroBeyondM || !(cfg.zeroBeyondM > cfg.fullWithinM)) return 0.0;
+    return (cfg.zeroBeyondM - distM) / (cfg.zeroBeyondM - cfg.fullWithinM);
+}
+
+double PresentLead::Update(double distM, double wantMs, double dtMs)
+{
+    const double want = (std::isfinite(wantMs) && wantMs > 0.0) ? std::fmin(wantMs, cfg_.maxLeadMs) : 0.0;
+    const double target = want * Weight(cfg_, distM);
+    if (!have_)
+    {
+        have_ = true;
+        leadMs_ = target;
+        return leadMs_;
+    }
+    const double dt = !std::isfinite(dtMs) || dtMs < 0.0 ? 0.0 : (dtMs > 1000.0 ? 1000.0 : dtMs);
+    const double step = cfg_.slewMsPerMs * dt;
+    const double d = target - leadMs_;
+    leadMs_ += d > step ? step : (d < -step ? -step : d);
+    return leadMs_;
 }
 
 bool VehicleIsMoving(float speedMs, float angSpeedRadS)

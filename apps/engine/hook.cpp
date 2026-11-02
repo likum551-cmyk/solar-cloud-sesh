@@ -854,6 +854,9 @@ const HashMapping kCrossmap3889[] = {
     {native::USE_PARTICLE_FX_ASSET,                       0xD03F4780B97A39AE},
     {native::REQUEST_NAMED_PTFX_ASSET,                    0xEBEE7DC21AB44EC9},
     {native::HAS_NAMED_PTFX_ASSET_LOADED,                 0x939D49C9FAA8139A},
+    // 0.4.4 (W9): lookup tool, public and 3889 agree.
+    {native::HAS_ENTITY_COLLIDED_WITH_ANYTHING,           0x14E25ED5E75102C8},
+    {native::GET_VEHICLE_CLASS,                           0x5506AFBD6056C05F},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -4647,6 +4650,18 @@ bool World::IsVehicleEngineRunning(int32_t veh) {
     return callPedBool(*this, native::GET_IS_VEHICLE_ENGINE_RUNNING, veh);
 }
 
+bool World::HasEntityCollidedWithAnything(int32_t entity) {
+    return callPedBool(*this, native::HAS_ENTITY_COLLIDED_WITH_ANYTHING, entity);
+}
+
+int World::GetVehicleClass(int32_t veh) {
+    if (!veh) return -1;
+    uint64_t arg[] = { entArg(veh) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_CLASS, arg, 1, r)) return -1;
+    return intOf(r[0]);
+}
+
 bool World::SetVehicleSiren(int32_t veh, bool on) {
     return callPedToggle(*this, native::SET_VEHICLE_SIREN, veh, on);
 }
@@ -5601,6 +5616,8 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(USE_PARTICLE_FX_ASSET),
         GAGE_NEW_NATIVE(REQUEST_NAMED_PTFX_ASSET),
         GAGE_NEW_NATIVE(HAS_NAMED_PTFX_ASSET_LOADED),
+        GAGE_NEW_NATIVE(HAS_ENTITY_COLLIDED_WITH_ANYTHING),
+        GAGE_NEW_NATIVE(GET_VEHICLE_CLASS),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));

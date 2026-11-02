@@ -15,6 +15,8 @@
 //   sync plan W6:             vehicle_body.h (lights / doors / roof encode, decode diff), NotOwner in
 //                             vehicle_link.h, combat.h's v5 inputs (Damage bone / flags, playerHealth,
 //                             ClassifyDamage, KillFeedLine), pedstate.h (Tier B edges, vehicle moves)
+//   live test 0.4.2 fixes W9:  pedstate.h EnterWarpDue (the sender's move), vehicle_w9.h (re-warp limiter, F / G press
+//                             guard, passenger engine re-assert, bail-out decision, vehicle impact, bike roll log)
 // Build target: gameplay_test (selftest/, never shipped). Simulated time, no randomness. Every
 // check names what it proves; the run asserts the total number of checks so a skipped block fails.
 
@@ -26,6 +28,7 @@
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_link.h"
+#include "sync/vehicle_w9.h"
 #include "protocol/protocol.h"
 
 #include <cctype>
@@ -2228,6 +2231,151 @@ static void Test0cMelee()
     }
 }
 
+// ---- W9 (docs/sync-specs/live-0.4.2-fixes.md section W9): passengers, seats, leaving a moving vehicle, impacts ----
+static void TestW9()
+{
+    // item 1: the door walk ends when the sender stops entering
+    {
+        const bool released = EnterWarpDue(true, false, 300, false);        // the sender is seated (its move is no longer entering)
+        const bool walking = EnterWarpDue(true, false, 300, true);          // it is still walking in: the walk plays
+        const bool slow = EnterWarpDue(true, false, 2500, true);            // a walk that long gives way anyway
+        const bool notListed = EnterWarpDue(false, false, 300, false);      // the server does not list the seat yet
+        const bool inside = EnterWarpDue(true, true, 300, false);           // already inside here
+        const bool noTask = EnterWarpDue(true, false, -1, true);            // no enter task: at once, as before
+        Check("W9 item 1: the seat warp is due as soon as the sender's move is no longer entering and the server lists the seat (300 ms, not 2.5 s); still entering waits; not listed / already inside never",
+              released && !walking && slow && !notListed && !inside && noTask,
+              F("released %d walking %d slow %d notListed %d inside %d noTask %d", released, walking, slow, notListed, inside, noTask));
+    }
+    // item 2: a ped GTA keeps moving out of its seat is not re-warped every 100 ms
+    {
+        SeatRewarpLimiter lim;
+        int warps = 0, naive = 0;
+        for (double t = 0; t < 10000; t += 100.0)
+        {
+            ++naive;                                                        // the old loop: every retry warps
+            if (lim.Allow(t, 7, 1, t > 0))
+                ++warps;
+        }
+        const uint32_t held = lim.Suppressed();
+        SeatRewarpLimiter fresh;
+        const bool first = fresh.Allow(0, 7, 1, false);                     // the first warp of a visit
+        const bool again = fresh.Allow(100, 7, 1, true);                    // 100 ms later, shuffled: held back
+        const bool other = fresh.Allow(150, 7, 2, true);                    // a different seat (the server moved it): at once
+        const bool otherVeh = fresh.Allow(160, 8, 2, true);                 // a different vehicle: at once
+        const bool afterGap = fresh.Allow(160 + 400, 8, 2, true);           // the gap passed: allowed ...
+        const bool doubled = fresh.Allow(160 + 400 + 500, 8, 2, true);      // ... then the gap doubled (800): 500 ms is too soon
+        const bool calm = fresh.Allow(160 + 400 + 500 + 6000, 8, 2, true);  // 6 s of quiet: starts over
+        Check("W9 item 2: 100 ms retries of a shuffled ped give at most 6 re-warps in 10 s (100 before); a seat or vehicle change is not held back; the gap doubles and starts over after 5 s of calm",
+              warps <= 6 && warps >= 3 && naive == 100 && held == (uint32_t)(100 - warps) && first && !again && other && otherVeh && afterGap &&
+                  !doubled && calm,
+              F("warps %d of %d, held %u; %d %d %d %d %d %d %d", warps, naive, (unsigned)held, first, again, other, otherVeh, afterGap, doubled, calm));
+    }
+    // item 3: the F press and the controls
+    {
+        EntryPressGuard g;
+        const bool before = g.DisableEnter(0);
+        g.OnPress(1000);
+        const bool walking = g.DisableEnter(1500);                          // the walk to the door: still ours
+        g.OnSeated(2000);
+        const bool at300 = g.DisableEnter(2300), at499 = g.DisableEnter(2499), at500 = g.DisableEnter(2500);
+        const bool quick = g.NoteExit(2800);                                // an exit 800 ms after the entry
+        const bool second = g.NoteExit(2900);                               // nothing seated now
+        EntryPressGuard h;
+        h.OnPress(0);
+        h.OnCancel();
+        const bool cancelled = h.DisableEnter(10);
+        h.OnPress(100);
+        h.OnSeated(200);
+        const bool slow = h.NoteExit(200 + kQuickExitMs + 1);              // out much later: not a quick exit
+        Check("W9 item 3: control 23 is disabled from the handled press until 500 ms after the ped sat; a cancelled walk releases it; a quick exit after an entry is counted (once), a late one is not",
+              !before && walking && at300 && at499 && !at500 && quick && !second && !cancelled && !slow && g.Presses() == 1 &&
+                  g.QuickExits() == 1 && h.QuickExits() == 0 && h.Presses() == 2,
+              F("%d %d %d %d %d quick %d %d cancelled %d slow %d presses %u/%u quick %u/%u", before, walking, at300, at499, at500, quick, second,
+                cancelled, slow, g.Presses(), h.Presses(), g.QuickExits(), h.QuickExits()));
+    }
+    // item 4: the passenger's engine
+    {
+        EngineReassert e;
+        const bool a0 = e.Due(0, true, true, true);                         // first sight: assert
+        const bool a500 = e.Due(500, true, true, true);
+        const bool a1000 = e.Due(1000, true, true, true);                   // ~1 s
+        const bool stopped = e.Due(1100, true, true, false);                // the car says it is not running: not yet (250 ms)
+        const bool stopped2 = e.Due(1260, true, true, false);               // ... and sooner than a second
+        const bool serverOff = e.Due(3000, true, false, false);             // the server says off: never forced on
+        const bool driver = e.Due(3100, false, true, true);                 // not a passenger of a remote-driven car
+        const bool again = e.Due(3200, true, true, true);                   // a new ride asserts at once
+        Check("W9 item 4: the engine of a car the local ped rides in is asserted at once, then every 1 s (250 ms while it reads not running); never when the server says off or when not a passenger",
+              a0 && !a500 && a1000 && !stopped && stopped2 && !serverOff && !driver && again && e.Asserts() == 4,
+              F("%d %d %d %d %d %d %d %d asserts %u", a0, a500, a1000, stopped, stopped2, serverOff, driver, again, e.Asserts()));
+    }
+    // item 5: leaving a moving vehicle
+    {
+        UnseatIn in;
+        in.haveVehicle = true;
+        in.vehSpeedMps = 0.4f;
+        const UnseatPlan still = DecideUnseat(in);                           // a parked car: the animated climb-out
+        in.vehSpeedMps = 12.0f;
+        const UnseatPlan moving = DecideUnseat(in);                          // 12 m/s: bail out with the car's velocity
+        in.vehSpeedMps = 1.0f;
+        in.senderFlags = proto::kPfFalling;
+        const UnseatPlan fell = DecideUnseat(in);                            // slow car, but the sender's first sample is falling
+        in.senderFlags = proto::kPfRagdoll;
+        const UnseatPlan rag = DecideUnseat(in);                             // ... or ragdolling: no pause, the ragdoll edge takes it
+        in.senderFlags = proto::kPfJumping;
+        const UnseatPlan jumped = DecideUnseat(in);
+        in.senderFlags = 0;
+        in.vehSpeedMps = 3.0f;
+        const UnseatPlan edge = DecideUnseat(in);                            // exactly 3 m/s is not above the threshold
+        UnseatIn gone;
+        gone.vehSpeedMps = 30.0f;
+        const UnseatPlan none = DecideUnseat(gone);                          // no vehicle here: the pop
+        in.vehSpeedMps = NAN;
+        const UnseatPlan nan = DecideUnseat(in);
+        Check("W9 item 5: a parked car is left with flag 0 (1.5 s pause); above 3 m/s, or with a falling / ragdolling / jumping sender, it is a bail-out (4160, fallback 16, velocity carried, 600 ms pause, none when ragdolling); no vehicle = clear",
+              still.mode == UnseatMode::Leave && still.leaveFlags == 0 && !still.carryVelocity && still.pauseMs == kLeavePauseMs &&
+                  moving.mode == UnseatMode::Bail && moving.leaveFlags == 4160 && moving.fallbackFlags == 16 && moving.carryVelocity &&
+                  moving.pauseMs == kBailPauseMs && fell.mode == UnseatMode::Bail && rag.mode == UnseatMode::Bail && rag.pauseMs == 0.0 &&
+                  jumped.mode == UnseatMode::Bail && edge.mode == UnseatMode::Leave && none.mode == UnseatMode::Clear &&
+                  nan.mode == UnseatMode::Leave,
+              F("%d %d %d %d %d %d %d %d", (int)still.mode, (int)moving.mode, (int)fell.mode, (int)rag.mode, (int)jumped.mode, (int)edge.mode,
+                (int)none.mode, (int)nan.mode));
+        Check("W9 item 5: the carried velocity fades linearly over 300 ms; the local forced exit bails out of a moving car on the first try and warps on a retry or when slow",
+              CarryVelocityScale(0) == 1.0f && std::fabs(CarryVelocityScale(150) - 0.5f) < 1e-6 && CarryVelocityScale(300) == 0.0f &&
+                  CarryVelocityScale(-1) == 0.0f && CarryVelocityScale(NAN) == 0.0f && LocalLeaveFlags(15.0f, false) == 4160 &&
+                  LocalLeaveFlags(15.0f, true) == 16 && LocalLeaveFlags(1.0f, false) == 16 && LocalLeaveFlags(NAN, false) == 16);
+    }
+    // item 6: a puppet run over by the local player's vehicle
+    {
+        ImpactIn in;
+        in.vehSpeedMps = 15.0f;
+        in.damagedByVehicle = true;
+        const ImpactOut hit = DecideVehicleImpact(in);
+        ImpactIn slow = in;
+        slow.vehSpeedMps = 4.0f;
+        ImpactIn noEvent = in;
+        noEvent.damagedByVehicle = false;
+        ImpactIn seated = in;
+        seated.puppetSeated = true;
+        ImpactIn dead = in;
+        dead.puppetDead = true;
+        ImpactIn again = in;
+        again.sinceLastImpactMs = 500;
+        ImpactIn fast = in;
+        fast.vehSpeedMps = 60.0f;
+        const ImpactOut capped = DecideVehicleImpact(fast);
+        Check("W9 item 6: a puppet damaged by the local player's vehicle above 5 m/s ragdolls (800..2500 ms, thrown with half the car's velocity); a slow car, no damage event, a seated or dead puppet, or a second impact within 1.5 s does not",
+              hit.ragdoll && hit.ragdollMs >= 800 && hit.ragdollMs <= 2500 && hit.velocityScale == 0.5f && !DecideVehicleImpact(slow).ragdoll &&
+                  !DecideVehicleImpact(noEvent).ragdoll && !DecideVehicleImpact(seated).ragdoll && !DecideVehicleImpact(dead).ragdoll &&
+                  !DecideVehicleImpact(again).ragdoll && capped.ragdoll && capped.ragdollMs == 2500,
+              F("%d %d ms, capped %d ms", hit.ragdoll, hit.ragdollMs, capped.ragdollMs));
+    }
+    // item 7: bike classes
+    {
+        Check("W9 item 7: GET_VEHICLE_CLASS 8 (motorcycles) and 13 (cycles) are bikes; cars, boats and the rest are not",
+              IsBikeClass(8) && IsBikeClass(13) && !IsBikeClass(0) && !IsBikeClass(7) && !IsBikeClass(14) && !IsBikeClass(-1));
+    }
+}
+
 int main()
 {
     std::printf("-- vitals\n");
@@ -2256,12 +2404,15 @@ int main()
     TestW8();
     std::printf("-- 0.4.4 item 0c: melee hit by the damage event, receiver swing trigger\n");
     Test0cMelee();
+    std::printf("-- W9: passenger enter, re-warp limiter, F press guard, passenger engine, bail-out, vehicle impact, bikes\n");
+    TestW9();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
     // + 0c 7 (hit by event, no event, gun, stale / action / edge, one report for both detectors, window gate, receiver swing trigger)
     // + 0d 6 (in TestW8 beside the climb window: pre-vault placement 1, climb accounting 1, cover window 4)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6;
+    // + W9 8 (enter warp 1, re-warp limiter 1, press guard 1, passenger engine 1, unseat 2, impact 1, bike class 1; EnterWarpDue's old W6 check stays)
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {

@@ -39,11 +39,18 @@
 //      the controller's send gate (5 Hz still, at once on a change or a stop, every call moving).
 //   9. Sync plan W7: VehicleInterpolator::TypicalGapMs (the class extra's input on the shared NetClock render clock).
 //
+//  10. Live test 0.4.2 fixes, W9 item 6 and 7: the contact grace (a knock plays out instead of being overwritten
+//      every frame, by the collision flag and by a speed loss alone, then converges back without a snap, and
+//      normal driving never opens one), PresentLead (a car within 30 m is drawn within 0.5 m of where it is NOW,
+//      blended back beyond 45 m, slewed), and a bike's lean (RollDeg conventions; the roll survives the
+//      controller on a banked circle).
+//
 // Every loop-shaped check also asserts how many frames it measured; the run asserts
 // the total number of checks.
 
 #include "sync/netclock.h"
 #include "sync/vehicle_drive.h"
+#include "sync/vehicle_w9.h"
 
 #include <algorithm>
 #include <cmath>
@@ -883,6 +890,198 @@ static void TestW6() {
     }
 }
 
+// ---- 10. W9: contact grace, present-time lead, bike lean ---------------------------------------------------
+
+// A 20 m/s straight car (heading 0, +y) driven by the controller on the SimCar at 60 fps. At 2.0 s a knock changes the
+// car's own velocity (sideways +6 m/s; and along the travel direction `lossMs` m/s lost) and, when `flag`, the contact
+// flag is true for that one frame. Returns the largest lateral error (m) in [2.0, 2.7] s, the error at 6 s, the number
+// of snaps after the first frame, and how many graces opened.
+struct KnockResult { double peakLateral = 0, endErr = 0, minWeight = 1; uint32_t extraSnaps = 0, contacts = 0, byFlag = 0, byDecel = 0; int frames = 0; };
+
+static KnockResult RunKnock(bool flag, double lossMs, double graceMs = -1.0, double sideMs = 6.0) {
+    VehicleDriveConfig cfg;                              // the defaults the engine uses (graceMs < 0), or an explicit grace (0 = off)
+    if (graceMs >= 0.0) cfg.contactGraceMs = float(graceMs);
+    VehicleDriveController c(cfg);
+    SimCar car;
+    car.pos = V(0, 0, 0);
+    car.vel = V(0, 20, 0);
+    car.rot = vq::FromHeadingDeg(0);
+    KnockResult r;
+    const double dt = 1000.0 / 60.0;
+    bool knocked = false;
+    for (double t = 0; t < 6000; t += dt) {
+        VehicleSample tg;
+        tg.pos = V(0, 20.0 * t / 1000.0, 0);
+        tg.vel = V(0, 20, 0);
+        tg.rot = vq::FromHeadingDeg(0);
+        tg.mode = VehMode::Interpolating;
+        bool contact = false;
+        if (!knocked && t >= 2000) {
+            knocked = true;
+            contact = flag;
+            car.vel = V(car.vel.x + sideMs, car.vel.y - lossMs, car.vel.z);
+        }
+        VehicleDriveInput in = Input(tg, car.pos, car.rot, car.vel, dt);
+        in.contact = contact;
+        const double lateral = std::fabs(double(car.pos.x - tg.pos.x));
+        const VehicleDriveOutput o = c.Update(in);
+        car.Apply(o, dt);
+        ++r.frames;
+        if (t >= 2000 && t <= 2700) { r.peakLateral = std::max(r.peakLateral, lateral); r.minWeight = std::min(r.minWeight, double(o.graceWeight)); }
+        if (t >= 5900) r.endErr = std::max(r.endErr, Dist(car.pos, tg.pos));
+    }
+    r.extraSnaps = c.Stats().snaps - 1;
+    r.contacts = c.Stats().contacts;
+    r.byFlag = c.Stats().contactsByFlag;
+    r.byDecel = c.Stats().contactsByDecel;
+    return r;
+}
+
+// The distance error of a PresentLead-drawn 30 m/s circle car, `distM` from the local player, 20 Hz snapshots with
+// jitter and latency 30..90 ms, drawn 120 ms behind the receipt. `lead` false = the old fixed delay.
+static double LeadErrorM(double distM, bool lead, int* frames) {
+    Feed feed([](double t) { return Circle(t); }, 12000, true, 77);
+    VehicleInterpolator ip;
+    PresentLead pl;
+    double worst = 0;
+    *frames = 0;
+    const double dt = 1000.0 / 60.0;
+    for (double now = 0; now < 11000; now += dt) {
+        feed.Deliver(now, ip);
+        double rt = now - 120.0;
+        const double l = lead ? pl.Update(distM, 120.0, dt) : 0.0;
+        rt += l;
+        VehicleSample s;
+        if (now < 2500 || !ip.Sample(rt, s)) continue;
+        ++*frames;
+        // truth: where the car is at `now` on the sender's timeline (the sample timeline IS the sender's: no clock offset)
+        worst = std::max(worst, Dist(s.pos, Circle(now).pos));
+    }
+    return worst;
+}
+
+static void TestW9() {
+    // RollDeg conventions: + = right side down, about the body's forward axis, independent of heading and pitch
+    {
+        const DriveQuat lean5 = vq::Exp(V(0, 5.0 * kPi / 180.0, 0));
+        const double r0 = vq::RollDeg(vq::FromHeadingDeg(0)), r5 = vq::RollDeg(lean5), rm = vq::RollDeg(vq::Exp(V(0, -20.0 * kPi / 180.0, 0)));
+        const double rh = vq::RollDeg(vq::Mul(vq::FromHeadingDeg(133), lean5));                        // any heading
+        const double rp = vq::RollDeg(vq::Mul(vq::FromHeadingDeg(40), vq::Mul(vq::Exp(V(0.2, 0, 0)), lean5)));   // nose up 11 deg
+        Check("RollDeg: 0 level, +5 for a 5 degree lean to the right (rotation about +y), -20 to the left, the same at any heading and with the nose pitched up",
+              std::fabs(r0) < 1e-6 && std::fabs(r5 - 5.0) < 1e-4 && std::fabs(rm + 20.0) < 1e-4 && std::fabs(rh - 5.0) < 1e-3 &&
+                  std::fabs(rp - 5.0) < 0.1,
+              F("%.5f %.5f %.5f %.5f %.4f", r0, r5, rm, rh, rp));
+    }
+    // the contact grace: a knock plays out (flag and speed loss), without a snap, then converges back
+    {
+        const KnockResult withFlag = RunKnock(true, 0.0), byDecel = RunKnock(false, 6.0), off = RunKnock(true, 0.0, 0.0),
+                          calm = RunKnock(false, 0.0, -1.0, 0.0);   // no knock: the sim's own standing error (drag) at 6 s
+        Check("contact grace: with the collision flag a 6 m/s sideways knock plays out (> 0.8 m lateral in 0.7 s) where the old every-frame overwrite holds it under 0.5 m",
+              withFlag.peakLateral > 0.8 && off.peakLateral < 0.5 && off.contacts == 0 && withFlag.contacts == 1 && withFlag.byFlag == 1,
+              F("grace %.3f m (contacts %u), without %.3f m (contacts %u)", withFlag.peakLateral, withFlag.contacts, off.peakLateral,
+                off.contacts));
+        Check("contact grace: a loss of speed along the travel direction alone (no flag, 6 m/s lost in one frame) opens it too",
+              byDecel.contacts == 1 && byDecel.byDecel == 1 && byDecel.peakLateral > 0.8, F("contacts %u by decel %u, %.3f m", byDecel.contacts,
+                                                                                             byDecel.byDecel, byDecel.peakLateral));
+        Check("contact grace: no snap while it plays out and the car converges back within 4 s (to within 5 cm of the undisturbed run); the weight starts soft (0.15)",
+              withFlag.extraSnaps == 0 && byDecel.extraSnaps == 0 && calm.contacts == 0 && withFlag.endErr < calm.endErr + 0.05 &&
+                  byDecel.endErr < calm.endErr + 0.05 && withFlag.minWeight < 0.2 && withFlag.frames > 340,
+              F("snaps %u %u, end error %.3f %.3f m (undisturbed %.3f), min weight %.3f, %d frames", withFlag.extraSnaps, byDecel.extraSnaps,
+                withFlag.endErr, byDecel.endErr, calm.endErr, withFlag.minWeight, withFlag.frames));
+    }
+    // normal driving never opens a grace (the closed loop with its knock of POSITION, which changes no velocity)
+    {
+        const Route route;
+        uint32_t contacts = 0;
+        for (int i = 0; i < 3; ++i) {
+            VehicleInterpolator ip;
+            VehicleDriveController c;
+            SimCar car;
+            car.rot = vq::FromHeadingDeg(0);
+            car.pos = V(30, -20, 5);
+            Feed feed([&route](double t) { return route.At(t); }, 13000, true, 31 + i);
+            const double dt = 1000.0 / kFps[i];
+            bool knocked = false;
+            for (double now = 0; now < 13150; now += dt) {
+                feed.Deliver(now, ip);
+                const double rt = now - 120;
+                VehicleSample s;
+                if (rt < 0 || !ip.Sample(rt, s)) continue;
+                if (!knocked && rt >= 1500) { knocked = true; car.pos = V(car.pos.x + 2.5, car.pos.y, car.pos.z); }
+                car.Apply(c.Update(Input(s, car.pos, car.rot, car.vel, dt)), dt);
+            }
+            contacts += c.Stats().contacts;
+        }
+        Check("contact grace: a route of straights, a hard turn and a stop at 30/60/144 fps (with a positional knock) opens no grace", contacts == 0,
+              F("%u", contacts));
+    }
+    // present-time lead
+    {
+        PresentLeadConfig cfg;
+        Check("PresentLead weight: 1 within 30 m, linear to 0 at 45 m (0.5 at 37.5 m), 0 beyond or for a non-finite distance",
+              PresentLead::Weight(cfg, 0) == 1.0 && PresentLead::Weight(cfg, 30) == 1.0 && std::fabs(PresentLead::Weight(cfg, 37.5) - 0.5) < 1e-9 &&
+                  PresentLead::Weight(cfg, 45) == 0.0 && PresentLead::Weight(cfg, 300) == 0.0 && PresentLead::Weight(cfg, std::nan("")) == 0.0);
+        PresentLead a;
+        const double first = a.Update(10, 400, 16);                    // the first call takes the target; capped at 250 ms
+        PresentLead b;
+        b.Update(100, 120, 16);                                          // far: 0
+        double l = 0;
+        for (int i = 0; i < 3; ++i) l = b.Update(10, 120, 16);          // close: slewed at 0.5 ms per ms, 8 ms a frame
+        const double afterThree = l;
+        for (int i = 0; i < 30; ++i) l = b.Update(10, 120, 16);
+        Check("PresentLead: capped at 250 ms, slewed at 0.5 ms/ms (3 frames of 16 ms move it 24 ms, not 120), settles at the full delay",
+              first == 250.0 && std::fabs(afterThree - 24.0) < 1e-9 && std::fabs(l - 120.0) < 1e-9, F("%.2f %.2f %.2f", first, afterThree, l));
+    }
+    {
+        int fl = 0, fo = 0, ff = 0;
+        const double near20 = LeadErrorM(20, true, &fl), old20 = LeadErrorM(20, false, &fo), far60 = LeadErrorM(60, true, &ff);
+        Check("present-time lead: a 30 m/s car 20 m away is drawn within 0.5 m of where it is now (without the lead it is 3.6 m behind)",
+              fl > 400 && near20 < 0.5 && old20 > 3.0, F("frames %d: lead %.3f m, old %.3f m", fl, near20, old20));
+        Check("present-time lead: beyond 45 m the car is drawn in the past as before (the same error as without the lead)",
+              ff > 400 && fo > 400 && std::fabs(far60 - old20) < 0.05, F("%.3f vs %.3f m", far60, old20));
+    }
+    // a bike on a banked circle: the lean survives the controller (item 7)
+    {
+        // 20 m/s on a 40 m circle (0.5 rad/s) leaning 30 degrees; snapshots at 20 Hz; SimCar at 60 fps
+        auto lean = [](double tMs) {
+            const double R = 40, w = 0.5, phi = w * tMs / 1000.0;
+            Truth t;
+            t.pos = V(R * std::cos(phi), R * std::sin(phi), 10);
+            t.vel = V(-20 * std::sin(phi), 20 * std::cos(phi), 0);
+            t.angVel = V(0, 0, w);
+            t.rot = vq::Mul(vq::FromHeadingDeg(Deg(phi)), vq::Exp(V(0, 30.0 * kPi / 180.0, 0)));
+            return t;
+        };
+        Feed feed(lean, 12000, true, 9);
+        VehicleInterpolator ip;
+        VehicleDriveController c;
+        SimCar car;
+        const Truth t0 = lean(0);
+        car.pos = t0.pos; car.vel = t0.vel; car.rot = t0.rot;
+        RollTracker rt;
+        double worstRoll = 0, worstAng = 0;
+        int frames = 0;
+        const double dt = 1000.0 / 60.0;
+        for (double now = 0; now < 11000; now += dt) {
+            feed.Deliver(now, ip);
+            VehicleSample s;
+            if (now < 150 || !ip.Sample(now - 120, s)) continue;
+            const double err = vq::RollDeg(car.rot) - vq::RollDeg(s.rot);
+            const VehicleDriveOutput o = c.Update(Input(s, car.pos, car.rot, car.vel, dt));
+            car.Apply(o, dt);
+            if (now > 3000) { worstRoll = std::max(worstRoll, std::fabs(err)); worstAng = std::max(worstAng, AngDeg(car.rot, s.rot)); rt.Add(err, Len(car.vel)); ++frames; }
+        }
+        const RollTracker::Window w = rt.Take();
+        Check("bike: a 30 degree lean on a 40 m circle at 20 m/s keeps its roll through the controller (within 2 degrees of the target, rotation within 5)",
+              frames > 400 && worstRoll < 2.0 && worstAng < 5.0 && std::fabs(vq::RollDeg(lean(5000).rot) - 30.0) < 0.1,
+              F("frames %d roll error %.3f deg, rotation error %.3f deg", frames, worstRoll, worstAng));
+        Check("bike log: the RollTracker window carries the frames, the largest and mean roll error and the top speed, and clears on Take",
+              w.frames == (uint32_t)frames && std::fabs(w.maxErrDeg - worstRoll) < 1e-3 && w.meanErrDeg <= w.maxErrDeg && w.maxSpeedMs > 15.0 &&
+                  rt.Take().frames == 0,
+              F("%u frames, max %.3f mean %.3f speed %.1f", w.frames, w.maxErrDeg, w.meanErrDeg, w.maxSpeedMs));
+    }
+}
+
 int main() {
     std::printf("-- quaternion math\n");
     TestQuatMath();
@@ -900,9 +1099,12 @@ int main() {
     TestSteer();
     std::printf("-- sync plan W6: stamps, repeats, sessions, send gate\n");
     TestW6();
+    std::printf("-- W9: contact grace, present-time lead, bike lean\n");
+    TestW9();
 
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1;
+    // + W9 11 (RollDeg 1, contact grace 3, no false grace 1, lead weight 1, lead slew 1, lead accuracy 2, bike roll 1, bike log 1)
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 11;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
