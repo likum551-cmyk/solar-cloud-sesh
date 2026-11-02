@@ -342,6 +342,7 @@ namespace gage::server {
         // value that undercuts another (rateNearHz under tickHz) is a WARNING naming both.
         Log(DescribeRepl(cfg_));
         Log(DescribeCombat(cfg_));
+        Log(DescribeLatestClient(cfg_));
         for (const std::string& w : ConfigWarnings(cfg_)) Log("WARNING: " + w);
         Log("authority: hits tied to shots within " +
             (cfg_.hitShotWindowMs ? std::to_string(cfg_.hitShotWindowMs) + " ms" : std::string("(shot binding OFF)")) +
@@ -402,6 +403,13 @@ namespace gage::server {
         rep.nonce = req.nonce;
         rep.players = (uint16_t)players_.size();
         rep.maxPlayers = cfg_.maxPlayers;
+        // The v2 reply (same 24 bytes) only to a request that asked for it; everyone else gets the exact v1 reply
+        // that 0.4.2 / 0.4.3 launchers and the master decode.
+        if (req.replyVersion >= proto::query::kQueryVersion2)
+        {
+            rep.version = proto::query::kQueryVersion2;
+            rep.latestClient = cfg_.latestClient;
+        }
         const proto::query::Datagram out = proto::query::Encode(rep);
         ENetBuffer buf;
         buf.data = const_cast<uint8_t*>(out.data());

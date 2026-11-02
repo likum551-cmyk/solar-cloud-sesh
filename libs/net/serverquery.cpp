@@ -132,6 +132,7 @@ namespace gage::net {
 
         using namespace gage::proto;
         query::Request req;
+        req.replyVersion = query::kQueryVersion2; // older servers ignore this and answer v1
         FillNonce(req.nonce);
         const query::Datagram dg = query::Encode(req);
 
@@ -185,6 +186,7 @@ namespace gage::net {
                     out.players = (int)rep.players;
                     out.maxPlayers = (int)rep.maxPlayers;
                     out.protocol = (int)rep.protocol;
+                    out.latestClient = (int)rep.latestClient.Packed();
                     ok = true;
                     break;
                 }

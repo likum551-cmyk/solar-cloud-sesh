@@ -115,7 +115,7 @@ static const COREWEBVIEW2_COLOR kBgColor = { 255, 10, 9, 7 };  // #0a0907, the S
 #define WM_GAME_EXITED  (WM_APP + 16)  // the game the launcher watched has ended (retry a deferred update)
 #define WM_TRAY_ACTION  (WM_APP + 20)  // legacy tray callback: LOWORD(lparam) = mouse message
 #define WM_WINDOW_STATE (WM_APP + 21)  // re-send {"type":"window"} once the change has landed
-#define WM_SERVER_PROTO (WM_APP + 22)  // wparam: the protocol a server reported in its UDP query (> 0); see version_gate.h
+#define WM_SERVER_PROTO (WM_APP + 22)  // wparam: the protocol a server reported in its UDP query (> 0); lparam: the latest client it reported (packed, 0 = unknown); see version_gate.h
 
 // ---------------------------------------------------------------------------
 // JSON helpers (parser in common/json.h)
@@ -655,6 +655,20 @@ static void WatchGameExit(HANDLE game, DWORD pid) {
     }).detach();
 }
 
+// This launcher's own version (kClientVersion) as vgate's packed number; 0 (= never updates because of a server's
+// say-so) if the constant ever fails to parse.
+static uint32_t ClientVersionPacked() {
+    static const uint32_t v = vgate::ParseVersion(Narrow(kClientVersion).c_str());
+    return v;
+}
+// "0.4.4" for a packed version, "unknown" for 0 (log lines).
+static std::string VersionText(uint32_t packed) {
+    if (packed == vgate::kUnknownVersion) return "unknown";
+    char b[32];
+    snprintf(b, sizeof(b), "%u.%u.%u", (packed >> 16) & 255u, (packed >> 8) & 255u, packed & 255u);
+    return b;
+}
+
 static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const std::wstring& playerName) {
     // 0. The lockstep gate (version_gate.h). Ask the server which protocol it enforces: a server AHEAD of this
     //    launcher means a release is out that we have not installed (refuse, and have the UI thread look for the
@@ -666,11 +680,16 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
         ApplyDefaultPort(probe);
         net::QueryResult q;
         if (probe.port >= 1 && probe.port <= 65535 && net::QueryServer(probe.host, probe.port, 1500, q)) {
-            if (q.protocol > 0) PostMessageW(g_hwnd, WM_SERVER_PROTO, (WPARAM)q.protocol, 0);
-            const vgate::Gate gate = vgate::Decide(q.protocol, (int)proto::kVersion, false);
+            if (q.protocol > 0) PostMessageW(g_hwnd, WM_SERVER_PROTO, (WPARAM)q.protocol, (LPARAM)q.latestClient);
+            // The protocol gate, then the update ping: a server released with a client newer than this one (same
+            // protocol, like 0.4.3) also refuses PLAY with code 14 until the launcher has updated. An older server
+            // (v1 reply) reports latestClient 0 = unknown and is never gated by it.
+            const vgate::Gate gate = vgate::DecideServer(q.protocol, (int)proto::kVersion, (uint32_t)q.latestClient,
+                                                         ClientVersionPacked(), false);
             if (gate.refuse) {
-                GLOGW("launch refused: %s:%d enforces protocol %d, this launcher speaks %d", Narrow(probe.host).c_str(), probe.port,
-                      q.protocol, (int)proto::kVersion);
+                GLOGW("launch refused: %s:%d enforces protocol %d (this launcher speaks %d), latest client %s (this launcher is %s)",
+                      Narrow(probe.host).c_str(), probe.port, q.protocol, (int)proto::kVersion,
+                      VersionText((uint32_t)q.latestClient).c_str(), Narrow(kClientVersion).c_str());
                 PostLaunch({ false, gate.code, gate.text });
                 return;
             }
@@ -1364,8 +1383,9 @@ static void StartServerStatusWorker() {
                 ",\"protocol\":" + numStr(ok ? q.protocol : -1) +
                 "}]}";
             PostJsonFromWorker(json);
-            // The UI thread compares the protocol with ours; a server ahead of this launcher starts an update check.
-            if (ok && q.protocol > 0 && g_hwnd) PostMessageW(g_hwnd, WM_SERVER_PROTO, (WPARAM)q.protocol, 0);
+            // The UI thread compares the protocol and the latest client the server reports (the update ping) with ours;
+            // a server ahead of this launcher in either starts an update check (rate limited there).
+            if (ok && q.protocol > 0 && g_hwnd) PostMessageW(g_hwnd, WM_SERVER_PROTO, (WPARAM)q.protocol, (LPARAM)q.latestClient);
             Sleep(kServerStatusPeriodMs);
         }
     }).detach();
@@ -1640,20 +1660,28 @@ static void ResumeParkedLaunch() {
     HandleLaunch(p.s, p.gp, p.pn, true);
 }
 
-// A server answered the UDP query with `protocol` (WM_SERVER_PROTO). One AHEAD of this launcher means a release
-// was published that this launcher has not installed: look for it now (rate-limited) instead of waiting for
-// the 2-minute poll or for PLAY.
-static void OnServerProtocol(int protocol) {
+// A server answered the UDP query with `protocol` and `latestClient` (WM_SERVER_PROTO; latestClient is the packed
+// version of the newest client it was released with, 0 = unknown). A protocol AHEAD of this launcher, or a latest client
+// newer than kClientVersion (the update ping: a same-protocol release such as 0.4.3), means a release was published that
+// this launcher has not installed: look for it now (rate-limited, vgate::kMinCheckGapMs) instead of waiting for the
+// 2-minute poll or for PLAY.
+static void OnServerProtocol(int protocol, uint32_t latestClient) {
     static int lastSeen = 0;
-    const vgate::Gate gate = vgate::Decide(protocol, (int)proto::kVersion, g_up.available);
-    if (protocol != lastSeen) {
+    static uint32_t lastLatest = 0;
+    const vgate::Gate gate = vgate::DecideServer(protocol, (int)proto::kVersion, latestClient, ClientVersionPacked(), g_up.available);
+    if (protocol != lastSeen || latestClient != lastLatest) {
         lastSeen = protocol;
-        GLOGI("server protocol %d, this launcher speaks %d%s", protocol, (int)proto::kVersion,
+        lastLatest = latestClient;
+        GLOGI("server protocol %d, this launcher speaks %d; server's latest client %s, this launcher %s%s", protocol, (int)proto::kVersion,
+              VersionText(latestClient).c_str(), Narrow(kClientVersion).c_str(),
               gate.refuse ? (gate.code == vgate::kCodeUpdate ? " (server ahead: PLAY is refused until the launcher updates)"
                                                              : " (server behind: PLAY is refused)")
                           : "");
     }
-    if (gate.checkNow) KickUpdateLimited("a server reports a newer protocol");
+    if (gate.checkNow) {
+        const bool byProtocol = vgate::Decide(protocol, (int)proto::kVersion, g_up.available).refuse;
+        KickUpdateLimited(byProtocol ? "a server reports a newer protocol" : "a server reports a newer client");
+    }
 }
 
 static void Dispatch(const std::string& json) {
@@ -2712,7 +2740,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_SERVER_PROTO: {
-            OnServerProtocol((int)wp);
+            OnServerProtocol((int)wp, (uint32_t)lp);
             return 0;
         }
         case WM_TRAY_ACTION: {

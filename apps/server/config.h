@@ -9,6 +9,7 @@
 #pragma once
 
 #include "protocol/protocol.h"
+#include "protocol/query.h"
 #include "replconfig.h"
 
 #include <cstdint>
@@ -36,6 +37,12 @@ namespace gage::server {
         // replconfig.h). 60 Hz would gain ~14 ms more
         // for twice the cost: rejected. The engine sends at 1.5x this (45 Hz).
         uint16_t tickHz = 30;
+        // The newest client release this server was released with, reported in the v2 UDP query reply ("update
+        // ping": a launcher older than this is told to update at once). server.json "latestClientVersion"
+        // "x.y.z" (each part 0..255; "" or "0.0.0" = unknown, nothing is announced), else the environment
+        // variable GAGE_LATEST_CLIENT_VERSION (tools/deploy/release.sh sets it, docs/OPS.md). Not in
+        // server.json.example on purpose: it belongs to a release, not to the operator.
+        proto::query::ClientVersion latestClient;
 
         // ---- server.json keys: world replication (interest management, send rates, budget) ----
         // The knobs of replconfig.h under these server.json names: relevanceEnterRadius,
@@ -216,13 +223,16 @@ namespace gage::server {
     // numbers (playerHealth and every damage percentage), so no value is ever pinned without a trace in the log.
     std::string DescribeRepl(const Config& cfg);
     std::string DescribeCombat(const Config& cfg);
+    // "latest client advertised in the UDP query: x.y.z" or "... none (unknown)": one log line at start.
+    std::string DescribeLatestClient(const Config& cfg);
 
     // Reads server.json into `cfg` (keys it lacks keep their value; the file must be a
     // single JSON object of at most 1024 values). Unknown keys, wrong types, non-integer
     // or out-of-range numbers, trailing data and a failing Validate() are all errors, so
     // a typo cannot silently leave a default in place. When the admin channel is on
     // (adminPort != 0) and the file sets no adminToken, the token is taken from the
-    // environment variable GAGE_ADMIN_TOKEN. Returns true and replaces `cfg` only when
+    // environment variable GAGE_ADMIN_TOKEN. Likewise latestClientVersion falls back to the environment variable
+    // GAGE_LATEST_CLIENT_VERSION when the file sets none; a malformed value in either place is an error. Returns true and replaces `cfg` only when
     // everything is valid; otherwise returns false, leaves `cfg` untouched and puts
     // "<path>: <reason>" in *err. *missing (when non-null) is true ONLY when the file does
     // not exist, so callers can choose to fall back to defaults; a file that exists but

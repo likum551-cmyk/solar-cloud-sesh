@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace query = proto::query;
@@ -200,7 +201,7 @@ static void QueryCodecTests()
     badReply.push_back(Dg(dq)); // a request is not a reply
     {
         std::vector<uint8_t> v = Dg(dr);
-        v[5] = 2;
+        v[5] = 3; // 2 is the v2 reply since the update ping; the next format is not known yet
         badReply.push_back(std::move(v));
     }
     {
@@ -217,6 +218,105 @@ static void QueryCodecTests()
     Check("query: Decode(Reply) rejects wrong length, kind, version, magic and zeros (6 cases) and leaves the output untouched",
           badReply.size() == 6 && replyAccepted == 0 && sentinel.protocol == 777,
           std::to_string(replyAccepted) + " accepted");
+
+    // ---- query format v2 ("update ping", 2026-11-02): the reply also carries the latest client x.y.z ----
+    {
+        query::Request r2 = rq;
+        r2.replyVersion = 2;
+        const query::Datagram d2q = query::Encode(r2);
+        query::Reply v2 = rp;
+        v2.version = 2;
+        v2.latestClient = {0, 4, 4};
+        const query::Datagram d2r = query::Encode(v2);
+        // The v2 request differs from the v1 vector in ONE byte (the u16 at 6 = 2); the v2 reply from the v1 vector in
+        // byte 5 and bytes 20..22. Both are still exactly 24 bytes.
+        const std::string wantReq2 = "474147450101020001020304050607080000000000000000";
+        const std::string wantRep2 = "474147458102010001020304050607080300200000040400";
+        // (a v1 reply that carries a latestClient it was given still encodes as v1: the field is v2-only)
+        query::Reply v1WithLatest = rp;
+        v1WithLatest.latestClient = {9, 9, 9};
+        query::Request rq3;
+        query::Reply rp3, rp4;
+        const bool a2 = query::Decode(d2q.data(), d2q.size(), rq3);
+        const bool b2 = query::Decode(d2r.data(), d2r.size(), rp3);
+        const bool c2 = query::Decode(dr.data(), dr.size(), rp4);
+        Check("query v2: the request asking for v2 and the v2 reply encode to fixed 24-byte vectors (v1 vectors unchanged, a v1 reply "
+              "ignores latestClient) and decode back (version, protocol, nonce, players, maxPlayers, latest client 0.4.4; a v1 reply decodes as version 1, 0.0.0)",
+              d2q.size() == 24 && d2r.size() == 24 && HexPlain(d2q.data(), 24) == wantReq2 && HexPlain(d2r.data(), 24) == wantRep2 &&
+                  HexPlain(query::Encode(rq).data(), 24) == wantReq && HexPlain(dr.data(), 24) == wantRep &&
+                  HexPlain(query::Encode(v1WithLatest).data(), 24) == wantRep && a2 && rq3.replyVersion == 2 && rq3.nonce == rq.nonce && b2 &&
+                  rp3.version == 2 && rp3.protocol == 1 && rp3.nonce == rq.nonce && rp3.players == 3 && rp3.maxPlayers == 32 &&
+                  rp3.latestClient == query::ClientVersion{0, 4, 4} && c2 && rp4.version == 1 && !rp4.latestClient.Known() &&
+                  query::Decode(dq.data(), dq.size(), rq2) && rq2.replyVersion == 1,
+              HexPlain(d2q.data(), 24) + " / " + HexPlain(d2r.data(), 24));
+
+        // A request asks for v2 only with a u16 at 6 of exactly 2. Everything else, including garbage in what v1 called
+        // "zero, ignored on receipt", is a v1 asker and must get the v1 reply it can decode.
+        struct Case { uint8_t b6, b7; int want; };
+        const Case cases[] = {{0, 0, 1}, {1, 0, 1}, {2, 0, 2}, {3, 0, 1}, {0xFF, 0xFF, 1}, {2, 1, 1}, {0, 2, 1}, {0x02, 0x80, 1}, {4, 0, 1}};
+        int wrong = 0;
+        for (const Case& c : cases)
+        {
+            std::vector<uint8_t> v = Dg(dq);
+            v[6] = c.b6;
+            v[7] = c.b7;
+            query::Request r;
+            if (!query::Decode(v.data(), v.size(), r) || r.replyVersion != c.want || !query::IsRequest(v.data(), v.size())) wrong++;
+        }
+        // v2 never relaxes the framing: 23 and 25 bytes, and query version 2 in byte 5 of a request, are still not queries.
+        std::vector<uint8_t> v23 = Dg(d2q, 23), v25 = Dg(d2q);
+        v25.push_back(0);
+        std::vector<uint8_t> req2b5 = Dg(d2q);
+        req2b5[5] = 2;
+        query::Request junk;
+        Check("query v2: only a u16 at 6 of exactly 2 asks for v2 (0, 1, 3, 4, 0xFFFF, 2 with a nonzero byte 7, 0x8002 and 0x0200 all get v1), "
+              "and a v2 request of 23 or 25 bytes, or with query version 2 in byte 5, is not a query",
+              wrong == 0 && sizeof(cases) / sizeof(cases[0]) == 9 && !query::IsRequest(v23.data(), v23.size()) &&
+                  !query::IsRequest(v25.data(), v25.size()) && !query::Decode(v25.data(), v25.size(), junk) &&
+                  !query::IsRequest(req2b5.data(), req2b5.size()) && !query::Decode(req2b5.data(), req2b5.size(), junk),
+              std::to_string(wrong) + " wrong");
+
+        // Compatibility with the 0.4.2 / 0.4.3 launcher, whose Decode(Reply) is frozen here as it shipped: exactly
+        // 24 bytes, magic, kind 0x81, query version 1. And the old server's IsRequest (the same test the master uses).
+        auto legacyDecodeReply = [](const uint8_t* p, size_t n) {
+            return n == 24 && std::memcmp(p, "GAGE", 4) == 0 && p[4] == 0x81 && p[5] == 1;
+        };
+        auto legacyIsRequest = [](const uint8_t* p, size_t n) {
+            return n == 24 && std::memcmp(p, "GAGE", 4) == 0 && p[4] == 0x01 && p[5] == 1;
+        };
+        const query::Datagram serverV1 = query::Encode([&] { query::Reply r = rp; r.version = 1; r.latestClient = {0, 4, 4}; return r; }());
+        Check("query v2 compat: the v1 reply (what a v1 request gets, whatever the server's latest client) passes the old launcher's frozen "
+              "Decode; a v2 reply does not (so it must never be sent unasked); the v2-asking request passes the old server's IsRequest "
+              "and has the same size as before",
+              legacyDecodeReply(serverV1.data(), serverV1.size()) && HexPlain(serverV1.data(), 24) == wantRep &&
+                  !legacyDecodeReply(d2r.data(), d2r.size()) && legacyIsRequest(d2q.data(), d2q.size()) && d2q.size() == query::kDatagramSize);
+    }
+    {
+        struct V { const char* s; bool ok; uint8_t a, b, c; };
+        const V vs[] = {{"0.4.4", true, 0, 4, 4}, {"0.4.3", true, 0, 4, 3}, {"255.255.255", true, 255, 255, 255}, {"0.0.0", true, 0, 0, 0},
+                        {"10.20.30", true, 10, 20, 30}, {"1.2.3", true, 1, 2, 3}, {"007.0.1", true, 7, 0, 1},
+                        {"", false, 0, 0, 0}, {"0.4", false, 0, 0, 0}, {"0.4.4.1", false, 0, 0, 0}, {"256.0.0", false, 0, 0, 0},
+                        {"0.4.256", false, 0, 0, 0}, {"-1.0.0", false, 0, 0, 0}, {"a.b.c", false, 0, 0, 0}, {" 0.4.4", false, 0, 0, 0},
+                        {"0.4.4 ", false, 0, 0, 0}, {"0..4", false, 0, 0, 0}, {".4.4", false, 0, 0, 0}, {"0.4.", false, 0, 0, 0},
+                        {"0.4.4-rc1", false, 0, 0, 0}, {"1000.0.0", false, 0, 0, 0}, {"+1.0.0", false, 0, 0, 0}, {"0x1.0.0", false, 0, 0, 0}};
+        int bad2 = 0;
+        for (const V& v : vs)
+        {
+            query::ClientVersion cv{9, 9, 9};
+            const bool ok = query::ParseClientVersion(v.s, std::strlen(v.s), cv);
+            if (ok != v.ok || (ok && !(cv.major == v.a && cv.minor == v.b && cv.patch == v.c)) || (!ok && !(cv.major == 9 && cv.minor == 9 && cv.patch == 9)))
+                bad2++;
+        }
+        query::ClientVersion nul{9, 9, 9};
+        const char embedded[] = {'0', '.', '4', '\0', '.', '4'};
+        Check("query v2: ParseClientVersion takes only strict x.y.z with parts 0..255 (23 cases incl. 0.4, 0.4.4.1, 256, signs, spaces, suffixes), leaves the output "
+              "untouched on failure, and orders like the version (Packed 0.4.4 > 0.4.3 > 0.0.0 = unknown)",
+              bad2 == 0 && !query::ParseClientVersion(nullptr, 0, nul) && !query::ParseClientVersion(embedded, sizeof(embedded), nul) &&
+                  nul.major == 9 && (query::ClientVersion{0, 4, 4}).Packed() > (query::ClientVersion{0, 4, 3}).Packed() &&
+                  (query::ClientVersion{1, 0, 0}).Packed() > (query::ClientVersion{0, 255, 255}).Packed() && !(query::ClientVersion{}).Known() &&
+                  (query::ClientVersion{0, 0, 1}).Known(),
+              std::to_string(bad2) + " wrong");
+    }
 }
 
 // ===========================================================================
@@ -523,6 +623,53 @@ static void ConfigTests()
         Check("config: the admin token falls back to GAGE_ADMIN_TOKEN only when the file has none",
               !without && with && withEnv.adminToken == "env-token-0123456789" && both &&
                   fileWins.adminToken == "file-token-0123456789");
+    }
+    {
+        // The update ping: latestClientVersion in the file, else GAGE_LATEST_CLIENT_VERSION (what release.sh sets), else unknown.
+        SetEnv("GAGE_LATEST_CLIENT_VERSION", "");
+        std::string err;
+        WriteTextFile(path, "{ \"tickHz\": 30 }");
+        server::Config none;
+        const bool okNone = server::LoadConfigFile(path, none, &err);
+        WriteTextFile(path, "{ \"latestClientVersion\": \"0.4.4\" }");
+        server::Config fromFile;
+        const bool okFile = server::LoadConfigFile(path, fromFile, &err);
+        SetEnv("GAGE_LATEST_CLIENT_VERSION", "0.5.1");
+        server::Config fileWins;
+        const bool okBoth = server::LoadConfigFile(path, fileWins, &err);
+        WriteTextFile(path, "{ \"tickHz\": 30 }");
+        server::Config fromEnv;
+        const bool okEnv = server::LoadConfigFile(path, fromEnv, &err);
+        WriteTextFile(path, "{ \"latestClientVersion\": \"\" }");
+        server::Config fileEmpty;
+        const bool okEmpty = server::LoadConfigFile(path, fileEmpty, &err); // an explicit "" in the file means none, env or not
+        SetEnv("GAGE_LATEST_CLIENT_VERSION", "0.4");
+        WriteTextFile(path, "{ \"tickHz\": 30 }");
+        server::Config badEnv;
+        badEnv.latestClient = {1, 1, 1};
+        std::string badEnvErr;
+        const bool okBadEnv = server::LoadConfigFile(path, badEnv, &badEnvErr);
+        SetEnv("GAGE_LATEST_CLIENT_VERSION", "");
+        const std::vector<std::string> badFiles = {"{ \"latestClientVersion\": \"0.4\" }", "{ \"latestClientVersion\": \"0.4.4.1\" }",
+                                                   "{ \"latestClientVersion\": \"256.0.0\" }", "{ \"latestClientVersion\": \"v0.4.4\" }",
+                                                   "{ \"latestClientVersion\": 4 }", "{ \"latestClientVersion\": null }",
+                                                   "{ \"latestClientversion\": \"0.4.4\" }"};
+        int rejected = 0, untouched = 0;
+        for (const std::string& text : badFiles)
+        {
+            WriteTextFile(path, text);
+            server::Config c;
+            c.latestClient = {7, 7, 7};
+            if (!server::LoadConfigFile(path, c, &err)) rejected++;
+            if (c.latestClient == proto::query::ClientVersion{7, 7, 7}) untouched++;
+        }
+        Check("config: latestClientVersion (server.json, else GAGE_LATEST_CLIENT_VERSION): absent = 0.0.0 unknown; the file key wins over the environment; "
+              "an explicit \"\" means none; the environment alone works; 7 malformed file values and a malformed environment value are refused with the config untouched",
+              okNone && !none.latestClient.Known() && okFile && fromFile.latestClient == proto::query::ClientVersion{0, 4, 4} && okBoth &&
+                  fileWins.latestClient == proto::query::ClientVersion{0, 4, 4} && okEnv && fromEnv.latestClient == proto::query::ClientVersion{0, 5, 1} &&
+                  okEmpty && !fileEmpty.latestClient.Known() && !okBadEnv && badEnv.latestClient == proto::query::ClientVersion{1, 1, 1} &&
+                  badEnvErr.find("GAGE_LATEST_CLIENT_VERSION") != std::string::npos && rejected == 7 && untouched == 7,
+              err + badEnvErr);
     }
     std::remove(path);
 
@@ -847,6 +994,104 @@ static void QueryLiveTests()
         Check("query live: six malformed datagrams get no reply, are not counted as queries and create no peer; a valid one right after is answered",
               variants.size() == 6 && stray == 0 && rig.srv.stats().queryAnswered == answeredBefore + 1 && controlOk &&
                   rig.srv.Players().size() == playersBefore && a.Joined() && c.Joined());
+    }
+    {
+        // The update ping on the wire: a server released with client 0.4.4.
+        server::Config cfg = Rig::BaseConfig();
+        cfg.latestClient = {0, 4, 4};
+        Rig rig;
+        if (!rig.Start(cfg)) { Check("query v2 live: server starts", false); return; }
+        Probe a(rig);
+        a.Join("Alice");
+        RawUdp udp;
+        // One raw round trip: the datagram out, the first datagram back (its bytes), pumping the rig meanwhile.
+        auto ask = [&](const std::vector<uint8_t>& dg, std::vector<uint8_t>& got, int ms = 800) {
+            udp.SendTo(rig.srv.port(), dg.data(), dg.size());
+            uint8_t buf[128];
+            int n = 0;
+            rig.Until([&] { return (n = udp.Recv(buf, sizeof(buf))) > 0; }, ms);
+            got.assign(buf, buf + (n > 0 ? n : 0));
+            return n > 0;
+        };
+        const query::Nonce n1 = MakeNonce(0x31);
+        // v1 request (byte for byte what 0.4.2 / 0.4.3 launchers and the master send).
+        query::Request r1;
+        r1.nonce = n1;
+        const query::Datagram d1 = query::Encode(r1);
+        std::vector<uint8_t> v1(d1.begin(), d1.end()), g1;
+        const bool got1 = ask(v1, g1);
+        // The exact v1 reply the same server would have sent before the update ping existed.
+        query::Reply expect1;
+        expect1.protocol = proto::kVersion;
+        expect1.nonce = n1;
+        expect1.players = 1;
+        expect1.maxPlayers = 8;
+        const query::Datagram e1 = query::Encode(expect1);
+        auto legacyDecode = [](const std::vector<uint8_t>& g) { return g.size() == 24 && std::memcmp(g.data(), "GAGE", 4) == 0 && g[4] == 0x81 && g[5] == 1; };
+        Check("query v2 live: a v1 request gets the byte-exact v1 reply (24 bytes, query version 1, bytes 20..23 zero) even though the server has a latest client "
+              "configured, and the frozen 0.4.3 Decode accepts it",
+              got1 && g1.size() == 24 && std::memcmp(g1.data(), e1.data(), 24) == 0 && legacyDecode(g1), got1 ? HexPlain(g1.data(), g1.size()) : "no reply");
+
+        // v2 request: the same 24 bytes with the u16 at 6 = 2; the reply is v2 and carries 0.4.4.
+        query::Request r2;
+        r2.nonce = MakeNonce(0x32);
+        r2.replyVersion = 2;
+        const query::Datagram d2 = query::Encode(r2);
+        std::vector<uint8_t> g2;
+        const bool got2 = ask(std::vector<uint8_t>(d2.begin(), d2.end()), g2);
+        query::Reply rep2;
+        const bool dec2 = got2 && query::Decode(g2.data(), g2.size(), rep2);
+        Check("query v2 live: a v2 request gets a 24-byte v2 reply: query version 2, protocol 5, players 1, maxPlayers 8, its own nonce, latest client 0.4.4 "
+              "in bytes 20..22, byte 23 zero",
+              got2 && g2.size() == 24 && dec2 && rep2.version == 2 && rep2.protocol == proto::kVersion && rep2.players == 1 && rep2.maxPlayers == 8 &&
+                  rep2.nonce == r2.nonce && rep2.latestClient == query::ClientVersion{0, 4, 4} && g2[20] == 0 && g2[21] == 4 && g2[22] == 4 && g2[23] == 0 &&
+                  !legacyDecode(g2),
+              got2 ? HexPlain(g2.data(), g2.size()) : "no reply");
+
+        // A v1 asker that left junk in the bytes v1 calls "zero" (or a future v3 asker) still gets the v1 reply; so does 2 with a stray byte 7.
+        int junkWrong = 0;
+        for (const std::pair<uint8_t, uint8_t>& b67 : std::vector<std::pair<uint8_t, uint8_t>>{{0, 0}, {1, 0}, {3, 0}, {0xFF, 0xFF}, {2, 1}, {0, 2}})
+        {
+            std::vector<uint8_t> v(d1.begin(), d1.end()), g;
+            v[6] = b67.first;
+            v[7] = b67.second;
+            if (!ask(v, g) || !legacyDecode(g) || std::memcmp(g.data() + 8, d1.data() + 8, 8) != 0) junkWrong++;
+        }
+        // Not queries at all (no reply, no peer, not counted): a v2 request with a trailing byte or one byte short, and query version 2 in byte 5.
+        const uint64_t answeredBefore = rig.srv.stats().queryAnswered;
+        std::vector<uint8_t> t25(d2.begin(), d2.end()), t23(d2.begin(), d2.end() - 1), b5(d2.begin(), d2.end());
+        t25.push_back(0);
+        b5[5] = 2;
+        int stray = 0;
+        for (const std::vector<uint8_t>* m : {&t25, &t23, &b5})
+        {
+            std::vector<uint8_t> g;
+            if (ask(*m, g, 250)) stray++;
+        }
+        std::vector<uint8_t> gc;
+        const bool controlOk = ask(std::vector<uint8_t>(d2.begin(), d2.end()), gc);
+        Check("query v2 live: junk in the reserved bytes (u16 at 6 = 0, 1, 3, 0xFFFF, 0x0102, 0x0200) gets the v1 reply; a v2 request with a trailing byte, "
+              "one byte short, or query version 2 in byte 5 gets no reply and is not counted; a valid v2 request right after is answered, the player stays joined",
+              junkWrong == 0 && stray == 0 && controlOk && rig.srv.stats().queryAnswered == answeredBefore + 1 && a.Joined() && rig.srv.Players().size() == 1,
+              std::to_string(junkWrong) + " junk wrong, " + std::to_string(stray) + " stray");
+    }
+    {
+        // A server with no latest client configured (the default): a v2 request still gets a v2 reply, 0.0.0 = unknown.
+        Rig rig;
+        if (!rig.Start()) { Check("query v2 live (no latest client): server starts", false); return; }
+        RawUdp udp;
+        query::Request r2;
+        r2.nonce = MakeNonce(0x44);
+        r2.replyVersion = 2;
+        const query::Datagram d2 = query::Encode(r2);
+        udp.SendTo(rig.srv.port(), d2.data(), d2.size());
+        uint8_t buf[128];
+        int n = 0;
+        rig.Until([&] { return (n = udp.Recv(buf, sizeof(buf))) > 0; }, 800);
+        query::Reply rep;
+        const bool dec = n == 24 && query::Decode(buf, (size_t)n, rep);
+        Check("query v2 live: a server with no latestClientVersion answers a v2 request with a v2 reply carrying 0.0.0 (unknown: a launcher never acts on it)",
+              dec && rep.version == 2 && !rep.latestClient.Known() && rep.nonce == r2.nonce && buf[20] == 0 && buf[21] == 0 && buf[22] == 0);
     }
     {
         // Per-source rate limit: 5 replies per second per address here.
@@ -2548,6 +2793,7 @@ static void W8ConfigAndLogTests()
         pinned.repl.rateNearHz = 20;
         pinned.playerHealth = 150;
         pinned.meleeDamagePercent = 35;
+        pinned.latestClient = {0, 4, 4};
         bool pinnedOk, plainOk;
         std::vector<std::string> pinnedLogs, plainLogs;
         {
@@ -2561,11 +2807,13 @@ static void W8ConfigAndLogTests()
             plainLogs = rig.logs;
         }
         Check("server start log: the effective replication numbers, playerHealth and every damage percent are logged, and a pinned rateNearHz 20 under tickHz 30 "
-              "logs a WARNING line (none for the matching default)",
+              "logs a WARNING line (none for the matching default); the update ping line names the latest client, or says none is configured",
               pinnedOk && plainOk && hasLine(pinnedLogs, "replication (effective): tickHz 30") && hasLine(pinnedLogs, "rates near/mid/far/idle/coarse 20/10/5/") &&
                   hasLine(pinnedLogs, "combat (effective): playerHealth 150, damage firearm 100% melee 35% explosive 100% run-over 100%") &&
                   hasLine(pinnedLogs, "WARNING: rateNearHz (20) is below tickHz (30)") && hasLine(plainLogs, "combat (effective): playerHealth 100") &&
-                  !hasLine(plainLogs, "WARNING"),
+                  !hasLine(plainLogs, "WARNING") &&
+                  hasLine(pinnedLogs, "update ping: the UDP query tells launchers the latest client is 0.4.4") &&
+                  hasLine(plainLogs, "update ping: no latest client configured"),
               std::to_string(pinnedLogs.size()) + " lines");
     }
 }
@@ -2730,7 +2978,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 97; // W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run
+    const int expected = 106; // W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {
