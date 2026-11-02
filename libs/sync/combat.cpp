@@ -110,9 +110,21 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
         rebase_ = true;
         puppetApplyAtMs_ = 0;          // the server's value is on the ped: a scheduled put-back is spent
     };
+    const bool maxChanged = lastMax_ != 0 && maxH != lastMax_;
+    lastMax_ = maxH;
     if (applyPending_ && pending_ == 0 && !o.dead)
     {
         applyPending_ = false;
+        applyServer();
+        return out;
+    }
+    // The ped's maximum moved (ApplyServerMaxHealth after a model swap, entry or respawn): the value written
+    // under the old maximum may have been cut to it (server 200 on a GTA max of 200 shows as 100 of 200), and
+    // raising the maximum later does not raise the health. Put the server's value on again. Live 0.4.3: the
+    // ped sat at 200 / 300 (a half bar) for the whole session and would have died at half the server's health.
+    if (maxChanged && pending_ == 0 && !o.dead && o.health != 100 + expHealth)
+    {
+        ++stats_.maxChanges;
         applyServer();
         return out;
     }

@@ -106,6 +106,24 @@ static void TestVitals()
               F("apply %d health %d clamps %u", o.apply, o.setHealth, v.Stats().clampsDown));
     }
     {
+        // Live 0.4.3: server playerHealth 200, the first write landed while the ped's max was still GTA's 200
+        // (cut to GTA 200 = 100 of 200), then ApplyServerMaxHealth raised the max to 300 and the ped sat at
+        // 200 / 300 all session (a half bar; it would die at half the server's health).
+        VitalsTracker v;
+        v.Reset(200, 0);
+        VitalsOut o = v.Tick(Obs(0, 200, 0, false, 200));
+        Check("vitals: under a GTA max of 200 the server's 200 is written as GTA 200 (all the ped can show)",
+              o.apply && o.setHealth == 200, F("apply %d health %d", o.apply, o.setHealth));
+        v.Tick(Obs(16, 200, 0, false, 200));
+        o = v.Tick(Obs(32, 200, 0, false, 300));
+        Check("vitals: when the max is raised to 300 the server's 200 is put on again (GTA 300), no self-hit",
+              o.apply && o.setHealth == 300 && o.selfHitCount == 0 && v.Stats().maxChanges == 1,
+              F("apply %d health %d hits %d maxChanges %u", o.apply, o.setHealth, o.selfHitCount, v.Stats().maxChanges));
+        v.Tick(Obs(48, 300, 0, false, 300));
+        o = v.Tick(Obs(64, 300, 0, false, 300));
+        Check("vitals: once the ped matches, a steady max sends nothing more", !o.apply && o.selfHitCount == 0);
+    }
+    {
         // GTA clamps armour at the player's max (100): the server's 200 cannot show. A comparison
         // with the server's values would report a phantom loss of 100 every tick.
         VitalsTracker v;
@@ -2020,9 +2038,9 @@ int main()
     std::printf("-- W8: melee reaction, dead-puppet damage, water / climb edges, alt-tab fallback\n");
     TestW8();
 
-    // vitals 38 + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
+    // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
-    const int expected = 38 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11;
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {

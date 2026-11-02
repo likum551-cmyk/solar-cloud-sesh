@@ -71,6 +71,7 @@ namespace gage::sync {
     struct VitalsStats
     {
         uint32_t selfHits = 0, selfDamage = 0;     // self-hits handed out and their damage
+        uint32_t maxChanges = 0;                    // the ped's max health changed and the server's value was put back on
         uint32_t acks = 0, ackedDamage = 0;        // our own self-hits the server answered
         uint32_t damageEvents = 0, damageTaken = 0; // every Damage for us (any attacker)
         uint32_t resyncs = 0;                      // pending self-damage given up after ackTimeoutMs
@@ -120,6 +121,7 @@ namespace gage::sync {
         bool applyPending_ = true;
         bool rebase_ = true;       // the next Tick only takes a baseline (after our own write)
         int lastLocal_ = 0;        // the ped's total (health above 100 + armour) at the last Tick
+        int lastMax_ = 0;          // the ped's max health at the last readable Tick (0 = none yet)
         int pending_ = 0;          // self-damage sent and not yet answered
         double pendingSinceMs_ = 0;
         double puppetUntilMs_ = 0; // a lethal self-hit waits until then after a puppet-caused loss
