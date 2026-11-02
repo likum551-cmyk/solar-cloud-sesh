@@ -10,6 +10,11 @@
 // file are the only thread-safe entry points; they touch a small mutex-guarded block of
 // data (chat history, outgoing queue, loader status) and a few atomics.
 //
+// Name tags (W10): above the remote players' heads, in the world layer under every plate. Plain outlined type, no panel:
+// the name in Segoe UI Semibold (kInk2, the role of other players' names), its "[id]" in the small face (kInk2 at 0.62),
+// both with a ground-coloured outline and a soft drop so they read on a bright sky and on a dark alley. The engine
+// decides which tags exist and where (libs/sync/nametag.h); this file only draws the list it was handed.
+//
 // Art direction: Solar RP, NOON palette (brand/solar/solar-rp-noon/README.md). Ground #0A0907, panels
 // #100E0B / #17140F, warm ink #F7F2E8 (#D9D1C3 for names and captions), one accent, Solar gold #F2B134,
 // rationed to rails, lit bars and the active row; a warning is ember #FF8A3D, never gold, so it cannot
@@ -83,6 +88,7 @@ constexpr std::size_t kNameMax = 32, kTextMax = 256, kStatusMax = 150;
 constexpr float kHoldS = 11.0f;            // a chat line stays this long while the chat is closed...
 constexpr float kFadeS = 1.5f;             // ...then fades out over this long
 constexpr float kFullSpeedKmh = 240.0f;    // the speed bar is full here
+constexpr ULONGLONG kTagStaleMs = 400;     // a name tag list not refreshed for this long is not drawn
 
 // ---------------------------------------------------------------------------
 // Pushed data (any thread)
@@ -110,6 +116,8 @@ struct Data {
     std::string status;
     bool statusFailed = false;      // the loader's status is a dead end, not progress
     uint32_t chatSeq = 0;
+    std::vector<NameTag> tags;      // W10: the newest list SetNameTags was given
+    ULONGLONG tagsAt = 0;           // ... and when (GetTickCount64)
 };
 // Heap-allocated and never freed: a join-worker thread may push a chat line while the DLL's
 // statics are being destroyed.
@@ -507,6 +515,64 @@ void Submit(const char* raw)
 // Corner mark (top-right, one gutter in from the top and the right edge): a dark chamfered chip so the
 // mark reads over any scene. The Solar S is 1:2, so the textured mark is drawn at that aspect (never
 // stretched into a square), centred in the square chip; the typeset fallback keeps the square box.
+// ---------------------------------------------------------------------------
+// Name tags (W10)
+// ---------------------------------------------------------------------------
+// Text with a legibility outline: eight ground-coloured copies one hairline around it (a 1 px outline survives 4K and a
+// white sky alike), a soft drop two hairlines down, then the face. No panel behind it.
+void OutlinedText(ImDrawList* dl, ImFont* font, float size, ImVec2 p, Rgb c, float a, const char* t)
+{
+    if (a <= 0.003f || !*t)
+        return;
+    const float o = u.px1;
+    const ImU32 edge = Col(kGround, 0.70f * a), drop = Col(kGround, 0.32f * a);
+    dl->AddText(font, size, ImVec2(p.x, p.y + 2.0f * o), drop, t);
+    static const float k[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+    for (const auto& d : k)
+        dl->AddText(font, size, ImVec2(p.x + d[0] * o, p.y + d[1] * o), edge, t);
+    dl->AddText(font, size, p, Col(c, a), t);
+}
+
+void DrawNameTags(ImDrawList* dl, float W, float H, float hudA, ULONGLONG now, UiState& L)
+{
+    static std::vector<NameTag> tags;      // render thread only; the pushed list is copied out under the lock
+    tags.clear();
+    {
+        DLock lk;
+        const Data& d = D();
+        if (d.tagsAt && now - d.tagsAt <= kTagStaleMs)
+            tags = d.tags;
+    }
+    L.nameTagsShown = 0;
+    // The list is nearest first: draw it backwards so a near tag lies over a far one.
+    for (std::size_t i = tags.size(); i-- > 0;) {
+        const NameTag& t = tags[i];
+        const float a = Clamp01(t.alpha) * hudA;
+        if (a <= 0.01f || !(t.x == t.x) || !(t.y == t.y) || !t.name[0])
+            continue;
+        const float sc = std::fmin(1.2f, std::fmax(0.5f, t.scale == t.scale ? t.scale : 1.0f));
+        const float namePx = std::fmax(11.0f, u.semi.px * sc), idPx = std::fmax(10.0f, u.small.px * sc);
+        const float nameK = namePx / u.semi.base, idK = idPx / u.small.base;
+        const ImVec2 nameSz = u.semi.font->CalcTextSizeA(namePx, FLT_MAX, 0.0f, t.name);
+        const ImVec2 idSz = t.idText[0] ? u.small.font->CalcTextSizeA(idPx, FLT_MAX, 0.0f, t.idText) : ImVec2(0, 0);
+        const float gap = idSz.x > 0.0f ? S(5.0f) * sc : 0.0f;
+        const float totalW = idSz.x + gap + nameSz.x;
+        // Centred on the head, kept inside the screen with a gutter; the bottom edge sits a little above the anchor.
+        const float gutter = S(8.0f);
+        const float x0 = std::fmax(gutter, std::fmin(W - gutter - totalW, t.x * W - totalW * 0.5f));
+        const float bottom = t.y * H - S(3.0f) * sc;
+        const float top = bottom - nameSz.y;
+        // The two faces share a baseline.
+        const float nameAsc = u.semi.font->Ascent * nameK, idAsc = u.small.font->Ascent * idK;
+        if (t.idText[0])
+            OutlinedText(dl, u.small.font, idPx, ImVec2(x0, top + nameAsc - idAsc), kInk2, a * 0.62f, t.idText);
+        OutlinedText(dl, u.semi.font, namePx, ImVec2(x0 + idSz.x + gap, top), kInk2, a, t.name);
+        if (L.nameTagsShown++ == 0) {
+            L.nameTagX = x0; L.nameTagY = top; L.nameTagW = totalW; L.nameTagH = nameSz.y;
+        }
+    }
+}
+
 void DrawLogo(ImDrawList* dl, float W, float a, UiState& L)
 {
     const float chip = S(50.0f), ch = S(8.0f);
@@ -1649,6 +1715,8 @@ void UiFrame()
     if (u.hudA > 0.003f) {
         // Bottom-right cluster (speedometer, vitals) and chat first, then the scrim over them (the
         // palette is a modal layer), then the mark on top so the brand stays at full strength.
+        // The name tags belong to the world, so they go first: every plate and the scrim lie over them.
+        DrawNameTags(bg, W, H, u.hudA, now, L);
         if (u.speedA > 0.003f)
             DrawSpeedo(bg, W, H, u.speedA * u.hudA, u.speedSm, L);
         if (u.vitalsA > 0.003f)
@@ -1719,6 +1787,28 @@ void PushChatLine(const char* name, const char* text, bool self)
 }
 
 void PushSystemLine(const char* text) { PushSystem(Clean(text, kTextMax)); }
+
+void SetNameTags(const NameTag* tags, int count)
+{
+    std::vector<NameTag> v;
+    if (tags && count > 0) {
+        v.assign(tags, tags + std::min(count, kMaxNameTags));
+        for (NameTag& t : v) {
+            // Never trust the caller's terminators; control characters become spaces like every pushed string.
+            t.idText[sizeof(t.idText) - 1] = 0;
+            t.name[sizeof(t.name) - 1] = 0;
+            const std::string id = Clean(t.idText, sizeof(t.idText) - 1), nm = Clean(t.name, sizeof(t.name) - 1);
+            std::memset(t.idText, 0, sizeof(t.idText));
+            std::memset(t.name, 0, sizeof(t.name));
+            std::memcpy(t.idText, id.data(), id.size());
+            std::memcpy(t.name, nm.data(), nm.size());
+        }
+    }
+    DLock lk;
+    Data& d = D();
+    d.tags.swap(v);
+    d.tagsAt = GetTickCount64();
+}
 
 bool PopOutgoing(char* out, std::size_t cap)
 {

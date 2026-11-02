@@ -398,6 +398,15 @@ namespace gage::game {
         //   GET_VEHICLE_CLASS                  public 0x29439776AAA00A62  3889 0x5506AFBD6056C05F  int (Vehicle); 8 = motorcycles, 13 = cycles
         constexpr uint64_t HAS_ENTITY_COLLIDED_WITH_ANYTHING           = 0x8BAD02F0368D9E14;
         constexpr uint64_t GET_VEHICLE_CLASS                           = 0x29439776AAA00A62;
+        // 0.4.4 (W10, player name tags). Same convention; looked up on the PC, both sources agree:
+        //   GET_SCREEN_COORD_FROM_WORLD_COORD  public 0x34E82F05DF2974F5  3889 0x2F8A75C70AF54208  BOOL (float x, y, z, float* sx, float* sy)
+        //   GET_FINAL_RENDERED_CAM_COORD       public 0xA200EB1EE790F448  3889 0x02AF3EA0F67D2329  Vector3 ()
+        //   HAS_ENTITY_CLEAR_LOS_TO_ENTITY     public 0xFCDFF7B72D23A1AC  3889 0xAD915B5E38F323E5  BOOL (Entity, Entity, int traceType)
+        //   GET_PED_BONE_COORDS                public 0x17C07FC640E86B4E  3889 0x83FDC027F0BEA202  Vector3 (Ped, int bone, float ox, oy, oz)
+        constexpr uint64_t GET_SCREEN_COORD_FROM_WORLD_COORD           = 0x34E82F05DF2974F5;
+        constexpr uint64_t GET_FINAL_RENDERED_CAM_COORD                = 0xA200EB1EE790F448;
+        constexpr uint64_t HAS_ENTITY_CLEAR_LOS_TO_ENTITY              = 0xFCDFF7B72D23A1AC;
+        constexpr uint64_t GET_PED_BONE_COORDS                         = 0x17C07FC640E86B4E;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -785,6 +794,15 @@ namespace gage::game {
         // GET_VEHICLE_CLASS (-1 when it cannot be called; 8 motorcycles, 13 cycles).
         bool     HasEntityCollidedWithAnything(int32_t entity);
         int      GetVehicleClass(int32_t veh);
+        // W10 (player name tags). GetPedBoneCoords: GET_PED_BONE_COORDS(ped, bone, offX, offY, offZ), world position (SKEL_Head is
+        // 31086). GetScreenCoordFromWorldCoord: GET_SCREEN_COORD_FROM_WORLD_COORD, sx / sy in 0..1 of the screen; returns the native's
+        // BOOL (false: behind the camera or off screen; also when it cannot be called). GetFinalRenderedCamCoord: the camera the frame
+        // is drawn with. HasEntityClearLosToEntity: 1 = clear line of sight, 0 = blocked, -1 = could not be called
+        // (traceType 17 is what R*'s scripts pass; the caller owns the meaning).
+        bool     GetPedBoneCoords(int32_t ped, int bone, float ox, float oy, float oz, float& x, float& y, float& z);
+        bool     GetScreenCoordFromWorldCoord(float x, float y, float z, float& sx, float& sy);
+        bool     GetFinalRenderedCamCoord(float& x, float& y, float& z);
+        int      HasEntityClearLosToEntity(int32_t from, int32_t to, int traceType);
         bool     SetVehicleSiren(int32_t veh, bool on);
         bool     IsVehicleSirenOn(int32_t veh);       // false also when it cannot be called
         bool     StartVehicleHorn(int32_t veh, int durationMs);  // mode 0 (default), not forever

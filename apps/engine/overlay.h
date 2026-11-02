@@ -53,6 +53,24 @@ namespace gage::game::Overlay {
     // pushes anything the overlay shows health and satiety full, no fuel.
     void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel);
 
+    // W10: the player name tags, one per remote ped in range, drawn in the world layer under the HUD plates. The
+    // engine decides which tags exist and where (libs/sync/nametag.h: range, projection, line of sight, dead, the
+    // fade); the overlay only draws what it was handed. x / y are 0..1 of the screen (y grows down) and mark the
+    // tag's bottom centre, alpha 0..1 is the whole tag's visibility, scale 0.5..1.2 multiplies the HUD fonts. idText
+    // ("[12]") and name are UTF-8; control characters become spaces, the strings are cut at their buffers. The list
+    // REPLACES the previous one (count 0 clears it) and is copied under the overlay's data lock, so any thread may
+    // push; entries past kMaxNameTags are ignored. A list not refreshed for 400 ms is no longer drawn (a stalled
+    // script tick never leaves tags hanging), and the tags are hidden with the rest of the HUD while the loader
+    // covers the game.
+    static constexpr int kMaxNameTags = 16;
+    struct NameTag {
+        float x = 0.0f, y = 0.0f;
+        float alpha = 0.0f, scale = 1.0f;
+        char  idText[12] = {};
+        char  name[104] = {};
+    };
+    void SetNameTags(const NameTag* tags, int count);
+
     // A chat line for the log. name is empty/null for a server or system line;
     // self marks the local player's own line. UTF-8, control characters become
     // spaces, name is cut at 32 bytes and text at 256.
@@ -169,6 +187,9 @@ namespace gage::game::Overlay {
         bool  speedoVisible = false;
         float speedoX = 0, speedoY = 0, speedoW = 0, speedoH = 0;
         int   speedShown = 0, speedLit = 0, speedSegments = 0;
+        // name tags (W10): how many were drawn last frame (alpha > 0.01), and the first one's box, for the capture proof
+        int   nameTagsShown = 0;
+        float nameTagX = 0, nameTagY = 0, nameTagW = 0, nameTagH = 0;
         // vitals cluster (bottom-right, same right edge and width as the speedometer, under it)
         bool  vitalsVisible = false;
         float vitalsX = 0, vitalsY = 0, vitalsW = 0, vitalsH = 0;
