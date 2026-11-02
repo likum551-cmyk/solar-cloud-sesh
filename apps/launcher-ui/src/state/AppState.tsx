@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from 'react';
 import { createApi, type Api } from '../lib/api';
 import { createMockBridge } from '../lib/bridge-mock';
-import { createNativeBridge, nativeWebView, request, toBridgeServer, type Bridge, type SettingKey, type SettingsMsg } from '../lib/bridge';
+import { CODE_UPDATE_REQUIRED, createNativeBridge, nativeWebView, request, toBridgeServer, type Bridge, type SettingKey, type SettingsMsg } from '../lib/bridge';
 import { describeFailure, isFailure } from '../lib/errors';
 import { parseAuthLink, type AuthLink } from '../lib/links';
 import { isValidInGameName, randomInGameName } from '../lib/names';
@@ -9,6 +9,7 @@ import { createMockFetch, scenarioFromQuery } from '../lib/mock-api';
 import type { Server } from '../lib/schemas';
 import { authReducer, initialAuth, type AuthState, type AuthEvent } from './auth';
 import { initialLaunch, isBusy, launchReducer, type LaunchState } from './launch';
+import { deriveUpdateView, initialUpdateGate, updateGateReducer, type UpdateView } from './updatePopup';
 
 // The app's single state owner: bridge, API client, auth, launch, local settings, window state
 // and the server list. Screens read it through useApp(); every side effect lives here.
@@ -36,6 +37,10 @@ interface AppValue {
   auth: AuthState;
   authDispatch: (e: AuthEvent) => void;
   launch: LaunchState;
+  /** The forced-update popup: what to draw (state/updatePopup.ts), try again, dismiss (a no-op while mandatory). */
+  updateView: UpdateView;
+  retryUpdate: () => void;
+  dismissUpdate: () => void;
   screen: Screen;
   setScreen: (s: Screen) => void;
   settings: SettingsMsg | null;
@@ -108,6 +113,10 @@ function makeBridge(search: string): Bridge {
     deepLink: q.get('deepLink'),
     // ?game=none: the exe found no GTA V install on `ready`.
     ...(q.get('game') === 'none' ? { gamePath: '' } : {}),
+    // ?update=pending|downloading|downloading-unknown|verifying|installing|deferred|error|run|noupdate|server-behind
+    // (&progress=0.42): previews the forced-update popup (docs/UPDATE-POPUP-REVIEW.md).
+    update: q.get('update'),
+    updateProgress: q.get('progress') === null ? undefined : Number(q.get('progress')),
   });
 }
 
@@ -128,6 +137,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const [auth, authDispatch] = useReducer(authReducer, initialAuth);
   const [launch, launchDispatch] = useReducer(launchReducer, initialLaunch);
+  const [updateGate, updateDispatch] = useReducer(updateGateReducer, initialUpdateGate);
+  const updateView = useMemo(() => deriveUpdateView(updateGate), [updateGate]);
   const [screen, setScreen] = useState<Screen>(() => {
     const s = new URLSearchParams(search).get('screen');
     return demo && (s === 'shop' || s === 'profile' || s === 'settings') ? s : 'play';
@@ -150,7 +161,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         case 'settings': setSettings(m); break;
         case 'status': launchDispatch({ type: 'STATUS', text: m.text }); break;
         case 'launchStage': launchDispatch({ type: 'STAGE', stage: m.stage }); break;
-        case 'launchResult': launchDispatch({ type: 'RESULT', ok: m.ok, code: m.code, error: m.error }); break;
+        case 'launchResult':
+          launchDispatch({ type: 'RESULT', ok: m.ok, code: m.code, error: m.error });
+          updateDispatch({ type: 'LAUNCH_RESULT', ok: m.ok, code: m.code, error: m.error });
+          // Code 14: the host started a check unless one ran in the last minute; checkUpdate is never
+          // rate-limited and re-sends where a running pass stands, so the popup always hears the outcome.
+          if (!m.ok && m.code === CODE_UPDATE_REQUIRED) bridge.send({ type: 'checkUpdate' });
+          break;
+        case 'update': updateDispatch({ type: 'UPDATE', msg: m }); break;
         case 'game': setGameRunning(m.running); launchDispatch({ type: 'GAME', running: m.running }); break;
         case 'window': setWindowState({ focused: m.focused, visible: m.visible, maximized: m.maximized }); break;
         case 'serverStatus': {
@@ -172,6 +190,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       }
     });
     bridge.send({ type: 'ready' });
+    // `ready` does not carry the update state, and the host's first check may have reported before this
+    // listener existed: ask once so a pending update opens the popup at once.
+    bridge.send({ type: 'checkUpdate' });
     return off;
   }, [bridge]);
 
@@ -317,6 +338,23 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     })();
   }), [bridge, api]);
 
+  const retryUpdate = useCallback(() => {
+    updateDispatch({ type: 'RETRY' });
+    bridge.send({ type: 'checkUpdate' });
+  }, [bridge]);
+  // The host answers every checkUpdate; if it somehow does not, Try again must not stay greyed out.
+  useEffect(() => {
+    if (!updateGate.retrying) return;
+    const t = setTimeout(() => updateDispatch({ type: 'RETRY_SETTLED' }), 8000);
+    return () => clearTimeout(t);
+  }, [updateGate.retrying]);
+  // Closing a dismissable popup also closes the failed launch it came from (code 15 / non-mandatory 14).
+  const dismissUpdate = useCallback(() => {
+    if (!updateView.dismissable) return; // mandatory: nothing dismisses it
+    updateDispatch({ type: 'DISMISS' });
+    if (launch.phase === 'failed') launchDispatch({ type: 'DISMISS' });
+  }, [updateView.dismissable, launch.phase]);
+
   const saveSetting = useCallback((key: SettingKey, value: string | boolean) => {
     bridge.send({ type: 'saveSetting', key, value });
   }, [bridge]);
@@ -375,7 +413,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const mergedServersState = useMemo<ServersState>(() => ({ ...servers, servers: mergedServers }), [servers, mergedServers]);
 
   const value: AppValue = {
-    bridge, api, demo, auth, authDispatch, launch, screen, setScreen, settings, saveSetting, windowState, gameRunning,
+    bridge, api, demo, auth, authDispatch, launch, updateView, retryUpdate, dismissUpdate, screen, setScreen, settings, saveSetting, windowState, gameRunning,
     servers: mergedServersState, refreshServers: () => void fetchServers(), selectedServerId, selectServer: setSelectedServerId,
     play, dismissLaunch: () => launchDispatch({ type: 'DISMISS' }), signIn, signOut,
     retryBoot: () => setBootNonce((n) => n + 1), openExternal,

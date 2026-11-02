@@ -20,7 +20,17 @@ export interface MockBridgeOptions {
   gamePath?: string;
   /** A gage-mp:// link "Windows handed over" at start; sent once, after `settings`. */
   deepLink?: string | null;
+  /**
+   * Preview the forced-update popup (docs/UPDATE-POPUP-REVIEW.md): after `ready` the host "reports" this
+   * scenario. One of UPDATE_SCENARIOS; anything else is ignored.
+   */
+  update?: string | null;
+  /** The download progress (0..1) the fixed `downloading` scenario holds at (default 0.42). */
+  updateProgress?: number;
 }
+
+export const UPDATE_SCENARIOS = ['pending', 'downloading', 'downloading-unknown', 'verifying', 'installing', 'deferred', 'error', 'run', 'noupdate', 'server-behind'] as const;
+export type UpdateScenario = (typeof UPDATE_SCENARIOS)[number];
 
 /** Create the mock bridge. Messages are delivered asynchronously, as WebView2 does. */
 export function createMockBridge(opts: MockBridgeOptions = {}): Bridge & { emit(msg: InMsg): void; sent: OutMsg[] } {
@@ -48,12 +58,59 @@ export function createMockBridge(opts: MockBridgeOptions = {}): Bridge & { emit(
     setTimeout(() => { for (const h of [...handlers]) h(msg); }, delay);
   };
 
+  // --- forced-update popup previews ---------------------------------------------------------
+  const scenario = (UPDATE_SCENARIOS as readonly string[]).includes(opts.update ?? '') ? (opts.update as UpdateScenario) : null;
+  const heldProgress = Math.min(1, Math.max(0, Number.isFinite(opts.updateProgress) ? (opts.updateProgress as number) : 0.42));
+  const newest = '0.4.4';
+  let errorShown = false;
+  const upd = (over: Partial<Extract<InMsg, { type: 'update' }>>, delay = 0) =>
+    emit({ type: 'update', current: settings.version, latest: newest, available: true, error: '', state: 'downloading', mandatory: true, notes: '', ...over }, delay);
+  const refuse = (code: number, error: string, delay = 0) => emit({ type: 'launchResult', ok: false, code, error }, delay);
+  /** The whole update, as the host walks it: 0..100% in 2% steps, verifying, installing (the real launcher then exits). */
+  const runUpdate = () => {
+    for (let i = 0; i <= 50; i++) upd({ state: 'downloading', progress: i / 50 }, i * 180);
+    upd({ state: 'verifying' }, 51 * 180);
+    upd({ state: 'ready' }, 51 * 180 + 1400);
+    upd({ state: 'installing' }, 51 * 180 + 2200);
+  };
+  /** What the host says for the scenario: on `ready`, and again (where the pass stands) on `checkUpdate`. */
+  const playUpdateScenario = (fromCheck: boolean) => {
+    switch (scenario) {
+      case 'pending':
+        if (!fromCheck) refuse(14, 'Solar RP was updated. Updating the launcher...', 150);
+        else upd({ state: 'checking', available: false, mandatory: false, latest: '' }, 300);
+        break;
+      case 'downloading': upd({ state: 'downloading', progress: heldProgress }, 150); break;
+      case 'downloading-unknown': upd({ state: 'downloading' }, 150); break;
+      case 'verifying': upd({ state: 'verifying' }, 150); break;
+      case 'installing': upd({ state: 'installing' }, 150); break;
+      case 'deferred': upd({ state: 'deferred' }, 150); break;
+      case 'error': {
+        const fail = () => upd({ state: 'error', error: 'The download stopped: the update server did not answer.' }, 150);
+        if (!fromCheck) { fail(); setTimeout(() => { errorShown = true; }, 400); } // `ready` and the boot check come first
+        else if (!errorShown) fail();
+        else runUpdate(); // Try again: this time it goes through
+        break;
+      }
+      case 'run': if (!fromCheck) runUpdate(); break;
+      case 'noupdate':
+        if (!fromCheck) refuse(14, 'Solar RP was updated. Updating the launcher...', 150);
+        else upd({ state: 'idle', available: false, mandatory: false, latest: '' }, 600);
+        break;
+      case 'server-behind':
+        if (!fromCheck) refuse(15, 'This server has not been updated yet. Try again in a minute.', 150);
+        break;
+      case null: break;
+    }
+  };
+
   function send(msg: OutMsg) {
     sent.push(msg);
     opts.onSend?.(msg);
     switch (msg.type) {
       case 'ready':
         emit({ ...settings });
+        playUpdateScenario(false);
         if (opts.deepLink) emit({ type: 'deepLink', url: opts.deepLink }, 50);
         break;
       case 'getSettings':
@@ -68,7 +125,8 @@ export function createMockBridge(opts: MockBridgeOptions = {}): Bridge & { emit(
         emit({ ...settings }, 400);
         break;
       case 'checkUpdate':
-        emit({ type: 'update', current: settings.version, latest: settings.version, available: false, error: '' }, 600);
+        if (scenario) playUpdateScenario(true);
+        else emit({ type: 'update', current: settings.version, latest: settings.version, available: false, error: '' }, 600);
         break;
       case 'copyText':
         emit({ type: 'copied', ok: true });
