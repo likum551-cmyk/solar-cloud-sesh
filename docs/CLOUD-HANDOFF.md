@@ -1,9 +1,9 @@
-# Cloud session handoff (2026-11-02, release 0.4.3)
+# Cloud session handoff (2026-11-02, release 0.4.4; 0.4.3 is live with W8)
 
 You are continuing work on Solar RP (code name GAGE-MP) in a Claude Code cloud session. The owner is GI (address him as "GI"; terse, verified claims only). Read `CLAUDE.md`, `.claude/rules/lessons.md` and this file first. The local PC session (Windows) did W0-W8; you do the queue below, then GI pulls your branch back to the PC, which builds and releases.
 
 ## Output
-- Work on branch `cloud/0.4.3` (create it from `main`). One commit per queue item, message `W9: ...`, `W10: ...`, `UI: ...`. Push the branch; do NOT push to `main`, do not open a PR unless GI asks.
+- Work on branch `cloud/0.4.4` (create it from `main`). One commit per queue item, message `W9: ...`, `W10: ...`, `UI: ...`. Push the branch; do NOT push to `main`, do not open a PR unless GI asks.
 - At the end write `docs/CLOUD-REPORT.md`: per item what changed, the tests that prove it (and that they failed on the old logic), test pass lines by name, anything only compiled / unverified live, anything you could not do.
 
 ## Queue (in order, one writer at a time)
@@ -32,7 +32,7 @@ You are continuing work on Solar RP (code name GAGE-MP) in a Claude Code cloud s
 - Natives are called outside `g_peersMtx` (existing engine.cpp rule).
 - No new dependencies, no file deletions, no broad refactors, no changes to `tools/deploy/*` except where an item says so. Shell scripts stay LF.
 - After any `CMakeLists.txt` edit: `launcher-ui/dist`, `crypt32`, `launcher-assets`, `GAGE_TEST_SERVER` must still appear (8 matches) and the `GAGE_CASEFIX_DIR` block must stay.
-- Do not bump `kClientVersion` (the PC release step does). Protocol stays v5 (`kVersion = 5`): no new wire fields in this release.
+- Do not bump `kClientVersion` (stays 0.4.3; the PC release step bumps it to 0.4.4). Protocol stays v5 (`kVersion = 5`): no new wire fields in this release.
 - Never put secrets, keys or tokens in the repo or logs. Untrusted data stays out of the repo.
 
 ## Build and test on Linux (Ubuntu)
