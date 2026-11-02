@@ -370,6 +370,15 @@ namespace gage::game {
         constexpr uint64_t RESET_AI_WEAPON_DAMAGE_MODIFIER             = 0xEA16670E7BA4743C;
         constexpr uint64_t RESET_AI_MELEE_WEAPON_DAMAGE_MODIFIER       = 0x46E56A7CD1D63C3F;
         constexpr uint64_t WAS_PED_KILLED_BY_TAKEDOWN                  = 0x7F08E26039C7347C;
+        // Hyper tune (GI 2026-11-02, libs/sync/hypertune.h); lookup tool, yim3889 and v2enh agreeing:
+        //   MODIFY_VEHICLE_TOP_SPEED             public 0x93A3996368C94158  3889 0xAC89BB42FE09CC80  void (Vehicle, float)
+        //   SET_VEHICLE_CHEAT_POWER_INCREASE     public 0xB59E4BD37AE292DB  3889 0xF1C985BBEC6B6321  void (Vehicle, float)
+        //   SET_VEHICLE_MAX_SPEED                public 0xBAA045B4E42F3C06  3889 0x8E9B5F00B41A9F8C  void (Vehicle, float)
+        //   GET_VEHICLE_ESTIMATED_MAX_SPEED      public 0x53AF99BAA671CA47  3889 0x66C1D6E6DBF7AC9B  float (Vehicle)
+        constexpr uint64_t MODIFY_VEHICLE_TOP_SPEED                    = 0x93A3996368C94158;
+        constexpr uint64_t SET_VEHICLE_CHEAT_POWER_INCREASE            = 0xB59E4BD37AE292DB;
+        constexpr uint64_t SET_VEHICLE_MAX_SPEED                       = 0xBAA045B4E42F3C06;
+        constexpr uint64_t GET_VEHICLE_ESTIMATED_MAX_SPEED             = 0x53AF99BAA671CA47;
         constexpr uint64_t GET_VEHICLE_LIGHTS_STATE                    = 0xB91B4C20085BD12F;
         constexpr uint64_t SET_VEHICLE_FULLBEAM                        = 0x8B7FD87F0DDB421E;
         constexpr uint64_t SET_VEHICLE_INTERIORLIGHT                   = 0xBC2042F090AF6AD3;
@@ -904,6 +913,11 @@ namespace gage::game {
         bool     ResetAiMeleeWeaponDamageModifier();
         // Diagnostic only (logged when a puppet dies locally): the game killed it with a takedown.
         bool     WasPedKilledByTakedown(int32_t ped);
+        // Hyper tune (libs/sync/hypertune.h). True = could be called; GetVehicleEstimatedMaxSpeed: m/s, 0 when not.
+        bool     ModifyVehicleTopSpeed(int32_t veh, float percent);
+        bool     SetVehicleCheatPowerIncrease(int32_t veh, float value);   // every frame
+        bool     SetVehicleMaxSpeed(int32_t veh, float metresPerSecond);
+        float    GetVehicleEstimatedMaxSpeed(int32_t veh);
         // Both outs are BOOL* slots. The native's own BOOL return has no documented meaning and is
         // not used: true here is "could be called", and then lightsOn / highbeamsOn are valid.
         bool     GetVehicleLightsState(int32_t veh, bool& lightsOn, bool& highbeamsOn);

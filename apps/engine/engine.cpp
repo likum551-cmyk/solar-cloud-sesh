@@ -26,6 +26,7 @@
 #include "sync/combat.h"
 #include "sync/emote.h"
 #include "sync/gtaids.h"
+#include "sync/hypertune.h"
 #include "sync/pausemenu.h"
 #include "common/registry.h"
 
@@ -5648,6 +5649,44 @@ namespace {
     // peds firing real shots, hurt nobody on this machine: damage is the server's. The two natives are global, are
     // re-asserted every 5 s (a revive or a game state change may restore them) and RESET when the session ends. Up to 5 tries
     // when a native cannot be called, then given up for the session (the clear-line check of PlayPeerShots then stays).
+    // Hyper tune (GI 2026-11-02): the cars in kHyperModels get giga acceleration and a 500 km/h top speed while the
+    // LOCAL player drives them (libs/sync/hypertune.h has the numbers). The owner's client is the authority for its
+    // car, so the other players see the speed through the normal vehicle sync. Script tick only.
+    void TickHyperTune(int32_t lp)
+    {
+        static const char* const kHyperModels[] = {"jesko"};
+        static uint32_t hashes[sizeof kHyperModels / sizeof kHyperModels[0]] = {};
+        static bool hashed = false;
+        static int32_t tunedVeh = 0;                   // the vehicle whose top speed is already raised
+        if (!hashed)
+        {
+            for (size_t i = 0; i < sizeof kHyperModels / sizeof kHyperModels[0]; ++i)
+                hashes[i] = g_world->HashKey(kHyperModels[i]);
+            hashed = true;
+        }
+        const int32_t veh = lp ? g_world->GetVehiclePedIsIn(lp) : 0;
+        if (!veh || g_world->GetPedInVehicleSeat(veh, -1) != lp)
+            return;                                    // only the driver tunes (passengers see the owner's result)
+        const uint32_t model = g_world->GetEntityModel(veh);
+        bool hyper = false;
+        for (uint32_t h : hashes)
+            if (h && h == model) hyper = true;
+        if (!hyper)
+            return;
+        g_world->SetVehicleCheatPowerIncrease(veh, sync::kHyperPower);   // the game clears it every frame
+        if (veh != tunedVeh)
+        {
+            const float est = g_world->GetVehicleEstimatedMaxSpeed(veh);
+            const float pct = sync::HyperTopSpeedPercent(est);
+            const bool topOk = g_world->ModifyVehicleTopSpeed(veh, pct);
+            const bool capOk = g_world->SetVehicleMaxSpeed(veh, sync::kHyperTargetMs);
+            tunedVeh = veh;
+            GLOGI("engine: hyper tune on vehicle %d (model 0x%08x): stock estimate %.1f m/s, top speed +%.0f%% (%s), "
+                  "cap %.0f km/h (%s), power x%.1f every frame", veh, model, est, pct, topOk ? "set" : "NOT callable",
+                  sync::kHyperTargetKmh, capOk ? "set" : "NOT callable", sync::kHyperPower);
+        }
+    }
+
     void TickAiDamage(double nowMs)
     {
         static double atMs = -1e9;
@@ -6189,6 +6228,8 @@ namespace {
         const bool mayChange = inScript ? mode != 0 : mode == 1;
         if (inScript && mayChange)
             TickAiDamage(NowMs());                     // W8 item 6: the AI damage modifiers follow the session (also after it ends)
+        if (inScript && mayChange)
+            TickHyperTune(lp);                         // the hyper cars (libs/sync/hypertune.h): power every frame, top speed once
         // The session ended (OnEnded marked every peer gone and every server vehicle removed): the entry gate
         // below returns before TickPeers / TickVehicles run, so the remote peds and server vehicles would stay
         // frozen in the world until a later session finished its entry (W4 review, fix 1). Run the cleanup pass

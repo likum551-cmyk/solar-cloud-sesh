@@ -128,8 +128,12 @@ int main() {
         W0_CALL(w.ResetAiWeaponDamageModifier());
         W0_CALL(w.ResetAiMeleeWeaponDamageModifier());
         W0_CALL(w.WasPedKilledByTakedown(e));
+        W0_CALL(w.ModifyVehicleTopSpeed(e, 100.f));
+        W0_CALL(w.SetVehicleCheatPowerIncrease(e, 4.f));
+        W0_CALL(w.SetVehicleMaxSpeed(e, 138.9f));
+        W0_CALL(w.GetVehicleEstimatedMaxSpeed(e));
 #undef W0_CALL
-        Check("W0: all 34 wrappers link and return false without natives", wrappers == 34 && truthy == 0,
+        Check("W0: all 38 wrappers link and return false without natives", wrappers == 38 && truthy == 0,
               (std::to_string(wrappers) + " called, " + std::to_string(truthy) + " true").c_str());
         Check("W0: failed calls leave their out parameters untouched",
               lightsOn && highbeamsOn && ratio == 1.5f && roof == 7);

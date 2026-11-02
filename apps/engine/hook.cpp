@@ -834,6 +834,11 @@ const HashMapping kCrossmap3889[] = {
     {native::RESET_AI_WEAPON_DAMAGE_MODIFIER,             0xDD84F9C956E69AC8},
     {native::RESET_AI_MELEE_WEAPON_DAMAGE_MODIFIER,       0x01B722A2B2026558},
     {native::WAS_PED_KILLED_BY_TAKEDOWN,                  0xD9F6166CE6292D26},
+    // Hyper tune (lookup tool, yim3889 and v2enh agreeing; public hashes in hook.h).
+    {native::MODIFY_VEHICLE_TOP_SPEED,                    0xAC89BB42FE09CC80},
+    {native::SET_VEHICLE_CHEAT_POWER_INCREASE,            0xF1C985BBEC6B6321},
+    {native::SET_VEHICLE_MAX_SPEED,                       0x8E9B5F00B41A9F8C},
+    {native::GET_VEHICLE_ESTIMATED_MAX_SPEED,             0x66C1D6E6DBF7AC9B},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
     {native::SET_VEHICLE_FULLBEAM,                        0x2F12C305B28C6C59},
     {native::SET_VEHICLE_INTERIORLIGHT,                   0xEC6A9F16D3F15978},
@@ -5145,6 +5150,34 @@ bool World::ResetAiMeleeWeaponDamageModifier() {
 
 bool World::WasPedKilledByTakedown(int32_t ped) { return callPedBool(*this, native::WAS_PED_KILLED_BY_TAKEDOWN, ped); }
 
+bool World::ModifyVehicleTopSpeed(int32_t veh, float percent) {
+    if (!veh) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)veh, FloatArg(percent) };
+    return CallNative(native::MODIFY_VEHICLE_TOP_SPEED, args, 2, nullptr);
+}
+
+bool World::SetVehicleCheatPowerIncrease(int32_t veh, float value) {
+    if (!veh) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)veh, FloatArg(value) };
+    return CallNative(native::SET_VEHICLE_CHEAT_POWER_INCREASE, args, 2, nullptr);
+}
+
+bool World::SetVehicleMaxSpeed(int32_t veh, float metresPerSecond) {
+    if (!veh) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)veh, FloatArg(metresPerSecond) };
+    return CallNative(native::SET_VEHICLE_MAX_SPEED, args, 2, nullptr);
+}
+
+float World::GetVehicleEstimatedMaxSpeed(int32_t veh) {
+    if (!veh) return 0.0f;
+    uint64_t args[] = { (uint64_t)(uint32_t)veh };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_ESTIMATED_MAX_SPEED, args, 1, r)) return 0.0f;
+    float f = 0.0f;
+    memcpy(&f, &r[0], 4);  // native returns a float in the low 4 bytes
+    return f;
+}
+
 bool World::GetVehicleLightsState(int32_t veh, bool& lightsOn, bool& highbeamsOn) {
     if (!veh) return false;
     // GET_VEHICLE_LIGHTS_STATE(vehicle, BOOL* lightsOn, BOOL* highbeamsOn): zeroed 8-byte slots, low
@@ -5572,6 +5605,10 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(RESET_AI_WEAPON_DAMAGE_MODIFIER),
         GAGE_NEW_NATIVE(RESET_AI_MELEE_WEAPON_DAMAGE_MODIFIER),
         GAGE_NEW_NATIVE(WAS_PED_KILLED_BY_TAKEDOWN),
+        GAGE_NEW_NATIVE(MODIFY_VEHICLE_TOP_SPEED),
+        GAGE_NEW_NATIVE(SET_VEHICLE_CHEAT_POWER_INCREASE),
+        GAGE_NEW_NATIVE(SET_VEHICLE_MAX_SPEED),
+        GAGE_NEW_NATIVE(GET_VEHICLE_ESTIMATED_MAX_SPEED),
         GAGE_NEW_NATIVE(GET_VEHICLE_LIGHTS_STATE),
         GAGE_NEW_NATIVE(SET_VEHICLE_FULLBEAM),
         GAGE_NEW_NATIVE(SET_VEHICLE_INTERIORLIGHT),

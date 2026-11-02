@@ -44,6 +44,7 @@
 
 #include "sync/netclock.h"
 #include "sync/vehicle_drive.h"
+#include "sync/hypertune.h"
 
 #include <algorithm>
 #include <cmath>
@@ -883,6 +884,22 @@ static void TestW6() {
     }
 }
 
+
+// ---- hyper tune (libs/sync/hypertune.h, GI 2026-11-02: the Jesko at 500 km/h) ------------------------------
+static void TestHyperTune() {
+    using namespace gage::sync;
+    // 100 m/s stock (360 km/h) -> +38.9 % reaches 138.9 m/s (500 km/h).
+    const float p = HyperTopSpeedPercent(100.0f);
+    Check("hyper: a 100 m/s car gets the percentage that lands exactly on 500 km/h",
+          std::fabs(100.0f * (1.0f + p / 100.0f) - kHyperTargetMs) < 0.01f, std::to_string(p));
+    Check("hyper: a slow car is capped at +400 % (never more than 5x stock)", HyperTopSpeedPercent(10.0f) == kHyperMaxPercent,
+          std::to_string(HyperTopSpeedPercent(10.0f)));
+    Check("hyper: a car already at or above 500 km/h gets 0, an unreadable estimate gets the safe +100 %",
+          HyperTopSpeedPercent(150.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f && HyperTopSpeedPercent(-5.0f) == 100.0f);
+    Check("hyper: the target stays under the server's default vehicleMaxSpeed (150 m/s), so no update is dropped",
+          kHyperTargetMs < 150.0f, std::to_string(kHyperTargetMs));
+}
+
 int main() {
     std::printf("-- quaternion math\n");
     TestQuatMath();
@@ -900,9 +917,11 @@ int main() {
     TestSteer();
     std::printf("-- sync plan W6: stamps, repeats, sessions, send gate\n");
     TestW6();
+    std::printf("-- hyper tune\n");
+    TestHyperTune();
 
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1;
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4; // + hyper tune 4
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
