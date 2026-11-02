@@ -84,7 +84,7 @@ Status key:
 | `{"type":"getSettings"}` | legacy | Reply `settings`. |
 | `{"type":"saveSetting","key":K,"value":V}` | changed | Also accept `key:"launchOptions"`, a string of at most 512 chars, trimmed. Persist it and reply `settings`. The other keys are as in BRIDGE.md. |
 | `{"type":"browseGamePath"}` | legacy | As in BRIDGE.md; reply `settings`. |
-| `{"type":"checkUpdate"}` | legacy | Reply `update`. |
+| `{"type":"checkUpdate"}` | legacy | Reply `update`. The SPA sends it once after `ready` (the host's first check may have reported before the page listened), on `launchResult` code 14 and from the update popup's Try again; `docs/UPDATE-POPUP-REVIEW.md` has the whole mapping. |
 | `{"type":"copyText","text":S}` | legacy | Reply `copied`. |
 | `{"type":"minimize"}` / `{"type":"close"}` / `{"type":"quit"}` | legacy | As in BRIDGE.md (close = hide to tray). |
 | `{"type":"toggleMaximize"}` | **NEW** | `ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE)`, then send `window`. A double-click on the drag region already does this natively; this message is for the rail's maximize button. |

@@ -9,6 +9,7 @@ import { LaunchOverlay } from './screens/LaunchOverlay';
 import { PlayScreen } from './screens/PlayScreen';
 import { ProfileScreen } from './screens/ProfileScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
+import { UpdatePopup } from './screens/UpdatePopup';
 import { ShopScreen } from './screens/ShopScreen';
 import { AppStateProvider, useApp } from './state/AppState';
 import { isBusy } from './state/launch';
@@ -135,7 +136,7 @@ function Shell() {
     <div className={`app app--${shot} ${booted ? 'is-booted' : ''} ${covered && launch.phase !== 'idle' ? 'is-covered' : ''}`}>
       <Backdrop ref={backdropEl} scene={scene} active={footageActive} reducedMotion={reducedMotion} onReady={ready} />
       <div className="scrim" aria-hidden />
-      <Rail locked={covered && launch.phase !== 'idle'} />
+      <Rail locked={(covered && launch.phase !== 'idle') || app.updateView.open} />
       <main className="screen" key={shot} ref={screenEl}>
         {auth.status !== 'signedIn' ? <AuthScreen /> : (
           <>
@@ -152,6 +153,8 @@ function Shell() {
         {EMBLEM_3D && <EmblemLayer charge={charge} active={covered ? footageActive : active} reducedMotion={reducedMotion} />}
       </Suspense>
       {covered && launch.phase !== 'idle' && <LaunchOverlay key={launchKey} onBack={uncover} startedAt={launchStartedAt} />}
+      {/* The forced-update popup: over the screen and the launch, under the rail's window buttons. */}
+      <UpdatePopup />
       {!booted && (
         <div className="boot" aria-label="Starting Solar Launcher">
           <GageMark size={30} />

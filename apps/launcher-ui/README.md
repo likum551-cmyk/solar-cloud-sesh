@@ -43,7 +43,7 @@ Wiring the exe is the native side's job. `NATIVE-INTEGRATION.md` is the complete
 
 ## Demo mode
 
-In a plain browser, where `chrome.webview` is absent, the UI runs on a mock bridge and mock API. Everything mock is labelled "Demo" on screen. Query parameters such as `?signedIn=1&screen=shop`, `servers=maintenance` and `launch=1` are listed in `docs/api/launcher-ui.md` §9.
+In a plain browser, where `chrome.webview` is absent, the UI runs on a mock bridge and mock API. Everything mock is labelled "Demo" on screen. Query parameters such as `?signedIn=1&screen=shop`, `servers=maintenance` and `launch=1` are listed in `docs/api/launcher-ui.md` §9. `update=pending|downloading|downloading-unknown|verifying|installing|deferred|error|run|noupdate|server-behind` (with `progress=0.42`) previews the forced-update popup: see `docs/UPDATE-POPUP-REVIEW.md`.
 
 ## Layout
 
@@ -52,8 +52,8 @@ src/
   App.tsx                shell: backdrop loop, scrim, rail, screen, emblem layer, launch overlay, PLAY move
   media/                 catalog (loop and still names, URLs, server and product mapping), Backdrop (loop/still layers, blob loader)
   audio/                 the PLAY launch sound
-  screens/               Auth, Play (+ server list), Shop (showroom, orders, owned), Profile, Settings, LaunchOverlay
-  state/                 AppState (context), auth / launch / shop reducers and helpers
+  screens/               Auth, Play (+ server list), Shop (showroom, orders, owned), Profile, Settings, LaunchOverlay, UpdatePopup (the forced-update modal)
+  state/                 AppState (context), auth / launch / shop / updatePopup reducers and helpers
   lib/                   bridge (+ mock), platform API client (+ mock), zod schemas, errors, deep links
   three/                 EmblemLayer (the one canvas), Emblem, env
   ui/                    primitives (Plate, Chip, Field, Toggle, Icon), Rail, emblem slot, hooks, Lenis
@@ -61,7 +61,7 @@ src/
   brand/, fonts/         brand mark and lockup (copied from brand/; still the old G art), Sofia Sans woff2 subsets
 public/assets/           video/ and stills/ (sources: ASSETS.md)
 scripts/asset-manifest.mjs
-tests/                   api, bridge, links, media, mock-api, state
+tests/                   api, bridge, links, media, mock-api, state, update-popup
 ```
 
 API reference for developers: `docs/api/launcher-ui.md` at the repo root.

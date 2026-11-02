@@ -714,6 +714,89 @@
 /* "Back" alone: its label lines up with the lead above, not its padding. */
 .launch__actions > .plate--quiet:first-child { margin-left: -18px; }
 
+/* ---------- forced-update popup ---------------------------------------------------------- */
+
+/* Over the screen and the launch, under the rail (--z-rail): minimise and close-to-tray keep working.
+   One flat veil, no blur (the Opaque Rule); an opaque Panel Black panel with the one 14px cut. Gold is
+   spent on the running step or on the one plate, never both at once. */
+.upd {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-update);
+  display: grid;
+  place-items: center;
+  padding: calc(var(--rail-h) + 16px) var(--gutter) var(--floor);
+  background: rgb(10 9 7 / 0.78);
+  animation: launch-in 520ms var(--ease-out) both;
+}
+.upd__panel {
+  display: grid;
+  gap: 16px;
+  width: min(460px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 26px 28px 24px;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+  animation: upd-rise 480ms var(--ease-out) both;
+}
+@keyframes upd-rise { from { opacity: 0; transform: translate3d(0, 8px, 0); } to { opacity: 1; transform: none; } }
+/* The panel takes focus when it has no control; the chamfer would clip an outline, and the dialog needs no ring. */
+.upd__panel:focus-visible { outline: none; }
+.upd__meta { display: flex; align-items: center; gap: 12px; }
+.upd__title {
+  font: 800 40px/0.95 var(--f-display);
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+  text-wrap: balance;
+}
+.upd__body { max-width: 44ch; font-size: 15px; color: var(--ink-2); }
+.upd__progress { display: grid; gap: 12px; margin-top: 4px; }
+.upd__now { display: flex; align-items: baseline; gap: 14px; min-height: 36px; }
+.upd__figure {
+  display: inline-block;
+  min-width: 2.7ch;
+  font: 800 44px/0.82 var(--f-display);
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+.upd__figure small { margin-left: 2px; font-size: 0.55em; color: var(--ink-3); }
+.upd__status { font-size: 16px; color: var(--ink-2); }
+/* Three named steps, the launch rail's grammar: done solid ink, the running one gold (filling with the
+   download's percent, or sweeping when the progress is unknown), the rest a hairline. */
+.upd__rail { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.upd__step { display: grid; gap: 8px; min-width: 0; }
+.upd__seg { position: relative; height: 4px; background: rgb(255 244 224 / 0.18); overflow: hidden; }
+.upd__seg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 500ms var(--ease-out);
+}
+.upd__step.is-done .upd__seg::after { transform: none; }
+.upd__step.is-now .upd__seg::after { background: var(--sun); transform: scaleX(var(--fill, 1)); transition-duration: 300ms; }
+.upd__step.is-now.is-sweep .upd__seg::after { animation: rail-fill 2.4s var(--ease-in-out) infinite; }
+.upd__segname {
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.upd__step.is-done .upd__segname, .upd__step.is-now .upd__segname { color: var(--ink); }
+.upd__detail { padding: 10px 12px; background: var(--panel-2); font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
+.upd__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 2px; }
+@media (forced-colors: active) {
+  .upd__panel { clip-path: none; border: 1px solid CanvasText; background: Canvas; box-shadow: none; }
+  .upd__seg { outline: 1px solid CanvasText; outline-offset: -1px; }
+  .upd__seg::after { forced-color-adjust: none; background: CanvasText; }
+  .upd__step.is-now .upd__seg::after { background: Highlight; }
+}
+
 /* ---------- narrow and short windows ---------------------------------------------------- */
 
 @media (max-width: 1180px) {
@@ -745,4 +828,6 @@
   .auth__panel { gap: 14px; padding: 20px 24px; }
   .auth__title { font-size: 34px; }
   .auth__body, .auth__form { gap: 12px; }
+  .upd__panel { gap: 12px; padding: 20px 24px; }
+  .upd__title { font-size: 34px; }
 }

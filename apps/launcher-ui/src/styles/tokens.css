@@ -91,7 +91,9 @@
   --z-launch: 5;
   /* above the whole launch stack (the covered emblem is z-launch + 1): the rail keeps painting
      and taking clicks over a launch that now runs to the window's top edge */
-  --z-rail: 7;
+  --z-rail: 8;
+  /* the forced-update popup: over the launch (z-launch, and the covered emblem at z-launch + 1), under the rail */
+  --z-update: 7;
   --z-boot: 9;
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
