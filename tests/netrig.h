@@ -79,6 +79,10 @@ struct Rig
     // so the vector it appends to must outlive it.
     std::vector<std::string> logs;
     std::vector<Probe*> probes;
+    // Other rigs that are alive while this one is stepped. Every Step() services them too: a rig that is left unserviced
+    // for about a second loses its clients to ENet's low rig timeouts (BaseConfig: 400..1000 ms), so a test that runs a
+    // second Rig inside the first one's lifetime must list it here (2026-11-02, the StateTests 30 Hz block).
+    std::vector<Rig*> companions;
     server::Server srv;
 
     static server::Config BaseConfig()
@@ -135,6 +139,7 @@ struct Rig
         return ok;
     }
 
+    void Service();
     void Step();
     bool Until(const std::function<bool()>& pred, int timeoutMs);
     void Pump(int ms) { Until([] { return false; }, ms); }
@@ -383,7 +388,7 @@ struct Probe
     bool SendReliable(const proto::Bytes& b) { return s.SendRaw(proto::kChanReliable, b, true); }
 };
 
-void Rig::Step()
+void Rig::Service()
 {
     srv.Poll(0);
     for (Probe* p : probes)
@@ -391,6 +396,12 @@ void Rig::Step()
         p->s.Poll(0);
         p->Drain();
     }
+}
+
+void Rig::Step()
+{
+    Service();
+    for (Rig* o : companions) o->Service();
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
