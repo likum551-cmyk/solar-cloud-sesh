@@ -1263,6 +1263,9 @@ static void StateTests()
         cfg.tickHz = server::Config().tickHz;
         cfg.repl = server::Config().repl;
         Rig rig30;
+        // The outer rig (a, b, c, ...) must keep being serviced for the ~3 s this block takes: left alone it drops them
+        // (ENet peer timeout 400..1000 ms) and the invalid-packet checks further down then find 3 players, not 6.
+        rig30.companions.push_back(&rig);
         if (!rig30.Start(cfg)) { Check("state: the 30 Hz server starts", false); return; }
         Probe m(rig30), n(rig30), f(rig30);
         m.Join("Mover");
