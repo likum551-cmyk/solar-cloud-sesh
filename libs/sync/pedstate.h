@@ -133,14 +133,24 @@ namespace gage::sync {
 
     constexpr double kEnterTaskMaxMs = 2500.0;   // TASK_ENTER_VEHICLE gets this long before the seat warp takes over
 
-    // The server says the peer sits in the car (move >= in-vehicle) but its local copy does not yet. With no enter
-    // task issued (sinceEnterIssuedMs < 0: the car was not here to walk to, or the entering move was missed) the
-    // warp is due at once, as before W6; with one, once it has had kEnterTaskMaxMs.
-    inline bool EnterWarpDue(bool serverSeated, bool locallySeated, double sinceEnterIssuedMs, double maxMs = kEnterTaskMaxMs)
+    // The server lists the peer's seat in the car but its local copy is not inside yet. The warp (put the ped
+    // straight into the seat) is due:
+    //   * at once when no enter task runs (sinceEnterIssuedMs < 0: the car was not here to walk to, or the entering
+    //     move was missed), as before W6;
+    //   * W9 item 1, at once when the sender's latest move is no longer kMoveEnteringVehicle (senderStillEntering
+    //     false): the real passenger was put into the seat by F (a warp, by design) in 0.3 s, so the door walk
+    //     on the other screen has nothing left to show. Before this the warp waited out kEnterTaskMaxMs (2.5 s) of
+    //     door walk while the real player already sat, the "passenger teleports";
+    //   * else once the walk has had kEnterTaskMaxMs (the sender is still walking in: a slow entry).
+    // senderStillEntering defaults to true (the pre-W9 rule) for callers that do not know the sender's move.
+    inline bool EnterWarpDue(bool serverSeated, bool locallySeated, double sinceEnterIssuedMs, bool senderStillEntering = true,
+                             double maxMs = kEnterTaskMaxMs)
     {
         if (!serverSeated || locallySeated)
             return false;
-        return sinceEnterIssuedMs < 0.0 || sinceEnterIssuedMs >= maxMs;
+        if (sinceEnterIssuedMs < 0.0 || !senderStillEntering)
+            return true;
+        return sinceEnterIssuedMs >= maxMs;
     }
 
     // ====================================================================================================

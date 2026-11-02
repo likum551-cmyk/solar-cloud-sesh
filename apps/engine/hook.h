@@ -393,6 +393,11 @@ namespace gage::game {
         constexpr uint64_t USE_PARTICLE_FX_ASSET                       = 0x6C38AF3693A69A91;
         constexpr uint64_t REQUEST_NAMED_PTFX_ASSET                    = 0xB80D8756B4668AB6;
         constexpr uint64_t HAS_NAMED_PTFX_ASSET_LOADED                 = 0x8702416E512EC454;
+        // 0.4.4 (W9, vehicles and collision). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
+        //   HAS_ENTITY_COLLIDED_WITH_ANYTHING  public 0x8BAD02F0368D9E14  3889 0x14E25ED5E75102C8  BOOL (Entity)
+        //   GET_VEHICLE_CLASS                  public 0x29439776AAA00A62  3889 0x5506AFBD6056C05F  int (Vehicle); 8 = motorcycles, 13 = cycles
+        constexpr uint64_t HAS_ENTITY_COLLIDED_WITH_ANYTHING           = 0x8BAD02F0368D9E14;
+        constexpr uint64_t GET_VEHICLE_CLASS                           = 0x29439776AAA00A62;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -775,6 +780,11 @@ namespace gage::game {
         bool     GetVehicleBodyHealth(int32_t veh, float& health);
         bool     SetVehicleBodyHealth(int32_t veh, float health);
         bool     IsVehicleEngineRunning(int32_t veh);  // false also when it cannot be called
+        // W9: HAS_ENTITY_COLLIDED_WITH_ANYTHING (true when the entity touched anything since it was last asked; whether the
+        // ground counts is INFERRED: the drive controller opens a grace on a rising contact only and has a cooldown) and
+        // GET_VEHICLE_CLASS (-1 when it cannot be called; 8 motorcycles, 13 cycles).
+        bool     HasEntityCollidedWithAnything(int32_t entity);
+        int      GetVehicleClass(int32_t veh);
         bool     SetVehicleSiren(int32_t veh, bool on);
         bool     IsVehicleSirenOn(int32_t veh);       // false also when it cannot be called
         bool     StartVehicleHorn(int32_t veh, int durationMs);  // mode 0 (default), not forever
