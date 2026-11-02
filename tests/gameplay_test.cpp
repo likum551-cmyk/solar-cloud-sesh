@@ -15,6 +15,8 @@
 //   sync plan W6:             vehicle_body.h (lights / doors / roof encode, decode diff), NotOwner in
 //                             vehicle_link.h, combat.h's v5 inputs (Damage bone / flags, playerHealth,
 //                             ClassifyDamage, KillFeedLine), pedstate.h (Tier B edges, vehicle moves)
+//   live test 0.4.2 fixes W10: nametag.h (distance fade and scale, projection validity, the 5 Hz line-of-sight cache, the
+//                             eased alpha, "[id] Name" with a safe cut, the nearest-N list)
 //   live test 0.4.2 fixes W9:  pedstate.h EnterWarpDue (the sender's move), vehicle_w9.h (re-warp limiter, F / G press
 //                             guard, passenger engine re-assert, bail-out decision, vehicle impact, bike roll log)
 // Build target: gameplay_test (selftest/, never shipped). Simulated time, no randomness. Every
@@ -23,6 +25,7 @@
 #include "sync/combat.h"
 #include "sync/emote.h"
 #include "sync/gtaids.h"
+#include "sync/nametag.h"
 #include "sync/pausemenu.h"
 #include "sync/pedstate.h"
 #include "sync/vehicle_body.h"
@@ -2376,6 +2379,274 @@ static void TestW9()
     }
 }
 
+
+// ---- W10: player name tags (libs/sync/nametag.h) ----
+
+// A head at distM from the camera, projected to the middle of the screen, with a fresh LOS answer `clear` recorded at `nowMs`.
+static TagFrame TagAt(double nowMs, float distM, double dtMs = 16.7)
+{
+    TagFrame f;
+    f.nowMs = nowMs;
+    f.dtMs = dtMs;
+    f.placed = true;
+    f.projOk = true;
+    f.sx = 0.5f;
+    f.sy = 0.4f;
+    f.distM = distM;
+    return f;
+}
+
+static bool Utf8Valid(const std::string& s)
+{
+    for (std::size_t i = 0; i < s.size();)
+    {
+        const unsigned char c = (unsigned char)s[i];
+        const std::size_t n = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        if (!n || i + n > s.size()) return false;
+        for (std::size_t k = 1; k < n; ++k)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        i += n;
+    }
+    return true;
+}
+
+static std::size_t CodePoints(const std::string& s)
+{
+    std::size_t n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+static void TestW10()
+{
+    const NameTagConfig cfg;
+    // fade and scale
+    {
+        Check("W10 fade: full alpha up to 25 m, linear to 0 at 40 m (32.5 m is half), 0 beyond, and 0 for a NaN or negative distance",
+              DistanceAlpha(0.0f) == 1.0f && DistanceAlpha(25.0f) == 1.0f && std::fabs(DistanceAlpha(32.5f) - 0.5f) < 1e-5f &&
+                  DistanceAlpha(40.0f) == 0.0f && DistanceAlpha(75.0f) == 0.0f && DistanceAlpha(std::nanf("")) == 0.0f &&
+                  DistanceAlpha(-3.0f) == 0.0f,
+              F("%.3f %.3f %.3f", DistanceAlpha(25.0f), DistanceAlpha(32.5f), DistanceAlpha(40.0f)));
+        bool inLimits = true, nonIncreasing = true;
+        float prev = 2.0f;
+        for (float d = 0.0f; d <= 80.0f; d += 0.5f)
+        {
+            const float sc = DistanceScale(d);
+            inLimits = inLimits && sc <= 1.0f && sc >= cfg.scaleFar;
+            nonIncreasing = nonIncreasing && sc <= prev;
+            prev = sc;
+        }
+        Check("W10 scale: 1.0 up to 8 m, 0.76 at 40 m and beyond, never above 1 or below 0.76 and never growing with distance; a NaN gets the smallest",
+              inLimits && nonIncreasing && DistanceScale(8.0f) == 1.0f && std::fabs(DistanceScale(24.0f) - 0.88f) < 1e-5f &&
+                  DistanceScale(40.0f) == cfg.scaleFar && DistanceScale(std::nanf("")) == cfg.scaleFar);
+    }
+    // projection
+    {
+        Check("W10 projection: the native's false (behind the camera, off screen), NaN / inf, and a point well outside the screen are unusable; the "
+              "middle, the edges and a point just outside (the text has width) are usable",
+              !ProjectionUsable(false, 0.5f, 0.5f) && !ProjectionUsable(true, std::nanf(""), 0.5f) &&
+                  !ProjectionUsable(true, 0.5f, INFINITY) && !ProjectionUsable(true, -0.2f, 0.5f) && !ProjectionUsable(true, 1.2f, 0.5f) &&
+                  !ProjectionUsable(true, 0.5f, -0.1f) && !ProjectionUsable(true, 0.5f, 1.1f) && ProjectionUsable(true, 0.5f, 0.4f) &&
+                  ProjectionUsable(true, 0.0f, 1.0f) && ProjectionUsable(true, -0.03f, 0.5f) && ProjectionUsable(true, 1.03f, -0.02f));
+    }
+    // LOS cache
+    {
+        LosCache c;
+        const bool pendingHidden = !c.Visible(0.0) && c.Due(0.0);
+        c.Record(1000.0, true);
+        const bool notDue = !c.Due(1100.0) && !c.Due(1199.0), due = c.Due(1200.0);
+        const bool freshClear = c.Visible(1100.0) && c.Visible(2000.0);   // reused for up to losStaleMs
+        const bool stale = !c.Visible(2001.0) && !c.Visible(9000.0);       // then a missing answer reads hidden (fail closed)
+        c.Record(3000.0, false);
+        const bool blocked = !c.Visible(3010.0);
+        c.Record(4000.0, true);
+        const bool backwards = c.Due(3000.0) && !c.Visible(3000.0);       // a clock that went back asks again and trusts nothing
+        c.Reset();
+        const bool reset = !c.Have() && c.Due(4000.0) && !c.Visible(4000.0);
+        Check("W10 occlusion cache: no answer yet reads hidden and is due; a fresh answer is reused for 200 ms without asking, kept for 1 s, then "
+              "reads hidden (never a guess); a blocked answer hides; a clock that went backwards asks again; Reset forgets",
+              pendingHidden && notDue && due && freshClear && stale && blocked && backwards && reset,
+              F("%d %d %d %d %d %d %d %d", pendingHidden, notDue, due, freshClear, stale, blocked, backwards, reset));
+    }
+    {
+        // 60 fps for 10 s with the engine's loop (ask when Due): 5 Hz per peer, not 60.
+        LosCache c;
+        int asks = 0;
+        for (double t = 0.0; t < 10000.0; t += 1000.0 / 60.0)
+            if (c.Due(t))
+            {
+                ++asks;
+                c.Record(t, true);
+            }
+        LosCache slow;     // 20 fps: every frame is later than 200 ms apart? no, 50 ms apart: still 5 Hz
+        int slowAsks = 0;
+        for (double t = 0.0; t < 10000.0; t += 50.0)
+            if (slow.Due(t))
+            {
+                ++slowAsks;
+                slow.Record(t, true);
+            }
+        Check("W10 occlusion rate: over 10 s at 60 fps and at 20 fps one peer is asked about 50 times (5 Hz), not once per frame",
+              asks >= 48 && asks <= 52 && slowAsks >= 48 && slowAsks <= 52, F("%d, %d", asks, slowAsks));
+    }
+    // the eased alpha
+    {
+        NameTagTrack t;
+        t.los.Record(0.0, true);
+        TagOut first = t.Step(TagAt(16.7, 10.0f));
+        TagOut mid;
+        for (int i = 1; i < 5; ++i) mid = t.Step(TagAt(16.7 * (i + 1), 10.0f));
+        TagOut full;
+        for (int i = 5; i < 14; ++i) { t.los.Record(16.7 * (i + 1), true); full = t.Step(TagAt(16.7 * (i + 1), 10.0f)); }
+        const bool fadeIn = first.alpha > 0.0f && first.alpha < 0.2f && mid.alpha > first.alpha && mid.alpha < 0.8f && full.alpha == 1.0f;
+        // blocked from now on: it does not vanish in one frame, and it is gone within ~110 ms
+        t.los.Record(300.0, false);
+        TagOut o1 = t.Step(TagAt(316.7, 10.0f));
+        TagOut o;
+        double now = 316.7;
+        int framesToGone = 1;
+        for (; o1.draw && framesToGone < 20; ++framesToGone) { now += 16.7; o1 = t.Step(TagAt(now, 10.0f)); o = o1; }
+        const TagOut afterOne = [&] { NameTagTrack u; u.los.Record(0.0, true); for (int i = 0; i < 12; ++i) u.Step(TagAt(16.7 * (i + 1), 10.0f));
+                                       u.los.Record(300.0, false); return u.Step(TagAt(316.7, 10.0f)); }();
+        Check("W10 fade: a tag eases in over ~160 ms (never pops to full) and out over ~110 ms when the line of sight breaks (no frame-sized flash)",
+              fadeIn && afterOne.alpha > 0.8f && afterOne.draw && framesToGone >= 5 && framesToGone <= 9 && !o1.draw,
+              F("in %.2f/%.2f/%.2f, after one frame %.2f, gone after %d frames", first.alpha, mid.alpha, full.alpha, afterOne.alpha, framesToGone));
+    }
+    // hidden rules
+    {
+        // Each case: a tag that has been fully visible for a second, then ONE thing changes and it must be gone within 300 ms.
+        auto goneAfter = [&](auto change) {
+            NameTagTrack t;
+            double now = 0.0;
+            for (int i = 0; i < 60; ++i) { now += 16.7; t.los.Record(now, true); t.Step(TagAt(now, 12.0f)); }
+            if (!t.Step(TagAt(now + 16.7, 12.0f)).draw) return -1;      // the premise: it was shown
+            int frames = 0;
+            TagOut o;
+            for (; frames < 40; ++frames)
+            {
+                now += 16.7;
+                TagFrame f = TagAt(now, 12.0f);
+                change(f, t, now);
+                o = t.Step(f);
+                if (!o.draw) break;
+            }
+            return frames;
+        };
+        const int dead = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.dead = true; });
+        const int unplaced = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.placed = false; });
+        const int far = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.distM = 41.0f; });
+        const int offscreen = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.projOk = false; });
+        const int behindWall = goneAfter([](TagFrame&, NameTagTrack& t, double now) { t.los.Record(now, false); });
+        const auto ok = [](int n) { return n >= 1 && n <= 18; };    // 18 frames = 300 ms
+        Check("W10 hidden: a dead peer, a missing ped, a peer beyond 40 m, one behind the camera / off screen and one behind a wall each lose their tag "
+              "within 300 ms (and not in zero frames)",
+              ok(dead) && ok(unplaced) && ok(far) && ok(offscreen) && ok(behindWall),
+              F("dead %d, unplaced %d, far %d, offscreen %d, wall %d frames", dead, unplaced, far, offscreen, behindWall));
+        Check("W10 hidden: a peer with no line-of-sight answer yet never shows (the engine asks in the same frame, so the wait is zero frames)",
+              [&] { NameTagTrack t; bool shown = false; for (int i = 1; i <= 30; ++i) shown = shown || t.Step(TagAt(16.7 * i, 10.0f)).draw; return !shown; }());
+        Check("W10 hidden: an answer older than 1 s is not trusted -- the checks stopped, so the tag fades out instead of hanging through a wall",
+              [&] {
+                  NameTagTrack t;
+                  double now = 0.0;
+                  t.los.Record(0.0, true);
+                  for (int i = 0; i < 20; ++i) { now += 16.7; t.Step(TagAt(now, 10.0f)); }
+                  const bool shownWhileFresh = t.Step(TagAt(now + 16.7, 10.0f)).draw;
+                  TagOut o;
+                  for (now = 1100.0; now < 1400.0; now += 16.7) o = t.Step(TagAt(now, 10.0f));    // no new Record since t=0
+                  return shownWhileFresh && !o.draw;
+              }());
+    }
+    // walking away and the wall, end to end
+    {
+        NameTagTrack t;
+        double now = 0.0;
+        float prevAlpha = 2.0f, prevScale = 2.0f;
+        bool mono = true, fullTo25 = true, goneAt40 = true, scaleLimits = true;
+        // 5 m -> 50 m at 5 m/s, 60 fps, LOS asked when due (the engine's loop)
+        for (float d = 5.0f; d <= 50.0f; d += 5.0f / 60.0f)
+        {
+            now += 1000.0 / 60.0;
+            if (t.los.Due(now)) t.los.Record(now, true);
+            const TagOut o = t.Step(TagAt(now, d, 1000.0 / 60.0));
+            if (d > 1.0f && d < 25.0f && now > 400.0 && o.alpha < 0.999f) fullTo25 = false;
+            if (d >= 25.0f) { mono = mono && o.alpha <= prevAlpha + 1e-4f; prevAlpha = o.alpha; }
+            if (d >= 40.0f && o.draw) goneAt40 = false;
+            if (o.draw) { scaleLimits = scaleLimits && o.scale <= 1.0f && o.scale >= cfg.scaleFar && o.scale <= prevScale + 1e-4f; prevScale = o.scale; }
+        }
+        Check("W10 walk-away 5 m -> 50 m at 60 fps: full alpha up to 25 m, then only ever dimmer, gone at 40 m, the scale shrinks within 1.0..0.76",
+              fullTo25 && mono && goneAt40 && scaleLimits, F("full %d mono %d gone %d scale %d", fullTo25, mono, goneAt40, scaleLimits));
+    }
+    {
+        // A wall appears at t = 2 s: the answers are asked at 5 Hz, so the tag must be hidden within 200 ms (next ask) + 110 ms (fade) + a frame.
+        NameTagTrack t;
+        double now = 0.0, hiddenAt = -1.0;
+        for (int i = 0; i < 300; ++i)
+        {
+            now += 1000.0 / 60.0;
+            if (t.los.Due(now)) t.los.Record(now, now < 2000.0);
+            const TagOut o = t.Step(TagAt(now, 15.0f, 1000.0 / 60.0));
+            if (now >= 2000.0 && !o.draw && hiddenAt < 0.0) hiddenAt = now - 2000.0;
+        }
+        Check("W10 occlusion latency: a wall that appears hides the tag within 350 ms with 5 Hz checks, and it stays hidden",
+              hiddenAt > 0.0 && hiddenAt <= 350.0, F("%.0f ms", hiddenAt));
+    }
+    // candidates
+    {
+        Check("W10 candidates: a puppet that is driven, alive and within 40 m is worth the natives; not driven, dead, or beyond 40 m is not",
+              NameTagTrack::Worth(true, false, 0.0f) && NameTagTrack::Worth(true, false, 40.0f) && !NameTagTrack::Worth(false, false, 5.0f) &&
+                  !NameTagTrack::Worth(true, true, 5.0f) && !NameTagTrack::Worth(true, false, 40.1f) && !NameTagTrack::Worth(true, false, -1.0f));
+    }
+    // text
+    {
+        const TagText a = FormatTag(7, "Alex"), b = FormatTag(123, "Mara_K.Smith-2");
+        Check("W10 text: the tag reads \"[id] Name\" (\"[7] Alex\", \"[123] Mara_K.Smith-2\")", a.Full() == "[7] Alex" && b.Full() == "[123] Mara_K.Smith-2",
+              a.Full() + " / " + b.Full());
+        const std::string exact(24, 'a'), longer(40, 'b');
+        const std::string cut = TruncateName(longer.c_str(), 24);
+        std::string geo;                                  // 30 Georgian letters, 3 bytes each
+        for (int i = 0; i < 30; ++i) geo += "\xE1\x83\x90";
+        const std::string geoCut = TruncateName(geo.c_str(), 24);
+        std::string emoji;                                // 30 four-byte code points
+        for (int i = 0; i < 30; ++i) emoji += "\xF0\x9F\x98\x80";
+        const std::string emojiCut = TruncateName(emoji.c_str(), 24);
+        Check("W10 text: a valid name (24 chars) is never cut; a longer one ends in an ellipsis within 24 code points, also for 3-byte and 4-byte "
+              "characters, and the cut never leaves half a UTF-8 sequence",
+              TruncateName(exact.c_str(), 24) == exact && CodePoints(cut) == 24 && cut.substr(0, 23) == std::string(23, 'b') &&
+                  cut.compare(cut.size() - 3, 3, "\xE2\x80\xA6") == 0 && Utf8Valid(geoCut) && CodePoints(geoCut) == 24 && Utf8Valid(emojiCut) &&
+                  CodePoints(emojiCut) == 24,
+              F("%zu %zu %zu", CodePoints(cut), CodePoints(geoCut), CodePoints(emojiCut)));
+        Check("W10 text: control characters become spaces, doubled and edge spaces go, a stray byte or a truncated sequence is dropped, and an empty "
+              "or null name reads \"Player\"",
+              TruncateName("A\tB\nC", 24) == "A B C" && TruncateName("  Bob   Ross  ", 24) == "Bob Ross" && TruncateName("Al\xC3", 24) == "Al" &&
+                  TruncateName("\x80Zed", 24) == "Zed" && Utf8Valid(TruncateName("a\xE1\x83", 24)) && TruncateName("", 24) == "Player" &&
+                  TruncateName(nullptr, 24) == "Player" && TruncateName("\t \n", 24) == "Player" && TruncateName("x\xC2\x85y", 24) == "x y");
+    }
+    // the list
+    {
+        std::vector<TagItem> v;
+        for (int i = 0; i < 20; ++i)
+        {
+            TagItem it;
+            it.id = i;
+            it.distM = (float)((i * 7) % 20) + 1.0f;      // 20 distinct distances in a scrambled order
+            v.push_back(it);
+        }
+        TagItem tie;
+        tie.id = 99;
+        tie.distM = 1.0f;
+        v.push_back(tie);
+        KeepNearest(v, cfg.maxTags);
+        bool sorted = true;
+        for (std::size_t i = 1; i < v.size(); ++i) sorted = sorted && v[i - 1].distM <= v[i].distM;
+        std::vector<TagCandidate> c;
+        for (int i = 0; i < 30; ++i) c.push_back({ i, (float)(30 - i) });
+        KeepNearestCandidates(c, cfg.maxCandidates);
+        Check("W10 cap: at most 12 tags are kept, the nearest first, ties by id; at most 16 peers are asked about, the nearest",
+              v.size() == 12 && sorted && v[0].distM == 1.0f && v[11].distM <= 11.0f && c.size() == 16 && c[0].id == 29 && c[15].id == 14,
+              F("%zu tags, last %.0f m; %zu candidates", v.size(), v.back().distM, c.size()));
+    }
+}
+
 int main()
 {
     std::printf("-- vitals\n");
@@ -2406,13 +2677,16 @@ int main()
     Test0cMelee();
     std::printf("-- W9: passenger enter, re-warp limiter, F press guard, passenger engine, bail-out, vehicle impact, bikes\n");
     TestW9();
+    std::printf("-- W10: player name tags (fade, projection, occlusion cache, text, list)\n");
+    TestW10();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
     // + 0c 7 (hit by event, no event, gun, stale / action / edge, one report for both detectors, window gate, receiver swing trigger)
     // + 0d 6 (in TestW8 beside the climb window: pre-vault placement 1, climb accounting 1, cover window 4)
     // + W9 8 (enter warp 1, re-warp limiter 1, press guard 1, passenger engine 1, unseat 2, impact 1, bike class 1; EnterWarpDue's old W6 check stays)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8;
+    // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {

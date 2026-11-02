@@ -24,6 +24,7 @@
 #include "sync/pedstate.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
+#include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
 #include "sync/gtaids.h"
@@ -133,6 +134,11 @@ namespace {
         return c;
     }
 
+    // W10 (player name tags): nametags=0 turns them off, nametags_los=<flags> changes the line-of-sight trace (R*'s scripts pass 17).
+    // Both are re-read at every Welcome. Read by the game thread (TickNameTags), written by the join worker: atomic.
+    std::atomic<bool> g_nameTags{true};
+    std::atomic<int>  g_nameTagTrace{17};
+
     struct Peer
     {
         std::string name;        // copied from PeerNet by SyncNet
@@ -217,6 +223,7 @@ namespace {
         sync::PedStateEdges edges;       // the edges of the sender's reload / stealth / cover / entering / exiting
         bool stealthOn = false;          // SET_PED_STEALTH_MOVEMENT is on for this ped
         double stealthAtMs = 0;          // ... when it was last (re)asserted
+        sync::NameTagTrack nameTag;      // W10: this peer's tag across frames (eased alpha, last position, LOS cache)
         sync::CoverWindow cover;         // 0d: TASK_PUT_PED_DIRECTLY_INTO_COVER as a window (issued, started, fallback, ended)
         int enterVeh = -1;               // the server vehicle id a TASK_ENTER_VEHICLE walks this ped to (-1 = none)
         double enterTaskMs = 0;          // ... when it was issued (> 0 while it runs); EnterWarpDue's clock
@@ -1111,6 +1118,17 @@ namespace {
         GLOGI("engine: remote on-foot walking via %s (loco_mode)",
               g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
                                   : "TASK_GO_STRAIGHT_TO_COORD at a far point");
+        // W10: name tags on by default; nametags=0 turns them off, nametags_los=<int> the LOS trace flags.
+        g_nameTags.store(reg::Get(L"nametags") != L"0");
+        {
+            const std::wstring tr = reg::Get(L"nametags_los");
+            long v = tr.empty() ? 17 : std::wcstol(tr.c_str(), nullptr, 10);
+            if (v <= 0 || v > 65535)
+                v = 17;
+            g_nameTagTrace.store((int)v);
+        }
+        GLOGI("engine: name tags %s (nametags), line-of-sight trace %d (nametags_los)", g_nameTags.load() ? "on" : "off",
+              g_nameTagTrace.load());
         // v4 switches, re-read at every Welcome like peer_drive.
         g_vehUseAngVel.store(reg::Get(L"veh_angvel") == L"1");
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
@@ -6275,6 +6293,160 @@ namespace {
     // peds firing real shots, hurt nobody on this machine: damage is the server's. The two natives are global, are
     // re-asserted every 5 s (a revive or a game state change may restore them) and RESET when the session ends. Up to 5 tries
     // when a native cannot be called, then given up for the session (the clear-line check of PlayPeerShots then stays).
+    // W10 (docs/sync-specs/live-0.4.2-fixes.md, libs/sync/nametag.h has every rule): the name above each remote ped's head.
+    // Script tick, after TickPeers; natives outside g_peersMtx (this works on the game thread's own g_peers). Per peer: the pose
+    // distance picks the nearest candidates (no native), then SKEL_Head + 0.35 m, GET_SCREEN_COORD_FROM_WORLD_COORD, and, for a
+    // point on screen, HAS_ENTITY_CLEAR_LOS_TO_ENTITY (local ped -> puppet) at most 5 Hz per peer (the answer is cached, see
+    // LosCache). The list goes to Overlay::SetNameTags (copied under the overlay's data lock); the overlay only draws it.
+    // Hidden as a whole while the server session is not up, the local ped is not alive, or the pause menu is open.
+    void TickNameTags(int32_t lp, double nowMs)
+    {
+        static const sync::NameTagConfig cfg;
+        static sync::NameTagStats st;
+        static std::vector<sync::TagCandidate> cand;
+        static std::vector<sync::TagItem> items;
+        static game::Overlay::NameTag pushOut[game::Overlay::kMaxNameTags];
+        static double lastMs = 0, lastLogMs = 0;
+        static bool pushed = false, loggedPath = false;
+        constexpr int kSkelHead = 31086;          // SKEL_Head
+        constexpr float kPoseSlackM = 4.0f;       // the pose is the body origin, the head anchor is up to ~2 m from it
+
+        const double dtMs = lastMs > 0 ? nowMs - lastMs : 16.0;
+        lastMs = nowMs;
+        const bool hide = !g_nameTags.load() || !lp || !join::IsConnected() || g_life != Life::Alive || g_pauseMenuActive ||
+                          g_peers.empty();
+        float cx = 0, cy = 0, cz = 0;
+        if (hide || !g_world->GetFinalRenderedCamCoord(cx, cy, cz))
+        {
+            if (!hide)
+                ++st.nativeFailed;
+            for (auto& kv : g_peers)
+                kv.second.nameTag.Reset();
+            if (pushed)
+            {
+                game::Overlay::SetNameTags(nullptr, 0);
+                pushed = false;
+            }
+            return;
+        }
+        if (!loggedPath)
+        {
+            loggedPath = true;
+            GLOGI("engine: name tags run: head bone %d + %.2f m, GET_SCREEN_COORD_FROM_WORLD_COORD, HAS_ENTITY_CLEAR_LOS_TO_ENTITY "
+                  "(trace %d) every %.0f ms per peer, fade %.0f-%.0f m, at most %zu tags; hidden while the pause menu is open or the "
+                  "local player is not alive",
+                  kSkelHead, cfg.headLiftM, g_nameTagTrace.load(), cfg.losIntervalMs, cfg.fadeStartM, cfg.maxRangeM, cfg.maxTags);
+        }
+
+        // 1. Candidates by pose distance: no native.
+        cand.clear();
+        for (const auto& kv : g_peers)
+        {
+            const Peer& pe = kv.second;
+            if (!(pe.ped && pe.poseOk && pe.lastDriveMs > 0 && !pe.gone && !pe.despawn))
+                continue;
+            const float dx = pe.pose.k.x - cx, dy = pe.pose.k.y - cy, dz = pe.pose.k.z - cz;
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (sync::NameTagTrack::Worth(true, pe.deadShown, d - kPoseSlackM, cfg))
+                cand.push_back({ kv.first, d });
+        }
+        sync::KeepNearestCandidates(cand, cfg.maxCandidates);
+        st.candidates += (uint32_t)cand.size();
+
+        // 2. Every peer steps once: the candidates with what the natives say, the rest with nothing (their tag fades out).
+        items.clear();
+        for (auto& kv : g_peers)
+        {
+            Peer& pe = kv.second;
+            sync::TagFrame f;
+            f.nowMs = nowMs;
+            f.dtMs = dtMs;
+            f.placed = pe.ped != 0 && !pe.gone && !pe.despawn;
+            f.dead = pe.deadShown;
+            const int id = kv.first;
+            const bool isCand = std::any_of(cand.begin(), cand.end(), [id](const sync::TagCandidate& c) { return c.id == id; });
+            if (isCand)
+            {
+                float hx = 0, hy = 0, hz = 0;
+                if (!g_world->GetPedBoneCoords(pe.ped, kSkelHead, 0.0f, 0.0f, 0.0f, hx, hy, hz))
+                    ++st.nativeFailed;
+                else
+                {
+                    hz += cfg.headLiftM;
+                    const float dx = hx - cx, dy = hy - cy, dz = hz - cz;
+                    f.distM = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (f.distM <= cfg.maxRangeM)
+                    {
+                        f.projOk = g_world->GetScreenCoordFromWorldCoord(hx, hy, hz, f.sx, f.sy);
+                        if (!f.projOk)
+                            ++st.projFailed;
+                        else if (sync::ProjectionUsable(true, f.sx, f.sy, cfg))
+                        {
+                            if (pe.nameTag.los.Due(nowMs, cfg))
+                            {
+                                const int r = g_world->HasEntityClearLosToEntity(lp, pe.ped, g_nameTagTrace.load());
+                                ++st.losChecks;
+                                if (r < 0)
+                                    ++st.losFailed;           // fail closed: recorded as blocked
+                                else if (r == 0)
+                                    ++st.losBlocked;
+                                pe.nameTag.los.Record(nowMs, r == 1);
+                            }
+                            else
+                                ++st.losHits;
+                        }
+                    }
+                }
+            }
+            const sync::TagOut o = pe.nameTag.Step(f, cfg);
+            if (o.draw)
+            {
+                sync::TagItem it;
+                it.id = id;
+                it.distM = o.distM;
+                it.out = o;
+                it.text = sync::FormatTag(id, pe.name.c_str(), cfg);
+                items.push_back(std::move(it));
+            }
+        }
+        sync::KeepNearest(items, cfg.maxTags);
+
+        // 3. Hand the list over.
+        int n = 0;
+        for (const sync::TagItem& it : items)
+        {
+            if (n >= game::Overlay::kMaxNameTags)
+                break;
+            game::Overlay::NameTag& t = pushOut[n++];
+            t = game::Overlay::NameTag();
+            t.x = it.out.x;
+            t.y = it.out.y;
+            t.alpha = it.out.alpha;
+            t.scale = it.out.scale;
+            std::snprintf(t.idText, sizeof(t.idText), "%s", it.text.id.c_str());
+            std::snprintf(t.name, sizeof(t.name), "%s", it.text.name.c_str());
+        }
+        if (n > 0 || pushed)
+        {
+            game::Overlay::SetNameTags(pushOut, n);
+            pushed = n > 0;
+        }
+        ++st.frames;
+        st.drawnSum += (uint32_t)n;
+        st.drawnMax = std::max(st.drawnMax, (uint32_t)n);
+
+        if (nowMs - lastLogMs >= 10000.0)
+        {
+            if (lastLogMs > 0 && (st.candidates || st.drawnMax))
+                GLOGI("engine: name tags (10 s): %u frames, %.1f drawn avg (max %u), %u candidates, LOS %u asked / %u reused / %u blocked / "
+                      "%u failed, %u off screen, %u native failures",
+                      st.frames, st.frames ? (double)st.drawnSum / st.frames : 0.0, st.drawnMax, st.candidates, st.losChecks, st.losHits,
+                      st.losBlocked, st.losFailed, st.projFailed, st.nativeFailed);
+            lastLogMs = nowMs;
+            st.Reset();
+        }
+    }
+
     void TickAiDamage(double nowMs)
     {
         static double atMs = -1e9;
@@ -7164,6 +7336,7 @@ namespace {
             WorkSection peersSection(probe, kSecPeers);    // the two short lock windows (SyncNet, CommitNet) and the natives
             TickPeers(lp, lpVeh);
             TickVehicles(lp, lpVeh);                   // after the peds: seating needs them spawned
+            TickNameTags(lp, nowMs);                   // W10: the names above the heads, from the poses this frame placed
             ReportV4(nowMs);
         }
     }

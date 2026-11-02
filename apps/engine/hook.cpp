@@ -857,6 +857,11 @@ const HashMapping kCrossmap3889[] = {
     // 0.4.4 (W9): lookup tool, public and 3889 agree.
     {native::HAS_ENTITY_COLLIDED_WITH_ANYTHING,           0x14E25ED5E75102C8},
     {native::GET_VEHICLE_CLASS,                           0x5506AFBD6056C05F},
+    // 0.4.4 (W10): lookup tool, public and 3889 agree.
+    {native::GET_SCREEN_COORD_FROM_WORLD_COORD,           0x2F8A75C70AF54208},
+    {native::GET_FINAL_RENDERED_CAM_COORD,                0x02AF3EA0F67D2329},
+    {native::HAS_ENTITY_CLEAR_LOS_TO_ENTITY,              0xAD915B5E38F323E5},
+    {native::GET_PED_BONE_COORDS,                         0x83FDC027F0BEA202},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -4662,6 +4667,43 @@ int World::GetVehicleClass(int32_t veh) {
     return intOf(r[0]);
 }
 
+bool World::GetPedBoneCoords(int32_t ped, int bone, float ox, float oy, float oz, float& x, float& y, float& z) {
+    if (!ped) return false;
+    // GET_PED_BONE_COORDS(ped, boneId, offsetX, offsetY, offsetZ): a Vector3 return, read like GetEntityCoords.
+    uint64_t args[] = { entArg(ped), (uint64_t)(uint32_t)bone, FloatArg(ox), FloatArg(oy), FloatArg(oz) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_PED_BONE_COORDS, args, 5, r)) return false;
+    vec3Of(r, x, y, z);
+    return true;
+}
+
+bool World::GetScreenCoordFromWorldCoord(float x, float y, float z, float& sx, float& sy) {
+    // GET_SCREEN_COORD_FROM_WORLD_COORD(x, y, z, float* screenX, float* screenY): BOOL, the two floats are written through
+    // pointers into zeroed 8-byte slots (like GetEntityQuaternion's), read from their low 4 bytes.
+    uint64_t s[2] = {};
+    uint64_t args[] = { FloatArg(x), FloatArg(y), FloatArg(z), ptrArg(&s[0]), ptrArg(&s[1]) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_SCREEN_COORD_FROM_WORLD_COORD, args, 5, r) || !(uint32_t)r[0]) return false;
+    sx = floatOf(s[0]);
+    sy = floatOf(s[1]);
+    return true;
+}
+
+bool World::GetFinalRenderedCamCoord(float& x, float& y, float& z) {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_FINAL_RENDERED_CAM_COORD, nullptr, 0, r)) return false;
+    vec3Of(r, x, y, z);
+    return true;
+}
+
+int World::HasEntityClearLosToEntity(int32_t from, int32_t to, int traceType) {
+    if (!from || !to) return -1;
+    uint64_t args[] = { entArg(from), entArg(to), (uint64_t)(uint32_t)traceType };
+    uint64_t r[4] = {};
+    if (!CallNative(native::HAS_ENTITY_CLEAR_LOS_TO_ENTITY, args, 3, r)) return -1;
+    return (uint32_t)r[0] ? 1 : 0;
+}
+
 bool World::SetVehicleSiren(int32_t veh, bool on) {
     return callPedToggle(*this, native::SET_VEHICLE_SIREN, veh, on);
 }
@@ -5618,6 +5660,10 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(HAS_NAMED_PTFX_ASSET_LOADED),
         GAGE_NEW_NATIVE(HAS_ENTITY_COLLIDED_WITH_ANYTHING),
         GAGE_NEW_NATIVE(GET_VEHICLE_CLASS),
+        GAGE_NEW_NATIVE(GET_SCREEN_COORD_FROM_WORLD_COORD),
+        GAGE_NEW_NATIVE(GET_FINAL_RENDERED_CAM_COORD),
+        GAGE_NEW_NATIVE(HAS_ENTITY_CLEAR_LOS_TO_ENTITY),
+        GAGE_NEW_NATIVE(GET_PED_BONE_COORDS),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));
