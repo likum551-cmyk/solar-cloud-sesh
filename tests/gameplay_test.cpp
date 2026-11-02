@@ -2011,6 +2011,108 @@ static void TestW8()
     }
 }
 
+// ---- 0.4.4 item 0c: melee hits by the damage event, the receiver's swing trigger ----------------------
+static void Test0cMelee()
+{
+    // The 0.4.3 live case: swings counted, the AI melee modifier at 0 left the pool untouched (poolReport false), but
+    // the game DID record the damage event. That is a hit of the nominal damage.
+    {
+        MeleeHitIn in;
+        in.meleeWeaponHeld = true;
+        in.eventDamaged = true;
+        in.sinceSwingMs = 180;
+        in.poolReport = false;
+        const MeleeHitOut o = DecideMeleeHit(in);
+        Check("0c melee: damage event + swing 180 ms ago + melee weapon in hand + NO pool drop => a Hit of the nominal damage (40), event read cleared",
+              o.source == MeleeHitSource::Event && o.damage == kMeleeNominalDamage && kMeleeNominalDamage == 40 && o.clearEvent,
+              F("source %d damage %d clear %d", (int)o.source, o.damage, (int)o.clearEvent));
+    }
+    {
+        MeleeHitIn in;
+        in.meleeWeaponHeld = true;
+        in.eventDamaged = false;
+        in.sinceSwingMs = 180;
+        const MeleeHitOut o = DecideMeleeHit(in);
+        Check("0c melee: a swing with NO damage event and no pool drop is no hit (nothing to clear)",
+              o.source == MeleeHitSource::None && o.damage == 0 && !o.clearEvent);
+    }
+    {
+        // A gun in hand: the event path is for melee only; the pool probe stays the gun's detector.
+        MeleeHitIn gunEvent;
+        gunEvent.meleeWeaponHeld = false;
+        gunEvent.eventDamaged = true;
+        gunEvent.sinceSwingMs = 100;
+        const MeleeHitOut a = DecideMeleeHit(gunEvent);
+        MeleeHitIn gunPool = gunEvent;
+        gunPool.poolReport = true;
+        gunPool.poolDamage = 28;
+        const MeleeHitOut b = DecideMeleeHit(gunPool);
+        Check("0c melee: with a gun in hand an event alone is no melee hit and clears nothing; a pool drop reports as before (28, by pool)",
+              a.source == MeleeHitSource::None && !a.clearEvent && b.source == MeleeHitSource::Pool && b.damage == 28 && !b.clearEvent,
+              F("a %d b %d/%d", (int)a.source, (int)b.source, b.damage));
+    }
+    {
+        // Outside the swing window: a stale event is cleared but is not a hit; a melee action still running keeps the window open.
+        MeleeHitIn stale;
+        stale.meleeWeaponHeld = true;
+        stale.eventDamaged = true;
+        stale.sinceSwingMs = 5000;
+        const MeleeHitOut a = DecideMeleeHit(stale);
+        MeleeHitIn action = stale;
+        action.meleeActionNow = true;
+        const MeleeHitOut b = DecideMeleeHit(action);
+        MeleeHitIn edge = stale;
+        edge.sinceSwingMs = kMeleeHitWindowMs;
+        MeleeHitIn past = stale;
+        past.sinceSwingMs = kMeleeHitWindowMs + 1;
+        Check("0c melee: an event 5 s after the swing is stale (cleared, no hit); the melee action still running is a hit; the window edge is inclusive",
+              a.source == MeleeHitSource::None && a.clearEvent && b.source == MeleeHitSource::Event && b.damage == 40 &&
+                  DecideMeleeHit(edge).source == MeleeHitSource::Event && DecideMeleeHit(past).source == MeleeHitSource::None,
+              F("a %d b %d", (int)a.source, (int)b.source));
+    }
+    {
+        // The same blow seen by both detectors (a modifier left at 1.0 lets the pool drop too): ONE report, not the sum.
+        MeleeHitIn both;
+        both.meleeWeaponHeld = true;
+        both.eventDamaged = true;
+        both.sinceSwingMs = 200;
+        both.poolReport = true;
+        both.poolDamage = 30;
+        const MeleeHitOut o = DecideMeleeHit(both);
+        MeleeHitIn poolOnly = both;
+        poolOnly.eventDamaged = false;
+        poolOnly.sinceSwingMs = 5000;
+        const MeleeHitOut p = DecideMeleeHit(poolOnly);
+        Check("0c melee: event and pool drop for one blow report once, as the event (40, not 70); a pool drop with no event keeps its own number (30, by pool)",
+              o.source == MeleeHitSource::Event && o.damage == 40 && p.source == MeleeHitSource::Pool && p.damage == 30,
+              F("o %d/%d p %d/%d", (int)o.source, o.damage, (int)p.source, p.damage));
+    }
+    {
+        // The window gate that keeps the native call out of every other frame.
+        Check("0c melee: the event is read only with a melee weapon in hand AND (a swing within the window OR a melee action running)",
+              MeleeEventWindow(true, 100, false) && MeleeEventWindow(true, 1e9, true) && !MeleeEventWindow(true, 1e9, false) &&
+                  !MeleeEventWindow(false, 100, true) && !MeleeEventWindow(true, kMeleeHitWindowMs + 1, false));
+    }
+    // Receiver: a rising kPfMelee shows a swing even when the shotSeq step was missed; step and flag are one swing; a gun never swings.
+    {
+        MeleeSwingGate g;
+        const bool flagOnly = PeerSwingDue(g, 1000, 0, true, true);          // no counter step, the flag rises
+        const bool flagHeld = PeerSwingDue(g, 1033, 0, true, true);
+        const bool flagDown = PeerSwingDue(g, 1500, 0, true, false);
+        MeleeSwingGate h;
+        const bool step = PeerSwingDue(h, 2000, 1, true, false);             // the counter steps first ...
+        const bool flagAfter = PeerSwingDue(h, 2100, 0, true, true);         // ... the flag rises 100 ms later: the same swing
+        MeleeSwingGate k;
+        const bool gunFlag = PeerSwingDue(k, 3000, 1, false, true);          // a pistol-whip with a gun in hand: shots, not a swing
+        MeleeSwingGate m;
+        PeerSwingDue(m, 4000, 1, true, true);
+        const bool second = PeerSwingDue(m, 4600, 1, true, true);            // 600 ms later, a new step: a second swing
+        Check("0c melee: receiver swing = a shotSeq step OR a rising kPfMelee (flag alone shows it, step + flag 100 ms apart is one, a gun never swings, a second swing shows)",
+              flagOnly && !flagHeld && !flagDown && step && !flagAfter && !gunFlag && second,
+              F("flagOnly %d held %d down %d step %d after %d gun %d second %d", flagOnly, flagHeld, flagDown, step, flagAfter, gunFlag, second));
+    }
+}
+
 int main()
 {
     std::printf("-- vitals\n");
@@ -2037,10 +2139,13 @@ int main()
     TestW6();
     std::printf("-- W8: melee reaction, dead-puppet damage, water / climb edges, alt-tab fallback\n");
     TestW8();
+    std::printf("-- 0.4.4 item 0c: melee hit by the damage event, receiver swing trigger\n");
+    Test0cMelee();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11;
+    // + 0c 7 (hit by event, no event, gun, stale / action / edge, one report for both detectors, window gate, receiver swing trigger)
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {
