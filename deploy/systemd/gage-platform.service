@@ -1,0 +1,77 @@
+# GAGE platform API (apps/platform): accounts, login, join tokens, official server list, shop.
+# Hono + PostgreSQL. Two loopback listeners: the public API (127.0.0.1:8787, proxied by Caddy)
+# and the internal game-server API (127.0.0.1:8788, never proxied).
+#   settings  /etc/gage/platform.env   (mode 600, owner gage-platform; example in README)
+# Schema migrations are NOT run by this unit: release.sh runs `node dist/scripts/migrate.js`
+# before switching, as the platform's own scripts/migrate.ts says ("never implicitly by a server process").
+# Install: sudo cp gage-platform.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Check:   systemd-analyze verify /etc/systemd/system/gage-platform.service
+#          systemd-analyze security gage-platform
+[Unit]
+Description=GAGE platform API
+Documentation=file:///opt/gage/deploy/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+# The compiled entry point. platform/tsconfig.build.json has rootDir "." so it is dist/src/index.js,
+# not the dist/index.js its `npm start` script names. release.sh refuses to switch if this path
+# and the build layout disagree.
+AssertPathExists=/opt/gage/platform/current/dist/src/index.js
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gage-platform
+Group=gage-platform
+WorkingDirectory=/opt/gage/platform/current
+EnvironmentFile=/etc/gage/platform.env
+# Production mode is what refuses fake payments, the in-memory database and a missing DATABASE_URL.
+# (An EnvironmentFile entry would override this line: keep NODE_ENV=production in platform.env too.)
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=512
+ExecStart=/usr/bin/node /opt/gage/platform/current/dist/src/index.js
+Restart=on-failure
+RestartSec=3
+# Exit 1 at boot = invalid configuration or the database is unreachable at start; the log says which.
+# systemd cannot tell those apart, so it keeps retrying (bounded by StartLimit) rather than giving up.
+KillSignal=SIGTERM
+# SHUTDOWN_GRACE_SECONDS (10 by default) plus margin: raise this if you raise that.
+TimeoutStopSec=25
+StandardOutput=journal
+StandardError=journal
+
+# Resources
+MemoryMax=768M
+TasksMax=256
+
+# Sandbox
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gage/platform
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# AF_INET/AF_INET6: PostgreSQL on 127.0.0.1, UDP queries to game servers, HTTPS to Discord and the
+# payment/email providers. AF_UNIX: name resolution helpers.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# V8 needs writable+executable memory (JIT): MemoryDenyWriteExecute stays off for Node.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+// SolarLauncher.exe resources. Icon 1 is the exe's file icon in Explorer (the
+// lowest-numbered group) and the window, taskbar and tray icon (gage_gui.cpp
+// kAppIconId). gage-mp.ico: the Solar RP gold S tile at 16..256 px, from brand/solar (the file name is kept).
+1 ICON "res/gage-mp.ico"
+
+// Application manifest: requireAdministrator (DLL injection into GTA5.exe
+// needs elevated privileges) + Windows 10/11 compatibility.
+// Resource type 24 = RT_MANIFEST, resource ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID.
+1 24 "gage_gui.manifest"

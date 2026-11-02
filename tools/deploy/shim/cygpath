@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# A stand-in for Git Bash's `cygpath`, for installer/build-installer.sh on the Linux VPS. That script calls
+# `cygpath -w <path>` to hand ISCC.exe Windows paths; here the path goes through wine's `winepath -w`
+# (/opt/gage/build/win/bin -> Z:\opt\gage\build\win\bin). Only the two forms the script uses are supported;
+# anything else fails loudly instead of guessing.
+#
+#   cygpath -w <unix path>     Windows spelling
+#   cygpath -u <windows path>  Unix spelling
+set -euo pipefail
+SHIM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$SHIM_DIR/../lib/wine-env.sh"
+wine_env_init || { echo "cygpath shim: wine / winepath not installed (tools/deploy/bootstrap-vps.sh)" >&2; exit 127; }
+
+mode=${1:-}
+[ $# -eq 2 ] && { [ "$mode" = -w ] || [ "$mode" = -u ]; } || { echo "cygpath shim: only 'cygpath -w PATH' and 'cygpath -u PATH' exist (got: $*)" >&2; exit 2; }
+out=$("$WINEPATH_BIN" "$mode" "$2") || { echo "cygpath shim: winepath $mode '$2' failed" >&2; exit 1; }
+[ -n "$out" ] || { echo "cygpath shim: winepath returned nothing for '$2'" >&2; exit 1; }
+printf '%s\n' "${out%$'\r'}"

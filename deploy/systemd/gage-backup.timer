@@ -1,0 +1,14 @@
+# Nightly database backup. 23:30 UTC = 03:30 in Tbilisi (GMT+4): adjust to the quietest hour.
+# Persistent=true: a backup missed because the machine was off runs at the next boot.
+[Unit]
+Description=GAGE nightly database backup
+Documentation=file:///opt/gage/deploy/README.md
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 UTC
+RandomizedDelaySec=10min
+Persistent=true
+Unit=gage-backup.service
+
+[Install]
+WantedBy=timers.target

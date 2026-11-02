@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "totalBytes": 12479136,
+  "files": [
+    {
+      "path": "assets/stills/coins.webp",
+      "bytes": 108822,
+      "sha256": "cec7b24331333655c8daafc707dc1a569f0b7e651f844a2bc4e307a3a0dd70c8",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/downtown.webp",
+      "bytes": 151222,
+      "sha256": "f84699a79fceb4fe09e0fc5e907adc11744ff84f904c384ca7b80e7267f1f151",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/item.webp",
+      "bytes": 92100,
+      "sha256": "1faff1556eab9be6e44f1f77eff9c0ffb2b5eda84c40e1f87f67381858dbfd25",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/outfit.webp",
+      "bytes": 102142,
+      "sha256": "72277aabe93ae0ebb91afd0fa3fddd526e68960203351009c782a1015e68a366",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/settings.webp",
+      "bytes": 95688,
+      "sha256": "59e296704dc2501f61ba5617e082b6de8eda34d223b7969a85d1cf0b12e4a5b3",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/thumb/coins.webp",
+      "bytes": 25464,
+      "sha256": "b3c1a3dbaa7282767be7aad926e7faedaadc1488cdc58206ebb313913d34a7bb",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/thumb/item.webp",
+      "bytes": 27846,
+      "sha256": "1977000dc5233d5a6ef41abcd816636fe52cef377554c621162e4851bf3890d3",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/thumb/outfit.webp",
+      "bytes": 21116,
+      "sha256": "56359164bda8bdc7d9e25dbaba1297a2629e6dc913a6a07ba9b8e98314b3b36d",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/thumb/vehicle.webp",
+      "bytes": 17082,
+      "sha256": "bd7df38936a3d6f2d2f2d34aa18562374dd8175c257d8eee9d4c927ee6faed5c",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/thumb/vip.webp",
+      "bytes": 20870,
+      "sha256": "e1baa5b9480928140752ec086af664cf8c6e7eb79d100f2d0b06de959ddeec8b",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/vehicle.webp",
+      "bytes": 73860,
+      "sha256": "42888a6ba140e497d0bc4091cc9a9e6959852a6909eaf824e267aadc6d45d96b",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/stills/vip.webp",
+      "bytes": 63010,
+      "sha256": "1f170da986caef2cc46da72d49d3f1ee0d6015178db832673f8d86637aed027d",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/city.mp4",
+      "bytes": 3324769,
+      "sha256": "65c29a56c3c25e89923e8036ed9bb8e41381aa060a5d16f46ee9d462b97d49b9",
+      "type": "video/mp4"
+    },
+    {
+      "path": "assets/video/city.webp",
+      "bytes": 81826,
+      "sha256": "8197279bef27b9318d243f4875e6d87cccb467f34d825e7a21e3f8311a0b0daf",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/harbor.mp4",
+      "bytes": 956452,
+      "sha256": "9eb3164abbf3446405d83a53d9bb072b8f159daa05772a2ab9f842925967c4e6",
+      "type": "video/mp4"
+    },
+    {
+      "path": "assets/video/harbor.webp",
+      "bytes": 44604,
+      "sha256": "62e1bb7914e9700ce5ad2f59a3bec937159aa9c61b0aee7c8cdf576b41858d34",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/night.mp4",
+      "bytes": 3268674,
+      "sha256": "8320b7f731a61ecb44c36b426d4e990a9019c86625dc8315051deb8ad5f0ddde",
+      "type": "video/mp4"
+    },
+    {
+      "path": "assets/video/night.webp",
+      "bytes": 79570,
+      "sha256": "6b94e5747527ea8f817b0a053ca2ecce7404e225138d3f82e5419f9a7aa555c5",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/city.webp",
+      "bytes": 22590,
+      "sha256": "0b7398d978ad923688974cad16c95fe02996d079504f33f80aebf4bf100d2baf",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/harbor.webp",
+      "bytes": 13048,
+      "sha256": "837373fb25aa1a4d57431bc82f9fb7dc222a1c2b4be4925ed9cebd952061dea0",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/night.webp",
+      "bytes": 24880,
+      "sha256": "b3a22dca6bb9e307a7a3b087254362d8647cece997c23a7f9637ef1f768753a6",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/vinewood.webp",
+      "bytes": 16156,
+      "sha256": "ff48dae47966f207792997c5ee517ade8f84f6ffe7ab11ebc64fc8a8982e87a0",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/wild.webp",
+      "bytes": 12250,
+      "sha256": "a35ed14c5dbce64787f3404f8b88a5888f10560967513cb9bccc82466b2dcb41",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/vinewood.mp4",
+      "bytes": 2098396,
+      "sha256": "8f11d1c5a7cf16774f0de1fe599e43c9123ac68796f562d59cb54bfaf2400507",
+      "type": "video/mp4"
+    },
+    {
+      "path": "assets/video/vinewood.webp",
+      "bytes": 48010,
+      "sha256": "74ef7f459fdeddc594add54954affa13224713448da540df19c85b88d15febd7",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/wild.mp4",
+      "bytes": 1650327,
+      "sha256": "ce29be3f79c43f0929c52189aa2ef189e4b3f67249d92a28a2f676042a5d37da",
+      "type": "video/mp4"
+    },
+    {
+      "path": "assets/video/wild.webp",
+      "bytes": 38362,
+      "sha256": "aca19db892b2eadf6912e57888a7898a0dcc4048adc7465da5c34d19bdc17bc1",
+      "type": "image/webp"
+    }
+  ]
+}

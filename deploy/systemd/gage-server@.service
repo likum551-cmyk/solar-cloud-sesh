@@ -1,0 +1,73 @@
+# GAGE game server, one instance per config: gage-server@1, gage-server@2, gage-server@test ...
+#   config   /etc/gage/server-<instance>.json        (no secrets; see deploy/server-instances/)
+#   secrets  /etc/gage/server-<instance>.env          GAGE_ADMIN_TOKEN=... (mode 600, owner gage-server)
+#   data     /var/lib/gage/server-<instance>/         bans.json lives here (relative bansFile)
+# Install: sudo cp gage-server@.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Check:   systemd-analyze verify /etc/systemd/system/gage-server@.service
+#          systemd-analyze security gage-server@1
+[Unit]
+Description=GAGE game server (instance %i)
+Documentation=file:///opt/gage/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+# Assert, not Condition: a missing binary or config must fail the start loudly, not skip it silently.
+AssertPathExists=/opt/gage/server/current/gage-server
+AssertPathExists=/etc/gage/server-%i.json
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gage-server
+Group=gage-server
+WorkingDirectory=/var/lib/gage/server-%i
+EnvironmentFile=/etc/gage/server-%i.env
+ExecStart=/opt/gage/server/current/gage-server --config /etc/gage/server-%i.json
+Restart=on-failure
+RestartSec=3
+# SIGTERM = clean stop (clients get Disconnected(Shutdown), bans flushed). Exit codes 1 and 2 (config,
+# ban-list or bind failure; usage) will not fix themselves, so they are not restarted.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+RestartPreventExitStatus=1 2
+# With stdin at /dev/null the server reads EOF, keeps serving and takes no console commands.
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+# Resources
+MemoryMax=512M
+TasksMax=64
+CPUWeight=200
+
+# Sandbox
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gage/server-%i
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# A denied syscall returns EPERM instead of killing the process: a sandbox that is a little too tight
+# degrades instead of crash-looping. `journalctl -u gage-server@1` and strace show what was denied.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+# GAGE master server list (apps/master): game servers POST /announce, the launcher GETs /servers.
+# State is in memory: a restart empties the list and servers reappear within one heartbeat (30 s).
+# Run exactly ONE instance (caps and rate limits are per process).
+#   settings  /etc/gage/master.env   (mode 600, owner gage-master; example in README)
+# Install: sudo cp gage-master.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Check:   systemd-analyze verify /etc/systemd/system/gage-master.service
+#          systemd-analyze security gage-master
+[Unit]
+Description=GAGE master server list
+Documentation=file:///opt/gage/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=/opt/gage/master/current/dist/index.js
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gage-master
+Group=gage-master
+WorkingDirectory=/opt/gage/master/current
+EnvironmentFile=/etc/gage/master.env
+# V8's default heap limit follows machine RAM, not the cgroup: cap it below MemoryMax so the
+# garbage collector works before the kernel OOM-killer does.
+Environment=NODE_OPTIONS=--max-old-space-size=160
+ExecStart=/usr/bin/node /opt/gage/master/current/dist/index.js
+Restart=on-failure
+RestartSec=2
+# Exit 1 is both "invalid configuration" and "uncaught exception" (src/index.ts), so it must be
+# restarted; StartLimitBurst stops a configuration error from looping forever.
+# SIGTERM starts the graceful shutdown: SHUTDOWN_GRACE_SECONDS (10) plus margin.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+# Resources
+MemoryMax=256M
+TasksMax=128
+
+# Sandbox. The master has no files to write today; the data directory is listed for the
+# day a persistent store replaces the in-memory one.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gage/master
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# AF_INET/AF_INET6: listener on loopback, UDP probes to game servers.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+# V8 needs writable+executable memory (JIT): MemoryDenyWriteExecute stays off for Node.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,64 @@
+--- a/src/lstrlib.c
++++ b/src/lstrlib.c
+@@ -355,6 +355,30 @@
+ #define CAP_POSITION	(-2)
+ 
+ 
++/*
++** GAGE patch (third_party/lua/GAGE-PATCHES.md): a CPU budget for pattern
++** matching. The instruction-count hook cannot interrupt a C function, and
++** Lua patterns backtrack (".-.-.-b" on a long string is O(n^3)), so without
++** this a script could freeze the server inside string.find. Compiled in only
++** when GAGE_LUA_PATTERN_BUDGET is defined; without it this file behaves
++** exactly like upstream. The host arms 'gage_lua_pattern_steps_left' (declared
++** extern "C" in libs/scripting) before it runs script code; every step of
++** the matcher (one match() entry or loop turn) costs one unit, and an
++** exhausted budget raises a normal Lua error. Single-threaded by design.
++*/
++#if defined(GAGE_LUA_PATTERN_BUDGET)
++unsigned long gage_lua_pattern_steps_left = ~0UL;
++#define GAGE_CHARGE(ms) \
++  do { \
++    if (l_unlikely(gage_lua_pattern_steps_left == 0)) \
++      luaL_error((ms)->L, "pattern matching budget exceeded"); \
++    gage_lua_pattern_steps_left--; \
++  } while (0)
++#else
++#define GAGE_CHARGE(ms) ((void)0)
++#endif
++
++
+ typedef struct MatchState {
+   const char *src_init;  /* init of source string */
+   const char *src_end;  /* end ('\0') of source string */
+@@ -506,10 +530,13 @@
+ static const char *max_expand (MatchState *ms, const char *s,
+                                  const char *p, const char *ep) {
+   ptrdiff_t i = 0;  /* counts maximum expand for item */
+-  while (singlematch(ms, s + i, p, ep))
++  while (singlematch(ms, s + i, p, ep)) {
++    GAGE_CHARGE(ms);
+     i++;
++  }
+   /* keeps trying to match with the maximum repetitions */
+   while (i>=0) {
++    GAGE_CHARGE(ms);
+     const char *res = match(ms, (s+i), ep+1);
+     if (res) return res;
+     i--;  /* else didn't match; reduce 1 repetition to try again */
+@@ -521,6 +548,7 @@
+ static const char *min_expand (MatchState *ms, const char *s,
+                                  const char *p, const char *ep) {
+   for (;;) {
++    GAGE_CHARGE(ms);
+     const char *res = match(ms, s, ep+1);
+     if (res != NULL)
+       return res;
+@@ -571,6 +599,7 @@
+   if (l_unlikely(ms->matchdepth-- == 0))
+     luaL_error(ms->L, "pattern too complex");
+   init: /* using goto to optimize tail recursion */
++  GAGE_CHARGE(ms);
+   if (p != ms->p_end) {  /* end of pattern? */
+     switch (*p) {
+       case '(': {  /* start capture */

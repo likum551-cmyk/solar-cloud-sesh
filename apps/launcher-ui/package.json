@@ -1,0 +1,40 @@
+{
+  "name": "gage-mp-launcher-ui",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Solar Launcher desktop client UI (Solar RP). One self-contained index.html for the WebView2 host plus GTA V footage and stills served from https://app.gage/assets/.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/asset-manifest.mjs && tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "manifest": "node scripts/asset-manifest.mjs"
+  },
+  "dependencies": {
+    "@react-three/drei": "9.122.0",
+    "@react-three/fiber": "8.18.0",
+    "@react-three/postprocessing": "2.19.1",
+    "gsap": "3.15.0",
+    "lenis": "1.3.26",
+    "postprocessing": "6.36.7",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "three": "0.173.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@types/three": "0.173.0",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.3",
+    "vite": "6.4.4",
+    "vite-plugin-singlefile": "2.2.1",
+    "vitest": "3.2.7"
+  }
+}

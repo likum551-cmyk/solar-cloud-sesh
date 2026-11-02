@@ -1,0 +1,748 @@
+/* One grammar for every screen: the picture holds the window, the title block sits bottom left
+   on the scrim, and the right column carries the list or the opaque panel. */
+
+.play,
+.showroom,
+.profile,
+.settings,
+.auth {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--col);
+  gap: clamp(24px, 3vw, 56px);
+}
+.play,
+.profile,
+.settings,
+.auth {
+  height: 100%;
+  padding: 24px var(--gutter) var(--floor);
+}
+
+/* ---------- play ----------------------------------------------------------------------- */
+
+.play__hero { align-self: end; min-width: 0; }
+.hero { display: grid; gap: 18px; justify-items: start; }
+.hero__title {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 1.6vw, 24px);
+  min-width: 0;
+  max-width: 100%;
+}
+.hero__emblem { width: var(--emblem); }
+.hero__name {
+  min-width: 0;
+  font: 800 clamp(56px, 7.4vw, 104px)/0.86 var(--f-display);
+  letter-spacing: 0.005em;
+  text-transform: uppercase;
+  text-wrap: balance;
+  overflow-wrap: break-word;
+  text-shadow: 0 2px 28px rgb(0 0 0 / 0.4);
+}
+.hero__name--quiet { font-size: clamp(44px, 4.6vw, 68px); }
+.hero__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 8px;
+  font: 600 15px/1 var(--f-display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.hero__live { display: inline-flex; align-items: center; gap: 10px; color: var(--ink); }
+/* The live count is a display figure with its capacity under it: how full the server is, read
+   at a glance from across the room. */
+.count {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: end;
+  column-gap: 16px;
+  row-gap: 12px;
+  justify-content: start;
+  min-width: min(100%, 300px);
+}
+.count__n {
+  font: 800 clamp(48px, 4.6vw, 64px)/0.82 var(--f-display);
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+.count__side {
+  display: grid;
+  gap: 6px;
+  padding-bottom: 2px;
+  font: 600 14px/1 var(--f-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.count__label { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); }
+.count__max { color: var(--ink-3); }
+.count__bar { position: relative; grid-column: 1 / -1; height: 3px; background: rgb(255 244 224 / 0.16); }
+.count__bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  transform: scaleX(var(--fill, 0));
+  transform-origin: left;
+  transition: transform 600ms var(--ease-out);
+}
+.hero__fact { margin-left: 14px; padding-left: 14px; box-shadow: inset 1px 0 0 var(--line-2); }
+.hero__meta > :first-child { margin-left: 0; padding-left: 0; box-shadow: none; }
+.hero__meta .chip { margin-left: 14px; }
+.hero__action { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 24px; margin-top: 8px; }
+/* Whole pixels so the chamfer and its focus ring stay crisp; the first line is the fallback where
+   round() does not parse. */
+.play-plate.plate--xl { min-width: clamp(240px, 21vw, 300px); min-width: round(clamp(240px, 21vw, 300px), 1px); }
+.play-plate--setup.plate--xl { --fs: 24px; letter-spacing: 0.08em; }
+.hero__why { max-width: 36ch; font-size: 14px; color: var(--ink-2); }
+.hero__why:empty { display: none; }
+.hero__stale { font-size: 13px; color: var(--warn); }
+.hero__body { max-width: 48ch; font-size: 16px; color: var(--ink-2); }
+
+/* ---------- the right column: server and product cards ---------------------------------- */
+
+.servers,
+.products {
+  align-self: end;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  max-height: 100%;
+}
+.servers__head { display: flex; align-items: center; gap: 10px; padding: 0 2px; }
+/* Over the footage: full ink and a soft dark halo, so the label holds on bright haze too. */
+.servers__title {
+  font: 700 14px/1 var(--f-display);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-shadow: 0 1px 10px rgb(0 0 0 / 0.75);
+}
+.servers__count { font: 700 14px/1 var(--f-display); color: var(--ink-2); text-shadow: 0 1px 10px rgb(0 0 0 / 0.75); }
+.servers__head .chip { margin-left: auto; }
+.servers__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* A card is a GTA V screenshot, darkened on the left where the name sits. */
+.scard {
+  position: relative;
+  flex: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 12px;
+  height: var(--card-h);
+  padding: 12px 12px 14px 16px;
+  border: 0;
+  background: var(--panel);
+  color: var(--ink);
+  text-align: left;
+  overflow: hidden;
+  isolation: isolate;
+}
+.scard__img {
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  object-fit: cover;
+  filter: saturate(0.92) brightness(0.88);
+  transition: filter 300ms, transform 700ms var(--ease-out);
+}
+.scard::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(90deg, rgb(16 14 11 / 0.9) 0, rgb(16 14 11 / 0.62) 42%, rgb(16 14 11 / 0) 100%);
+}
+.scard::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  box-shadow: inset 0 0 0 1px var(--line-soft);
+  pointer-events: none;
+  transition: box-shadow 200ms;
+}
+.scard:hover .scard__img { filter: saturate(1) brightness(1); transform: scale(1.035); }
+.scard:hover::after { box-shadow: inset 0 0 0 1px var(--line-2); }
+.scard.is-chosen .scard__img { filter: saturate(1) brightness(1); }
+.scard.is-chosen::after { box-shadow: inset 0 0 0 2px var(--sun); }
+/* Focus lands on the chosen card (roving tabindex), inside its 2px gold frame: an ink ring, as on
+   the primary plate, because a gold ring on gold does not show. Server and product cards alike. */
+.scard:focus-visible { outline-color: var(--ink); outline-offset: -4px; }
+.scard__body { display: grid; gap: 6px; min-width: 0; }
+.scard__name {
+  font: 800 22px/0.95 var(--f-display);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.scard__meta {
+  font: 600 12px/1 var(--f-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.scard__state,
+.scard__price {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  background: rgb(10 9 7 / 0.8);
+  font: 700 13px/1 var(--f-display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.scard__count { font-size: 16px; color: var(--ink); }
+.scard__count span { font-size: 13px; color: var(--ink-3); }
+.scard__price { font-size: 18px; font-weight: 800; color: var(--ink); letter-spacing: 0.04em; }
+/* Above the card's frame (::after), so the chosen card's 2px border never paints over the bar. */
+.scard__bar { position: absolute; z-index: 1; left: 0; right: 0; bottom: 0; height: 3px; background: rgb(255 244 224 / 0.1); }
+.scard__bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ink-3);
+  transform: scaleX(var(--fill, 0));
+  transform-origin: left;
+  transition: transform 600ms var(--ease-out);
+}
+/* Inside the gold frame, in ink: a gold bar on the gold border read as a thicker border. */
+.scard.is-chosen .scard__bar { left: 2px; right: 2px; bottom: 2px; }
+/* the focus ring takes the 2-4px band, so the bar steps inside it instead of merging into it */
+.scard.is-chosen:focus-visible .scard__bar { left: 4px; right: 4px; bottom: 4px; }
+.scard.is-chosen .scard__bar::after { background: var(--ink); }
+.scard.is-out .scard__img { filter: grayscale(1) brightness(0.42); }
+.scard.is-out .scard__name { color: var(--ink-2); }
+
+/* ---------- shop ----------------------------------------------------------------------- */
+
+.shop {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 16px;
+  padding: 14px var(--gutter) var(--floor);
+}
+/* min-height = the wallet's height, so Orders and Owned (no wallet) do not lift the page 3px */
+.shop__bar { display: flex; align-items: center; gap: 24px; min-width: 0; min-height: 36px; }
+.subnav { display: flex; }
+.subnav__item {
+  position: relative;
+  padding: 8px 12px 10px;
+  border: 0;
+  background: none;
+  font: 700 15px/1 var(--f-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  text-shadow: 0 1px 10px rgb(0 0 0 / 0.7);
+  transition: color 160ms;
+}
+.subnav__item:first-child { padding-left: 0; }
+.subnav__item:hover { color: var(--ink); }
+.subnav__item.is-active { color: var(--ink); }
+.subnav__item.is-active::after {
+  content: '';
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 0;
+  height: 2px;
+  background: var(--ink);
+}
+.subnav__item.is-active:first-child::after { left: 0; }
+.wallet {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  padding: 7px 14px;
+  background: rgb(10 9 7 / 0.8);
+}
+.wallet__label {
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.wallet__bal { display: inline-flex; align-items: baseline; gap: 6px; }
+.wallet__n { font: 800 20px/1 var(--f-display); color: var(--ink); }
+
+.showroom { min-height: 0; }
+.shop__plate { align-self: end; min-width: 0; }
+.nameplate { display: grid; gap: 14px; justify-items: start; max-width: 640px; }
+.nameplate__name {
+  font: 800 clamp(52px, 5.8vw, 88px)/0.88 var(--f-display);
+  letter-spacing: 0.005em;
+  text-transform: uppercase;
+  text-wrap: balance;
+  text-shadow: 0 2px 28px rgb(0 0 0 / 0.4);
+}
+.nameplate__name--quiet { display: flex; align-items: center; gap: 14px; font-size: clamp(40px, 4.2vw, 60px); }
+.nameplate__line { max-width: 46ch; font-size: 16px; color: var(--ink-2); }
+.nameplate__price { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.price { margin-right: 6px; font: 800 40px/1 var(--f-display); letter-spacing: 0.02em; }
+.buy-plate { min-width: 240px; }
+.nameplate__fine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 54ch;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+.checkout-wait {
+  display: grid;
+  gap: 10px;
+  max-width: 520px;
+  padding: 14px 16px;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.checkout-wait strong { color: var(--ink); }
+.checkout-wait__row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+
+/* Orders and Owned: one full-height page. The summary (wallet, VIP, spend) stands as a tall
+   left column and the record fills the rest, so the window holds the account, not a ghosted
+   still under a short table. */
+.ledger {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: var(--col) minmax(0, 1fr);
+  align-items: stretch;
+  gap: 16px;
+}
+.ledger > .panel { min-height: 0; max-height: 100%; }
+.ledger > .record--empty { max-width: none; align-content: start; }
+.record { min-height: 0; display: flex; flex-direction: column; }
+.record:not(.record--empty) { padding-bottom: 6px; }
+.record__head,
+.record__row {
+  display: grid;
+  grid-template-columns: 104px 92px minmax(0, 1fr) 100px 210px;
+  gap: 14px;
+  align-items: center;
+  padding: 0 22px;
+}
+.record__head {
+  padding-bottom: 10px;
+  box-shadow: inset 0 -1px 0 var(--line);
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.record__rows { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+.record__row { padding-top: 14px; padding-bottom: 14px; box-shadow: inset 0 -1px 0 var(--line-soft); }
+.record__date { font: 600 14px/1 var(--f-display); letter-spacing: 0.06em; color: var(--ink-2); }
+.record__item { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.record__total { font: 700 17px/1 var(--f-display); letter-spacing: 0.02em; }
+.record__stamp { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.record__why { flex-basis: 100%; font-size: 12px; color: var(--ink-3); }
+.record--empty { align-self: start; display: grid; gap: 12px; justify-items: start; max-width: 560px; padding: 28px; }
+.record__title { font: 800 34px/1 var(--f-display); text-transform: uppercase; }
+.record__body { color: var(--ink-2); }
+
+.summary { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.summary__block { display: grid; gap: 8px; padding: 20px 22px; box-shadow: inset 0 -1px 0 var(--line-soft); }
+.summary__block:last-child { box-shadow: none; }
+.summary__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.summary__count { display: flex; align-items: baseline; gap: 8px; }
+.summary__n { font: 800 44px/1 var(--f-display); }
+.summary__money { font: 800 36px/1 var(--f-display); letter-spacing: 0.02em; }
+.summary__dim { font-size: 14px; color: var(--ink-3); }
+.summary__fine { font-size: 13px; color: var(--ink-3); }
+.summary .vip { padding: 0; }
+
+/* A shelf of large tiles; the slot after the last item points back to the showroom. */
+.owned-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  align-content: start;
+  gap: 14px;
+  padding: 0 22px 22px;
+}
+.owned { min-width: 0; display: grid; grid-template-rows: auto 1fr; background: var(--panel-2); }
+.owned--more {
+  grid-template-rows: none;
+  align-content: center;
+  justify-items: start;
+  gap: 12px;
+  padding: 24px;
+  background: none;
+  box-shadow: inset 0 0 0 1px var(--line-2);
+}
+.owned__line { font-size: 14px; color: var(--ink-2); }
+.owned__img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
+.owned__body { display: grid; gap: 6px; padding: 12px 14px 14px; }
+.owned__kind {
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.owned__name { font: 800 22px/1 var(--f-display); text-transform: uppercase; }
+.owned__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+
+/* ---------- profile -------------------------------------------------------------------- */
+
+.profile { grid-template-columns: minmax(0, 1fr) min(420px, 40vw); }
+.profile__plate { align-self: end; display: grid; gap: 16px; justify-items: start; min-width: 0; }
+.profile__name {
+  max-width: 100%;
+  font: 800 clamp(64px, 8vw, 120px)/0.84 var(--f-display);
+  text-transform: uppercase;
+  overflow-wrap: break-word;
+  text-shadow: 0 2px 28px rgb(0 0 0 / 0.4);
+}
+.profile__roles { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.profile__since {
+  margin-left: 6px;
+  font: 600 13px/1 var(--f-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.profile__panel { align-self: end; max-height: 100%; overflow-y: auto; padding: 6px 24px 24px; }
+.facts { margin: 0; display: grid; }
+.facts__row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 16px;
+  align-items: baseline;
+  padding: 16px 0;
+  box-shadow: inset 0 -1px 0 var(--line-soft);
+}
+.facts dt {
+  font: 700 12px/1.3 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.facts dd { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; overflow-wrap: anywhere; }
+.facts__count { display: inline-flex; align-items: baseline; gap: 6px; }
+.facts__n { font: 800 26px/1 var(--f-display); }
+.facts__paste { flex-basis: 100%; display: grid; gap: 10px; margin-top: 6px; }
+.facts__paste-actions { display: flex; align-items: center; gap: 14px; }
+.profile__msg { margin-top: 14px; padding: 10px 14px; background: var(--panel-2); font-size: 14px; color: var(--ink-2); }
+
+.vip { display: grid; gap: 10px; padding-top: 18px; }
+.vip__label {
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.vip__head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; }
+.vip__head > :last-child { margin-left: auto; }
+.vip__left { font: 600 14px/1 var(--f-display); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); }
+.vip__n { font-size: 26px; font-weight: 800; color: var(--ink); }
+.vip__bar { display: grid; grid-template-columns: repeat(var(--ticks), minmax(0, 1fr)); gap: 1px; height: 8px; }
+.vip__tick--off { background: rgb(255 244 224 / 0.12); }
+.vip__tick--on { background: var(--ink); }
+.vip__tick--part { background: rgb(247 242 232 / 0.5); }
+.vip__scale { display: flex; justify-content: space-between; }
+
+/* ---------- settings ------------------------------------------------------------------- */
+
+.settings { grid-template-columns: minmax(0, 1fr) min(600px, 52vw); }
+.settings__side { align-self: end; display: grid; gap: 22px; justify-items: start; }
+.settings__title {
+  font: 800 clamp(64px, 7.4vw, 112px)/0.84 var(--f-display);
+  text-transform: uppercase;
+  text-shadow: 0 2px 28px rgb(0 0 0 / 0.4);
+}
+.settings__index { display: grid; gap: 2px; }
+.settings__jump {
+  position: relative;
+  padding: 8px 0 8px 18px;
+  border: 0;
+  background: none;
+  font: 700 17px/1 var(--f-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-align: left;
+  color: var(--ink-3);
+  transition: color 160ms;
+}
+.settings__jump::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 12px;
+  height: 2px;
+  background: currentColor;
+  transform: scaleX(0.5);
+  transform-origin: left center;
+  transition: transform 200ms var(--ease-out);
+}
+.settings__jump:hover { color: var(--ink); }
+.settings__jump.is-current { color: var(--ink); }
+.settings__jump.is-current::before { transform: none; }
+.settings__panel {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--panel);
+  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+}
+/* Content scrolling under the panel's top edge fades out instead of being cut. A pinned veil in
+   the panel's own colour, not a mask, so the panel itself keeps its hard edge and chamfer. */
+.settings__panel::before {
+  content: '';
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: block;
+  height: 26px;
+  margin-bottom: -26px;
+  background: linear-gradient(to bottom, var(--panel), rgb(16 14 11 / 0));
+  pointer-events: none;
+}
+/* The same veil at the bottom edge, so content leaving the panel fades instead of being sliced.
+   Both veils hide themselves at the ends: at rest each sits over the inner padding (top 4 + 24px
+   frame padding, bottom 28px), which is at least their 26px. */
+.settings__panel::after {
+  content: '';
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: block;
+  height: 26px;
+  margin-top: -26px;
+  background: linear-gradient(to top, var(--panel), rgb(16 14 11 / 0));
+  pointer-events: none;
+}
+.settings__inner { display: grid; padding: 4px 28px 28px; }
+.sframe { display: grid; gap: 14px; padding: 24px 0; box-shadow: inset 0 -1px 0 var(--line); }
+/* A lone plate in a frame keeps its own width instead of stretching across the grid. */
+.sframe > .plate { justify-self: start; }
+/* A quiet plate at the end of a row sets its label, not its hover wash, on the column edge. */
+.sframe__row > .plate--quiet:last-child,
+.device > .plate--quiet { margin-right: 0; }
+.sframe > .plate--quiet.plate--sm { margin-left: -12px; }
+.sframe--exit { box-shadow: none; }
+.sframe__head h2 { font: 800 26px/1 var(--f-display); letter-spacing: 0.02em; text-transform: uppercase; }
+.sframe__row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; }
+.sframe__note { font-size: 13px; color: var(--ink-2); }
+.path { flex: 1; display: grid; gap: 6px; min-width: 0; }
+.path__value { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; overflow-wrap: anywhere; }
+.path__value.is-empty { color: var(--warn); }
+.pw { display: grid; gap: 14px; max-width: 420px; }
+.pw__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
+.devices { display: grid; margin: 0; padding: 0; list-style: none; }
+.device { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 0; box-shadow: inset 0 -1px 0 var(--line-soft); }
+.device__main { display: grid; gap: 4px; min-width: 0; }
+.device__name { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.device__meta { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.exit, .exit__confirm { display: grid; gap: 12px; }
+.exit__row { display: flex; flex-wrap: wrap; gap: 12px; }
+.exit__confirm p { font-size: 14px; color: var(--ink-2); }
+.settings__foot { max-width: 64ch; padding-top: 14px; font-size: 12px; color: var(--ink-3); }
+
+/* ---------- auth ----------------------------------------------------------------------- */
+
+.auth { grid-template-columns: minmax(0, 1fr) min(420px, 42vw); align-items: end; }
+.auth__intro { display: flex; align-items: center; gap: clamp(16px, 1.8vw, 26px); min-width: 0; }
+.auth__emblem { width: clamp(96px, 9vw, 128px); }
+.auth__brand { display: grid; gap: 14px; justify-items: start; min-width: 0; }
+.auth__brand .lockup { filter: drop-shadow(0 2px 18px rgb(0 0 0 / 0.45)); }
+.auth__tagline {
+  font: 600 clamp(16px, 1.4vw, 20px)/1.2 var(--f-display);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.auth__panel {
+  align-self: center;
+  display: grid;
+  gap: 18px;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 26px 28px 24px;
+  background: var(--panel);
+  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+}
+.auth__title { font: 800 40px/0.95 var(--f-display); letter-spacing: 0.01em; text-transform: uppercase; }
+.auth__body { display: grid; gap: 16px; }
+.auth__form { display: grid; gap: 14px; }
+.auth__submit, .auth__discord, .auth__demo { width: 100%; }
+.auth__demo .chip { margin-left: 4px; }
+.auth__lead { font-size: 15px; color: var(--ink-2); }
+.auth__lead strong { color: var(--ink); }
+.auth__note { font-size: 13px; color: var(--ink-3); }
+.auth__notice { padding: 10px 12px; background: var(--panel-2); font-size: 14px; color: var(--ink-2); }
+.auth__error { font-size: 14px; }
+.auth__or {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.auth__or::before, .auth__or::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.auth__links { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; }
+.auth__link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  font-size: 14px;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-decoration-color: var(--line-2);
+  text-underline-offset: 4px;
+}
+.auth__link:hover { color: var(--ink); text-decoration-color: currentColor; }
+.auth__retry { justify-self: start; }
+.auth__waiting { display: flex; align-items: center; gap: 12px; color: var(--ink-2); }
+.auth__pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--ink-2); animation: pulse 1.4s var(--ease-in-out) infinite; }
+@keyframes pulse { 50% { opacity: 0.25; } }
+
+/* ---------- launch --------------------------------------------------------------------- */
+
+/* The launch covers the whole window, under the see-through rail too, so its grade and the failed
+   state's grey run to the top edge with no seam; the rail stays above it (--z-rail). */
+.launch {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-launch);
+  display: flex;
+  align-items: flex-end;
+  padding: calc(var(--rail-h) + 24px) var(--gutter) var(--floor-launch);
+  overflow: hidden;
+  animation: launch-in 520ms var(--ease-out) both;
+}
+@keyframes launch-in { from { opacity: 0; } to { opacity: 1; } }
+/* The launch is set over the same shot, still playing: one gradient from the left corner holds
+   the type and the rest of the frame stays footage. A failed launch takes the colour out. */
+.launch::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background:
+    linear-gradient(90deg, rgb(10 9 7 / 0.78) 0, rgb(10 9 7 / 0.42) 38%, rgb(10 9 7 / 0) 70%),
+    linear-gradient(0deg, rgb(10 9 7 / 0.7) 0, rgb(10 9 7 / 0) 50%);
+}
+.launch--failed { backdrop-filter: grayscale(1) brightness(0.6); }
+.launch__inner { position: relative; z-index: 2; display: grid; gap: 18px; width: min(820px, 100%); }
+.launch__meta { display: flex; align-items: center; gap: 14px; }
+.launch__title { display: flex; align-items: center; gap: clamp(14px, 1.6vw, 24px); min-width: 0; }
+/* The emblem is drawn above the launch layer (its slot sits in this row). */
+.app.is-covered .emblem-layer { z-index: calc(var(--z-launch) + 1); }
+.launch__name {
+  font: 800 clamp(56px, 7.4vw, 104px)/0.86 var(--f-display);
+  text-transform: uppercase;
+  text-wrap: balance;
+}
+/* Five named segments, one per step: done ones solid, the current one filling gold, the rest a
+   hairline. */
+.launch__rail { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin: 4px 0 0; padding: 0; list-style: none; }
+.launch__rail li { display: grid; gap: 8px; min-width: 0; }
+.launch__seg { position: relative; height: 4px; background: rgb(255 244 224 / 0.18); overflow: hidden; }
+.launch__segname {
+  font: 700 12px/1 var(--f-display);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.launch__rail li.is-done .launch__segname, .launch__rail li.is-now .launch__segname { color: var(--ink); }
+.launch__seg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 500ms var(--ease-out);
+}
+.launch__rail li.is-done .launch__seg::after { transform: none; }
+.launch__rail li.is-now .launch__seg::after { background: var(--sun); animation: rail-fill 2.4s var(--ease-in-out) infinite; }
+@keyframes rail-fill { 0% { transform: scaleX(0); opacity: 1; } 70% { transform: scaleX(1); } 88% { opacity: 1; } 100% { transform: scaleX(1); opacity: 0; } }
+/* The current step is the launch's headline, at display size in the names' face. */
+.launch__step {
+  font: 800 clamp(40px, 4.4vw, 60px)/0.92 var(--f-display);
+  letter-spacing: 0.005em;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-wrap: balance;
+}
+.launch__status { font-size: 16px; color: var(--ink-2); }
+.launch__lead { max-width: 52ch; font-size: 18px; color: var(--ink-2); }
+.launch__lead strong { color: var(--ink); }
+.launch__fine { max-width: 60ch; font-size: 13px; color: var(--ink-3); }
+.launch__actions { display: flex; flex-wrap: wrap; gap: 12px; }
+/* "Back" alone: its label lines up with the lead above, not its padding. */
+.launch__actions > .plate--quiet:first-child { margin-left: -18px; }
+
+/* ---------- narrow and short windows ---------------------------------------------------- */
+
+@media (max-width: 1180px) {
+  .rail__user { display: none; }
+  /* Beside the summary, a narrow ledger drops the order id so the item stays legible. */
+  .record__head, .record__row { grid-template-columns: 92px minmax(0, 1fr) 88px 172px; padding: 0 18px; }
+  .record__head > :nth-child(2), .record__row > :nth-child(2) { display: none; }
+  .record__head { padding-bottom: 10px; }
+  .record__row { padding-top: 12px; padding-bottom: 12px; }
+  .summary__block { padding: 16px 18px; }
+  .summary__n { font-size: 38px; }
+  .summary__money { font-size: 32px; }
+}
+/* Forced colours (see the block at the end of ui.css): the chosen card's frame is a box-shadow,
+   which forced colours drop, so it is repainted in Highlight; focus is a system outline. */
+@media (forced-colors: active) {
+  .scard.is-chosen::after { forced-color-adjust: none; box-shadow: inset 0 0 0 2px Highlight; }
+  .scard:focus-visible { outline: 2px solid CanvasText; outline-offset: -5px; }
+  /* quiet plates gain a system border here, so the label-on-the-edge outdent would push it past
+     the column */
+  .sframe__row > .plate--quiet:last-child,
+  .device > .plate--quiet,
+  .sframe > .plate--quiet.plate--sm,
+  .launch__actions > .plate--quiet:first-child { margin-left: 0; margin-right: 0; }
+}
+
+@media (max-height: 760px) {
+  .hero, .nameplate { gap: 14px; }
+  .auth__panel { gap: 14px; padding: 20px 24px; }
+  .auth__title { font-size: 34px; }
+  .auth__body, .auth__form { gap: 12px; }
+}

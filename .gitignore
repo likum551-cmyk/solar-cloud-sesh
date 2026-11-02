@@ -1,0 +1,30 @@
+# Mirrors tools/deploy/pack-source.sh: what never leaves the PC.
+
+# build output, logs, archives
+/build/
+/logs/
+*.log
+*.tgz
+*.tar.gz
+
+# toolchains: only the portable Inno Setup is source (the VPS builds the installer with it under wine)
+/.toolchain/*
+!/.toolchain/innosetup-6.7.3/
+
+# secrets (the signing key lives outside the repo; these are defence in depth)
+.env*
+!.env.example
+*.pem
+*.key
+update-signing-key*
+.gage-keys/
+
+# untrusted or personal data: friend game dump, live-test logs
+/enhanced EXE/
+/gage testing/
+
+# local tool state
+node_modules/
+/.claude/settings.local.json
+.DS_Store
+Thumbs.db

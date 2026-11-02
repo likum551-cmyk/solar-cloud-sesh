@@ -1,0 +1,41 @@
+# One health-check pass; started every minute by gage-healthcheck.timer.
+# Alerts go to the webhook in /etc/gage/healthcheck.env (GAGE_ALERT_WEBHOOK_URL, mode 600 root:root;
+# systemd reads it as root, the script itself runs as an unprivileged dynamic user).
+# The unit shows "failed" in `systemctl --failed` while any check fails: that is intended.
+[Unit]
+Description=GAGE health check
+Documentation=file:///opt/gage/deploy/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=gage-healthcheck
+EnvironmentFile=-/etc/gage/healthcheck.env
+ExecStart=/usr/bin/bash /opt/gage/deploy/scripts/healthcheck.sh
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+MemoryMax=128M
+TasksMax=64
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077

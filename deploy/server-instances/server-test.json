@@ -1,0 +1,16 @@
+{
+  "name": "GAGE Test Server",
+  "port": 24801,
+  "maxPlayers": 16,
+  "tickHz": 30,
+  "masterUrl": "",
+  "heartbeatSeconds": 30,
+  "gamemode": "freeroam",
+  "lang": "en",
+  "url": "",
+  "maxConnectionsPerIp": 8,
+  "chatBurst": 5,
+  "chatWindowSeconds": 5,
+  "bansFile": "bans.json",
+  "adminPort": 24901
+}

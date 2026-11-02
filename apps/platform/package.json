@@ -1,0 +1,40 @@
+{
+  "name": "gage-mp-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GAGE-MP platform API: accounts, login, join tokens, official server list, shop, settings.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file-if-exists=.env dist/src/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx --env-file-if-exists=.env scripts/migrate.ts",
+    "admin:grant-role": "tsx --env-file-if-exists=.env scripts/grant-role.ts",
+    "admin:create-server": "tsx --env-file-if-exists=.env scripts/create-server.ts",
+    "docs:reference": "tsx scripts/gen-reference.ts",
+    "docs:check": "tsx scripts/check-docs.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.5",
+    "@node-rs/argon2": "2.2.2",
+    "drizzle-orm": "0.45.4",
+    "hono": "4.13.14",
+    "pg": "8.23.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.13",
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "drizzle-kit": "0.31.11",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}

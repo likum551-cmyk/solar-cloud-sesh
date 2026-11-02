@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "flat-type-hierarchy",
+        "value": "*",
+        "files": [
+          "apps/website/index.html"
+        ],
+        "createdAt": "2026-11-01T21:35:24.495Z",
+        "reason": "Claude: detector cannot resolve clamp() sizes and reads every role as 16px; rendered captures show h1 clamp(52px,6.6vw,104px) and card titles up to 176px over 17-19px body"
+      }
+    ]
+  }
+}

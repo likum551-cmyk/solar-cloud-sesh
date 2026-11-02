@@ -1,0 +1,114 @@
+/* Solar RP launcher tokens (NOON palette). A window onto Los Santos: GTA V footage full-bleed, type and panels in a
+   warm night ink so the picture carries the colour. Solar gold is spent on six things only:
+   PLAY (also busy), a form's one submit (sign in, BUY), the chosen card, the current tab bar,
+   the running launch segment and focus. Green is the online dot, nothing else. */
+
+@font-face {
+  font-family: 'Sofia Sans';
+  src: url('../fonts/sofia-sans-latin.woff2') format('woff2');
+  font-weight: 300 900;
+  font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Sofia Sans';
+  src: url('../fonts/sofia-sans-cyrillic.woff2') format('woff2');
+  font-weight: 300 900;
+  font-display: block;
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: 'Sofia Sans Extra Condensed';
+  src: url('../fonts/sofia-sans-xc-latin.woff2') format('woff2');
+  font-weight: 400 900;
+  font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Sofia Sans Extra Condensed';
+  src: url('../fonts/sofia-sans-xc-cyrillic.woff2') format('woff2');
+  font-weight: 400 900;
+  font-display: block;
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
+:root {
+  /* ground and panels: opaque, never glass; a warm black, the shade side of a sunlit wall */
+  --ground: #0a0907;
+  --panel: #100e0b;
+  --panel-2: #17140f;
+  --panel-3: #201c16;
+
+  /* ink: every step >= 4.5:1 on --panel (ink-4 is for disabled and decoration only) */
+  --ink: #f7f2e8;
+  --ink-2: #d9d1c3;
+  --ink-3: #b3aa9a;
+  --ink-4: #7a7266;
+
+  /* hairlines, warm white */
+  --line: rgb(255 244 224 / 0.12);
+  --line-2: rgb(255 244 224 / 0.2);
+  --line-soft: rgb(255 244 224 / 0.07);
+
+  /* Solar gold, the six uses in the header. Text on it is --on-sun (dark): gold is a light
+     fill, 9.8:1 against --on-sun, 1.8:1 against white. */
+  --sun: #f2b134;
+  --sun-hi: #ffc75a;
+  --sun-lo: #c98d16;
+  --on-sun: #1a1206;
+
+  /* state: warn is ember (not gold) so a warning never reads as an action */
+  --live: #4cc67f;
+  --warn: #ff8a3d;
+  --danger: #f05a4f;
+
+  /* type */
+  --f-display: 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif;
+  --f-read: 'Sofia Sans', 'Segoe UI', sans-serif;
+
+  /* the mark's 45-degree chamfer, in px, for clip-path plates and panels */
+  --cut: 14px;
+  --cut-s: 8px;
+
+  /* rhythm */
+  --rail-h: 60px;
+  /* the rail's GAGE-MP lockup: its letters stand as tall as the section names beside it */
+  --lockup-h: clamp(22px, 1.85vw, 26px);
+  --gutter: clamp(24px, 2.8vw, 44px);
+  --col: clamp(288px, 24vw, 344px);
+  --emblem: clamp(88px, 9vw, 120px);
+  /* the bottom padding the title block and the right column stand on */
+  --floor: clamp(24px, 4.4vh, 44px);
+  --floor-launch: clamp(28px, 6vh, 64px);
+  /* server and product card height */
+  --card-h: clamp(76px, 10.4vh, 94px);
+
+  /* stacking */
+  --z-backdrop: 0;
+  --z-scrim: 1;
+  --z-screen: 2;
+  --z-emblem: 3;
+  --z-launch: 5;
+  /* above the whole launch stack (the covered emblem is z-launch + 1): the rail keeps painting
+     and taking clicks over a launch that now runs to the window's top edge */
+  --z-rail: 7;
+  --z-boot: 9;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+/* The fluid steps land on whole pixels (4.4vh of an 800px window is 35.2px), so plate edges,
+   card frames and the focus rings drawn on them stay crisp. Guarded: a custom property holding
+   an unsupported round() would only fail at use time and zero the padding it feeds. */
+@supports (width: round(1.5px, 1px)) {
+  :root {
+    --gutter: round(clamp(24px, 2.8vw, 44px), 1px);
+    --col: round(clamp(288px, 24vw, 344px), 1px);
+    --emblem: round(clamp(88px, 9vw, 120px), 1px);
+    --floor: round(clamp(24px, 4.4vh, 44px), 1px);
+    --floor-launch: round(clamp(28px, 6vh, 64px), 1px);
+    --card-h: round(clamp(76px, 10.4vh, 94px), 1px);
+    --lockup-h: round(clamp(22px, 1.85vw, 26px), 1px);
+  }
+}

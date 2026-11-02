@@ -1,0 +1,11 @@
+{
+  "name": "welcome",
+  "version": "1.0.0",
+  "description": "Greets players, counts their visits, and adds /me and an admin-only /tp.",
+  "author": "GAGE-MP",
+  "server_scripts": ["main.lua"],
+  "config": {
+    "welcome": "Welcome to the server, {name}! Type /me <action> to emote.",
+    "announceJoins": true
+  }
+}

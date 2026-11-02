@@ -1,0 +1,3 @@
+# The kit runs on Linux: scripts, unit files, the Caddyfile and JSON must never be checked out with CRLF
+# (a CR in a #! line or an `exit` makes bash and systemd fail in confusing ways).
+* text eol=lf

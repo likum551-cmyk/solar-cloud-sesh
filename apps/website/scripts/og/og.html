@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>og</title>
+<!-- The 1200x630 share card (public/og.png). Rendered by scripts/render-og.mjs from the repo root,
+     so paths are root-relative. Same world as the hero: the city still, the NOON ground scrim from
+     the left, the horizontal lockup, the hero line in Sofia Sans Extra Condensed. -->
+<style>
+  @font-face { font-family: 'XC'; src: url('/apps/website/src/fonts/sofia-sans-xc-latin.woff2') format('woff2'); font-weight: 400 900; }
+  @font-face { font-family: 'Sofia'; src: url('/apps/website/src/fonts/sofia-sans-latin.woff2') format('woff2'); font-weight: 300 900; }
+  html, body { margin: 0; background: #0a0907; }
+  .card { position: relative; width: 1200px; height: 630px; overflow: hidden; background: #0a0907 url('/apps/website/public/media/city.webp') 62% 40% / cover no-repeat; }
+  .card::before { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, rgb(10 9 7 / 0.92) 0%, rgb(10 9 7 / 0.78) 38%, rgb(10 9 7 / 0.18) 72%, rgb(10 9 7 / 0) 100%); }
+  .card::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 160px; background: linear-gradient(0deg, rgb(10 9 7 / 0.7), rgb(10 9 7 / 0)); }
+  .lockup { position: absolute; z-index: 2; left: 72px; top: 68px; height: 46px; width: auto; }
+  h1 { position: absolute; z-index: 2; left: 72px; bottom: 150px; margin: 0; color: #f7f2e8; font: 800 112px/0.86 'XC', sans-serif; text-transform: uppercase; letter-spacing: 0.002em; text-shadow: 0 2px 30px rgb(0 0 0 / 0.45); }
+  h1 span { display: block; }
+  p { position: absolute; z-index: 2; left: 72px; bottom: 82px; margin: 0; color: #d9d1c3; font: 500 26px/1.2 'Sofia', sans-serif; }
+  .rule { position: absolute; z-index: 2; left: 72px; bottom: 132px; width: 64px; height: 4px; background: #f2b134; }
+  .url { position: absolute; z-index: 2; right: 64px; bottom: 82px; color: #b3aa9a; font: 700 22px/1.2 'XC', sans-serif; letter-spacing: 0.14em; text-transform: uppercase; }
+</style>
+<div class="card">
+  <img class="lockup" src="/brand/solar/solar-rp-noon/solar-rp-horizontal-noon-full.svg" alt="" />
+  <h1><span>Los Santos.</span><span>Our servers.</span></h1>
+  <div class="rule"></div>
+  <p>GTA V roleplay on our own network.</p>
+  <div class="url">solar-rp.com</div>
+</div>

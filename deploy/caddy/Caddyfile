@@ -1,0 +1,196 @@
+# GAGE-MP reverse proxy: /etc/caddy/Caddyfile
+#
+# 1. Replace the placeholder domain everywhere:   sudo sed -i 's/gage\.example/YOUR.DOMAIN/g' /etc/caddy/Caddyfile
+# 2. Put the announce allow-list in /etc/gage/network.env (GAGE_ANNOUNCE_ALLOW="203.0.113.10 198.51.100.7")
+#    and hand it to Caddy with a drop-in:   sudo systemctl edit caddy
+#        [Service]
+#        EnvironmentFile=/etc/gage/network.env
+#    ufw.sh reads the same file, so the firewall and this file agree.
+# 3. Validate with the same environment, then reload (never restart: restart drops connections):
+#        sudo bash -c 'set -a; . /etc/gage/network.env; set +a; caddy validate --config /etc/caddy/Caddyfile'
+#        caddy fmt --diff /etc/caddy/Caddyfile
+#        sudo systemctl reload caddy
+#
+# Listeners
+#   api.gage.example     :443   TLS (automatic Let's Encrypt)   -> platform   127.0.0.1:8787
+#   master.gage.example  :443   TLS                             -> master     127.0.0.1:8080  (launcher: GET /servers)
+#   :8081                plain HTTP, ONLY from GAGE_ANNOUNCE_ALLOW -> master    127.0.0.1:8080  (game servers: POST /announce)
+#   :80                  Caddy's automatic ACME + redirect to HTTPS
+#
+# Why the plain-HTTP announce listener exists: gage-server has no TLS client. Its masterUrl accepts
+# http:// only and an https:// URL is rejected at startup (docs/api/server.md, section 2 and 7). The
+# announce body is public information (name, port, player count) and carries no secret and no
+# credential, so cleartext costs nothing in confidentiality. The risk is injection of fake listings,
+# which is why this listener (a) answers only the one route POST /announce, (b) only to the
+# allow-listed source IPs, here AND in the host firewall, and (c) sits behind the master's own checks
+# (per-address caps, token bucket, and with VERIFY_UDP=1 a UDP probe of the announced port).
+# Do not widen GAGE_ANNOUNCE_ALLOW to the internet unless you want a community master list.
+#
+# Ports 8080/8787/8788 stay on loopback; nothing here exposes /internal/* (the game-server API).
+#
+# Rate limiting: stock Caddy has NO request rate limiter (it is the third-party module
+# github.com/mholt/caddy-ratelimit, which needs a custom build with xcaddy). What this file does with
+# stock Caddy: request body caps, header/body/idle timeouts, header size cap, no HTTP/3 amplification
+# surface. Request-rate limits that exist today are inside the apps: the master's token bucket on
+# POST /announce and per-address caps; the platform's Postgres-backed login/account throttles. There is
+# no global per-IP limiter in front of GET /servers or the platform's other routes: see the commented
+# rate_limit blocks below and the open decision in README.md.
+
+{
+	# ACME account contact (certificate expiry notices).
+	email ops@gage.example
+
+	servers {
+		# HTTP/3 needs UDP/443, which the firewall keeps closed: do not advertise it (Alt-Svc) to clients.
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			read_body 30s
+			write 60s
+			idle        2m
+		}
+		max_header_size 16KB
+	}
+
+	# Only with a Caddy built with github.com/mholt/caddy-ratelimit (xcaddy build --with ...):
+	# order rate_limit before basicauth
+}
+
+# Response headers for every JSON/API response. `header X value` REPLACES what the upstream sent,
+# so that is used for the headers that must never vary; `?X` (set only when absent) is used where
+# an upstream may legitimately decide, so the apps can tighten them later.
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Cross-Origin-Opener-Policy "same-origin"
+		?Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+		-Server
+	}
+}
+
+# Access log to stderr (journald). Credentials headers are redacted by Caddy by default; the OAuth
+# one-time `code` and `state` in the Discord callback query string are redacted here as well.
+(access_log) {
+	log {
+		format filter {
+			fields {
+				request>uri query {
+					replace code REDACTED
+					replace state REDACTED
+					replace token REDACTED
+				}
+			}
+			wrap json
+		}
+	}
+}
+
+api.gage.example {
+	import security_headers
+	import access_log
+	# The Discord callback page uses one inline <style>; every other response is JSON.
+	header ?Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+	encode zstd gzip
+
+	# Largest legitimate body is the payment webhook (262144 bytes); everything else is far smaller.
+	request_body {
+		max_size 512KB
+	}
+
+	# The internal game-server API has its own loopback listener and is never proxied. The dev
+	# checkout routes are not mounted in production; both are refused here as defence in depth
+	# (INTERNAL_ON_PUBLIC_LISTENER=1 would otherwise serve /internal/* on the public listener).
+	@never_public path /internal /internal/* /v1/dev/*
+	handle @never_public {
+		respond "not found" 404
+	}
+
+	handle {
+		# rate_limit {
+		#	zone api_per_ip {
+		#		key {remote_host}
+		#		events 120
+		#		window 1m
+		#	}
+		# }
+		reverse_proxy 127.0.0.1:8787 {
+			# The platform runs with TRUST_PROXY=1 and reads the last X-Forwarded-For entry:
+			# overwrite the header with the real peer so a client cannot supply its own.
+			header_up X-Forwarded-For {remote_host}
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 30s
+			}
+		}
+	}
+}
+
+master.gage.example {
+	import security_headers
+	import access_log
+	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+	encode zstd gzip
+
+	request_body {
+		max_size 8KB
+	}
+
+	# The launcher needs the list and monitors need liveness. Announcing is NOT offered over HTTPS:
+	# gage-server cannot speak it, so POST /announce lives on the restricted :8081 listener below.
+	@public {
+		method GET HEAD
+		path /servers /healthz
+	}
+	handle @public {
+		# rate_limit {
+		#	zone servers_per_ip {
+		#		key {remote_host}
+		#		events 30
+		#		window 1m
+		#	}
+		# }
+		reverse_proxy 127.0.0.1:8080 {
+			# The master runs with TRUST_PROXY=1 and reads the FIRST X-Forwarded-For entry: overwrite.
+			header_up X-Forwarded-For {remote_host}
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 15s
+			}
+		}
+	}
+	handle {
+		respond "not found" 404
+	}
+}
+
+# Plain-HTTP announce listener (see the long comment at the top). `http://` disables automatic HTTPS
+# for this address. The default of 127.0.0.1 fails closed: a game server announces from its public
+# address, so until GAGE_ANNOUNCE_ALLOW lists those addresses every announce is refused with 403.
+# Game servers on THIS machine announce from the machine's own public IPv4 (a connection to a local
+# address keeps that address as its source): put it in the list too.
+http://:8081 {
+	@announce {
+		remote_ip {$GAGE_ANNOUNCE_ALLOW:127.0.0.1}
+		method POST
+		path /announce
+	}
+	handle @announce {
+		request_body {
+			max_size 8KB
+		}
+		reverse_proxy 127.0.0.1:8080 {
+			header_up X-Forwarded-For {remote_host}
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 15s
+			}
+		}
+	}
+	handle {
+		respond "forbidden" 403
+	}
+	import access_log
+}

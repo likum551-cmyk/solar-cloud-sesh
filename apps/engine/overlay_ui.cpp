@@ -1,0 +1,1754 @@
+// GAGE-MP in-game overlay: the real UI (loading state, corner mark, chat, quick actions,
+// vitals, speedometer). Contract: overlay.h. Seam to the D3D11 plumbing: overlay_internal.h.
+//
+// Screen layout (one 28 px gutter at 1080p on every edge): the mark top-right, the chat top-left
+// (its plate starts 100 px from the top), the vitals plate and the speedometer stacked on the
+// bottom-right edge, sharing a right edge and a width.
+//
+// Everything that draws runs between ImGui::NewFrame and ImGui::Render on the render
+// thread and never calls a game native. The push/pull functions at the bottom of the
+// file are the only thread-safe entry points; they touch a small mutex-guarded block of
+// data (chat history, outgoing queue, loader status) and a few atomics.
+//
+// Art direction: Solar RP, NOON palette (brand/solar/solar-rp-noon/README.md). Ground #0A0907, panels
+// #100E0B / #17140F, warm ink #F7F2E8 (#D9D1C3 for names and captions), one accent, Solar gold #F2B134,
+// rationed to rails, lit bars and the active row; a warning is ember #FF8A3D, never gold, so it cannot
+// read as an action. Segoe UI Semibold with a bold italic for numerals.
+// The plate geometry predates the Solar mark and is unchanged: panels are chamfered at the top-left and
+// bottom-right corners and small controls (quick-action rows, the input line, speed and progress segments)
+// are parallelograms leaned by kSkew, the cut and lean of the retired italic G. The Solar S is upright with
+// its cuts at the top-right and bottom-left.
+#include "overlay.h"
+#include "overlay_internal.h"
+#include "common/logger.h"
+#include "protocol/protocol.h"
+
+#include "imgui.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cfloat>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <string>
+#include <vector>
+
+namespace gage::game::Overlay {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+constexpr float kSkew = 0.14f;   // the HUD's lean (top edge shifted right by height * kSkew)
+
+// The Solar S (brand/solar viewBox 50 x 100): width / height of the mark textures and of the mark as drawn.
+constexpr float kMarkAspect = 0.5f;
+// The mark textures are exactly 1:2 and the S touches their edges, while the ImGui backends sample with WRAP: a
+// bilinear sample on a border row or column would blend in the opposite edge (a faint dark rim when the mark is
+// drawn larger than its texture, e.g. 4K). Inset the UVs by half a texel so the filter never leaves the image.
+// texH is the texture's height in texels (64, 256 or 1024); its width is texH * kMarkAspect.
+constexpr ImVec2 MarkUv0(float texH) { return ImVec2(0.5f / (texH * kMarkAspect), 0.5f / texH); }
+constexpr ImVec2 MarkUv1(float texH) { return ImVec2(1.0f - 0.5f / (texH * kMarkAspect), 1.0f - 0.5f / texH); }
+
+struct Rgb { float r, g, b; };
+constexpr Rgb Hex(unsigned v)
+{
+    return Rgb{(float)((v >> 16) & 255u) / 255.0f, (float)((v >> 8) & 255u) / 255.0f, (float)(v & 255u) / 255.0f};
+}
+// NOON, role by role (brand/solar/solar-rp-noon/README.md).
+constexpr Rgb kGround   = Hex(0x0A0907);   // scrims, the loader's ground, the input well, cursor outline, text shadow
+constexpr Rgb kPanel    = Hex(0x100E0B);   // the plate fill: chat, vitals, speedometer, quick actions, corner chip
+constexpr Rgb kPanelHi  = Hex(0x17140F);   // a raised ground: the top of the loader's ground gradient
+constexpr Rgb kInk      = Hex(0xF7F2E8);   // text, digits, lit tips, the cursor, neutral fills (at alpha)
+constexpr Rgb kInk2     = Hex(0xD9D1C3);   // other players' names, captions, column heads, glyphs
+constexpr Rgb kHair     = Hex(0xFFF4E0);   // hairlines (plate edges, separators), used at 0.10 - 0.16 alpha
+constexpr Rgb kGold     = Hex(0xF2B134);   // Solar gold: the one accent (rails, lit bars, selection, active row)
+constexpr Rgb kGoldHot  = Hex(0xFFC75A);   // gold, lifted: the pressed row's edge
+constexpr Rgb kGoldDown = Hex(0xC98D16);   // gold, pressed: the pressed row's fill
+constexpr Rgb kEmber    = Hex(0xFF8A3D);   // warning: low vitals, the last speed bars, a failed connection
+constexpr Rgb kOnGold   = Hex(0x1A1206);   // text on gold
+constexpr Rgb kNoTint{1.0f, 1.0f, 1.0f};   // texture modulate that changes nothing: the brand PNGs carry their own colour
+
+constexpr std::size_t kChatCap = 100;      // history kept
+constexpr std::size_t kOutCap = 16;        // outgoing lines held for the engine
+constexpr std::size_t kViewMax = kChatCap; // lines the renderer copies per refresh: the whole history
+constexpr std::size_t kBufLen = gage::proto::kMaxChat + 1;   // the server refuses longer lines
+constexpr std::size_t kNameMax = 32, kTextMax = 256, kStatusMax = 150;
+constexpr float kHoldS = 11.0f;            // a chat line stays this long while the chat is closed...
+constexpr float kFadeS = 1.5f;             // ...then fades out over this long
+constexpr float kFullSpeedKmh = 240.0f;    // the speed bar is full here
+
+// ---------------------------------------------------------------------------
+// Pushed data (any thread)
+// ---------------------------------------------------------------------------
+struct DataCs {
+    CRITICAL_SECTION cs;
+    DataCs() { InitializeCriticalSection(&cs); }   // never deleted: lives as long as the DLL
+};
+DataCs g_dcs;
+struct DLock {
+    DLock() { EnterCriticalSection(&g_dcs.cs); }
+    ~DLock() { LeaveCriticalSection(&g_dcs.cs); }
+    DLock(const DLock&) = delete;
+    DLock& operator=(const DLock&) = delete;
+};
+
+struct Line {
+    std::string name, text;
+    ULONGLONG at = 0;
+    bool system = false, self = false;
+};
+struct Data {
+    std::deque<Line> chat;
+    std::deque<std::string> out;
+    std::string status;
+    bool statusFailed = false;      // the loader's status is a dead end, not progress
+    uint32_t chatSeq = 0;
+};
+// Heap-allocated and never freed: a join-worker thread may push a chat line while the DLL's
+// statics are being destroyed.
+Data& D() { static Data* d = new Data; return *d; }
+
+std::atomic<int>      g_phase{(int)Phase::Loading};   // loading until the engine says otherwise
+std::atomic<bool>     g_inVehicle{false};
+std::atomic<float>    g_speedKmh{0.0f};
+std::atomic<bool>     g_interactive{false};
+// The Alt+F4 confirm (OpenQuitPrompt): GetTickCount64 when it opened, 0 = closed. Written by the window
+// thread (WndProc) and by the render thread (the timeout), read by both and by the engine's script tick.
+std::atomic<ULONGLONG> g_quitPromptAt{0};
+constexpr ULONGLONG    kQuitPromptMs = 10000;   // unanswered, the card goes away by itself after this
+// Vitals, 0..1. Until the engine pushes, health and satiety read full and the cluster is shown.
+std::atomic<float>    g_vitHealth{1.0f};
+std::atomic<float>    g_vitSatiety{1.0f};
+std::atomic<float>    g_vitFuel{1.0f};
+std::atomic<bool>     g_vitShow{true};
+std::atomic<bool>     g_vitShowFuel{false};
+
+// Keep printable text: control characters become spaces, and a cut never leaves half a UTF-8 sequence.
+std::string Clean(const char* s, std::size_t maxBytes)
+{
+    std::string o;
+    if (!s)
+        return o;
+    const char* p = s;
+    for (; *p && o.size() < maxBytes; ++p) {
+        const unsigned char c = (unsigned char)*p;
+        o.push_back((c < 0x20 || c == 0x7f) ? ' ' : (char)c);
+    }
+    if (*p) {
+        while (!o.empty() && ((unsigned char)o.back() & 0xC0) == 0x80)
+            o.pop_back();
+        if (!o.empty() && ((unsigned char)o.back() & 0x80))
+            o.pop_back();
+    }
+    return o;
+}
+
+void PushLine(Line&& l)
+{
+    DLock lk;
+    Data& d = D();
+    d.chat.push_back(std::move(l));
+    while (d.chat.size() > kChatCap)
+        d.chat.pop_front();
+    ++d.chatSeq;
+}
+
+void PushSystem(const std::string& text)
+{
+    if (text.empty())
+        return;
+    Line l;
+    l.text = text;
+    l.system = true;
+    l.at = GetTickCount64();
+    PushLine(std::move(l));
+}
+
+bool Enqueue(const std::string& s)
+{
+    DLock lk;
+    if (D().out.size() >= kOutCap)
+        return false;
+    D().out.push_back(s);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Render-thread state
+// ---------------------------------------------------------------------------
+struct Fnt {
+    ImFont* font = nullptr;
+    float   px = 0.0f;        // size drawn at this frame (follows the display size)
+    float   base = 0.0f;      // size the glyph atlas was baked at
+    float   design = 0.0f;    // size at 1080p
+    float   minPx = 0.0f;     // never drawn smaller than this
+};
+
+struct ViewLine {
+    std::string name, text;
+    ULONGLONG at = 0;
+    bool system = false, self = false;
+};
+
+struct Ui {
+    float scale = 1.0f;                     // layout scale, H / 1080, follows the display every frame
+    float bakeScale = 1.0f;                 // the scale the fonts were baked at (UiInit)
+    float px1 = 1.0f;                       // one hairline, in whole pixels
+    float chatPlateH = 0.0f;                // the open chat plate's current height (animated)
+    Fnt body, semi, small, title, mid, num, numMid;
+    detail::UiTextures tex;
+
+    bool     first = true;
+    uint32_t frame = 0;
+    float    loaderA = 1.0f, hudA = 0.0f, speedA = 0.0f, chatA = 0.0f, invA = 0.0f;
+    float    quitA = 0.0f;                  // the Alt+F4 confirm card's visibility
+    float    quitLeft = 1.0f;               // its countdown rail as last drawn (held while it fades out)
+    ULONGLONG loaderT0 = 0;                 // when the loader first drew: the stills' crossfade cycle starts here
+
+    // The bottom-right cluster's eased values (TickVitals, UiFrame): what is drawn trails what was pushed.
+    float    speedSm = 0.0f;                // displayed speed, km/h
+    float    vitalsA = 0.0f, fuelA = 0.0f;  // cluster / fuel row visibility
+    struct Vital {
+        float fill = 1.0f;                  // the bar's level as drawn
+        float trail = 1.0f;                 // lags above fill after a loss, so damage reads
+        float warn = 0.0f;                  // 0..1 mix toward the warning colour
+        bool  low = false;                  // below its threshold (with hysteresis)
+    };
+    Vital vit[3];                           // health, satiety, fuel
+
+    bool      chatOpen = false, invOpen = false;
+    uint32_t  chatOpenFrame = 0;
+    ULONGLONG chatOpenedAt = 0;
+    int       focusFrames = 0;
+    bool      inputActive = false;          // the chat text box held keyboard focus last frame
+    std::vector<ImWchar> held;              // characters typed before the box took focus
+    char      buf[kBufLen] = {};
+    int       scroll = 0;
+    bool      invJustOpened = false;
+
+    std::vector<ViewLine> view;
+    uint32_t              viewSeq = ~0u;
+
+    UiState last;
+};
+Ui& u = *new Ui;     // never freed, see D()
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+float S(float v) { return std::floor(v * u.scale + 0.5f); }
+float Clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+float Approach(float v, float target, float step)
+{
+    return v < target ? std::fmin(target, v + step) : std::fmax(target, v - step);
+}
+// Frame-rate independent ease: closes 1 - e^(-k dt) of the gap each frame (k = 9 is ~95 % in a third
+// of a second), and lands exactly on the target once within eps, so a value never hovers just short.
+float Ease(float v, float target, float k, float dt, float eps)
+{
+    const float d = target - v;
+    if (std::fabs(d) <= eps)
+        return target;
+    return v + d * (1.0f - std::exp(-k * dt));
+}
+// A pushed fraction: NaN counts as 0, anything else is clamped to 0..1.
+float Frac01(float v) { return v == v ? Clamp01(v) : 0.0f; }
+Rgb Mix(Rgb a, Rgb b, float t)
+{
+    t = Clamp01(t);
+    return Rgb{a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t};
+}
+ImU32 Col(Rgb c, float a)
+{
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(c.r, c.g, c.b, Clamp01(a)));
+}
+// Distance from a text box's top to its baseline at the size drawn (lets two faces share a baseline).
+float AscentPx(const Fnt& f) { return f.font->Ascent * (f.px / f.base); }
+// The ink box of a numeral at the size drawn, as offsets from the text box's top. '1' is flat on
+// both ends (a '0' overshoots), so these are the cap line and the baseline.
+void DigitBox(const Fnt& f, float* top, float* bottom)
+{
+    const ImFontGlyph* g = f.font->FindGlyph((ImWchar)'1');
+    const float k = f.base > 0.0f ? f.px / f.base : 1.0f;
+    if (g) {
+        *top = g->Y0 * k;
+        *bottom = g->Y1 * k;
+    } else {
+        *top = 0.285f * f.px;
+        *bottom = 0.81f * f.px;
+    }
+}
+ImVec2 Measure(const Fnt& f, const char* t, float wrap = 0.0f)
+{
+    return f.font->CalcTextSizeA(f.px, FLT_MAX, wrap, t);
+}
+// Text with an optional drop shadow (one hairline down-right) so it reads on any scene.
+void Text(ImDrawList* dl, const Fnt& f, ImVec2 p, Rgb c, float a, const char* t, float wrap = 0.0f,
+          float shadow = 0.0f)
+{
+    if (a <= 0.003f)
+        return;
+    if (shadow > 0.0f)
+        dl->AddText(f.font, f.px, ImVec2(p.x + u.px1, p.y + u.px1), Col(kGround, a * shadow), t, nullptr, wrap);
+    dl->AddText(f.font, f.px, p, Col(c, a), t, nullptr, wrap);
+}
+
+// The brand's cut: top-left and bottom-right corners chamfered.
+void PlateChamfer(ImDrawList* dl, float x0, float y0, float x1, float y1, float ch, ImU32 fill, ImU32 border)
+{
+    const ImVec2 p[6] = {{x0 + ch, y0}, {x1, y0}, {x1, y1 - ch}, {x1 - ch, y1}, {x0, y1}, {x0, y0 + ch}};
+    dl->AddConvexPolyFilled(p, 6, fill);
+    if (border)
+        dl->AddPolyline(p, 6, border, ImDrawFlags_Closed, u.px1);
+}
+// The brand's lean: the top edge sits (y1 - y0) * kSkew to the right of the bottom edge,
+// so the plate's bounding box is [x0, x1 + lean]. Returns the lean.
+float PlateSlant(ImDrawList* dl, float x0, float y0, float x1, float y1, ImU32 fill, ImU32 border)
+{
+    const float off = (y1 - y0) * kSkew;
+    const ImVec2 p[4] = {{x0 + off, y0}, {x1 + off, y0}, {x1, y1}, {x0, y1}};
+    dl->AddConvexPolyFilled(p, 4, fill);
+    if (border)
+        dl->AddPolyline(p, 4, border, ImDrawFlags_Closed, u.px1);
+    return off;
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+// Latin, Latin-1/Extended-A, Cyrillic, Georgian (Mkhedruli + Mtavruli), general punctuation, euro.
+const ImWchar kFullRanges[] = {
+    0x0020, 0x017F,
+    0x0400, 0x04FF,
+    0x10A0, 0x10FF,
+    0x1C90, 0x1CBF,
+    0x2010, 0x2027,
+    0x20AC, 0x20AC,
+    0,
+};
+const ImWchar kLatinRanges[] = { 0x0020, 0x00FF, 0 };
+
+bool WindowsFontPath(const char* file, char* out, std::size_t cap)
+{
+    char dir[MAX_PATH] = {};
+    const UINT n = GetWindowsDirectoryA(dir, MAX_PATH);
+    if (!n || n > MAX_PATH - 40)
+        return false;
+    std::snprintf(out, cap, "%s\\Fonts\\%s", dir, file);
+    return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Pixel size of a font at a layout scale: the 1080p design size scaled, never below floorPx
+// (15 px type is already small; at 0.75 it must not become 11 px).
+float FontPx(float design, float floorPx, float scale)
+{
+    return std::fmax(floorPx, std::floor(design * scale + 0.5f));
+}
+
+// The layout scale follows the display every frame (a resolution or window-size change needs no
+// restart). The glyph atlas stays as baked; text is drawn at the matching size.
+void RefreshScale(float displayH)
+{
+    u.scale = std::fmin(3.0f, std::fmax(0.75f, displayH / 1080.0f));
+    u.px1 = std::fmax(1.0f, std::floor(u.scale + 0.5f));
+    Fnt* const fs[] = {&u.body, &u.semi, &u.small, &u.mid, &u.title, &u.num, &u.numMid};
+    for (Fnt* f : fs)
+        f->px = FontPx(f->design, f->minPx, u.scale);
+    // ImGui draws the one text box itself, with the body font: keep its size in step.
+    ImGui::GetIO().FontGlobalScale = u.body.base > 0.0f ? u.body.px / u.body.base : 1.0f;
+}
+
+// First file of `files` that exists, baked at `px`; the ImGui default font when none does.
+Fnt LoadFont(ImGuiIO& io, const char* const* files, int nFiles, float px, const ImWchar* ranges)
+{
+    Fnt f;
+    f.px = px;
+    f.base = px;
+    for (int i = 0; i < nFiles && !f.font; ++i) {
+        char path[MAX_PATH];
+        if (WindowsFontPath(files[i], path, sizeof(path)))
+            f.font = io.Fonts->AddFontFromFileTTF(path, px, nullptr, ranges);
+    }
+    if (!f.font) {
+        ImFontConfig cfg;
+        cfg.SizePixels = px;
+        f.font = io.Fonts->AddFontDefault(&cfg);
+    }
+    return f;
+}
+
+void BuildStyle(float scale)
+{
+    ImGui::StyleColorsDark();
+    ImGuiStyle& st = ImGui::GetStyle();
+    st.WindowRounding = 0.0f;
+    st.FrameRounding = 0.0f;
+    st.PopupRounding = 0.0f;
+    st.ScrollbarRounding = 0.0f;
+    st.GrabRounding = 0.0f;
+    st.WindowBorderSize = 0.0f;
+    st.FrameBorderSize = 0.0f;
+    st.ScaleAllSizes(scale);
+    // ScaleAllSizes floors the software cursor's scale: below 1080p (0.67 -> 0) the pointer vanished.
+    // The cursor bitmap is a fixed 12x19 px, so keep it at a whole number, never below 1.
+    st.MouseCursorScale = std::fmax(1.0f, std::floor(scale + 0.5f));
+    ImVec4* c = st.Colors;
+    const ImVec4 accent(kGold.r, kGold.g, kGold.b, 1.0f);
+    c[ImGuiCol_Text]            = ImVec4(kInk.r, kInk.g, kInk.b, 1.0f);
+    c[ImGuiCol_TextDisabled]    = ImVec4(kInk.r, kInk.g, kInk.b, 0.52f);
+    c[ImGuiCol_WindowBg]        = ImVec4(kGround.r, kGround.g, kGround.b, 0.94f);
+    c[ImGuiCol_FrameBg]         = ImVec4(0, 0, 0, 0);          // the panels draw their own plates
+    c[ImGuiCol_FrameBgHovered]  = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_FrameBgActive]   = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_TextSelectedBg]  = ImVec4(accent.x, accent.y, accent.z, 0.38f);
+    c[ImGuiCol_Border]          = ImVec4(kHair.r, kHair.g, kHair.b, 0.12f);
+    c[ImGuiCol_Separator]       = ImVec4(kHair.r, kHair.g, kHair.b, 0.12f);
+    c[ImGuiCol_NavHighlight]    = accent;
+}
+
+// ---------------------------------------------------------------------------
+// Chat input callbacks
+// ---------------------------------------------------------------------------
+int ChatCharFilter(ImGuiInputTextCallbackData* d)
+{
+    const ImWchar c = d->EventChar;
+    if (c < 0x20 || c == 0x7f)
+        return 1;                       // tab and other control characters never enter the line
+    // (The character of the T key that opened the box never reaches ImGui: see OverlayWndProc.)
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Quick actions
+// ---------------------------------------------------------------------------
+struct Action {
+    const char* label;
+    const char* cmd;      // what is queued for the engine (QueueCommand in engine.cpp)
+    int         column;   // 0 player, 1 vehicles, 2 weapons
+};
+const Action kActions[] = {
+    {"Heal",           "/heal",                 0},
+    {"Repair vehicle", "/fix",                  0},
+    {"Go to spawn",    "/spawn",                0},
+    {"Adder",          "/car adder",            1},
+    {"Zentorno",       "/car zentorno",         1},
+    {"T20",            "/car t20",              1},
+    {"Comet",          "/car comet2",           1},
+    {"Bati 801",       "/car bati",             1},
+    {"Pistol",         "/gun pistol",           2},
+    {"Micro SMG",      "/gun microsmg",         2},
+    {"Carbine rifle",  "/gun carbinerifle",     2},
+    {"Pump shotgun",   "/gun pumpshotgun",      2},
+    {"Sniper rifle",   "/gun sniperrifle",      2},
+};
+constexpr int kActionCount = (int)(sizeof(kActions) / sizeof(kActions[0]));
+static_assert(kActionCount <= UiState::kMaxActions, "UiState::kMaxActions is too small");
+const char* const kColumnTitle[3] = {"Player", "Vehicles", "Weapons"};
+
+// ---------------------------------------------------------------------------
+// Panel open / close
+// ---------------------------------------------------------------------------
+void OpenChat(ULONGLONG now)
+{
+    u.chatOpen = true;
+    u.chatOpenFrame = u.frame;
+    u.chatOpenedAt = now;
+    u.focusFrames = 3;
+    u.inputActive = false;
+    u.held.clear();
+    u.buf[0] = 0;
+    u.scroll = 0;
+    u.chatA = 0.0f;
+}
+void CloseChat()
+{
+    u.chatOpen = false;
+    u.focusFrames = 0;
+    u.inputActive = false;
+    u.held.clear();
+    u.buf[0] = 0;
+    u.scroll = 0;
+}
+void OpenInventory()
+{
+    u.invOpen = true;
+    u.invJustOpened = true;
+    u.invA = 0.0f;
+}
+void CloseInventory() { u.invOpen = false; }
+
+// What the player submitted: trim, queue for the engine, echo commands as a dim line.
+void Submit(const char* raw)
+{
+    std::string s = raw ? raw : "";
+    const char* ws = " \t";
+    const std::size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos)
+        return;
+    s = s.substr(b, s.find_last_not_of(ws) - b + 1);
+    if (!Enqueue(s)) {
+        PushSystem("Too many messages queued, slow down.");
+        return;
+    }
+    if (s[0] == '/')
+        PushSystem(s);
+}
+
+// ---------------------------------------------------------------------------
+// Panels
+// ---------------------------------------------------------------------------
+// Corner mark (top-right, one gutter in from the top and the right edge): a dark chamfered chip so the
+// mark reads over any scene. The Solar S is 1:2, so the textured mark is drawn at that aspect (never
+// stretched into a square), centred in the square chip; the typeset fallback keeps the square box.
+void DrawLogo(ImDrawList* dl, float W, float a, UiState& L)
+{
+    const float chip = S(50.0f), ch = S(8.0f);
+    const float markH = S(36.0f), markW = std::floor(markH * kMarkAspect + 0.5f);   // the textured S
+    const float box = S(34.0f);                                                      // the fallback monogram's box
+    const float x0 = std::floor(W - S(28.0f) - chip), y0 = S(28.0f);
+    // One plate rule for every surface: solid ground, a hairline and the accent rail (as on the
+    // chat and the cluster), so the chip never tints with the scene behind it.
+    PlateChamfer(dl, x0, y0, x0 + chip, y0 + chip, ch, Col(kPanel, 0.92f * a), Col(kHair, 0.14f * a));
+    dl->AddRectFilled(ImVec2(x0 + ch, y0), ImVec2(x0 + ch + S(22.0f), y0 + std::fmax(2.0f, S(3.0f))), Col(kGold, a));
+    // markH is in screen pixels, so compare against the textures' pixel heights (64 / 256 / 1024), not S()-scaled values.
+    void* tex = markH <= 72.0f ? u.tex.mark64 : (markH <= 290.0f ? u.tex.mark256 : u.tex.mark1024);
+    if (!tex)
+        tex = u.tex.mark256 ? u.tex.mark256 : (u.tex.mark64 ? u.tex.mark64 : u.tex.mark1024);
+    float mx, my, mw, mh;
+    if (tex) {
+        mw = markW; mh = markH;
+        mx = x0 + std::floor((chip - mw) * 0.5f); my = y0 + std::floor((chip - mh) * 0.5f);
+        const float texH = tex == u.tex.mark64 ? 64.0f : (tex == u.tex.mark256 ? 256.0f : 1024.0f);
+        dl->AddImage((ImTextureID)tex, ImVec2(mx, my), ImVec2(mx + mw, my + mh), MarkUv0(texH), MarkUv1(texH),
+                     Col(kNoTint, a));
+    } else {
+        // No texture: a gold chip with the typeset "SR" monogram (Solar RP) in dark-on-gold ink, shrunk to
+        // sit inside the chip. "SOLAR RP" is the loader's wordmark; it cannot be read at chip size.
+        mw = mh = box;
+        mx = x0 + std::floor((chip - mw) * 0.5f); my = y0 + std::floor((chip - mh) * 0.5f);
+        PlateChamfer(dl, mx, my, mx + mw, my + mh, S(9.0f), Col(kGold, a), 0);
+        static const char* const kMonogram = "SR";
+        Fnt mono = u.title;
+        ImVec2 ts = Measure(mono, kMonogram);
+        const float fit = mw * 0.80f;
+        if (ts.x > fit) {
+            mono.px *= fit / ts.x;
+            ts = Measure(mono, kMonogram);
+        }
+        Text(dl, mono, ImVec2(mx + (mw - ts.x) * 0.5f, my + (mh - ts.y) * 0.5f), kOnGold, a, kMonogram);
+    }
+    L.logoTextured = tex != nullptr;
+    L.logoX = mx; L.logoY = my; L.logoW = mw; L.logoH = mh;
+}
+
+// ---- bottom-right cluster: vitals plate with the speedometer stacked on it --------------------
+// One right edge and one width for both plates (the mark's gutter from the edge and the bottom), so
+// the two read as a single instrument block. The speedometer sits directly above the vitals plate and
+// drops into the corner while the vitals are hidden; the vitals plate is a fixed two rows (HP, FOOD) so
+// it never shifts, and fuel is a gauge on the speedometer plate (vehicle data, shown only in a vehicle).
+struct Cluster {
+    float x = 0, w = 0;                      // left edge and width, shared by both plates
+    float gut = 0, gap = 0;                  // screen gutter, space between the two plates
+    float padX = 0, padT = 0, padB = 0;      // vitals plate: side, top (clears the rail) and bottom padding
+    float rowH = 0, rowGap = 0;
+    float vH = 0, vTop = 0;                  // vitals plate height now (animated rows) and its top edge
+    float speedoBottom = 0;                  // where the speedometer's bottom edge goes
+};
+Cluster ClusterLayout(float W, float H)
+{
+    Cluster c;
+    c.gut = S(28.0f);
+    c.gap = S(10.0f);
+    c.w = std::floor(std::fmin(S(272.0f), std::fmax(S(160.0f), W - 2.0f * c.gut)));
+    c.x = std::floor(W - c.gut - c.w);
+    c.padX = S(20.0f);
+    c.padT = S(20.0f);
+    c.padB = S(16.0f);
+    c.rowH = S(22.0f);
+    c.rowGap = S(10.0f);
+    const float rows = 2.0f;                 // health and satiety, always: fuel lives on the speedometer plate
+    c.vH = std::floor(c.padT + rows * c.rowH + (rows - 1.0f) * c.rowGap + c.padB);
+    // The vitals plate slides in from below the screen edge (and out again); the speedometer rides on its
+    // top edge until the plate is gone, then rests on the gutter. Both are bottom-anchored, so a row
+    // growing in (fuel) lifts the speedometer instead of overlapping it.
+    const float e = u.vitalsA * u.vitalsA * (3.0f - 2.0f * u.vitalsA);
+    c.vTop = std::floor(H - c.gut - c.vH + (1.0f - e) * (c.vH + c.gut));
+    c.speedoBottom = std::floor(std::fmin(H - c.gut, c.vTop - c.gap));
+    return c;
+}
+
+// Below these levels a vital turns the warning ember and pulses: health, satiety, fuel.
+constexpr float kVitalLow[3] = {0.30f, 0.25f, 0.15f};
+
+// Icon-first vitals (qb-hud / ps-hud read): one filled glyph per stat is the glance target, not a word.
+// Each is drawn from primitives inside a box of side `s` at (x, y), so it is crisp at 14-16 px.
+void IconHeart(ImDrawList* dl, float x, float y, float s, ImU32 col)
+{
+    const float r = s * 0.26f, cy = y + s * 0.34f;
+    dl->AddCircleFilled(ImVec2(x + s * 0.31f, cy), r, col, 14);
+    dl->AddCircleFilled(ImVec2(x + s * 0.69f, cy), r, col, 14);
+    const ImVec2 tri[3] = {{x + s * 0.05f, cy - r * 0.10f}, {x + s * 0.95f, cy - r * 0.10f}, {x + s * 0.50f, y + s * 0.97f}};
+    dl->AddTriangleFilled(tri[0], tri[1], tri[2], col);
+}
+void IconFood(ImDrawList* dl, float x, float y, float s, ImU32 col)   // a fork and knife (dining)
+{
+    const float th = std::fmax(1.6f, s * 0.085f);
+    // Fork (left): three tines over a short neck, then a handle.
+    for (int i = 0; i < 3; ++i) {
+        const float tx = x + s * (0.14f + 0.10f * (float)i);
+        dl->AddLine(ImVec2(tx, y + s * 0.06f), ImVec2(tx, y + s * 0.34f), col, th);
+    }
+    dl->AddLine(ImVec2(x + s * 0.14f, y + s * 0.34f), ImVec2(x + s * 0.34f, y + s * 0.34f), col, th);
+    dl->AddLine(ImVec2(x + s * 0.24f, y + s * 0.34f), ImVec2(x + s * 0.24f, y + s * 0.96f), col, th * 1.5f);
+    // Knife (right): a blade that tapers to the tip, over a handle on the same axis.
+    const float kx = x + s * 0.68f;
+    const ImVec2 blade[3] = {{kx - s * 0.08f, y + s * 0.06f}, {kx + s * 0.02f, y + s * 0.06f}, {kx + s * 0.02f, y + s * 0.50f}};
+    dl->AddTriangleFilled(blade[0], blade[1], blade[2], col);
+    dl->AddLine(ImVec2(kx + s * 0.02f, y + s * 0.50f), ImVec2(kx + s * 0.02f, y + s * 0.96f), col, th * 1.5f);
+}
+void IconFuel(ImDrawList* dl, float x, float y, float s, ImU32 col)   // a gas pump: body + nozzle hooked over the top
+{
+    const float bx0 = x + s * 0.08f, by0 = y + s * 0.08f, bx1 = x + s * 0.50f, by1 = y + s * 0.96f;
+    dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), col, s * 0.06f);
+    const float th = std::fmax(1.6f, s * 0.11f);
+    // The nozzle: up the right side and hooked back over the pump's head, so it can't read as a "1".
+    dl->AddLine(ImVec2(bx1, by1 - s * 0.06f), ImVec2(bx1 + s * 0.26f, by1 - s * 0.06f), col, th);  // foot out
+    dl->AddLine(ImVec2(bx1 + s * 0.26f, by1 - s * 0.06f), ImVec2(bx1 + s * 0.26f, by0 + s * 0.16f), col, th);  // riser
+    dl->AddLine(ImVec2(bx1 + s * 0.26f, by0 + s * 0.16f), ImVec2(bx1 + s * 0.02f, by0 + s * 0.16f), col, th);  // hook over head
+}
+
+// The cluster's accent rail reflects the vitals: gold normally, ember as any vital goes low, and it
+// pulses once any vital is critical (at or below half its low mark). Both plates call this, so the whole
+// instrument block alarms together instead of only three small fills flickering.
+void RailState(Rgb* col, float* alpha, float baseA)
+{
+    float warn = 0.0f;
+    bool crit = false;
+    for (int i = 0; i < 3; ++i) {
+        if (i == 2 && u.fuelA < 0.5f)
+            continue;                        // fuel only counts once its gauge is live
+        warn = std::fmax(warn, u.vit[i].warn);
+        if (u.vit[i].low && u.vit[i].fill <= kVitalLow[i] * 0.5f)
+            crit = true;
+    }
+    *col = Mix(kGold, kEmber, warn);
+    if (crit) {
+        const float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 6.2832f * 2.4f);
+        *alpha = baseA * (0.55f + 0.45f * pulse);
+    } else {
+        *alpha = baseA;
+    }
+}
+
+// One brand rule for the pair: a chamfered plate, a hairline and the accent rail along the top
+// edge from the end of the chamfer (as on the chat and the palette). The rail carries the vitals alarm.
+void ClusterPlate(ImDrawList* dl, float x, float y, float w, float h, float a)
+{
+    const float ch = S(16.0f);
+    PlateChamfer(dl, x, y, x + w, y + h, ch, Col(kPanel, 0.92f * a), Col(kHair, 0.12f * a));
+    Rgb rc;
+    float ra;
+    RailState(&rc, &ra, a);
+    dl->AddRectFilled(ImVec2(x + ch, y), ImVec2(x + ch + S(56.0f), y + std::fmax(2.0f, S(3.0f))), Col(rc, ra));
+}
+
+// Once per frame, whether or not the cluster is drawn: eases the cluster's visibility and every bar
+// toward what the engine pushed. Coming up from hidden snaps to the true level instead of sweeping
+// from a stale one (the fuel row snaps each time it appears).
+void TickVitals(float dt, bool loading)
+{
+    const bool show = g_vitShow.load() && !loading;
+    const bool fuel = show && g_vitShowFuel.load();
+    const float target[3] = {Frac01(g_vitHealth.load()), Frac01(g_vitSatiety.load()), Frac01(g_vitFuel.load())};
+    const bool snapAll = u.vitalsA <= 0.003f;
+    const bool snapFuel = snapAll || u.fuelA <= 0.003f;
+    u.vitalsA = Approach(u.vitalsA, show ? 1.0f : 0.0f, dt / 0.18f);
+    u.fuelA = Approach(u.fuelA, fuel ? 1.0f : 0.0f, dt / 0.20f);
+    for (int i = 0; i < 3; ++i) {
+        Ui::Vital& v = u.vit[i];
+        const float t = target[i];
+        if (!v.low && t <= kVitalLow[i])
+            v.low = true;
+        else if (v.low && t > kVitalLow[i] + 0.04f)
+            v.low = false;                                   // a little hysteresis: no flicker at the line
+        if (i == 2 ? snapFuel : snapAll) {
+            v.fill = v.trail = t;
+            v.low = t <= kVitalLow[i];
+            v.warn = v.low ? 1.0f : 0.0f;
+            continue;
+        }
+        v.fill = Ease(v.fill, t, 9.0f, dt, 0.002f);
+        // After a loss the trail hangs above the fill and drains slowly, so a hit reads as a hit.
+        v.trail = t < v.trail ? std::fmax(Ease(v.trail, t, 2.0f, dt, 0.002f), v.fill) : v.fill;
+        v.warn = Ease(v.warn, v.low ? 1.0f : 0.0f, 10.0f, dt, 0.01f);
+    }
+}
+
+// The speedometer: the number is the hero, the gauge a rising wedge of leaning bars beside it.
+//   [ 128         /////// ]   digits left, leading zeros ghosted so the slot never moves
+//   [ KM/H   (pump) ====== ]  the unit under the number; the fuel gauge rides the same baseline (in a vehicle)
+// The wedge lights bar by bar (the bar at the tip fades in with the remainder, so the gauge moves
+// continuously), the tip in ink; every bar is a neutral ghost at rest, and the last three light ember
+// only once speed reaches them (colour means wrong, never decoration). `speed` is the eased value.
+void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState& L)
+{
+    const Cluster c = ClusterLayout(W, H);
+    const float padX = S(20.0f), padT = S(20.0f), padB = S(14.0f), capGap = S(8.0f);
+    float dTop = 0.0f, dBot = 0.0f;
+    DigitBox(u.num, &dTop, &dBot);
+    const float dH = dBot - dTop;                            // the numerals' height, the wedge's tallest bar
+    const float pw = c.w, px = c.x;
+    const float ph = std::floor(padT + dH + capGap + u.small.px + padB);
+    const float py = std::floor(c.speedoBottom - ph);
+    ClusterPlate(dl, px, py, pw, ph, a);
+
+    // The number. Digits are laid left to right from the slot's left edge; the zeros that pad it to three
+    // places are ghosted. The top of the digits sits padT under the plate's top, the baseline is yb.
+    int shown = (int)(speed + 0.5f);
+    shown = shown < 0 ? 0 : (shown > 999 ? 999 : shown);
+    char digits[8];
+    std::snprintf(digits, sizeof(digits), "%d", shown);
+    const int nd = (int)std::strlen(digits);
+    const float numX = px + padX, numY = py + padT - dTop;
+    const float yb = py + padT + dH;
+    float gx = 0.0f;
+    if (nd < 3) {
+        const char* ghost = nd == 1 ? "00" : "0";
+        Text(dl, u.num, ImVec2(numX, numY), kInk, a * 0.16f, ghost);
+        gx = Measure(u.num, ghost).x;
+    }
+    Text(dl, u.num, ImVec2(numX + gx, numY), kInk, a, digits, 0.0f, 0.5f);
+    const float slotW = Measure(u.num, "000").x;
+
+    // The wedge: kBars bars leaning with the mark, right-aligned to the plate's padding, as tall as the digits.
+    constexpr int kBars = 16, kRedBars = 3;
+    const float leanMax = dH * kSkew;
+    const float availW = (px + pw - padX) - (numX + slotW + S(20.0f)) - leanMax;
+    const float pitch = std::fmax(3.0f, std::floor(availW / (float)kBars));
+    const float gapB = std::fmax(2.0f, std::floor(S(2.0f)));
+    const float barW = pitch - gapB;
+    const float wx0 = std::floor(px + pw - padX - leanMax - pitch * (float)kBars + gapB);
+    const float hMin = std::floor(dH * 0.28f);
+    const float t = Clamp01(speed / kFullSpeedKmh) * (float)kBars;
+    const int tip = t > 0.001f ? (int)std::ceil(t) - 1 : -1;
+    for (int i = 0; i < kBars; ++i) {
+        const float h = std::floor(hMin + (dH - hMin) * (float)i / (float)(kBars - 1));
+        const float lean = h * kSkew;
+        const float x = wx0 + pitch * (float)i;
+        const bool red = i >= kBars - kRedBars;
+        const ImVec2 p[4] = {{x + lean, yb - h}, {x + lean + barW, yb - h}, {x + barW, yb}, {x, yb}};
+        dl->AddConvexPolyFilled(p, 4, Col(kInk, 0.12f * a));     // every bar is a neutral ghost until lit
+        const float cover = Clamp01(t - (float)i);
+        if (cover <= 0.0f)
+            continue;
+        if (i == tip) {
+            // The leading bar: its colour fades in with the remainder, then the ink tip over it.
+            dl->AddConvexPolyFilled(p, 4, Col(red ? kEmber : kGold, 0.95f * cover * a));
+            dl->AddConvexPolyFilled(p, 4, Col(kInk, 0.90f * cover * a));
+        } else {
+            dl->AddConvexPolyFilled(p, 4, Col(red ? kEmber : kGold, 0.95f * a));
+        }
+    }
+
+    // The unit caption under the number; the rest of this baseline carries the fuel gauge (vehicle data)
+    // when the engine feeds it, otherwise it stays clear — the wedge already shows the scale.
+    const float capY = yb + capGap;
+    Text(dl, u.small, ImVec2(numX, capY), kInk2, a * 0.82f, "KM/H");
+    int fuelPct = 0;
+    bool fuelLow = false;
+    if (u.fuelA > 0.003f) {
+        // The fuel gauge on the caption baseline: a pump glyph, a bar (ink-capped, as the vitals bars),
+        // and the value in the brand's numerals. Ember as a whole once fuel is low. It is the vital a
+        // driver most needs, so it is sized to read, not tucked in.
+        const Ui::Vital& fv = u.vit[2];
+        const float fa = a * u.fuelA;
+        const Rgb fcol = Mix(kGold, kEmber, fv.warn), gcol = Mix(kInk2, kEmber, fv.warn), icol = Mix(kInk, kEmber, fv.warn);
+        fuelPct = (int)(fv.fill * 100.0f + 0.5f);
+        if (fuelPct == 0 && fv.fill > 0.0f)
+            fuelPct = 1;
+        fuelPct = fuelPct > 100 ? 100 : fuelPct;
+        fuelLow = fv.low;
+        char fval[8];
+        std::snprintf(fval, sizeof(fval), "%d", fuelPct);
+        Fnt fsm = u.numMid;
+        fsm.px = std::floor(u.small.px + S(4.0f));                 // the value, bold-italic, matched to the vitals values
+        const float gs = std::floor(u.small.px * 1.25f);          // a pump a little taller than the caption
+        const float gx0 = numX + Measure(u.small, "KM/H").x + S(14.0f);
+        IconFuel(dl, gx0, std::floor(capY + (u.small.px - gs) * 0.5f), gs, Col(gcol, fa * 0.95f));
+        const float vx = px + pw - padX - Measure(fsm, fval).x;
+        Text(dl, fsm, ImVec2(vx, std::floor(capY + (u.small.px - fsm.px) * 0.5f)), icol, fa, fval, 0.0f, 0.5f);
+        const float bh = std::fmax(5.0f, S(7.0f)), lean = bh * kSkew, tipw = std::fmax(2.0f, S(2.0f));
+        const float by = std::floor(capY + (u.small.px - bh) * 0.5f);
+        const float bx0 = gx0 + gs + S(10.0f), bx1 = vx - S(10.0f);
+        if (bx1 - bx0 >= S(16.0f)) {
+            PlateSlant(dl, bx0, by, bx1 - lean, by + bh, Col(kInk, 0.10f * fa), 0);
+            const float fx = std::floor(bx0 + (bx1 - lean - bx0) * Clamp01(fv.fill));
+            if (fx - bx0 >= 1.0f) {
+                PlateSlant(dl, bx0, by, fx, by + bh, Col(fcol, 0.95f * fa), 0);
+                if (fx - bx0 >= tipw + 1.0f)
+                    PlateSlant(dl, fx - tipw, by, fx, by + bh, Col(kInk, 0.90f * fa), 0);
+            }
+        }
+    }
+
+    L.speedoVisible = true;
+    L.speedoX = px; L.speedoY = py; L.speedoW = pw; L.speedoH = ph;
+    L.speedShown = shown; L.speedLit = (int)(t + 0.5f); L.speedSegments = kBars;
+    L.fuelShown = fuelPct; L.fuelLow = fuelLow;
+}
+
+// The vitals plate: two fixed rows, HP and FOOD, each a glyph, a bar and the value. The glyph is the
+// glance target (qb-hud / ps-hud read), not a word. One accent for every bar: colour means something
+// only when it is wrong, so a bar under its threshold turns the glyph, bar and number ember together and
+// the fill pulses, while the plate's rail (ClusterPlate) alarms for the block. The fill's end is capped in
+// ink; fills ease (TickVitals) and after a loss a pale trail drains behind the fill. Fuel is not here —
+// it is a gauge on the speedometer plate.
+void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
+{
+    const Cluster c = ClusterLayout(W, H);
+    const float px = c.x, pw = c.w, py = c.vTop, ph = c.vH;
+    ClusterPlate(dl, px, py, pw, ph, a);
+    dl->PushClipRect(ImVec2(px, py), ImVec2(px + pw, py + ph), true);
+
+    const float gs = S(16.0f);                               // glyph box
+    const float valW = Measure(u.numMid, "000").x;           // the value slot (no "%")
+    const float colGap = S(10.0f);
+    const float barH = S(12.0f), lean = barH * kSkew;        // the leaning bar reserves `lean` at its right
+    const float bx0 = px + c.padX + gs + colGap;
+    const float bw = std::floor((px + pw - c.padX) - (valW + colGap) - bx0 - lean);
+    const float tip = std::fmax(2.0f, S(2.0f));
+    const float tPulse = (float)ImGui::GetTime();
+    void (*const kGlyph[2])(ImDrawList*, float, float, float, ImU32) = {IconHeart, IconFood};
+
+    int pct[2] = {0, 0};
+    for (int i = 0; i < 2; ++i) {
+        const Ui::Vital& v = u.vit[i];
+        const float ry = std::floor(py + c.padT + (float)i * (c.rowH + c.rowGap));
+        const Rgb ink = Mix(kInk, kEmber, v.warn), glyph = Mix(kInk2, kEmber, v.warn);
+        const float hz = v.fill <= 0.10f ? 2.4f : 1.3f;
+        const float pulse = 0.5f + 0.5f * std::sin(tPulse * 6.2832f * hz);
+        const float fillA = 1.0f - v.warn * 0.38f * (1.0f - pulse);
+
+        pct[i] = (int)(v.fill * 100.0f + 0.5f);
+        if (pct[i] == 0 && v.fill > 0.0f)
+            pct[i] = 1;                                      // never "0" while there is anything left
+        pct[i] = pct[i] > 100 ? 100 : pct[i];
+        char val[8];
+        std::snprintf(val, sizeof(val), "%d", pct[i]);
+
+        // The glyph and the value share the row's vertical centre; the value is the brand's numerals.
+        kGlyph[i](dl, px + c.padX, ry + std::floor((c.rowH - gs) * 0.5f), gs, Col(glyph, a * 0.95f));
+        const float vy = ry + std::floor((c.rowH - u.numMid.px) * 0.5f);
+        Text(dl, u.numMid, ImVec2(px + pw - c.padX - Measure(u.numMid, val).x, vy), ink, a, val, 0.0f, 0.5f);
+
+        if (bw < 4.0f)
+            continue;                                        // a display too narrow for a bar keeps its numbers
+        const float by = ry + std::floor((c.rowH - barH) * 0.5f);
+        PlateSlant(dl, bx0, by, bx0 + bw, by + barH, Col(kInk, 0.10f * a), 0);
+        const float fx = std::floor(bx0 + bw * Clamp01(v.fill));
+        const float tx = std::floor(bx0 + bw * Clamp01(v.trail));
+        if (tx > fx + 1.0f)
+            PlateSlant(dl, fx, by, tx, by + barH, Col(kInk, 0.30f * a), 0);   // the drain trail after a loss
+        if (fx - bx0 >= 1.0f) {
+            PlateSlant(dl, bx0, by, fx, by + barH, Col(Mix(kGold, kEmber, v.warn), 0.95f * a * fillA), 0);
+            if (fx - bx0 >= tip + 1.0f)
+                PlateSlant(dl, fx - tip, by, fx, by + barH, Col(kInk, 0.90f * a * fillA), 0);
+        }
+    }
+    dl->PopClipRect();
+
+    L.vitalsVisible = true;
+    L.vitalsX = px; L.vitalsY = py; L.vitalsW = pw; L.vitalsH = ph;
+    L.vitalsRows = 2;
+    L.healthShown = pct[0]; L.satietyShown = pct[1];
+    L.healthLow = u.vit[0].low; L.satietyLow = u.vit[1].low;
+}
+
+// Chat, top-left: the plate's top edge is fixed 100 px (1080p design) from the top of the screen and the
+// left edge is the common 28 px gutter; the log reads top to bottom, oldest first, and the open plate
+// grows downward with the input line at its foot. Lines never jump: a new line adds to the bottom, and in
+// the closed view a line that is fading out rolls up as it fades, so the lines below glide up.
+void DrawChat(ImDrawList* bg, float /*W*/, float /*H*/, ULONGLONG now, float hudA, UiState& L)
+{
+    ImGuiIO& io = ImGui::GetIO();
+    const bool open = u.chatOpen;
+    const float x0 = S(28.0f), cw = S(588.0f), padX = S(16.0f), padY = S(14.0f);
+    const float inH = S(44.0f), inGap = S(12.0f);
+    const float plateTop = S(100.0f);
+    const float logTop = plateTop + padY;          // the first line starts here
+    const float logH = S(310.0f);
+    const float logX = x0 + padX, logW = cw - 2.0f * padX;
+    const float openA = u.chatA * hudA;
+    const float dt = std::fmin(std::fmax(io.DeltaTime, 0.0f), 0.1f);
+
+    // One name column for the whole log, so the message bodies line up (a longer name is clipped).
+    float gutter = 0.0f;
+    {
+        const int from = (int)u.view.size() - 1 - (open ? u.scroll : 0);
+        for (int i = from, seen = 0; i >= 0 && seen < 40; --i, ++seen) {
+            const ViewLine& m = u.view[(std::size_t)i];
+            if (!m.system)
+                gutter = std::fmax(gutter, Measure(u.semi, m.name.c_str()).x);
+        }
+        gutter = std::fmin(gutter, S(150.0f));
+    }
+    const float indent = gutter > 0.0f ? gutter + S(10.0f) : 0.0f;
+
+    // Layout, newest first, bottom up, in coordinates relative to the newest line's bottom edge (0):
+    // y is a slot's top, h its text height, vis the height it currently takes (less than h only for a
+    // line that is rolling up while it fades out).
+    struct Slot { int i; float y, h, vis, a; };
+    Slot slots[kViewMax];
+    int ns = 0;
+    {
+        float y = 0.0f;
+        const int start = (int)u.view.size() - 1 - (open ? u.scroll : 0);
+        const float budget = open ? logH : S(260.0f);
+        for (int i = start; i >= 0 && ns < (int)kViewMax; --i) {
+            const ViewLine& m = u.view[(std::size_t)i];
+            float a = 1.0f;
+            if (!open) {
+                const float age = (float)(now - m.at) / 1000.0f;
+                if (age > kHoldS)
+                    a = 1.0f - (age - kHoldS) / kFadeS;
+                if (a <= 0.0f)
+                    break;                  // older lines are older still
+            }
+            const float wrapW = std::fmax(S(80.0f), logW - (m.system ? 0.0f : indent));
+            const ImVec2 ts = Measure(u.body, m.text.c_str(), wrapW);
+            const float h = std::fmax(ts.y, m.system ? 0.0f : u.semi.px);
+            const float vis = h * a;        // a is 1 while open and for every line not yet fading
+            y -= vis;
+            if (!open && -y > budget)
+                break;                      // no half lines in the closed view
+            slots[ns++] = {i, y, h, vis, a};
+            y -= S(6.0f) * a;
+            if (open && -y > budget + S(40.0f))
+                break;
+        }
+    }
+    // Height of the block of lines, first line's top to the newest line's bottom.
+    const float contentH = ns > 0 ? -slots[ns - 1].y : 0.0f;
+
+    // The open plate is as tall as its lines (at least four lines' worth, at most logH), with the input
+    // line under them, and grows downward smoothly as lines arrive; it snaps to size when it opens.
+    // Lines are placed against the plate's top (the newest line's bottom, blockBottom, sits at the
+    // block's height below logTop; a block taller than logH shows its newest lines, the rest is clipped).
+    const float logAreaH = std::fmin(logH, std::fmax(S(100.0f), contentH + S(4.0f)));
+    const float wantH = padY + logAreaH + inGap + inH + padY;
+    if (!open)
+        u.chatPlateH = 0.0f;
+    else if (u.chatPlateH <= 0.0f)
+        u.chatPlateH = wantH;
+    else
+        u.chatPlateH = Approach(u.chatPlateH, wantH, S(1200.0f) * dt);
+    const float plateBottom = plateTop + u.chatPlateH;
+    const float inY1 = plateBottom - padY, inY0 = inY1 - inH;
+    const float logBottom = inY0 - inGap;          // the log's clip edge (follows the animated plate)
+    const float blockBottom = logTop + (open ? std::fmin(contentH, logAreaH) : contentH);
+
+    // Wheel scrolls the history while the box is open and the pointer is over it.
+    if (open && io.MouseWheel != 0.0f && io.MousePos.x >= x0 && io.MousePos.x <= x0 + cw &&
+        io.MousePos.y >= plateTop && io.MousePos.y <= plateBottom) {
+        const int maxScroll = std::max(0, (int)u.view.size() - 1);
+        u.scroll = std::min(maxScroll, std::max(0, u.scroll + (io.MouseWheel > 0.0f ? 2 : -2)));
+    }
+
+    if (open) {
+        PlateChamfer(bg, x0, plateTop, x0 + cw, plateBottom, S(24.0f), Col(kPanel, 0.90f * openA), Col(kHair, 0.12f * openA));
+        // History position: a slim leaning thumb on the right edge while there is more than is shown.
+        const int total = (int)u.view.size();
+        if (total > ns && ns > 0) {
+            const int newest = total - 1 - u.scroll;              // index of the newest line shown
+            const float tTop = plateTop + S(26.0f), tBot = logBottom - S(2.0f), tH = tBot - tTop;
+            const float f0 = (float)(newest + 1 - ns) / (float)total, f1 = (float)(newest + 1) / (float)total;
+            const float ty0 = tTop + tH * f0, ty1 = std::fmax(ty0 + S(14.0f), tTop + tH * f1);
+            // The track is a plain vertical hairline: a leaning one would shift its top by 14 % of its
+            // whole length and poke out of the plate. The thumb leans by a fixed 3 px, whatever its length.
+            const float tw = S(4.0f), tx = x0 + cw - S(16.0f), tl = S(3.0f);
+            const float trackW = std::fmax(u.px1, S(2.0f)), trackX = tx + tl * 0.5f + std::floor((tw - trackW) * 0.5f);
+            bg->AddRectFilled(ImVec2(trackX, tTop), ImVec2(trackX + trackW, tBot), Col(kInk, 0.16f * openA));
+            const float tb = std::fmin(ty1, tBot);
+            const ImVec2 thumb[4] = {{tx + tl, ty0}, {tx + tl + tw, ty0}, {tx + tw, tb}, {tx, tb}};
+            bg->AddConvexPolyFilled(thumb, 4, Col(kInk, 0.75f * openA));
+        }
+        // Solar gold at rest, as on the palette: a short rail along the top edge.
+        bg->AddRectFilled(ImVec2(x0 + S(24.0f), plateTop), ImVec2(x0 + S(24.0f) + S(72.0f), plateTop + std::fmax(2.0f, S(3.0f))),
+                          Col(kGold, openA));
+        bg->PushClipRect(ImVec2(logX, plateTop + S(6.0f)), ImVec2(logX + logW, logBottom + S(2.0f)), true);
+    } else if (ns > 0) {
+        // Closed: a chamfered plate like every other surface, but fitted to the lines it shows so it is
+        // never a half-empty slab, and opaque enough (0.82) to carry text on a bright sky. Under the
+        // quick-actions palette it steps back, so the two plates do not read as accidentally stacked.
+        const float a0 = slots[0].a * hudA * (1.0f - 0.8f * u.invA);
+        float maxW = 0.0f;
+        for (int k = 0; k < ns; ++k) {
+            const ViewLine& m = u.view[(std::size_t)slots[k].i];
+            const float ind = m.system ? 0.0f : indent;
+            maxW = std::fmax(maxW, ind + Measure(u.body, m.text.c_str(), std::fmax(S(80.0f), logW - ind)).x);
+        }
+        const float top = plateTop, bot = logTop + contentH + padY;
+        const float fitW = std::fmin(cw, std::fmax(S(300.0f), 2.0f * padX + maxW));
+        PlateChamfer(bg, x0, top, x0 + fitW, bot, S(24.0f), Col(kPanel, 0.90f * a0), Col(kHair, 0.10f * a0));
+        bg->AddRectFilled(ImVec2(x0 + S(24.0f), top), ImVec2(x0 + S(24.0f) + S(72.0f), top + std::fmax(2.0f, S(3.0f))),
+                          Col(kGold, 0.9f * a0));
+    }
+
+    for (int k = ns - 1; k >= 0; --k) {
+        const Slot& s = slots[k];
+        const ViewLine& m = u.view[(std::size_t)s.i];
+        const float a = s.a * hudA * (open ? 1.0f : 1.0f - 0.8f * u.invA);
+        const float sy = blockBottom + s.y;
+        // A line rolling up as it fades is cut to the height it still takes.
+        const bool rolling = s.vis < s.h - 0.5f;
+        const float sh = 0.7f;                     // a light 1px shadow; the plate carries the contrast
+        if (rolling)
+            bg->PushClipRect(ImVec2(logX - S(2.0f), sy), ImVec2(logX + logW + S(2.0f), sy + s.vis), true);
+        if (m.system) {
+            Text(bg, u.body, ImVec2(logX, sy), kInk, a * 0.82f, m.text.c_str(), logW, sh);
+        } else {
+            bg->PushClipRect(ImVec2(logX, sy - S(2.0f)), ImVec2(logX + gutter, sy + s.h + S(2.0f)), true);
+            Text(bg, u.semi, ImVec2(logX, sy), m.self ? kInk : kInk2, a, m.name.c_str(), 0.0f, sh);
+            bg->PopClipRect();
+            Text(bg, u.body, ImVec2(logX + indent, sy), kInk, a * 0.95f, m.text.c_str(),
+                 std::fmax(S(80.0f), logW - indent), sh);
+        }
+        if (rolling)
+            bg->PopClipRect();
+    }
+    if (open)
+        bg->PopClipRect();
+
+    L.chatOpen = open;
+    L.chatLinesShown = ns;
+    L.chatX = x0; L.chatY = plateTop; L.chatW = cw;
+    L.chatH = open ? plateBottom - plateTop : (ns > 0 ? contentH + 2.0f * padY : 0.0f);
+    if (!open)
+        return;
+
+    // The input line: a leaning plate with the ImGui text box laid over it.
+    const float inX = logX, inW = logW - inH * kSkew;
+    const ImU32 plate = Col(kGround, 0.80f * openA), edge = Col(kGold, 0.85f * openA);
+    PlateSlant(bg, inX, inY0, inX + inW, inY1, Col(kInk, 0.07f * openA), 0);
+    PlateSlant(bg, inX, inY0, inX + inW, inY1, plate, edge);
+
+    ImGui::SetNextWindowPos(ImVec2(inX, inY0));
+    ImGui::SetNextWindowSize(ImVec2(inW, inH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, std::floor((inH - u.body.px) * 0.5f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, Clamp01(openA));
+    const ImGuiWindowFlags wf = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    bool submitted = false, active = false;
+    if (ImGui::Begin("##gage_chat_input", nullptr, wf)) {
+        ImGui::PushFont(u.body.font);
+        ImGui::SetCursorPos(ImVec2(S(20.0f) + inH * kSkew * 0.5f, 0.0f));
+        ImGui::SetNextItemWidth(inW - S(40.0f) - inH * kSkew * 0.5f);
+        if (u.focusFrames > 0) {
+            ImGui::SetKeyboardFocusHere(0);
+            --u.focusFrames;
+        }
+        const ImGuiInputTextFlags tf = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter |
+                                       ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_NoUndoRedo;
+        submitted = ImGui::InputTextWithHint("##msg", "Message, or a /command   (Enter sends, Esc cancels)", u.buf,
+                                             sizeof(u.buf), tf, ChatCharFilter);
+        active = ImGui::IsItemActive();
+        u.inputActive = active;
+        ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(4);
+
+    L.inputX = inX; L.inputY = inY0; L.inputW = inW + inH * kSkew; L.inputH = inH;
+
+    const bool settled = u.frame > u.chatOpenFrame + 8 && now - u.chatOpenedAt > 160;
+    if (submitted) {
+        if (u.frame <= u.chatOpenFrame + 1) {
+            // The Enter that opened the box must not submit it.
+            u.buf[0] = 0;
+            u.focusFrames = 3;
+        } else {
+            Submit(u.buf);
+            CloseChat();
+        }
+    } else if (settled && !active) {
+        CloseChat();                         // Esc, or a click away from the box
+    }
+}
+
+// t cut from the end and closed with "..." so it is at most maxW wide; "" when not even the dots fit.
+// (ASCII dots: the baked ranges are not guaranteed to hold an ellipsis glyph. Inputs are ASCII.)
+std::string FitText(const Fnt& f, const char* t, float maxW)
+{
+    if (maxW <= 0.0f)
+        return std::string();
+    if (Measure(f, t).x <= maxW)
+        return std::string(t);
+    std::string s(t);
+    while (!s.empty() && Measure(f, (s + "...").c_str()).x > maxW)
+        s.pop_back();
+    return s.empty() ? std::string() : s + "...";
+}
+
+// A key hint: a small leaning key cap with its label. Returns the cap's right edge.
+float KeyCap(ImDrawList* dl, float x, float y, const char* label, float a)
+{
+    const float h = u.small.px + S(8.0f);
+    const float w = Measure(u.small, label).x + S(16.0f);
+    const float lean = PlateSlant(dl, x, y, x + w, y + h, Col(kInk, 0.10f * a), Col(kInk, 0.36f * a));
+    Text(dl, u.small, ImVec2(x + S(8.0f) + lean * 0.5f, y + S(4.0f)), kInk, a * 0.94f, label);
+    return x + w + lean;
+}
+
+void DrawInventory(float W, float H, float hudA, UiState& L)
+{
+    const float a = u.invA * hudA;
+    const float pad = S(30.0f);
+    const float rowH = S(42.0f), rowGap = S(8.0f);
+    const float pw = std::fmin(S(880.0f), W - S(48.0f));     // never wider than the screen
+
+    // The panel is as tall as its content: the tallest column, then one line of typed commands, then
+    // the footer with the key hints.
+    int rowCount[3] = {0, 0, 0};
+    for (int i = 0; i < kActionCount; ++i)
+        ++rowCount[kActions[i].column];
+    static const char* const kHelp[] = {"/car <model>", "/gun <weapon>", "/tp <x> <y> <z>"};
+    float contentH = 0.0f;
+    for (int c = 0; c < 3; ++c)
+        contentH = std::fmax(contentH, (rowH + rowGap) * (float)rowCount[c] - rowGap);
+    const float sepY0 = S(66.0f), headY0 = sepY0 + S(18.0f), rowsY0 = headY0 + S(32.0f);
+    const float helpY0 = rowsY0 + contentH + S(22.0f);
+    const float footSepY0 = helpY0 + u.small.px + S(18.0f);
+    const float footH = S(52.0f);
+    const float ph = footSepY0 + footH;
+
+    const float px = std::floor((W - pw) * 0.5f);
+    const float py = std::floor((H - ph) * 0.5f + (1.0f - u.invA) * S(14.0f));
+
+    ImGui::SetNextWindowPos(ImVec2(px, py));
+    ImGui::SetNextWindowSize(ImVec2(pw, ph));
+    if (u.invJustOpened)
+        ImGui::SetNextWindowFocus();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    const ImGuiWindowFlags wf = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    const bool began = ImGui::Begin("##gage_inventory", nullptr, wf);
+    if (began) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        PlateChamfer(dl, px, py, px + pw, py + ph, S(30.0f), Col(kPanel, 0.95f * a), Col(kHair, 0.16f * a));
+        // Solar gold at rest: a rail along the top edge, from the end of the chamfer.
+        dl->AddRectFilled(ImVec2(px + S(30.0f), py), ImVec2(px + S(30.0f) + S(120.0f), py + std::fmax(2.0f, S(3.0f))),
+                          Col(kGold, a));
+
+        // Header
+        Text(dl, u.title, ImVec2(px + pad, py + S(22.0f)), kInk, a, "Quick actions");
+        const float sepY = py + sepY0;
+        dl->AddLine(ImVec2(px + pad, sepY), ImVec2(px + pw - pad, sepY), Col(kHair, 0.14f * a), u.px1);
+
+        // Typed commands, one line under the columns.
+        {
+            const float hy = py + helpY0;
+            const char* lead = "Or type in chat";
+            Text(dl, u.small, ImVec2(px + pad, hy), kInk2, a * 0.82f, lead);
+            float hx = px + pad + Measure(u.small, lead).x + S(24.0f);
+            for (const char* line : kHelp) {
+                Text(dl, u.small, ImVec2(hx, hy), kInk, a * 0.90f, line);
+                hx += Measure(u.small, line).x + S(26.0f);
+            }
+        }
+
+        // Footer: how to drive it without the mouse, as key caps.
+        const float footY = py + footSepY0;
+        dl->AddLine(ImVec2(px + pad, footY), ImVec2(px + pw - pad, footY), Col(kHair, 0.14f * a), u.px1);
+        {
+            const float capH = u.small.px + S(8.0f);
+            const float capY = footY + std::floor((footH - capH) * 0.5f);
+            const float g = S(8.0f), gg = S(22.0f);
+            float x = px + pad;
+            x = KeyCap(dl, x, capY, "Arrows", a) + g;
+            Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "move");
+            x += Measure(u.small, "move").x + gg;
+            x = KeyCap(dl, x, capY, "Enter", a) + g;
+            Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "run");
+            // Right group, laid out from its measured width.
+            const float lean = capH * kSkew;
+            const float wTab = Measure(u.small, "Tab").x + S(16.0f) + lean;
+            const float wEsc = Measure(u.small, "Esc").x + S(16.0f) + lean;
+            const float wOr = Measure(u.small, "or").x, wClose = Measure(u.small, "close").x;
+            float rx = px + pw - pad - (wTab + g + wOr + g + wEsc + g + wClose);
+            rx = KeyCap(dl, rx, capY, "Tab", a) + g;
+            Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "or");
+            rx = KeyCap(dl, rx + wOr + g, capY, "Esc", a) + g;
+            Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "close");
+        }
+
+        // Columns
+        const float gapC = S(26.0f);
+        const float colW = std::floor((pw - 2.0f * pad - 2.0f * gapC) / 3.0f);
+        const float headY = sepY + (headY0 - sepY0);
+        const float rowsY = py + rowsY0;
+        int rowIndex[3] = {0, 0, 0};
+        for (int c = 0; c < 3; ++c)
+            Text(dl, u.small, ImVec2(px + pad + (colW + gapC) * (float)c, headY), kInk2, a * 0.82f, kColumnTitle[c]);
+
+        L.actionCount = 0;
+        int clicked = -1;
+        for (int i = 0; i < kActionCount; ++i) {
+            const Action& act = kActions[i];
+            const float cx = px + pad + (colW + gapC) * (float)act.column;
+            const float cy = rowsY + (rowH + rowGap) * (float)rowIndex[act.column]++;
+            const float lean = rowH * kSkew;
+            ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+            ImGui::PushID(i);
+            const bool pressed = ImGui::InvisibleButton("##act", ImVec2(colW, rowH));
+            if (u.invJustOpened && i == 0)
+                ImGui::SetItemDefaultFocus();
+            // The keyboard focus ring shows only while the keyboard is the one steering (NavVisible);
+            // otherwise the default-focused first row would stay lit next to the hovered one.
+            const bool hot = ImGui::IsItemHovered() || (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible);
+            const bool down = ImGui::IsItemActive();
+            ImGui::PopID();
+            if (pressed)
+                clicked = i;
+
+            const float x1 = cx + colW - lean;
+            ImU32 fill = Col(kInk, 0.09f * a), edge = 0;
+            if (down)      { fill = Col(kGoldDown, 0.62f * a); edge = Col(kGoldHot, 0.95f * a); }
+            else if (hot)  { fill = Col(kGold, 0.30f * a); edge = Col(kGold, 0.95f * a); }
+            PlateSlant(dl, cx, cy, x1, cy + rowH, fill, edge);
+            if (hot)
+                PlateSlant(dl, cx, cy, cx + S(4.0f), cy + rowH, Col(kGold, a), 0);   // the lit row's tick
+            Text(dl, u.semi, ImVec2(cx + S(18.0f) + lean * 0.5f, cy + std::floor((rowH - u.semi.px) * 0.5f)), kInk,
+                 a, act.label);
+            // The command, right-aligned; when the row is too narrow for label and command it is cut
+            // with an ellipsis rather than dropped (a missing label looks like a bug).
+            const ImVec2 ls = Measure(u.semi, act.label);
+            const float cmdR = x1 - S(14.0f) + lean * 0.5f;
+            const float cmdAvail = cmdR - (cx + S(18.0f) + lean * 0.5f + ls.x + S(14.0f));
+            const std::string cmdText = FitText(u.small, act.cmd, cmdAvail);
+            if (!cmdText.empty())
+                Text(dl, u.small, ImVec2(cmdR - Measure(u.small, cmdText.c_str()).x, cy + std::floor((rowH - u.small.px) * 0.5f)),
+                     kInk, a * (hot ? 0.90f : 0.66f), cmdText.c_str());
+
+            if (L.actionCount < UiState::kMaxActions) {
+                const int k = L.actionCount++;
+                L.actionRect[k][0] = cx; L.actionRect[k][1] = cy; L.actionRect[k][2] = colW; L.actionRect[k][3] = rowH;
+                std::snprintf(L.actionCmd[k], sizeof(L.actionCmd[k]), "%s", act.cmd);
+            }
+        }
+
+        if (clicked >= 0) {
+            Submit(kActions[clicked].cmd);
+            CloseInventory();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    u.invJustOpened = false;
+
+    L.invOpen = true;
+    L.invX = px; L.invY = py; L.invW = pw; L.invH = ph;
+}
+
+// The Alt+F4 confirm: a card a little above the middle that takes neither the mouse nor the game's keys (the
+// world, the sender and the player keep running). The WndProc answers Enter / Alt+F4 (quit) and Esc
+// (stay); the gold rail along the top runs down the time left before the card goes away by itself.
+void DrawQuitPrompt(ImDrawList* dl, float W, float H, float a, float left)
+{
+    const float pad = S(28.0f), ch = S(22.0f);
+    const float pw = std::fmin(S(560.0f), W - S(48.0f));
+    const char* title = "Quit Solar RP?";
+    const char* body = "The game keeps running until you choose.";
+    const float titleY0 = S(24.0f), bodyY0 = titleY0 + u.title.px + S(10.0f);
+    const float sepY0 = bodyY0 + u.small.px + S(22.0f), footH = S(52.0f);
+    const float ph = sepY0 + footH;
+    const float px = std::floor((W - pw) * 0.5f);
+    const float py = std::floor(H * 0.36f - (1.0f - a) * S(10.0f)); // GI 2026-11-02: lower than the first 0.26
+
+    PlateChamfer(dl, px, py, px + pw, py + ph, ch, Col(kPanel, 0.95f * a), Col(kHair, 0.16f * a));
+    // The countdown: the rail spans the top edge after the chamfer and shrinks toward its start.
+    const float railW = (pw - ch) * std::fmin(std::fmax(left, 0.0f), 1.0f);
+    if (railW > 0.5f)
+        dl->AddRectFilled(ImVec2(px + ch, py), ImVec2(px + ch + railW, py + std::fmax(2.0f, S(3.0f))), Col(kGold, a));
+
+    Text(dl, u.title, ImVec2(px + pad, py + titleY0), kInk, a, title);
+    Text(dl, u.small, ImVec2(px + pad, py + bodyY0), kInk2, a * 0.86f, body);
+
+    const float sepY = py + sepY0;
+    dl->AddLine(ImVec2(px + pad, sepY), ImVec2(px + pw - pad, sepY), Col(kHair, 0.14f * a), u.px1);
+    const float capH = u.small.px + S(8.0f);
+    const float capY = sepY + std::floor((footH - capH) * 0.5f);
+    const float g = S(8.0f);
+    float x = px + pad;
+    x = KeyCap(dl, x, capY, "Enter", a) + g;
+    Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "or");
+    x += Measure(u.small, "or").x + g;
+    x = KeyCap(dl, x, capY, "Alt+F4", a) + g;
+    Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "quit");
+    const float lean = capH * kSkew;
+    const float wEsc = Measure(u.small, "Esc").x + S(16.0f) + lean, wStay = Measure(u.small, "stay").x;
+    float rx = px + pw - pad - (wEsc + g + wStay);
+    rx = KeyCap(dl, rx, capY, "Esc", a) + g;
+    Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "stay");
+}
+
+// The pointer: an ink arrow with a ground-coloured outline (readable on the dark panels and on a bright
+// street), sized with the display. Drawn on the foreground list so nothing covers it.
+void DrawCursor(ImVec2 m)
+{
+    if (!(m.x > -1.0e6f && m.y > -1.0e6f))
+        return;                                    // ImGui has not seen the mouse yet
+    const float k = std::fmax(1.0f, u.scale * 1.25f);
+    const ImVec2 q[7] = {{0.0f, 0.0f}, {0.0f, 17.0f}, {4.2f, 13.4f}, {7.2f, 20.0f},
+                         {10.0f, 18.8f}, {7.0f, 12.4f}, {12.4f, 12.4f}};
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // The arrow is concave: fill it as convex pieces (left sliver, head triangles, tail). The outline
+    // is the same shape in the ground colour, stamped one pixel to every side first (a stroked polyline puts a
+    // miter spike, drawn as a stray dot, on the 45 degree tip).
+    auto fill = [&](float ox, float oy, ImU32 c) {
+        ImVec2 p[7];
+        for (int i = 0; i < 7; ++i)
+            p[i] = ImVec2(std::floor(m.x + ox + q[i].x * k + 0.5f), std::floor(m.y + oy + q[i].y * k + 0.5f));
+        dl->AddTriangleFilled(p[0], p[1], p[2], c);
+        dl->AddTriangleFilled(p[0], p[2], p[5], c);
+        dl->AddTriangleFilled(p[0], p[5], p[6], c);
+        dl->AddQuadFilled(p[2], p[3], p[4], p[5], c);
+    };
+    const float o = u.px1;
+    const ImU32 outline = Col(kGround, 1.0f);
+    static const float kDir[8][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+    for (const auto& d : kDir)
+        fill(d[0] * o, d[1] * o, outline);
+    fill(0.0f, 0.0f, Col(kInk, 1.0f));
+}
+
+void DrawLoader(float W, float H, ULONGLONG now, const std::string& status, bool failed, UiState& L)
+{
+    const float a = u.loaderA;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    // Ground: opaque while the loader is fully up, so GTA's own loading screen is hidden.
+    const ImU32 top = Col(kPanelHi, a), bot = Col(kGround, a);
+    dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, H), top, top, bot, bot);
+
+    // Real GTA V stills behind the block, cover-cropped to the display and crossfaded (8 s hold, 2 s
+    // fade). The ground stays under them (fully opaque while the loader is up). A dark gradient from
+    // the left keeps the type readable and leaves the right of the picture visible.
+    if (!u.loaderT0)
+        u.loaderT0 = now;
+    L.loaderSceneTextured = u.tex.sceneA != nullptr;
+    if (u.tex.sceneA || u.tex.sceneB) {
+        const float aspect = 16.0f / 9.0f, dispAspect = W / H;
+        float u0 = 0.0f, u1 = 1.0f, v0 = 0.0f, v1 = 1.0f;
+        if (dispAspect > aspect) {            // wider than the picture: crop top and bottom
+            const float k = aspect / dispAspect;
+            v0 = (1.0f - k) * 0.5f; v1 = v0 + k;
+        } else {                              // narrower: crop the sides, keeping the right-hand scene
+            const float k = dispAspect / aspect;
+            u0 = (1.0f - k) * 0.6f; u1 = u0 + k;
+        }
+        const float cyc = (float)((now - u.loaderT0) % 20000ULL) / 1000.0f;     // 0..20 s
+        float mix = 0.0f;                     // 0: A, 1: B
+        if (cyc >= 8.0f && cyc < 10.0f)        mix = (cyc - 8.0f) / 2.0f;
+        else if (cyc >= 10.0f && cyc < 18.0f)  mix = 1.0f;
+        else if (cyc >= 18.0f)                 mix = 1.0f - (cyc - 18.0f) / 2.0f;
+        mix = mix * mix * (3.0f - 2.0f * mix);
+        L.loaderSceneMix = mix;
+        const float dim = 0.80f;               // the picture's own brightness under the gradient
+        void* first = u.tex.sceneA ? u.tex.sceneA : u.tex.sceneB;
+        void* second = u.tex.sceneA ? u.tex.sceneB : nullptr;
+        dl->AddImage((ImTextureID)first, ImVec2(0, 0), ImVec2(W, H), ImVec2(u0, v0), ImVec2(u1, v1),
+                     Col({dim, dim, dim}, a));
+        if (second && mix > 0.003f)
+            dl->AddImage((ImTextureID)second, ImVec2(0, 0), ImVec2(W, H), ImVec2(u0, v0), ImVec2(u1, v1),
+                         Col({dim, dim, dim}, a * mix));
+        const float mid = std::floor(W * 0.50f);
+        const ImU32 sl = Col(kGround, 0.94f * a), sm = Col(kGround, 0.52f * a), sr = Col(kGround, 0.16f * a);
+        dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(mid, H), sl, sm, sm, sl);
+        dl->AddRectFilledMultiColor(ImVec2(mid, 0), ImVec2(W, H), sm, sr, sr, sm);
+        // Foot of the picture: the lower fifth sinks into the ground.
+        const ImU32 f0 = Col(kGround, 0.0f), f1 = Col(kGround, 0.55f * a);
+        dl->AddRectFilledMultiColor(ImVec2(0, std::floor(H * 0.78f)), ImVec2(W, H), f0, f0, f1, f1);
+    } else if (u.tex.mark1024) {
+        // No stills: the mark, huge and nearly invisible, bleeding off the right edge. The S is 1:2, so it is
+        // as tall as the old square mark was and half as wide.
+        const float gh = std::floor(H * 1.28f), gw = std::floor(gh * kMarkAspect);
+        const float gx = std::floor(W - gw * 0.72f), gy = std::floor((H - gh) * 0.5f);
+        dl->AddImage((ImTextureID)u.tex.mark1024, ImVec2(gx, gy), ImVec2(gx + gw, gy + gh), MarkUv0(1024.0f), MarkUv1(1024.0f),
+                     Col(kNoTint, 0.085f * a));
+    }
+
+    // Block: lockup, tagline, progress segments, status.
+    const float lh = S(112.0f);
+    const float lw = (u.tex.lockup && u.tex.lockupH > 0) ? std::floor(lh * (float)u.tex.lockupW / (float)u.tex.lockupH)
+                                                         : S(480.0f);
+    const float tagH = S(24.0f), segH = S(18.0f), stH = S(26.0f);
+    const float gap1 = S(18.0f), gap2 = S(52.0f), gap3 = S(22.0f);
+    const float blockH = lh + gap1 + tagH + gap2 + segH + gap3 + stH;
+    const float bx = std::floor(W * 0.085f), by = std::floor((H - blockH) * 0.5f);
+
+    if (u.tex.lockup) {
+        dl->AddImage((ImTextureID)u.tex.lockup, ImVec2(bx, by), ImVec2(bx + lw, by + lh), ImVec2(0, 0), ImVec2(1, 1),
+                     Col(kNoTint, a));
+    } else {
+        // No texture: the wordmark typeset in the numeral face.
+        Text(dl, u.num, ImVec2(bx, by + (lh - u.num.px) * 0.5f), kInk, a, "SOLAR RP");
+    }
+    L.loaderLockupTextured = u.tex.lockup != nullptr;
+    L.loaderLockupX = bx; L.loaderLockupY = by; L.loaderLockupW = lw; L.loaderLockupH = lh;
+
+    Text(dl, u.mid, ImVec2(bx + S(4.0f), by + lh + gap1), kInk, a * 0.70f, "GTA V multiplayer network");
+
+    // Progress: the speedometer's leaning segments, a lit run travelling along them. The row is as
+    // wide as the lockup above it. A failed connection is not progress: the row stands still, dim.
+    const float sy = by + lh + gap1 + tagH + gap2;
+    const int n = 26;
+    const float lean = segH * kSkew;
+    // The lockup's artwork starts 4 px (design) inside its image, so the row starts there too and both
+    // end on the lockup's right edge.
+    const float barX = bx + S(4.0f);
+    const float pitch = (lw - S(4.0f) - lean) / (float)n, segW = pitch - S(5.0f);
+    const float head = std::fmod((float)(now % 2600ULL) / 2600.0f * (float)(n + 8), (float)(n + 8));
+    for (int i = 0; i < n; ++i) {
+        const float x = barX + pitch * (float)i;
+        const ImVec2 p[4] = {{x + lean, sy}, {x + lean + segW, sy}, {x + segW, sy + segH}, {x, sy + segH}};
+        const float d = head - (float)i;     // behind the head
+        ImU32 c = Col(kInk, (failed ? 0.18f : 0.10f) * a);     // a stopped row must still read over the picture
+        if (!failed && d >= 0.0f && d < 8.0f) {
+            const float t = 1.0f - d / 8.0f;
+            c = d < 1.0f ? Col(kInk, a) : Col(kGold, (0.14f + 0.86f * t) * a);
+        }
+        dl->AddConvexPolyFilled(p, 4, c);
+    }
+    L.loaderBarX = barX; L.loaderBarY = sy; L.loaderBarW = lw - S(4.0f); L.loaderBarH = segH;
+    L.loaderFailed = failed;
+
+    // Status: wrapped to the screen (a long host name must not run off it), with travelling dots
+    // while it is still working, and at full ink once it has given up.
+    const char* st = status.empty() ? "Loading" : status.c_str();
+    const float stY = sy + segH + gap3;
+    const float stWrap = std::fmax(S(200.0f), lw);      // never wider than the block above it
+    const ImVec2 sm = Measure(u.mid, st, stWrap);
+    const float stA = failed ? 0.97f : 0.88f;
+    const Rgb stC = failed ? kEmber : kInk;
+    Text(dl, u.mid, ImVec2(bx + S(4.0f), stY), stC, a * stA, st, stWrap);
+    L.loaderStatusX = bx; L.loaderStatusY = stY; L.loaderStatusW = sm.x + S(40.0f);
+    L.loaderStatusH = sm.y;
+    const bool oneLine = sm.y < u.mid.px * 1.5f;
+    if (!failed && oneLine) {
+        const float dotsX = bx + S(4.0f) + sm.x + S(3.0f);
+        const int dots = (int)((now / 420ULL) % 4ULL);
+        char ds[4] = {0, 0, 0, 0};
+        for (int i = 0; i < dots; ++i) ds[i] = '.';
+        if (dots)
+            Text(dl, u.mid, ImVec2(dotsX, stY), kInk, a * stA, ds);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat view refresh
+// ---------------------------------------------------------------------------
+void RefreshView()
+{
+    DLock lk;
+    Data& d = D();
+    if (u.viewSeq == d.chatSeq)
+        return;
+    const bool grew = u.viewSeq != ~0u;
+    u.viewSeq = d.chatSeq;
+    const std::size_t n = std::min(d.chat.size(), kViewMax);
+    u.view.clear();
+    u.view.reserve(n);
+    for (std::size_t i = d.chat.size() - n; i < d.chat.size(); ++i) {
+        const Line& l = d.chat[i];
+        ViewLine v;
+        v.name = l.name; v.text = l.text; v.at = l.at; v.system = l.system; v.self = l.self;
+        u.view.push_back(std::move(v));
+    }
+    if (grew)
+        u.scroll = 0;       // a new line while scrolled back jumps to the bottom
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// detail:: seam (overlay.cpp)
+// ---------------------------------------------------------------------------
+namespace detail {
+
+void UiInit(float scale)
+{
+    u = Ui();
+    u.scale = scale;
+    u.px1 = std::fmax(1.0f, std::floor(scale + 0.5f));
+    ImGuiIO& io = ImGui::GetIO();
+
+    static const char* const kRegular[] = {"segoeui.ttf"};
+    static const char* const kSemibold[] = {"seguisb.ttf", "segoeuib.ttf", "segoeui.ttf"};
+    static const char* const kBoldItalic[] = {"segoeuiz.ttf", "seguisbi.ttf", "segoeuii.ttf", "segoeuib.ttf", "segoeui.ttf"};
+    u.bakeScale = scale;
+    // Pixel size at this scale, never below `floorPx`: 15 px type is already small, at 0.75 it must not
+    // become 11 px (small text) or 14 px (body).
+    const auto load = [&](const char* const* files, int nFiles, float design, float floorPx, const ImWchar* ranges) {
+        Fnt f = LoadFont(io, files, nFiles, FontPx(design, floorPx, scale), ranges);
+        f.design = design;
+        f.minPx = floorPx;
+        return f;
+    };
+
+    u.body  = load(kRegular, 1, 19.0f, 15.0f, kFullRanges);      // first font: ImGui's default
+    u.semi  = load(kSemibold, 3, 19.0f, 15.0f, kFullRanges);
+    u.small = load(kSemibold, 3, 16.0f, 14.0f, kLatinRanges);
+    u.mid   = load(kSemibold, 3, 23.0f, 17.0f, kLatinRanges);
+    u.title = load(kSemibold, 3, 30.0f, 22.0f, kLatinRanges);
+    u.num   = load(kBoldItalic, 5, 76.0f, 56.0f, kLatinRanges);
+    u.numMid = load(kBoldItalic, 5, 22.0f, 17.0f, kLatinRanges);   // the vitals values, in the brand's numerals
+    BuildStyle(scale);
+}
+
+void UiSetTextures(const UiTextures& t)
+{
+    u.tex = t;
+    if (!kUseBrandArt) {    // belt and braces: no backend can bring the retired art back
+        u.tex.mark64 = u.tex.mark256 = u.tex.mark1024 = u.tex.lockup = nullptr;
+        u.tex.lockupW = u.tex.lockupH = 0;
+    }
+}
+
+void UiReset()
+{
+    g_interactive.store(false);
+    u = Ui();
+}
+
+bool UiInteractive() { return g_interactive.load(); }
+
+void UiFrame()
+{
+    if (!u.body.font)
+        return;                              // UiInit never ran: draw nothing rather than crash
+    ImGuiIO& io = ImGui::GetIO();
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+    if (W < 16.0f || H < 16.0f)
+        return;
+    RefreshScale(H);
+    const float dt = std::fmin(std::fmax(io.DeltaTime, 0.0f), 0.1f);
+    const ULONGLONG now = GetTickCount64();
+    const bool loading = g_phase.load() == (int)Phase::Loading;
+    ++u.frame;
+
+    // Fades. The loader comes up fast and leaves slowly; the HUD arrives as the loader thins.
+    if (u.first) {
+        u.first = false;
+        u.loaderA = loading ? 1.0f : 0.0f;
+    }
+    u.loaderA = Approach(u.loaderA, loading ? 1.0f : 0.0f, dt / (loading ? 0.20f : 0.70f));
+    const float hudTarget = (!loading && u.loaderA < 0.85f) ? 1.0f : 0.0f;
+    u.hudA = Approach(u.hudA, hudTarget, dt / (hudTarget > 0.0f ? 0.45f : 0.12f));
+    const bool live = !loading && u.hudA > 0.6f;
+
+    const bool inVeh = g_inVehicle.load();
+    const float speed = g_speedKmh.load();
+    // The speed on screen eases toward the pushed value (k = 12: ~95 % in a quarter second) so a jittery
+    // per-tick push never flickers the digits or the gauge; it snaps while the speedometer is hidden, so
+    // getting into a moving car starts at the true speed.
+    if (u.speedA <= 0.003f)
+        u.speedSm = speed;
+    else
+        u.speedSm = Ease(u.speedSm, speed, 12.0f, dt, 0.15f);
+    u.speedA = Approach(u.speedA, (inVeh && !loading) ? 1.0f : 0.0f, dt / 0.18f);
+    TickVitals(dt, loading);
+    u.chatA = Approach(u.chatA, u.chatOpen ? 1.0f : 0.0f, dt / 0.12f);
+    u.invA = Approach(u.invA, u.invOpen ? 1.0f : 0.0f, dt / 0.14f);
+    {
+        // The Alt+F4 confirm times out here; a WndProc answer may close it at the same moment, so
+        // only the opening this frame saw is cleared.
+        ULONGLONG at = g_quitPromptAt.load();
+        if (at && now - at >= kQuitPromptMs && g_quitPromptAt.compare_exchange_strong(at, 0))
+            at = 0;
+        if (at)
+            u.quitLeft = 1.0f - (float)(now - at) / (float)kQuitPromptMs;
+        u.quitA = Approach(u.quitA, at ? 1.0f : 0.0f, dt / 0.12f);
+    }
+
+    if (loading && (u.chatOpen || u.invOpen)) {
+        CloseChat();
+        CloseInventory();
+    }
+
+    // Hotkeys: ImGui key events (the WndProc subclass feeds them), no natives.
+    if (live) {
+        const bool tab = ImGui::IsKeyPressed(ImGuiKey_Tab, false);
+        const bool esc = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+        const bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+        const bool tKey = ImGui::IsKeyPressed(ImGuiKey_T, false);
+        if (u.chatOpen) {
+            if (esc)
+                CloseChat();
+        } else if (u.invOpen) {
+            if (tab || esc)
+                CloseInventory();
+        } else if (tab) {
+            OpenInventory();
+        } else if (enter || tKey) {
+            OpenChat(now);
+        }
+    }
+
+    // The text box takes focus a frame or two after the chat opens, and ImGui drops the characters
+    // queued before then. Hold what the player types meanwhile and put it back in front, in order,
+    // on the first frame the box is active.
+    if (u.chatOpen) {
+        if (!u.inputActive) {
+            for (int i = 0; i < io.InputQueueCharacters.Size && u.held.size() < (std::size_t)kBufLen; ++i)
+                u.held.push_back(io.InputQueueCharacters[i]);
+            io.InputQueueCharacters.resize(0);
+        } else if (!u.held.empty()) {
+            ImVector<ImWchar> merged;
+            for (std::size_t i = 0; i < u.held.size(); ++i)
+                merged.push_back(u.held[i]);
+            for (int i = 0; i < io.InputQueueCharacters.Size; ++i)
+                merged.push_back(io.InputQueueCharacters[i]);
+            io.InputQueueCharacters.swap(merged);
+            u.held.clear();
+        }
+    }
+
+    // Keyboard navigation of the quick actions (arrows + Enter) only while that panel is open.
+    if (u.invOpen)
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    else
+        io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+
+    RefreshView();
+    std::string status;
+    bool statusFailed = false;
+    if (u.loaderA > 0.003f) {
+        DLock lk;
+        status = D().status;
+        statusFailed = D().statusFailed;
+    }
+
+    UiState L;
+    L.valid = true;
+    L.displayW = W; L.displayH = H; L.scale = u.scale;
+    L.loaderAlpha = u.loaderA; L.hudAlpha = u.hudA;
+
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    if (u.hudA > 0.003f) {
+        // Bottom-right cluster (speedometer, vitals) and chat first, then the scrim over them (the
+        // palette is a modal layer), then the mark on top so the brand stays at full strength.
+        if (u.speedA > 0.003f)
+            DrawSpeedo(bg, W, H, u.speedA * u.hudA, u.speedSm, L);
+        if (u.vitalsA > 0.003f)
+            DrawVitals(bg, W, H, u.vitalsA * u.hudA, L);
+        DrawChat(bg, W, H, now, u.hudA, L);
+        if (u.invA > 0.003f)
+            bg->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Col(kGround, 0.52f * u.invA * u.hudA));
+        DrawLogo(bg, W, u.hudA, L);
+        if (u.invOpen)
+            DrawInventory(W, H, u.hudA, L);
+    }
+    if (u.loaderA > 0.003f)
+        DrawLoader(W, H, now, status, statusFailed, L);
+    if (u.quitA > 0.003f)                 // over everything, the loader included: Alt+F4 works while loading
+        DrawQuitPrompt(ImGui::GetForegroundDrawList(), W, H, u.quitA, u.quitLeft);
+
+    const bool interactive = live && (u.chatOpen || u.invOpen);
+    L.interactive = interactive;
+    g_interactive.store(interactive);
+    io.MouseDrawCursor = false;           // ImGui's own 12 x 19 bitmap is unreadable on a 4K display: draw ours
+    if (interactive)
+        DrawCursor(io.MousePos);
+    u.last = L;
+}
+
+} // namespace detail
+
+// ---------------------------------------------------------------------------
+// Public push / pull API (overlay.h)
+// ---------------------------------------------------------------------------
+void SetPhase(Phase p) { g_phase.store((int)p); }
+
+void SetLoaderStatus(const char* utf8, bool failed)
+{
+    std::string s = Clean(utf8, kStatusMax);
+    DLock lk;
+    if (D().status != s)
+        D().status = std::move(s);
+    D().statusFailed = failed;
+}
+
+void SetStats(bool inVehicle, float speedKmh)
+{
+    g_inVehicle.store(inVehicle);
+    g_speedKmh.store(speedKmh == speedKmh && speedKmh > 0.0f ? speedKmh : 0.0f);   // NaN and negatives show 0
+}
+
+void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel)
+{
+    g_vitHealth.store(Frac01(healthFrac));        // NaN counts as 0, the rest is clamped to 0..1
+    g_vitSatiety.store(Frac01(satietyFrac));
+    g_vitFuel.store(Frac01(fuelFrac));
+    g_vitShow.store(show);
+    g_vitShowFuel.store(showFuel);
+}
+
+void PushChatLine(const char* name, const char* text, bool self)
+{
+    Line l;
+    l.name = Clean(name, kNameMax);
+    l.text = Clean(text, kTextMax);
+    if (l.text.empty())
+        return;
+    l.system = l.name.empty();
+    l.self = self;
+    l.at = GetTickCount64();
+    PushLine(std::move(l));
+}
+
+void PushSystemLine(const char* text) { PushSystem(Clean(text, kTextMax)); }
+
+bool PopOutgoing(char* out, std::size_t cap)
+{
+    if (!out || cap == 0)
+        return false;
+    out[0] = 0;
+    DLock lk;
+    std::deque<std::string>& q = D().out;
+    if (q.empty())
+        return false;
+    const std::string s = std::move(q.front());
+    q.pop_front();
+    const std::size_t n = std::min(s.size(), cap - 1);
+    std::memcpy(out, s.data(), n);
+    out[n] = 0;
+    return true;
+}
+
+bool Interactive() { return g_interactive.load(); }
+
+bool OpenQuitPrompt()
+{
+    ULONGLONG closed = 0;
+    return g_quitPromptAt.compare_exchange_strong(closed, std::max<ULONGLONG>(GetTickCount64(), 1));
+}
+
+bool QuitPromptOpen() { return g_quitPromptAt.load() != 0; }
+
+void CloseQuitPrompt() { g_quitPromptAt.store(0); }
+
+UiState LastUiState() { return u.last; }
+
+} // namespace gage::game::Overlay

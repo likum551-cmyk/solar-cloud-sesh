@@ -1,0 +1,117 @@
+# Caddy for the Solar RP VPS. Installed to /etc/caddy/Caddyfile by tools/deploy/bootstrap-vps.sh (the package's own
+# file is kept next to it as Caddyfile.dist). Validate before every reload:
+#   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl reload caddy
+#
+# What is served
+#   https://solar-rp.com/update/*     the launcher's update feed: version.json (signed) and the installers, from
+#                                     /var/www/gage/update, written by tools/deploy/publish-client.sh. Launchers from
+#                                     0.4.0 on have https://solar-rp.com/update/version.json baked in.
+#   https://solar-rp.com/* (the rest) the website (apps/website) from /var/www/gage/site, a symlink to the live release
+#                                     that tools/deploy/deploy-site.sh switches. Also on the bare IP over plain HTTP.
+#   https://www.solar-rp.com/*        permanent redirect to the apex.
+#   http://5.175.253.187/update/*     the same files over plain HTTP on the bare IP: fallback, and the address the
+#                                     publish script checks through (http://127.0.0.1). The manifest is signed, so
+#                                     the transport does not have to be trusted.
+#
+# HTTPS is automatic: on the first start Caddy asks Let's Encrypt for certificates for solar-rp.com and
+# www.solar-rp.com. That needs, BEFORE the first start:
+#   - DNS A records for @ and www -> 5.175.253.187 (done),
+#   - ports 80 and 443 (tcp) open in ufw (bootstrap-vps.sh does that) AND in the Hetzner Cloud Firewall (Cloud Console,
+#     Firewalls: inbound tcp 80, 443; nothing on the VPS can open that one).
+# {$DOMAIN:solar-rp.com} is the host name; to run under another name set Environment=DOMAIN=<name> with
+# `systemctl edit caddy`. (An EMPTY DOMAIN breaks the file, because the value is substituted before parsing.)
+# IP-only operation: delete the two blocks that use {$DOMAIN:solar-rp.com} and the launcher's baked URL has to be the IP one.
+#
+# The :80 block stays whatever the domain does: a host-name site beats the :80 catch-all for its own host names, and
+# Caddy redirects http://solar-rp.com to https on its own, so :80 only ever answers other Host values (the bare IP).
+
+(gage_update) {
+	# /update/<file> is looked up as /var/www/gage/update/<file>. file_server has no directory listing unless `browse` is added;
+	# a directory answers with its index.txt (bootstrap-vps.sh leaves a placeholder there, which also serves its HTTPS self-check).
+	root * /var/www/gage
+	encode zstd gzip
+
+	# The manifest is the one file that changes under a fixed name: never cache it, so a published release is seen at once.
+	@manifest path /update/version.json
+	header @manifest Cache-Control "no-store"
+
+	# Installers are named by version and never replaced by different bytes (publish-client.sh refuses that). Both
+	# naming generations are served: SolarRP-Setup-<v>.exe and the pre-rename GAGE-MP-Setup-<v>.exe.
+	@installer path_regexp installer ^/update/(SolarRP|GAGE-MP)-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$
+	header @installer Cache-Control "public, max-age=86400"
+
+	file_server
+}
+
+(gage_site) {
+	# The website (apps/website), deployed by tools/deploy/deploy-site.sh: /var/www/gage/site is a symlink to the live
+	# release in /var/www/gage/site-releases/<stamp>/, switched in one rename. Until the first deploy it does not exist
+	# and every path answers 404.
+	root * /var/www/gage/site
+	encode zstd gzip
+
+	# Vite names every built file by its content hash: cache it for good.
+	@hashed path /assets/*
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+	# Footage, stills and screenshots keep their names across deploys: a day, then revalidate.
+	@media path /media/* /shots/* /og.png /apple-touch-icon.png /favicon.svg /favicon-32.png /mark.svg
+	header @media Cache-Control "public, max-age=86400"
+	# The page itself names the hashed files: always revalidate it, so a deploy is seen at once.
+	@page path / /index.html
+	header @page Cache-Control "no-cache"
+
+	# Everything the page loads is its own: scripts and fonts from /assets, footage from /media, the release manifest from
+	# /update/version.json (same origin). GSAP and SplitText write inline styles, hence 'unsafe-inline' for styles only.
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Strict-Transport-Security "max-age=31536000"
+	}
+	file_server
+}
+
+# ---- https://solar-rp.com --------------------------------------------------------------------------------------
+{$DOMAIN:solar-rp.com} {
+	handle /update/* {
+		import gage_update
+	}
+	# Liveness for scripts and uptime checks; has nothing to do with the game server.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# The master server list (apps/master, Node, 127.0.0.1:8080). Uncomment when it runs on this VPS. Only the read
+	# side is public; POST /announce stays on loopback, where the game server announces itself.
+	# handle /servers {
+	# 	reverse_proxy 127.0.0.1:8080
+	# }
+	# Then set list_url=https://solar-rp.com/servers in gage_mp.cfg, or change kDefaultListUrl in libs/net/serverfinder.h.
+
+	# Everything else is the website.
+	handle {
+		import gage_site
+	}
+	log
+}
+
+# ---- www -> apex -----------------------------------------------------------------------------------------------
+www.{$DOMAIN:solar-rp.com} {
+	redir https://{$DOMAIN:solar-rp.com}{uri} permanent
+}
+
+# ---- plain HTTP on the bare IP (and on anything else that is not one of the host names above) -----------------
+:80 {
+	handle /update/* {
+		import gage_update
+	}
+	handle /healthz {
+		respond "ok" 200
+	}
+	# The website on the bare IP too (plain HTTP; the browser ignores HSTS sent over http).
+	handle {
+		import gage_site
+	}
+	log
+}

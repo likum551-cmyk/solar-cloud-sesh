@@ -1,0 +1,75 @@
+/* GAGE-MP in-game UI — minimal, dark, chat-first. */
+:root {
+  --bg: #0d0f14;
+  --panel: #161a22;
+  --fg: #e6e9ef;
+  --muted: #8b93a1;
+  --accent: #3ba6ff;
+  --who: #9ecbff;
+  --in: #cdd6e4;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  overflow: hidden;
+}
+
+.app {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  width: min(680px, 90vw);
+  background: var(--panel);
+  border: 1px solid #232a36;
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  padding: 10px 12px 12px;
+}
+
+.status {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: .02em;
+  margin-bottom: 8px;
+}
+
+.chat {
+  max-height: 240px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+.chat.hidden { display: none; }
+
+.line {
+  line-height: 1.4;
+  margin: 2px 0;
+  word-wrap: break-word;
+}
+.who { color: var(--who); }
+.line.in { color: var(--in); }
+
+.input-row { display: flex; }
+
+#chat-input {
+  flex: 1;
+  background: #0f131a;
+  color: var(--fg);
+  border: 1px solid #2a3340;
+  border-radius: 5px;
+  padding: 8px 10px;
+  font: inherit;
+  outline: none;
+}
+#chat-input:focus { border-color: var(--accent); }
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-thumb { background: #2a3340; border-radius: 4px; }

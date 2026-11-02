@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs Inno Setup's ISCC.exe under wine, so installer/build-installer.sh can be used unchanged on the VPS:
+#   ISCC=<this file> PATH=<shim dir>:$PATH bash installer/build-installer.sh
+# (build-installer.sh tests `[ -x "$ISCC" ]` and then executes it with /Q /DAppVersion=... /DBinDir=... <iss>.)
+#
+# The compiler directory comes from GAGE_INNO_DIR (default /opt/gage/inno/6.7.3, a copy of
+# .toolchain/innosetup-6.7.3 made by tools/deploy/build-client.sh). ISCC.exe, ISCmplr.dll and ISPP.dll are 32-bit x86
+# programs, so this needs wine32:i386 and a WoW64 prefix.
+set -euo pipefail
+SHIM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$SHIM_DIR/../lib/wine-env.sh"
+: "${GAGE_OPT:=/opt/gage}"
+: "${GAGE_INNO_DIR:=$GAGE_OPT/inno/6.7.3}"
+wine_env_init || { echo "iscc shim: wine is not installed (tools/deploy/bootstrap-vps.sh)" >&2; exit 127; }
+[ -f "$GAGE_INNO_DIR/ISCC.exe" ] || { echo "iscc shim: $GAGE_INNO_DIR/ISCC.exe missing (tools/deploy/build-client.sh copies it there)" >&2; exit 1; }
+
+# ISCC parses /D switches itself: they arrive as-is ("/DAppVersion=0.3.5", "/DBinDir=Z:\opt\gage\build\win\bin").
+wine_run "$GAGE_INNO_DIR/ISCC.exe" "$@"

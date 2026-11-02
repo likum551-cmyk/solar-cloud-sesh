@@ -1,0 +1,13 @@
+# Runs gage-healthcheck.service every minute (first run two minutes after boot, so services are up).
+[Unit]
+Description=GAGE health check every minute
+Documentation=file:///opt/gage/deploy/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=gage-healthcheck.service
+
+[Install]
+WantedBy=timers.target

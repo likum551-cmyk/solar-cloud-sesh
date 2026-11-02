@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Runs one Windows program under wine and returns its exit code, so a Node driver that expects to start a native
+# executable (tests/update_check_test.mjs does execFile(exe, args)) can start it on Linux:
+#
+#   wine-exe <program.exe> [args...]
+#
+# Arguments that look like Unix paths (they start with "/", have a second "/" and the parent directory exists)
+# are rewritten to their Windows spelling with winepath; everything else, including http:// URLs and /X switches,
+# is passed through untouched.
+set -euo pipefail
+SHIM_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$SHIM_DIR/../lib/wine-env.sh"
+wine_env_init || { echo "wine-exe: wine is not installed (tools/deploy/bootstrap-vps.sh)" >&2; exit 127; }
+[ $# -ge 1 ] || { echo "usage: wine-exe <program.exe> [args...]" >&2; exit 2; }
+
+exe=$1; shift
+args=()
+for a in "$@"; do
+  if [[ $a == /*/* && -d $(dirname "$a") ]]; then
+    a=$(wine_win_path "$a") || { echo "wine-exe: winepath failed for '$a'" >&2; exit 1; }
+  fi
+  args+=("$a")
+done
+exec_args=("$exe" "${args[@]}")
+if [ -n "${XVFB_RUN:-}" ]; then
+  # no exec: xvfb-run must stay the parent so the virtual display is torn down
+  "$XVFB_RUN" -a "$WINE_BIN" "${exec_args[@]}"
+else
+  exec "$WINE_BIN" "${exec_args[@]}"
+fi

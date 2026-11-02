@@ -1,0 +1,46 @@
+# Nightly pg_dump of the platform database (see scripts/backup-db.sh), run by gage-backup.timer.
+# Runs as the postgres OS user so pg_dump uses peer authentication on the local socket: no database
+# password is stored anywhere for backups. /var/backups/gage must exist (README, "Directories").
+#   settings (optional)  /etc/gage/backup.env : BACKUP_DB, BACKUP_DIR, BACKUP_KEEP_DAYS, BACKUP_MIN_KEEP,
+#                        BACKUP_POST_HOOK (off-site copy)
+[Unit]
+Description=GAGE database backup
+Documentation=file:///opt/gage/deploy/README.md
+After=postgresql.service
+Wants=postgresql.service
+AssertPathIsDirectory=/var/backups/gage
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile=-/etc/gage/backup.env
+ExecStart=/usr/bin/bash /opt/gage/deploy/scripts/backup-db.sh
+TimeoutStartSec=1h
+StandardOutput=journal
+StandardError=journal
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/backups/gage
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# AF_UNIX: the PostgreSQL socket. AF_INET*: only for a BACKUP_POST_HOOK that copies off-site.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077

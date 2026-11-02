@@ -1,0 +1,193 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-29T18:00:00+04:00",
+  "title": "Design System: GAGE-MP Launcher",
+  "designMd": "apps/launcher-ui/DESIGN.md",
+  "extensions": {
+    "colorMeta": {
+      "ground": { "role": "neutral", "displayName": "Night Ground", "canonical": "#07080a", "tonalRamp": ["#07080a", "#0b0d10", "#12151a", "#1a1e25", "#2a2f37", "#454b55", "#6b7079", "#a7abb2"] },
+      "panel": { "role": "neutral", "displayName": "Panel Black", "canonical": "#0b0d10", "tonalRamp": ["#07080a", "#0b0d10", "#12151a", "#1a1e25", "#2a2f37", "#454b55", "#6b7079", "#a7abb2"] },
+      "panel-2": { "role": "neutral", "displayName": "Raised Panel", "canonical": "#12151a" },
+      "panel-3": { "role": "neutral", "displayName": "Slot Grey", "canonical": "#1a1e25" },
+      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#f2f1ee", "tonalRamp": ["#1a1e25", "#3a3f47", "#6b7079", "#8a8f97", "#a7abb2", "#c9ccd1", "#e0e0df", "#f2f1ee"] },
+      "ink-2": { "role": "neutral", "displayName": "Ink 2", "canonical": "#c9ccd1" },
+      "ink-3": { "role": "neutral", "displayName": "Ink 3 (the secondary grey)", "canonical": "#a7abb2" },
+      "ink-4": { "role": "neutral", "displayName": "Ink 4 (disabled, decoration)", "canonical": "#6b7079" },
+      "line": { "role": "neutral", "displayName": "Hairline 12%", "canonical": "rgb(255 255 255 / 0.12)" },
+      "line-2": { "role": "neutral", "displayName": "Hairline 20%", "canonical": "rgb(255 255 255 / 0.2)" },
+      "line-soft": { "role": "neutral", "displayName": "Hairline 7%", "canonical": "rgb(255 255 255 / 0.07)" },
+      "blue": { "role": "primary", "displayName": "GAGE Blue", "canonical": "#2d6eb9", "tonalRamp": ["#0d2138", "#163659", "#23578f", "#2d6eb9", "#4a8ad6", "#78a9e2", "#a9c8ee", "#dce8f8"] },
+      "blue-hi": { "role": "primary", "displayName": "Blue Lift (hover, focus ring, caret)", "canonical": "#4a8ad6" },
+      "blue-lo": { "role": "primary", "displayName": "Blue Pressed", "canonical": "#23578f" },
+      "live": { "role": "tertiary", "displayName": "Online Green (dot only)", "canonical": "#3fb66b", "tonalRamp": ["#0f2d1b", "#18462a", "#22643c", "#2f8a52", "#3fb66b", "#6bca8e", "#a1deb6", "#d6f1df"] },
+      "warn": { "role": "tertiary", "displayName": "Amber Hold", "canonical": "#d8a34a", "tonalRamp": ["#33240b", "#523a12", "#7a571c", "#a57829", "#d8a34a", "#e3bb78", "#eed3a6", "#f8ecd8"] },
+      "danger": { "role": "tertiary", "displayName": "Signal Red", "canonical": "#e0645a", "tonalRamp": ["#3a120f", "#5c1d18", "#872b24", "#b84237", "#e0645a", "#e98b83", "#f1b4ae", "#f9dfdc"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display name", "purpose": "The chosen server's name on Play and on the launch overlay; quiet variant clamp(44px, 4.6vw, 68px)." },
+      "display-profile": { "displayName": "Profile name", "purpose": "The player's name on Profile." },
+      "display-settings": { "displayName": "Settings title", "purpose": "The SETTINGS title." },
+      "display-product": { "displayName": "Product name", "purpose": "The showroom name plate; quiet variant clamp(40px, 4.2vw, 60px)." },
+      "figure": { "displayName": "Live count", "purpose": "The live player count; ledger figures 44/36/40px." },
+      "launch-step": { "displayName": "Launch step", "purpose": "The current launch step, the overlay headline." },
+      "headline": { "displayName": "Panel headline", "purpose": "Auth panel title (34px on short windows)." },
+      "title": { "displayName": "Title", "purpose": "Panel titles, settings section heads, fact figures." },
+      "card-name": { "displayName": "Card name", "purpose": "Server, product and owned tile names." },
+      "label-nav": { "displayName": "Nav label", "purpose": "Rail tabs, Shop sub-tabs, hero meta row." },
+      "label": { "displayName": "Label", "purpose": "Field labels, chips, table heads, launch segment names." },
+      "body": { "displayName": "Body", "purpose": "All reading copy, tabular lining figures." },
+      "body-lead": { "displayName": "Lead", "purpose": "Hero body, product line, launch status; launch outcome lead is 18px." },
+      "body-small": { "displayName": "Fine", "purpose": "Hints and fine print." }
+    },
+    "shadows": [
+      { "name": "name-halo", "value": "text-shadow: 0 2px 28px rgb(0 0 0 / 0.4)", "purpose": "Display names over footage." },
+      { "name": "label-halo", "value": "text-shadow: 0 1px 10px rgb(0 0 0 / 0.75)", "purpose": "Small labels standing directly on footage." },
+      { "name": "emblem-shadow", "value": "filter: drop-shadow(0 14px 22px rgb(0 0 0 / 0.55))", "purpose": "The 3D emblem canvas only." },
+      { "name": "hairline", "value": "box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.07)", "purpose": "Panel and card edges are inset hairlines, never drop shadows." },
+      { "name": "scrim-play", "value": "linear-gradient(180deg, rgb(7 8 10 / 0.7) 0, rgb(7 8 10 / 0) 150px), linear-gradient(0deg, rgb(7 8 10 / 0.86) 0, rgb(7 8 10 / 0.42) 24%, rgb(7 8 10 / 0) 48%), linear-gradient(90deg, rgb(7 8 10 / 0.5) 0, rgb(7 8 10 / 0) 40%), linear-gradient(270deg, rgb(7 8 10 / 0.66) 0, rgb(7 8 10 / 0.3) 22%, rgb(7 8 10 / 0) 36%)", "purpose": "Edge-only grade on Play and Auth." },
+      { "name": "scrim-shop", "value": "linear-gradient(180deg, rgb(7 8 10 / 0.7) 0, rgb(7 8 10 / 0) 150px), linear-gradient(0deg, rgb(7 8 10 / 0.94) 0, rgb(7 8 10 / 0.62) 30%, rgb(7 8 10 / 0) 56%), linear-gradient(90deg, rgb(7 8 10 / 0.72) 0, rgb(7 8 10 / 0.3) 34%, rgb(7 8 10 / 0) 52%), linear-gradient(270deg, rgb(7 8 10 / 0.66) 0, rgb(7 8 10 / 0.3) 22%, rgb(7 8 10 / 0) 36%)", "purpose": "Deeper bottom-left grade under bright product stills." },
+      { "name": "scrim-reading", "value": "rgb(7 8 10 / 0.92)", "purpose": "Orders and Owned: a flat near-solid veil." }
+    ],
+    "motion": [
+      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Entrances, tab bar, bars, card image scale." },
+      { "name": "ease-in-out", "value": "cubic-bezier(0.65, 0, 0.35, 1)", "purpose": "Footage crossfade, still drift, busy sweep, rail fill." },
+      { "name": "screen-in", "value": "480ms ease-out, opacity 0 and translateY 8px to rest", "purpose": "Every screen entrance." },
+      { "name": "reveal", "value": "640ms ease-out, rise 0.16em", "purpose": "Display titles arriving." },
+      { "name": "footage-crossfade", "value": "900ms ease-in-out; poster to video 200ms linear", "purpose": "Scene change; video replaces its first-frame poster invisibly." },
+      { "name": "still-drift", "value": "48s ease-in-out infinite alternate, scale 1.06, about 1.2% pan", "purpose": "Stills on Shop, Profile, Settings." },
+      { "name": "tab-bar", "value": "260ms ease-out scaleX 0 to 1", "purpose": "Active rail tab's blue bar." },
+      { "name": "capacity-bar", "value": "600ms ease-out scaleX(--fill)", "purpose": "Hero and card capacity bars." },
+      { "name": "play-push", "value": "GSAP: emblem charge 0 to 1 in 0.46s power2.in; backdrop scale 1 to 1.05 in 1.4s power2.out; screen opacity to 0 from 0.32s over 0.3s; covered at 0.64s; launch-in 520ms fade; uncover eases scale back in 0.6s", "purpose": "The PLAY moment." },
+      { "name": "server-pick-pulse", "value": "emblem charge to 0.42 in 60ms, back to 0 in 300ms", "purpose": "Choosing a server card." },
+      { "name": "launch-rail", "value": "done segments fill 500ms ease-out; current segment blue sweep 2.4s ease-in-out infinite", "purpose": "Five-segment launch rail." },
+      { "name": "busy-sweep", "value": "1.1s ease-in-out infinite, 36% wide 2px bar", "purpose": "Busy plate (PLAY while launching)." },
+      { "name": "reduced-motion", "value": "posters and stills only, no drift, no PLAY push; all animations and transitions 1ms", "purpose": "prefers-reduced-motion: reduce." }
+    ],
+    "breakpoints": [
+      { "name": "narrow", "value": "max-width: 1180px" },
+      { "name": "short", "value": "max-height: 760px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "PLAY Plate",
+      "kind": "button",
+      "refersTo": "plate-play",
+      "description": "The one blue action on Play: 64px chamfered plate; busy keeps blue and sweeps a bar along the bottom.",
+      "html": "<button class=\"ds-plate ds-plate--play\"><span>PLAY</span></button> <button class=\"ds-plate ds-plate--play is-busy\" aria-busy=\"true\"><span>PLAY</span></button>",
+      "css": ".ds-plate--play { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 64px; min-width: 260px; padding: 0 40px; border: 0; background: var(--blue, #2d6eb9); color: #fff; clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%); font: 800 30px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer; transition: background 160ms; } .ds-plate--play:hover { background: var(--blue-hi, #4a8ad6); } .ds-plate--play:active { background: var(--blue-lo, #23578f); } .ds-plate--play:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: 3px; } .ds-plate--play.is-busy { cursor: progress; } .ds-plate--play.is-busy::after { content: ''; position: absolute; left: 0; bottom: 0; width: 36%; height: 2px; background: currentColor; animation: ds-busy 1.1s cubic-bezier(0.65, 0, 0.35, 1) infinite; } @keyframes ds-busy { from { transform: translateX(-100%); } to { transform: translateX(280%); } }"
+    },
+    {
+      "name": "Primary Plate",
+      "kind": "button",
+      "refersTo": "plate-primary",
+      "description": "A form's single submit (Log in, BUY).",
+      "html": "<button class=\"ds-plate ds-plate--primary\">LOG IN</button>",
+      "css": ".ds-plate--primary { display: inline-flex; align-items: center; justify-content: center; height: 40px; padding: 0 18px; border: 0; background: var(--blue, #2d6eb9); color: #fff; clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 0 100%); font: 800 15px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: background 160ms; } .ds-plate--primary:hover { background: var(--blue-hi, #4a8ad6); } .ds-plate--primary:active { background: var(--blue-lo, #23578f); } .ds-plate--primary:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: 3px; }"
+    },
+    {
+      "name": "Ghost Plate",
+      "kind": "button",
+      "refersTo": "plate-ghost",
+      "description": "Secondary actions: a 1px chamfered edge drawn as an inner fill.",
+      "html": "<button class=\"ds-plate-ghost\"><span>ENTER WITH THE DEMO ACCOUNT</span></button>",
+      "css": ".ds-plate-ghost { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 40px; padding: 0 18px; border: 0; background: rgb(255 255 255 / 0.2); color: var(--ink, #f2f1ee); clip-path: polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 0 100%); font: 800 15px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; cursor: pointer; transition: background 160ms; } .ds-plate-ghost::before { content: ''; position: absolute; inset: 1px; background: var(--panel-2, #12151a); clip-path: polygon(0 0, calc(100% - 7.4px) 0, 100% 7.4px, 100% 100%, 0 100%); transition: background 160ms; } .ds-plate-ghost span { position: relative; } .ds-plate-ghost:hover { background: rgb(255 255 255 / 0.42); } .ds-plate-ghost:hover::before { background: var(--panel-3, #1a1e25); } .ds-plate-ghost:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: 3px; }"
+    },
+    {
+      "name": "Rail Tabs",
+      "kind": "nav",
+      "refersTo": "rail",
+      "description": "40px top rail; condensed caps tabs, a 2px blue bar under the active one.",
+      "html": "<nav class=\"ds-rail\"><button class=\"ds-tab is-active\">Play</button><button class=\"ds-tab\">Shop</button><button class=\"ds-tab\">Profile</button><button class=\"ds-tab\">Settings</button></nav>",
+      "css": ".ds-rail { display: flex; align-items: stretch; height: 40px; padding-top: 8px; background: rgb(7 8 10 / 0.9); box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.07); } .ds-tab { position: relative; display: flex; align-items: center; padding: 0 14px; border: 0; background: none; font: 700 15px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3, #a7abb2); cursor: pointer; transition: color 160ms; } .ds-tab:hover, .ds-tab.is-active { color: var(--ink, #f2f1ee); } .ds-tab::after { content: ''; position: absolute; left: 14px; right: 14px; bottom: 0; height: 2px; background: var(--blue, #2d6eb9); transform: scaleX(0); transition: transform 260ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-tab.is-active::after { transform: scaleX(1); } .ds-tab:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: -2px; }"
+    },
+    {
+      "name": "Server Card",
+      "kind": "card",
+      "refersTo": "server-card",
+      "description": "A GTA V screenshot darkened from the left with the name set on it; chosen = 2px blue inner frame, capacity bar inside it in ink.",
+      "html": "<button class=\"ds-scard is-chosen\" style=\"--fill:0.96\"><span class=\"ds-scard__body\"><span class=\"ds-scard__name\">Downtown Roleplay</span><span class=\"ds-scard__meta\">EU-Central - Roleplay</span></span><span class=\"ds-scard__state\"><i class=\"ds-dot\"></i>287/300</span><span class=\"ds-scard__bar\"></span></button>",
+      "css": ".ds-scard { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; width: 320px; height: 88px; padding: 12px 12px 14px 16px; border: 0; background: linear-gradient(90deg, rgb(11 13 16 / 0.9) 0, rgb(11 13 16 / 0.62) 42%, rgb(11 13 16 / 0) 100%), linear-gradient(120deg, #6b4a2e, #c08a52 60%, #3a2b22); color: var(--ink, #f2f1ee); text-align: left; cursor: pointer; } .ds-scard::after { content: ''; position: absolute; inset: 0; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.07); transition: box-shadow 200ms; pointer-events: none; } .ds-scard:hover::after { box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.2); } .ds-scard.is-chosen::after { box-shadow: inset 0 0 0 2px var(--blue, #2d6eb9); } .ds-scard:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: -4px; } .ds-scard__body { display: grid; gap: 6px; min-width: 0; } .ds-scard__name { font: 800 22px/0.95 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.02em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ds-scard__meta { font: 600 12px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3, #a7abb2); } .ds-scard__state { display: inline-flex; align-items: center; gap: 7px; padding: 5px 8px; background: rgb(7 8 10 / 0.8); font: 700 16px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.08em; } .ds-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--live, #3fb66b); box-shadow: 0 0 0 3px rgb(63 182 107 / 0.22); } .ds-scard__bar { position: absolute; z-index: 1; left: 2px; right: 2px; bottom: 2px; height: 3px; background: rgb(255 255 255 / 0.1); } .ds-scard__bar::after { content: ''; position: absolute; inset: 0; background: var(--ink, #f2f1ee); transform: scaleX(var(--fill, 0)); transform-origin: left; }"
+    },
+    {
+      "name": "Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "Opaque near-black panel with the one 14px top-right cut; never glass.",
+      "html": "<section class=\"ds-panel\"><h2 class=\"ds-panel__title\">Orders</h2><p class=\"ds-panel__body\">3 paid of 6 orders.</p></section>",
+      "css": ".ds-panel { width: 360px; background: var(--panel, #0b0d10); clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.07); color: var(--ink, #f2f1ee); } .ds-panel__title { margin: 0; padding: 20px 22px 14px; font: 800 26px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.02em; text-transform: uppercase; } .ds-panel__body { margin: 0; padding: 0 22px 22px; font: 400 14px/1.45 'Sofia Sans', 'Segoe UI', sans-serif; color: var(--ink-3, #a7abb2); }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "field-input",
+      "description": "44px square field on the night ground; focus swaps the border for a 2px blue ring.",
+      "html": "<label class=\"ds-field\"><span class=\"ds-field__label\">Email or username</span><input class=\"ds-field__input\" value=\"demo@gage-mp.net\"></label>",
+      "css": ".ds-field { display: grid; gap: 6px; width: 320px; } .ds-field__label { font: 700 12px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3, #a7abb2); } .ds-field__input { height: 44px; padding: 0 14px; border: 1px solid rgb(255 255 255 / 0.12); border-radius: 0; background: var(--ground, #07080a); color: var(--ink, #f2f1ee); font: 400 15px 'Sofia Sans', 'Segoe UI', sans-serif; transition: border-color 160ms; } .ds-field__input:hover { border-color: rgb(255 255 255 / 0.2); } .ds-field__input:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: -1px; border-color: transparent; }"
+    },
+    {
+      "name": "State Chips",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Straight-edged status tags: done (green tick), pending/warn amber, void red, refunded and demo neutral.",
+      "html": "<span class=\"ds-chip ds-chip--done\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><path d=\"M3.5 8.5 6.5 11.5 12.5 4.5\"/></svg>Delivered</span> <span class=\"ds-chip ds-chip--pending\">Awaiting payment</span> <span class=\"ds-chip ds-chip--void\">Failed</span> <span class=\"ds-chip\">Refunded</span>",
+      "css": ".ds-chip { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px; background: rgb(11 13 16 / 0.78); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.2); font: 700 12px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2, #c9ccd1); } .ds-chip--done { color: var(--ink, #f2f1ee); } .ds-chip--done svg { color: var(--live, #3fb66b); } .ds-chip--pending { color: var(--warn, #d8a34a); box-shadow: inset 0 0 0 1px rgb(216 163 74 / 0.5); } .ds-chip--void { color: var(--danger, #e0645a); box-shadow: inset 0 0 0 1px rgb(224 100 90 / 0.5); }"
+    },
+    {
+      "name": "Toggle",
+      "kind": "custom",
+      "refersTo": "toggle",
+      "description": "A chamfered slot with a square knob; on = white, not blue.",
+      "html": "<button class=\"ds-toggle is-on\" role=\"switch\" aria-checked=\"true\"><span class=\"ds-toggle__knob\"></span></button> <button class=\"ds-toggle\" role=\"switch\" aria-checked=\"false\"><span class=\"ds-toggle__knob\"></span></button>",
+      "css": ".ds-toggle { position: relative; width: 60px; height: 28px; padding: 0; border: 0; background: var(--panel-3, #1a1e25); clip-path: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 0 100%); cursor: pointer; transition: background 200ms; } .ds-toggle__knob { position: absolute; top: 4px; left: 4px; width: 24px; height: 20px; background: var(--ink-3, #a7abb2); transition: transform 220ms cubic-bezier(0.16, 1, 0.3, 1), background 200ms; } .ds-toggle.is-on { background: rgb(255 255 255 / 0.3); } .ds-toggle.is-on .ds-toggle__knob { transform: translateX(28px); background: var(--ink, #f2f1ee); } .ds-toggle:focus-visible { outline: 2px solid var(--blue-hi, #4a8ad6); outline-offset: 3px; }"
+    },
+    {
+      "name": "Launch Rail",
+      "kind": "custom",
+      "description": "Five named segments: done solid ink, current sweeping blue, pending track.",
+      "html": "<ol class=\"ds-lrail\"><li class=\"is-done\"><i></i><span>Join</span></li><li class=\"is-done\"><i></i><span>Files</span></li><li class=\"is-done\"><i></i><span>Store</span></li><li class=\"is-now\"><i></i><span>Game</span></li><li><i></i><span>Load</span></li></ol>",
+      "css": ".ds-lrail { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; width: 640px; margin: 0; padding: 0; list-style: none; } .ds-lrail li { display: grid; gap: 8px; } .ds-lrail i { position: relative; display: block; height: 4px; background: rgb(255 255 255 / 0.18); overflow: hidden; } .ds-lrail i::after { content: ''; position: absolute; inset: 0; background: var(--ink, #f2f1ee); transform: scaleX(0); transform-origin: left; } .ds-lrail .is-done i::after { transform: none; } .ds-lrail .is-now i::after { background: var(--blue, #2d6eb9); animation: ds-fill 2.4s cubic-bezier(0.65, 0, 0.35, 1) infinite; } @keyframes ds-fill { 0% { transform: scaleX(0); } 70%, 100% { transform: scaleX(1); opacity: 0.4; } } .ds-lrail span { font: 700 12px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3, #a7abb2); } .ds-lrail .is-done span, .ds-lrail .is-now span { color: var(--ink, #f2f1ee); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "A Window onto Los Santos",
+    "overview": "The client is one 1240x800 frameless window, and every screen is real GTA V: a muted, held trailer shot (Play, Auth) or an official screenshot (Shop, Profile, Settings) fills the whole window, edge to edge, under the 40px rail. GAGE-MP does not draw a world; it lays a thin, hard-edged instrument over the one Rockstar already made. Each screen has one name at display size standing on the bottom-left corner, one live figure, and one blue action. The middle of the picture is left alone.\n\nProvenance: this world is owner-pinned, not chosen by a direction roll, and there is no re-roll. It replaced a home-made real-time 3D street and a film-strip design after the owner's verdict on 2026-10-29: \"this is not gta5 3d? its just dogshit 3d wannabe. the g logo is good but its not it man\", together with the brief \"you can download anything and use any tool available go\". So the footage is the real game (official trailers and Steam screenshots, owner-accepted IP risk, sources in `ASSETS.md`), and the chrome G emblem the owner kept is the only real-time 3D left. The references the owner named are the cinematic lobbies of the big GTA RP launchers (Majestic RP, GTA5RP, Grand RP) and the Riot Client.\n\nDensity is low on Play and the Shop showroom (a hero and a column of five cards), and higher on the reading surfaces (orders, owned, settings, profile facts), where the footage drops to a near-solid ground and opaque panels carry the content.",
+    "keyCharacteristics": [
+      "Full-bleed GTA V footage or stills on every screen; one continuous held shot per loop, never a montage.",
+      "Grading at the edges only: a band under the rail, the bottom-left corner the type stands on, a falloff on the right for the list.",
+      "Neutral night ink for all type and panels, so the picture carries the colour.",
+      "GAGE blue is rationed to the one active choice; green only for \"online\"; amber and red only for product states.",
+      "Sofia Sans Extra Condensed 800 caps for names and figures, Sofia Sans for reading, tabular figures everywhere.",
+      "Opaque near-black panels and plates with the G mark's single 45-degree top-right corner cut; no radius, no glass.",
+      "The chrome G emblem, studio-lit, is the only real-time 3D."
+    ],
+    "rules": [
+      { "name": "The Rationed Blue Rule", "body": "Blue marks the one active choice on a screen: PLAY, a form's single submit, the chosen card, the active rail tab, the running launch step, focus. Secondary choices are ink: the Shop's sub-tab bar is an ink bar, a toggle that is on turns white, a done launch segment is solid ink.", "section": "colors" },
+      { "name": "The Green Dot Rule", "body": "Green means a server is online, as a dot. It is never a button, a fill or a text colour.", "section": "colors" },
+      { "name": "The Colour Comes From The Picture Rule", "body": "Type, panels and chrome stay neutral; any warmth or neon in the window belongs to the GTA V frame behind it.", "section": "colors" },
+      { "name": "The Name Face Rule", "body": "Extra Condensed 800 caps is for names, figures, plate labels and small caps labels. Sentences are always Sofia Sans in sentence case.", "section": "typography" },
+      { "name": "The Figures Line Up Rule", "body": "Counts, prices, clocks and dates are tabular lining figures, so a ticking count or launch clock never shifts.", "section": "typography" },
+      { "name": "The Edge Grade Rule", "body": "Scrims darken only the edges the type and panels stand on; the middle of the frame stays untouched footage. Reading surfaces are the exception and take a flat near-solid veil.", "section": "elevation" },
+      { "name": "The Opaque Rule", "body": "Panels, plates, chips and cards are opaque or near-opaque fills. No backdrop blur, no glass.", "section": "elevation" },
+      { "name": "The One Cut Rule", "body": "One corner, top right, 45 degrees. No border radius anywhere, no other notches or angles.", "section": "shapes" }
+    ],
+    "dos": [
+      "Do put real GTA V footage or an official still behind every screen, full-bleed, one held continuous shot per loop, with its source recorded in `ASSETS.md`.",
+      "Do grade only the edges the type stands on, and drop reading surfaces to a flat 92% veil.",
+      "Do set every name at display scale in Extra Condensed 800 caps on the bottom-left corner, with the emblem beside it on Play, Auth and the launch.",
+      "Do spend blue on the one active choice per screen and keep everything else ink (The Rationed Blue Rule).",
+      "Do cut panels and plates with the single 14px or 8px top-right chamfer.",
+      "Do show demo or stale data with a chip or line that says so.",
+      "Do give state colour only to platform states: amber for unsettled or needing action, red for failed, expired, reversed, banned or stopped, neutral for refunded."
+    ],
+    "donts": [
+      "Don't build a home-made 3D scene, a film strip or any drawn stand-in for the city; the owner rejected exactly that (\"just dogshit 3d wannabe\").",
+      "Don't add real-time 3D beyond the chrome G emblem.",
+      "Don't cut loops into a montage.",
+      "Don't use glass, backdrop blur, border radius or neon glow on panels, plates, chips or cards.",
+      "Don't show Rockstar or GTA V logos, Pricedown, or anything that presents the client as an official Rockstar product.",
+      "Don't use green for anything but the online dot.",
+      "Don't set sentences in the condensed face."
+    ]
+  }
+}

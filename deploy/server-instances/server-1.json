@@ -1,0 +1,16 @@
+{
+  "name": "GAGE Official #1",
+  "port": 24800,
+  "maxPlayers": 64,
+  "tickHz": 30,
+  "masterUrl": "http://203.0.113.10:8081",
+  "heartbeatSeconds": 30,
+  "gamemode": "freeroam",
+  "lang": "en",
+  "url": "",
+  "maxConnectionsPerIp": 4,
+  "chatBurst": 5,
+  "chatWindowSeconds": 5,
+  "bansFile": "bans.json",
+  "adminPort": 24900
+}

@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "layout-transition",
+        "value": "*",
+        "files": [
+          "src/styles/ui.css"
+        ],
+        "createdAt": "2026-11-01T20:02:39.907Z",
+        "reason": "Claude (agent) decided: the only width transition is .rail__mark, a 4px absolutely positioned tab marker; DESIGN.md records width is animated on purpose because scaleX would stretch its 45-degree cut; an abs-positioned box relayouts only itself"
+      }
+    ]
+  }
+}

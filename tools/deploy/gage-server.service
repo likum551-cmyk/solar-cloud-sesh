@@ -1,0 +1,85 @@
+# Solar RP game server, gage-server (UDP 24800 game + query, loopback TCP admin channel). Installed by tools/deploy/bootstrap-vps.sh to
+# /etc/systemd/system/gage-server.service. Rolled out by tools/deploy/deploy-server.sh, which swaps the `current`
+# symlink and restarts this unit; the unit itself rarely changes.
+#
+#   binary    /opt/gage/server/current/gage-server        (symlink -> releases/<UTC stamp>/, root-owned, read-only to the service)
+#   config    /opt/gage/server/server.json                (root:gage 0640; read only; "bansFile" must be under data/)
+#   secrets   /etc/gage/server.env                         GAGE_ADMIN_TOKEN=... (root:gage 0640, optional; the admin channel needs it)
+#   data      /opt/gage/server/data/                       the ONLY writable path: bans.json, gamemode data/<resource>/storage.json
+#   scripts   /opt/gage/server/resources/                  gamemode resources (read-only to the service)
+# Check:   systemd-analyze verify /etc/systemd/system/gage-server.service
+#          systemd-analyze security gage-server
+# Logs:    journalctl -u gage-server -f
+[Unit]
+Description=Solar RP game server (gage-server)
+Documentation=file:///opt/gage/src/docs/OPS.md
+After=network-online.target
+Wants=network-online.target
+# Assert, not Condition: a missing binary must fail the start loudly instead of skipping it silently.
+AssertPathExists=/opt/gage/server/current/gage-server
+# At most 5 starts in 5 minutes (StartLimit* belongs in [Unit]).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# exec: `systemctl start` reports failure when the binary cannot be executed, not just when fork succeeded.
+Type=exec
+User=gage
+Group=gage
+WorkingDirectory=/opt/gage/server
+# Optional (the dash): GAGE_ADMIN_TOKEN for the admin channel. Read by systemd as root; never in server.json.
+EnvironmentFile=-/etc/gage/server.env
+ExecStart=/opt/gage/server/current/gage-server --config /opt/gage/server/server.json
+Restart=always
+RestartSec=3
+# Exit 1 (bad config, ban list or bind failure) and 2 (usage) will not fix themselves: RestartPreventExitStatus
+# beats Restart=always, so a broken config shows as "failed" once instead of crash-looping.
+RestartPreventExitStatus=1 2
+# SIGTERM = clean stop (clients get a Shutdown disconnect, the ban list is flushed).
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# stdin /dev/null: the server reads EOF, keeps serving and takes no console commands (use the admin channel).
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gage-server
+
+# Resources. Every connection is a file descriptor on the one UDP socket plus the admin channel; 65536 is generous.
+LimitNOFILE=65536
+MemoryMax=1G
+TasksMax=128
+CPUWeight=200
+
+# Sandbox
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/opt/gage/server/data
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# AF_INET/AF_INET6: game UDP, the optional master announce over HTTP, the loopback admin channel. AF_UNIX: journald.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# The scripting runtime is PUC Lua (third_party/lua), not a JIT: nothing needs writable+executable memory.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# A denied syscall returns EPERM instead of killing the process, so a filter that is a little too tight degrades
+# instead of crash-looping. `journalctl -u gage-server` and strace show what was denied.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

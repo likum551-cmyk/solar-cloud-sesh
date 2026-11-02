@@ -1,0 +1,38 @@
+# DLLs the launcher, the three injected DLLs and the launch shim may import (tools/deploy/build-client.sh
+# feeds this to lib/pe-imports.mjs --allow). One name per line, case-insensitive; a trailing * is a prefix.
+#
+# Baseline = what the WinLibs build in build/win/bin imports today (measured 2026-11-01 with
+# pe-imports.mjs): ADVAPI32 bcrypt comdlg32 CRYPT32 GDI32 KERNEL32 msvcrt ole32 SHELL32 SHLWAPI USER32
+# WINHTTP WS2_32 WINMM d3d12 D3DCOMPILER_47 dwmapi. The extras below are stock Windows 10 system DLLs that a
+# link-order change could legitimately add. All of them exist next to GTA already.
+#
+# NOT allowed on purpose, so the build fails and a human looks:
+#   libstdc++-6.dll, libgcc_s_seh-1.dll, libwinpthread-1.dll, libssp-0.dll   (the -static flags were lost)
+#   ucrtbase.dll, api-ms-win-crt-*                                           (the cross compiler defaults to the UCRT)
+#   anything else GTA would have to find next to itself.
+
+advapi32.dll
+bcrypt.dll
+comctl32.dll
+comdlg32.dll
+crypt32.dll
+d3d11.dll
+d3d12.dll
+d3dcompiler_47.dll
+dwmapi.dll
+dxgi.dll
+gdi32.dll
+imm32.dll
+kernel32.dll
+msvcrt.dll
+ole32.dll
+oleaut32.dll
+psapi.dll
+shell32.dll
+shlwapi.dll
+user32.dll
+version.dll
+windowscodecs.dll
+winhttp.dll
+winmm.dll
+ws2_32.dll

@@ -1,0 +1,55 @@
+# Every executable that the Windows build puts into build/win/selftest/, classified, with the reason.
+# tools/deploy/build-client.sh runs them BY NAME under wine, from this list, never by glob (project lesson
+# 2026-11-01: a glob also ran gage_v.exe, which overwrote the HKCU\Software\GAGE-MP launch handoff).
+#
+# Columns, separated by "|" (surrounding spaces are trimmed):
+#   name | mode | timeout-seconds | arguments | reason
+#
+#   mode  gate    a failure stops the build. Only for tests that are pure computation or that touch nothing wine
+#                 implements differently from Windows, so a failure means the code or the toolchain is wrong.
+#         soft    run, print the result, list a failure in the summary, do NOT stop (exit stays 0 unless
+#                 build-client.sh --tests strict). For tests that call Windows APIs wine only emulates.
+#         driver  like soft, but the test is driven by a Node script that starts it (see the "driver:" reason).
+#         skip    not run, on purpose; the reason says why. A skip needs a reason a reviewer can check.
+#
+#   arguments  {BIN} = the Windows spelling of build/win/bin (what integrity_test must hash).
+#
+# The three rules that keep this list honest:
+#   1. An exe in selftest/ that is not listed here fails the build ("unclassified"): a new test must be classified
+#      by whoever adds it, not silently ignored.
+#   2. A listed exe that does not exist fails the build ("stale entry"): renames cannot hide a lost test.
+#   3. build-client.sh counts: classified = gate + soft + driver + skip, and the number it ran must equal
+#      gate + soft + driver. An empty list is an error, never a pass.
+#
+# Promotion: nothing here has run under wine yet (the first VPS run is the proof). Run the first build with
+# `build-client.sh --tests soft` (every failure is reported, none stops the build), read the results, then
+# move a test from soft to gate here once it passed twice. A test that cannot pass under wine for a reason that is
+# wine's (not the code's) is documented in its reason and stays soft or skip.
+
+# ---- pure computation: a failure is a real regression or a compiler/ABI difference -----------------------------
+quant_test            | gate   |  300 |        | protocol quantisation: exhaustive round trips and float error bounds; no OS calls, so a failure is a codegen or logic difference
+interest_test         | gate   |  300 |        | Replicator (interest management, delta frames) driven directly, simulated time; no sockets
+sync_test             | gate   |  300 |        | remote-player smoother under loss and jitter; pure
+locomotion_test       | gate   |  300 |        | remote-ped locomotion controller against scripted poses; seeded, pure
+vehicle_drive_test    | gate   |  300 |        | remote-vehicle driving model; seeded, pure
+gameplay_test         | gate   |  300 |        | protocol v4 decision units (vitals, respawn gate, emotes, vehicle link); simulated time, asserts its check count
+script_suppress_test  | gate   |   60 |        | the singleplayer-script tables the engine terminates; table integrity only
+version_gate_test     | gate   |   60 |        | the launcher's lockstep policy (version_gate.h): protocol gate table, every update mandatory, poll and gap timing; pure functions, no OS calls
+
+# ---- Windows APIs that wine emulates: advisory until promoted ---------------------------------------------------
+integrity_test        | soft   |  120 | {BIN}  | hashes the chain DLLs in bin/ against the SHA-256 baked into the launcher (bcrypt). Gate-worthy once wine's bcrypt SHA-256 is seen to agree
+gage_mp_test          | soft   |  120 |        | patches its own image in memory (VirtualProtect, module scan); wine's PE loader layout may differ from Windows
+game_launch_test      | soft   |  120 |        | store detection against fixture folders, plus registry reads; wine's registry is not Windows' registry
+legacy_handoff_test   | soft   |   60 |        | registry clean-up on the scratch key HKCU\Software\GAGE-MP-Selftest, inside the wine prefix only
+crash_diag_test       | soft   |  120 |        | MiniDumpWriteDump from a vectored handler, MSVC throw decoding, thread enumeration: wine's dbghelp and SEH unwinding are partial
+crash_filter_test     | soft   |  120 |        | vectored exception handler behaviour; wine's exception dispatch is close but not identical
+launch_shim_test      | soft   |  120 |        | IAT hook on CreateProcessW that spawns cmd.exe (exit 42); needs wine's cmd.exe
+serverquery_test      | soft   |  120 |        | the launcher's UDP server query over winsock loopback
+netcode_test          | soft   |  300 |        | protocol v4 + server over real ENet on loopback with the WINDOWS build of ENet/winsock (the client's network path); about 12 s native. The native Linux copy is the gate in deploy-server.sh
+server_test           | soft   |  300 |        | UDP query, master announce, bans, admin channel; about 16 s native. Same: the native copy gates the server deploy
+join_test             | soft   |  300 |        | the engine's session adapter against an in-process server on loopback (winsock threads)
+update_check_test     | driver |  600 | -      | driver: node tests/update_check_test.mjs --exe <wrapper>; the .mjs signs fixtures, serves them over HTTP and runs the exe (winhttp, bcrypt ECDSA via wine's bcrypt)
+
+# ---- never run here --------------------------------------------------------------------------------------------
+gage_v                | skip   |    0 |        | the inject-chain harness: it tries to launch GTA and overwrites HKCU\Software\GAGE-MP (install_dir, server_host); never run it except by hand on the owner's PC
+brand_apparel_test    | skip   |    0 |        | needs a D3D11 WARP software device and the player's own game files; wine has no WARP and the VPS has no GPU

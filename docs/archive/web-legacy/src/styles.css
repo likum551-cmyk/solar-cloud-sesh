@@ -1,0 +1,1965 @@
+@font-face {
+  font-family: 'Overpass';
+  font-style: normal;
+  font-display: block;
+  font-weight: 100 900;
+  src: url('./assets/fonts/overpass-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Overpass';
+  font-style: normal;
+  font-display: block;
+  font-weight: 100 900;
+  src: url('./assets/fonts/overpass-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF,
+    U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Overpass';
+  font-style: normal;
+  font-display: block;
+  font-weight: 100 900;
+  src: url('./assets/fonts/overpass-cyrillic-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * The GTA V pause menu, played straight. One system: flat black glass over
+ * the blurred, paused city; no borders, no radii; the picked row reverses to
+ * white; the header bar carries the playing character's colour. Rank comes
+ * from weight, case and reversal, never from extra sizes or decoration.
+ * State changes snap, as the game's menu does: no eased hovers.
+ */
+@layer base {
+  :root {
+    color-scheme: dark;
+    --text: #ffffff;
+    --text-2: rgba(255, 255, 255, 0.74);
+    --muted: rgba(255, 255, 255, 0.56);
+    /* the menu's glass and its rows */
+    --glass: rgba(0, 0, 0, 0.72);
+    --glass-head: rgba(6, 6, 7, 0.94);
+    --row: rgba(255, 255, 255, 0.04);
+    --row-hover: rgba(255, 255, 255, 0.11);
+    --well: rgba(255, 255, 255, 0.09);
+    --picked: #ffffff;
+    --picked-ink: #000000;
+    --picked-ink-2: rgba(0, 0, 0, 0.62);
+    /* GTA Online's freemode blue: the menu's own header colour, fixed for
+       the session. Only a job card's title takes its lead's colour (.card). */
+    --freemode: #2d6eb9;
+    /* the same blue lifted for a hairline on dark art (the edge bars) */
+    --freemode-hi: #4f8fda;
+    --gold: #f0c850;
+    --red: #c8352b;
+    --red-text: #f2705d;
+    /* GTA Online's connection bars, on glass and on the picked white row */
+    --ping-good: #72c672;
+    --ping-fair: #f0c850;
+    --ping-poor: #e0574a;
+    --ping-good-ink: #1d7a33;
+    --ping-fair-ink: #8a6500;
+    --ping-poor-ink: #b3342a;
+    --gutter: clamp(20px, 3.4vw, 56px);
+    --side-w: 380px;
+    --row-h: 36px;
+    --opt-track: 440px;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    color: var(--text);
+    font-family: 'Overpass', 'Bahnschrift', 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+    background: #000;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    user-select: none;
+  }
+  input {
+    user-select: text;
+    caret-color: #fff;
+  }
+  ::selection {
+    background: rgba(255, 255, 255, 0.85);
+    color: #000;
+  }
+  :focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: 2px;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.28) transparent;
+  }
+}
+
+/* WebView2 frameless-window drag regions. `app-region` is a no-op in a
+   plain browser, so previewing works identically. */
+.app-drag {
+  app-region: drag;
+}
+.app-no-drag {
+  app-region: no-drag;
+}
+
+@layer components {
+  /* ---------- lettering ---------- */
+  /* Pricedown outlines (gta.jsx): white under a black outline with a hard
+     drop, the game's title treatment. Stroke is in outline units (100/em). */
+  .pd {
+    display: block;
+    flex-shrink: 0;
+    overflow: visible;
+    fill: #fff;
+    stroke: #000;
+    stroke-width: 9;
+    stroke-linejoin: round;
+    paint-order: stroke;
+    filter: drop-shadow(0 2px 0 rgba(0, 0, 0, 0.55));
+  }
+  /* the brand lockup (Brand.jsx): the same hard drop, plus a soft halo so the
+     white wordmark holds over bright key art */
+  .lockup {
+    display: block;
+    flex-shrink: 0;
+    max-width: none;
+    filter: drop-shadow(0 2px 0 rgba(0, 0, 0, 0.55)) drop-shadow(0 0 12px rgba(0, 0, 0, 0.35));
+    user-select: none;
+  }
+
+  /* the game's PC prompt: a white key cap, black legend */
+  .key {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 22px;
+    padding: 1px 6px 0;
+    border-radius: 3px;
+    background: #fff;
+    color: #000;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .spin {
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* ---------- shell ---------- */
+  .shell {
+    position: relative;
+    isolation: isolate;
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    height: 100%;
+    /* wide windows keep the menu's proportions: a centred column */
+    padding-inline: max(var(--gutter), calc((100% - 1400px) / 2));
+  }
+  /* the paused game: downtown at dusk, blurred and dimmed under the glass */
+  .backdrop {
+    pointer-events: none;
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    overflow: hidden;
+    background: #000;
+  }
+  .backdrop img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    /* the towers' feet stay in frame at every window shape */
+    object-position: 50% 100%;
+    /* the paused world: blurred until the towers are colour fields (at 5px
+       they read as dark ghost panels beside a short list), bright enough
+       to hold the dusk's pink and blue where a panel ends early */
+    filter: blur(18px) brightness(0.6) saturate(0.95);
+    transform: scale(1.1); /* the blur's soft rim stays outside the window */
+  }
+  .backdrop::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(to bottom, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0) 22%),
+      linear-gradient(to top, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0) 18%);
+  }
+
+  /* ---------- header: title left, the HUD stack right ---------- */
+  .masthead {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    min-width: 0;
+    /* the HUD stack starts below the window buttons' 32px strip */
+    padding: 40px 0 12px;
+  }
+  .title {
+    margin: 0;
+    line-height: 0;
+  }
+  .dev-badge {
+    align-self: center;
+    margin-top: 10px;
+    padding: 3px 6px 2px;
+    background: var(--gold);
+    color: #000;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .hud {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: flex-end;
+    min-width: 0;
+    /* three lines tall even when the list line is absent: the tabs never jump */
+    min-height: 59px;
+    margin-left: auto;
+    text-align: right;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  }
+  .hud-name {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  .hud-line {
+    color: var(--text-2);
+    font-size: 13px;
+    line-height: 1.4;
+    white-space: nowrap;
+  }
+  .hud-sep::before {
+    content: '·';
+    /* the dot's own side bearing sits left: less margin there evens the gaps */
+    margin: 0 7px 0 5px;
+    color: var(--muted);
+  }
+  /* the window's own buttons, in the corner above everything */
+  .win {
+    position: fixed;
+    top: 0;
+    right: 0;
+    z-index: 60;
+    display: flex;
+  }
+  .win-btn {
+    display: grid;
+    place-items: center;
+    width: 46px;
+    height: 32px;
+    color: rgba(255, 255, 255, 0.86);
+  }
+  .win-btn:hover {
+    background: rgba(255, 255, 255, 0.14);
+    color: #fff;
+  }
+  .win-btn.is-close:hover {
+    background: #c42b1c;
+  }
+  .win-btn:focus-visible {
+    outline-offset: -2px;
+  }
+
+  /* ---------- the tab strip ---------- */
+  .tabs {
+    display: grid;
+    grid-auto-columns: minmax(0, 1fr);
+    grid-auto-flow: column;
+    gap: 3px;
+  }
+  .tab {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 38px;
+    padding-top: 2px;
+    background: var(--glass);
+    color: var(--text-2);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  /* every tab hangs from the header bar; the current one carries its colour */
+  .tab::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -4px;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.16);
+  }
+  .tab:hover {
+    background: rgba(30, 30, 32, 0.86);
+    color: #fff;
+  }
+  .tab[aria-current='page'] {
+    background: var(--picked);
+    color: var(--picked-ink);
+    font-weight: 800;
+  }
+  .tab[aria-current='page']::before {
+    background: var(--freemode);
+  }
+  .tab-count {
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .tab[aria-current='page'] .tab-count {
+    color: var(--picked-ink-2);
+  }
+  .tab:focus-visible {
+    outline-offset: -4px;
+    outline-color: var(--freemode);
+  }
+
+  /* ---------- the deck: list left, the job card right ---------- */
+  .deck {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) var(--side-w);
+    gap: 12px;
+    min-height: 0;
+    padding-top: 12px;
+  }
+  /* Settings: one wide list, its description docked underneath */
+  .deck.is-single {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
+  /* a panel's message (loading, offline, empty) fills the frame */
+  .panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    background: var(--glass);
+  }
+  /* a server list ends at its last row (or its foot), as the game's menus
+     do; the backdrop shows below a short one (ServerGrid sizes a long one
+     to the column's whole rows) */
+  .panel:has(> .panel-fit) {
+    flex: 0 1 auto;
+  }
+  /* a list longer than the column fills it: whole rows, then the foot
+     takes the remainder (under a row's height), so the list and the side
+     column end on one line */
+  .panel:has(> .panel-fit .panel-scroll.is-paged) {
+    flex: 1 1 auto;
+  }
+  .panel-fit:has(> .panel-scroll.is-paged) > .list-foot {
+    flex-grow: 1;
+  }
+  /* The art takes the slack up to a cap: the card's own size holds it at
+     340px (max-height: max-content), so in a tall window the column ends at
+     its content and the backdrop shows below, rather than a ballooning
+     painting sized by leftover space. */
+  .deck:has(.panel-scroll.is-paged) .card {
+    flex: 1 1 auto;
+    max-height: max-content;
+  }
+  .deck:has(.panel-scroll.is-paged) .card > .card-art {
+    height: 340px;
+    aspect-ratio: auto;
+  }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+    height: 46px;
+    padding: 0 8px 0 14px;
+  }
+  .panel-title {
+    margin: 0;
+    padding-top: 2px;
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .panel-count {
+    padding-top: 2px;
+    color: var(--text-2);
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .panel-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  /* a list longer than its frame: sized to whole rows (ServerGrid), the foot
+     right under it, and every scroll lands on a row under the header */
+  .panel-fit {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .panel-scroll.is-paged {
+    flex: none;
+    scroll-snap-type: y mandatory;
+    scroll-padding-top: 30px;
+  }
+  /* the game's list foot: arrows centred, the picked row's place at right */
+  .list-foot {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    height: 30px;
+    margin-top: 2px;
+    background: var(--glass-head);
+  }
+  .list-foot-arrows {
+    display: flex;
+    gap: 2px;
+  }
+  .list-foot-arrows button {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 26px;
+    color: #fff;
+  }
+  .list-foot-arrows button:hover:not(:disabled) {
+    background: var(--row-hover);
+  }
+  .list-foot-arrows button:disabled {
+    color: rgba(255, 255, 255, 0.24);
+  }
+  .list-foot-arrows svg {
+    width: 12px;
+    height: 8px;
+  }
+  .list-foot-count {
+    position: absolute;
+    right: 14px;
+    padding-top: 2px;
+    color: var(--text-2);
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .panel-actions {
+    display: flex;
+    justify-content: flex-end;
+    flex-shrink: 0;
+    padding: 10px 8px 8px;
+  }
+
+  .search {
+    position: relative;
+    display: block;
+  }
+  .search-icon {
+    pointer-events: none;
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+  }
+  .field {
+    width: 100%;
+    height: 32px;
+    padding: 2px 10px 0;
+    background: var(--well);
+    color: #fff;
+    font-size: 13px;
+    outline: none;
+  }
+  .search .field {
+    width: clamp(240px, 32vw, 380px);
+    padding-left: 32px;
+  }
+  .field::placeholder {
+    color: var(--muted);
+  }
+  .field:hover {
+    background: rgba(255, 255, 255, 0.13);
+  }
+  .field:focus {
+    background: rgba(255, 255, 255, 0.16);
+    box-shadow: inset 0 -2px 0 #fff;
+  }
+  .field.is-invalid {
+    box-shadow: inset 0 -2px 0 var(--red-text);
+  }
+  .icon-btn {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    background: var(--well);
+    color: #fff;
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--picked);
+    color: var(--picked-ink);
+  }
+  .icon-btn:disabled {
+    color: var(--muted);
+  }
+  /* the list head's game-mode option: ‹ Roleplay 8 › (ServerTable ModePicker) */
+  .mode-pick {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    min-width: 0;
+    height: 32px;
+    background: var(--well);
+  }
+  /* focused, it reverses as the Settings `‹ On ›` rows do */
+  .mode-pick:focus-within {
+    background: var(--picked);
+  }
+  .mode-pick:focus-within .mode-cur,
+  .mode-pick:focus-within .mode-step {
+    color: var(--picked-ink);
+  }
+  .mode-pick:focus-within .mode-count {
+    color: var(--picked-ink-2);
+  }
+  .mode-step {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 28px;
+    height: 100%;
+    color: var(--text-2);
+  }
+  .mode-step:hover {
+    background: var(--picked);
+    color: var(--picked-ink);
+  }
+  .mode-step:focus-visible {
+    outline: none;
+  }
+  .mode-cur {
+    display: flex;
+    flex: 0 1 136px;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-width: 56px;
+    padding-top: 2px;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .mode-count {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- menu rows (servers, favorites, recents) ---------- */
+  /* geometry ServerGrid pages by: header 30, then rows at a 38 pitch (a 2px
+     gap above each 36px row), so the list starts and ends on a row */
+  .schedule {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+  }
+  /* opaque: a row scrolled under the header must not ghost through it */
+  .schedule th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    height: 30px;
+    padding: 0 12px;
+    background: #060607;
+    font-weight: 400;
+  }
+  .sort {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    padding-top: 2px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  button.sort:hover,
+  .sort.is-active {
+    color: #fff;
+  }
+  /* hangs past the label's end (before it in a right-aligned column) */
+  .sort-arrow {
+    position: absolute;
+    left: calc(100% + 5px);
+    width: 8px;
+    height: 8px;
+  }
+  .sort.is-end .sort-arrow {
+    left: auto;
+    right: calc(100% + 5px);
+  }
+  /* Each row carries the 2px gap above it as a transparent band in its own
+     paint, not as border-spacing: spacing snaps to device pixels under the
+     shell's zoom, a gradient does not, so the pitch stays exactly 38. */
+  .row {
+    --row-bg: var(--row);
+    cursor: default;
+    scroll-snap-align: start;
+  }
+  .row td {
+    height: calc(var(--row-h) + 2px);
+    padding: 4px 12px 0;
+    background: linear-gradient(transparent 0 2px, var(--row-bg) 2px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .row td:first-child:has(.star) {
+    padding: 2px 0 0 6px;
+  }
+  .row td:last-child:has(.is-remove) {
+    padding: 2px 6px 0 0;
+  }
+  .row:hover {
+    --row-bg: var(--row-hover);
+  }
+  .row[aria-selected='true'] {
+    --row-bg: var(--picked);
+    color: var(--picked-ink);
+  }
+  .row:focus-visible {
+    outline: none;
+  }
+  .row:focus-visible td {
+    box-shadow: inset 0 -3px 0 var(--freemode);
+  }
+  .row-name {
+    font-weight: 600;
+  }
+  .row[aria-selected='true'] .row-name {
+    font-weight: 800;
+  }
+  /* name, then the list's language and mode, quieter. Every row carries the
+     same tags: the name truncates first (a narrow list drops the mode tag
+     as a whole, ServerGrid `compact`) */
+  .row-name-in {
+    position: relative;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-width: 0;
+  }
+  /* dropped table-wide, but still laid out (hidden) so ServerGrid can keep
+     measuring whether they would fit */
+  .schedule.no-mode .row-tag.is-mode {
+    position: absolute;
+    left: 0;
+    top: 0;
+    visibility: hidden;
+  }
+  .row-name-in > .truncate {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .row-tag {
+    flex-shrink: 0;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  /* the language as a small boxed code, as the game marks a job's region */
+  .row-tag.is-lang {
+    padding: 1px 4px 0;
+    box-shadow: inset 0 0 0 1px currentColor;
+    font-size: 10px;
+    line-height: 14px;
+  }
+  .row[aria-selected='true'] .row-tag {
+    color: var(--picked-ink-2);
+  }
+  .row-addr {
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .row[aria-selected='true'] .row-addr {
+    color: var(--picked-ink-2);
+  }
+  /* slots after the player count: "42/500", the cap quieter than the count */
+  .row-max {
+    margin-left: 1px;
+    color: var(--muted);
+    font-weight: 400;
+    font-size: 13px;
+  }
+  .row[aria-selected='true'] .row-max {
+    color: var(--picked-ink-2);
+  }
+  .star {
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    color: rgba(255, 255, 255, 0.34);
+  }
+  .star:hover {
+    color: #fff;
+  }
+  .star.is-on {
+    color: var(--gold);
+  }
+  .row[aria-selected='true'] .star {
+    color: rgba(0, 0, 0, 0.36);
+  }
+  .row[aria-selected='true'] .star:hover,
+  .row[aria-selected='true'] .star.is-on {
+    color: #000;
+  }
+  .star.is-remove:hover {
+    color: var(--red-text);
+  }
+  .row[aria-selected='true'] .star.is-remove:hover {
+    color: var(--red);
+  }
+  .card-title .star {
+    flex-shrink: 0;
+    margin-right: -6px;
+  }
+
+  /* ping: GTA Online's connection bars, then the number */
+  .ping-btn {
+    display: inline-flex;
+    justify-content: flex-end;
+    max-width: 100%;
+    color: inherit;
+    vertical-align: middle;
+  }
+  button.ping-btn:hover .ping-ms {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .ping {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .ping-bars {
+    flex-shrink: 0;
+    width: 16px;
+    height: 12px;
+    margin-top: -2px;
+  }
+  .ping-bars rect {
+    fill: rgba(255, 255, 255, 0.22);
+  }
+  .ping.is-good .is-lit {
+    fill: var(--ping-good);
+  }
+  .ping.is-fair .is-lit {
+    fill: var(--ping-fair);
+  }
+  .ping.is-poor .is-lit {
+    fill: var(--ping-poor);
+  }
+  .ping-ms {
+    min-width: 4.6em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+    font-size: 13px;
+  }
+  .ping.is-none .ping-ms {
+    color: var(--muted);
+  }
+  .row[aria-selected='true'] .ping-bars rect {
+    fill: rgba(0, 0, 0, 0.16);
+  }
+  .row[aria-selected='true'] .ping.is-good .is-lit {
+    fill: var(--ping-good-ink);
+  }
+  .row[aria-selected='true'] .ping.is-fair .is-lit {
+    fill: var(--ping-fair-ink);
+  }
+  .row[aria-selected='true'] .ping.is-poor .is-lit {
+    fill: var(--ping-poor-ink);
+  }
+  .row[aria-selected='true'] .ping.is-none .ping-ms {
+    color: var(--picked-ink-2);
+  }
+
+  /* ---------- a panel's empty or error body ---------- */
+  /* centred in the frame, as the game's empty lists are */
+  .msg {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 24px 48px;
+    text-align: center;
+  }
+  .msg-spin {
+    margin-bottom: 14px;
+  }
+  .msg-title {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 800;
+  }
+  .msg-detail {
+    margin: 6px 0 0;
+    color: var(--red-text);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .msg-hint {
+    max-width: 52ch;
+    margin: 6px 0 0;
+    color: var(--text-2);
+    font-size: 13px;
+  }
+  .msg-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: min(320px, 100%);
+    margin-top: 18px;
+  }
+  /* a menu action row: picked (hovered, focused) is the reversed white */
+  .menu-btn {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    height: var(--row-h);
+    padding: 2px 8px 0 12px;
+    background: var(--well);
+    color: #fff;
+    font-weight: 600;
+    text-align: left;
+  }
+  .menu-btn:hover,
+  .menu-btn:focus-visible {
+    background: var(--picked);
+    color: var(--picked-ink);
+    outline: none;
+  }
+  .menu-btn:hover .key,
+  .menu-btn:focus-visible .key {
+    background: #000;
+    color: #fff;
+  }
+  .menu-btn.is-danger {
+    color: var(--red-text);
+  }
+  .menu-btn.is-danger:hover,
+  .menu-btn.is-danger:focus-visible {
+    background: var(--picked);
+    color: var(--red);
+  }
+  .menu-btn.is-danger.is-armed {
+    background: var(--red);
+    color: #fff;
+  }
+
+  /* ---------- a row's right-click menu (RowMenu.jsx) ----------
+     GTA Online's interaction menu, small: the blue strip names the server,
+     the actions are glass rows that reverse to white under the pointer or
+     the arrow keys (hover moves focus, so only one row is ever lit). */
+  .row-menu {
+    position: fixed;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 236px;
+    padding-bottom: 2px;
+    /* opaque: it sits over a table of text, never over the scene */
+    background: #060607;
+    /* a hairline and a deep shadow lift it off the rows it covers */
+    box-shadow:
+      0 0 0 1px rgba(255, 255, 255, 0.1),
+      0 12px 32px rgba(0, 0, 0, 0.6),
+      0 2px 6px rgba(0, 0, 0, 0.4);
+    animation: menu-in 120ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    transform-origin: top left;
+  }
+  @keyframes menu-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+  }
+  .row-menu-head {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    padding: 7px 12px 6px;
+    background: var(--freemode);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 1.2;
+  }
+  .row-menu-addr {
+    color: rgba(255, 255, 255, 0.78);
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .row-menu-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    height: 32px;
+    margin: 0 2px;
+    padding: 1px 6px 0 10px;
+    background: var(--row);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+  }
+  .row-menu-item:focus {
+    background: var(--picked);
+    color: var(--picked-ink);
+    outline: none;
+  }
+  .row-menu-item:focus .key {
+    background: #000;
+    color: #fff;
+  }
+  .row-menu-item:disabled {
+    color: var(--muted);
+  }
+  .row-menu-item .key {
+    min-width: 20px;
+    height: 20px;
+    font-size: 10px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .row-menu {
+      animation: none;
+    }
+  }
+
+  /* ---------- the job card column ---------- */
+  .side {
+    container: side / size;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+  .card {
+    --lead: var(--freemode);
+    --lead-ink: #fff;
+    display: flex;
+    flex-direction: column;
+    /* as tall as its content; in a short window the art gives height up first */
+    flex: 0 1 auto;
+    min-height: 0;
+    background: var(--glass);
+  }
+  .card > * {
+    flex-shrink: 0;
+  }
+  .card > .card-art {
+    flex-shrink: 1;
+    min-height: 140px;
+  }
+  /* a column too short for a real crop of the art drops it: the title bar
+     leads (a 90px strip cut the lead at the brow and the dog at the muzzle) */
+  @container side (max-height: 520px) {
+    .card > .card-art {
+      display: none;
+    }
+    /* no art to take the slack beside a full list: the card still fills
+       to the floor line (under a row's height of slack) and Connect drops
+       to the card's floor instead of leaving glass under it */
+    .deck:has(.panel-scroll.is-paged) .card {
+      max-height: none;
+    }
+    .card > .connect {
+      margin-top: auto;
+    }
+  }
+  .card-art {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    /* covers are 2:1 with headroom over the lead: keep the crown */
+    object-position: 50% 0%;
+    background: #000;
+  }
+  .card-art.is-empty {
+    object-position: 50% 40%;
+    filter: brightness(0.82);
+  }
+  .card-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 48px;
+    padding: 0 12px 0 14px;
+    /* GTA Online's title bar: freemode blue for every card, whichever lead
+       the art shows (a lead's HUD colour here meant nothing to the player) */
+    background: var(--lead);
+    color: var(--lead-ink);
+  }
+  .card-title .star,
+  .card-title .star.is-on,
+  .card-title .star:hover {
+    color: var(--lead-ink);
+  }
+  .card-title .star:not(.is-on) {
+    opacity: 0.55;
+  }
+  .card-title .star:hover {
+    opacity: 1;
+  }
+  .card-title h2 {
+    margin: 0;
+    padding-top: 2px;
+    font-size: 18px;
+    font-weight: 800;
+  }
+  .card-hint {
+    margin: 0;
+    padding: 12px 14px 4px;
+    color: var(--text-2);
+    font-size: 13px;
+  }
+  .facts {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding-top: 2px;
+  }
+  .facts > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    height: 34px;
+    padding: 2px 14px 0;
+    background: var(--row);
+  }
+  .facts dt {
+    color: var(--text-2);
+  }
+  .facts dd {
+    min-width: 0;
+    margin: 0;
+    font-weight: 700;
+  }
+  .fact-sub {
+    margin-left: 10px;
+    color: var(--text-2);
+  }
+  .facts dd.is-plain {
+    font-weight: 400;
+  }
+  /* an overview standout: the whole row picks it, reversing as list rows do */
+  .fact-pick {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 34px;
+    padding: 2px 14px 0;
+    background: var(--row);
+    color: #fff;
+    text-align: left;
+  }
+  .fact-pick-label {
+    flex-shrink: 0;
+    margin-right: 16px;
+    color: var(--text-2);
+  }
+  .fact-pick > .truncate {
+    min-width: 0;
+    margin-left: auto;
+  }
+  .fact-pick .fact-sub {
+    flex-shrink: 0;
+  }
+  .fact-pick:hover,
+  .fact-pick:focus-visible {
+    background: var(--picked);
+    color: var(--picked-ink);
+    outline: none;
+  }
+  .fact-pick:hover .fact-pick-label,
+  .fact-pick:focus-visible .fact-pick-label,
+  .fact-pick:hover .fact-sub,
+  .fact-pick:focus-visible .fact-sub {
+    color: var(--picked-ink-2);
+  }
+  .connect {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    width: calc(100% - 28px);
+    height: 46px;
+    margin: 14px 14px;
+    padding: 2px 10px 0 16px;
+    /* the screen's one filled accent: the way into the game */
+    background: var(--freemode);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  /* white means "this has focus", as everywhere in the menu */
+  .connect:hover:not(:disabled),
+  .connect:focus-visible {
+    background: var(--picked);
+    color: var(--picked-ink);
+    outline: none;
+  }
+  .connect:hover:not(:disabled) .key,
+  .connect:focus-visible .key {
+    background: #000;
+    color: #fff;
+  }
+  /* launching / launched: the same filled row, dimmed (no outlined ghost) */
+  .connect:disabled {
+    background: var(--well);
+    color: var(--muted);
+  }
+  .connect:disabled .key {
+    background: rgba(255, 255, 255, 0.2);
+    color: var(--muted);
+  }
+  .connect.is-launched svg {
+    color: var(--ping-good);
+  }
+  .card-note {
+    margin: -4px 14px 14px;
+  }
+  .card-note .menu-btn {
+    width: 100%;
+  }
+  /* right under the card: the column ends at its content, as the game's
+     panels do, and the backdrop shows below */
+  .dc {
+    flex-shrink: 0;
+    padding-bottom: 14px;
+    background: var(--glass);
+  }
+  /* with no list to pick from, direct connect is the way in */
+  .dc.is-promoted {
+    box-shadow: inset 0 4px 0 var(--freemode);
+  }
+  .dc-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 46px;
+    padding: 0 14px;
+  }
+  /* titled as the card is (18px 800, sentence case), one title voice per column */
+  .dc-head .panel-title {
+    font-size: 18px;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .dc-form {
+    display: flex;
+    gap: 6px;
+    padding: 0 14px;
+  }
+  .dc-form .field {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 36px;
+    font-size: 12.5px;
+  }
+  .go {
+    flex-shrink: 0;
+    height: 36px;
+    padding: 2px 16px 0;
+    background: var(--picked);
+    color: var(--picked-ink);
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .go:disabled {
+    background: var(--well);
+    color: var(--muted);
+  }
+  .dc-error {
+    margin: 8px 14px 0;
+    color: var(--red-text);
+    font-size: 12.5px;
+  }
+
+  /* ---------- settings: option rows and the description box ---------- */
+  /* The list is as tall as its rows (the backdrop shows below the
+     description box, as in the game); a window too short for it pages by
+     whole rows, the rows' geometry mirrored in SettingsView. */
+  .main.is-settings .panel {
+    flex: 0 1 auto;
+  }
+  .main.is-settings .panel-scroll.is-paged {
+    scroll-padding-top: 0;
+  }
+  .opts {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .opt {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 16px;
+    width: 100%;
+    height: 36px;
+    padding: 2px 14px 0;
+    scroll-snap-align: start;
+    background: var(--row);
+    color: #fff;
+    text-align: left;
+  }
+  /* the highlighted option reverses, as the game's settings rows do */
+  .opt:focus-visible {
+    outline: none;
+  }
+  /* one row is always the current one (focus or the pointer moves it) */
+  .opt.is-current {
+    background: var(--picked);
+    color: var(--picked-ink);
+    outline: none;
+  }
+  .opt-label {
+    flex-shrink: 0;
+    width: 180px;
+    font-weight: 600;
+  }
+  /* every value sits in one track at the row's right end, as the game's do */
+  .opt-value {
+    display: flex;
+    flex: 0 1 var(--opt-track);
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0;
+    margin-left: auto;
+    font-weight: 700;
+  }
+  .opt-value.is-stop {
+    color: var(--red-text);
+  }
+  .opt-value.is-gold {
+    color: var(--gold);
+  }
+  .opt.is-current .opt-value.is-stop {
+    color: var(--red);
+  }
+  .opt.is-current .opt-value.is-gold {
+    color: var(--ping-fair-ink);
+  }
+  .opt-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 28px;
+    padding: 2px 10px 0;
+    background: var(--well);
+    color: inherit;
+    font-size: 13px;
+    font-weight: 400;
+    outline: none;
+  }
+  .opt-input::placeholder {
+    color: var(--muted);
+  }
+  /* a path at rest shows its end, the game's own folder, clipped at the left */
+  .opt-input.is-path:not(:focus):not(:placeholder-shown) {
+    direction: rtl;
+    text-align: left;
+    text-overflow: ellipsis;
+  }
+  .opt.is-current .opt-input {
+    background: rgba(0, 0, 0, 0.07);
+  }
+  .opt.is-current .opt-input::placeholder {
+    color: rgba(0, 0, 0, 0.45);
+  }
+  .opt-btn {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 2px 10px 0;
+    background: var(--well);
+    color: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .opt.is-current .opt-btn {
+    background: #000;
+    color: #fff;
+  }
+  .opt-btn:focus-visible {
+    outline: 2px solid var(--freemode);
+    outline-offset: 1px;
+  }
+  .opt:disabled {
+    color: var(--muted);
+  }
+  /* a clear-list row armed for its second press */
+  .opt.is-armed,
+  .opt.is-armed.is-current {
+    background: var(--red);
+    color: #fff;
+  }
+  /* the update row: what it does at rest, its key when highlighted */
+  .opt-idle {
+    color: var(--muted);
+    font-weight: 600;
+  }
+  .opt-key {
+    display: none;
+  }
+  .opt.is-current .opt-idle {
+    display: none;
+  }
+  .opt.is-current .opt-key {
+    display: inline-flex;
+  }
+
+  /* the description box docked under the settings list, as the game's */
+  .desc {
+    flex-shrink: 0;
+    min-height: 92px;
+    margin-top: 12px;
+    padding: 14px 16px 16px;
+    background: var(--glass);
+  }
+  .desc-title {
+    margin: 0;
+    padding-top: 2px;
+    font-size: 15px;
+    font-weight: 800;
+  }
+  .desc-text {
+    max-width: 90ch;
+    margin: 6px 0 0;
+    color: var(--text-2);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .desc-error {
+    margin: 6px 0 0;
+    color: var(--red-text);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  /* ---------- the foot: status left, instructional buttons right ---------- */
+  .foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    min-width: 0;
+    height: 52px;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  }
+  .foot-status {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+    padding-top: 2px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .hints {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 6px;
+  }
+  .hint {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 30px;
+    padding: 0 6px;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hint > span:last-child {
+    margin-left: 3px;
+    padding-top: 2px;
+  }
+  button.hint:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .hint:disabled {
+    opacity: 0.4;
+  }
+  .hint.is-loud {
+    height: 38px;
+    padding: 0 10px;
+    font-size: 15px;
+  }
+  .hint.is-loud .key {
+    min-width: 26px;
+    height: 26px;
+    font-size: 12px;
+  }
+
+  /* ---------- the start-up loading screen (Splash.jsx) ---------- */
+  .splash {
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    overflow: hidden;
+    background: #000;
+    transition: opacity 260ms cubic-bezier(0.4, 0, 0.2, 1) 200ms;
+  }
+  /* out through black: the art goes first, then the black lifts */
+  .splash > * {
+    transition: opacity 200ms ease-in;
+  }
+  .splash.is-leaving,
+  .splash.is-leaving > * {
+    opacity: 0;
+    pointer-events: none;
+  }
+  /* the art rises out of black, then the three leads crossfade, each on a
+     slow push, as the game's loading screens do */
+  .splash-art {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: 50% 22%;
+    opacity: 0;
+    transition: opacity 900ms cubic-bezier(0.4, 0, 0.2, 1);
+    animation:
+      drift 12s linear both,
+      rise 700ms ease-out backwards; /* backwards only: leaving still fades */
+  }
+  .splash-art.is-on {
+    opacity: 1;
+  }
+  .splash-art.is-alt {
+    animation-name: drift-back, rise;
+  }
+  /* out through black: the painting reaches 0 (~185 ms) before the black
+     starts to lift (200 ms delay). Stated for `.is-on` too: `.is-leaving > *`
+     ties with `.splash-art.is-on` and loses on order, and per-frame samples
+     caught the painting at full opacity over the lifting black */
+  .splash.is-leaving > .splash-art,
+  .splash.is-leaving > .splash-art.is-on {
+    opacity: 0;
+    transition-duration: 200ms;
+  }
+  @keyframes drift-back {
+    from {
+      transform: scale(1.12) translateX(1.2%);
+    }
+    to {
+      transform: scale(1.06) translateX(-1.2%);
+    }
+  }
+  @keyframes drift {
+    from {
+      transform: scale(1.06) translateX(-1.2%);
+    }
+    to {
+      transform: scale(1.12) translateX(1.2%);
+    }
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes push {
+    from {
+      transform: scale(1.02);
+    }
+    to {
+      transform: scale(1.1);
+    }
+  }
+  /* the captions sit on a scrim, never on bright art (a cream car hood, a
+     grille): deepest in the bottom-left corner, where the title and the
+     address sit */
+  .splash-shade,
+  .loading-shade {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(120% 70% at 0% 100%, rgba(0, 0, 0, 0.62), rgba(0, 0, 0, 0) 60%),
+      linear-gradient(to top, rgba(0, 0, 0, 0.88), rgba(0, 0, 0, 0.45) 20%, rgba(0, 0, 0, 0) 42%),
+      linear-gradient(to bottom, rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0) 16%);
+  }
+  .splash-foot {
+    position: absolute;
+    left: var(--gutter);
+    right: var(--gutter);
+    bottom: 36px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 32px;
+    animation: rise 500ms ease-out 250ms backwards;
+  }
+  .splash-title {
+    min-width: 0;
+  }
+  /* the lockup wipes in left to right (the clip keeps room for its shadow) */
+  .splash-lockup {
+    animation: lockup-in 760ms cubic-bezier(0.16, 1, 0.3, 1) 180ms both;
+  }
+  @keyframes lockup-in {
+    from {
+      clip-path: inset(-24px 100% -24px -24px);
+      transform: translateX(-10px);
+    }
+    to {
+      clip-path: inset(-24px -48px -24px -24px);
+      transform: none;
+    }
+  }
+  .splash-tip {
+    max-width: 54ch;
+    min-height: 1.5em;
+    margin: 12px 0 0;
+    color: var(--text-2);
+    font-size: 14px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    animation: tip-in 420ms ease-out both;
+  }
+  @keyframes tip-in {
+    from {
+      opacity: 0;
+      transform: translateY(5px);
+    }
+  }
+  .splash-status {
+    display: flex;
+    flex-shrink: 0;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+  }
+  .splash-totals {
+    margin: 0;
+    color: var(--text-2);
+    font-size: 13px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+    animation: tip-in 360ms ease-out both;
+  }
+  .splash-num {
+    color: #fff;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .splash-dot {
+    display: inline-block;
+    width: 3px;
+    height: 3px;
+    margin: 0 8px 3px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  /* the bottom edge fills with the share of pings in */
+  .splash-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 5px;
+    overflow: hidden;
+    /* the track shows, so the fill reads as a share of a whole */
+    background: rgba(255, 255, 255, 0.18);
+  }
+  .splash-bar > span {
+    display: block;
+    height: 100%;
+    background: var(--freemode-hi);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 320ms ease-out;
+  }
+  .splash-bar.is-busy > span {
+    width: 28%;
+    transform: none;
+    animation: bar-busy 1.3s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+  }
+  @keyframes bar-busy {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(360%);
+    }
+  }
+  .splash-load,
+  .loading-busy {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    margin: 0;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  }
+  .splash-load {
+    flex-shrink: 0;
+    padding-bottom: 2px;
+  }
+
+  /* ---------- joining a server: the game's loading screen ---------- */
+  .loading-screen {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    overflow: hidden;
+    background: #000;
+  }
+  .loading-art {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: 50% 22%;
+    /* slow enough to keep moving through a download of minutes */
+    animation: push 90s linear both;
+  }
+  .loading-drag {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 40px;
+  }
+  .loading-foot {
+    position: absolute;
+    left: var(--gutter);
+    right: var(--gutter);
+    bottom: 34px;
+    display: flex;
+    align-items: last baseline; /* address line, step and percent on one line */
+    justify-content: space-between;
+    gap: 32px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+  }
+  .loading-foot > :first-child {
+    flex: 1 1 auto;
+  }
+  /* real server names run 60-88 characters: two lines, then an ellipsis */
+  .loading-name {
+    display: -webkit-box;
+    margin: 0;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    font-size: 26px;
+    font-weight: 800;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+    text-wrap: pretty;
+  }
+  .loading-verb {
+    font-weight: 400;
+  }
+  .loading-sub {
+    margin: 4px 0 0;
+    color: var(--text-2);
+    font-size: 13px;
+  }
+  /* native's progress, right: the file counts over the busy line. A fixed
+     width, so a changing count or line never re-wraps the name beside it */
+  .loading-status {
+    display: flex;
+    flex: 0 0 clamp(290px, 27.5vw, 340px);
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    padding-bottom: 2px;
+    text-align: right;
+  }
+  .loading-busy {
+    align-items: last baseline;
+    max-width: 100%;
+    margin-top: 2px;
+    font-size: 15px;
+  }
+  .loading-busy > .spin {
+    align-self: center;
+  }
+  /* native's step words wrap (two lines at most), never cut */
+  .loading-step {
+    display: -webkit-box;
+    min-width: 0;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow-wrap: anywhere;
+  }
+  /* the share done leads the corner; the lines above it are detail */
+  .loading-pct {
+    font-size: 30px;
+    font-weight: 800;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .loading-pct.is-empty {
+    width: 0;
+    min-width: 0;
+    margin-left: -10px; /* cancels the row's gap */
+    visibility: hidden;
+  }
+  .loading-pct-sign {
+    margin-left: 0.04em;
+    font-size: 0.6em;
+    font-weight: 700;
+  }
+  /* counts and the wait's cause: each piece keeps its words, a narrow foot
+     breaks between pieces */
+  .loading-line {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 100%;
+    margin: 0;
+    color: var(--text-2);
+    font-size: 14px;
+    animation: tip-in 360ms ease-out both;
+  }
+  .loading-seg {
+    white-space: nowrap;
+  }
+  .loading-seg + .loading-seg::before {
+    content: '';
+    display: inline-block;
+    width: 3px;
+    height: 3px;
+    margin: 0 8px 3px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  /* a piece that wrapped starts its line: no dot (kept in the layout, so
+     hiding it cannot pull the piece back and forth) */
+  .loading-seg.is-wrap::before {
+    visibility: hidden;
+  }
+  .loading-status .splash-num {
+    font-weight: 600;
+  }
+  /* the files are on disk: the full bar holds a beat, then bar and counts clear */
+  .loading-screen .is-complete {
+    animation: fade-out 320ms ease-in 700ms forwards;
+  }
+  @keyframes fade-out {
+    to {
+      opacity: 0;
+    }
+  }
+  /* "game launched": the big message across a band of shade */
+  .shard {
+    pointer-events: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 42%;
+    display: flex;
+    justify-content: center;
+    padding: 26px 0 28px;
+    transform: translateY(-50%);
+    /* the game's big-message band: flat, full width, hard edged */
+    background: rgba(0, 0, 0, 0.6);
+    animation: shard-in 560ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  /* the art drops back behind the message, as the game dims its frame */
+  .loading-screen.is-done .loading-art {
+    filter: brightness(0.6) saturate(0.7);
+  }
+  .shard-title {
+    fill: var(--gold);
+    animation: shard-title 640ms cubic-bezier(0.16, 1, 0.3, 1) 120ms both;
+  }
+  @keyframes shard-in {
+    from {
+      clip-path: inset(50% 0 50% 0);
+    }
+    to {
+      clip-path: inset(0 0 0 0);
+    }
+  }
+  @keyframes shard-title {
+    from {
+      opacity: 0;
+      transform: scale(1.4);
+    }
+  }
+
+  /* ---------- the game's alert screen ---------- */
+  .alert {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: grid;
+    place-items: center;
+    padding: 48px var(--gutter);
+    background: #000;
+  }
+  .alert-body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: min(680px, 100%);
+    text-align: center;
+  }
+  .alert-body h1,
+  .alert-body h2 {
+    margin: 0;
+    line-height: 0;
+  }
+  .alert-text {
+    margin: 26px 0 0;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+  .alert-fix {
+    display: block;
+    margin-top: 6px;
+    color: var(--text-2);
+    font-weight: 400;
+  }
+  .alert-rule {
+    width: 100%;
+    height: 2px;
+    margin: 26px 0 18px;
+    background: rgba(255, 255, 255, 0.75);
+  }
+  .alert-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px 18px;
+  }
+}
+
+/* ---------- window sizes ---------- */
+@media (max-width: 1080px) {
+  :root {
+    --side-w: 340px;
+  }
+  .opt-label {
+    width: 150px;
+  }
+}
+@media (max-height: 700px) {
+  .masthead {
+    padding-top: 36px;
+    padding-bottom: 8px;
+  }
+  /* the window's floor (640 high) must still hold card and direct connect */
+  .card-art {
+    aspect-ratio: 3 / 1;
+  }
+  .connect {
+    height: 42px;
+    margin-block: 10px;
+  }
+  .facts > div {
+    height: 32px;
+  }
+  .dc-head {
+    height: 40px;
+  }
+  .dc {
+    padding-bottom: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+  /* the busy spinner is information, not decoration: it steps instead */
+  .spin {
+    animation: spin 1.2s steps(8) infinite !important;
+  }
+}
