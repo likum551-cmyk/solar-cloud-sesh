@@ -10,6 +10,10 @@
 //   switch (o.task)      StandStill: TASK_STAND_STILL(o.standStillMs)
 //                        GoStraight: TASK_GO_STRAIGHT_TO_COORD(o.target, o.moveBlendRatio, -1, 0, 0)
 //                                    + SET_PED_DESIRED_MOVE_BLEND_RATIO(o.moveBlendRatio)
+//                        GoToAnchor: TASK_GO_TO_ENTITY(ped, anchor, -1, 0.1, o.moveBlendRatio, 0, 0)
+//                                    + SET_PED_DESIRED_MOVE_BLEND_RATIO (W11, item 8 below)
+//   if (o.setBlend)      SET_PED_DESIRED_MOVE_BLEND_RATIO(o.moveBlendRatio) on the running task (W11)
+//   if (o.moveAnchor)    SET_ENTITY_COORDS_NO_OFFSET(anchor, o.anchorPos) EVERY frame (W11)
 //   if (o.setMoveRate)   SET_PED_MOVE_RATE_OVERRIDE(o.moveRate)   EVERY frame (it only holds while called);
 //                        if the call fails set LocoInput::moveRateAvailable = false from then on
 //   if (o.setHeading)    SET_ENTITY_HEADING(o.heading)                      (degrees, [0, 360))
@@ -40,8 +44,8 @@
 //  2. Gait. The speed's gait with hysteresis (a gait is entered at its "up" speed
 //     and left below its "down" speed) is the base:
 //        still -> walk 0.50 / walk -> still 0.25 m/s
-//        walk  -> run  2.90 / run  -> walk  2.40 m/s
-//        run -> sprint 5.90 / sprint -> run 5.60 m/s
+//        walk  -> run  3.10 / run  -> walk  2.10 m/s   (W11, was 2.90 / 2.40)
+//        run -> sprint 6.10 / sprint -> run 5.30 m/s   (W11, was 5.90 / 5.60)
 //     GTA on foot walks at ~1.2-1.8 m/s, runs at ~3.5-5.5 and sprints at ~6-7.5:
 //     each band sits in the gap between two gaits, so ordinary speed noise of a
 //     gait never crosses a band, and noise at a band edge cannot flap. The sender's
@@ -51,7 +55,7 @@
 //     slid it along in its idle pose. Going Still needs the speed under idleDown for
 //     stillHoldMs (150 ms; nothing is issued meanwhile), so a one-sample flap cannot
 //     fire StandStill then GoStraight. A change between Walk / Run / Sprint has to
-//     hold for gaitDebounceMs (200 ms); leaving Still is immediate.
+//     hold for gaitDebounceMs (400 ms, W11); leaving Still is immediate..
 //
 //  3. Task. Moving gaits use TASK_GO_STRAIGHT_TO_COORD towards a point ahead,
 //     target = pose + (pose - ped) + direction * lead (GTAN WalkAnimation: Position +
@@ -61,8 +65,9 @@
 //     a second, ~2 task restarts per second. The task's blend ratio is the plain gait
 //     (1 walk, 2 run, 3 sprint; the native's scale is 0 still, 1 walk, 2 run, 3 sprint).
 //     It is re-issued:
-//       - at once when the commanded (debounced) gait changes, or after a snap /
-//         ragdoll end / jump end / Reset() / Pause();
+//       - at once when the last task was not a gait task (first move, after a stand-still), or after a snap /
+//         ragdoll end / jump end / Reset() / Pause(). A change between Walk / Run / Sprint is NOT a re-issue
+//         since W11: setBlend carries it (item 8);
 //       - otherwise at most every minReissueMs (500 ms), when the velocity direction
 //         turned more than turnReissueDeg (25) since the last issue, the target's
 //         anchor (pose + ped error) drifted driftM (1 m) from where the last one has
@@ -120,12 +125,32 @@
 //  7. Pause(ms): the ped is leaving a vehicle (TASK_LEAVE_VEHICLE): for that long
 //     Update sets nothing at all (not even a snap), then re-issues the gait task.
 //
+//  8. W11 (docs/CLOUD-HANDOFF.md item 0b): the live 0.4.3 test still showed 8-12 go-straight per 10 s of running.
+//     (a) A change between Walk / Run / Sprint never re-issues the running task: LocoOutput::setBlend asks for
+//         SET_PED_DESIRED_MOVE_BLEND_RATIO(moveBlendRatio) on it (every frame the commanded gait differs from the
+//         one the task was issued with; the move rate override follows the gait as before). The Walk/Run and Run/Sprint
+//         bands are wider (3.1 / 2.1 and 6.1 / 5.3 m/s) and a change holds gaitDebounceMs = 400 ms. The drift rule
+//         counts only the lateral part of the target anchor's drift: a Run <-> Sprint speed change moves the anchor
+//         along the track faster than the last velocity predicted, which re-issued the task 4 times in 10 s.
+//     (b) LocoMode::Anchor: the ped runs TASK_GO_TO_ENTITY(ped, anchor) ONCE; the engine moves an invisible,
+//         collision-less anchor entity to LocoOutput::anchorPos every frame (pose + direction * lead, lead =
+//         anchorLeadS (0.8 s) of travel clamped to 1.5..5 m). Turns, drift and arrival cannot re-issue a task
+//         that has no fixed target: only a lost task does (the stall rule), a snap/Reset, or Still <-> moving.
+//         A stall in anchor mode drops the ped back to LocoMode::Straight for anchorFallbackMs (the anchor path may be
+//         unusable there: no navmesh, interior). LocoInput::noAnchor (anchor entity missing, aim task) forces Straight
+//         for that frame. LocoConfig::mode defaults to Straight here; the engine picks Anchor (loco_mode).
+//     (c) Residual push: with LocoInput::pedVel (GET_ENTITY_VELOCITY: the animation's own displacement) the velocity
+//         set is pedVel + a low-passed (residualTauMs 150) correction of the position error, capped at
+//         residualMaxMs (2 m/s); nothing at all inside the dead band, so the stride carries the ped instead of the
+//         pose velocity dragging it. A hard snap stays beyond the teleport threshold. Jumps, ragdoll, swimming and
+//         a missing pedVel keep the pose-velocity push of item 4.
+//
 // CONSTANTS (LocoConfig defaults)
 //   idleUp/Down        0.50 / 0.25 m/s  old GTAN GetPedSpeed: walk from 0.5; band below
-//   walkRunUp/Down     2.90 / 2.40 m/s  around 2.65, the middle of walk max 1.8 .. run min 3.5
-//   runSprintUp/Down   5.90 / 5.60 m/s  inside run max 5.5 .. sprint min 6.0 (old GTAN 6.2)
+//   walkRunUp/Down     3.10 / 2.10 m/s  W11: was 2.90 / 2.40; around 2.6, walk max 1.8 .. run min 3.5
+//   runSprintUp/Down   6.10 / 5.30 m/s  W11: was 5.90 / 5.60; run max 5.5 .. sprint min 6.0 (old GTAN 6.2)
 //   stillHoldMs        150 ms           docs/sync-specs/onfoot.md item 1
-//   gaitDebounceMs     200 ms           ours (the spec says "debounced")
+//   gaitDebounceMs     400 ms           W11: was 200 (ours; the spec says "debounced")
 //   leadS, leadMin/MaxM 3 s, 3..16 m    onfoot.md item 2 (GTAN: 1 s); was 2.5 s, 3..12 m: W8 item 3, arrival re-issues came every 1.9 s
 //   turnReissueDeg     25 deg           onfoot.md item 2
 //   driftM             1.0 m            onfoot.md item 2 (GTAN: 0.5-0.87 m, squared 0.25-0.75)
@@ -164,19 +189,24 @@ namespace gage::sync {
         None,       // issue nothing this frame
         StandStill, // TASK_STAND_STILL(standStillMs)
         GoStraight, // TASK_GO_STRAIGHT_TO_COORD(target, moveBlendRatio) + SET_PED_DESIRED_MOVE_BLEND_RATIO
+        GoToAnchor, // W11: TASK_GO_TO_ENTITY(ped, anchor, -1, 0.1, moveBlendRatio, 0, 0) + SET_PED_DESIRED_MOVE_BLEND_RATIO
     };
+
+    // W11: how a moving gait is tasked. Straight: TASK_GO_STRAIGHT_TO_COORD at a far point, re-issued on turn / drift /
+    // arrival. Anchor: TASK_GO_TO_ENTITY once at an invisible entity the engine moves every frame (LocoOutput::anchorPos).
+    enum class LocoMode : uint8_t { Straight, Anchor };
 
     struct LocoVec { float x = 0, y = 0, z = 0; };
 
     struct LocoConfig
     {
         float idleUp = 0.50f, idleDown = 0.25f;           // m/s, horizontal
-        float walkRunUp = 2.90f, walkRunDown = 2.40f;
-        float runSprintUp = 5.90f, runSprintDown = 5.60f;
+        float walkRunUp = 3.10f, walkRunDown = 2.10f;     // W11: dead zone 1.0 m/s (was 2.90 / 2.40)
+        float runSprintUp = 6.10f, runSprintDown = 5.30f; // W11: dead zone 0.8 m/s (was 5.90 / 5.60)
 
         // Gait authority and debounce (W1 item 1 and 2)
         float stillHoldMs = 150.0f;    // speed under idleDown this long before a moving gait goes Still
-        float gaitDebounceMs = 200.0f; // a change between Walk / Run / Sprint holds this long (Still <-> moving: at once)
+        float gaitDebounceMs = 400.0f; // a change between Walk / Run / Sprint holds this long (Still <-> moving: at once); W11: was 200
 
         // Task target and re-issue (W1 item 2)
         float leadS = 3.0f;                           // target = leadS seconds of travel ahead ...
@@ -199,6 +229,16 @@ namespace gage::sync {
         // look decides the final window.
         float moveRateMin = 0.6f, moveRateMax = 1.6f;
         float blendStep = 0.25f, blendReissueMs = 400.0f;
+
+        // W11 item 2: the continuously steered target. mode defaults to Straight (the library's old behaviour); the engine
+        // sets Anchor from loco_mode. The anchor leads the pose by anchorLeadS of travel (shorter than the straight path's
+        // 3 s: it is moved every frame, so it need not outrun a re-issue; a long lead cuts corners: error ~ lead^2 / 2R), clamped to anchorLeadMinM..anchorLeadMaxM.
+        LocoMode mode = LocoMode::Straight;
+        float anchorLeadS = 0.8f, anchorLeadMinM = 1.5f, anchorLeadMaxM = 5.0f;
+        float anchorFallbackMs = 20000.0f; // a stall in anchor mode: Straight for this long, then Anchor again
+
+        // W11 item 3: with LocoInput::pedVel the velocity push is pedVel + a low-passed, capped position correction.
+        float residualTauMs = 150.0f, residualMaxMs = 2.0f;
 
         float corrGainBase = 2.0f;   // 1/s
         float corrGainPerM = 5.0f;   // 1/(m*s)
@@ -254,6 +294,14 @@ namespace gage::sync {
         // minReissueMs), and the land animation speed override is not set (nothing it scales is playing).
         // The pose is still followed (velocity and snap rules unchanged).
         bool swimming = false;
+
+        // W11 item 3: the ped's own velocity now (GET_ENTITY_VELOCITY: what the animation moves it by). With havePedVel
+        // the controller pushes only the residual error on top of it (LocoConfig::residualTauMs / residualMaxMs).
+        LocoVec pedVel;
+        bool havePedVel = false;
+        // W11 item 2: no anchor entity this frame (not created yet, lost, or an aim task owns the walk): the controller
+        // acts as LocoMode::Straight for it. A switch between the modes re-issues the task once.
+        bool noAnchor = false;
     };
 
     // Why a GoStraight was issued (LocoOutput::why; the per-trigger counters of LocoStats). W8 item 3: the live test
@@ -270,6 +318,7 @@ namespace gage::sync {
         Arrive,   // the ped came within max(arriveMinM, arriveFrac * lead) of the target
         Stall,    // the ped showed no gait for stallMs while a moving one is commanded
     };
+    // (Anchor mode: Gait = the first task after a stand-still; Turn / Drift / Arrive / Blend never fire.)
 
     struct LocoOutput
     {
@@ -300,6 +349,16 @@ namespace gage::sync {
                                     // only holds while it is called); set while a gait task is wanted
         float moveRate = 1.0f;      // speed / nominal(gait), clamped moveRateMin..moveRateMax
         bool paused = false;        // Pause() is in force: nothing else is set this frame
+
+        // W11. setBlend: SET_PED_DESIRED_MOVE_BLEND_RATIO(moveBlendRatio) on the RUNNING task, every frame this is set
+        // (the commanded gait differs from the one the task was issued with: a Walk / Run / Sprint change is not a re-issue).
+        bool setBlend = false;
+        // Anchor mode: move the anchor entity to anchorPos (SET_ENTITY_COORDS_NO_OFFSET) EVERY frame moveAnchor is set; the
+        // engine creates it there before the first GoToAnchor. anchorMode says the controller acts as Anchor now
+        // (cfg.mode == Anchor, not noAnchor, not in a stall fallback), also on frames that issue no task.
+        bool anchorMode = false;
+        bool moveAnchor = false;
+        LocoVec anchorPos;
     };
 
     struct LocoStats
@@ -309,6 +368,9 @@ namespace gage::sync {
         uint32_t whyGait = 0, whyReset = 0, whyForced = 0, whyBlend = 0, whyTurn = 0, whyDrift = 0, whyArrive = 0, whyStall = 0;
         // Reset() calls, SoftReset() calls and how those ended: the running task kept, or re-issued
         uint32_t resets = 0, softResets = 0, softKept = 0, softReissued = 0;
+        // W11: GoToAnchor issues (also counted in goStraight and by cause), Walk / Run / Sprint changes carried by setBlend
+        // without a re-issue, stalls that dropped anchor mode to Straight, frames spent in anchor mode
+        uint32_t anchorIssues = 0, gaitKept = 0, anchorFallbacks = 0, anchorFrames = 0;
     };
 
     class LocomotionController
@@ -370,6 +432,7 @@ namespace gage::sync {
         Gait lastTaskGait_ = Gait::Still;
         LocoVec lastTarget_, lastAnchor_, lastTargetVel_;
         float lastLeadM_ = 0, lastBlend_ = 0;
+        float blendSet_ = 0;                // W11: the blend ratio last sent to the running task (issue or setBlend)
         double sinceIssueMs_ = 0;
         double mismatchMs_ = 0;             // how long the ped has shown no gait while a moving one is commanded
         bool forceIssue_ = true;
@@ -377,6 +440,11 @@ namespace gage::sync {
         bool reevaluate_ = false;           // SoftReset(): the next evaluation ignores minReissueMs
 
         float offAcc_ = 0;
+
+        // W11
+        double anchorFallbackLeftMs_ = 0;    // > 0: a stall dropped anchor mode to Straight
+        Gait gaitShown_ = Gait::Still;       // the moving gait at the last task evaluation (counts gaitKept)
+        float corrFx_ = 0, corrFy_ = 0;      // low-passed residual correction (m/s)
 
         bool ragdollActive_ = false;
         bool haveJumpSeq_ = false;

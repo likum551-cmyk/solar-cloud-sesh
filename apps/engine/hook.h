@@ -370,6 +370,11 @@ namespace gage::game {
         constexpr uint64_t RESET_AI_WEAPON_DAMAGE_MODIFIER             = 0xEA16670E7BA4743C;
         constexpr uint64_t RESET_AI_MELEE_WEAPON_DAMAGE_MODIFIER       = 0x46E56A7CD1D63C3F;
         constexpr uint64_t WAS_PED_KILLED_BY_TAKEDOWN                  = 0x7F08E26039C7347C;
+        // 0.4.4 (W11, anchor steering). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
+        //   TASK_GO_TO_ENTITY  public 0x6A071245EB0D1882  3889 0xAB3658A740EED98E
+        //                      void (Entity entity, Entity target, int duration, float distance, float moveBlendRatio,
+        //                            float slowDownDistance, int flags)
+        constexpr uint64_t TASK_GO_TO_ENTITY                           = 0x6A071245EB0D1882;
         constexpr uint64_t GET_VEHICLE_LIGHTS_STATE                    = 0xB91B4C20085BD12F;
         constexpr uint64_t SET_VEHICLE_FULLBEAM                        = 0x8B7FD87F0DDB421E;
         constexpr uint64_t SET_VEHICLE_INTERIORLIGHT                   = 0xBC2042F090AF6AD3;
@@ -895,6 +900,10 @@ namespace gage::game {
         bool     IsPedVaulting(int32_t ped);
         // TASK_CLIMB(ped, usePlayerLaunchForce): the ped climbs / vaults whatever is in front of it. Once per climb.
         bool     TaskClimb(int32_t ped, bool usePlayerLaunchForce);
+        // W11: TASK_GO_TO_ENTITY(ped, target, duration, distance, moveBlendRatio, slowDownDistance, flags): the ped walks / runs to
+        // an entity and follows it. duration -1 = until another task; the remote puppets use it on an invisible anchor entity.
+        bool     TaskGoToEntity(int32_t ped, int32_t target, int durationMs, float distance, float moveBlendRatio,
+                                float slowDownDistance, int flags);
         // The AI damage modifiers are global (every AI ped's weapon / melee damage, which includes the remote
         // players' puppets): 0.0 at Welcome so a puppet's real shot or punch hurts nobody locally (damage is the
         // server's), RESET at the end of the session. True = could be called.
