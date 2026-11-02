@@ -222,6 +222,7 @@ namespace {
 
         // ---- sync plan W3, combat client (script tick unless marked "join worker") ----
         sync::ShotDebt shotDebt;         // shots owed to this ped (shotSeq stepped) and not fired yet: 3 a frame
+        sync::MeleeSwingGate swingGate;  // 0c: a shotSeq step or a rising kPfMelee is ONE swing to show (300 ms dedupe)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
         bool reactLifted = false;        // PCF 188 (DisableHurt) and the ragdoll block are lifted for the reaction
@@ -395,6 +396,16 @@ namespace {
     // game-wide AI weapon and melee damage modifiers are 0 while a session is on and reset when it ends.
     std::atomic<bool> g_aiDamageWanted{false};
     bool g_aiDamageApplied = false;                    // script tick (and the PlayPeerShots it calls)
+    // 0.4.4 item 0c: SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER is NOT set by default (ai_melee_mod=1 sets it again). A puppet
+    // only PLAYS a swing animation (PlayPeerSwing: TaskPlayAnim, no melee task, no TASK_COMBAT anywhere), so there is no
+    // melee blow that could hurt the local player, and the 0.0 modifier zeroed OUR fists on the puppet (the 0.4.3
+    // regression: swings counted, no hit ever seen). Registry read at Welcome; applied only after the tick set it.
+    std::atomic<bool> g_aiMeleeMod{false};
+    bool g_aiMeleeApplied = false;                     // script tick
+    // 0c, written by TickLocalMelee every script frame, read by ProbePeerHits (same thread): the melee state of OUR ped.
+    bool   g_meleeHeld = false;                        // a melee-class weapon in hand, on foot, alive
+    bool   g_meleeActionNow = false;                   // IS_PED_PERFORMING_MELEE_ACTION(local ped)
+    double g_lastSwingMs = -1e9;                       // when TickLocalMelee last counted a swing
     // W8 item 8: the last PedState the script tick read, for the render-thread fallback (GameWork !inScript).
     std::mutex g_realPedMtx;
     proto::PedState g_realPed;                         // g_realPedMtx
@@ -492,6 +503,11 @@ namespace {
         // capped, puppets that died of a takedown, the local health losses a puppet ped caused, AI modifier sets
         uint32_t reactStagger = 0, puppetStagger = 0, climbTasks = 0, climbFallbacks = 0, deadCapped = 0, takedownKills = 0,
                  puppetFireLoss = 0, aiModSets = 0;
+        // 0c: melee Hits reported by the damage event / by the pool drop; damage events read in a swing window; swing
+        // steps seen on puppets and why one was not shown (the ped was owned by something else, the dictionary was
+        // still streaming or missing, the anim task failed)
+        uint32_t meleeHitsEvent = 0, meleeHitsPool = 0, meleeEventsRead = 0, peerSwingSteps = 0, peerSwingOwned = 0,
+                 peerSwingNoDict = 0, peerSwingFailed = 0;
     };
     V4Stats g_v4;
     std::atomic<uint32_t> g_vehWorldsIn{0}, g_emotesIn{0};
@@ -1072,14 +1088,18 @@ namespace {
             // AI damage modifiers go to 0 (TickAiDamage, script tick): a puppet's shot or punch hurts nobody on this machine.
             g_peerShootPed.store(reg::Get(L"peer_shoot") != L"script");
             g_aiDamageWanted.store(true);
+            // 0c: the AI MELEE modifier stays untouched unless ai_melee_mod=1 (see g_aiMeleeMod).
+            g_aiMeleeMod.store(reg::Get(L"ai_melee_mod") == L"1");
             GLOGI("engine: combat client: hit reactions %s (a melee blow: a short stagger), muzzle flash %s, remote shots via %s "
-                  "(hit_react / peer_muzzle / peer_shoot); AI weapon and melee damage modifiers 0.0 once the tick sets them",
+                  "(hit_react / peer_muzzle / peer_shoot); AI weapon damage modifier 0.0 once the tick sets it, AI melee modifier %s "
+                  "(ai_melee_mod; off: puppets only play a swing animation, and the modifier zeroed our own fists on them)",
                   react == L"off" ? "OFF" : react == L"bullet" ? "bullet flinch only" : react == L"ragdoll" ? "knockdown / stagger only"
                                                                                                            : "flinch + knockdown + stagger",
                   g_peerMuzzle.load() ? "ON" : "OFF",
                   g_peerShootPed.load() ? "SET_PED_SHOOTS_AT_COORD (real shots; the clear-line check is lifted once the AI "
                                           "damage modifiers are set)"
-                                        : "the zero-damage script bullet (peer_shoot=script)");
+                                        : "the zero-damage script bullet (peer_shoot=script)",
+                  g_aiMeleeMod.load() ? "0.0 (ai_melee_mod=1)" : "left alone");
         }
         g_v4Reset.store(true);
         GLOGI("engine: v4: remote vehicles take angular velocity %s, applied in the %s frame; local hit detection "
@@ -2813,12 +2833,10 @@ namespace {
         release(g_swingArmed, sizeof(g_swingArmed) / sizeof(g_swingArmed[0]));
     }
 
-    // A remote ped swings: its shotSeq stepped with a melee-class weapon (combat 4, receiver). The first swing
-    // after a dictionary is requested is missed while it streams in.
-    void PlayPeerSwing(Peer& pe, int id, uint32_t weapon)
+    // The first candidate clip of a swing whose dictionary exists, requested (a reference held until the session ends).
+    // nullptr = none exists in this game (or not checkable yet). Logs once per dictionary what DOES_ANIM_DICT_EXIST said.
+    SwingClip* SwingClipFor(uint32_t weapon)
     {
-        if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
-            return;                                    // an emote, a seat, a climb or a reaction owns the ped
         const bool unarmed = weapon == UnarmedHash();
         SwingClip* list = unarmed ? g_swingUnarmed : g_swingArmed;
         const size_t n = unarmed ? sizeof(g_swingUnarmed) / sizeof(g_swingUnarmed[0])
@@ -2842,19 +2860,44 @@ namespace {
                 g_world->RequestAnimDict(c.dict);
                 c.held = true;
             }
-            if (!g_world->HasAnimDictLoaded(c.dict))
-                return;                                // still streaming: this swing is missed
-            if (g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
-                ++g_v4.peerSwings;
+            return &c;
+        }
+        return nullptr;
+    }
+
+    // A remote ped swings: a shotSeq step or a rising kPfMelee with a melee-class weapon in hand (combat 4, receiver;
+    // the pair is one swing, see PlayPeerShots). Every way a swing is not shown is counted (0c: the live test showed
+    // "0 peer swings shown" with no hint why).
+    void PlayPeerSwing(Peer& pe, int id, uint32_t weapon)
+    {
+        ++g_v4.peerSwingSteps;
+        if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
+        {
+            ++g_v4.peerSwingOwned;                     // an emote, a seat, a climb or a reaction owns the ped
             return;
         }
-        static bool logged = false;
-        if (!logged)
+        SwingClip* c = SwingClipFor(weapon);
+        if (!c)
         {
-            logged = true;
-            PeerLog(true, "engine: melee swing: peer id=%d swung but none of the candidate dictionaries exists in this "
-                    "game (names are INFERRED): remote melee swings are not shown", id);
+            ++g_v4.peerSwingNoDict;
+            static bool logged = false;
+            if (!logged)
+            {
+                logged = true;
+                PeerLog(true, "engine: melee swing: peer id=%d swung but none of the candidate dictionaries exists in this "
+                        "game (names are INFERRED): remote melee swings are not shown", id);
+            }
+            return;
         }
+        if (!g_world->HasAnimDictLoaded(c->dict))
+        {
+            ++g_v4.peerSwingNoDict;                    // still streaming: this swing is missed (WarmPeerSwing loads it early)
+            return;
+        }
+        if (g_world->TaskPlayAnim(pe.ped, c->dict, c->clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
+            ++g_v4.peerSwings;
+        else
+            ++g_v4.peerSwingFailed;
     }
 
     // A muzzle flash for a remote shot: the "core" particle asset's per-class effect (sync::MuzzleFlashEffect,
@@ -2944,13 +2987,20 @@ namespace {
             pe.shotDebt.Clear();
             return;
         }
-        if (n == 0 && pe.shotDebt.Owed() == 0)
-            return;
-        if (n > 0 && IsMeleeClassWeapon(ps.weapon))
-        {
+        // 0c: a swing is a shotSeq step OR the rising edge of the sender's kPfMelee (the flag was sent since v5 and the
+        // receiver ignored it, so a swing whose counter step was missed was never shown); one swing within 300 ms.
+        const bool meleeWeapon = IsMeleeClassWeapon(ps.weapon);
+        if (sync::PeerSwingDue(pe.swingGate, nowMs, n, meleeWeapon, (ps.flags & proto::kPfMelee) != 0))
             PlayPeerSwing(pe, id, ps.weapon);
+        else if (meleeWeapon)
+            SwingClipFor(ps.weapon);                   // load the swing dictionary before the first swing, not during it
+        if (meleeWeapon)
+        {
+            pe.shotDebt.Clear();                       // fists and clubs owe no bullets
             return;
         }
+        if (n == 0 && pe.shotDebt.Owed() == 0)
+            return;
         if (!IsGunWeapon(ps.weapon))
         {
             pe.shotDebt.Clear();                       // the weapon changed or is not a gun: nothing is owed
@@ -3054,7 +3104,19 @@ namespace {
         if (!pe.hpPool || pe.deadShown || !lp)
             return;
         const int h = g_world->GetEntityHealth(pe.ped);
-        if (h == pe.hpPool)
+        // 0c: a melee blow is read from the damage EVENT as well, in the window of our own swing only (a melee-class weapon
+        // in hand and a swing counted or a melee action running: sync::MeleeEventWindow keeps the native call out of every
+        // other frame). The pool alone cannot see a fist that took nothing off it (the AI melee modifier at 0 did exactly
+        // that in 0.4.3), and the early return below must not hide the event.
+        const double sinceSwing = nowMs - g_lastSwingMs;
+        const bool eventWindow = sync::MeleeEventWindow(g_meleeHeld, sinceSwing, g_meleeActionNow);
+        bool eventDamaged = false;
+        if (eventWindow)
+        {
+            ++g_v4.meleeEventsRead;
+            eventDamaged = g_world->DamagedBy(pe.ped, lp);
+        }
+        if (h == pe.hpPool && !eventDamaged)
             return;
         // A puppet the game killed in one blow above the pool (a headshot would, but critical hits are
         // off for puppets; a rocket or a ram can) is still ours to report when we did it.
@@ -3076,11 +3138,29 @@ namespace {
         const uint32_t myWeapon = byMe && !byVeh ? g_world->GetSelectedPedWeapon(lp) : 0;
         const int deadMax = (dead && myWeapon && IsMeleeClassWeapon(myWeapon)) ? sync::kDeadMeleeCapDamage : sync::kNoDeadCap;
         const bool takedown = dead && byMe && g_world->WasPedKilledByTakedown(pe.ped);   // diagnostic only
-        const sync::PeerDamageOut o = sync::ProbePeerDamage(h, pe.hpPool, byMe, dead, deadMax);
+        sync::PeerDamageOut o = sync::ProbePeerDamage(h, pe.hpPool, byMe, dead, deadMax);
         if (deadMax != sync::kNoDeadCap && o.report && pe.hpPool - (h > 0 ? h : 0) > deadMax)
             ++g_v4.deadCapped;
         if (takedown)
             ++g_v4.takedownKills;
+        // 0c: the melee decision (sync::DecideMeleeHit): the damage event in the swing window is the hit, at the weapon's
+        // nominal damage (the server's melee ceiling decides what it is worth); it replaces the pool number for that blow.
+        // A pool drop with no event keeps reporting as before (guns, a melee drop outside the window).
+        sync::MeleeHitIn mi;
+        mi.meleeWeaponHeld = g_meleeHeld;
+        mi.eventDamaged = eventDamaged;
+        mi.sinceSwingMs = sinceSwing;
+        mi.meleeActionNow = g_meleeActionNow;
+        mi.poolReport = o.report;
+        mi.poolDamage = o.damage;
+        const sync::MeleeHitOut md = sync::DecideMeleeHit(mi);
+        o.report = md.source != sync::MeleeHitSource::None;
+        if (o.report)
+            o.damage = md.damage;
+        if (md.source == sync::MeleeHitSource::Event)
+            ++g_v4.meleeHitsEvent;
+        else if (md.source == sync::MeleeHitSource::Pool && g_meleeHeld)
+            ++g_v4.meleeHitsPool;
         if (o.report)
         {
             int bone = -1;
@@ -3097,7 +3177,7 @@ namespace {
             hit.shotSeq = (uint8_t)(g_shotSeq & 15);
             g_hits.Add(hit, nowMs);
         }
-        if (o.damage > 0 || h <= 0)
+        if (o.damage > 0 || h <= 0 || md.clearEvent)   // md.clearEvent: a melee event is read once, never fires the next swing too
         {
             g_world->ClearLastDamage(pe.ped);
             g_world->ClearLastDamageBone(pe.ped);
@@ -5762,8 +5842,11 @@ namespace {
             if (failed >= 5 || nowMs - atMs < (g_aiDamageApplied ? 5000.0 : 1000.0))
                 return;
             atMs = nowMs;
+            // 0c: the MELEE modifier only with ai_melee_mod=1. A puppet plays a swing animation and starts no melee task, so
+            // nothing of its own can hurt the local player, and the 0.0 modifier zeroed our own fists on the puppet.
+            const bool meleeWanted = g_aiMeleeMod.load(std::memory_order_relaxed);
             const bool weaponOk = g_world->SetAiWeaponDamageModifier(0.0f);
-            const bool meleeOk = g_world->SetAiMeleeWeaponDamageModifier(0.0f);
+            const bool meleeOk = !meleeWanted || g_world->SetAiMeleeWeaponDamageModifier(0.0f);
             if (weaponOk && meleeOk)
             {
                 if (!g_aiDamageApplied)
@@ -5771,23 +5854,27 @@ namespace {
                     g_aiDamageApplied = true;
                     failed = 0;
                     ++g_v4.aiModSets;
-                    GLOGI("engine: AI weapon and melee damage modifiers set to 0.0: a puppet's real shot or punch hurts nobody "
-                          "here (damage is the server's); the clear-line check of real peer shots is lifted");
+                    GLOGI("engine: AI weapon damage modifier set to 0.0: a puppet's real shot hurts nobody here (damage is the "
+                          "server's); the clear-line check of real peer shots is lifted. AI melee damage modifier: %s",
+                          meleeWanted ? "also 0.0 (ai_melee_mod=1)" : "NOT set (puppets only play a swing animation; our fists must hurt the puppet's pool)");
                 }
+                g_aiMeleeApplied = meleeWanted;
             }
             else if (++failed >= 5)
-                GLOGW("engine: SET_AI_WEAPON_DAMAGE_MODIFIER / SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER could not be called (weapon "
-                      "%s, melee %s): real peer shots keep the clear-line check", weaponOk ? "ok" : "no", meleeOk ? "ok" : "no");
+                GLOGW("engine: SET_AI_WEAPON_DAMAGE_MODIFIER%s could not be called (weapon %s, melee %s): real peer shots keep "
+                      "the clear-line check", meleeWanted ? " / SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER" : "", weaponOk ? "ok" : "no",
+                      meleeOk ? "ok" : "no");
             return;
         }
         failed = 0;
         if (g_aiDamageApplied)
         {
             const bool weaponOk = g_world->ResetAiWeaponDamageModifier();
-            const bool meleeOk = g_world->ResetAiMeleeWeaponDamageModifier();
+            const bool meleeOk = !g_aiMeleeApplied || g_world->ResetAiMeleeWeaponDamageModifier();   // only if we set it
             g_aiDamageApplied = false;
-            GLOGI("engine: session ended: AI weapon and melee damage modifiers reset (weapon %s, melee %s)", weaponOk ? "ok" : "NOT CALLABLE",
-                  meleeOk ? "ok" : "NOT CALLABLE");
+            GLOGI("engine: session ended: AI weapon damage modifier reset (%s), melee modifier %s", weaponOk ? "ok" : "NOT CALLABLE",
+                  !g_aiMeleeApplied ? "was never set" : meleeOk ? "reset" : "NOT CALLABLE");
+            g_aiMeleeApplied = false;
         }
     }
 
@@ -6068,6 +6155,16 @@ namespace {
                   c.muzzleFlashes - last.muzzleFlashes, c.reactFlinch - last.reactFlinch, c.reactKnock - last.reactKnock,
                   c.reactStagger - last.reactStagger, c.puppetFlinch - last.puppetFlinch, c.puppetKnock - last.puppetKnock,
                   c.puppetStagger - last.puppetStagger);
+            GLOGI("engine: melee (0c), last 10 s: hits sent (all weapons) %u; melee hits detected by the damage EVENT %u / by the pool drop %u (event read "
+                  "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u shown, %u not shown (ped owned "
+                  "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s",
+                  c.hitsSent - last.hitsSent, c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool,
+                  c.meleeEventsRead - last.meleeEventsRead, c.meleeSwings - last.meleeSwings,
+                  c.peerSwingSteps - last.peerSwingSteps, c.peerSwings - last.peerSwings,
+                  (c.peerSwingOwned - last.peerSwingOwned) + (c.peerSwingNoDict - last.peerSwingNoDict) +
+                      (c.peerSwingFailed - last.peerSwingFailed),
+                  c.peerSwingOwned - last.peerSwingOwned, c.peerSwingNoDict - last.peerSwingNoDict,
+                  c.peerSwingFailed - last.peerSwingFailed, g_aiMeleeApplied ? "0.0 (ai_melee_mod=1)" : "not set");
             GLOGI("engine: combat client (W8), last 10 s: local health changed by a puppet ped's gun or fists %u times (our "
                   "own cosmetic flinch bullets included); AI damage modifiers %s; dead-puppet melee reports capped %u, puppets "
                   "killed by a takedown %u; TASK_CLIMB issued %u, placement fallbacks %u; alt-tab fallback states sent %u",
@@ -6096,15 +6193,19 @@ namespace {
     void TickLocalMelee(int32_t lp, bool inVehicle, double nowMs)
     {
         bool control = false, action = false;
-        if (!inVehicle && g_life == Life::Alive && !game::Overlay::Interactive() &&
-            IsMeleeClassWeapon(g_world->GetSelectedPedWeapon(lp)))
+        // 0c: the melee state of our ped, for ProbePeerHits' event window (a menu or the chat does not change what is in hand)
+        g_meleeHeld = !inVehicle && g_life == Life::Alive && IsMeleeClassWeapon(g_world->GetSelectedPedWeapon(lp));
+        g_meleeActionNow = false;
+        if (g_meleeHeld && !game::Overlay::Interactive())
         {
             control = g_world->IsDisabledControlJustPressed(0, 140) || g_world->IsDisabledControlJustPressed(0, 141) ||
                       g_world->IsDisabledControlJustPressed(0, 142);
             action = g_world->IsPedPerformingMeleeAction(lp);
+            g_meleeActionNow = action;
         }
         if (!g_meleeGate.Tick(nowMs, control, action))
             return;
+        g_lastSwingMs = nowMs;
         ++g_shotSeq;
         ++g_v4.meleeSwings;
         static int logged = 0;
