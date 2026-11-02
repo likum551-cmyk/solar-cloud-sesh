@@ -13,6 +13,7 @@
 #include "loading_screen.h"
 #include "overlay.h"
 #include "brand_apparel.h"
+#include "pack_stream.h"
 #include "quit_gate.h"
 #include "common/common.h"
 #include "common/logger.h"
@@ -7093,6 +7094,8 @@ namespace {
             TickAiDamage(NowMs());                     // W8 item 6: the AI damage modifiers follow the session (also after it ends)
         if (inScript && mayChange)
             TickHyperTune(lp);                         // the hyper cars (libs/sync/hypertune.h): power every frame, top speed once
+        if (inScript && mayChange && lp)
+            game::content::Tick(*g_world);             // auto-mount the add-on pack (Jesko) through the game's own DLC loader, if armed (pack_mount=1; default off)
         // The session ended (OnEnded marked every peer gone and every server vehicle removed): the entry gate
         // below returns before TickPeers / TickVehicles run, so the remote peds and server vehicles would stay
         // frozen in the world until a later session finished its entry (W4 review, fix 1). Run the cleanup pass

@@ -320,6 +320,7 @@ add_library(gage_mp SHARED
     apps/engine/engine.cpp
     apps/engine/loading_screen.cpp
     apps/engine/brand_apparel.cpp
+    apps/engine/pack_stream.cpp
 )
 target_link_libraries(gage_mp PRIVATE gage_common gage_netclient gage_sync gage_overlay winhttp ws2_32)
 set_target_properties(gage_mp PROPERTIES
@@ -338,6 +339,7 @@ add_executable(gage_mp_test
     apps/engine/engine.cpp
     apps/engine/loading_screen.cpp
     apps/engine/brand_apparel.cpp
+    apps/engine/pack_stream.cpp
 )
 target_link_libraries(gage_mp_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
 set_target_properties(gage_mp_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
