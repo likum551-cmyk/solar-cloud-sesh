@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 namespace gage::server {
 
@@ -341,6 +342,7 @@ namespace gage::server {
             return fail("top level must be an object");
 
         Config out = cfg;
+        bool fileSetsLatestClient = false;
         for (const auto& kv : p.v.o)
         {
             const std::string& key = kv.first;
@@ -420,6 +422,16 @@ namespace gage::server {
             else if (key == "adminToken")
             {
                 if (!str(out.adminToken)) return false;
+            }
+            else if (key == "latestClientVersion")
+            {
+                // "x.y.z" (each 0..255) or "" (none). 0.0.0 is the same as none.
+                if (v.t != JVal::Str) return fail("\"latestClientVersion\" must be a string \"x.y.z\" (each part 0..255) or \"\"");
+                proto::query::ClientVersion cv;
+                if (!v.s.empty() && !proto::query::ParseClientVersion(v.s.data(), v.s.size(), cv))
+                    return fail("\"latestClientVersion\" must look like \"0.4.4\" (three numbers 0..255) or be \"\"");
+                out.latestClient = cv;
+                fileSetsLatestClient = true;
             }
             else if (key == "maxVehicles")
             {
@@ -566,7 +578,7 @@ namespace gage::server {
             {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
                                     "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, adminPort, adminToken, "
-                                    "maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
+                                    "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
                                     "vehicleMaxSpeed, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "
                                     "respawnArmour, respawnDelaySeconds, maxHitDistance, "
@@ -582,6 +594,18 @@ namespace gage::server {
         // of anything that gets copied around): only used when the file sets none.
         if (out.adminEnabled() && out.adminToken.empty())
             if (const char* env = std::getenv("GAGE_ADMIN_TOKEN")) out.adminToken = env;
+        // Same for the newest client release (tools/deploy/release.sh writes it to /etc/gage/server.env, which the
+        // service unit loads; an older server binary ignores an environment variable it does not know, but would
+        // refuse a new server.json key, so a rollback stays possible).
+        if (!fileSetsLatestClient)
+            if (const char* env = std::getenv("GAGE_LATEST_CLIENT_VERSION"))
+                if (*env)
+                {
+                    proto::query::ClientVersion cv;
+                    if (!proto::query::ParseClientVersion(env, std::strlen(env), cv))
+                        return fail("environment variable GAGE_LATEST_CLIENT_VERSION must look like \"0.4.4\" (three numbers 0..255)");
+                    out.latestClient = cv;
+                }
         std::string why;
         if (!Validate(out, &why)) return fail(why);
         cfg = out;
@@ -609,6 +633,14 @@ namespace gage::server {
                std::to_string(r.rateMidHz) + "/" + std::to_string(r.rateFarHz) + "/" + std::to_string(r.rateIdleHz) + "/" + std::to_string(r.rateCoarseHz) +
                " Hz, idle after " + std::to_string(r.idleAfterMs) + " ms, budget " + std::to_string(r.budgetBytesPerSec) + " B/s per client, world packet max " +
                std::to_string(r.packetMaxBytes) + " B, coarse share " + std::to_string(r.coarseSharePercent) + "%";
+    }
+
+    std::string DescribeLatestClient(const Config& cfg)
+    {
+        const proto::query::ClientVersion& v = cfg.latestClient;
+        if (!v.Known()) return "update ping: no latest client configured (the UDP query reports 0.0.0 = unknown)";
+        return "update ping: the UDP query tells launchers the latest client is " + std::to_string(v.major) + "." +
+               std::to_string(v.minor) + "." + std::to_string(v.patch);
     }
 
     std::string DescribeCombat(const Config& cfg)

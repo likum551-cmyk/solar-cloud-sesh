@@ -51,7 +51,8 @@
 //    violation).
 //  * UDP query (apps/master/PROTOCOL.md): a 24-byte datagram "GAGE 01 01 ..." on the game
 //    port is answered with protocol version, players and maxPlayers, rate-limited per
-//    source address and overall; ENet never sees it.
+//    source address and overall; ENet never sees it. A request that asks for query format v2 (u16 at 6
+//    = 2) also gets Config::latestClient in the same 24 bytes; any other request gets the v1 reply.
 //  * Admin is the console (Execute) and, when Config::adminPort is set, the local
 //    loopback channel (admin.h). No player is ever an admin.
 //  * v4 vehicles (vehicles.h): VehicleCmd (reliable) is checked against the server's own state

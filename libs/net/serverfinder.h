@@ -114,11 +114,16 @@ namespace gage::net {
         int players = -1;     // joined players right now (-1 = unknown)
         int maxPlayers = -1;  // slots (-1 = unknown)
         int protocol = -1;    // the game protocol version the server enforces (-1 = unknown)
+        // The newest client release the server was released with (query format v2, "update ping"), packed as
+        // major<<16 | minor<<8 | patch (proto::query::ClientVersion::Packed). 0 = unknown: a server that predates
+        // v2 (it answers v1), or one with no latest client configured. Never a reason to block anything.
+        int latestClient = 0;
     };
 
     // Send one GAGE UDP query to host:port and wait up to `timeoutMs` for the matching reply
-    // (the reply's nonce must echo the request's). Returns true and fills `out` on a valid reply,
-    // false on timeout, resolve failure or socket error. `host` may be an IP or a hostname. This
+    // (the reply's nonce must echo the request's). The request asks for the v2 reply; a server that
+    // predates v2 ignores that and answers v1, which is accepted (latestClient stays 0). Returns true
+    // and fills `out` on a valid reply, false on timeout, resolve failure or socket error. `host` may be an IP or a hostname. This
     // is the UDP equivalent of PingServer for GAGE servers (ENet/UDP), which a TCP connect cannot
     // reach; it is independent of the TCP Ping/PingServer/PingMany path above.
     bool QueryServer(const std::wstring& host, int port, int timeoutMs, QueryResult& out);

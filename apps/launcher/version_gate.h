@@ -4,7 +4,7 @@
 // can pin every row. gage_gui.cpp supplies the inputs (the update state, the server's UDP-query protocol,
 // the clock) and acts on the answers; docs/UPDATES.md ("Lockstep releases") is the prose version.
 //
-// Three rules live here:
+// Four rules live here:
 //
 //  1. EVERY available update is mandatory (UpdateIsMandatory): PLAY is refused until the launcher runs the
 //     newest published version, whatever the manifest's `mandatory` flag or the "install automatically"
@@ -15,6 +15,10 @@
 //  3. When the launcher looks for an update (kUpdatePollMs, CheckDue, BeforePlay): every 2 minutes while it
 //     is open, and on the events that matter (window brought forward, PLAY pressed, the game exited, a
 //     server that is ahead of us seen), never more often than once per kMinCheckGapMs.
+//  4. The update ping (DecideClient, DecideServer): the server's UDP query (format v2) also reports the newest
+//     client it was released with. When that is newer than this launcher's kClientVersion, PLAY is refused with
+//     code 14 and the update check starts at once (same rate limit), even though the protocol is the same.
+//     Unknown (0.0.0, an older server, no latestClientVersion configured), equal and older never trigger anything.
 
 #include <cstdint>
 
@@ -69,6 +73,38 @@ namespace gage::vgate {
     inline constexpr const wchar_t* kTextServerAhead = L"Solar RP was updated. Updating the launcher...";
     inline constexpr const wchar_t* kTextServerBehind = L"This server has not been updated yet. Try again in a minute.";
 
+    // ---- rule 4: versions as one number -----------------------------------------------------------------------
+    // major<<16 | minor<<8 | patch, each 0..255: orders like the version. 0 = unknown. The same packing as
+    // proto::query::ClientVersion::Packed() (libs/protocol/query.h); the test asserts they agree.
+    inline constexpr uint32_t kUnknownVersion = 0;
+    inline constexpr uint32_t PackVersion(unsigned major, unsigned minor, unsigned patch)
+    {
+        return (major > 255 || minor > 255 || patch > 255) ? kUnknownVersion : ((major << 16) | (minor << 8) | patch);
+    }
+    // Strict "x.y.z" (three numbers of 1..3 digits, each 0..255, nothing else) -> packed; anything else, or a null
+    // pointer, is kUnknownVersion. The launcher feeds it kClientVersion; a client that cannot read its own version
+    // is never told to update.
+    inline uint32_t ParseVersion(const char* s)
+    {
+        if (!s) return kUnknownVersion;
+        unsigned part[3] = {0, 0, 0};
+        unsigned idx = 0, digits = 0;
+        for (; *s; ++s) {
+            if (*s >= '0' && *s <= '9') {
+                if (++digits > 3) return kUnknownVersion;
+                part[idx] = part[idx] * 10 + (unsigned)(*s - '0');
+                if (part[idx] > 255) return kUnknownVersion;
+            } else if (*s == '.' && digits > 0 && idx < 2) {
+                ++idx;
+                digits = 0;
+            } else {
+                return kUnknownVersion;
+            }
+        }
+        if (idx != 2 || digits == 0) return kUnknownVersion;
+        return PackVersion(part[0], part[1], part[2]);
+    }
+
     struct Gate {
         bool refuse = false;           // PLAY must not start the game
         bool checkNow = false;         // look for a launcher update now (the caller applies kMinCheckGapMs)
@@ -102,6 +138,38 @@ namespace gage::vgate {
             g.text = kTextServerBehind;
         }
         return g;
+    }
+
+    // ---- rule 4: the update ping ---------------------------------------------------------------------------
+    // serverLatest: the newest client the server reported in its v2 UDP query reply (packed; 0 = unknown: an older
+    // server answered v1, or none is configured). clientVersion: this launcher's kClientVersion (packed; 0 = could not
+    // be read). updatePending: this launcher already knows a newer version.
+    //
+    //   server latest              update pending   result
+    //   unknown (0), or client unknown   any        allow
+    //   <= client                  any              allow (an older or equal "latest" never triggers anything)
+    //   >  client                  no               refuse, code 14, kTextServerAhead, checkNow
+    //   >  client                  yes              refuse, code 14, usePendingText (the update is the cure)
+    inline Gate DecideClient(uint32_t serverLatest, uint32_t clientVersion, bool updatePending)
+    {
+        Gate g;
+        if (serverLatest == kUnknownVersion || clientVersion == kUnknownVersion || serverLatest <= clientVersion) return g;
+        g.refuse = true;
+        g.code = kCodeUpdate;
+        g.text = kTextServerAhead;
+        g.checkNow = !updatePending;
+        g.usePendingText = updatePending;
+        return g;
+    }
+
+    // Everything one server answer can say: the protocol gate first (a protocol mismatch is the harder fact: ahead
+    // and behind keep their codes and texts), then the update ping. This is what the launcher calls.
+    inline Gate DecideServer(int serverProtocol, int clientProtocol, uint32_t serverLatest, uint32_t clientVersion,
+                             bool updatePending)
+    {
+        const Gate byProtocol = Decide(serverProtocol, clientProtocol, updatePending);
+        if (byProtocol.refuse) return byProtocol;
+        return DecideClient(serverLatest, clientVersion, updatePending);
     }
 
 }
