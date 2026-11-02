@@ -1,11 +1,16 @@
 // pack_dlc_rpf.mjs - pack content/dlc/gage_apparel/source into dlc.rpf (RPF7), and check RPF7 archives.
 //
 //   node pack_dlc_rpf.mjs                         pack <pack>/source -> <pack>/out/dlc.rpf
-//   node pack_dlc_rpf.mjs --enc=none|open         header encryption word written (default open = 0x4E45504F)
+//   node pack_dlc_rpf.mjs --enc=none|open|aes     header encryption word written (default open = 0x4E45504F);
+//                                                 aes needs --aes-key-file and seals the entries+names region
+//   node pack_dlc_rpf.mjs --aes-key-file=<path>   32 raw bytes; the operator supplies it (this tool never
+//                                                 extracts or ships a key). Used by --enc=aes and by --check on an AES rpf.
 //   node pack_dlc_rpf.mjs --allow-missing         pack even though the three game assets are absent (writes
 //                                                 dlc.INCOMPLETE.rpf: for checking the container only, never ship it)
 //   node pack_dlc_rpf.mjs --check=<file.rpf>      parse an RPF7 independently of the writer and print its tree
-//   node pack_dlc_rpf.mjs --selftest              build a synthetic archive, check it, then corrupt it and see the checker object
+//                                                 (add --aes-key-file to read an AES archive, e.g. a real game rpf)
+//   node pack_dlc_rpf.mjs --selftest              build a synthetic archive, check it, corrupt it and see the checker
+//                                                 object, then AES seal/unseal round-trip with a throwaway key
 //
 // A directory whose name ends in .rpf under source/ becomes a NESTED archive (stored as-is, like the game's own
 // dlc.rpf holds x64/models/cdimages/*.rpf). A file that starts with the RSC7 magic is stored as a resource entry.
@@ -17,7 +22,7 @@
 // No dependencies.
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createCipheriv, createDecipheriv } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -202,6 +207,46 @@ function readArchive(buf, label = "root") {
   return { errs, files, enc };
 }
 
+// ---- AES seal / unseal (RPF7 AES = AES-256-ECB over the entries+names region) --------------------
+// GTA V reads AES archives natively (no game-side patch). This tool NEVER extracts or ships a key: it
+// consumes a 32-byte key file the operator supplies (the same split the MIT tools use - the archive
+// library "only consumes keys"; recovering the key from your own GTA5.exe is a separate tool's job).
+// Only the entries+names table is encrypted, in 16-byte ECB blocks; file data and the 16-byte header
+// stay plain (the header must be read to learn the encryption type). Any trailing <16 bytes of the
+// region are left plain, matching CodeWalker's block-wise GTACrypto. The exact region/padding is
+// UNVERIFIED against the retail game: a live mount test must tell "game refuses AES top-level dlc"
+// apart from "our sealed region is wrong" - check against a real game AES rpf with `--check ... --aes-key-file`.
+function tocRegion(buf) {
+  const count = buf.readUInt32LE(4), namesLen = buf.readUInt32LE(8);
+  const full = count * 16 + namesLen;            // entries (16 each) + names
+  const encLen = full - (full % 16);             // ECB processes whole 16-byte blocks only
+  if (16 + full > buf.length) throw new Error("entries+names region runs past the end of the file");
+  return { start: 16, encLen, full };
+}
+function sealAes(buf, key) {
+  if (key.length !== 32) throw new Error(`AES key must be 32 bytes, got ${key.length}`);
+  const out = Buffer.from(buf);
+  const { start, encLen } = tocRegion(out);
+  const c = createCipheriv("aes-256-ecb", key, null); c.setAutoPadding(false);
+  Buffer.concat([c.update(out.subarray(start, start + encLen)), c.final()]).copy(out, start);
+  out.writeUInt32LE(ENC_AES, 12);
+  return out;
+}
+function unsealAes(buf, key, encWordOut = ENC_OPEN) {
+  if (key.length !== 32) throw new Error(`AES key must be 32 bytes, got ${key.length}`);
+  const out = Buffer.from(buf);
+  const { start, encLen } = tocRegion(out);
+  const d = createDecipheriv("aes-256-ecb", key, null); d.setAutoPadding(false);
+  Buffer.concat([d.update(out.subarray(start, start + encLen)), d.final()]).copy(out, start);
+  out.writeUInt32LE(encWordOut, 12);
+  return out;
+}
+function readKeyFile(p) {
+  const k = readFileSync(path.resolve(String(p)));
+  if (k.length !== 32) { console.error(`AES key file must be exactly 32 bytes (got ${k.length}): ${p}`); process.exit(2); }
+  return k;
+}
+
 const sha = (b) => createHash("sha256").update(b).digest("hex").slice(0, 12);
 
 function printTree(r, buf) {
@@ -251,6 +296,22 @@ function selftest() {
   mutate("a name offset out of range", (b) => b.writeUInt16LE(0xFFF0, 16 + 1 * 16));
   mutate("RSC7 magic overwritten", (b) => { const f = r.files.find((x) => x.path.endsWith(".ytd")); const i = b.indexOf(f.data.subarray(0, 32)); b.writeUInt32LE(0, i); });
   mutate("an entry not reachable from the root", (b) => b.writeUInt32LE(b.readUInt32LE(4) + 1, 4));
+
+  // AES seal/unseal: a random 32-byte key (NOT a game key - this only proves the transform round-trips).
+  const key = createHash("sha256").update("pack_dlc_rpf selftest key").digest();   // 32 deterministic bytes
+  const sealed = sealAes(buf, key);
+  check(sealed.readUInt32LE(12) === ENC_AES, "sealed archive's header says AES");
+  check(sealed.length === buf.length, "sealing does not change the archive length");
+  const { start, encLen } = tocRegion(buf);
+  check(!sealed.subarray(start, start + encLen).equals(buf.subarray(start, start + encLen)), "sealing actually encrypts the entries+names region");
+  check(sealed.subarray(0, 12).equals(buf.subarray(0, 12)) && sealed.subarray(start + encLen).equals(buf.subarray(start + encLen)), "sealing leaves the magic/count/names fields and the file data untouched");
+  check(readArchive(sealed).errs.length > 0, "the plain checker cannot read a sealed archive (its TOC is encrypted)");
+  const unsealed = unsealAes(sealed, key);
+  check(unsealed.equals(buf), "unseal(seal(x)) == x with the same key");
+  check(readArchive(unsealed).errs.length === 0, "the checker accepts the unsealed archive");
+  const wrong = createHash("sha256").update("a different key").digest();
+  check(readArchive(unsealAes(sealed, wrong)).errs.length > 0, "unsealing with the wrong key does not reproduce a valid archive");
+
   console.log(bad ? `FAILED (${bad})` : "ALL PASS");
   process.exit(bad ? 1 : 0);
 }
@@ -259,7 +320,18 @@ function selftest() {
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const m = /^--([^=]+)(?:=(.*))?$/.exec(a); if (!m) { console.error(`bad argument ${a}`); process.exit(2); } return [m[1], m[2] ?? true]; }));
 if (args.selftest) selftest();
 if (args.check) {
-  const buf = readFileSync(path.resolve(String(args.check)));
+  let buf = readFileSync(path.resolve(String(args.check)));
+  const enc = buf.length >= 16 ? buf.readUInt32LE(12) : 0;
+  if (enc === ENC_AES && args["aes-key-file"]) {
+    console.log("archive header says AES; decrypting the entries+names region with the supplied key to read it");
+    buf = unsealAes(buf, readKeyFile(args["aes-key-file"]));
+  } else if (enc === ENC_AES) {
+    console.error("archive is AES-encrypted; pass --aes-key-file=<32-byte key> to read its TOC");
+    process.exit(1);
+  } else if (enc === ENC_NG) {
+    console.error("archive is NG-encrypted; NG is not supported by this tool");
+    process.exit(1);
+  }
   const r = readArchive(buf);
   printTree(r, buf);
   if (r.errs.length) { for (const e of r.errs) console.error("PROBLEM " + e); process.exit(1); }
@@ -267,8 +339,11 @@ if (args.check) {
   process.exit(0);
 }
 
-const encWord = { open: ENC_OPEN, none: ENC_NONE }[String(args.enc ?? "open")];
-if (encWord === undefined) { console.error("--enc must be open or none (NG/AES cannot be written headlessly: see the report)"); process.exit(2); }
+const encName = String(args.enc ?? "open");
+const encWord = { open: ENC_OPEN, none: ENC_NONE, aes: ENC_OPEN }[encName];   // aes builds OPEN first, then seals below
+if (encWord === undefined) { console.error("--enc must be open, none or aes (NG cannot be written: it needs CodeWalker's magic.dat, which is excluded)"); process.exit(2); }
+if (encName === "aes" && !args["aes-key-file"]) { console.error("--enc=aes needs --aes-key-file=<path to a 32-byte key>"); process.exit(2); }
+const aesKey = encName === "aes" ? readKeyFile(args["aes-key-file"]) : null;
 const srcDir = path.join(packDir, "source");
 const outDir = path.join(packDir, "out");
 const root = readTree(srcDir, "");
@@ -284,11 +359,13 @@ if (missing.length && !args["allow-missing"]) {
   console.error("pass --allow-missing to build dlc.INCOMPLETE.rpf for a container check only");
   process.exit(1);
 }
-const buf = buildArchive(root, encWord);
-const r = readArchive(buf);
+const plain = buildArchive(root, encWord);
+const r = readArchive(plain);                 // validate the plaintext structure before any sealing
+const buf = aesKey ? sealAes(plain, aesKey) : plain;
 mkdirSync(outDir, { recursive: true });
 const outFile = path.join(outDir, missing.length ? "dlc.INCOMPLETE.rpf" : "dlc.rpf");
 writeFileSync(outFile, buf);
-printTree(r, buf);
+printTree(r, plain);
+if (aesKey) console.log(`sealed as AES (0x${ENC_AES.toString(16)}) with the supplied key; the game reads AES natively`);
 if (r.errs.length) { for (const e of r.errs) console.error("PROBLEM " + e); process.exit(1); }
 console.log(`structure OK -> ${outFile}${missing.length ? "  (INCOMPLETE: missing game assets)" : ""}`);
