@@ -834,6 +834,8 @@ const HashMapping kCrossmap3889[] = {
     {native::RESET_AI_WEAPON_DAMAGE_MODIFIER,             0xDD84F9C956E69AC8},
     {native::RESET_AI_MELEE_WEAPON_DAMAGE_MODIFIER,       0x01B722A2B2026558},
     {native::WAS_PED_KILLED_BY_TAKEDOWN,                  0xD9F6166CE6292D26},
+    // 0.4.4 (W11): lookup tool, public and 3889 agree.
+    {native::TASK_GO_TO_ENTITY,                           0xAB3658A740EED98E},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
     {native::SET_VEHICLE_FULLBEAM,                        0x2F12C305B28C6C59},
     {native::SET_VEHICLE_INTERIORLIGHT,                   0xEC6A9F16D3F15978},
@@ -5125,6 +5127,14 @@ bool World::TaskClimb(int32_t ped, bool usePlayerLaunchForce) {
     return callPedToggle(*this, native::TASK_CLIMB, ped, usePlayerLaunchForce);   // TASK_CLIMB(ped, BOOL)
 }
 
+bool World::TaskGoToEntity(int32_t ped, int32_t target, int durationMs, float distance, float moveBlendRatio,
+                           float slowDownDistance, int flags) {
+    if (!ped || !target) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)target, (uint64_t)(uint32_t)durationMs,
+                        FloatArg(distance), FloatArg(moveBlendRatio), FloatArg(slowDownDistance), (uint64_t)(uint32_t)flags };
+    return CallNative(native::TASK_GO_TO_ENTITY, args, 7, nullptr);
+}
+
 bool World::SetAiWeaponDamageModifier(float value) {
     uint64_t args[] = { FloatArg(value) };
     return CallNative(native::SET_AI_WEAPON_DAMAGE_MODIFIER, args, 1, nullptr);
@@ -5567,6 +5577,7 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_PED_MOVE_RATE_OVERRIDE),
         GAGE_NEW_NATIVE(IS_PED_VAULTING),
         GAGE_NEW_NATIVE(TASK_CLIMB),
+        GAGE_NEW_NATIVE(TASK_GO_TO_ENTITY),
         GAGE_NEW_NATIVE(SET_AI_WEAPON_DAMAGE_MODIFIER),
         GAGE_NEW_NATIVE(SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER),
         GAGE_NEW_NATIVE(RESET_AI_WEAPON_DAMAGE_MODIFIER),

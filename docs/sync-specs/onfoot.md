@@ -72,6 +72,14 @@ Aim task re-issued every 500 ms or on any loco task (engine.cpp:2599). Re-issue 
 - Loco closed loop (SimPed anim-driven mode): after 2 s on a 4.5 m/s circle p95 distance <= 0.5 m, max <= 1.0 m; 0 persistent snaps in 60 s; GoStraight <= 0.4/s straight, <= 1.0/s circle; 0 StandStill above 0.5 m/s; 0 snaps on Reset().
 - Latency: shown-pose age behind sample time <= 200 ms at jitter 10 ms; with tickHz 30, gap 33 ms and delay <= 100 ms.
 
+## W11 (0.4.4): no re-issue on gait changes, anchor steering, residual push
+
+Live 0.4.3 still issued 8-12 TASK_GO_STRAIGHT_TO_COORD per 10 s (first of a gait 6-8, turn 4-6, drift 3-5). Implemented in libs/sync/locomotion.* (header section 8), tests in tests/locomotion_test.cpp (TestW11):
+- A Walk / Run / Sprint change is carried by SET_PED_DESIRED_MOVE_BLEND_RATIO on the running task (`LocoOutput::setBlend`), never a re-issue; bands 3.1 / 2.1 and 6.1 / 5.3 m/s, hold 400 ms; the straight path's drift rule counts only the lateral drift (a speed change moved the anchor along the track and re-issued).
+- `loco_mode=anchor` (default, HKCU value like peer_drive, read at Welcome): TASK_GO_TO_ENTITY once at an invisible, collision-less, frozen, non-networked helper ped moved to pose + direction * lead (0.8 s of travel, 1.5..5 m) every frame; only a lost task re-issues (stall rule); a stall drops that ped to the straight path for 20 s; no anchor entity or an aim task acts as straight for the frame. `loco_mode=straight` keeps the old path.
+- Velocity push: with the ped's own velocity (GET_ENTITY_VELOCITY) only the residual error is pushed on top of it, low-passed (150 ms) and capped at 2 m/s, nothing inside the 0.08 m dead band. Jumps, ragdoll and swimming keep the pose-velocity push.
+- INFERRED, to confirm live: that TASK_GO_TO_ENTITY on a frozen invisible ped follows a moved target without pathing detours, and that SET_PED_DESIRED_MOVE_BLEND_RATIO on a running task changes its speed. The 10 s `engine: loco` line shows anchor on/off, go-to-entity issues, gait changes carried, stall fallbacks.
+
 ## Sequencing
 
 Items 1-4 (libs/sync only) first; then 5(a)+(c) and 6 Tier A; then the v5 bump with 5(b) and Tier B. Server and client redeploy together (docs/api/protocol.md:751).

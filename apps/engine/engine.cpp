@@ -110,12 +110,27 @@ namespace {
     {
         kSiteHitReact, kSiteEmoteEnd, kSiteCoverExit, kSiteEnterWalk, kSiteEnterTimeout, kSiteEnterGaveUp, kSiteDriveMode,
         kSiteLeaveVeh, kSiteTierBDrift, kSiteBackFromVeh, kSiteAimEnd, kSiteCollisionBack, kSiteClimbEnd, kSiteUnseat,
-        kSiteWater, kLocoSites
+        kSiteWater, kSiteAnchorLost, kLocoSites
     };
     const char* const kLocoSiteName[kLocoSites] = {
         "hit-react-end", "emote-end", "cover-exit", "enter-walk", "enter-timeout", "enter-gave-up", "drive-mode",
-        "leave-vehicle", "tier-b-drift", "back-from-vehicle", "aim-end", "collision-back", "climb-end", "unseat", "water-edge"
+        "leave-vehicle", "tier-b-drift", "back-from-vehicle", "aim-end", "collision-back", "climb-end", "unseat", "water-edge",
+        "anchor-lost"
     };
+
+    // W11 (docs/CLOUD-HANDOFF.md item 0b): loco_mode = anchor (default) | straight, re-read at every Welcome like peer_drive. Anchor: each
+    // on-foot puppet runs TASK_GO_TO_ENTITY once to an invisible, collision-less, frozen, non-networked helper ped that DrivePeer moves
+    // to the controller's predicted point every frame (libs/sync/locomotion.h item 8). Straight: the old far-point
+    // TASK_GO_STRAIGHT_TO_COORD, re-issued on turn / drift / arrival. The controller falls back to straight by itself for a
+    // frame without an anchor entity, while aiming, and for 20 s after a lost task.
+    // Read by the join worker's OnWelcome and by the game thread's SyncNet (Peer construction): atomic.
+    std::atomic<bool> g_locoAnchor{true};
+    sync::LocoConfig LocoCfg()
+    {
+        sync::LocoConfig c;
+        c.mode = g_locoAnchor.load() ? sync::LocoMode::Anchor : sync::LocoMode::Straight;
+        return c;
+    }
 
     struct Peer
     {
@@ -130,7 +145,12 @@ namespace {
         uint32_t samples = 0, extrapolated = 0, held = 0, snaps = 0;
         // Stage 2: turns the pose into ped tasks / velocity / heading (libs/sync/locomotion.h).
         // ResetForNewPed on every (re)spawn, Reset on a peer_drive mode change. Script tick only.
-        sync::LocomotionController loco;
+        sync::LocomotionController loco{LocoCfg()};
+        // W11: the anchor entity this puppet's go-to-entity task follows (0 = none yet / lost), when its creation was last tried
+        // and how many times the create call failed since the last log line. Deleted with the puppet. Script tick only.
+        int32_t anchor = 0;
+        double anchorTryMs = -1e9;
+        uint32_t anchorSpawnFails = 0;
         int driveMode = -1;      // the PeerDrive the ped was last driven with (-1 = not yet)
         uint32_t locoSnapsSeen = 0, locoGoSeen = 0, locoStandSeen = 0; // LocoStats at the last log line
         // W8: the controller's churn per trigger (LocoStats at the last "engine: loco" line, and the Reset / SoftReset callers
@@ -459,7 +479,7 @@ namespace {
     struct V4Stats
     {
         uint32_t vehSpawned = 0, vehDeleted = 0, vehSpawnFail = 0, vehUpdates = 0, vehCmds = 0, vehOk = 0,
-                 vehRefused = 0, seatWarps = 0, unseats = 0, ejects = 0, vehSnaps = 0, reverts = 0, entryPicks = 0,
+                 vehRefused = 0, seatWarps = 0, seatRewarps = 0, unseats = 0, ejects = 0, vehSnaps = 0, reverts = 0, entryPicks = 0,
                  entryRefused = 0;
         uint32_t shots = 0, peerShots = 0, hitsSent = 0, hitDamage = 0, hitsRefusedLocal = 0, damageIn = 0,
                  damageInTotal = 0, kills = 0, respawnReqs = 0, peerDeaths = 0, peerRecoveries = 0, peerLocalDeaths = 0;
@@ -1031,6 +1051,11 @@ namespace {
               g_peerDrive.load() == kDrivePlace ? "PLACEMENT (stage 1: set onto the pose, no animation)"
                                                 : "TASKS (locomotion controller)",
               drive.empty() ? L"<unset>" : drive.c_str());
+        // W11: loco_mode = straight keeps the old far-point go-straight path; anything else is the anchor (default).
+        g_locoAnchor.store(reg::Get(L"loco_mode") != L"straight");
+        GLOGI("engine: remote on-foot walking via %s (loco_mode)",
+              g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
+                                  : "TASK_GO_STRAIGHT_TO_COORD at a far point");
         // v4 switches, re-read at every Welcome like peer_drive.
         g_vehUseAngVel.store(reg::Get(L"veh_angvel") == L"1");
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
@@ -2715,6 +2740,43 @@ namespace {
         pe.loco.SoftReset();
     }
 
+    // W11 item 2: the anchor entity of a puppet. DeleteAnchor with the puppet (every place its ped is deleted); EnsureAnchor
+    // once per DrivePeer in anchor mode: true = the entity exists and can be moved this frame. A failed create (the model
+    // is not in memory yet, the pool is full) is retried every kAnchorRetryMs and meanwhile the controller walks straight.
+    constexpr double kAnchorRetryMs = 1000.0;
+    bool g_anchorBroken = false;   // TASK_GO_TO_ENTITY could not be called at all: straight for the rest of the run (script tick)
+    void DeleteAnchor(Peer& pe)
+    {
+        if (pe.anchor && g_world)
+            g_world->DeleteEntity(pe.anchor);          // zeroes the handle
+        pe.anchor = 0;
+    }
+    bool EnsureAnchor(Peer& pe, const sync::Pose& pose, double nowMs)
+    {
+        if (pe.anchor && !g_world->EntityExists(pe.anchor))
+        {
+            pe.anchor = 0;                             // deleted under us (a game cleanup): the task is lost with it
+            LocoReset(pe, kSiteAnchorLost);
+        }
+        if (pe.anchor)
+            return true;
+        if (nowMs - pe.anchorTryMs < kAnchorRetryMs)
+            return false;
+        pe.anchorTryMs = nowMs;
+        // SpawnPed: CREATE_PED not networked, mission ped, invincible, frozen; then hidden and without collision. Never
+        // registered anywhere else (no peer, no hit detection).
+        const int32_t h = g_world->SpawnPed(kCompanionModel, pose.k.x, pose.k.y, pose.k.z);
+        if (!h)
+        {
+            ++pe.anchorSpawnFails;
+            return false;
+        }
+        g_world->SetEntityVisible(h, false);
+        g_world->SetEntityCollision(h, false);
+        pe.anchor = h;
+        return true;
+    }
+
     // ---- sync plan W3, combat client: melee swing, muzzle flash, real shots (script tick, no lock) ----
 
     // The swing a remote ped plays when its shotSeq steps with a melee-class weapon in hand. Every dictionary and
@@ -3461,6 +3523,7 @@ namespace {
         case sync::LocoTask::None:       return "none";
         case sync::LocoTask::StandStill: return "stand-still";
         case sync::LocoTask::GoStraight: return "go-straight";
+        case sync::LocoTask::GoToAnchor: return "go-to-anchor";
         }
         return "?";
     }
@@ -3502,17 +3565,22 @@ namespace {
         const sync::LocoStats& a = pe.loco.Stats();
         const sync::LocoStats& b = pe.locoSeen;
         const std::string hard = SiteList(pe.hardSites), soft = SiteList(pe.softSites);
-        char buf[900];
+        char buf[1300];
         std::snprintf(buf, sizeof(buf),
                       "engine: loco id=%d (%s): last 10 s %u go-straight (first of a gait %u, task lost %u, forced %u, blend %u, "
                       "turn %u, drift %u, arrive %u, stall %u), %u stand-still; %u Reset [%s]; %u SoftReset [%s] (%u kept the "
-                      "task, %u re-issued); last applied: flags 0x%04x move %u weapon 0x%08x, latched task %s (gait %s), "
+                      "task, %u re-issued); W11: anchor %s (mode %s, entity %d, %u go-to-entity issues, %u frames, %u stall "
+                      "fallbacks to straight, %u spawn fails), %u gait changes carried by SET_PED_DESIRED_MOVE_BLEND_RATIO "
+                      "without a re-issue; last applied: flags 0x%04x move %u weapon 0x%08x, latched task %s (gait %s), "
                       "collisionOff %d, climb %s, water %d",
                       id, pe.name.c_str(), a.goStraight - b.goStraight, a.whyGait - b.whyGait, a.whyReset - b.whyReset,
                       a.whyForced - b.whyForced, a.whyBlend - b.whyBlend, a.whyTurn - b.whyTurn, a.whyDrift - b.whyDrift,
                       a.whyArrive - b.whyArrive, a.whyStall - b.whyStall, a.standStill - b.standStill, a.resets - b.resets,
                       hard.c_str(), a.softResets - b.softResets, soft.c_str(), a.softKept - b.softKept,
-                      a.softReissued - b.softReissued, (unsigned)pe.lastPed.flags, (unsigned)pe.lastPed.move,
+                      a.softReissued - b.softReissued, pe.anchor ? "on" : "off", g_locoAnchor.load() ? "anchor" : "straight",
+                      pe.anchor, a.anchorIssues - b.anchorIssues, a.anchorFrames - b.anchorFrames,
+                      a.anchorFallbacks - b.anchorFallbacks, pe.anchorSpawnFails, a.gaitKept - b.gaitKept,
+                      (unsigned)pe.lastPed.flags, (unsigned)pe.lastPed.move,
                       (unsigned)pe.lastPed.weapon, LocoTaskName(pe.loco.LastTask()), GaitName(pe.loco.CurrentGait()),
                       pe.collisionOff ? 1 : 0, ClimbPhaseName(pe.climb.CurrentPhase()), pe.water.InWater() ? 1 : 0);
         return buf;
@@ -3894,6 +3962,16 @@ namespace {
         in.jumpSeq = ps.jumpSeq;                       // a change starts one jump, even if kPfJumping was skipped
         in.moveRateAvailable = !g_moveRateFailed;
         in.swimming = (ps.flags & proto::kPfSwimming) != 0;   // W6: a swimmer shows no land gait: not a stall
+        {
+            // W11 item 3: the ped's own velocity (what its animation moves it by): the controller pushes only the residual on it.
+            float pvx = 0, pvy = 0, pvz = 0;
+            in.havePedVel = g_world->GetEntityVelocity(pe.ped, pvx, pvy, pvz);
+            in.pedVel = { pvx, pvy, pvz };
+            // W11 item 2: anchor mode needs the entity; an aim task owns the walk (its target is a coordinate) and a broken
+            // TASK_GO_TO_ENTITY ends it: the controller then acts as straight for the frame.
+            const bool anchorWanted = g_locoAnchor.load() && !g_anchorBroken && !aiming;
+            in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
+        }
         const sync::LocoOutput o = pe.loco.Update(in);
         if (o.paused)
             return;                                    // leaving a vehicle: the exit animation owns the ped
@@ -3905,6 +3983,8 @@ namespace {
             pe.haveLastTarget = true;
             pe.lastMbr = o.moveBlendRatio;
         }
+        if (o.moveAnchor && pe.anchor)
+            g_world->SetEntityCoordsNoOffset(pe.anchor, o.anchorPos.x, o.anchorPos.y, o.anchorPos.z);   // W11: every frame
         if (o.snap)
         {
             g_world->SetEntityCoordsNoOffset(ped, o.snapPos.x, o.snapPos.y, o.snapPos.z);
@@ -3962,7 +4042,22 @@ namespace {
                                                0.0f);
                 g_world->SetPedDesiredMoveBlendRatio(ped, o.moveBlendRatio);
                 break;
+            case sync::LocoTask::GoToAnchor:
+                // W11: ONE task for as long as the ped keeps walking; the anchor (placed above) moves every frame.
+                // TASK_GO_TO_ENTITY(ped, anchor, duration -1, distance 0.1, blend, slowDownDistance 0, flags 0).
+                if (pe.anchor && g_world->TaskGoToEntity(ped, pe.anchor, -1, 0.1f, o.moveBlendRatio, 0.0f, 0))
+                    g_world->SetPedDesiredMoveBlendRatio(ped, o.moveBlendRatio);
+                else
+                {
+                    g_anchorBroken = true;
+                    PeerLog(true, "engine: TASK_GO_TO_ENTITY could not be called (anchor %d): remote walking falls back to "
+                            "TASK_GO_STRAIGHT_TO_COORD (loco_mode=straight) for this run", pe.anchor);
+                    LocoReset(pe, kSiteAnchorLost);
+                }
+                break;
             }
+            if (o.setBlend)                            // W11: a Walk / Run / Sprint change rides on the running task
+                g_world->SetPedDesiredMoveBlendRatio(ped, o.moveBlendRatio);
         }
         // Heading. Standing still nothing else turns the ped, so it is set outright. While a gait task
         // runs, GTA's motion task steers the ped toward its target every frame and blends the turn
@@ -4224,6 +4319,7 @@ namespace {
                 Peer& pe = it->second;
                 if (pe.gone)
                 {
+                    DeleteAnchor(pe);
                     if (pe.ped)
                         g_world->DeleteEntity(pe.ped);
                     SyncEmoteDict(pe.emoteDict, false, std::string());   // its ped is gone: free the dictionary
@@ -4238,6 +4334,7 @@ namespace {
                     // own flag: OnWorld clears `despawn` with every WorldState that lists the peer.
                     pe.despawn = false;
                     pe.respawnPed = false;
+                    DeleteAnchor(pe);
                     if (pe.ped)
                         g_world->DeleteEntity(pe.ped);
                     pe.ped = 0;                        // DeleteEntity zeroes it; also when the call failed
@@ -4281,6 +4378,7 @@ namespace {
                     {
                         PeerLog(false, "engine: remote peer id=%d (%s) changed model 0x%08x -> 0x%08x: respawning its ped",
                                 it->first, pe.name.c_str(), (unsigned)pe.pedModel, (unsigned)pe.look.model);
+                        DeleteAnchor(pe);
                         g_world->DeleteEntity(pe.ped);
                         pe.ped = 0;
                         pe.lastDriveMs = 0;
@@ -4360,6 +4458,7 @@ namespace {
                     // Deleted under us (a game cleanup): forget the handle, a new ped next frame.
                     PeerLog(true, "engine: remote peer id=%d (%s): ped %d no longer exists -- respawning", it->first,
                             pe.name.c_str(), pe.ped);
+                    DeleteAnchor(pe);
                     pe.ped = 0;
                     pe.lastDriveMs = 0;
                     pe.spawnSinceMs = 0;
@@ -4408,6 +4507,7 @@ namespace {
                     pe.locoStandSeen = ls.standStill;
                     pe.locoSnapsSeen = ls.snaps;
                     pe.locoSeen = ls;
+                    pe.anchorSpawnFails = 0;
                     pe.hardSites = sync::SiteTally<kLocoSites>();
                     pe.softSites = sync::SiteTally<kLocoSites>();
                     pe.samples = pe.extrapolated = pe.held = pe.snaps = 0;
@@ -4865,6 +4965,9 @@ namespace {
                     const int32_t occupant = g_world->GetPedInVehicleSeat(h, gtaSeat);
                     if (occupant && occupant == lp)
                         continue;                      // our own ped holds it here: the server will sort it out
+                    // W11 (W9 evidence): a warp of a ped that is already seated somewhere (here or in a car) is a RE-warp, the
+                    // visible "passenger teleports"; counted per 10 s so the next live test shows how often it still happens.
+                    const bool wasSeated = pe.seatedVeh >= 0 || g_world->IsPedInVehicle(pe.ped);
                     if (pe.seatedVeh < 0 && !g_world->IsPedInVehicle(pe.ped))
                         ClearPedTasksNow(pe.ped);      // drop the gait task before the warp
                     pe.emote.Clear();
@@ -4876,6 +4979,8 @@ namespace {
                     pe.seatedSeat = (int)s;
                     pe.aimTask = false;
                     ++g_v4.seatWarps;
+                    if (wasSeated)
+                        ++g_v4.seatRewarps;
                 }
                 ++it;
             }
@@ -5924,12 +6029,12 @@ namespace {
             const sync::VehLinkStats& ls = g_link.Stats();
             GLOGI("engine: vehicles: %zu tracked, %zu spawned, %zu peers seated; link %s id=%d seat %d; last 10 s: "
                   "%u VehicleWorld in, %u spawned, %u deleted, %u spawn fails, %u updates sent, %u cmds (%u ok, %u "
-                  "refused), %u seat warps, %u unseats, %u ejects, %u seat reverts, %u F/G entries (%u refused), "
+                  "refused), %u seat warps (%u re-warps of an already seated ped), %u unseats, %u ejects, %u seat reverts, %u F/G entries (%u refused), "
                   "%u snaps; link total %u enters %u registers %u exits %u retries %u timeouts",
                   tracked, spawned, seated, g_link.StateName(), g_link.NetId(), g_link.Seat(), worlds - lastWorlds,
                   c.vehSpawned - last.vehSpawned, c.vehDeleted - last.vehDeleted, c.vehSpawnFail - last.vehSpawnFail,
                   c.vehUpdates - last.vehUpdates, c.vehCmds - last.vehCmds, c.vehOk - last.vehOk,
-                  c.vehRefused - last.vehRefused, c.seatWarps - last.seatWarps, c.unseats - last.unseats,
+                  c.vehRefused - last.vehRefused, c.seatWarps - last.seatWarps, c.seatRewarps - last.seatRewarps, c.unseats - last.unseats,
                   c.ejects - last.ejects, c.reverts - last.reverts, c.entryPicks - last.entryPicks,
                   c.entryRefused - last.entryRefused, c.vehSnaps - last.vehSnaps, ls.enters, ls.registers, ls.exits,
                   ls.retries, ls.timeouts);
@@ -6672,8 +6777,11 @@ namespace gage::engine {
             // first); the join worker is gone by now (Disconnect above), the lock is for the net maps.
             std::lock_guard<std::mutex> sk(g_scriptMtx);
             for (auto& kv : g_peers)
+            {
+                DeleteAnchor(kv.second);
                 if (kv.second.ped && g_world)
                     g_world->DeleteEntity(kv.second.ped);
+            }
             g_peers.clear();
             for (auto& kv : g_vehs)
             {
