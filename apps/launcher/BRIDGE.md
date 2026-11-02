@@ -94,7 +94,9 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
       an update is pending (**every** available update counts: the host reports `mandatory: true`
       for all of them; downloading, waiting for GTA V to close, or failed
       and being retried by this very press), or setup has already been started and the
-      launcher is about to exit, or the server speaks a newer protocol than this launcher
+      launcher is about to exit, or the server speaks a newer protocol than this launcher, or the server's UDP
+      query (format v2, the "update ping") reports a latest client newer than this launcher even though the
+      protocol is the same
       (`error` = `"Solar RP was updated. Updating the launcher..."`; the host has started an update
       check); 15 the server is **behind** this launcher: it has not been updated yet
       (`error` = `"This server has not been updated yet. Try again in a minute."`; nothing to install,

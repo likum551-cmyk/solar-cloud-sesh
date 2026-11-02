@@ -839,6 +839,8 @@ const HashMapping kCrossmap3889[] = {
     {native::SET_VEHICLE_CHEAT_POWER_INCREASE,            0xF1C985BBEC6B6321},
     {native::SET_VEHICLE_MAX_SPEED,                       0x8E9B5F00B41A9F8C},
     {native::GET_VEHICLE_ESTIMATED_MAX_SPEED,             0x66C1D6E6DBF7AC9B},
+    // 0.4.4 (W11): lookup tool, public and 3889 agree.
+    {native::TASK_GO_TO_ENTITY,                           0xAB3658A740EED98E},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
     {native::SET_VEHICLE_FULLBEAM,                        0x2F12C305B28C6C59},
     {native::SET_VEHICLE_INTERIORLIGHT,                   0xEC6A9F16D3F15978},
@@ -857,6 +859,14 @@ const HashMapping kCrossmap3889[] = {
     {native::USE_PARTICLE_FX_ASSET,                       0xD03F4780B97A39AE},
     {native::REQUEST_NAMED_PTFX_ASSET,                    0xEBEE7DC21AB44EC9},
     {native::HAS_NAMED_PTFX_ASSET_LOADED,                 0x939D49C9FAA8139A},
+    // 0.4.4 (W9): lookup tool, public and 3889 agree.
+    {native::HAS_ENTITY_COLLIDED_WITH_ANYTHING,           0x14E25ED5E75102C8},
+    {native::GET_VEHICLE_CLASS,                           0x5506AFBD6056C05F},
+    // 0.4.4 (W10): lookup tool, public and 3889 agree.
+    {native::GET_SCREEN_COORD_FROM_WORLD_COORD,           0x2F8A75C70AF54208},
+    {native::GET_FINAL_RENDERED_CAM_COORD,                0x02AF3EA0F67D2329},
+    {native::HAS_ENTITY_CLEAR_LOS_TO_ENTITY,              0xAD915B5E38F323E5},
+    {native::GET_PED_BONE_COORDS,                         0x83FDC027F0BEA202},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -4650,6 +4660,55 @@ bool World::IsVehicleEngineRunning(int32_t veh) {
     return callPedBool(*this, native::GET_IS_VEHICLE_ENGINE_RUNNING, veh);
 }
 
+bool World::HasEntityCollidedWithAnything(int32_t entity) {
+    return callPedBool(*this, native::HAS_ENTITY_COLLIDED_WITH_ANYTHING, entity);
+}
+
+int World::GetVehicleClass(int32_t veh) {
+    if (!veh) return -1;
+    uint64_t arg[] = { entArg(veh) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_CLASS, arg, 1, r)) return -1;
+    return intOf(r[0]);
+}
+
+bool World::GetPedBoneCoords(int32_t ped, int bone, float ox, float oy, float oz, float& x, float& y, float& z) {
+    if (!ped) return false;
+    // GET_PED_BONE_COORDS(ped, boneId, offsetX, offsetY, offsetZ): a Vector3 return, read like GetEntityCoords.
+    uint64_t args[] = { entArg(ped), (uint64_t)(uint32_t)bone, FloatArg(ox), FloatArg(oy), FloatArg(oz) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_PED_BONE_COORDS, args, 5, r)) return false;
+    vec3Of(r, x, y, z);
+    return true;
+}
+
+bool World::GetScreenCoordFromWorldCoord(float x, float y, float z, float& sx, float& sy) {
+    // GET_SCREEN_COORD_FROM_WORLD_COORD(x, y, z, float* screenX, float* screenY): BOOL, the two floats are written through
+    // pointers into zeroed 8-byte slots (like GetEntityQuaternion's), read from their low 4 bytes.
+    uint64_t s[2] = {};
+    uint64_t args[] = { FloatArg(x), FloatArg(y), FloatArg(z), ptrArg(&s[0]), ptrArg(&s[1]) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_SCREEN_COORD_FROM_WORLD_COORD, args, 5, r) || !(uint32_t)r[0]) return false;
+    sx = floatOf(s[0]);
+    sy = floatOf(s[1]);
+    return true;
+}
+
+bool World::GetFinalRenderedCamCoord(float& x, float& y, float& z) {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_FINAL_RENDERED_CAM_COORD, nullptr, 0, r)) return false;
+    vec3Of(r, x, y, z);
+    return true;
+}
+
+int World::HasEntityClearLosToEntity(int32_t from, int32_t to, int traceType) {
+    if (!from || !to) return -1;
+    uint64_t args[] = { entArg(from), entArg(to), (uint64_t)(uint32_t)traceType };
+    uint64_t r[4] = {};
+    if (!CallNative(native::HAS_ENTITY_CLEAR_LOS_TO_ENTITY, args, 3, r)) return -1;
+    return (uint32_t)r[0] ? 1 : 0;
+}
+
 bool World::SetVehicleSiren(int32_t veh, bool on) {
     return callPedToggle(*this, native::SET_VEHICLE_SIREN, veh, on);
 }
@@ -5130,6 +5189,14 @@ bool World::TaskClimb(int32_t ped, bool usePlayerLaunchForce) {
     return callPedToggle(*this, native::TASK_CLIMB, ped, usePlayerLaunchForce);   // TASK_CLIMB(ped, BOOL)
 }
 
+bool World::TaskGoToEntity(int32_t ped, int32_t target, int durationMs, float distance, float moveBlendRatio,
+                           float slowDownDistance, int flags) {
+    if (!ped || !target) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)target, (uint64_t)(uint32_t)durationMs,
+                        FloatArg(distance), FloatArg(moveBlendRatio), FloatArg(slowDownDistance), (uint64_t)(uint32_t)flags };
+    return CallNative(native::TASK_GO_TO_ENTITY, args, 7, nullptr);
+}
+
 bool World::SetAiWeaponDamageModifier(float value) {
     uint64_t args[] = { FloatArg(value) };
     return CallNative(native::SET_AI_WEAPON_DAMAGE_MODIFIER, args, 1, nullptr);
@@ -5600,6 +5667,7 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_PED_MOVE_RATE_OVERRIDE),
         GAGE_NEW_NATIVE(IS_PED_VAULTING),
         GAGE_NEW_NATIVE(TASK_CLIMB),
+        GAGE_NEW_NATIVE(TASK_GO_TO_ENTITY),
         GAGE_NEW_NATIVE(SET_AI_WEAPON_DAMAGE_MODIFIER),
         GAGE_NEW_NATIVE(SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER),
         GAGE_NEW_NATIVE(RESET_AI_WEAPON_DAMAGE_MODIFIER),
@@ -5627,6 +5695,12 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(USE_PARTICLE_FX_ASSET),
         GAGE_NEW_NATIVE(REQUEST_NAMED_PTFX_ASSET),
         GAGE_NEW_NATIVE(HAS_NAMED_PTFX_ASSET_LOADED),
+        GAGE_NEW_NATIVE(HAS_ENTITY_COLLIDED_WITH_ANYTHING),
+        GAGE_NEW_NATIVE(GET_VEHICLE_CLASS),
+        GAGE_NEW_NATIVE(GET_SCREEN_COORD_FROM_WORLD_COORD),
+        GAGE_NEW_NATIVE(GET_FINAL_RENDERED_CAM_COORD),
+        GAGE_NEW_NATIVE(HAS_ENTITY_CLEAR_LOS_TO_ENTITY),
+        GAGE_NEW_NATIVE(GET_PED_BONE_COORDS),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));

@@ -48,6 +48,77 @@ Contents
   fits one 1400-byte-MTU datagram without ENet fragmentation; a `VehicleWorld` presence list alone is at most 521
   bytes).
 
+### The UDP query (formats v1 and v2)
+
+Not part of the ENet protocol: a separate 24-byte datagram pair on the game port, answered before ENet sees the
+datagram (`docs/api/server.md` section 8 for the server rules, `apps/master/PROTOCOL.md` for the master's use, codec
+`libs/protocol/query.{h,cpp}`). The **query format version** is its own number and has nothing to do with `kVersion`
+(the game protocol stays 5). All integers are little-endian; offsets are bytes from the start of the datagram.
+
+Request, 24 bytes (v1 and v2 differ only in the `u16` at offset 6):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `47 41 47 45` ("GAGE") |
+| 4 | 1 | kind `0x01` |
+| 5 | 1 | query version `1` (always, in both formats) |
+| 6 | 2 | **reply version wanted**: `0000` (what v1 askers write) or `0100` = v1 reply; `0200` = **v2 reply**. Exactly `2` asks for v2; every other value (3, `FFFF`, `0201`...) gets the v1 reply |
+| 8 | 8 | nonce, random per probe |
+| 16 | 8 | zero (ignored on receipt) |
+
+Reply v1, 24 bytes (what a v1 request gets, and what every server before the update ping sends):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic |
+| 4 | 1 | kind `0x81` |
+| 5 | 1 | query version `1` |
+| 6 | 2 | game protocol version (`kVersion`) |
+| 8 | 8 | the request's nonce |
+| 16 | 2 | players |
+| 18 | 2 | maxPlayers |
+| 20 | 4 | zero (ignored on receipt) |
+
+Reply v2, 24 bytes (only to a request that asked for it): the v1 layout except
+
+| Offset | Size | Field |
+|---|---|---|
+| 5 | 1 | query version `2` |
+| 20 | 1 | **latest client, major** |
+| 21 | 1 | latest client, minor |
+| 22 | 1 | latest client, patch |
+| 23 | 1 | zero (ignored on receipt) |
+
+"Latest client" is the newest launcher release `x.y.z` this server was released with (each part 0..255); `0.0.0`
+means unknown (the operator configured none). A launcher that sees a latest client newer than its own refuses PLAY
+(`launchResult` code 14) and starts its update check at once, so a release that keeps the game protocol (like 0.4.3)
+is noticed within one 5-second query instead of the 2-minute manifest poll (`docs/UPDATES.md`). The server takes the
+value from `server.json` `latestClientVersion` or the environment variable `GAGE_LATEST_CLIENT_VERSION`
+(`docs/api/server.md`; `tools/deploy/release.sh` sets the variable).
+
+Test vectors (nonce `01 02 03 04 05 06 07 08`, protocol 1, 3 players, max 32, latest client 0.4.4), asserted by `server_test`:
+
+```
+request v1  474147450101000001020304050607080000000000000000
+request v2  474147450101020001020304050607080000000000000000
+reply v1    474147458101010001020304050607080300200000000000
+reply v2    474147458102010001020304050607080300200000040400
+```
+
+Compatibility rules (why the request keeps query version 1)
+
+* **Old askers, new server.** A 0.4.2 / 0.4.3 launcher and the master send the v1 request. The server answers it with
+  the exact v1 reply, 24 bytes, query version 1: their `Decode` refuses any other length or version, so a v2 reply
+  is never sent unasked.
+* **New asker, old server.** A v2 request is a valid v1 request to a server that predates v2 (it checks `GAGE 01 01`
+  and ignores offsets 6, 7 and 16..23), so it answers v1 in the same round trip. The asker accepts both formats and
+  reads "latest client unknown" from a v1 reply; no retry, no fallback delay. (A request with query version `2`
+  in byte 5 would be ignored by an old server: it is not a query to it, so the format is not signalled there.)
+* **Framing.** Unchanged: only an exactly-24-byte datagram starting `GAGE 01 01` is a query. A v2 request with a
+  trailing byte (25), one byte short (23), or with `02` in byte 5 is not a query: no reply, nothing logged, handed to
+  ENet which drops it. Garbage in the `u16` at offset 6 is not an error; it just selects the v1 reply.
+* **Same size.** The v2 reply is exactly as long as the request, so the amplification argument is unchanged.
+
 ## 2. Primitives
 
 | Name | Encoding |

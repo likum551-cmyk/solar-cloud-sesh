@@ -72,6 +72,7 @@ working directory the server is started in.
 | `bansFile` | string | `"bans.json"` | At most 260 bytes. Path of the ban list. `""` keeps bans in memory only (lost on restart). |
 | `adminPort` | integer | `0` (off) | 0..65535. Loopback TCP port of the [admin channel](#6-the-admin-channel-loopback-tcp). `0` disables it. |
 | `adminToken` | string | `""` | 16..128 printable ASCII characters, no spaces. **Required when `adminPort` is not 0.** When the file sets none, the server uses the environment variable `GAGE_ADMIN_TOKEN`. |
+| `latestClientVersion` | string | absent (= `"0.0.0"`, unknown) | `"x.y.z"`, each part 0..255, or `""`. The newest launcher release this server was released with; the [UDP query](#8-the-udp-query) reports it to v2 askers and a launcher older than it refuses PLAY and updates at once. When the file sets none, the server uses the environment variable `GAGE_LATEST_CLIENT_VERSION` (malformed = the server refuses to start). **Release-managed, not listed in `server.json.example`:** `tools/deploy/release.sh` writes `GAGE_LATEST_CLIENT_VERSION` to `/etc/gage/server.env` rather than this file, because `server.json` is shared by every release and an older server binary refuses a key it does not know, which would break a rollback (docs/OPS.md). Set it only to a client that is already published. |
 
 Examples
 
@@ -759,7 +760,7 @@ Request (to the game port):
 | 0 | 4 | magic `47 41 47 45` ("GAGE") |
 | 4 | 1 | kind `0x01` |
 | 5 | 1 | query version `1` |
-| 6 | 2 | zero (ignored on receipt) |
+| 6 | 2 | reply version wanted: `0` / `1` (v1 askers write `0`) = the v1 reply, exactly `2` = the v2 reply (query format v2, the "update ping"); anything else gets v1 |
 | 8 | 8 | nonce, random per probe, opaque to the server |
 | 16 | 8 | zero (padding so the reply is not larger than the request; ignored on receipt) |
 
@@ -786,6 +787,10 @@ reply   474147458101010001020304050607080300200000000000
 
 Rules
 
+* **Query format v2 (update ping).** A request whose `u16` at 6 is exactly 2 gets the **v2 reply**, also 24 bytes: byte 5 =
+  `2` and bytes 20, 21, 22 = the `latestClientVersion` major, minor, patch (`0.0.0` when none is configured), byte 23 zero.
+  Every other request gets the byte-exact v1 reply, so 0.4.2 / 0.4.3 launchers and the master are unaffected. The layouts,
+  vectors and compatibility rules are in `docs/api/protocol.md` ("The UDP query (formats v1 and v2)").
 * Only a datagram of **exactly 24 bytes** starting `GAGE 01 01` is a query. Anything else (23 or 25 bytes, wrong
   magic, kind or version, a reply sent as a request) is left to ENet and, not being ENet traffic, ignored: no reply,
   no peer, nothing logged.

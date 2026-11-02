@@ -23,6 +23,8 @@
 #include "sync/vehicle_body.h"
 #include "sync/pedstate.h"
 #include "sync/vehicle_entry.h"
+#include "sync/vehicle_w9.h"
+#include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
 #include "sync/gtaids.h"
@@ -111,12 +113,32 @@ namespace {
     {
         kSiteHitReact, kSiteEmoteEnd, kSiteCoverExit, kSiteEnterWalk, kSiteEnterTimeout, kSiteEnterGaveUp, kSiteDriveMode,
         kSiteLeaveVeh, kSiteTierBDrift, kSiteBackFromVeh, kSiteAimEnd, kSiteCollisionBack, kSiteClimbEnd, kSiteUnseat,
-        kSiteWater, kLocoSites
+        kSiteWater, kSiteAnchorLost, kSiteCoverFail, kLocoSites
     };
     const char* const kLocoSiteName[kLocoSites] = {
         "hit-react-end", "emote-end", "cover-exit", "enter-walk", "enter-timeout", "enter-gave-up", "drive-mode",
-        "leave-vehicle", "tier-b-drift", "back-from-vehicle", "aim-end", "collision-back", "climb-end", "unseat", "water-edge"
+        "leave-vehicle", "tier-b-drift", "back-from-vehicle", "aim-end", "collision-back", "climb-end", "unseat", "water-edge",
+        "anchor-lost", "cover-fail"
     };
+
+    // W11 (docs/CLOUD-HANDOFF.md item 0b): loco_mode = anchor (default) | straight, re-read at every Welcome like peer_drive. Anchor: each
+    // on-foot puppet runs TASK_GO_TO_ENTITY once to an invisible, collision-less, frozen, non-networked helper ped that DrivePeer moves
+    // to the controller's predicted point every frame (libs/sync/locomotion.h item 8). Straight: the old far-point
+    // TASK_GO_STRAIGHT_TO_COORD, re-issued on turn / drift / arrival. The controller falls back to straight by itself for a
+    // frame without an anchor entity, while aiming, and for 20 s after a lost task.
+    // Read by the join worker's OnWelcome and by the game thread's SyncNet (Peer construction): atomic.
+    std::atomic<bool> g_locoAnchor{true};
+    sync::LocoConfig LocoCfg()
+    {
+        sync::LocoConfig c;
+        c.mode = g_locoAnchor.load() ? sync::LocoMode::Anchor : sync::LocoMode::Straight;
+        return c;
+    }
+
+    // W10 (player name tags): nametags=0 turns them off, nametags_los=<flags> changes the line-of-sight trace (R*'s scripts pass 17).
+    // Both are re-read at every Welcome. Read by the game thread (TickNameTags), written by the join worker: atomic.
+    std::atomic<bool> g_nameTags{true};
+    std::atomic<int>  g_nameTagTrace{17};
 
     struct Peer
     {
@@ -131,7 +153,12 @@ namespace {
         uint32_t samples = 0, extrapolated = 0, held = 0, snaps = 0;
         // Stage 2: turns the pose into ped tasks / velocity / heading (libs/sync/locomotion.h).
         // ResetForNewPed on every (re)spawn, Reset on a peer_drive mode change. Script tick only.
-        sync::LocomotionController loco;
+        sync::LocomotionController loco{LocoCfg()};
+        // W11: the anchor entity this puppet's go-to-entity task follows (0 = none yet / lost), when its creation was last tried
+        // and how many times the create call failed since the last log line. Deleted with the puppet. Script tick only.
+        int32_t anchor = 0;
+        double anchorTryMs = -1e9;
+        uint32_t anchorSpawnFails = 0;
         int driveMode = -1;      // the PeerDrive the ped was last driven with (-1 = not yet)
         uint32_t locoSnapsSeen = 0, locoGoSeen = 0, locoStandSeen = 0; // LocoStats at the last log line
         // W8: the controller's churn per trigger (LocoStats at the last "engine: loco" line, and the Reset / SoftReset callers
@@ -197,12 +224,20 @@ namespace {
         sync::PedStateEdges edges;       // the edges of the sender's reload / stealth / cover / entering / exiting
         bool stealthOn = false;          // SET_PED_STEALTH_MOVEMENT is on for this ped
         double stealthAtMs = 0;          // ... when it was last (re)asserted
-        bool coverHold = false;          // TASK_PUT_PED_DIRECTLY_INTO_COVER was issued and the sender is still in cover
+        sync::NameTagTrack nameTag;      // W10: this peer's tag across frames (eased alpha, last position, LOS cache)
+        sync::CoverWindow cover;         // 0d: TASK_PUT_PED_DIRECTLY_INTO_COVER as a window (issued, started, fallback, ended)
         int enterVeh = -1;               // the server vehicle id a TASK_ENTER_VEHICLE walks this ped to (-1 = none)
         double enterTaskMs = 0;          // ... when it was issued (> 0 while it runs); EnterWarpDue's clock
+        // ---- W9 (vehicles, passengers, collision; script tick) ----
+        sync::SeatRewarpLimiter seatLimiter;   // item 2: a ped that stays shuffled is re-warped on a growing gap, not every 100 ms
+        double carryFromMs = 0;                // item 5: when the ped bailed out of a moving vehicle (0 = none) ...
+        double carryOutMs = 0;                 // ... when it was first seen outside it (the fade starts then) ...
+        float carryVel[3] = {0, 0, 0};         // ... and the vehicle's velocity it is thrown with, fading over kCarryVelocityMs
+        double lastImpactMs = -1e9;            // item 6: when a vehicle impact of ours was last shown on this puppet
 
         // ---- sync plan W3, combat client (script tick unless marked "join worker") ----
         sync::ShotDebt shotDebt;         // shots owed to this ped (shotSeq stepped) and not fired yet: 3 a frame
+        sync::MeleeSwingGate swingGate;  // 0c: a shotSeq step or a rising kPfMelee is ONE swing to show (300 ms dedupe)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
         bool reactLifted = false;        // PCF 188 (DisableHurt) and the ragdoll block are lifted for the reaction
@@ -287,7 +322,7 @@ namespace {
 
     // How long a remote ped's locomotion is paused while it climbs out of a vehicle (TASK_LEAVE_VEHICLE,
     // flags 0 plays the exit animation; ~1.2 s in the game).
-    constexpr double kUnseatPauseMs = 1500.0;
+    constexpr double kUnseatPauseMs = sync::kLeavePauseMs;
 
     // ---- protocol v4 state ---------------------------------------------------------------------
     // Server vehicles (VehicleWorld), keyed by the server's id. The join worker writes presence and full
@@ -337,6 +372,14 @@ namespace {
         uint8_t sentFlags = 0, sentFlags2 = 0, sentDoors = 0;
         bool sentOnce = false;
         float steerPrev = 0.0f;       // the steering estimate's held value (below 1 m/s)
+        // ---- W9 (script tick) ----
+        sync::PresentLead lead;       // item 6: how far past the interpolation time this copy is drawn (near the local player)
+        double leadMs = 0;            // ... the lead of this frame (for the 10 s line)
+        int vehClass = -2;            // GET_VEHICLE_CLASS (-2 = not read yet, -1 = not callable); 8 / 13 = a bike
+        sync::RollTracker roll;       // item 7: this copy's roll error against the sender's, per 10 s
+        uint32_t rollSnapsSeen = 0, rollBlendsSeen = 0, rollGracesSeen = 0;   // drive stats at the last bike line
+        sync::EngineReassert engineAssert;   // item 4: the engine is re-asserted while the local ped rides in this copy
+        bool lastContactFlag = false; // item 6: HAS_ENTITY_COLLIDED_WITH_ANYTHING at the previous frame (a rising edge opens a grace)
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -376,6 +419,16 @@ namespace {
     // game-wide AI weapon and melee damage modifiers are 0 while a session is on and reset when it ends.
     std::atomic<bool> g_aiDamageWanted{false};
     bool g_aiDamageApplied = false;                    // script tick (and the PlayPeerShots it calls)
+    // 0.4.4 item 0c: SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER is NOT set by default (ai_melee_mod=1 sets it again). A puppet
+    // only PLAYS a swing animation (PlayPeerSwing: TaskPlayAnim, no melee task, no TASK_COMBAT anywhere), so there is no
+    // melee blow that could hurt the local player, and the 0.0 modifier zeroed OUR fists on the puppet (the 0.4.3
+    // regression: swings counted, no hit ever seen). Registry read at Welcome; applied only after the tick set it.
+    std::atomic<bool> g_aiMeleeMod{false};
+    bool g_aiMeleeApplied = false;                     // script tick
+    // 0c, written by TickLocalMelee every script frame, read by ProbePeerHits (same thread): the melee state of OUR ped.
+    bool   g_meleeHeld = false;                        // a melee-class weapon in hand, on foot, alive
+    bool   g_meleeActionNow = false;                   // IS_PED_PERFORMING_MELEE_ACTION(local ped)
+    double g_lastSwingMs = -1e9;                       // when TickLocalMelee last counted a swing
     // W8 item 8: the last PedState the script tick read, for the render-thread fallback (GameWork !inScript).
     std::mutex g_realPedMtx;
     proto::PedState g_realPed;                         // g_realPedMtx
@@ -441,6 +494,9 @@ namespace {
         sync::EntryVec target;     // its last target
     };
     EntryWalk g_entryWalk;
+    // W9 item 3: INPUT_ENTER (23) stays disabled from our handled F / G press until 500 ms after the ped sat down, and a
+    // quick exit after an entry is counted (the 0.4.2 log: enter, exit 1.4 s later, enter, exit). Script tick only.
+    sync::EntryPressGuard g_entryGuard;
     int g_exitNetId = -1;          // the networked car the link last sent Exit for, and when (PedState move 6)
     double g_exitAtMs = -1e9;
     double g_entryChatMs = -1e9;   // the last F / G refusal line (rate limit)
@@ -460,7 +516,7 @@ namespace {
     struct V4Stats
     {
         uint32_t vehSpawned = 0, vehDeleted = 0, vehSpawnFail = 0, vehUpdates = 0, vehCmds = 0, vehOk = 0,
-                 vehRefused = 0, seatWarps = 0, unseats = 0, ejects = 0, vehSnaps = 0, reverts = 0, entryPicks = 0,
+                 vehRefused = 0, seatWarps = 0, seatRewarps = 0, unseats = 0, ejects = 0, vehSnaps = 0, reverts = 0, entryPicks = 0,
                  entryRefused = 0;
         uint32_t shots = 0, peerShots = 0, hitsSent = 0, hitDamage = 0, hitsRefusedLocal = 0, damageIn = 0,
                  damageInTotal = 0, kills = 0, respawnReqs = 0, peerDeaths = 0, peerRecoveries = 0, peerLocalDeaths = 0;
@@ -473,8 +529,34 @@ namespace {
         // capped, puppets that died of a takedown, the local health losses a puppet ped caused, AI modifier sets
         uint32_t reactStagger = 0, puppetStagger = 0, climbTasks = 0, climbFallbacks = 0, deadCapped = 0, takedownKills = 0,
                  puppetFireLoss = 0, aiModSets = 0;
+        // 0c: melee Hits reported by the damage event / by the pool drop; damage events read in a swing window; swing
+        // steps seen on puppets and why one was not shown (the ped was owned by something else, the dictionary was
+        // still streaming or missing, the anim task failed)
+        uint32_t meleeHitsEvent = 0, meleeHitsPool = 0, meleeEventsRead = 0, peerSwingSteps = 0, peerSwingOwned = 0,
+                 peerSwingNoDict = 0, peerSwingFailed = 0;
+        // 0d: TASK_CLIMB windows that really started (the puppet climbs / vaults) versus the placement fallbacks (climbTasks,
+        // climbFallbacks above), the puppet put on the sender's pose before a task (nudged / set outright), and the cover
+        // windows: task issued, the puppet really in cover, never in cover (fallback), ended with the sender's flag
+        uint32_t climbStarted = 0, prePlaceNudged = 0, prePlaceSet = 0, coverIssued = 0, coverStarted = 0, coverFailed = 0,
+                 coverEnded = 0;
+        // W9: re-warps held back by the limiter, F / G presses we took, quick exits after an entry, passenger engine
+        // re-asserts, bail-outs of a moving vehicle (remote / our own forced exit), vehicle impacts shown on puppets,
+        // contact graces opened (flag / speed loss), frames the lead drew a car in the present, shots at seated puppets
+        // (the free-aim target), at a puppet's vehicle, hits reported on seated puppets
+        uint32_t seatRewarpsHeld = 0, entryPresses = 0, quickExits = 0, engineAsserts = 0, bailOuts = 0, localBailOuts = 0,
+                 vehImpacts = 0, contactsFlag = 0, contactsDecel = 0, leadFrames = 0, shotsAtSeated = 0, shotsAtPuppetCar = 0,
+                 shotsAtFoot = 0, hitsOnSeated = 0, seatedHpDrops = 0;
     };
     V4Stats g_v4;
+    // W9 item 4: the engine state of the car the local ped rides in as a passenger (script tick), for the 10 s vehicles line.
+    struct PassengerEngineView
+    {
+        double atMs = -1e9;              // when it was last read (a passenger frame)
+        uint16_t id = 0;
+        bool serverOn = false, running = false;
+        bool rpmLogged = false;          // the one-time line about the missing throttle / RPM native
+    };
+    PassengerEngineView g_pax;
     std::atomic<uint32_t> g_vehWorldsIn{0}, g_emotesIn{0};
 
     // A single "companion" ped that mirrors the local player at a fixed offset:
@@ -1032,6 +1114,22 @@ namespace {
               g_peerDrive.load() == kDrivePlace ? "PLACEMENT (stage 1: set onto the pose, no animation)"
                                                 : "TASKS (locomotion controller)",
               drive.empty() ? L"<unset>" : drive.c_str());
+        // W11: loco_mode = straight keeps the old far-point go-straight path; anything else is the anchor (default).
+        g_locoAnchor.store(reg::Get(L"loco_mode") != L"straight");
+        GLOGI("engine: remote on-foot walking via %s (loco_mode)",
+              g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
+                                  : "TASK_GO_STRAIGHT_TO_COORD at a far point");
+        // W10: name tags on by default; nametags=0 turns them off, nametags_los=<int> the LOS trace flags.
+        g_nameTags.store(reg::Get(L"nametags") != L"0");
+        {
+            const std::wstring tr = reg::Get(L"nametags_los");
+            long v = tr.empty() ? 17 : std::wcstol(tr.c_str(), nullptr, 10);
+            if (v <= 0 || v > 65535)
+                v = 17;
+            g_nameTagTrace.store((int)v);
+        }
+        GLOGI("engine: name tags %s (nametags), line-of-sight trace %d (nametags_los)", g_nameTags.load() ? "on" : "off",
+              g_nameTagTrace.load());
         // v4 switches, re-read at every Welcome like peer_drive.
         g_vehUseAngVel.store(reg::Get(L"veh_angvel") == L"1");
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
@@ -1048,14 +1146,18 @@ namespace {
             // AI damage modifiers go to 0 (TickAiDamage, script tick): a puppet's shot or punch hurts nobody on this machine.
             g_peerShootPed.store(reg::Get(L"peer_shoot") != L"script");
             g_aiDamageWanted.store(true);
+            // 0c: the AI MELEE modifier stays untouched unless ai_melee_mod=1 (see g_aiMeleeMod).
+            g_aiMeleeMod.store(reg::Get(L"ai_melee_mod") == L"1");
             GLOGI("engine: combat client: hit reactions %s (a melee blow: a short stagger), muzzle flash %s, remote shots via %s "
-                  "(hit_react / peer_muzzle / peer_shoot); AI weapon and melee damage modifiers 0.0 once the tick sets them",
+                  "(hit_react / peer_muzzle / peer_shoot); AI weapon damage modifier 0.0 once the tick sets it, AI melee modifier %s "
+                  "(ai_melee_mod; off: puppets only play a swing animation, and the modifier zeroed our own fists on them)",
                   react == L"off" ? "OFF" : react == L"bullet" ? "bullet flinch only" : react == L"ragdoll" ? "knockdown / stagger only"
                                                                                                            : "flinch + knockdown + stagger",
                   g_peerMuzzle.load() ? "ON" : "OFF",
                   g_peerShootPed.load() ? "SET_PED_SHOOTS_AT_COORD (real shots; the clear-line check is lifted once the AI "
                                           "damage modifiers are set)"
-                                        : "the zero-damage script bullet (peer_shoot=script)");
+                                        : "the zero-damage script bullet (peer_shoot=script)",
+                  g_aiMeleeMod.load() ? "0.0 (ai_melee_mod=1)" : "left alone");
         }
         g_v4Reset.store(true);
         GLOGI("engine: v4: remote vehicles take angular velocity %s, applied in the %s frame; local hit detection "
@@ -2587,6 +2689,35 @@ namespace {
         g_world->CallNative(game::native::CLEAR_PED_TASKS_IMMEDIATELY, arg, 1, nullptr);
     }
 
+    // 0d: the puppet onto the sender's pose of the edge before TASK_CLIMB / TASK_PUT_PED_DIRECTLY_INTO_COVER goes out the same
+    // frame (sync::DecidePrePlace: left, nudged with its task and momentum kept, or set outright with its task cleared). The
+    // pose is the interpolated one, i.e. where the sender was ~one render delay ago, at the obstacle. Script tick, ped valid.
+    void PrePlacePeer(Peer& pe, const sync::Pose& pose)
+    {
+        float cx = 0, cy = 0, cz = 0;
+        float dist = -1.0f, headErr = 0.0f;
+        const float wantHeading = Heading360(pose.k.heading);
+        if (g_world->GetEntityCoords(pe.ped, cx, cy, cz))
+        {
+            const float dx = cx - pose.k.x, dy = cy - pose.k.y, dz = cz - pose.k.z;
+            dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            float dh = std::fabs(g_world->GetEntityHeading(pe.ped) - wantHeading);
+            dh = std::fmod(dh, 360.0f);
+            headErr = dh > 180.0f ? 360.0f - dh : dh;
+        }
+        const sync::PrePlace pp = sync::DecidePrePlace(dist, headErr);
+        if (pp.clearTasks)
+            ClearPedTasksNow(pe.ped);
+        if (pp.mode != sync::PrePlaceMode::Keep)
+            g_world->SetEntityCoordsNoOffset(pe.ped, pose.k.x, pose.k.y, pose.k.z);
+        if (pp.setHeading)
+            g_world->SetEntityHeading(pe.ped, wantHeading);
+        if (pp.mode == sync::PrePlaceMode::Blend)
+            ++g_v4.prePlaceNudged;
+        else if (pp.mode == sync::PrePlaceMode::Set)
+            ++g_v4.prePlaceSet;
+    }
+
     // ---- protocol v4 on remote peds (script tick, no lock) -----------------------------------------
 
     // A weapon whose shots are shown: valid, not unarmed, NOT explosive or thrown (sync/gtaids.h: the
@@ -2673,12 +2804,15 @@ namespace {
         pe.edges.Reset();                              // W6: a fresh ped has done no reload / stealth / cover / entering yet
         pe.stealthOn = false;
         pe.stealthAtMs = 0;
-        pe.coverHold = false;
+        pe.cover.Reset();
         pe.enterVeh = -1;
         pe.enterTaskMs = 0;
         pe.emote.OnNewPed(NowMs());
         pe.water.Reset();                              // W8: a fresh ped has no water edge and no climb in progress
         pe.climb.Reset();
+        pe.seatLimiter.Reset();                        // W9: a fresh ped has no warp history, no bail-out velocity, no impact
+        pe.carryFromMs = pe.carryOutMs = 0;
+        pe.lastImpactMs = -1e9;
         if (!g_peerHits.load(std::memory_order_relaxed))
             return;
         g_world->SetEntityMaxHealth(pe.ped, kPeerHpPool);
@@ -2714,6 +2848,43 @@ namespace {
     {
         pe.softSites.Add((size_t)site);
         pe.loco.SoftReset();
+    }
+
+    // W11 item 2: the anchor entity of a puppet. DeleteAnchor with the puppet (every place its ped is deleted); EnsureAnchor
+    // once per DrivePeer in anchor mode: true = the entity exists and can be moved this frame. A failed create (the model
+    // is not in memory yet, the pool is full) is retried every kAnchorRetryMs and meanwhile the controller walks straight.
+    constexpr double kAnchorRetryMs = 1000.0;
+    bool g_anchorBroken = false;   // TASK_GO_TO_ENTITY could not be called at all: straight for the rest of the run (script tick)
+    void DeleteAnchor(Peer& pe)
+    {
+        if (pe.anchor && g_world)
+            g_world->DeleteEntity(pe.anchor);          // zeroes the handle
+        pe.anchor = 0;
+    }
+    bool EnsureAnchor(Peer& pe, const sync::Pose& pose, double nowMs)
+    {
+        if (pe.anchor && !g_world->EntityExists(pe.anchor))
+        {
+            pe.anchor = 0;                             // deleted under us (a game cleanup): the task is lost with it
+            LocoReset(pe, kSiteAnchorLost);
+        }
+        if (pe.anchor)
+            return true;
+        if (nowMs - pe.anchorTryMs < kAnchorRetryMs)
+            return false;
+        pe.anchorTryMs = nowMs;
+        // SpawnPed: CREATE_PED not networked, mission ped, invincible, frozen; then hidden and without collision. Never
+        // registered anywhere else (no peer, no hit detection).
+        const int32_t h = g_world->SpawnPed(kCompanionModel, pose.k.x, pose.k.y, pose.k.z);
+        if (!h)
+        {
+            ++pe.anchorSpawnFails;
+            return false;
+        }
+        g_world->SetEntityVisible(h, false);
+        g_world->SetEntityCollision(h, false);
+        pe.anchor = h;
+        return true;
     }
 
     // ---- sync plan W3, combat client: melee swing, muzzle flash, real shots (script tick, no lock) ----
@@ -2752,12 +2923,10 @@ namespace {
         release(g_swingArmed, sizeof(g_swingArmed) / sizeof(g_swingArmed[0]));
     }
 
-    // A remote ped swings: its shotSeq stepped with a melee-class weapon (combat 4, receiver). The first swing
-    // after a dictionary is requested is missed while it streams in.
-    void PlayPeerSwing(Peer& pe, int id, uint32_t weapon)
+    // The first candidate clip of a swing whose dictionary exists, requested (a reference held until the session ends).
+    // nullptr = none exists in this game (or not checkable yet). Logs once per dictionary what DOES_ANIM_DICT_EXIST said.
+    SwingClip* SwingClipFor(uint32_t weapon)
     {
-        if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
-            return;                                    // an emote, a seat, a climb or a reaction owns the ped
         const bool unarmed = weapon == UnarmedHash();
         SwingClip* list = unarmed ? g_swingUnarmed : g_swingArmed;
         const size_t n = unarmed ? sizeof(g_swingUnarmed) / sizeof(g_swingUnarmed[0])
@@ -2781,19 +2950,44 @@ namespace {
                 g_world->RequestAnimDict(c.dict);
                 c.held = true;
             }
-            if (!g_world->HasAnimDictLoaded(c.dict))
-                return;                                // still streaming: this swing is missed
-            if (g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
-                ++g_v4.peerSwings;
+            return &c;
+        }
+        return nullptr;
+    }
+
+    // A remote ped swings: a shotSeq step or a rising kPfMelee with a melee-class weapon in hand (combat 4, receiver;
+    // the pair is one swing, see PlayPeerShots). Every way a swing is not shown is counted (0c: the live test showed
+    // "0 peer swings shown" with no hint why).
+    void PlayPeerSwing(Peer& pe, int id, uint32_t weapon)
+    {
+        ++g_v4.peerSwingSteps;
+        if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
+        {
+            ++g_v4.peerSwingOwned;                     // an emote, a seat, a climb or a reaction owns the ped
             return;
         }
-        static bool logged = false;
-        if (!logged)
+        SwingClip* c = SwingClipFor(weapon);
+        if (!c)
         {
-            logged = true;
-            PeerLog(true, "engine: melee swing: peer id=%d swung but none of the candidate dictionaries exists in this "
-                    "game (names are INFERRED): remote melee swings are not shown", id);
+            ++g_v4.peerSwingNoDict;
+            static bool logged = false;
+            if (!logged)
+            {
+                logged = true;
+                PeerLog(true, "engine: melee swing: peer id=%d swung but none of the candidate dictionaries exists in this "
+                        "game (names are INFERRED): remote melee swings are not shown", id);
+            }
+            return;
         }
+        if (!g_world->HasAnimDictLoaded(c->dict))
+        {
+            ++g_v4.peerSwingNoDict;                    // still streaming: this swing is missed (WarmPeerSwing loads it early)
+            return;
+        }
+        if (g_world->TaskPlayAnim(pe.ped, c->dict, c->clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
+            ++g_v4.peerSwings;
+        else
+            ++g_v4.peerSwingFailed;
     }
 
     // A muzzle flash for a remote shot: the "core" particle asset's per-class effect (sync::MuzzleFlashEffect,
@@ -2883,13 +3077,20 @@ namespace {
             pe.shotDebt.Clear();
             return;
         }
-        if (n == 0 && pe.shotDebt.Owed() == 0)
-            return;
-        if (n > 0 && IsMeleeClassWeapon(ps.weapon))
-        {
+        // 0c: a swing is a shotSeq step OR the rising edge of the sender's kPfMelee (the flag was sent since v5 and the
+        // receiver ignored it, so a swing whose counter step was missed was never shown); one swing within 300 ms.
+        const bool meleeWeapon = IsMeleeClassWeapon(ps.weapon);
+        if (sync::PeerSwingDue(pe.swingGate, nowMs, n, meleeWeapon, (ps.flags & proto::kPfMelee) != 0))
             PlayPeerSwing(pe, id, ps.weapon);
+        else if (meleeWeapon)
+            SwingClipFor(ps.weapon);                   // load the swing dictionary before the first swing, not during it
+        if (meleeWeapon)
+        {
+            pe.shotDebt.Clear();                       // fists and clubs owe no bullets
             return;
         }
+        if (n == 0 && pe.shotDebt.Owed() == 0)
+            return;
         if (!IsGunWeapon(ps.weapon))
         {
             pe.shotDebt.Clear();                       // the weapon changed or is not a gun: nothing is owed
@@ -2988,12 +3189,77 @@ namespace {
     // Hits WE dealt to this remote ped: its health below the pool, damaged by our ped or our vehicle.
     // The pool is restored every time; the damage goes to the server as a Hit (via g_hits). A ped the
     // game killed anyway (one blow above the pool) is respawned.
-    void ProbePeerHits(Peer& pe, int id, int32_t lp, int32_t lpVeh, double nowMs)
+    void ApplyPuppetVehicleImpact(Peer& pe, int id, const sync::ImpactOut& io, int32_t lpVeh, double nowMs);   // below, with the hit reactions
+
+    // W9 item 8 (hit rate on drivers): what the local player's shot was aimed at (IS_PLAYER_FREE_AIMING_AT_ENTITY's target),
+    // counted per 10 s: a seated puppet, the vehicle a puppet sits in, a puppet on foot. With the hits reported on seated
+    // puppets (ProbePeerHits) and the pool drops they took, the next live test shows whether seated puppets are hittable.
+    void NoteShotTarget()
+    {
+        int32_t aimed = 0;
+        if (!g_world->GetEntityLocalPlayerIsFreeAimingAt(aimed) || !aimed)
+            return;
+        for (const auto& kv : g_peers)                 // the game thread's own maps: no lock
+            if (kv.second.ped == aimed)
+            {
+                if (kv.second.seatedVeh >= 0)
+                    ++g_v4.shotsAtSeated;
+                else
+                    ++g_v4.shotsAtFoot;
+                return;
+            }
+        for (const auto& kv : g_vehs)
+            if (kv.second.handle == aimed)
+            {
+                for (const auto& pk : g_peers)
+                    if (pk.second.seatedVeh == (int)kv.first)
+                    {
+                        ++g_v4.shotsAtPuppetCar;
+                        return;
+                    }
+                return;
+            }
+    }
+
+    void ProbePeerHits(Peer& pe, int id, int32_t lp, int32_t lpVeh, float lpVehSpeed, double nowMs)
     {
         if (!pe.hpPool || pe.deadShown || !lp)
             return;
+        // W9 item 6: the local player's vehicle runs a puppet over: it ragdolls (a cosmetic reaction; the damage itself goes
+        // through the pool probe below). The damage query is asked only for a vehicle above 5 m/s with the puppet within 6 m.
+        if (lpVeh && lpVehSpeed >= sync::kImpactMinSpeedMps && pe.seatedVeh < 0 && nowMs - pe.lastImpactMs >= sync::kImpactRepeatMs)
+        {
+            float px, py, pz, vx, vy, vz;
+            if (g_world->GetEntityCoords(pe.ped, px, py, pz) && g_world->GetEntityCoords(lpVeh, vx, vy, vz) &&
+                (px - vx) * (px - vx) + (py - vy) * (py - vy) + (pz - vz) * (pz - vz) <= sync::kImpactReachM * sync::kImpactReachM)
+            {
+                sync::ImpactIn ii;
+                ii.vehSpeedMps = lpVehSpeed;
+                ii.damagedByVehicle = g_world->DamagedBy(pe.ped, lpVeh);
+                ii.puppetSeated = false;
+                ii.puppetDead = false;
+                ii.sinceLastImpactMs = nowMs - pe.lastImpactMs;
+                const sync::ImpactOut io = sync::DecideVehicleImpact(ii);
+                if (io.ragdoll)
+                    ApplyPuppetVehicleImpact(pe, id, io, lpVeh, nowMs);
+            }
+        }
         const int h = g_world->GetEntityHealth(pe.ped);
-        if (h == pe.hpPool)
+        if (pe.seatedVeh >= 0 && h < pe.hpPool)
+            ++g_v4.seatedHpDrops;                      // W9 item 8: a seated puppet lost pool health (whoever caused it): it is hittable
+        // 0c: a melee blow is read from the damage EVENT as well, in the window of our own swing only (a melee-class weapon
+        // in hand and a swing counted or a melee action running: sync::MeleeEventWindow keeps the native call out of every
+        // other frame). The pool alone cannot see a fist that took nothing off it (the AI melee modifier at 0 did exactly
+        // that in 0.4.3), and the early return below must not hide the event.
+        const double sinceSwing = nowMs - g_lastSwingMs;
+        const bool eventWindow = sync::MeleeEventWindow(g_meleeHeld, sinceSwing, g_meleeActionNow);
+        bool eventDamaged = false;
+        if (eventWindow)
+        {
+            ++g_v4.meleeEventsRead;
+            eventDamaged = g_world->DamagedBy(pe.ped, lp);
+        }
+        if (h == pe.hpPool && !eventDamaged)
             return;
         // A puppet the game killed in one blow above the pool (a headshot would, but critical hits are
         // off for puppets; a rocket or a ram can) is still ours to report when we did it.
@@ -3015,11 +3281,31 @@ namespace {
         const uint32_t myWeapon = byMe && !byVeh ? g_world->GetSelectedPedWeapon(lp) : 0;
         const int deadMax = (dead && myWeapon && IsMeleeClassWeapon(myWeapon)) ? sync::kDeadMeleeCapDamage : sync::kNoDeadCap;
         const bool takedown = dead && byMe && g_world->WasPedKilledByTakedown(pe.ped);   // diagnostic only
-        const sync::PeerDamageOut o = sync::ProbePeerDamage(h, pe.hpPool, byMe, dead, deadMax);
+        sync::PeerDamageOut o = sync::ProbePeerDamage(h, pe.hpPool, byMe, dead, deadMax);
         if (deadMax != sync::kNoDeadCap && o.report && pe.hpPool - (h > 0 ? h : 0) > deadMax)
             ++g_v4.deadCapped;
         if (takedown)
             ++g_v4.takedownKills;
+        // 0c: the melee decision (sync::DecideMeleeHit): the damage event in the swing window is the hit, at the weapon's
+        // nominal damage (the server's melee ceiling decides what it is worth); it replaces the pool number for that blow.
+        // A pool drop with no event keeps reporting as before (guns, a melee drop outside the window).
+        sync::MeleeHitIn mi;
+        mi.meleeWeaponHeld = g_meleeHeld;
+        mi.eventDamaged = eventDamaged;
+        mi.sinceSwingMs = sinceSwing;
+        mi.meleeActionNow = g_meleeActionNow;
+        mi.poolReport = o.report;
+        mi.poolDamage = o.damage;
+        const sync::MeleeHitOut md = sync::DecideMeleeHit(mi);
+        o.report = md.source != sync::MeleeHitSource::None;
+        if (o.report)
+            o.damage = md.damage;
+        if (md.source == sync::MeleeHitSource::Event)
+            ++g_v4.meleeHitsEvent;
+        else if (md.source == sync::MeleeHitSource::Pool && g_meleeHeld)
+            ++g_v4.meleeHitsPool;
+        if (o.report && pe.seatedVeh >= 0)
+            ++g_v4.hitsOnSeated;                       // W9 item 8: a Hit reported on a puppet that sits in a vehicle
         if (o.report)
         {
             int bone = -1;
@@ -3036,7 +3322,7 @@ namespace {
             hit.shotSeq = (uint8_t)(g_shotSeq & 15);
             g_hits.Add(hit, nowMs);
         }
-        if (o.damage > 0 || h <= 0)
+        if (o.damage > 0 || h <= 0 || md.clearEvent)   // md.clearEvent: a melee event is read once, never fires the next swing too
         {
             g_world->ClearLastDamage(pe.ped);
             g_world->ClearLastDamageBone(pe.ped);
@@ -3220,6 +3506,43 @@ namespace {
             LocoReset(pe, kSiteHitReact);              // the controller re-issues its gait (a real drift still snaps)
         else
             LocoSoft(pe, kSiteHitReact);
+    }
+
+    // W9 item 6: a puppet the local player's vehicle ran over ragdolls for io.ragdollMs and is thrown with a share of the
+    // vehicle's velocity. The same cosmetic window as a server-confirmed knockdown (ApplyPuppetHitReact): its guards are
+    // lifted, the hit-reaction arbiter holds the ped (no gait, no position correction) until the window ends, then the
+    // guards go back and the locomotion re-issues. The sender (the owner) stays authoritative: its own ragdoll arrives
+    // through the Tier B edge and its next states put the puppet back. Obeys hit_react (off / bullet: no ragdoll).
+    void ApplyPuppetVehicleImpact(Peer& pe, int id, const sync::ImpactOut& io, int32_t lpVeh, double nowMs)
+    {
+        sync::HitReaction r;
+        r.kind = sync::ReactKind::Knockdown;
+        r.ragdollMs = io.ragdollMs;
+        bool ragdoll = false, bullet = false;
+        sync::ReactionToShow(g_hitReact.load(std::memory_order_relaxed), r, ragdoll, bullet);
+        if (!ragdoll || !pe.ped)
+            return;
+        const int32_t ped = pe.ped;
+        g_world->SetPedConfigFlag(ped, 188, false);
+        pe.reactLifted = true;
+        g_world->SetPedCanRagdoll(ped, true);
+        g_world->SetPedToRagdoll(ped, io.ragdollMs, io.ragdollMs);
+        float vx = 0, vy = 0, vz = 0;
+        if (g_world->GetEntityVelocity(lpVeh, vx, vy, vz))
+            g_world->SetEntityVelocity(ped, vx * io.velocityScale, vy * io.velocityScale, vz * io.velocityScale + 2.0f);
+        pe.reactRagdolled = true;
+        pe.aimTask = false;
+        pe.hitReact.Start(nowMs, r);
+        pe.lastImpactMs = nowMs;
+        ++g_v4.vehImpacts;
+        static int logged = 0;
+        if (logged < 8)
+        {
+            ++logged;
+            PeerLog(false, "engine: vehicle impact on peer id=%d (%s): our vehicle at %.1f m/s: ragdoll %d ms, thrown with %.0f%% of its "
+                    "velocity (look and feel INFERRED)", id, pe.name.c_str(), std::sqrt((double)vx * vx + (double)vy * vy + (double)vz * vz),
+                    io.ragdollMs, io.velocityScale * 100.0);
+        }
     }
 
     // Per frame in DrivePeer: turn the Damage the join worker queued for this puppet into a reaction, run the
@@ -3462,6 +3785,7 @@ namespace {
         case sync::LocoTask::None:       return "none";
         case sync::LocoTask::StandStill: return "stand-still";
         case sync::LocoTask::GoStraight: return "go-straight";
+        case sync::LocoTask::GoToAnchor: return "go-to-anchor";
         }
         return "?";
     }
@@ -3503,17 +3827,22 @@ namespace {
         const sync::LocoStats& a = pe.loco.Stats();
         const sync::LocoStats& b = pe.locoSeen;
         const std::string hard = SiteList(pe.hardSites), soft = SiteList(pe.softSites);
-        char buf[900];
+        char buf[1300];
         std::snprintf(buf, sizeof(buf),
                       "engine: loco id=%d (%s): last 10 s %u go-straight (first of a gait %u, task lost %u, forced %u, blend %u, "
                       "turn %u, drift %u, arrive %u, stall %u), %u stand-still; %u Reset [%s]; %u SoftReset [%s] (%u kept the "
-                      "task, %u re-issued); last applied: flags 0x%04x move %u weapon 0x%08x, latched task %s (gait %s), "
+                      "task, %u re-issued); W11: anchor %s (mode %s, entity %d, %u go-to-entity issues, %u frames, %u stall "
+                      "fallbacks to straight, %u spawn fails), %u gait changes carried by SET_PED_DESIRED_MOVE_BLEND_RATIO "
+                      "without a re-issue; last applied: flags 0x%04x move %u weapon 0x%08x, latched task %s (gait %s), "
                       "collisionOff %d, climb %s, water %d",
                       id, pe.name.c_str(), a.goStraight - b.goStraight, a.whyGait - b.whyGait, a.whyReset - b.whyReset,
                       a.whyForced - b.whyForced, a.whyBlend - b.whyBlend, a.whyTurn - b.whyTurn, a.whyDrift - b.whyDrift,
                       a.whyArrive - b.whyArrive, a.whyStall - b.whyStall, a.standStill - b.standStill, a.resets - b.resets,
                       hard.c_str(), a.softResets - b.softResets, soft.c_str(), a.softKept - b.softKept,
-                      a.softReissued - b.softReissued, (unsigned)pe.lastPed.flags, (unsigned)pe.lastPed.move,
+                      a.softReissued - b.softReissued, pe.anchor ? "on" : "off", g_locoAnchor.load() ? "anchor" : "straight",
+                      pe.anchor, a.anchorIssues - b.anchorIssues, a.anchorFrames - b.anchorFrames,
+                      a.anchorFallbacks - b.anchorFallbacks, pe.anchorSpawnFails, a.gaitKept - b.gaitKept,
+                      (unsigned)pe.lastPed.flags, (unsigned)pe.lastPed.move,
                       (unsigned)pe.lastPed.weapon, LocoTaskName(pe.loco.LastTask()), GaitName(pe.loco.CurrentGait()),
                       pe.collisionOff ? 1 : 0, ClimbPhaseName(pe.climb.CurrentPhase()), pe.water.InWater() ? 1 : 0);
         return buf;
@@ -3590,9 +3919,81 @@ namespace {
     // steer, heading and the rare snap; this applies them in the order its header gives.
     void UnseatPeer(Peer& pe, int32_t leaveVeh);   // defined below (its default argument is declared there)
 
+    // 0d: cover as a window (sync::CoverWindow), once per DrivePeer from TickPeerTierB. The puppet is put on the sender's pose of the
+    // edge first (the native looks for a cover point at the coordinates it is given), then TASK_PUT_PED_DIRECTLY_INTO_COVER(ped, pose,
+    // timeout -1, allowPeekingAndFiring false, blendIn 0, forceInitialFacingDirection false, forceFaceLeft false, identifier -1,
+    // doEntry false). Returns true while the cover task owns the ped: DrivePeer then runs no gait task, no velocity push and no
+    // anchor move (LocoController::Update is not called). INFERRED, not verifiable without a game: that these parameters find a
+    // cover point at a car; the log line "engine: vault / cover (0d)" counts issued / started / fallback / ended per 10 s.
+    bool TickPeerCover(Peer& pe, int id, const sync::Pose& pose, double nowMs)
+    {
+        const proto::PedState& ps = pose.ped;
+        const bool flag = (ps.flags & proto::kPfCover) != 0 && (ps.flags & proto::kPfRagdoll) == 0 && pe.seatedVeh < 0;
+        bool inCover = false;
+        float drift = 0.0f;
+        if (pe.cover.Busy())
+        {
+            inCover = g_world->IsPedInCover(pe.ped, false);
+            float cx = 0, cy = 0, cz = 0;
+            if (g_world->GetEntityCoords(pe.ped, cx, cy, cz))
+                drift = std::sqrt((cx - pose.k.x) * (cx - pose.k.x) + (cy - pose.k.y) * (cy - pose.k.y));
+        }
+        const sync::CoverWindow::Phase before = pe.cover.CurrentPhase();
+        const sync::CoverWindow::Out cv = pe.cover.Update(flag, inCover, drift, nowMs);
+        if (before == sync::CoverWindow::Phase::Pending && pe.cover.CurrentPhase() == sync::CoverWindow::Phase::Held)
+        {
+            ++g_v4.coverStarted;
+            PeerLog(false, "engine: remote peer id=%d (%s) is in cover (IS_PED_IN_COVER)", id, pe.name.c_str());
+        }
+        bool failed = cv.failed;
+        if (cv.issue)
+        {
+            ++g_v4.coverIssued;
+            PrePlacePeer(pe, pose);
+            pe.aimTask = false;
+            const bool called = g_world->TaskPutPedDirectlyIntoCover(pe.ped, pose.k.x, pose.k.y, pose.k.z, -1, false, 0.0f, false,
+                                                                     false, -1, false);
+            if (!called)
+            {
+                pe.cover.NoteIssueFailed();
+                failed = true;
+            }
+            static int coverLogged = 0;
+            if (coverLogged < 8)
+            {
+                ++coverLogged;
+                PeerLog(!called, "engine: remote peer id=%d (%s) takes cover (flags 0x%x): TASK_PUT_PED_DIRECTLY_INTO_COVER at "
+                        "%.2f %.2f %.2f %s", id, pe.name.c_str(), (unsigned)ps.flags, pose.k.x, pose.k.y, pose.k.z,
+                        called ? "issued; the puppet is checked with IS_PED_IN_COVER" : "could not be called");
+            }
+        }
+        if (failed)
+        {
+            ++g_v4.coverFailed;
+            ClearPedTasksNow(pe.ped);                  // no half-run task: the controller keeps the ped on the sender's pose
+            pe.aimTask = false;
+            LocoReset(pe, kSiteCoverFail);
+            static int failLogged = 0;
+            if (failLogged < 8)
+            {
+                ++failLogged;
+                PeerLog(true, "engine: remote peer id=%d (%s): not in cover 700 ms after TASK_PUT_PED_DIRECTLY_INTO_COVER (no cover "
+                        "point at the pose?): the puppet stands on the pose until the flag falls", id, pe.name.c_str());
+            }
+        }
+        if (cv.ended)
+        {
+            ++g_v4.coverEnded;
+            if (pe.seatedVeh < 0)
+                ClearPedTasksNow(pe.ped);              // out of cover: the controller re-issues its gait
+            pe.aimTask = false;
+            LocoReset(pe, kSiteCoverExit);
+        }
+        return cv.suspend;
+    }
+
     // The Tier B receivers of protocol v5's PedState (sync plan W6), run once per DrivePeer before the ped is tasked:
-    // reload once per edge, stealth on change (refreshed while on), cover on the enter edge (the native puts the
-    // ped into cover at its position if there is a cover point there; if it cannot be called nothing happens), a
+    // reload once per edge, stealth on change (refreshed while on), cover (TickPeerCover, a window), a
     // walk to a networked car on the entering move (TASK_ENTER_VEHICLE to that car, seat any; no jack flags), and
     // the way out on the exiting move. INFERRED live checks: that the native seat -2 takes any free seat, that
     // SET_PED_STEALTH_MOVEMENT's second argument true means "on", and that cover finds a point. Returns true while
@@ -3610,23 +4011,7 @@ namespace {
             pe.stealthOn = e.stealthOn;
             pe.stealthAtMs = nowMs;
         }
-        if (e.coverEnter && pe.seatedVeh < 0 && !(ps.flags & proto::kPfRagdoll))
-        {
-            pe.coverHold = g_world->TaskPutPedDirectlyIntoCover(ped, pose.k.x, pose.k.y, pose.k.z, -1, false, 0.0f, false, false,
-                                                                -1, false);
-            if (pe.coverHold)
-            {
-                pe.aimTask = false;
-                PeerLog(false, "engine: remote peer id=%d (%s) took cover", id, pe.name.c_str());
-            }
-        }
-        if (e.coverExit && pe.coverHold)
-        {
-            pe.coverHold = false;
-            ClearPedTasksNow(ped);                     // out of cover: the controller re-issues its gait
-            pe.aimTask = false;
-            LocoReset(pe, kSiteCoverExit);
-        }
+        const bool coverHolds = TickPeerCover(pe, id, pose, nowMs);
         if (e.exitStart && pe.seatedVeh >= 0)
         {
             // The sender is getting out: climb out with TASK_LEAVE_VEHICLE (flags 0) now instead of waiting for
@@ -3675,7 +4060,16 @@ namespace {
             }
             else if (ps.move == proto::kMoveInVehicle)
             {
-                if (!sync::EnterWarpDue(true, false, inCar ? 1e9 : nowMs - pe.enterTaskMs))
+                // W9 item 1: the sender is no longer entering (F warps the real passenger into the seat in 0.3 s), so the
+                // door walk is over the moment the server's seat list names this player (the seat warp, TickVehicles,
+                // follows). Until the list does, the walk plays on at most kEnterTaskMaxMs (the list is a tick or two
+                // behind the sender's move): EnterWarpDue is asked "is the sender still entering" = "not listed yet".
+                bool listed = false;
+                const auto evit = g_vehs.find((uint16_t)pe.enterVeh);
+                if (evit != g_vehs.end())
+                    for (size_t s2 = 0; s2 < proto::kVehSeats; ++s2)
+                        listed = listed || evit->second.st.seats[s2] == (uint16_t)id;
+                if (!sync::EnterWarpDue(true, false, inCar ? 1e9 : nowMs - pe.enterTaskMs, !listed))
                     return true;                       // still walking in; the seat warp comes when it is due
             }
             else if (!inCar)
@@ -3686,9 +4080,7 @@ namespace {
                 LocoReset(pe, kSiteEnterGaveUp);
             }
         }
-        if (pe.coverHold && (ps.flags & proto::kPfCover))
-            return true;
-        return false;
+        return coverHolds;
     }
 
     void DrivePeer(Peer& pe, int id, const sync::Pose& pose, double dtMs, double nowMs)
@@ -3730,6 +4122,7 @@ namespace {
         if (pe.deadShown)
         {
             pe.climb.Reset();
+            pe.cover.Reset();
             return;                                    // playing dead (UpdatePeerDeath): no tasks, no placing
         }
         const bool tierBHolds = !reactHolds && TickPeerTierB(pe, id, pose, nowMs);   // W6: reload / stealth / cover / enter / exit
@@ -3739,6 +4132,23 @@ namespace {
             pe.lastMove = ps.move;                     // seated in a synced vehicle: the vehicle carries it
             TickSeatedAim(pe, id, pose, nowMs);        // a raised gun is the only thing it adds
             return;
+        }
+        if (pe.carryFromMs > 0.0)
+        {
+            // W9 item 5: a bail-out leaves a moving vehicle with its momentum: the ped is given the vehicle's velocity for
+            // kCarryVelocityMs from the first frame it is outside (fading), so it does not drop dead at the door.
+            if (nowMs - pe.carryFromMs > 2000.0)
+                pe.carryFromMs = pe.carryOutMs = 0;                // never got out: the pop below has it
+            else if (!g_world->IsPedInVehicle(pe.ped))
+            {
+                if (pe.carryOutMs <= 0.0)
+                    pe.carryOutMs = nowMs;
+                const float k = sync::CarryVelocityScale(nowMs - pe.carryOutMs);
+                if (k <= 0.0f)
+                    pe.carryFromMs = pe.carryOutMs = 0;
+                else
+                    g_world->SetEntityVelocity(pe.ped, pe.carryVel[0] * k, pe.carryVel[1] * k, pe.carryVel[2] * k);
+            }
         }
         if (pe.leaveUntilMs > 0.0 && nowMs >= pe.leaveUntilMs)
         {
@@ -3770,7 +4180,6 @@ namespace {
                 {
                     PlacePeer(pe, pose);
                     pe.enterTaskMs = 0.0;
-                    pe.coverHold = false;
                     LocoReset(pe, kSiteTierBDrift);
                 }
             }
@@ -3816,6 +4225,10 @@ namespace {
         if (cw.issueClimb)
         {
             pe.aimTask = false;
+            // 0d: the puppet first goes onto the sender's pose of the edge (position + heading: it is at the obstacle, facing it;
+            // the puppet is ~100 ms behind and the vault is short), the task goes out the same frame. The loco / anchor / push
+            // are suspended by the window from this frame on, so nothing drives the ped off the pose again.
+            PrePlacePeer(pe, pose);
             const bool issued = g_world->TaskClimb(pe.ped, false);
             if (issued)
                 ++g_v4.climbTasks;
@@ -3831,6 +4244,8 @@ namespace {
                                : "could not be called: the ped is placed on the pose instead");
             }
         }
+        if (climbBefore == sync::ClimbWindow::Phase::Pending && pe.climb.CurrentPhase() == sync::ClimbWindow::Phase::Active)
+            ++g_v4.climbStarted;                       // 0d: the puppet really climbs / vaults
         if (climbBefore != sync::ClimbWindow::Phase::Fallback && pe.climb.CurrentPhase() == sync::ClimbWindow::Phase::Fallback)
         {
             ++g_v4.climbFallbacks;
@@ -3895,6 +4310,16 @@ namespace {
         in.jumpSeq = ps.jumpSeq;                       // a change starts one jump, even if kPfJumping was skipped
         in.moveRateAvailable = !g_moveRateFailed;
         in.swimming = (ps.flags & proto::kPfSwimming) != 0;   // W6: a swimmer shows no land gait: not a stall
+        {
+            // W11 item 3: the ped's own velocity (what its animation moves it by): the controller pushes only the residual on it.
+            float pvx = 0, pvy = 0, pvz = 0;
+            in.havePedVel = g_world->GetEntityVelocity(pe.ped, pvx, pvy, pvz);
+            in.pedVel = { pvx, pvy, pvz };
+            // W11 item 2: anchor mode needs the entity; an aim task owns the walk (its target is a coordinate) and a broken
+            // TASK_GO_TO_ENTITY ends it: the controller then acts as straight for the frame.
+            const bool anchorWanted = g_locoAnchor.load() && !g_anchorBroken && !aiming;
+            in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
+        }
         const sync::LocoOutput o = pe.loco.Update(in);
         if (o.paused)
             return;                                    // leaving a vehicle: the exit animation owns the ped
@@ -3906,6 +4331,8 @@ namespace {
             pe.haveLastTarget = true;
             pe.lastMbr = o.moveBlendRatio;
         }
+        if (o.moveAnchor && pe.anchor)
+            g_world->SetEntityCoordsNoOffset(pe.anchor, o.anchorPos.x, o.anchorPos.y, o.anchorPos.z);   // W11: every frame
         if (o.snap)
         {
             g_world->SetEntityCoordsNoOffset(ped, o.snapPos.x, o.snapPos.y, o.snapPos.z);
@@ -3963,7 +4390,22 @@ namespace {
                                                0.0f);
                 g_world->SetPedDesiredMoveBlendRatio(ped, o.moveBlendRatio);
                 break;
+            case sync::LocoTask::GoToAnchor:
+                // W11: ONE task for as long as the ped keeps walking; the anchor (placed above) moves every frame.
+                // TASK_GO_TO_ENTITY(ped, anchor, duration -1, distance 0.1, blend, slowDownDistance 0, flags 0).
+                if (pe.anchor && g_world->TaskGoToEntity(ped, pe.anchor, -1, 0.1f, o.moveBlendRatio, 0.0f, 0))
+                    g_world->SetPedDesiredMoveBlendRatio(ped, o.moveBlendRatio);
+                else
+                {
+                    g_anchorBroken = true;
+                    PeerLog(true, "engine: TASK_GO_TO_ENTITY could not be called (anchor %d): remote walking falls back to "
+                            "TASK_GO_STRAIGHT_TO_COORD (loco_mode=straight) for this run", pe.anchor);
+                    LocoReset(pe, kSiteAnchorLost);
+                }
+                break;
             }
+            if (o.setBlend)                            // W11: a Walk / Run / Sprint change rides on the running task
+                g_world->SetPedDesiredMoveBlendRatio(ped, o.moveBlendRatio);
         }
         // Heading. Standing still nothing else turns the ped, so it is set outright. While a gait task
         // runs, GTA's motion task steers the ped toward its target every frame and blends the turn
@@ -4169,7 +4611,13 @@ namespace {
     // The car is drawn at the connection's render clock (the one the peds read: sync plan W7) minus its class extra,
     // (whole ticks its snapshots are spaced beyond one, slewed): `nowMs` is the tick's time, so a ped and a car of
     // one frame show the same instant. False: no snapshot yet, or the clock has heard no frame this session.
-    bool SampleVehInterp(uint16_t id, double nowMs, sync::VehicleSample& out)
+    //
+    // W9 item 6 (present-time prediction): with a `lead` (the car's sync::PresentLead) the car is drawn `lead` ms later
+    // on that timeline, up to the present: the delay and the class extra it is otherwise behind by, weighted 1 within
+    // 30 m of the local player and 0 beyond 45 m (`distM`), the interpolator extrapolating past its newest snapshot
+    // by the velocity (arc, capped at 500 ms). `leadMs` returns what was added. dtMs is the frame gap for the slew.
+    bool SampleVehInterp(uint16_t id, double nowMs, sync::VehicleSample& out, sync::PresentLead* lead = nullptr,
+                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr)
     {
         PeersLock lk(g_peersMtx, true);
         if (!g_syncLive || !g_sync.Clock().Ready())
@@ -4180,7 +4628,10 @@ namespace {
         VehNet& v = it->second;
         sync::NetClock& clock = g_sync.Clock();
         const double extra = v.extra.UpdateGap(v.interp.TypicalGapMs(), clock.TickMs(), nowMs, clock.Config().maxSlew);
-        return v.interp.Sample(clock.RenderT(nowMs) - extra, out);
+        const double add = lead ? lead->Update(distM, clock.DelayMs() + extra, dtMs) : 0.0;
+        if (leadMs)
+            *leadMs = add;
+        return v.interp.Sample(clock.RenderT(nowMs) - extra + add, out);
     }
     void ClearVehInterp(uint16_t id)
     {
@@ -4205,6 +4656,7 @@ namespace {
         constexpr size_t kReportMaxPeers = 8;
         report.clear();
         removedPeers.clear();
+        const float lpVehSpeed = lpVeh ? g_world->GetEntitySpeed(lpVeh) : 0.0f;   // W9 item 6: once per frame, for the impact check
         {
             double nowMs = 0;
             bool reportNow = false;
@@ -4225,6 +4677,7 @@ namespace {
                 Peer& pe = it->second;
                 if (pe.gone)
                 {
+                    DeleteAnchor(pe);
                     if (pe.ped)
                         g_world->DeleteEntity(pe.ped);
                     SyncEmoteDict(pe.emoteDict, false, std::string());   // its ped is gone: free the dictionary
@@ -4239,6 +4692,7 @@ namespace {
                     // own flag: OnWorld clears `despawn` with every WorldState that lists the peer.
                     pe.despawn = false;
                     pe.respawnPed = false;
+                    DeleteAnchor(pe);
                     if (pe.ped)
                         g_world->DeleteEntity(pe.ped);
                     pe.ped = 0;                        // DeleteEntity zeroes it; also when the call failed
@@ -4282,6 +4736,7 @@ namespace {
                     {
                         PeerLog(false, "engine: remote peer id=%d (%s) changed model 0x%08x -> 0x%08x: respawning its ped",
                                 it->first, pe.name.c_str(), (unsigned)pe.pedModel, (unsigned)pe.look.model);
+                        DeleteAnchor(pe);
                         g_world->DeleteEntity(pe.ped);
                         pe.ped = 0;
                         pe.lastDriveMs = 0;
@@ -4361,6 +4816,7 @@ namespace {
                     // Deleted under us (a game cleanup): forget the handle, a new ped next frame.
                     PeerLog(true, "engine: remote peer id=%d (%s): ped %d no longer exists -- respawning", it->first,
                             pe.name.c_str(), pe.ped);
+                    DeleteAnchor(pe);
                     pe.ped = 0;
                     pe.lastDriveMs = 0;
                     pe.spawnSinceMs = 0;
@@ -4369,7 +4825,7 @@ namespace {
                 }
                 UpdatePeerDeath(pe, it->first, pose, nowMs);
                 DrivePeer(pe, it->first, pose, pe.lastDriveMs > 0 ? nowMs - pe.lastDriveMs : 0.0, nowMs);
-                ProbePeerHits(pe, it->first, lp, lpVeh, nowMs);
+                ProbePeerHits(pe, it->first, lp, lpVeh, lpVehSpeed, nowMs);
                 pe.lastDriveMs = nowMs;
                 ++pe.samples;
                 if (pose.mode == sync::PoseMode::Extrapolating) ++pe.extrapolated;
@@ -4409,6 +4865,7 @@ namespace {
                     pe.locoStandSeen = ls.standStill;
                     pe.locoSnapsSeen = ls.snaps;
                     pe.locoSeen = ls;
+                    pe.anchorSpawnFails = 0;
                     pe.hardSites = sync::SiteTally<kLocoSites>();
                     pe.softSites = sync::SiteTally<kLocoSites>();
                     pe.samples = pe.extrapolated = pe.held = pe.snaps = 0;
@@ -4452,19 +4909,59 @@ namespace {
 
     // A remote ped seated in a server vehicle back on foot (the vehicle is going away, or its seat list
     // no longer has them). With `leaveVeh` (the vehicle it sits in, still alive: the player really got
-    // out) the ped climbs out with TASK_LEAVE_VEHICLE (flags 0) and its locomotion is paused for the
-    // exit animation (kUnseatPauseMs). Without one, or when the ped is not in a vehicle on this machine,
-    // CLEAR_PED_TASKS_IMMEDIATELY takes it out at once. Either way the next DrivePeer steers it onto its
-    // pose (Reset: a snap only if it really diverged). Script tick, no lock.
+    // out) sync::DecideUnseat picks the exit (W9 item 5): a parked car is left with TASK_LEAVE_VEHICLE flags 0 and
+    // the locomotion paused for the exit animation (kUnseatPauseMs); a car moving faster than 3 m/s, or a sender
+    // whose first on-foot sample is falling / ragdolling / jumping, is bailed out of (flag 4160, 16 = warp out when
+    // that call fails), the vehicle's velocity is carried for the exit window (DrivePeer) and, when the sender is
+    // already ragdolling, the locomotion is not paused at all (its ragdoll edge takes the ped and holds it, with no
+    // position correction over it, until the sender's ragdoll ends). Without a vehicle, or when the ped is not in a
+    // vehicle on this machine, CLEAR_PED_TASKS_IMMEDIATELY takes it out at once. Either way the next DrivePeer
+    // steers it onto its pose (Reset: a snap only if it really diverged). Script tick, no lock.
     void UnseatPeer(Peer& pe, int32_t leaveVeh = 0)
     {
         if (pe.ped)
         {
-            if (leaveVeh && g_world->EntityExists(leaveVeh) && g_world->IsPedInVehicle(pe.ped) &&
-                g_world->TaskLeaveVehicle(pe.ped, leaveVeh, 0))
+            sync::UnseatIn ui;
+            ui.haveVehicle = leaveVeh && g_world->EntityExists(leaveVeh) && g_world->IsPedInVehicle(pe.ped);
+            if (ui.haveVehicle)
             {
-                pe.loco.Pause(kUnseatPauseMs);
-                pe.leaveUntilMs = NowMs() + kUnseatPauseMs;
+                ui.vehSpeedMps = g_world->GetEntitySpeed(leaveVeh);
+                ui.senderFlags = pe.lastPed.flags;
+            }
+            const sync::UnseatPlan plan = sync::DecideUnseat(ui);
+            bool left = false;
+            if (plan.mode != sync::UnseatMode::Clear)
+            {
+                left = g_world->TaskLeaveVehicle(pe.ped, leaveVeh, plan.leaveFlags);
+                if (!left && plan.fallbackFlags >= 0)
+                    left = g_world->TaskLeaveVehicle(pe.ped, leaveVeh, plan.fallbackFlags);
+            }
+            if (left)
+            {
+                const double now = NowMs();
+                if (plan.pauseMs > 0.0)
+                    pe.loco.Pause(plan.pauseMs);
+                pe.leaveUntilMs = now + (plan.pauseMs > 0.0 ? plan.pauseMs : sync::kBailPauseMs);
+                pe.carryFromMs = pe.carryOutMs = 0;
+                if (plan.carryVelocity)
+                {
+                    float vx = 0, vy = 0, vz = 0;
+                    if (g_world->GetEntityVelocity(leaveVeh, vx, vy, vz))
+                    {
+                        pe.carryVel[0] = vx; pe.carryVel[1] = vy; pe.carryVel[2] = vz;
+                        pe.carryFromMs = now;
+                    }
+                    ++g_v4.bailOuts;
+                    static int bailLogged = 0;
+                    if (bailLogged < 8)
+                    {
+                        ++bailLogged;
+                        PeerLog(false, "engine: vehicle: peer left a vehicle moving at %.1f m/s (sender flags 0x%x): bail-out (flags %d), "
+                                "velocity carried %s, locomotion %s", ui.vehSpeedMps, (unsigned)ui.senderFlags, plan.leaveFlags,
+                                pe.carryFromMs > 0.0 ? "yes" : "no (velocity unreadable)",
+                                plan.pauseMs > 0.0 ? "paused for the exit" : "not paused (the sender is ragdolling)");
+                    }
+                }
             }
             else
             {
@@ -4698,10 +5195,15 @@ namespace {
                         // Destroyed on the server with us inside: out first (warp, flag 16), delete after.
                         if (!v.leaveAtMs || nowMs - v.leaveAtMs > 2000.0)
                         {
-                            g_world->TaskLeaveVehicle(lp, v.handle, 16);
+                            // W9 item 5: out of a MOVING car by bail-out (4160), not a warp; the retry (and a slow car) warps (16).
+                            const float speed = g_world->GetEntitySpeed(v.handle);
+                            const int flags = sync::LocalLeaveFlags(speed, v.leaveAtMs > 0.0);
+                            g_world->TaskLeaveVehicle(lp, v.handle, flags);
                             v.leaveAtMs = nowMs;
-                            PeerLog(true, "engine: vehicle id=%u was removed by the server while we sit in it: "
-                                    "getting out", id);
+                            if (flags == sync::kLeaveBailOut)
+                                ++g_v4.localBailOuts;
+                            PeerLog(true, "engine: vehicle id=%u was removed by the server while we sit in it (%.1f m/s): "
+                                    "getting out (flags %d)", id, speed, flags);
                         }
                         ++it;
                         continue;
@@ -4782,11 +5284,57 @@ namespace {
                     ApplyVehicleFields(v, iControl);
                     v.appliedVersion = v.stVersion;
                 }
+                // W9 item 4 (passenger engine sound): the engine flag above is applied only when the server's flag CHANGES, and the
+                // server clears it at 0 fuel, so a car the local ped rides in as a passenger could sit with its engine stopped on
+                // this machine (silent). While the server says it runs, SET_VEHICLE_ENGINE_ON is asserted again every ~1 s
+                // (250 ms while the car reads not running). A throttle / RPM native for the puppet driver's audio is not in 3889
+                // (SET_VEHICLE_CURRENT_RPM is not available): only the engine flag is driven, and the line below says so once.
+                {
+                    const bool passengerHere = mine && !iControl && g_localSeat > 0;
+                    const bool serverOn = (st.flags & proto::kVehEngine) != 0;
+                    const bool running = passengerHere ? g_world->IsVehicleEngineRunning(h) : true;
+                    if (passengerHere)
+                    {
+                        g_pax.atMs = nowMs;
+                        g_pax.id = id;
+                        g_pax.serverOn = serverOn;
+                        g_pax.running = running;
+                        if (!g_pax.rpmLogged)
+                        {
+                            g_pax.rpmLogged = true;
+                            PeerLog(false, "engine: vehicle id=%u: we ride as a passenger; the engine is re-asserted every 1 s while the server "
+                                    "says it runs. Tried for the puppet driver's engine audio: SET_VEHICLE_ENGINE_ON only (no throttle / RPM "
+                                    "native in 3889: SET_VEHICLE_CURRENT_RPM is unavailable)", id);
+                        }
+                    }
+                    if (v.engineAssert.Due(nowMs, passengerHere, serverOn, running))
+                    {
+                        g_world->SetVehicleEngineOn(h, true);
+                        v.appliedEngine = 1;
+                        ++g_v4.engineAsserts;
+                        if (!running)
+                        {
+                            static double notRunningLoggedMs = -1e9;
+                            if (nowMs - notRunningLoggedMs >= 5000.0)
+                            {
+                                notRunningLoggedMs = nowMs;
+                                PeerLog(true, "engine: vehicle id=%u: the server says the engine runs but our copy reads it stopped "
+                                        "(we ride in it): SET_VEHICLE_ENGINE_ON again", id);
+                            }
+                        }
+                    }
+                }
                 if (!iControl)
                 {
                     sync::VehicleSample s;
-                    if (SampleVehInterp(id, s_frameMs, s))
+                    // W9 item 6: how far the local player is from this car (by the server position: cheap, and the bands are wide)
+                    const double leadDist = haveLp ? std::sqrt((double)(st.k.x - lpx) * (st.k.x - lpx) + (double)(st.k.y - lpy) * (st.k.y - lpy) +
+                                                               (double)(st.k.z - lpz) * (st.k.z - lpz))
+                                                   : 1e9;
+                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs))
                     {
+                        if (v.leadMs > 1.0)
+                            ++g_v4.leadFrames;
                         sync::VehicleDriveInput in;
                         in.target = s;
                         float qx, qy, qz, qw;
@@ -4796,7 +5344,48 @@ namespace {
                         {
                             in.localRot = { qx, qy, qz, qw };
                             in.dtMs = v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0;
+                            // W9 item 6 (contact grace): HAS_ENTITY_COLLIDED_WITH_ANYTHING of the copy, a rising edge only, and only
+                            // for a car within 60 m of us (the native is not free); the drive controller also opens a grace by itself
+                            // on a speed loss it did not command. Whether the flag stays set on the ground is INFERRED: a flag that
+                            // never falls opens one grace, not a stream of them (rising edge, and the controller's cooldown).
+                            if (leadDist < 60.0)
+                            {
+                                const bool flag = g_world->HasEntityCollidedWithAnything(h);
+                                in.contact = flag && !v.lastContactFlag;
+                                v.lastContactFlag = flag;
+                            }
+                            else
+                                v.lastContactFlag = false;
+                            const uint32_t gracesBefore = v.drive.Stats().contacts, flagBefore = v.drive.Stats().contactsByFlag;
                             const sync::VehicleDriveOutput o = v.drive.Update(in);
+                            if (v.drive.Stats().contacts != gracesBefore)
+                            {
+                                if (v.drive.Stats().contactsByFlag != flagBefore)
+                                    ++g_v4.contactsFlag;
+                                else
+                                    ++g_v4.contactsDecel;
+                                static int graceLogged = 0;
+                                if (graceLogged < 12)
+                                {
+                                    ++graceLogged;
+                                    PeerLog(false, "engine: vehicle id=%u: contact on the remote copy (%s): soft correction for %.0f ms "
+                                            "(speed %.1f m/s, error %.2f m)", id, v.drive.Stats().contactsByFlag != flagBefore ? "collision flag" : "speed loss",
+                                            sync::VehicleDriveConfig().contactGraceMs, std::sqrt((double)in.localVel.x * in.localVel.x + (double)in.localVel.y * in.localVel.y +
+                                                                                        (double)in.localVel.z * in.localVel.z), (double)o.posErrorM);
+                                }
+                            }
+                            // W9 item 7: bikes carry their lean in the quaternion (no bike-specific handling exists; none is invented): the
+                            // roll error against the sender's goes into a per-bike 10 s line so the next live test shows what is wrong.
+                            if (v.vehClass == -2)
+                            {
+                                v.vehClass = g_world->GetVehicleClass(h);
+                                if (sync::IsBikeClass(v.vehClass))
+                                    PeerLog(false, "engine: vehicle id=%u is a bike (class %d): a roll line is logged every 10 s", id, v.vehClass);
+                            }
+                            if (sync::IsBikeClass(v.vehClass))
+                                v.roll.Add(sync::vq::RollDeg(in.localRot) - sync::vq::RollDeg(s.rot),
+                                           std::sqrt((double)in.localVel.x * in.localVel.x + (double)in.localVel.y * in.localVel.y +
+                                                     (double)in.localVel.z * in.localVel.z));
                             if (o.snap)
                             {
                                 g_world->SetEntityCoordsNoOffset(h, o.snapPos.x, o.snapPos.y, o.snapPos.z);
@@ -4859,17 +5448,44 @@ namespace {
                         continue;                      // already there
                     // W6: a ped walking to this car with TASK_ENTER_VEHICLE (TickPeerTierB) is left to the walk; the
                     // old seat warp takes over once it has had sync::kEnterTaskMaxMs (or the ped is already inside).
+                    // W9 item 1: ... and no longer once the sender's move says it is not entering (it was put into the seat).
                     if (pe.enterTaskMs > 0.0 && pe.seatedVeh < 0 && pe.enterVeh == (int)id &&
-                        !g_world->IsPedInVehicle(pe.ped) && !sync::EnterWarpDue(true, false, nowMs - pe.enterTaskMs))
+                        !g_world->IsPedInVehicle(pe.ped) &&
+                        !sync::EnterWarpDue(true, false, nowMs - pe.enterTaskMs, pe.lastPed.move == proto::kMoveEnteringVehicle))
                         continue;
                     pe.seatTryMs = nowMs;
                     const int32_t occupant = g_world->GetPedInVehicleSeat(h, gtaSeat);
                     if (occupant && occupant == lp)
                         continue;                      // our own ped holds it here: the server will sort it out
+                    // W11 (W9 evidence): a warp of a ped that is already seated somewhere (here or in a car) is a RE-warp, the
+                    // visible "passenger teleports"; counted per 10 s so the next live test shows how often it still happens.
+                    const bool wasSeated = pe.seatedVeh >= 0 || g_world->IsPedInVehicle(pe.ped);
+                    // W9 item 2: GTA moving the puppet out of the seat the server gave it (the auto-shuffle to the driver's
+                    // seat; PCF 184 below should stop it) made this loop re-warp it every 100 ms. A re-warp to the same seat
+                    // now waits on a gap that doubles (400 ms, 800, ... 4 s) and starts over after 5 s of calm; a different
+                    // seat or vehicle (the server moved the player) goes at once.
+                    if (!pe.seatLimiter.Allow(nowMs, (int)id, (int)s, wasSeated))
+                    {
+                        ++g_v4.seatRewarpsHeld;
+                        continue;
+                    }
                     if (pe.seatedVeh < 0 && !g_world->IsPedInVehicle(pe.ped))
                         ClearPedTasksNow(pe.ped);      // drop the gait task before the warp
                     pe.emote.Clear();
                     SyncPeerEmoteDict(pe);
+                    {
+                        // W9 item 2: PCF 184 (PreventAutoShuffleToDriversSeat) on the PUPPET, as on the local ped
+                        // (TickLocalVehicle): a passenger puppet beside an empty driver's seat is otherwise shuffled over by GTA.
+                        // Flag id 184 is INFERRED; set before every warp (a warp resets nothing, but it is one native call).
+                        const bool pcfOk = g_world->SetPedConfigFlag(pe.ped, 184, true);
+                        static bool pcfLogged = false;
+                        if (!pcfLogged)
+                        {
+                            pcfLogged = true;
+                            PeerLog(false, "engine: vehicle: PCF 184 (PreventAutoShuffleToDriversSeat) set on remote puppets at seat time: %s",
+                                    pcfOk ? "called" : "NOT callable");
+                        }
+                    }
                     g_world->SetPedIntoVehicle(pe.ped, h, gtaSeat);
                     pe.enterTaskMs = 0.0;              // the walk (if any) is over: the ped is seated
                     pe.enterVeh = -1;
@@ -4877,6 +5493,18 @@ namespace {
                     pe.seatedSeat = (int)s;
                     pe.aimTask = false;
                     ++g_v4.seatWarps;
+                    if (wasSeated)
+                        ++g_v4.seatRewarps;
+                    if (wasSeated)
+                    {
+                        static double rewarpLoggedMs = -1e9;
+                        if (nowMs - rewarpLoggedMs >= 5000.0)
+                        {
+                            rewarpLoggedMs = nowMs;
+                            PeerLog(true, "engine: vehicle id=%u seat %u: re-warp of player %u (already seated; %u held back so far by the limiter)",
+                                    id, (unsigned)s, (unsigned)pid, (unsigned)pe.seatLimiter.Suppressed());
+                        }
+                    }
                 }
                 ++it;
             }
@@ -5023,6 +5651,7 @@ namespace {
         if (g_entryWalk.active && g_entryWalk.tasked && lp)
             g_world->ClearPedTasks(lp);
         g_entryWalk = EntryWalk();
+        g_entryGuard.OnCancel();
     }
 
     // The chat line for an F / G that found nothing (one per second at most).
@@ -5040,6 +5669,13 @@ namespace {
     {
         if (!lp || lpVeh || dead)
         {
+            // W9 item 3: just seated by our press: GTA's own INPUT_ENTER must not consume the same press (or the next
+            // one a moment later) as another entry / exit. Whether 23 is the control that did it is INFERRED (counted).
+            if (lp && lpVeh && !dead && g_entryGuard.DisableEnter(nowMs))
+            {
+                uint64_t args[] = { 0, (uint64_t)kControlEnter, 1 };     // DISABLE_CONTROL_ACTION(0, 23, true)
+                g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+            }
             CancelEntryWalk(lp);                       // in a vehicle (ours, or GTA's) or dead: no walk to finish
             return;
         }
@@ -5116,6 +5752,8 @@ namespace {
             g_entryWalk.active = true;
             g_entryWalk.wantDriver = wantDriver;
             g_entryWalk.startMs = nowMs;
+            g_entryGuard.OnPress(nowMs);               // W9 item 3: the press is ours, control 23 stays disabled until seated + 500 ms
+            ++g_v4.entryPresses;
         }
         else
         {
@@ -5178,6 +5816,7 @@ namespace {
             const bool ok = g_world->SetPedIntoVehicle(lp, car->handle, pick.seat - 1);
             g_localSeatAtMs = 0;                       // read the real seat next tick
             ++g_v4.entryPicks;
+            g_entryGuard.OnSeated(nowMs);
             GLOGI("engine: vehicle: %s -> seat %d of vehicle id=%d (door %.2f m): %s", wantDriver ? "F" : "G", pick.seat,
                   pick.netId, pick.doorDistM, ok ? "SET_PED_INTO_VEHICLE called" : "SET_PED_INTO_VEHICLE FAILED");
             g_entryWalk = EntryWalk();
@@ -5329,6 +5968,12 @@ namespace {
             what = "Exit";
             g_exitNetId = o.netId;                     // PedState.move 6 (exiting) names this car for a moment
             g_exitAtMs = nowMs;
+            if (g_entryGuard.NoteExit(nowMs))
+            {
+                ++g_v4.quickExits;
+                GLOGI("engine: vehicle: exit within %.0f s of our F / G entry (the double-F / enter-exit loop: if this repeats, control 23 "
+                      "was not the one that consumed the press)", sync::kQuickExitMs / 1000.0);
+            }
             break;
         case sync::VehLinkCmd::Register:
         {
@@ -5687,6 +6332,160 @@ namespace {
         }
     }
 
+    // W10 (docs/sync-specs/live-0.4.2-fixes.md, libs/sync/nametag.h has every rule): the name above each remote ped's head.
+    // Script tick, after TickPeers; natives outside g_peersMtx (this works on the game thread's own g_peers). Per peer: the pose
+    // distance picks the nearest candidates (no native), then SKEL_Head + 0.35 m, GET_SCREEN_COORD_FROM_WORLD_COORD, and, for a
+    // point on screen, HAS_ENTITY_CLEAR_LOS_TO_ENTITY (local ped -> puppet) at most 5 Hz per peer (the answer is cached, see
+    // LosCache). The list goes to Overlay::SetNameTags (copied under the overlay's data lock); the overlay only draws it.
+    // Hidden as a whole while the server session is not up, the local ped is not alive, or the pause menu is open.
+    void TickNameTags(int32_t lp, double nowMs)
+    {
+        static const sync::NameTagConfig cfg;
+        static sync::NameTagStats st;
+        static std::vector<sync::TagCandidate> cand;
+        static std::vector<sync::TagItem> items;
+        static game::Overlay::NameTag pushOut[game::Overlay::kMaxNameTags];
+        static double lastMs = 0, lastLogMs = 0;
+        static bool pushed = false, loggedPath = false;
+        constexpr int kSkelHead = 31086;          // SKEL_Head
+        constexpr float kPoseSlackM = 4.0f;       // the pose is the body origin, the head anchor is up to ~2 m from it
+
+        const double dtMs = lastMs > 0 ? nowMs - lastMs : 16.0;
+        lastMs = nowMs;
+        const bool hide = !g_nameTags.load() || !lp || !join::IsConnected() || g_life != Life::Alive || g_pauseMenuActive ||
+                          g_peers.empty();
+        float cx = 0, cy = 0, cz = 0;
+        if (hide || !g_world->GetFinalRenderedCamCoord(cx, cy, cz))
+        {
+            if (!hide)
+                ++st.nativeFailed;
+            for (auto& kv : g_peers)
+                kv.second.nameTag.Reset();
+            if (pushed)
+            {
+                game::Overlay::SetNameTags(nullptr, 0);
+                pushed = false;
+            }
+            return;
+        }
+        if (!loggedPath)
+        {
+            loggedPath = true;
+            GLOGI("engine: name tags run: head bone %d + %.2f m, GET_SCREEN_COORD_FROM_WORLD_COORD, HAS_ENTITY_CLEAR_LOS_TO_ENTITY "
+                  "(trace %d) every %.0f ms per peer, fade %.0f-%.0f m, at most %zu tags; hidden while the pause menu is open or the "
+                  "local player is not alive",
+                  kSkelHead, cfg.headLiftM, g_nameTagTrace.load(), cfg.losIntervalMs, cfg.fadeStartM, cfg.maxRangeM, cfg.maxTags);
+        }
+
+        // 1. Candidates by pose distance: no native.
+        cand.clear();
+        for (const auto& kv : g_peers)
+        {
+            const Peer& pe = kv.second;
+            if (!(pe.ped && pe.poseOk && pe.lastDriveMs > 0 && !pe.gone && !pe.despawn))
+                continue;
+            const float dx = pe.pose.k.x - cx, dy = pe.pose.k.y - cy, dz = pe.pose.k.z - cz;
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (sync::NameTagTrack::Worth(true, pe.deadShown, d - kPoseSlackM, cfg))
+                cand.push_back({ kv.first, d });
+        }
+        sync::KeepNearestCandidates(cand, cfg.maxCandidates);
+        st.candidates += (uint32_t)cand.size();
+
+        // 2. Every peer steps once: the candidates with what the natives say, the rest with nothing (their tag fades out).
+        items.clear();
+        for (auto& kv : g_peers)
+        {
+            Peer& pe = kv.second;
+            sync::TagFrame f;
+            f.nowMs = nowMs;
+            f.dtMs = dtMs;
+            f.placed = pe.ped != 0 && !pe.gone && !pe.despawn;
+            f.dead = pe.deadShown;
+            const int id = kv.first;
+            const bool isCand = std::any_of(cand.begin(), cand.end(), [id](const sync::TagCandidate& c) { return c.id == id; });
+            if (isCand)
+            {
+                float hx = 0, hy = 0, hz = 0;
+                if (!g_world->GetPedBoneCoords(pe.ped, kSkelHead, 0.0f, 0.0f, 0.0f, hx, hy, hz))
+                    ++st.nativeFailed;
+                else
+                {
+                    hz += cfg.headLiftM;
+                    const float dx = hx - cx, dy = hy - cy, dz = hz - cz;
+                    f.distM = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (f.distM <= cfg.maxRangeM)
+                    {
+                        f.projOk = g_world->GetScreenCoordFromWorldCoord(hx, hy, hz, f.sx, f.sy);
+                        if (!f.projOk)
+                            ++st.projFailed;
+                        else if (sync::ProjectionUsable(true, f.sx, f.sy, cfg))
+                        {
+                            if (pe.nameTag.los.Due(nowMs, cfg))
+                            {
+                                const int r = g_world->HasEntityClearLosToEntity(lp, pe.ped, g_nameTagTrace.load());
+                                ++st.losChecks;
+                                if (r < 0)
+                                    ++st.losFailed;           // fail closed: recorded as blocked
+                                else if (r == 0)
+                                    ++st.losBlocked;
+                                pe.nameTag.los.Record(nowMs, r == 1);
+                            }
+                            else
+                                ++st.losHits;
+                        }
+                    }
+                }
+            }
+            const sync::TagOut o = pe.nameTag.Step(f, cfg);
+            if (o.draw)
+            {
+                sync::TagItem it;
+                it.id = id;
+                it.distM = o.distM;
+                it.out = o;
+                it.text = sync::FormatTag(id, pe.name.c_str(), cfg);
+                items.push_back(std::move(it));
+            }
+        }
+        sync::KeepNearest(items, cfg.maxTags);
+
+        // 3. Hand the list over.
+        int n = 0;
+        for (const sync::TagItem& it : items)
+        {
+            if (n >= game::Overlay::kMaxNameTags)
+                break;
+            game::Overlay::NameTag& t = pushOut[n++];
+            t = game::Overlay::NameTag();
+            t.x = it.out.x;
+            t.y = it.out.y;
+            t.alpha = it.out.alpha;
+            t.scale = it.out.scale;
+            std::snprintf(t.idText, sizeof(t.idText), "%s", it.text.id.c_str());
+            std::snprintf(t.name, sizeof(t.name), "%s", it.text.name.c_str());
+        }
+        if (n > 0 || pushed)
+        {
+            game::Overlay::SetNameTags(pushOut, n);
+            pushed = n > 0;
+        }
+        ++st.frames;
+        st.drawnSum += (uint32_t)n;
+        st.drawnMax = std::max(st.drawnMax, (uint32_t)n);
+
+        if (nowMs - lastLogMs >= 10000.0)
+        {
+            if (lastLogMs > 0 && (st.candidates || st.drawnMax))
+                GLOGI("engine: name tags (10 s): %u frames, %.1f drawn avg (max %u), %u candidates, LOS %u asked / %u reused / %u blocked / "
+                      "%u failed, %u off screen, %u native failures",
+                      st.frames, st.frames ? (double)st.drawnSum / st.frames : 0.0, st.drawnMax, st.candidates, st.losChecks, st.losHits,
+                      st.losBlocked, st.losFailed, st.projFailed, st.nativeFailed);
+            lastLogMs = nowMs;
+            st.Reset();
+        }
+    }
+
     void TickAiDamage(double nowMs)
     {
         static double atMs = -1e9;
@@ -5696,8 +6495,11 @@ namespace {
             if (failed >= 5 || nowMs - atMs < (g_aiDamageApplied ? 5000.0 : 1000.0))
                 return;
             atMs = nowMs;
+            // 0c: the MELEE modifier only with ai_melee_mod=1. A puppet plays a swing animation and starts no melee task, so
+            // nothing of its own can hurt the local player, and the 0.0 modifier zeroed our own fists on the puppet.
+            const bool meleeWanted = g_aiMeleeMod.load(std::memory_order_relaxed);
             const bool weaponOk = g_world->SetAiWeaponDamageModifier(0.0f);
-            const bool meleeOk = g_world->SetAiMeleeWeaponDamageModifier(0.0f);
+            const bool meleeOk = !meleeWanted || g_world->SetAiMeleeWeaponDamageModifier(0.0f);
             if (weaponOk && meleeOk)
             {
                 if (!g_aiDamageApplied)
@@ -5705,23 +6507,27 @@ namespace {
                     g_aiDamageApplied = true;
                     failed = 0;
                     ++g_v4.aiModSets;
-                    GLOGI("engine: AI weapon and melee damage modifiers set to 0.0: a puppet's real shot or punch hurts nobody "
-                          "here (damage is the server's); the clear-line check of real peer shots is lifted");
+                    GLOGI("engine: AI weapon damage modifier set to 0.0: a puppet's real shot hurts nobody here (damage is the "
+                          "server's); the clear-line check of real peer shots is lifted. AI melee damage modifier: %s",
+                          meleeWanted ? "also 0.0 (ai_melee_mod=1)" : "NOT set (puppets only play a swing animation; our fists must hurt the puppet's pool)");
                 }
+                g_aiMeleeApplied = meleeWanted;
             }
             else if (++failed >= 5)
-                GLOGW("engine: SET_AI_WEAPON_DAMAGE_MODIFIER / SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER could not be called (weapon "
-                      "%s, melee %s): real peer shots keep the clear-line check", weaponOk ? "ok" : "no", meleeOk ? "ok" : "no");
+                GLOGW("engine: SET_AI_WEAPON_DAMAGE_MODIFIER%s could not be called (weapon %s, melee %s): real peer shots keep "
+                      "the clear-line check", meleeWanted ? " / SET_AI_MELEE_WEAPON_DAMAGE_MODIFIER" : "", weaponOk ? "ok" : "no",
+                      meleeOk ? "ok" : "no");
             return;
         }
         failed = 0;
         if (g_aiDamageApplied)
         {
             const bool weaponOk = g_world->ResetAiWeaponDamageModifier();
-            const bool meleeOk = g_world->ResetAiMeleeWeaponDamageModifier();
+            const bool meleeOk = !g_aiMeleeApplied || g_world->ResetAiMeleeWeaponDamageModifier();   // only if we set it
             g_aiDamageApplied = false;
-            GLOGI("engine: session ended: AI weapon and melee damage modifiers reset (weapon %s, melee %s)", weaponOk ? "ok" : "NOT CALLABLE",
-                  meleeOk ? "ok" : "NOT CALLABLE");
+            GLOGI("engine: session ended: AI weapon damage modifier reset (%s), melee modifier %s", weaponOk ? "ok" : "NOT CALLABLE",
+                  !g_aiMeleeApplied ? "was never set" : meleeOk ? "reset" : "NOT CALLABLE");
+            g_aiMeleeApplied = false;
         }
     }
 
@@ -5747,6 +6553,7 @@ namespace {
         g_lastMarkedVeh = 0;
         g_noShuffleVeh = 0;
         g_entryWalk = EntryWalk();
+        g_entryGuard.Reset();
         g_vitalsPrevTotal = -1;
         g_serverDeadNoticed = false;
     }
@@ -5963,15 +6770,51 @@ namespace {
             const sync::VehLinkStats& ls = g_link.Stats();
             GLOGI("engine: vehicles: %zu tracked, %zu spawned, %zu peers seated; link %s id=%d seat %d; last 10 s: "
                   "%u VehicleWorld in, %u spawned, %u deleted, %u spawn fails, %u updates sent, %u cmds (%u ok, %u "
-                  "refused), %u seat warps, %u unseats, %u ejects, %u seat reverts, %u F/G entries (%u refused), "
+                  "refused), %u seat warps (%u re-warps of an already seated ped), %u unseats, %u ejects, %u seat reverts, %u F/G entries (%u refused), "
                   "%u snaps; link total %u enters %u registers %u exits %u retries %u timeouts",
                   tracked, spawned, seated, g_link.StateName(), g_link.NetId(), g_link.Seat(), worlds - lastWorlds,
                   c.vehSpawned - last.vehSpawned, c.vehDeleted - last.vehDeleted, c.vehSpawnFail - last.vehSpawnFail,
                   c.vehUpdates - last.vehUpdates, c.vehCmds - last.vehCmds, c.vehOk - last.vehOk,
-                  c.vehRefused - last.vehRefused, c.seatWarps - last.seatWarps, c.unseats - last.unseats,
+                  c.vehRefused - last.vehRefused, c.seatWarps - last.seatWarps, c.seatRewarps - last.seatRewarps, c.unseats - last.unseats,
                   c.ejects - last.ejects, c.reverts - last.reverts, c.entryPicks - last.entryPicks,
                   c.entryRefused - last.entryRefused, c.vehSnaps - last.vehSnaps, ls.enters, ls.registers, ls.exits,
                   ls.retries, ls.timeouts);
+            {
+                // W9: the passenger / seat / collision / bike numbers of the same 10 s (docs/sync-specs/live-0.4.2-fixes.md W9).
+                char pax[120];
+                if (nowMs - g_pax.atMs < 2000.0)
+                    std::snprintf(pax, sizeof(pax), "riding in vehicle id=%u: the server says the engine %s, our copy reads it %s", (unsigned)g_pax.id,
+                                  g_pax.serverOn ? "runs" : "is off", g_pax.running ? "running" : "stopped");
+                else
+                    std::snprintf(pax, sizeof(pax), "not riding a car somebody else controls");
+                GLOGI("engine: vehicles (W9), last 10 s: %u seat re-warps done, %u held back by the limiter; %u F/G presses taken (%u quick exits "
+                      "after an entry); passenger engine: %u re-asserts, %s; %u peer bail-outs of a moving vehicle, %u forced exits of ours "
+                      "by bail-out; %u vehicle impacts shown on puppets; contact graces opened %u by the collision flag / %u by a speed "
+                      "loss; %u car frames drawn in the present (lead); shots: at seated puppets %u, at a puppet's car %u, at puppets on foot "
+                      "%u; hits reported on seated puppets %u, pool drops on seated puppets %u",
+                      c.seatRewarps - last.seatRewarps, c.seatRewarpsHeld - last.seatRewarpsHeld, c.entryPresses - last.entryPresses,
+                      c.quickExits - last.quickExits, c.engineAsserts - last.engineAsserts, pax, c.bailOuts - last.bailOuts,
+                      c.localBailOuts - last.localBailOuts, c.vehImpacts - last.vehImpacts, c.contactsFlag - last.contactsFlag,
+                      c.contactsDecel - last.contactsDecel, c.leadFrames - last.leadFrames, c.shotsAtSeated - last.shotsAtSeated,
+                      c.shotsAtPuppetCar - last.shotsAtPuppetCar, c.shotsAtFoot - last.shotsAtFoot, c.hitsOnSeated - last.hitsOnSeated,
+                      c.seatedHpDrops - last.seatedHpDrops);
+                for (auto& kv : g_vehs)
+                {
+                    NetVeh& bv = kv.second;
+                    if (!sync::IsBikeClass(bv.vehClass))
+                        continue;
+                    const sync::RollTracker::Window w = bv.roll.Take();
+                    const sync::VehicleDriveStats& ds = bv.drive.Stats();
+                    if (w.frames)
+                        GLOGI("engine: bike id=%u (class %d), last 10 s: %u frames, roll error against the sender's max %.1f / mean %.1f deg, "
+                              "top speed %.1f m/s; drive: %u snaps, %u quaternion blends, %u contact graces (no bike-specific handling: the lean "
+                              "rides in the quaternion)", (unsigned)kv.first, bv.vehClass, w.frames, w.maxErrDeg, w.meanErrDeg, w.maxSpeedMs,
+                              ds.snaps - bv.rollSnapsSeen, ds.blends - bv.rollBlendsSeen, ds.contacts - bv.rollGracesSeen);
+                    bv.rollSnapsSeen = ds.snaps;
+                    bv.rollBlendsSeen = ds.blends;
+                    bv.rollGracesSeen = ds.contacts;
+                }
+            }
             const sync::VitalsStats& vs = g_vitals.Stats();
             const sync::HitBatchStats& hs = g_hits.Stats();
             GLOGI("engine: combat: server health %u armour %u%s, pending self-damage %d; last 10 s: %u shots, %u peer "
@@ -6002,6 +6845,16 @@ namespace {
                   c.muzzleFlashes - last.muzzleFlashes, c.reactFlinch - last.reactFlinch, c.reactKnock - last.reactKnock,
                   c.reactStagger - last.reactStagger, c.puppetFlinch - last.puppetFlinch, c.puppetKnock - last.puppetKnock,
                   c.puppetStagger - last.puppetStagger);
+            GLOGI("engine: melee (0c), last 10 s: hits sent (all weapons) %u; melee hits detected by the damage EVENT %u / by the pool drop %u (event read "
+                  "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u shown, %u not shown (ped owned "
+                  "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s",
+                  c.hitsSent - last.hitsSent, c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool,
+                  c.meleeEventsRead - last.meleeEventsRead, c.meleeSwings - last.meleeSwings,
+                  c.peerSwingSteps - last.peerSwingSteps, c.peerSwings - last.peerSwings,
+                  (c.peerSwingOwned - last.peerSwingOwned) + (c.peerSwingNoDict - last.peerSwingNoDict) +
+                      (c.peerSwingFailed - last.peerSwingFailed),
+                  c.peerSwingOwned - last.peerSwingOwned, c.peerSwingNoDict - last.peerSwingNoDict,
+                  c.peerSwingFailed - last.peerSwingFailed, g_aiMeleeApplied ? "0.0 (ai_melee_mod=1)" : "not set");
             GLOGI("engine: combat client (W8), last 10 s: local health changed by a puppet ped's gun or fists %u times (our "
                   "own cosmetic flinch bullets included); AI damage modifiers %s; dead-puppet melee reports capped %u, puppets "
                   "killed by a takedown %u; TASK_CLIMB issued %u, placement fallbacks %u; alt-tab fallback states sent %u",
@@ -6010,6 +6863,12 @@ namespace {
                   c.climbFallbacks - last.climbFallbacks,
                   g_fallbackStates.load(std::memory_order_relaxed) - lastFallbackStates);
             lastFallbackStates = g_fallbackStates.load(std::memory_order_relaxed);
+            GLOGI("engine: vault / cover (0d), last 10 s: TASK_CLIMB issued %u, started %u (the puppet really climbed / vaulted), "
+                  "placement fallbacks %u; puppet put on the sender's pose before a task: nudged %u, set outright %u; cover: "
+                  "task issued %u, started %u (IS_PED_IN_COVER), never started (fallback: stands on the pose) %u, ended %u",
+                  c.climbTasks - last.climbTasks, c.climbStarted - last.climbStarted, c.climbFallbacks - last.climbFallbacks,
+                  c.prePlaceNudged - last.prePlaceNudged, c.prePlaceSet - last.prePlaceSet, c.coverIssued - last.coverIssued,
+                  c.coverStarted - last.coverStarted, c.coverFailed - last.coverFailed, c.coverEnded - last.coverEnded);
             GLOGI("engine: anims: last 10 s: %u emote events in, %u started, %u dictionary timeouts, %u ended "
                   "not-playing, %u missing dictionaries; ours %s",
                   emotes - lastEmotes, c.emotesStarted - last.emotesStarted, c.emoteDictTimeouts - last.emoteDictTimeouts,
@@ -6030,15 +6889,19 @@ namespace {
     void TickLocalMelee(int32_t lp, bool inVehicle, double nowMs)
     {
         bool control = false, action = false;
-        if (!inVehicle && g_life == Life::Alive && !game::Overlay::Interactive() &&
-            IsMeleeClassWeapon(g_world->GetSelectedPedWeapon(lp)))
+        // 0c: the melee state of our ped, for ProbePeerHits' event window (a menu or the chat does not change what is in hand)
+        g_meleeHeld = !inVehicle && g_life == Life::Alive && IsMeleeClassWeapon(g_world->GetSelectedPedWeapon(lp));
+        g_meleeActionNow = false;
+        if (g_meleeHeld && !game::Overlay::Interactive())
         {
             control = g_world->IsDisabledControlJustPressed(0, 140) || g_world->IsDisabledControlJustPressed(0, 141) ||
                       g_world->IsDisabledControlJustPressed(0, 142);
             action = g_world->IsPedPerformingMeleeAction(lp);
+            g_meleeActionNow = action;
         }
         if (!g_meleeGate.Tick(nowMs, control, action))
             return;
+        g_lastSwingMs = nowMs;
         ++g_shotSeq;
         ++g_v4.meleeSwings;
         static int logged = 0;
@@ -6296,6 +7159,7 @@ namespace {
                 ++g_shotSeq;
                 g_lastShotMs = nowMs;
                 ++g_v4.shots;
+                NoteShotTarget();                      // W9 item 8: at a seated puppet, a puppet's car, or one on foot
             }
             TickLocalMelee(lp, lpVeh != 0, nowMs);     // W3: a punch or a swing steps shotSeq too
         }
@@ -6513,6 +7377,7 @@ namespace {
             WorkSection peersSection(probe, kSecPeers);    // the two short lock windows (SyncNet, CommitNet) and the natives
             TickPeers(lp, lpVeh);
             TickVehicles(lp, lpVeh);                   // after the peds: seating needs them spawned
+            TickNameTags(lp, nowMs);                   // W10: the names above the heads, from the poses this frame placed
             ReportV4(nowMs);
         }
     }
@@ -6713,8 +7578,11 @@ namespace gage::engine {
             // first); the join worker is gone by now (Disconnect above), the lock is for the net maps.
             std::lock_guard<std::mutex> sk(g_scriptMtx);
             for (auto& kv : g_peers)
+            {
+                DeleteAnchor(kv.second);
                 if (kv.second.ped && g_world)
                     g_world->DeleteEntity(kv.second.ped);
+            }
             g_peers.clear();
             for (auto& kv : g_vehs)
             {

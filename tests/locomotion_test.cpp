@@ -41,6 +41,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -151,15 +152,15 @@ static void TestGait() {
         g = n;
     }
     const bool ramp = ups.size() == 3 && downs.size() == 3 &&
-                      std::fabs(ups[0] - 0.50) < 0.006 && std::fabs(ups[1] - 2.90) < 0.006 && std::fabs(ups[2] - 5.90) < 0.006 &&
-                      std::fabs(downs[0] - 5.59) < 0.006 && std::fabs(downs[1] - 2.39) < 0.006 && std::fabs(downs[2] - 0.24) < 0.006;
-    Check("gait: ramp up changes at 0.50 / 2.90 / 5.90, ramp down below 5.60 / 2.40 / 0.25 (hysteresis bands)", ramp,
+                      std::fabs(ups[0] - 0.50) < 0.006 && std::fabs(ups[1] - 3.10) < 0.006 && std::fabs(ups[2] - 6.10) < 0.006 &&
+                      std::fabs(downs[0] - 5.29) < 0.006 && std::fabs(downs[1] - 2.09) < 0.006 && std::fabs(downs[2] - 0.24) < 0.006;
+    Check("gait: ramp up changes at 0.50 / 3.10 / 6.10, ramp down below 5.30 / 2.10 / 0.25 (hysteresis bands; W11: was 2.90 / 5.90 and 2.40 / 5.60)", ramp,
           F("ups %zu [%.2f %.2f %.2f] downs %zu [%.2f %.2f %.2f]", ups.size(), ups.size() > 0 ? ups[0] : -1, ups.size() > 1 ? ups[1] : -1,
             ups.size() > 2 ? ups[2] : -1, downs.size(), downs.size() > 0 ? downs[0] : -1, downs.size() > 1 ? downs[1] : -1, downs.size() > 2 ? downs[2] : -1));
 
     // Noise straddling the middle of each band: one change at most (the entry), at any fps.
     struct Band { double mid, noise; };
-    const Band bands[3] = {{0.375, 0.11}, {2.65, 0.22}, {5.75, 0.13}};
+    const Band bands[3] = {{0.375, 0.11}, {2.60, 0.22}, {5.70, 0.13}};
     int worst = 0;
     size_t frames = 0;
     for (const Band& b : bands)
@@ -752,13 +753,13 @@ static void TestAuthoritativeGait() {
           stop.standStill == 1 && delay >= 120 && delay <= 190, F("stand-still %u after %.0f ms", stop.standStill, delay));
 
     // Debounce: the sender's gait flapping Run / Sprint every frame (speed 5 m/s) must not re-issue the task
-    // per frame; a sustained Sprint is taken after gaitDebounceMs (200 ms).
+    // per frame; a sustained Sprint is taken after gaitDebounceMs (400 ms).
     const ScriptRun flap = RunScript(3000, 60, [](double) { return 5.0; }, [](int f, double) { return f % 2 ? 3 : 2; });
     Check("gait class change is debounced: Run <-> Sprint flapping every frame for 3 s issues <= 3 tasks (was one per frame)",
           flap.frames >= 179 && flap.goStraight <= 3 && flap.firstSprintMs < 0, F("go-straight %u, first sprint at %.0f ms", flap.goStraight, flap.firstSprintMs));
     const ScriptRun keep = RunScript(3000, 60, [](double) { return 5.0; }, [](int, double t) { return t < 1000 ? 2 : 3; });
-    Check("gait class change is debounced: a sustained Sprint from 1000 ms is shown after 200 ms (+- 2 frames), not at once",
-          keep.firstSprintMs >= 1180 && keep.firstSprintMs <= 1260 && keep.finalGait == Gait::Sprint,
+    Check("gait class change is debounced: a sustained Sprint from 1000 ms is shown after 400 ms (+- 2 frames), not at once (W11: was 200)",
+          keep.firstSprintMs >= 1360 && keep.firstSprintMs <= 1460 && keep.finalGait == Gait::Sprint,
           F("sprint first shown at %.0f ms, final gait %d", keep.firstSprintMs, int(keep.finalGait)));
 }
 
@@ -766,8 +767,8 @@ static void TestMoveRate() {
     // Steady speeds: rate = speed / nominal(gait) clamped 0.6..1.6 (nominal 1.5 / 4.5 / 7.0 m/s; W8 item 3: was 0.8..1.25).
     struct Case { double speed, expect; Gait gait; };
     const Case cases[] = {{1.5, 1.0, Gait::Walk},   {2.0, 2.0 / 1.5, Gait::Walk}, {1.2, 0.8, Gait::Walk},  {4.5, 1.0, Gait::Run},
-                          {5.4, 1.2, Gait::Run},    {3.0, 3.0 / 4.5, Gait::Run},   {7.0, 1.0, Gait::Sprint}, {8.4, 1.2, Gait::Sprint},
-                          {6.0, 6.0 / 7.0, Gait::Sprint}, {9.9, 9.9 / 7.0, Gait::Sprint}, {12.0, 1.6, Gait::Sprint}, {0.8, 0.6, Gait::Walk}};
+                          {5.4, 1.2, Gait::Run},    {3.3, 3.3 / 4.5, Gait::Run},   {7.0, 1.0, Gait::Sprint}, {8.4, 1.2, Gait::Sprint},
+                          {6.3, 6.3 / 7.0, Gait::Sprint}, {9.9, 9.9 / 7.0, Gait::Sprint}, {12.0, 1.6, Gait::Sprint}, {0.8, 0.6, Gait::Walk}};
     bool ok = true;
     std::string bad;
     for (const Case& c : cases) {
@@ -1111,6 +1112,384 @@ static void TestSwimCorrection() {
           F("pull land %.2f swim %.2f; up 1.4 m: land %.2f swim %.2f; up 0.8 m: land %.2f swim %.2f", land.dvx, swim.dvx, land.dvz, swim.dvz, landDiver.dvz, swimDiver.dvz));
 }
 
+
+// ---- 9: W11 (docs/CLOUD-HANDOFF.md item 0b): no re-issue on a gait change, anchor steering, residual push -----------------
+
+// A ped that moves by its animation: while a task runs it walks toward the task's target (the coordinate or the anchor
+// entity) at nominal(blend) * moveRate; a SET_ENTITY_VELOCITY from the controller replaces that velocity for the frame
+// (so a push of pedVel + residual adds to the animation, the pose-velocity push of the old logic replaces it).
+struct AnimPed {
+    LocoVec pos = V(0, 0, 30), anchor;
+    float heading = 0;
+    int task = 0;            // 0 none / stand-still, 1 go-straight coordinate, 2 go-to-entity (anchor)
+    LocoVec target;
+    float blend = 0, rate = 1;
+    bool lost = false;       // the task is gone (the ped stands, reading Still)
+    double scale = 1.0;      // animation speed error (0.9 = 10% slower than commanded)
+    static double Nominal(double b) {
+        if (b <= 0) return 0;
+        if (b <= 1) return 1.5 * b;
+        if (b <= 2) return 1.5 + 3.0 * (b - 1);
+        return 4.5 + 2.5 * (std::min(b, 3.0) - 2);
+    }
+    LocoVec AnimVel() const {
+        if (task == 0 || lost) return V(0, 0, 0);
+        const LocoVec& t = task == 2 ? anchor : target;
+        const double dx = double(t.x) - pos.x, dy = double(t.y) - pos.y, d = std::hypot(dx, dy);
+        if (d < 0.25) return V(0, 0, 0);
+        const double sp = Nominal(blend) * rate * scale;
+        return V(dx / d * sp, dy / d * sp, 0);
+    }
+};
+
+struct Pose { LocoVec pos, vel; float heading; };
+
+// The pose of a remote that travels at speedAt(t) along the direction dirAt(t) (degrees, math convention: 0 = +x).
+struct Path {
+    std::function<double(double)> speed, dirDeg;
+    double x = 0, y = 0;
+    Pose At(double t) const {
+        const double a = dirDeg(t) * kPi / 180.0, s = speed(t);
+        Pose p;
+        p.pos = V(x, y, 30);
+        p.vel = V(s * std::cos(a), s * std::sin(a), 0);
+        p.heading = float(WrapDeg(std::atan2(-std::cos(a), std::sin(a)) * 180.0 / kPi)); // GTA heading 0 = +y, counter-clockwise: h = atan2(-dx, dy)
+        return p;
+    }
+    void Advance(double t, double dtMs) {
+        const Pose p = At(t);
+        x += p.vel.x * dtMs / 1000.0;
+        y += p.vel.y * dtMs / 1000.0;
+    }
+};
+
+static LocoOutput StepAnim(LocomotionController& lc, AnimPed& p, const Pose& pose, double dtMs, bool noAnchor = false,
+                           bool forceStill = false) {
+    const LocoVec av = p.AnimVel();
+    LocoInput in;
+    in.pos = pose.pos; in.vel = pose.vel; in.heading = pose.heading;
+    in.pedPos = p.pos; in.pedHeading = p.heading; in.dtMs = dtMs;
+    in.pedVel = av; in.havePedVel = true;
+    const double as = std::hypot(av.x, av.y);
+    in.pedGait = forceStill ? Gait::Still : as < 0.5 ? Gait::Still : as < 2.65 ? Gait::Walk : as < 5.75 ? Gait::Run : Gait::Sprint;
+    in.noAnchor = noAnchor;
+    const LocoOutput o = lc.Update(in);
+    if (o.snap) p.pos = o.snapPos;
+    if (o.setHeading) p.heading = o.heading;
+    if (o.task == LocoTask::GoStraight) { p.task = 1; p.target = o.target; p.blend = o.moveBlendRatio; p.lost = false; }
+    else if (o.task == LocoTask::GoToAnchor) { p.task = 2; p.blend = o.moveBlendRatio; p.lost = false; }
+    else if (o.task == LocoTask::StandStill) p.task = 0;
+    if (o.setBlend) p.blend = o.moveBlendRatio;
+    if (o.moveAnchor) p.anchor = o.anchorPos;
+    if (o.setMoveRate) p.rate = o.moveRate;
+    LocoVec v = p.AnimVel();
+    if (o.setVelocity) v = o.velocity;
+    p.pos.x = float(p.pos.x + v.x * dtMs / 1000.0);
+    p.pos.y = float(p.pos.y + v.y * dtMs / 1000.0);
+    p.pos.z = 30;
+    return o;
+}
+
+struct W11Run {
+    LocoStats st;
+    size_t frames = 0, setBlendFrames = 0, anchorFrames = 0, taskFrames = 0;
+    double maxErr = 0, errSum = 0, maxPush = 0;
+    int gaitChanges = 0;
+    double firstIssueAfterMs = -1, lastIssueMs = -1;
+    double anchorLeadMin = 1e9, anchorLeadMax = 0;
+};
+
+// Runs `path` for durMs on a 60 fps clock against an AnimPed. `cfgMode`: the controller's mode.
+static W11Run RunW11(Path path, double durMs, LocoMode mode, double fps = 60.0, double errFromMs = 1500) {
+    LocoConfig cfg;
+    cfg.mode = mode;
+    LocomotionController lc(cfg);
+    AnimPed ped;
+    W11Run r;
+    const double dt = 1000.0 / fps;
+    Gait last = Gait::Still;
+    for (double t = 0; t < durMs; t += dt, ++r.frames) {
+        const Pose pose = path.At(t / 1000.0);
+        const LocoOutput o = StepAnim(lc, ped, pose, dt);
+        if (o.task == LocoTask::GoStraight || o.task == LocoTask::GoToAnchor) { ++r.taskFrames; r.lastIssueMs = t; }
+        if (o.setBlend) ++r.setBlendFrames;
+        if (o.moveAnchor) {
+            ++r.anchorFrames;
+            const double lead = std::hypot(double(o.anchorPos.x) - pose.pos.x, double(o.anchorPos.y) - pose.pos.y);
+            r.anchorLeadMin = std::min(r.anchorLeadMin, lead);
+            r.anchorLeadMax = std::max(r.anchorLeadMax, lead);
+        }
+        if (r.frames > 0 && o.gait != last) ++r.gaitChanges;
+        last = o.gait;
+        const double err = HDist(ped.pos, pose.pos);
+        if (t >= errFromMs) { r.maxErr = std::max(r.maxErr, err); r.errSum += err; }
+        path.Advance(t / 1000.0, dt);
+    }
+    r.st = lc.Stats();
+    return r;
+}
+
+static void TestW11() {
+    // ---- item 1: a gait change never re-issues the task ----
+    // 10 s straight along +x, 4.5 <-> 7 m/s every 2 s (Run <-> Sprint), Straight mode (the fallback path).
+    {
+        Path p;
+        p.speed = [](double t) { return int(t / 2) % 2 == 0 ? 4.5 : 7.0; };
+        p.dirDeg = [](double) { return 0.0; };
+        const W11Run r = RunW11(p, 10000, LocoMode::Straight);
+        std::printf("  [item 1, Run<->Sprint every 2 s, straight] go-straight %u (gait %u, kept %u, arrive %u, turn %u, drift %u), setBlend frames %zu, gait changes %d\n",
+                    r.st.goStraight, r.st.whyGait, r.st.gaitKept, r.st.whyArrive, r.st.whyTurn, r.st.whyDrift, r.setBlendFrames, r.gaitChanges);
+        Check("W11 item 1: Run <-> Sprint every 2 s for 10 s: the gait changes (>= 4) are carried by setBlend on the running task, none is a re-issue (no 'first of a gait', drift or turn re-issue; only arrivals)",
+              r.frames >= 599 && r.gaitChanges >= 4 && r.st.gaitKept >= 4 && r.st.whyGait == 0 && r.st.whyDrift == 0 && r.st.whyTurn == 0 && r.setBlendFrames >= 4,
+              F("gait changes %d, kept %u, first-of-a-gait issues %u, drift %u, turn %u, setBlend frames %zu", r.gaitChanges, r.st.gaitKept, r.st.whyGait, r.st.whyDrift, r.st.whyTurn, r.setBlendFrames));
+    }
+    {
+        // The blend ratio asked for is the commanded gait's, and it is asked for until it matches the task's (the test ped's task
+        // speed follows setBlend: after the Sprint is shown the ped runs 7 m/s again, error small).
+        LocoConfig cfg;
+        LocomotionController lc(cfg);
+        AnimPed ped;
+        Path p;
+        p.speed = [](double t) { return t < 1.0 ? 4.5 : 7.0; };
+        p.dirDeg = [](double) { return 0.0; };
+        float blendAt3s = -1;
+        bool setBlendWhileRun = false;
+        for (double t = 0; t < 2000; t += 1000.0 / 60) {
+            const Pose pose = p.At(t / 1000.0);
+            const LocoOutput o = StepAnim(lc, ped, pose, 1000.0 / 60);
+            if (o.setBlend && o.gait == Gait::Run) setBlendWhileRun = true;
+            if (o.setBlend && o.gait == Gait::Sprint) blendAt3s = o.moveBlendRatio;
+            p.Advance(t / 1000.0, 1000.0 / 60);
+        }
+        Check("W11 item 1: after Run -> Sprint the running task gets SET_PED_DESIRED_MOVE_BLEND_RATIO 3 (setBlend, ratio = the gait), and none while the gait still matches the task",
+              std::fabs(blendAt3s - 3.0f) < 1e-4 && !setBlendWhileRun && lc.Stats().goStraight == 1, F("blend %.2f, run setBlend %d, issues %u", blendAt3s, int(setBlendWhileRun), lc.Stats().goStraight));
+    }
+    // Dead zone: 2.6 +- 0.4 m/s at 0.7 Hz (inside the 2.1 .. 3.1 band, over the old 2.4 / 2.9 edges for 0.32 s each), 10 s.
+    {
+        Path p;
+        p.speed = [](double t) { return 2.6 + 0.4 * std::sin(2 * kPi * 0.7 * t); };
+        p.dirDeg = [](double) { return 0.0; };
+        const W11Run r = RunW11(p, 10000, LocoMode::Straight);
+        Path q;
+        q.speed = [](double t) { return 5.7 + 0.35 * std::sin(2 * kPi * 0.7 * t); };
+        q.dirDeg = [](double) { return 0.0; };
+        const W11Run r2 = RunW11(q, 10000, LocoMode::Straight);
+        Check("W11 item 1: 2.6 +- 0.4 m/s and 5.7 +- 0.35 m/s at 0.7 Hz (inside the new walk/run and run/sprint dead zones) change gait at most once in 10 s (old edges flipped)",
+              r.gaitChanges <= 1 && r2.gaitChanges <= 1 && r.frames >= 599, F("walk/run %d changes, run/sprint %d changes", r.gaitChanges, r2.gaitChanges));
+    }
+    // Hold: 300 ms dips of a run to walking speed never change the shown gait; 1 s dips do.
+    {
+        Path p;
+        p.speed = [](double t) { return std::fmod(t, 2.0) < 0.3 && t > 1.0 ? 1.5 : 4.5; };
+        p.dirDeg = [](double) { return 0.0; };
+        const W11Run shortDip = RunW11(p, 10000, LocoMode::Straight);
+        Path q;
+        q.speed = [](double t) { return std::fmod(t, 3.0) < 1.0 && t > 1.0 ? 1.5 : 4.5; };
+        q.dirDeg = [](double) { return 0.0; };
+        const W11Run longDip = RunW11(q, 10000, LocoMode::Straight);
+        Check("W11 item 1: a gait must hold ~400 ms: 300 ms dips of a run to 1.5 m/s (5 of them) change nothing, 1 s dips (2 of them) change the gait both ways",
+              shortDip.gaitChanges == 0 && longDip.gaitChanges >= 4, F("300 ms dips: %d changes, 1 s dips: %d", shortDip.gaitChanges, longDip.gaitChanges));
+    }
+
+    // ---- item 2: the anchor ----
+    // 12 s run along a path with gait changes (Run <-> Sprint every 3 s) and gentle turns (40 degrees over 4 s, then back).
+    auto mixed = []() {
+        Path p;
+        p.speed = [](double t) { return int(t / 3) % 2 == 0 ? 4.5 : 7.0; };
+        p.dirDeg = [](double t) { return t < 1 ? 0.0 : t < 5 ? (t - 1) * 10.0 : t < 7 ? 40.0 : t < 11 ? 40.0 - (t - 7) * 10.0 : 0.0; };
+        return p;
+    };
+    {
+        const W11Run a = RunW11(mixed(), 12000, LocoMode::Anchor);
+        const W11Run s = RunW11(mixed(), 12000, LocoMode::Straight);
+        std::printf("  [item 2, mixed run 12 s] anchor mode: %u tasks (anchor %u), max err %.2f m, lead %.1f..%.1f m; straight mode: %u tasks (turn %u, arrive %u, drift %u, gait %u)\n",
+                    a.st.goStraight, a.st.anchorIssues, a.maxErr, a.anchorLeadMin, a.anchorLeadMax, s.st.goStraight, s.st.whyTurn, s.st.whyArrive, s.st.whyDrift, s.st.whyGait);
+        Check("W11 item 2/4: a run/sprint with gait changes and 40 degree turns for 12 s issues exactly 1 task (one TASK_GO_TO_ENTITY) in anchor mode; the straight path needs >= 4",
+              a.frames >= 719 && a.st.goStraight == 1 && a.st.anchorIssues == 1 && s.st.goStraight >= 4, F("anchor %u tasks, straight %u tasks", a.st.goStraight, s.st.goStraight));
+        Check("W11 item 2: the anchor is moved every frame, 1.5..5 m ahead of the pose (0.8 s of travel), and the ped that follows it stays within 1 m of the pose after 1.5 s",
+              a.anchorFrames == a.frames && a.anchorLeadMin >= 1.5 - 1e-3 && a.anchorLeadMax <= 5.0 + 1e-3 && a.maxErr <= 1.0 && a.st.snaps == 1,
+              F("anchor frames %zu of %zu, lead %.2f..%.2f, max err %.3f, snaps %u", a.anchorFrames, a.frames, a.anchorLeadMin, a.anchorLeadMax, a.maxErr, a.st.snaps));
+    }
+    {
+        // Straight mode with the anchor config absent behaves as before: GoStraight tasks, no anchor output.
+        LocomotionController lc;
+        AnimPed ped;
+        Path p = mixed();
+        bool anyAnchor = false, anyStraight = false;
+        for (double t = 0; t < 3000; t += 1000.0 / 60) {
+            const LocoOutput o = StepAnim(lc, ped, p.At(t / 1000.0), 1000.0 / 60);
+            anyAnchor = anyAnchor || o.moveAnchor || o.anchorMode || o.task == LocoTask::GoToAnchor;
+            anyStraight = anyStraight || o.task == LocoTask::GoStraight;
+            p.Advance(t / 1000.0, 1000.0 / 60);
+        }
+        Check("W11 item 2: the default mode is Straight (loco_mode=straight): TASK_GO_STRAIGHT_TO_COORD only, no anchor output", !anyAnchor && anyStraight);
+    }
+    {
+        // noAnchor (entity missing, aim task): that frame acts Straight, the task kind changes (one issue), and back to the anchor (one issue).
+        LocoConfig cfg;
+        cfg.mode = LocoMode::Anchor;
+        LocomotionController lc(cfg);
+        AnimPed ped;
+        Path p;
+        p.speed = [](double) { return 4.5; };
+        p.dirDeg = [](double) { return 0.0; };
+        std::vector<LocoTask> issued;
+        for (double t = 0; t < 4000; t += 1000.0 / 60) {
+            const LocoOutput o = StepAnim(lc, ped, p.At(t / 1000.0), 1000.0 / 60, t >= 1500 && t < 2500);
+            if (o.task != LocoTask::None) issued.push_back(o.task);
+            p.Advance(t / 1000.0, 1000.0 / 60);
+        }
+        Check("W11 item 2: noAnchor for 1 s of a run: anchor task, then one go-straight, then one anchor task again (3 issues)",
+              issued.size() == 3 && issued[0] == LocoTask::GoToAnchor && issued[1] == LocoTask::GoStraight && issued[2] == LocoTask::GoToAnchor,
+              F("%zu issues", issued.size()));
+    }
+    {
+        // Still: one stand-still, the anchor parked 2 m ahead of the pose along its heading; moving again: one anchor task.
+        LocoConfig cfg;
+        cfg.mode = LocoMode::Anchor;
+        LocomotionController lc(cfg);
+        AnimPed ped;
+        std::vector<LocoTask> issued;
+        bool parkedNear = true;
+        for (double t = 0; t < 4000; t += 1000.0 / 60) {
+            const bool moving = t < 1000 || t >= 3000;
+            Pose pose;
+            pose.pos = V(t < 1000 ? t / 1000.0 * 4.5 : t < 3000 ? 4.5 : 4.5 + (t - 3000) / 1000.0 * 4.5, 0, 30);
+            pose.vel = V(moving ? 4.5 : 0, 0, 0);
+            pose.heading = 270; // GTA heading 270 = +x
+            const LocoOutput o = StepAnim(lc, ped, pose, 1000.0 / 60);
+            if (o.task != LocoTask::None) issued.push_back(o.task);
+            if (!moving && t > 1500) parkedNear = parkedNear && o.moveAnchor && std::hypot(o.anchorPos.x - pose.pos.x, o.anchorPos.y - pose.pos.y) <= 1.5 + 1e-3;
+        }
+        Check("W11 item 2: a stop is one stand-still (the anchor parks within 1.5 m of the pose), moving again is one anchor task: anchor, stand-still, anchor",
+              issued.size() == 3 && issued[0] == LocoTask::GoToAnchor && issued[1] == LocoTask::StandStill && issued[2] == LocoTask::GoToAnchor && parkedNear,
+              F("%zu issues, parked near %d", issued.size(), int(parkedNear)));
+    }
+    {
+        // A lost task (the ped reads Still for 500 ms+ while a gait is commanded): anchor mode re-issues ONCE as the straight task
+        // (stall, 2.5 s after the issue), stays Straight for anchorFallbackMs (20 s), then goes back to the anchor task.
+        LocoConfig cfg;
+        cfg.mode = LocoMode::Anchor;
+        LocomotionController lc(cfg);
+        AnimPed ped;
+        Path p;
+        p.speed = [](double) { return 4.5; };
+        p.dirDeg = [](double) { return 0.0; };
+        struct Is { double t; LocoTask k; LocoWhy why; };
+        std::vector<Is> is;
+        double fallbackOffMs = -1;
+        bool wasMode = false;
+        for (double t = 0; t < 30000; t += 1000.0 / 60) {
+            const LocoOutput o = StepAnim(lc, ped, p.At(t / 1000.0), 1000.0 / 60, false, t < 2800);
+            if (o.task != LocoTask::None) is.push_back({t, o.task, o.why});
+            if (!o.anchorMode && wasMode && fallbackOffMs < 0) fallbackOffMs = t;
+            wasMode = o.anchorMode;
+            p.Advance(t / 1000.0, 1000.0 / 60);
+        }
+        // the first anchor task after the fallback, and no anchor task in between (the straight path's own arrival re-issues are fine)
+        double backT = -1;
+        bool onlyStraightBetween = true;
+        for (size_t i = 2; i < is.size() && backT < 0; ++i) {
+            if (is[i].k == LocoTask::GoToAnchor) backT = is[i].t;
+        }
+        for (size_t i = 1; i < is.size(); ++i)
+            if (is[i].k == LocoTask::GoToAnchor && is[i].t != backT) onlyStraightBetween = false;
+        Check("W11 item 2: a lost anchor task (ped reads Still) is re-issued once as go-straight after ~2.5 s (cause stall), 20 s of straight, then one anchor task again",
+              is.size() >= 3 && is[0].k == LocoTask::GoToAnchor && is[1].k == LocoTask::GoStraight && is[1].why == LocoWhy::Stall &&
+                  is[1].t >= 2400 && is[1].t <= 3200 && backT >= is[1].t + 19900 && backT <= is[1].t + 20400 && onlyStraightBetween &&
+                  lc.Stats().anchorFallbacks == 1,
+              F("%zu issues: %.0f ms kind %d, %.0f ms kind %d why %d, back to anchor at %.0f ms (%d); fallbacks %u", is.size(), is.size() > 0 ? is[0].t : -1,
+                is.size() > 0 ? int(is[0].k) : -1, is.size() > 1 ? is[1].t : -1, is.size() > 1 ? int(is[1].k) : -1, is.size() > 1 ? int(is[1].why) : -1,
+                backT, 0, lc.Stats().anchorFallbacks));
+        (void)fallbackOffMs;
+    }
+
+    // ---- item 3: residual velocity push ----
+    {
+        // A ped exactly on the pose with its animation at the pose speed: nothing is set at all (old logic: the pose velocity every frame).
+        LocomotionController lc;
+        AnimPed ped;
+        Path p;
+        p.speed = [](double) { return 4.5; };
+        p.dirDeg = [](double) { return 0.0; };
+        size_t setFrames = 0, frames = 0;
+        for (double t = 0; t < 4000; t += 1000.0 / 60, ++frames) {
+            const Pose pose = p.At(t / 1000.0);
+            if (frames == 0) { ped.pos = pose.pos; }
+            const LocoOutput o = StepAnim(lc, ped, pose, 1000.0 / 60);
+            // The sim's anim speed is exactly 4.5 after the first task; ignore the first 0.5 s (task start)
+            if (t > 500 && o.setVelocity) ++setFrames;
+            p.Advance(t / 1000.0, 1000.0 / 60);
+        }
+        Check("W11 item 3: a ped whose animation already moves it at the pose speed is not pushed at all (no SET_ENTITY_VELOCITY inside the dead band)",
+              setFrames == 0 && frames > 200, F("%zu velocity sets in %zu frames", setFrames, frames));
+    }
+    {
+        // The push on top of pedVel: gain, low-pass and cap. Ped 0.5 m / 3 m / 10 m behind a pose running at 4.5 m/s, its own velocity 4.5.
+        struct C { double behind; };
+        const C cs[] = {{0.4}, {3.0}};
+        double firstFrame[2] = {}, settled[2] = {};
+        bool snapped[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            LocomotionController lc;
+            LocoInput in;
+            in.vel = V(4.5f, 0, 0); in.heading = 270;
+            in.pedVel = V(4.5f, 0, 0); in.havePedVel = true;
+            in.pedGait = Gait::Run;
+            in.dtMs = 16.667;
+            in.pos = V(100, 0, 30); in.pedPos = V(100, 0, 30);
+            lc.Update(in); // first frame snaps (baseline)
+            in.pedPos = V(float(100 - cs[i].behind), 0, 30);
+            for (int f = 0; f < 90; ++f) {
+                const LocoOutput o = lc.Update(in);
+                if (o.snap) snapped[i] = true;
+                const double push = o.setVelocity ? o.velocity.x - 4.5 : 0.0;
+                if (f == 0) firstFrame[i] = push;
+                settled[i] = push;
+            }
+        }
+        Check("W11 item 3: behind the pose by 0.4 m the push on top of the ped's own velocity is low-passed (first frame < 40% of the 1.6 m/s target) and reaches it; at 3 m it is capped at 2 m/s; no snap",
+              firstFrame[0] > 0 && firstFrame[0] < 0.4 * 1.6 && std::fabs(settled[0] - 1.6) < 0.05 && std::fabs(settled[1] - 2.0) < 0.02 && !snapped[0] && !snapped[1],
+              F("0.4 m: first %.3f settled %.3f; 3 m: settled %.3f", firstFrame[0], settled[0], settled[1]));
+    }
+    {
+        // A hard snap only beyond the teleport threshold (5 + 5|v| = 27.5 m at 4.5 m/s): 20 m behind is pushed (capped), 30 m snaps.
+        int snaps[2] = {};
+        const double behind[2] = {20.0, 30.0};
+        for (int i = 0; i < 2; ++i) {
+            LocomotionController lc;
+            LocoInput in;
+            in.vel = V(4.5f, 0, 0); in.heading = 270; in.pedVel = V(4.5f, 0, 0); in.havePedVel = true; in.pedGait = Gait::Run; in.dtMs = 16.667;
+            in.pos = V(100, 0, 30); in.pedPos = V(100, 0, 30);
+            lc.Update(in);
+            in.pedPos = V(float(100 - behind[i]), 0, 30);
+            const LocoOutput o = lc.Update(in);
+            snaps[i] = o.snap ? 1 : 0;
+        }
+        Check("W11 item 3: the hard snap stays at the teleport threshold (27.5 m at 4.5 m/s): 20 m behind is pushed, 30 m snaps", snaps[0] == 0 && snaps[1] == 1);
+    }
+    {
+        // Closed loop: an animation 10% slower than the pose (4.05 vs 4.5 m/s: rate clamp / blend rounding) for 30 s. The residual push
+        // carries the difference: bounded error, no snap.
+        LocomotionController lc;
+        AnimPed ped;
+        Path p;
+        p.speed = [](double) { return 4.5; };
+        p.dirDeg = [](double) { return 0.0; };
+        ped.scale = 0.9;
+        double maxErr = 0;
+        for (double t = 0; t < 30000; t += 1000.0 / 60) {
+            const Pose pose = p.At(t / 1000.0);
+            StepAnim(lc, ped, pose, 1000.0 / 60);
+            if (t > 3000) maxErr = std::max(maxErr, HDist(ped.pos, pose.pos));
+            p.Advance(t / 1000.0, 1000.0 / 60);
+        }
+        Check("W11 item 3: an animation 10% slower than the pose for 30 s is carried by the residual push: error <= 0.15 m ((2 + 5e) e = 0.45 m/s gives 0.086), one snap (the first frame), no persistent-error snap",
+              maxErr <= 0.15 && maxErr >= 0.05 && lc.Stats().snaps == 1 && lc.Stats().persistentSnaps == 0,
+              F("max err %.3f m, snaps %u, tasks %u", maxErr, lc.Stats().snaps, lc.Stats().goStraight));
+    }
+}
+
 int main() {
     std::printf("-- gait\n");
     TestGait();
@@ -1141,11 +1520,13 @@ int main() {
     TestChurn();
     TestSoftReset();
     TestSwimCorrection();
+    std::printf("-- W11: gait changes without re-issue, anchor steering, residual push\n");
+    TestW11();
 
     // gait 3 + task 6 + snap 4 + velocity 6 + heading 2 + jump/ragdoll 4 + closed loop 3 + 60 s circle 1
     // + authoritative gait / debounce 7 + move rate 3 + pause 1 + aim gate 3 + swimming 1
-    // + W8: churn 2 + soft reset 2 + swim correction 1
-    const int expected = 3 + 6 + 4 + 6 + 2 + 4 + 3 + 1 + 7 + 3 + 1 + 3 + 1 + 2 + 2 + 1;
+    // + W8: churn 2 + soft reset 2 + swim correction 1 + W11 14
+    const int expected = 3 + 6 + 4 + 6 + 2 + 4 + 3 + 1 + 7 + 3 + 1 + 3 + 1 + 2 + 2 + 1 + 14;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

@@ -22,6 +22,9 @@
 #                                              the stamp is read from its `RELEASE_STAMP=<stamp>` line and checked
 #                                              against /opt/gage/server/releases
 #   3 publish-client.sh <version> --mandatory --notes TEXT      LIVE: launchers see it within 2 minutes and update
+#   3b update ping                             GAGE_LATEST_CLIENT_VERSION=<version> in /etc/gage/server.env (one line; see
+#                                              set_latest_client_env below); the server reports it in its UDP query once it
+#                                              restarts in step 5, so open launchers learn of the release within 5 s
 #   4 countdown                                the players hear it through the admin channel (say), then wait
 #   5 deploy-server.sh --activate <stamp> --allow-players --no-announce      LIVE: the server restarts on the new release
 #   6 deploy-server.sh --status                 what runs now
@@ -82,6 +85,42 @@ if [ "$DRY_RUN" = 0 ]; then
   [ "$(id -u)" = 0 ] || warn "not root: the scripts this runs are meant to run as root on the VPS"
   mkdir -p "$LOGDIR" || die "cannot create $LOGDIR"
 fi
+
+# set_latest_client_env FILE VERSION: the "update ping". The game server reports the newest client it was released
+# with in its UDP query (query format v2, docs/api/protocol.md), so launchers learn of a release from the query they
+# already send every 5 s. The server takes the value from the environment variable GAGE_LATEST_CLIENT_VERSION (the
+# systemd unit loads /etc/gage/server.env; apps/server/config.cpp), not from a new server.json key, because
+#   * server.json is ONE file shared by every release and an older server binary refuses a key it does not know (an
+#     unknown key is fatal), which would make the rollback in deploy-server.sh impossible; an old binary ignores an
+#     environment variable it does not read;
+#   * the unit's ExecStart is fixed (no per-release command line), and the operator's server.json stays untouched.
+# This function makes FILE contain the line GAGE_LATEST_CLIENT_VERSION=VERSION and changes nothing else: a line that
+# is already there is replaced in place, otherwise one is appended (after a missing final newline is supplied); every
+# other line stays byte for byte, and the file is rewritten in place (owner, mode and inode kept: it holds the admin
+# token). It prints nothing from the file. Returns 1 for a VERSION that is not x.y.z with parts 0..255 or when the
+# file cannot be written or does not read back.
+set_latest_client_env() {
+  local f=$1 v=$2 tmp got
+  [[ $v =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  local -a parts; read -ra parts <<< "${v//./ }"
+  [ "${parts[0]}" -le 255 ] && [ "${parts[1]}" -le 255 ] && [ "${parts[2]}" -le 255 ] || return 1
+  tmp=$(mktemp "$f.XXXXXX") || return 1
+  if [ -s "$f" ]; then
+    if grep -q '^GAGE_LATEST_CLIENT_VERSION=' "$f"; then
+      sed "s|^GAGE_LATEST_CLIENT_VERSION=.*|GAGE_LATEST_CLIENT_VERSION=$v|" "$f" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    else
+      cp -- "$f" "$tmp" || { rm -f -- "$tmp"; return 1; }
+      if [ -n "$(tail -c 1 -- "$tmp")" ]; then printf '\n' >> "$tmp"; fi
+      printf 'GAGE_LATEST_CLIENT_VERSION=%s\n' "$v" >> "$tmp"
+    fi
+  else
+    printf 'GAGE_LATEST_CLIENT_VERSION=%s\n' "$v" > "$tmp"
+  fi
+  cat -- "$tmp" > "$f" || { rm -f -- "$tmp"; return 1; }
+  rm -f -- "$tmp"
+  got=$(sed -n 's/^GAGE_LATEST_CLIENT_VERSION=//p' "$f" | tail -n 1)
+  [ "$got" = "$v" ]
+}
 
 # ---- preflight: cheap checks first, before anything is built ---------------------------------------------------------
 need_cmd node
@@ -169,6 +208,24 @@ PC=("$PUBLISH_SH" "$VERSION" --mandatory --notes "$NOTES")
 [ "$DRY_RUN" = 0 ] || PC+=(--dry-run)
 rc=0; run_step publish-client "${PC[@]}" || rc=$?
 [ "$rc" -eq 0 ] || stop_or_note publish-client "$rc" "the previous client manifest is still served (publish-client.sh switches version.json last); server release $STAMP is staged, NOT active. Fix and run release.sh again, or activate: $SERVER_SH --activate $STAMP --allow-players"
+
+# ---- 3b the update ping (not a stop: the protocol gate and the manifest poll still bring everyone over) -------------------
+# From the next server start the UDP query reports VERSION as the latest client. Done after the publish, never before: a
+# server that advertises a client that is not published yet would refuse PLAY to every launcher that cannot find it.
+FILE_LATEST=''
+[ -f "$CONF" ] && FILE_LATEST=$(ops_js json-get "$CONF" latestClientVersion '' 2>/dev/null || true)
+if [ "$DRY_RUN" = 1 ]; then
+  log "== update-ping (plan): set GAGE_LATEST_CLIENT_VERSION=$VERSION in $ENVF (that one line only); the restart in step 5 makes the server report it in its UDP query"
+  [ -z "$FILE_LATEST" ] || log "[dry-run]   NOTE: $CONF has latestClientVersion=$FILE_LATEST, which wins over the environment: remove it there"
+else
+  log "== update-ping: GAGE_LATEST_CLIENT_VERSION=$VERSION in $ENVF"
+  if set_latest_client_env "$ENVF" "$VERSION"; then
+    log "update ping set; it takes effect when the server restarts in step 5"
+  else
+    warn "could not set GAGE_LATEST_CLIENT_VERSION in $ENVF: the new server will not announce $VERSION in its UDP query (launchers still update through the manifest poll and the protocol gate). To fix it, add the line GAGE_LATEST_CLIENT_VERSION=$VERSION to $ENVF before the server restarts"
+  fi
+  [ -z "$FILE_LATEST" ] || warn "$CONF has latestClientVersion=$FILE_LATEST, which wins over the environment value: remove that key from server.json (launchers would be told $FILE_LATEST)"
+fi
 
 # ---- 4 countdown ---------------------------------------------------------------------------------------------------
 # Marks: the start, then 30 s and 10 s when they fit. Each mark is one `say` through the admin channel (the same

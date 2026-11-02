@@ -15,17 +15,23 @@
 //   sync plan W6:             vehicle_body.h (lights / doors / roof encode, decode diff), NotOwner in
 //                             vehicle_link.h, combat.h's v5 inputs (Damage bone / flags, playerHealth,
 //                             ClassifyDamage, KillFeedLine), pedstate.h (Tier B edges, vehicle moves)
+//   live test 0.4.2 fixes W10: nametag.h (distance fade and scale, projection validity, the 5 Hz line-of-sight cache, the
+//                             eased alpha, "[id] Name" with a safe cut, the nearest-N list)
+//   live test 0.4.2 fixes W9:  pedstate.h EnterWarpDue (the sender's move), vehicle_w9.h (re-warp limiter, F / G press
+//                             guard, passenger engine re-assert, bail-out decision, vehicle impact, bike roll log)
 // Build target: gameplay_test (selftest/, never shipped). Simulated time, no randomness. Every
 // check names what it proves; the run asserts the total number of checks so a skipped block fails.
 
 #include "sync/combat.h"
 #include "sync/emote.h"
 #include "sync/gtaids.h"
+#include "sync/nametag.h"
 #include "sync/pausemenu.h"
 #include "sync/pedstate.h"
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_link.h"
+#include "sync/vehicle_w9.h"
 #include "protocol/protocol.h"
 
 #include <cctype>
@@ -1960,6 +1966,121 @@ static void TestW8()
               F("early %d late %d hold %d released %d done %d direct %d again %d fin %d", (int)early.fallbackPlace, (int)late.fallbackPlace, (int)hold.fallbackPlace,
                 (int)released.fallbackPlace, (int)done.reset, (int)direct.fallbackPlace, (int)again.issueClimb, (int)fin.reset));
     }
+    // 0d: the puppet goes onto the sender's pose of the edge before TASK_CLIMB / the cover task, and the task windows are counted started-vs-fallback.
+    {
+        const PrePlace keep = DecidePrePlace(0.05f, 3.0f);
+        const PrePlace turn = DecidePrePlace(0.05f, 30.0f);
+        const PrePlace nudge = DecidePrePlace(0.5f, 2.0f);
+        const PrePlace edgeBelow = DecidePrePlace(0.99f, 0.0f);
+        const PrePlace set1 = DecidePrePlace(1.0f, 0.0f);
+        const PrePlace far5 = DecidePrePlace(5.0f, 0.0f);
+        const PrePlace unreadable = DecidePrePlace(-1.0f, 0.0f);
+        Check("0d: pre-vault placement: within 0.12 m the position is left (the heading only when > 8 deg off); 0.12..1 m is a nudge that keeps the task and the heading is set; "
+              "1 m and more (or an unreadable ped) is set outright with the old task cleared",
+              keep.mode == PrePlaceMode::Keep && !keep.setHeading && !keep.clearTasks && turn.mode == PrePlaceMode::Keep && turn.setHeading &&
+                  nudge.mode == PrePlaceMode::Blend && nudge.setHeading && !nudge.clearTasks && edgeBelow.mode == PrePlaceMode::Blend && !edgeBelow.clearTasks &&
+                  set1.mode == PrePlaceMode::Set && set1.clearTasks && set1.setHeading && far5.mode == PrePlaceMode::Set && far5.clearTasks &&
+                  unreadable.mode == PrePlaceMode::Set && unreadable.clearTasks,
+              F("keep %d turn %d%d nudge %d%d below %d set %d%d far %d unreadable %d", (int)keep.mode, (int)turn.mode, (int)turn.setHeading, (int)nudge.mode, (int)nudge.setHeading,
+                (int)edgeBelow.mode, (int)set1.mode, (int)set1.clearTasks, (int)far5.mode, (int)unreadable.mode));
+
+        // Three vaults: one starts (the puppet vaults 100 ms after the task), one never starts (300 ms), one cannot be issued. The tally says 3 issued, 1 started, 2 fell back.
+        TaskWindowTally tally;
+        auto step = [&](ClimbWindow& w, bool flag, bool climbing, double t) {
+            const ClimbWindow::Phase before = w.CurrentPhase();
+            const ClimbWindow::Out o = w.Update(flag, climbing, t);
+            CountClimb(tally, before, w.CurrentPhase(), o.issueClimb);
+            return o;
+        };
+        ClimbWindow a, b, c;
+        step(a, true, false, 0);                               // issued
+        step(a, true, true, 100);                              // started
+        step(a, false, false, 600);
+        step(a, false, false, 1000);                           // settle over: ended
+        step(b, true, false, 0);                               // issued
+        step(b, true, false, 299);
+        step(b, true, false, 300);                             // never started: fallback
+        step(c, true, false, 0);                               // issued ...
+        {
+            const ClimbWindow::Phase before = c.CurrentPhase();
+            c.NoteIssueFailed();                               // ... but the native could not be called
+            CountClimb(tally, before, c.CurrentPhase(), false);
+        }
+        Check("0d: climb accounting: 3 TASK_CLIMB windows = 3 issued, 1 started (the puppet really vaulted), 2 placement fallbacks (timeout, uncallable), 1 settled to its end",
+              tally.issued == 3 && tally.started == 1 && tally.fellBack == 2 && tally.ended == 1,
+              F("issued %u started %u fellBack %u ended %u", tally.issued, tally.started, tally.fellBack, tally.ended));
+    }
+    // 0d cover: the window around TASK_PUT_PED_DIRECTLY_INTO_COVER. The old hold was set when the native was CALLED and kept the controller, the velocity push and the anchor
+    // off the ped for as long as the flag stayed up, in cover or not.
+    {
+        using CP = CoverWindow::Phase;
+        CoverWindow w;                                         // 350 ms start timeout, one retry
+        const auto idle = w.Update(false, false, 0.0f, 0);
+        const auto rise = w.Update(true, false, 2.0f, 1000);
+        const auto pend = w.Update(true, false, 2.0f, 1200);
+        const auto retry = w.Update(true, false, 2.0f, 1350);    // 350 ms in, still not in cover: the pose moved on, once more
+        const auto pend2 = w.Update(true, false, 2.0f, 1500);
+        const auto fail = w.Update(true, false, 2.0f, 1700);     // 350 ms after the retry: it never starts
+        const auto after1 = w.Update(true, false, 2.0f, 1800);
+        const auto after2 = w.Update(true, false, 2.0f, 5000);
+        const auto fell = w.Update(false, false, 2.0f, 5100);
+        Check("0d cover: the rising flag issues the task once and suspends the controller / velocity push / anchor; after one retry a puppet that never got into cover is RELEASED "
+              "(failed once, no more suspend, no more issue) instead of being held frozen for as long as the flag stays up; the flag falling after that is quiet",
+              !idle.issue && !idle.suspend && rise.issue && rise.suspend && !pend.issue && pend.suspend && retry.issue && retry.suspend && !pend2.issue && pend2.suspend &&
+                  fail.failed && !fail.suspend && !after1.suspend && !after1.issue && !after1.failed && !after2.suspend && !after2.issue && !fell.ended && !fell.suspend &&
+                  w.CurrentPhase() == CP::Idle && w.Tally().issued == 2 && w.Tally().started == 0 && w.Tally().fellBack == 1,
+              F("rise %d%d retry %d%d fail %d%d after %d%d%d fell %d tally %u/%u/%u", (int)rise.issue, (int)rise.suspend, (int)retry.issue, (int)retry.suspend, (int)fail.failed,
+                (int)fail.suspend, (int)after1.suspend, (int)after1.issue, (int)after1.failed, (int)fell.ended, w.Tally().issued, w.Tally().started, w.Tally().fellBack));
+
+        CoverWindow h;
+        h.Update(true, false, 0.0f, 0);
+        const auto in = h.Update(true, true, 0.3f, 100);         // IS_PED_IN_COVER: started
+        bool heldAll = h.CurrentPhase() == CP::Held && in.suspend && !in.issue;
+        for (int i = 1; i <= 100; ++i)                           // 3 s in cover, the sender stands still: suspended every frame, no task churn
+        {
+            const auto o = h.Update(true, true, 0.4f, 100 + i * 30);
+            heldAll = heldAll && o.suspend && !o.issue && !o.failed && !o.ended;
+        }
+        const auto out = h.Update(false, true, 0.4f, 3300);
+        const auto out2 = h.Update(false, false, 0.4f, 3330);
+        Check("0d cover: a puppet that IS in cover stays suspended frame after frame without a second issue; the flag falling ends the window once (clear the task, Reset the controller)",
+              heldAll && out.ended && !out.suspend && !out2.ended && !out2.suspend && h.Tally().started == 1 && h.Tally().ended == 1 && h.Tally().issued == 1,
+              F("heldAll %d out %d%d out2 %d%d tally %u/%u/%u", (int)heldAll, (int)out.ended, (int)out.suspend, (int)out2.ended, (int)out2.suspend, h.Tally().issued,
+                h.Tally().started, h.Tally().ended));
+
+        CoverWindow l;                                           // the puppet leaves cover by itself, or the sender shuffles away
+        l.Update(true, false, 0.0f, 0);
+        l.Update(true, true, 0.0f, 50);
+        const auto brief = l.Update(true, false, 0.0f, 1100);    // out of cover (first sight) ...
+        const auto brief2 = l.Update(true, false, 0.0f, 1499);   // ... 399 ms: not yet
+        const auto lost = l.Update(true, false, 0.0f, 1500);     // 400 ms: issue again
+        CoverWindow d;
+        d.Update(true, false, 0.0f, 0);
+        d.Update(true, true, 0.0f, 50);
+        const auto near1 = d.Update(true, true, 1.0f, 1100);      // 1 m off: fine
+        const auto d1 = d.Update(true, true, 2.0f, 1200);         // 2 m off starts the clock
+        const auto d2 = d.Update(true, true, 2.0f, 1799);
+        const auto d3 = d.Update(true, true, 2.0f, 1800);         // 600 ms: issue again, from the sender's pose
+        CoverWindow g;
+        g.Update(true, false, 0.0f, 0);
+        g.Update(true, true, 0.0f, 50);
+        const auto gap = g.Update(true, true, 5.0f, 400);         // > 4 m: at once, even inside the 1 s gap
+        Check("0d cover: leaving cover for 400 ms, or drifting > 1.5 m for 600 ms, issues again (rate-limited to once a second); > 4 m at once",
+              !brief.issue && brief.suspend && !brief2.issue && lost.issue && lost.suspend && !near1.issue && !d1.issue && !d2.issue && d3.issue && gap.issue && gap.suspend,
+              F("brief %d %d lost %d near %d d %d%d%d gap %d", (int)brief.issue, (int)brief2.issue, (int)lost.issue, (int)near1.issue, (int)d1.issue, (int)d2.issue, (int)d3.issue,
+                (int)gap.issue));
+
+        CoverWindow u;                                            // the native could not be called: no suspend, the controller keeps the ped on the pose
+        u.Update(true, false, 0.0f, 0);
+        u.NoteIssueFailed();
+        const auto free1 = u.Update(true, false, 0.0f, 10);
+        CoverWindow e;                                            // the sender left cover before the puppet got in: ended once
+        e.Update(true, false, 0.0f, 0);
+        const auto early = e.Update(false, false, 0.0f, 100);
+        Check("0d cover: an uncallable native releases the ped at once; a flag that falls while the task is pending ends the window once",
+              free1.suspend == false && !free1.issue && u.CurrentPhase() == CP::Fallback && early.ended && !early.suspend && e.CurrentPhase() == CP::Idle && !e.Busy(),
+              F("free %d early %d", (int)free1.suspend, (int)early.ended));
+    }
     // Item 8: the aim task is only wanted with a weapon; the alt-tab fallback state.
     {
         Check("W8 item 8: the aim task needs the aiming flag, no ragdoll and a weapon (weapon 0 = none / not reported clears a stale one)",
@@ -2011,6 +2132,521 @@ static void TestW8()
     }
 }
 
+// ---- 0.4.4 item 0c: melee hits by the damage event, the receiver's swing trigger ----------------------
+static void Test0cMelee()
+{
+    // The 0.4.3 live case: swings counted, the AI melee modifier at 0 left the pool untouched (poolReport false), but
+    // the game DID record the damage event. That is a hit of the nominal damage.
+    {
+        MeleeHitIn in;
+        in.meleeWeaponHeld = true;
+        in.eventDamaged = true;
+        in.sinceSwingMs = 180;
+        in.poolReport = false;
+        const MeleeHitOut o = DecideMeleeHit(in);
+        Check("0c melee: damage event + swing 180 ms ago + melee weapon in hand + NO pool drop => a Hit of the nominal damage (40), event read cleared",
+              o.source == MeleeHitSource::Event && o.damage == kMeleeNominalDamage && kMeleeNominalDamage == 40 && o.clearEvent,
+              F("source %d damage %d clear %d", (int)o.source, o.damage, (int)o.clearEvent));
+    }
+    {
+        MeleeHitIn in;
+        in.meleeWeaponHeld = true;
+        in.eventDamaged = false;
+        in.sinceSwingMs = 180;
+        const MeleeHitOut o = DecideMeleeHit(in);
+        Check("0c melee: a swing with NO damage event and no pool drop is no hit (nothing to clear)",
+              o.source == MeleeHitSource::None && o.damage == 0 && !o.clearEvent);
+    }
+    {
+        // A gun in hand: the event path is for melee only; the pool probe stays the gun's detector.
+        MeleeHitIn gunEvent;
+        gunEvent.meleeWeaponHeld = false;
+        gunEvent.eventDamaged = true;
+        gunEvent.sinceSwingMs = 100;
+        const MeleeHitOut a = DecideMeleeHit(gunEvent);
+        MeleeHitIn gunPool = gunEvent;
+        gunPool.poolReport = true;
+        gunPool.poolDamage = 28;
+        const MeleeHitOut b = DecideMeleeHit(gunPool);
+        Check("0c melee: with a gun in hand an event alone is no melee hit and clears nothing; a pool drop reports as before (28, by pool)",
+              a.source == MeleeHitSource::None && !a.clearEvent && b.source == MeleeHitSource::Pool && b.damage == 28 && !b.clearEvent,
+              F("a %d b %d/%d", (int)a.source, (int)b.source, b.damage));
+    }
+    {
+        // Outside the swing window: a stale event is cleared but is not a hit; a melee action still running keeps the window open.
+        MeleeHitIn stale;
+        stale.meleeWeaponHeld = true;
+        stale.eventDamaged = true;
+        stale.sinceSwingMs = 5000;
+        const MeleeHitOut a = DecideMeleeHit(stale);
+        MeleeHitIn action = stale;
+        action.meleeActionNow = true;
+        const MeleeHitOut b = DecideMeleeHit(action);
+        MeleeHitIn edge = stale;
+        edge.sinceSwingMs = kMeleeHitWindowMs;
+        MeleeHitIn past = stale;
+        past.sinceSwingMs = kMeleeHitWindowMs + 1;
+        Check("0c melee: an event 5 s after the swing is stale (cleared, no hit); the melee action still running is a hit; the window edge is inclusive",
+              a.source == MeleeHitSource::None && a.clearEvent && b.source == MeleeHitSource::Event && b.damage == 40 &&
+                  DecideMeleeHit(edge).source == MeleeHitSource::Event && DecideMeleeHit(past).source == MeleeHitSource::None,
+              F("a %d b %d", (int)a.source, (int)b.source));
+    }
+    {
+        // The same blow seen by both detectors (a modifier left at 1.0 lets the pool drop too): ONE report, not the sum.
+        MeleeHitIn both;
+        both.meleeWeaponHeld = true;
+        both.eventDamaged = true;
+        both.sinceSwingMs = 200;
+        both.poolReport = true;
+        both.poolDamage = 30;
+        const MeleeHitOut o = DecideMeleeHit(both);
+        MeleeHitIn poolOnly = both;
+        poolOnly.eventDamaged = false;
+        poolOnly.sinceSwingMs = 5000;
+        const MeleeHitOut p = DecideMeleeHit(poolOnly);
+        Check("0c melee: event and pool drop for one blow report once, as the event (40, not 70); a pool drop with no event keeps its own number (30, by pool)",
+              o.source == MeleeHitSource::Event && o.damage == 40 && p.source == MeleeHitSource::Pool && p.damage == 30,
+              F("o %d/%d p %d/%d", (int)o.source, o.damage, (int)p.source, p.damage));
+    }
+    {
+        // The window gate that keeps the native call out of every other frame.
+        Check("0c melee: the event is read only with a melee weapon in hand AND (a swing within the window OR a melee action running)",
+              MeleeEventWindow(true, 100, false) && MeleeEventWindow(true, 1e9, true) && !MeleeEventWindow(true, 1e9, false) &&
+                  !MeleeEventWindow(false, 100, true) && !MeleeEventWindow(true, kMeleeHitWindowMs + 1, false));
+    }
+    // Receiver: a rising kPfMelee shows a swing even when the shotSeq step was missed; step and flag are one swing; a gun never swings.
+    {
+        MeleeSwingGate g;
+        const bool flagOnly = PeerSwingDue(g, 1000, 0, true, true);          // no counter step, the flag rises
+        const bool flagHeld = PeerSwingDue(g, 1033, 0, true, true);
+        const bool flagDown = PeerSwingDue(g, 1500, 0, true, false);
+        MeleeSwingGate h;
+        const bool step = PeerSwingDue(h, 2000, 1, true, false);             // the counter steps first ...
+        const bool flagAfter = PeerSwingDue(h, 2100, 0, true, true);         // ... the flag rises 100 ms later: the same swing
+        MeleeSwingGate k;
+        const bool gunFlag = PeerSwingDue(k, 3000, 1, false, true);          // a pistol-whip with a gun in hand: shots, not a swing
+        MeleeSwingGate m;
+        PeerSwingDue(m, 4000, 1, true, true);
+        const bool second = PeerSwingDue(m, 4600, 1, true, true);            // 600 ms later, a new step: a second swing
+        Check("0c melee: receiver swing = a shotSeq step OR a rising kPfMelee (flag alone shows it, step + flag 100 ms apart is one, a gun never swings, a second swing shows)",
+              flagOnly && !flagHeld && !flagDown && step && !flagAfter && !gunFlag && second,
+              F("flagOnly %d held %d down %d step %d after %d gun %d second %d", flagOnly, flagHeld, flagDown, step, flagAfter, gunFlag, second));
+    }
+}
+
+// ---- W9 (docs/sync-specs/live-0.4.2-fixes.md section W9): passengers, seats, leaving a moving vehicle, impacts ----
+static void TestW9()
+{
+    // item 1: the door walk ends when the sender stops entering
+    {
+        const bool released = EnterWarpDue(true, false, 300, false);        // the sender is seated (its move is no longer entering)
+        const bool walking = EnterWarpDue(true, false, 300, true);          // it is still walking in: the walk plays
+        const bool slow = EnterWarpDue(true, false, 2500, true);            // a walk that long gives way anyway
+        const bool notListed = EnterWarpDue(false, false, 300, false);      // the server does not list the seat yet
+        const bool inside = EnterWarpDue(true, true, 300, false);           // already inside here
+        const bool noTask = EnterWarpDue(true, false, -1, true);            // no enter task: at once, as before
+        Check("W9 item 1: the seat warp is due as soon as the sender's move is no longer entering and the server lists the seat (300 ms, not 2.5 s); still entering waits; not listed / already inside never",
+              released && !walking && slow && !notListed && !inside && noTask,
+              F("released %d walking %d slow %d notListed %d inside %d noTask %d", released, walking, slow, notListed, inside, noTask));
+    }
+    // item 2: a ped GTA keeps moving out of its seat is not re-warped every 100 ms
+    {
+        SeatRewarpLimiter lim;
+        int warps = 0, naive = 0;
+        for (double t = 0; t < 10000; t += 100.0)
+        {
+            ++naive;                                                        // the old loop: every retry warps
+            if (lim.Allow(t, 7, 1, t > 0))
+                ++warps;
+        }
+        const uint32_t held = lim.Suppressed();
+        SeatRewarpLimiter fresh;
+        const bool first = fresh.Allow(0, 7, 1, false);                     // the first warp of a visit
+        const bool again = fresh.Allow(100, 7, 1, true);                    // 100 ms later, shuffled: held back
+        const bool other = fresh.Allow(150, 7, 2, true);                    // a different seat (the server moved it): at once
+        const bool otherVeh = fresh.Allow(160, 8, 2, true);                 // a different vehicle: at once
+        const bool afterGap = fresh.Allow(160 + 400, 8, 2, true);           // the gap passed: allowed ...
+        const bool doubled = fresh.Allow(160 + 400 + 500, 8, 2, true);      // ... then the gap doubled (800): 500 ms is too soon
+        const bool calm = fresh.Allow(160 + 400 + 500 + 6000, 8, 2, true);  // 6 s of quiet: starts over
+        Check("W9 item 2: 100 ms retries of a shuffled ped give at most 6 re-warps in 10 s (100 before); a seat or vehicle change is not held back; the gap doubles and starts over after 5 s of calm",
+              warps <= 6 && warps >= 3 && naive == 100 && held == (uint32_t)(100 - warps) && first && !again && other && otherVeh && afterGap &&
+                  !doubled && calm,
+              F("warps %d of %d, held %u; %d %d %d %d %d %d %d", warps, naive, (unsigned)held, first, again, other, otherVeh, afterGap, doubled, calm));
+    }
+    // item 3: the F press and the controls
+    {
+        EntryPressGuard g;
+        const bool before = g.DisableEnter(0);
+        g.OnPress(1000);
+        const bool walking = g.DisableEnter(1500);                          // the walk to the door: still ours
+        g.OnSeated(2000);
+        const bool at300 = g.DisableEnter(2300), at499 = g.DisableEnter(2499), at500 = g.DisableEnter(2500);
+        const bool quick = g.NoteExit(2800);                                // an exit 800 ms after the entry
+        const bool second = g.NoteExit(2900);                               // nothing seated now
+        EntryPressGuard h;
+        h.OnPress(0);
+        h.OnCancel();
+        const bool cancelled = h.DisableEnter(10);
+        h.OnPress(100);
+        h.OnSeated(200);
+        const bool slow = h.NoteExit(200 + kQuickExitMs + 1);              // out much later: not a quick exit
+        Check("W9 item 3: control 23 is disabled from the handled press until 500 ms after the ped sat; a cancelled walk releases it; a quick exit after an entry is counted (once), a late one is not",
+              !before && walking && at300 && at499 && !at500 && quick && !second && !cancelled && !slow && g.Presses() == 1 &&
+                  g.QuickExits() == 1 && h.QuickExits() == 0 && h.Presses() == 2,
+              F("%d %d %d %d %d quick %d %d cancelled %d slow %d presses %u/%u quick %u/%u", before, walking, at300, at499, at500, quick, second,
+                cancelled, slow, g.Presses(), h.Presses(), g.QuickExits(), h.QuickExits()));
+    }
+    // item 4: the passenger's engine
+    {
+        EngineReassert e;
+        const bool a0 = e.Due(0, true, true, true);                         // first sight: assert
+        const bool a500 = e.Due(500, true, true, true);
+        const bool a1000 = e.Due(1000, true, true, true);                   // ~1 s
+        const bool stopped = e.Due(1100, true, true, false);                // the car says it is not running: not yet (250 ms)
+        const bool stopped2 = e.Due(1260, true, true, false);               // ... and sooner than a second
+        const bool serverOff = e.Due(3000, true, false, false);             // the server says off: never forced on
+        const bool driver = e.Due(3100, false, true, true);                 // not a passenger of a remote-driven car
+        const bool again = e.Due(3200, true, true, true);                   // a new ride asserts at once
+        Check("W9 item 4: the engine of a car the local ped rides in is asserted at once, then every 1 s (250 ms while it reads not running); never when the server says off or when not a passenger",
+              a0 && !a500 && a1000 && !stopped && stopped2 && !serverOff && !driver && again && e.Asserts() == 4,
+              F("%d %d %d %d %d %d %d %d asserts %u", a0, a500, a1000, stopped, stopped2, serverOff, driver, again, e.Asserts()));
+    }
+    // item 5: leaving a moving vehicle
+    {
+        UnseatIn in;
+        in.haveVehicle = true;
+        in.vehSpeedMps = 0.4f;
+        const UnseatPlan still = DecideUnseat(in);                           // a parked car: the animated climb-out
+        in.vehSpeedMps = 12.0f;
+        const UnseatPlan moving = DecideUnseat(in);                          // 12 m/s: bail out with the car's velocity
+        in.vehSpeedMps = 1.0f;
+        in.senderFlags = proto::kPfFalling;
+        const UnseatPlan fell = DecideUnseat(in);                            // slow car, but the sender's first sample is falling
+        in.senderFlags = proto::kPfRagdoll;
+        const UnseatPlan rag = DecideUnseat(in);                             // ... or ragdolling: no pause, the ragdoll edge takes it
+        in.senderFlags = proto::kPfJumping;
+        const UnseatPlan jumped = DecideUnseat(in);
+        in.senderFlags = 0;
+        in.vehSpeedMps = 3.0f;
+        const UnseatPlan edge = DecideUnseat(in);                            // exactly 3 m/s is not above the threshold
+        UnseatIn gone;
+        gone.vehSpeedMps = 30.0f;
+        const UnseatPlan none = DecideUnseat(gone);                          // no vehicle here: the pop
+        in.vehSpeedMps = NAN;
+        const UnseatPlan nan = DecideUnseat(in);
+        Check("W9 item 5: a parked car is left with flag 0 (1.5 s pause); above 3 m/s, or with a falling / ragdolling / jumping sender, it is a bail-out (4160, fallback 16, velocity carried, 600 ms pause, none when ragdolling); no vehicle = clear",
+              still.mode == UnseatMode::Leave && still.leaveFlags == 0 && !still.carryVelocity && still.pauseMs == kLeavePauseMs &&
+                  moving.mode == UnseatMode::Bail && moving.leaveFlags == 4160 && moving.fallbackFlags == 16 && moving.carryVelocity &&
+                  moving.pauseMs == kBailPauseMs && fell.mode == UnseatMode::Bail && rag.mode == UnseatMode::Bail && rag.pauseMs == 0.0 &&
+                  jumped.mode == UnseatMode::Bail && edge.mode == UnseatMode::Leave && none.mode == UnseatMode::Clear &&
+                  nan.mode == UnseatMode::Leave,
+              F("%d %d %d %d %d %d %d %d", (int)still.mode, (int)moving.mode, (int)fell.mode, (int)rag.mode, (int)jumped.mode, (int)edge.mode,
+                (int)none.mode, (int)nan.mode));
+        Check("W9 item 5: the carried velocity fades linearly over 300 ms; the local forced exit bails out of a moving car on the first try and warps on a retry or when slow",
+              CarryVelocityScale(0) == 1.0f && std::fabs(CarryVelocityScale(150) - 0.5f) < 1e-6 && CarryVelocityScale(300) == 0.0f &&
+                  CarryVelocityScale(-1) == 0.0f && CarryVelocityScale(NAN) == 0.0f && LocalLeaveFlags(15.0f, false) == 4160 &&
+                  LocalLeaveFlags(15.0f, true) == 16 && LocalLeaveFlags(1.0f, false) == 16 && LocalLeaveFlags(NAN, false) == 16);
+    }
+    // item 6: a puppet run over by the local player's vehicle
+    {
+        ImpactIn in;
+        in.vehSpeedMps = 15.0f;
+        in.damagedByVehicle = true;
+        const ImpactOut hit = DecideVehicleImpact(in);
+        ImpactIn slow = in;
+        slow.vehSpeedMps = 4.0f;
+        ImpactIn noEvent = in;
+        noEvent.damagedByVehicle = false;
+        ImpactIn seated = in;
+        seated.puppetSeated = true;
+        ImpactIn dead = in;
+        dead.puppetDead = true;
+        ImpactIn again = in;
+        again.sinceLastImpactMs = 500;
+        ImpactIn fast = in;
+        fast.vehSpeedMps = 60.0f;
+        const ImpactOut capped = DecideVehicleImpact(fast);
+        Check("W9 item 6: a puppet damaged by the local player's vehicle above 5 m/s ragdolls (800..2500 ms, thrown with half the car's velocity); a slow car, no damage event, a seated or dead puppet, or a second impact within 1.5 s does not",
+              hit.ragdoll && hit.ragdollMs >= 800 && hit.ragdollMs <= 2500 && hit.velocityScale == 0.5f && !DecideVehicleImpact(slow).ragdoll &&
+                  !DecideVehicleImpact(noEvent).ragdoll && !DecideVehicleImpact(seated).ragdoll && !DecideVehicleImpact(dead).ragdoll &&
+                  !DecideVehicleImpact(again).ragdoll && capped.ragdoll && capped.ragdollMs == 2500,
+              F("%d %d ms, capped %d ms", hit.ragdoll, hit.ragdollMs, capped.ragdollMs));
+    }
+    // item 7: bike classes
+    {
+        Check("W9 item 7: GET_VEHICLE_CLASS 8 (motorcycles) and 13 (cycles) are bikes; cars, boats and the rest are not",
+              IsBikeClass(8) && IsBikeClass(13) && !IsBikeClass(0) && !IsBikeClass(7) && !IsBikeClass(14) && !IsBikeClass(-1));
+    }
+}
+
+
+// ---- W10: player name tags (libs/sync/nametag.h) ----
+
+// A head at distM from the camera, projected to the middle of the screen, with a fresh LOS answer `clear` recorded at `nowMs`.
+static TagFrame TagAt(double nowMs, float distM, double dtMs = 16.7)
+{
+    TagFrame f;
+    f.nowMs = nowMs;
+    f.dtMs = dtMs;
+    f.placed = true;
+    f.projOk = true;
+    f.sx = 0.5f;
+    f.sy = 0.4f;
+    f.distM = distM;
+    return f;
+}
+
+static bool Utf8Valid(const std::string& s)
+{
+    for (std::size_t i = 0; i < s.size();)
+    {
+        const unsigned char c = (unsigned char)s[i];
+        const std::size_t n = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        if (!n || i + n > s.size()) return false;
+        for (std::size_t k = 1; k < n; ++k)
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) return false;
+        i += n;
+    }
+    return true;
+}
+
+static std::size_t CodePoints(const std::string& s)
+{
+    std::size_t n = 0;
+    for (unsigned char c : s) if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+static void TestW10()
+{
+    const NameTagConfig cfg;
+    // fade and scale
+    {
+        Check("W10 fade: full alpha up to 25 m, linear to 0 at 40 m (32.5 m is half), 0 beyond, and 0 for a NaN or negative distance",
+              DistanceAlpha(0.0f) == 1.0f && DistanceAlpha(25.0f) == 1.0f && std::fabs(DistanceAlpha(32.5f) - 0.5f) < 1e-5f &&
+                  DistanceAlpha(40.0f) == 0.0f && DistanceAlpha(75.0f) == 0.0f && DistanceAlpha(std::nanf("")) == 0.0f &&
+                  DistanceAlpha(-3.0f) == 0.0f,
+              F("%.3f %.3f %.3f", DistanceAlpha(25.0f), DistanceAlpha(32.5f), DistanceAlpha(40.0f)));
+        bool inLimits = true, nonIncreasing = true;
+        float prev = 2.0f;
+        for (float d = 0.0f; d <= 80.0f; d += 0.5f)
+        {
+            const float sc = DistanceScale(d);
+            inLimits = inLimits && sc <= 1.0f && sc >= cfg.scaleFar;
+            nonIncreasing = nonIncreasing && sc <= prev;
+            prev = sc;
+        }
+        Check("W10 scale: 1.0 up to 8 m, 0.76 at 40 m and beyond, never above 1 or below 0.76 and never growing with distance; a NaN gets the smallest",
+              inLimits && nonIncreasing && DistanceScale(8.0f) == 1.0f && std::fabs(DistanceScale(24.0f) - 0.88f) < 1e-5f &&
+                  DistanceScale(40.0f) == cfg.scaleFar && DistanceScale(std::nanf("")) == cfg.scaleFar);
+    }
+    // projection
+    {
+        Check("W10 projection: the native's false (behind the camera, off screen), NaN / inf, and a point well outside the screen are unusable; the "
+              "middle, the edges and a point just outside (the text has width) are usable",
+              !ProjectionUsable(false, 0.5f, 0.5f) && !ProjectionUsable(true, std::nanf(""), 0.5f) &&
+                  !ProjectionUsable(true, 0.5f, INFINITY) && !ProjectionUsable(true, -0.2f, 0.5f) && !ProjectionUsable(true, 1.2f, 0.5f) &&
+                  !ProjectionUsable(true, 0.5f, -0.1f) && !ProjectionUsable(true, 0.5f, 1.1f) && ProjectionUsable(true, 0.5f, 0.4f) &&
+                  ProjectionUsable(true, 0.0f, 1.0f) && ProjectionUsable(true, -0.03f, 0.5f) && ProjectionUsable(true, 1.03f, -0.02f));
+    }
+    // LOS cache
+    {
+        LosCache c;
+        const bool pendingHidden = !c.Visible(0.0) && c.Due(0.0);
+        c.Record(1000.0, true);
+        const bool notDue = !c.Due(1100.0) && !c.Due(1199.0), due = c.Due(1200.0);
+        const bool freshClear = c.Visible(1100.0) && c.Visible(2000.0);   // reused for up to losStaleMs
+        const bool stale = !c.Visible(2001.0) && !c.Visible(9000.0);       // then a missing answer reads hidden (fail closed)
+        c.Record(3000.0, false);
+        const bool blocked = !c.Visible(3010.0);
+        c.Record(4000.0, true);
+        const bool backwards = c.Due(3000.0) && !c.Visible(3000.0);       // a clock that went back asks again and trusts nothing
+        c.Reset();
+        const bool reset = !c.Have() && c.Due(4000.0) && !c.Visible(4000.0);
+        Check("W10 occlusion cache: no answer yet reads hidden and is due; a fresh answer is reused for 200 ms without asking, kept for 1 s, then "
+              "reads hidden (never a guess); a blocked answer hides; a clock that went backwards asks again; Reset forgets",
+              pendingHidden && notDue && due && freshClear && stale && blocked && backwards && reset,
+              F("%d %d %d %d %d %d %d %d", pendingHidden, notDue, due, freshClear, stale, blocked, backwards, reset));
+    }
+    {
+        // 60 fps for 10 s with the engine's loop (ask when Due): 5 Hz per peer, not 60.
+        LosCache c;
+        int asks = 0;
+        for (double t = 0.0; t < 10000.0; t += 1000.0 / 60.0)
+            if (c.Due(t))
+            {
+                ++asks;
+                c.Record(t, true);
+            }
+        LosCache slow;     // 20 fps: every frame is later than 200 ms apart? no, 50 ms apart: still 5 Hz
+        int slowAsks = 0;
+        for (double t = 0.0; t < 10000.0; t += 50.0)
+            if (slow.Due(t))
+            {
+                ++slowAsks;
+                slow.Record(t, true);
+            }
+        Check("W10 occlusion rate: over 10 s at 60 fps and at 20 fps one peer is asked about 50 times (5 Hz), not once per frame",
+              asks >= 48 && asks <= 52 && slowAsks >= 48 && slowAsks <= 52, F("%d, %d", asks, slowAsks));
+    }
+    // the eased alpha
+    {
+        NameTagTrack t;
+        t.los.Record(0.0, true);
+        TagOut first = t.Step(TagAt(16.7, 10.0f));
+        TagOut mid;
+        for (int i = 1; i < 5; ++i) mid = t.Step(TagAt(16.7 * (i + 1), 10.0f));
+        TagOut full;
+        for (int i = 5; i < 14; ++i) { t.los.Record(16.7 * (i + 1), true); full = t.Step(TagAt(16.7 * (i + 1), 10.0f)); }
+        const bool fadeIn = first.alpha > 0.0f && first.alpha < 0.2f && mid.alpha > first.alpha && mid.alpha < 0.8f && full.alpha == 1.0f;
+        // blocked from now on: it does not vanish in one frame, and it is gone within ~110 ms
+        t.los.Record(300.0, false);
+        TagOut o1 = t.Step(TagAt(316.7, 10.0f));
+        TagOut o;
+        double now = 316.7;
+        int framesToGone = 1;
+        for (; o1.draw && framesToGone < 20; ++framesToGone) { now += 16.7; o1 = t.Step(TagAt(now, 10.0f)); o = o1; }
+        const TagOut afterOne = [&] { NameTagTrack u; u.los.Record(0.0, true); for (int i = 0; i < 12; ++i) u.Step(TagAt(16.7 * (i + 1), 10.0f));
+                                       u.los.Record(300.0, false); return u.Step(TagAt(316.7, 10.0f)); }();
+        Check("W10 fade: a tag eases in over ~160 ms (never pops to full) and out over ~110 ms when the line of sight breaks (no frame-sized flash)",
+              fadeIn && afterOne.alpha > 0.8f && afterOne.draw && framesToGone >= 5 && framesToGone <= 9 && !o1.draw,
+              F("in %.2f/%.2f/%.2f, after one frame %.2f, gone after %d frames", first.alpha, mid.alpha, full.alpha, afterOne.alpha, framesToGone));
+    }
+    // hidden rules
+    {
+        // Each case: a tag that has been fully visible for a second, then ONE thing changes and it must be gone within 300 ms.
+        auto goneAfter = [&](auto change) {
+            NameTagTrack t;
+            double now = 0.0;
+            for (int i = 0; i < 60; ++i) { now += 16.7; t.los.Record(now, true); t.Step(TagAt(now, 12.0f)); }
+            if (!t.Step(TagAt(now + 16.7, 12.0f)).draw) return -1;      // the premise: it was shown
+            int frames = 0;
+            TagOut o;
+            for (; frames < 40; ++frames)
+            {
+                now += 16.7;
+                TagFrame f = TagAt(now, 12.0f);
+                change(f, t, now);
+                o = t.Step(f);
+                if (!o.draw) break;
+            }
+            return frames;
+        };
+        const int dead = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.dead = true; });
+        const int unplaced = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.placed = false; });
+        const int far = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.distM = 41.0f; });
+        const int offscreen = goneAfter([](TagFrame& f, NameTagTrack&, double) { f.projOk = false; });
+        const int behindWall = goneAfter([](TagFrame&, NameTagTrack& t, double now) { t.los.Record(now, false); });
+        const auto ok = [](int n) { return n >= 1 && n <= 18; };    // 18 frames = 300 ms
+        Check("W10 hidden: a dead peer, a missing ped, a peer beyond 40 m, one behind the camera / off screen and one behind a wall each lose their tag "
+              "within 300 ms (and not in zero frames)",
+              ok(dead) && ok(unplaced) && ok(far) && ok(offscreen) && ok(behindWall),
+              F("dead %d, unplaced %d, far %d, offscreen %d, wall %d frames", dead, unplaced, far, offscreen, behindWall));
+        Check("W10 hidden: a peer with no line-of-sight answer yet never shows (the engine asks in the same frame, so the wait is zero frames)",
+              [&] { NameTagTrack t; bool shown = false; for (int i = 1; i <= 30; ++i) shown = shown || t.Step(TagAt(16.7 * i, 10.0f)).draw; return !shown; }());
+        Check("W10 hidden: an answer older than 1 s is not trusted -- the checks stopped, so the tag fades out instead of hanging through a wall",
+              [&] {
+                  NameTagTrack t;
+                  double now = 0.0;
+                  t.los.Record(0.0, true);
+                  for (int i = 0; i < 20; ++i) { now += 16.7; t.Step(TagAt(now, 10.0f)); }
+                  const bool shownWhileFresh = t.Step(TagAt(now + 16.7, 10.0f)).draw;
+                  TagOut o;
+                  for (now = 1100.0; now < 1400.0; now += 16.7) o = t.Step(TagAt(now, 10.0f));    // no new Record since t=0
+                  return shownWhileFresh && !o.draw;
+              }());
+    }
+    // walking away and the wall, end to end
+    {
+        NameTagTrack t;
+        double now = 0.0;
+        float prevAlpha = 2.0f, prevScale = 2.0f;
+        bool mono = true, fullTo25 = true, goneAt40 = true, scaleLimits = true;
+        // 5 m -> 50 m at 5 m/s, 60 fps, LOS asked when due (the engine's loop)
+        for (float d = 5.0f; d <= 50.0f; d += 5.0f / 60.0f)
+        {
+            now += 1000.0 / 60.0;
+            if (t.los.Due(now)) t.los.Record(now, true);
+            const TagOut o = t.Step(TagAt(now, d, 1000.0 / 60.0));
+            if (d > 1.0f && d < 25.0f && now > 400.0 && o.alpha < 0.999f) fullTo25 = false;
+            if (d >= 25.0f) { mono = mono && o.alpha <= prevAlpha + 1e-4f; prevAlpha = o.alpha; }
+            if (d >= 40.0f && o.draw) goneAt40 = false;
+            if (o.draw) { scaleLimits = scaleLimits && o.scale <= 1.0f && o.scale >= cfg.scaleFar && o.scale <= prevScale + 1e-4f; prevScale = o.scale; }
+        }
+        Check("W10 walk-away 5 m -> 50 m at 60 fps: full alpha up to 25 m, then only ever dimmer, gone at 40 m, the scale shrinks within 1.0..0.76",
+              fullTo25 && mono && goneAt40 && scaleLimits, F("full %d mono %d gone %d scale %d", fullTo25, mono, goneAt40, scaleLimits));
+    }
+    {
+        // A wall appears at t = 2 s: the answers are asked at 5 Hz, so the tag must be hidden within 200 ms (next ask) + 110 ms (fade) + a frame.
+        NameTagTrack t;
+        double now = 0.0, hiddenAt = -1.0;
+        for (int i = 0; i < 300; ++i)
+        {
+            now += 1000.0 / 60.0;
+            if (t.los.Due(now)) t.los.Record(now, now < 2000.0);
+            const TagOut o = t.Step(TagAt(now, 15.0f, 1000.0 / 60.0));
+            if (now >= 2000.0 && !o.draw && hiddenAt < 0.0) hiddenAt = now - 2000.0;
+        }
+        Check("W10 occlusion latency: a wall that appears hides the tag within 350 ms with 5 Hz checks, and it stays hidden",
+              hiddenAt > 0.0 && hiddenAt <= 350.0, F("%.0f ms", hiddenAt));
+    }
+    // candidates
+    {
+        Check("W10 candidates: a puppet that is driven, alive and within 40 m is worth the natives; not driven, dead, or beyond 40 m is not",
+              NameTagTrack::Worth(true, false, 0.0f) && NameTagTrack::Worth(true, false, 40.0f) && !NameTagTrack::Worth(false, false, 5.0f) &&
+                  !NameTagTrack::Worth(true, true, 5.0f) && !NameTagTrack::Worth(true, false, 40.1f) && !NameTagTrack::Worth(true, false, -1.0f));
+    }
+    // text
+    {
+        const TagText a = FormatTag(7, "Alex"), b = FormatTag(123, "Mara_K.Smith-2");
+        Check("W10 text: the tag reads \"[id] Name\" (\"[7] Alex\", \"[123] Mara_K.Smith-2\")", a.Full() == "[7] Alex" && b.Full() == "[123] Mara_K.Smith-2",
+              a.Full() + " / " + b.Full());
+        const std::string exact(24, 'a'), longer(40, 'b');
+        const std::string cut = TruncateName(longer.c_str(), 24);
+        std::string geo;                                  // 30 Georgian letters, 3 bytes each
+        for (int i = 0; i < 30; ++i) geo += "\xE1\x83\x90";
+        const std::string geoCut = TruncateName(geo.c_str(), 24);
+        std::string emoji;                                // 30 four-byte code points
+        for (int i = 0; i < 30; ++i) emoji += "\xF0\x9F\x98\x80";
+        const std::string emojiCut = TruncateName(emoji.c_str(), 24);
+        Check("W10 text: a valid name (24 chars) is never cut; a longer one ends in an ellipsis within 24 code points, also for 3-byte and 4-byte "
+              "characters, and the cut never leaves half a UTF-8 sequence",
+              TruncateName(exact.c_str(), 24) == exact && CodePoints(cut) == 24 && cut.substr(0, 23) == std::string(23, 'b') &&
+                  cut.compare(cut.size() - 3, 3, "\xE2\x80\xA6") == 0 && Utf8Valid(geoCut) && CodePoints(geoCut) == 24 && Utf8Valid(emojiCut) &&
+                  CodePoints(emojiCut) == 24,
+              F("%zu %zu %zu", CodePoints(cut), CodePoints(geoCut), CodePoints(emojiCut)));
+        Check("W10 text: control characters become spaces, doubled and edge spaces go, a stray byte or a truncated sequence is dropped, and an empty "
+              "or null name reads \"Player\"",
+              TruncateName("A\tB\nC", 24) == "A B C" && TruncateName("  Bob   Ross  ", 24) == "Bob Ross" && TruncateName("Al\xC3", 24) == "Al" &&
+                  TruncateName("\x80Zed", 24) == "Zed" && Utf8Valid(TruncateName("a\xE1\x83", 24)) && TruncateName("", 24) == "Player" &&
+                  TruncateName(nullptr, 24) == "Player" && TruncateName("\t \n", 24) == "Player" && TruncateName("x\xC2\x85y", 24) == "x y");
+    }
+    // the list
+    {
+        std::vector<TagItem> v;
+        for (int i = 0; i < 20; ++i)
+        {
+            TagItem it;
+            it.id = i;
+            it.distM = (float)((i * 7) % 20) + 1.0f;      // 20 distinct distances in a scrambled order
+            v.push_back(it);
+        }
+        TagItem tie;
+        tie.id = 99;
+        tie.distM = 1.0f;
+        v.push_back(tie);
+        KeepNearest(v, cfg.maxTags);
+        bool sorted = true;
+        for (std::size_t i = 1; i < v.size(); ++i) sorted = sorted && v[i - 1].distM <= v[i].distM;
+        std::vector<TagCandidate> c;
+        for (int i = 0; i < 30; ++i) c.push_back({ i, (float)(30 - i) });
+        KeepNearestCandidates(c, cfg.maxCandidates);
+        Check("W10 cap: at most 12 tags are kept, the nearest first, ties by id; at most 16 peers are asked about, the nearest",
+              v.size() == 12 && sorted && v[0].distM == 1.0f && v[11].distM <= 11.0f && c.size() == 16 && c[0].id == 29 && c[15].id == 14,
+              F("%zu tags, last %.0f m; %zu candidates", v.size(), v.back().distM, c.size()));
+    }
+}
+
 int main()
 {
     std::printf("-- vitals\n");
@@ -2037,10 +2673,20 @@ int main()
     TestW6();
     std::printf("-- W8: melee reaction, dead-puppet damage, water / climb edges, alt-tab fallback\n");
     TestW8();
+    std::printf("-- 0.4.4 item 0c: melee hit by the damage event, receiver swing trigger\n");
+    Test0cMelee();
+    std::printf("-- W9: passenger enter, re-warp limiter, F press guard, passenger engine, bail-out, vehicle impact, bikes\n");
+    TestW9();
+    std::printf("-- W10: player name tags (fade, projection, occlusion cache, text, list)\n");
+    TestW10();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11;
+    // + 0c 7 (hit by event, no event, gun, stale / action / edge, one report for both detectors, window gate, receiver swing trigger)
+    // + 0d 6 (in TestW8 beside the climb window: pre-vault placement 1, climb accounting 1, cover window 4)
+    // + W9 8 (enter warp 1, re-warp limiter 1, press guard 1, passenger engine 1, unseat 2, impact 1, bike class 1; EnterWarpDue's old W6 check stays)
+    // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {

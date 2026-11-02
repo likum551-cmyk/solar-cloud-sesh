@@ -8,12 +8,16 @@
 //     simulated hour of events showing the gap holds and the poll is never throttled by it
 //   * what PLAY does about a running / due / not-due check
 //   * that the launcher's "server is behind" sentence is the one the server sends a newer client
+//   * the update ping: a server whose query reports a latest client newer than the launcher's own refuses PLAY
+//     with code 14 and starts the update check (same text, same rate limit), also for an unchanged protocol;
+//     unknown (0.0.0, an older server), equal and older never do; the protocol gate keeps precedence
 //
 // Build target: version_gate_test (selftest/, never shipped). Classified `gate` in
 // tools/deploy/wine-selftests.list: it touches nothing wine implements differently from Windows.
 
 #include "../apps/launcher/version_gate.h"
 #include "protocol/protocol.h"
+#include "protocol/query.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -150,7 +154,96 @@ int main() {
     Check("PLAY: a check cannot start (download / install under way) and none is running -> go (the update refusal comes first)",
           vg::BeforePlay(false, false, true) == vg::PlayStep::Go);
 
+    // ---- rule 4: the update ping (query format v2: the server reports the newest client it was released with) ----
+    {
+        namespace q = gage::proto::query;
+        const uint32_t kMe = vg::ParseVersion("0.4.3");          // this launcher
+        const uint32_t kNew = vg::ParseVersion("0.4.4");         // the server's latest client
+        Check("versions: ParseVersion packs strict x.y.z like the query codec's ClientVersion (0.4.3 = 0x000403) and orders like the version",
+              kMe == 0x000403 && kNew == 0x000404 && kMe == (q::ClientVersion{0, 4, 3}).Packed() && kNew == (q::ClientVersion{0, 4, 4}).Packed() &&
+                  vg::ParseVersion("1.0.0") > vg::ParseVersion("0.255.255") && vg::ParseVersion("0.10.0") > vg::ParseVersion("0.9.9") &&
+                  vg::PackVersion(1, 2, 3) == 0x010203);
+        Check("versions: ParseVersion refuses anything but x.y.z with parts 0..255 (unknown = 0, never an update)",
+              vg::ParseVersion(nullptr) == 0 && vg::ParseVersion("") == 0 && vg::ParseVersion("0.4") == 0 && vg::ParseVersion("0.4.4.1") == 0 &&
+                  vg::ParseVersion("256.0.0") == 0 && vg::ParseVersion("a.b.c") == 0 && vg::ParseVersion(" 0.4.4") == 0 &&
+                  vg::ParseVersion("0.4.4-rc1") == 0 && vg::ParseVersion("0..4") == 0 && vg::ParseVersion("0.0.0") == 0 &&
+                  vg::PackVersion(256, 0, 0) == 0);
+
+        // The table.
+        for (bool pending : { false, true }) {
+            const vg::Gate newer = vg::DecideClient(kNew, kMe, pending);
+            Check(pending ? "update ping: server latest 0.4.4 > client 0.4.3: refused with code 14, the pending-update text, no new check"
+                          : "update ping: server latest 0.4.4 > client 0.4.3: refused with code 14 and 'Updating the launcher...', and a check is requested",
+                  newer.refuse && newer.code == 14 && newer.usePendingText == pending && newer.checkNow == !pending &&
+                      Same(newer.text, L"Solar RP was updated. Updating the launcher..."));
+            const vg::Gate unknown = vg::DecideClient(0, kMe, pending);
+            Check(pending ? "update ping: server latest unknown (0.0.0: an old server, or none configured): allowed (update pending)"
+                          : "update ping: server latest unknown (0.0.0: an old server, or none configured): allowed",
+                  !unknown.refuse && !unknown.checkNow && !unknown.usePendingText && unknown.code == 0);
+            const vg::Gate same = vg::DecideClient(kMe, kMe, pending);
+            const vg::Gate older = vg::DecideClient(vg::ParseVersion("0.4.2"), kMe, pending);
+            const vg::Gate muchOlder = vg::DecideClient(vg::ParseVersion("0.0.1"), kMe, pending);
+            Check(pending ? "update ping: server latest == client, or older (0.4.2, 0.0.1): allowed, no check (update pending)"
+                          : "update ping: server latest == client, or older (0.4.2, 0.0.1): allowed, no check",
+                  !same.refuse && !same.checkNow && !older.refuse && !older.checkNow && !muchOlder.refuse && !muchOlder.checkNow);
+        }
+        Check("update ping: a launcher that cannot read its own version (0) is never told to update, whatever the server reports",
+              !vg::DecideClient(kNew, 0, false).refuse && !vg::DecideClient(0xFFFFFF, 0, false).refuse);
+        Check("update ping: the next patch, minor and major release all count (0.4.4, 0.5.0, 1.0.0 vs 0.4.3); 0.4.3 vs 0.4.3 and 0.3.9 do not",
+              vg::DecideClient(vg::ParseVersion("0.4.4"), kMe, false).refuse && vg::DecideClient(vg::ParseVersion("0.5.0"), kMe, false).refuse &&
+                  vg::DecideClient(vg::ParseVersion("1.0.0"), kMe, false).refuse && !vg::DecideClient(vg::ParseVersion("0.3.9"), kMe, false).refuse &&
+                  !vg::DecideClient(kMe, kMe, false).refuse);
+
+        // DecideServer = protocol gate first, then the ping. The protocol rows must be exactly the old Decide.
+        const int P = (int)proto::kVersion;
+        for (bool pending : { false, true }) {
+            const vg::Gate sameProto = vg::DecideServer(P, P, kNew, kMe, pending);
+            Check(pending ? "server answer: same protocol but a newer latest client: refused with code 14 (update pending: its text, no new check)"
+                          : "server answer: same protocol but a newer latest client (the 0.4.3-style same-protocol release): refused with code 14, check now",
+                  sameProto.refuse && sameProto.code == 14 && sameProto.checkNow == !pending && sameProto.usePendingText == pending);
+            const vg::Gate old = vg::DecideServer(P, P, 0, kMe, pending);
+            Check(pending ? "server answer: same protocol, old server (latest unknown): allowed, exactly as before the update ping (update pending)"
+                          : "server answer: same protocol, old server (latest unknown): allowed, exactly as before the update ping",
+                  !old.refuse && !old.checkNow && old.code == 0);
+            const vg::Gate behind = vg::DecideServer(P - 1, P, kNew, kMe, pending);
+            Check(pending ? "server answer: protocol behind keeps code 15 even if the latest client is newer (update pending)"
+                          : "server answer: protocol behind keeps code 15 even if the latest client is newer (the protocol gate wins)",
+                  behind.refuse && behind.code == 15 && !behind.checkNow && Same(behind.text, vg::kTextServerBehind));
+            const vg::Gate ahead = vg::DecideServer(P + 1, P, 0, kMe, pending);
+            Check(pending ? "server answer: protocol ahead keeps code 14 and its text, latest unknown (update pending)"
+                          : "server answer: protocol ahead keeps code 14 and its text, latest unknown",
+                  ahead.refuse && ahead.code == 14 && ahead.checkNow == !pending && ahead.usePendingText == pending);
+        }
+        Check("server answer: no answer (protocol -1, latest 0): allowed",
+              !vg::DecideServer(-1, P, 0, kMe, false).refuse && !vg::DecideServer(0, P, 0, kMe, true).refuse);
+
+        // The rate limit is the existing one: the update ping asks for a check the same way a protocol-ahead server
+        // does (Gate::checkNow), and the caller applies CheckDue/kMinCheckGapMs. A server queried every 5 s that keeps
+        // reporting a newer client therefore starts at most one check a minute: simulate 10 minutes of 5-second answers.
+        {
+            uint64_t last = 0;
+            bool started = false;
+            int checks = 0;
+            bool gapOk = true;
+            uint64_t prev = 0;
+            for (uint64_t t = 0; t <= 10 * 60 * 1000; t += 5000) {
+                const vg::Gate g = vg::DecideServer(P, P, kNew, kMe, false);
+                if (g.checkNow && vg::CheckDue(t, last, started)) {
+                    if (started && t - prev < vg::kMinCheckGapMs) gapOk = false;
+                    started = true; last = t; prev = t; ++checks;
+                }
+            }
+            Check("update ping: a server reporting a newer client on every 5 s answer starts one check per minute (11 in 10 minutes), never closer than 60 s",
+                  gapOk && checks == 11);
+            // ...and once the update is pending no further check is requested at all.
+            int pendingChecks = 0;
+            for (uint64_t t = 0; t <= 10 * 60 * 1000; t += 5000)
+                if (vg::DecideServer(P, P, kNew, kMe, true).checkNow) ++pendingChecks;
+            Check("update ping: with an update already pending no check is requested by the ping", pendingChecks == 0);
+        }
+    }
+
     std::printf("CHECKS %d FAILED %d\n", g_run, g_fail);
-    if (g_run < 35) { std::printf("FAIL  expected at least 35 checks, ran %d\n", g_run); return 1; }
+    if (g_run < 60) { std::printf("FAIL  expected at least 60 checks, ran %d\n", g_run); return 1; }
     return g_fail == 0 ? 0 : 1;
 }

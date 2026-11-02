@@ -107,6 +107,20 @@
 //  4. Steering: the sample's steering, every frame (RAGECOOP CustomSteeringAngle;
 //     GTAN lerps it, the interpolator already does).
 //
+//  5. Contact grace (W9 item 6). The commands above overwrite the car's velocity every frame, so any impulse
+//     (the local player's car ramming this one, a wall) is erased within a frame and the crash never plays. A
+//     contact (VehicleDriveInput.contact, the engine's HAS_ENTITY_COLLIDED_WITH_ANYTHING, or a measured loss of
+//     speed along the direction of travel of more than contactDecelMs 4 m/s against what the controller
+//     itself commanded last frame) opens a grace of contactGraceMs 400: no snap of any kind, the velocity
+//     written is the car's own plus a weight w of the way to the full command (w rises from contactSoftFloor
+//     0.15 to 1 along a smoothstep), no quaternion blend, and the angular velocity is left to physics until
+//     w >= 0.5. After it the ordinary correction converges the car back; a new contact is not looked for for
+//     contactCooldownMs 800 (a flag that stays set while scraping must not keep the car soft for ever).
+//
+// PresentLead (W9 item 6, below): a remote car within 30 m of the local player is drawn at the present time,
+// not ~110 ms in the past: the interpolator extrapolates by the render delay (capped), weighted 1 within
+// fullWithinM 30 and 0 beyond zeroBeyondM 45, slewed so the weight never jumps the car.
+//
 // RISK: SET_ENTITY_ANGULAR_VELOCITY's frame. RAGECOOP feeds its RotationVelocity
 // (SHVDN: GET_ENTITY_ROTATION_VELOCITY) straight back into the setter; whether that
 // pair is world or body frame is not verified here. Both are output
@@ -136,6 +150,9 @@ namespace gage::sync {
         double AngleBetween(const DriveQuat& a, const DriveQuat& b); // rad, [0, pi]
         DriveQuat FromHeadingDeg(double headingDeg);        // yaw about +z
         double HeadingDeg(const DriveQuat& q);              // of the body +y axis, (-180, 180]
+        // Lean about the body's forward axis, degrees: + = right side down (a rotation about +y by +a is +a). A bike's
+        // lean rides in the quaternion; 0 for a level body; sign flips with upside-down are not special-cased.
+        double RollDeg(const DriveQuat& q);
         bool Finite(const DriveQuat& q);
     }
 
@@ -254,6 +271,15 @@ namespace gage::sync {
         float offLimitMs = 0.5f;                            // RAGECOOP IsOff 30 m*frames at 60 fps
         float underFloorMinM = 0.4f, underFloorMaxM = 10.0f, underFloorVzMs = 0.01f; // GTAN StuckVehicleCheck
         float underFloorMs = 250.0f;                        // ours (GTAN: 2 consecutive frames)
+
+        // W9 item 6, contact grace (see the doc block, 5.): 0 grace disables it.
+        float contactGraceMs = 400.0f;      // how long the correction is soft after a contact
+        float contactSoftFloor = 0.15f;     // the weight of the full command at the start of the grace
+        float contactDecelMs = 4.0f;        // m/s lost along the travel direction in one frame vs the last command = a contact
+        float contactMinSpeedMs = 3.0f;     // the deceleration test only for a target faster than this
+        float contactCooldownMs = 800.0f;   // after a grace, no new contact is looked for for this long
+        float contactMaxFrameMs = 150.0f;   // a frame gap longer than this: the deceleration test is skipped (a hitch)
+        float contactHardSnapMul = 4.0f;    // inside a grace a snap needs this many times the usual distance
     };
 
     struct VehicleDriveInput
@@ -262,6 +288,7 @@ namespace gage::sync {
         DriveVec localPos, localVel; // GET_ENTITY_COORDS / GET_ENTITY_VELOCITY of the local copy
         DriveQuat localRot;       // GET_ENTITY_QUATERNION
         double dtMs = 0;          // since the previous Update (clamped to [0, 1000])
+        bool contact = false;     // W9: HAS_ENTITY_COLLIDED_WITH_ANYTHING of the local copy this frame (INFERRED to ignore the ground)
     };
 
     struct VehicleDriveOutput
@@ -285,9 +312,15 @@ namespace gage::sync {
 
         float posErrorM = 0;      // diagnostics: before this frame's commands
         float rotErrorDeg = 0;
+        bool graceActive = false; // W9: a contact grace is in force this frame (soft correction)
+        float graceWeight = 1.0f; // ... and the weight of the full command (1 outside a grace)
     };
 
-    struct VehicleDriveStats { uint32_t frames = 0, snaps = 0, persistentSnaps = 0, underFloorSnaps = 0, blends = 0, refused = 0; };
+    struct VehicleDriveStats
+    {
+        uint32_t frames = 0, snaps = 0, persistentSnaps = 0, underFloorSnaps = 0, blends = 0, refused = 0;
+        uint32_t contacts = 0, contactsByFlag = 0, contactsByDecel = 0;   // W9: graces opened, and what opened them
+    };
 
     // ---- sender steering ----
 
@@ -347,6 +380,44 @@ namespace gage::sync {
         float offAcc_ = 0;
         double underFloorMs_ = 0;
         VehicleDriveStats stats_;
+        // contact grace (W9 item 6)
+        bool graceOn_ = false;
+        double graceAgeMs_ = 0, cooldownMs_ = 0;
+        bool haveCmd_ = false;      // lastCmdVel_ is the previous frame's velocity command (not a snap)
+        DriveVec lastCmdVel_;
+    };
+
+    // ---- present-time prediction (W9 item 6) ----
+
+    struct PresentLeadConfig
+    {
+        float fullWithinM = 30.0f;     // full lead within this distance of the local player
+        float zeroBeyondM = 45.0f;     // no lead beyond this (the car is drawn in the past, as before)
+        double maxLeadMs = 250.0;      // cap of the lead: extrapolation past the newest snapshot is an estimate
+        double slewMsPerMs = 0.5;      // the lead changes at most this fast (a car crossing the band does not jump)
+    };
+
+    // How far past the interpolation time a remote car is drawn. The interpolation time is the render clock minus
+    // the car's class extra (about 110 ms behind the present); the lead moves it forward by `wantMs` (that delay,
+    // so the car is drawn where it is NOW on the sender's side, extrapolated from its newest snapshots), weighted by
+    // the distance to the local player: a car beside you is what you collide with and what you look at, a car 100 m
+    // away is not worth the extrapolation error. One per remote car; Update once per frame.
+    class PresentLead
+    {
+    public:
+        explicit PresentLead(const PresentLeadConfig& cfg = PresentLeadConfig()) : cfg_(cfg) {}
+        // 1 within fullWithinM, 0 beyond zeroBeyondM, linear between; a non-finite distance is 0.
+        static double Weight(const PresentLeadConfig& cfg, double distM);
+        // The lead (ms) to add to the interpolation time this frame. The first call (and the first after Reset)
+        // takes the target at once. dtMs is clamped to [0, 1000]; a non-finite or negative wantMs is 0.
+        double Update(double distM, double wantMs, double dtMs);
+        double LeadMs() const { return leadMs_; }
+        void Reset() { have_ = false; leadMs_ = 0; }
+
+    private:
+        PresentLeadConfig cfg_;
+        bool have_ = false;
+        double leadMs_ = 0;
     };
 
 }

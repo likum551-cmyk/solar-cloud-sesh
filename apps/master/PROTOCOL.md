@@ -60,6 +60,11 @@ reply   474147458101010001020304050607080300200000000000
 
 Reply field by field: `47414745 81 01 0100 0102030405060708 0300 2000 00000000`.
 
+Query format v2 (2026-11-02, "update ping"): a request whose `u16` at offset 6 is exactly `2` (the master always sends
+`0`, as above) is answered with a reply that also carries the latest client version in bytes 20..22 and `02` in byte 5.
+The master never asks for it and always gets the v1 reply described here; layouts and rules:
+`docs/api/protocol.md`, "The UDP query (formats v1 and v2)".
+
 Server rules:
 
 - Answer only a datagram that is exactly 24 bytes with the full prefix `GAGE 01 01`. Anything

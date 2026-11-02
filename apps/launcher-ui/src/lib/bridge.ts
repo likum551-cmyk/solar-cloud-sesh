@@ -240,6 +240,13 @@ export function toBridgeServer(s: { name: string; host: string; port: number; pl
   };
 }
 
+/** launchResult code 14: an update stands in the way (BRIDGE.md, apps/launcher/version_gate.h). */
+export const CODE_UPDATE_REQUIRED = 14;
+/** launchResult code 15: the server is behind this launcher; nothing to install, retry later. */
+export const CODE_SERVER_BEHIND = 15;
+/** The sentence for code 15, the same one the host sends in `error` (version_gate.h kTextServerBehind). */
+export const SERVER_BEHIND_TEXT = 'This server has not been updated yet. Try again in a minute.';
+
 /** Human copy for BRIDGE.md launchResult codes. */
 export function launchErrorCopy(code: number, error: string): { title: string; body: string; action?: 'gameFolder' } {
   switch (code) {
@@ -256,6 +263,7 @@ export function launchErrorCopy(code: number, error: string): { title: string; b
     case 12: return { title: 'No join ticket', body: `${error ? `${error} ` : 'The Solar RP network did not hand out a join ticket. '}GTA V stays open: press PLAY again to join.` };
     case 13: return { title: 'Demo mode', body: 'These servers are demo data: no Solar RP server is set up yet, so PLAY does not start the game.' };
     case 14: return { title: 'Solar Launcher is updating', body: error || 'A Solar Launcher update is being installed. Try again in a moment.' };
+    case 15: return { title: 'Server not updated yet', body: SERVER_BEHIND_TEXT };
     default: return { title: 'Launch failed', body: error || `The launcher stopped with code ${code}.` };
   }
 }

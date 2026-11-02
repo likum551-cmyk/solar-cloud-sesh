@@ -379,6 +379,11 @@ namespace gage::game {
         constexpr uint64_t SET_VEHICLE_CHEAT_POWER_INCREASE            = 0xB59E4BD37AE292DB;
         constexpr uint64_t SET_VEHICLE_MAX_SPEED                       = 0xBAA045B4E42F3C06;
         constexpr uint64_t GET_VEHICLE_ESTIMATED_MAX_SPEED             = 0x53AF99BAA671CA47;
+        // 0.4.4 (W11, anchor steering). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
+        //   TASK_GO_TO_ENTITY  public 0x6A071245EB0D1882  3889 0xAB3658A740EED98E
+        //                      void (Entity entity, Entity target, int duration, float distance, float moveBlendRatio,
+        //                            float slowDownDistance, int flags)
+        constexpr uint64_t TASK_GO_TO_ENTITY                           = 0x6A071245EB0D1882;
         constexpr uint64_t GET_VEHICLE_LIGHTS_STATE                    = 0xB91B4C20085BD12F;
         constexpr uint64_t SET_VEHICLE_FULLBEAM                        = 0x8B7FD87F0DDB421E;
         constexpr uint64_t SET_VEHICLE_INTERIORLIGHT                   = 0xBC2042F090AF6AD3;
@@ -397,6 +402,20 @@ namespace gage::game {
         constexpr uint64_t USE_PARTICLE_FX_ASSET                       = 0x6C38AF3693A69A91;
         constexpr uint64_t REQUEST_NAMED_PTFX_ASSET                    = 0xB80D8756B4668AB6;
         constexpr uint64_t HAS_NAMED_PTFX_ASSET_LOADED                 = 0x8702416E512EC454;
+        // 0.4.4 (W9, vehicles and collision). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
+        //   HAS_ENTITY_COLLIDED_WITH_ANYTHING  public 0x8BAD02F0368D9E14  3889 0x14E25ED5E75102C8  BOOL (Entity)
+        //   GET_VEHICLE_CLASS                  public 0x29439776AAA00A62  3889 0x5506AFBD6056C05F  int (Vehicle); 8 = motorcycles, 13 = cycles
+        constexpr uint64_t HAS_ENTITY_COLLIDED_WITH_ANYTHING           = 0x8BAD02F0368D9E14;
+        constexpr uint64_t GET_VEHICLE_CLASS                           = 0x29439776AAA00A62;
+        // 0.4.4 (W10, player name tags). Same convention; looked up on the PC, both sources agree:
+        //   GET_SCREEN_COORD_FROM_WORLD_COORD  public 0x34E82F05DF2974F5  3889 0x2F8A75C70AF54208  BOOL (float x, y, z, float* sx, float* sy)
+        //   GET_FINAL_RENDERED_CAM_COORD       public 0xA200EB1EE790F448  3889 0x02AF3EA0F67D2329  Vector3 ()
+        //   HAS_ENTITY_CLEAR_LOS_TO_ENTITY     public 0xFCDFF7B72D23A1AC  3889 0xAD915B5E38F323E5  BOOL (Entity, Entity, int traceType)
+        //   GET_PED_BONE_COORDS                public 0x17C07FC640E86B4E  3889 0x83FDC027F0BEA202  Vector3 (Ped, int bone, float ox, oy, oz)
+        constexpr uint64_t GET_SCREEN_COORD_FROM_WORLD_COORD           = 0x34E82F05DF2974F5;
+        constexpr uint64_t GET_FINAL_RENDERED_CAM_COORD                = 0xA200EB1EE790F448;
+        constexpr uint64_t HAS_ENTITY_CLEAR_LOS_TO_ENTITY              = 0xFCDFF7B72D23A1AC;
+        constexpr uint64_t GET_PED_BONE_COORDS                         = 0x17C07FC640E86B4E;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -779,6 +798,20 @@ namespace gage::game {
         bool     GetVehicleBodyHealth(int32_t veh, float& health);
         bool     SetVehicleBodyHealth(int32_t veh, float health);
         bool     IsVehicleEngineRunning(int32_t veh);  // false also when it cannot be called
+        // W9: HAS_ENTITY_COLLIDED_WITH_ANYTHING (true when the entity touched anything since it was last asked; whether the
+        // ground counts is INFERRED: the drive controller opens a grace on a rising contact only and has a cooldown) and
+        // GET_VEHICLE_CLASS (-1 when it cannot be called; 8 motorcycles, 13 cycles).
+        bool     HasEntityCollidedWithAnything(int32_t entity);
+        int      GetVehicleClass(int32_t veh);
+        // W10 (player name tags). GetPedBoneCoords: GET_PED_BONE_COORDS(ped, bone, offX, offY, offZ), world position (SKEL_Head is
+        // 31086). GetScreenCoordFromWorldCoord: GET_SCREEN_COORD_FROM_WORLD_COORD, sx / sy in 0..1 of the screen; returns the native's
+        // BOOL (false: behind the camera or off screen; also when it cannot be called). GetFinalRenderedCamCoord: the camera the frame
+        // is drawn with. HasEntityClearLosToEntity: 1 = clear line of sight, 0 = blocked, -1 = could not be called
+        // (traceType 17 is what R*'s scripts pass; the caller owns the meaning).
+        bool     GetPedBoneCoords(int32_t ped, int bone, float ox, float oy, float oz, float& x, float& y, float& z);
+        bool     GetScreenCoordFromWorldCoord(float x, float y, float z, float& sx, float& sy);
+        bool     GetFinalRenderedCamCoord(float& x, float& y, float& z);
+        int      HasEntityClearLosToEntity(int32_t from, int32_t to, int traceType);
         bool     SetVehicleSiren(int32_t veh, bool on);
         bool     IsVehicleSirenOn(int32_t veh);       // false also when it cannot be called
         bool     StartVehicleHorn(int32_t veh, int durationMs);  // mode 0 (default), not forever
@@ -904,6 +937,10 @@ namespace gage::game {
         bool     IsPedVaulting(int32_t ped);
         // TASK_CLIMB(ped, usePlayerLaunchForce): the ped climbs / vaults whatever is in front of it. Once per climb.
         bool     TaskClimb(int32_t ped, bool usePlayerLaunchForce);
+        // W11: TASK_GO_TO_ENTITY(ped, target, duration, distance, moveBlendRatio, slowDownDistance, flags): the ped walks / runs to
+        // an entity and follows it. duration -1 = until another task; the remote puppets use it on an invisible anchor entity.
+        bool     TaskGoToEntity(int32_t ped, int32_t target, int durationMs, float distance, float moveBlendRatio,
+                                float slowDownDistance, int flags);
         // The AI damage modifiers are global (every AI ped's weapon / melee damage, which includes the remote
         // players' puppets): 0.0 at Welcome so a puppet's real shot or punch hurts nobody locally (damage is the
         // server's), RESET at the end of the session. True = could be called.

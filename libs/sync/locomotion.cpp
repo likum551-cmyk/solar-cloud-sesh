@@ -88,8 +88,9 @@ void LocomotionController::ResetHard()
     started_ = false;
     haveVf_ = false;
     pauseMs_ = 0;
-    gait_ = inferred_ = pendingGait_ = Gait::Still;
+    gait_ = inferred_ = pendingGait_ = gaitShown_ = Gait::Still;
     stillMs_ = pendingMs_ = 0;
+    corrFx_ = corrFy_ = 0.0f;
 }
 
 void LocomotionController::Pause(double ms) { pauseMs_ = ms > 0.0 ? ms : 0.0; }
@@ -137,6 +138,9 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     const double dtS = dt / 1000.0;
     sinceIssueMs_ += dt;
     sinceJumpMs_ += dt;
+    if (anchorFallbackLeftMs_ > 0.0) anchorFallbackLeftMs_ = anchorFallbackLeftMs_ > dt ? anchorFallbackLeftMs_ - dt : 0.0;
+    // W11 item 2: anchor mode now? (the engine reports no anchor entity or an aim task with noAnchor; a stall dropped it)
+    bool anchorMode = cfg_.mode == LocoMode::Anchor && !in.noAnchor && anchorFallbackLeftMs_ <= 0.0;
 
     // ---- pause: the ped is busy with something else (leaving a vehicle) ----
     if (pauseMs_ > 0.0)
@@ -260,11 +264,52 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     // While ragdolling the same is set (NaturalMotion owns the pose, the velocity makes the ragdoll
     // follow the sender instead of falling in place) with the total capped at ragdollMaxMs and z left to
     // physics.
+    // W11 item 3: with the ped's own velocity (havePedVel) a walking / running / standing ped gets only the RESIDUAL: its
+    // own velocity (the animation's displacement) plus the position correction, low-passed and capped at residualMaxMs,
+    // and nothing at all while the error is inside the dead band. Jumps, ragdoll and swimming keep the push above.
     {
+        const bool residual = cfg_.residualMaxMs > 0.0f && in.havePedVel && !jumping && !ragdollActive_ && !in.swimming;
+        if (!residual || snap) { corrFx_ = corrFy_ = 0.0f; }
         o.setVelocity = true;
         if (snap)
         {
             o.velocity = in.vel;
+        }
+        else if (residual)
+        {
+            const double hx = double(in.pos.x) - ped.x, hy = double(in.pos.y) - ped.y;
+            const double he = HLen(hx, hy);
+            double cx = 0, cy = 0;
+            if (he >= cfg_.steerDeadbandM)
+            {
+                cx = (cfg_.corrGainBase + cfg_.corrGainPerM * he) * hx;
+                cy = (cfg_.corrGainBase + cfg_.corrGainPerM * he) * hy;
+                const double cl = HLen(cx, cy);
+                if (cl > cfg_.residualMaxMs && cl > 0.0) { cx *= cfg_.residualMaxMs / cl; cy *= cfg_.residualMaxMs / cl; }
+            }
+            const double k = 1.0 - std::exp(-dt / static_cast<double>(cfg_.residualTauMs > 0 ? cfg_.residualTauMs : 1.0f));
+            corrFx_ = static_cast<float>(corrFx_ + (cx - corrFx_) * k);
+            corrFy_ = static_cast<float>(corrFy_ + (cy - corrFy_) * k);
+            const double cf = HLen(corrFx_, corrFy_);
+            double cz = 0;
+            const double dz = double(in.pos.z) - ped.z;
+            if (std::fabs(dz) > cfg_.zDeadbandM)
+            {
+                cz = cfg_.zGain * (dz > 0 ? dz - cfg_.zDeadbandM : dz + cfg_.zDeadbandM);
+                if (cz > cfg_.zCorrMaxMs) cz = cfg_.zCorrMaxMs;
+                if (cz < -cfg_.zCorrMaxMs) cz = -cfg_.zCorrMaxMs;
+            }
+            if (cf < 0.02 && cz == 0.0)
+            {
+                o.setVelocity = false;                 // inside the dead band: the animation carries the ped
+                corrFx_ = corrFy_ = 0.0f;
+            }
+            else
+            {
+                o.velocity.x = static_cast<float>(in.pedVel.x + corrFx_);
+                o.velocity.y = static_cast<float>(in.pedVel.y + corrFy_);
+                o.velocity.z = static_cast<float>(in.pedVel.z + cz);
+            }
         }
         else
         {
@@ -302,8 +347,32 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
             }
             o.velocity.z = static_cast<float>(vz);
         }
-        o.velocityZFromPhysics = jumping || ragdollActive_;
+        o.velocityZFromPhysics = !residual && (jumping || ragdollActive_);
     }
+
+    // ---- direction, lead and the anchor (W11) ----
+    // direction = the low-passed velocity's (the sender's heading when it is hardly moving); sp its speed.
+    const double sp = HLen(vf_.x, vf_.y);
+    double dirx, diry;
+    if (sp >= kDirMinSpeedMs) { dirx = vf_.x / sp; diry = vf_.y / sp; }
+    else
+    {
+        const double r = double(in.heading) * kPi / 180.0; // GTA heading 0 = +y, counter-clockwise
+        dirx = -std::sin(r);
+        diry = std::cos(r);
+    }
+    if (anchorMode)
+    {
+        // Anchor mode: the entity the ped runs to is moved EVERY frame to pose + direction * lead (the pose is already the
+        // smoother's predicted position), so a turn bends the path instead of re-issuing a task.
+        const double aLead = Clamp(sp * cfg_.anchorLeadS, cfg_.anchorLeadMinM, cfg_.anchorLeadMaxM);
+        o.moveAnchor = true;
+        o.anchorPos.x = static_cast<float>(in.pos.x + dirx * aLead);
+        o.anchorPos.y = static_cast<float>(in.pos.y + diry * aLead);
+        o.anchorPos.z = in.pos.z;
+        ++stats_.anchorFrames;
+    }
+    o.anchorMode = anchorMode;
 
     // ---- gait task ----
     if (ragdollActive_ || jumping)
@@ -318,6 +387,7 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     {
         mismatchMs_ = 0;
         reevaluate_ = false;      // nothing to keep or re-issue: the stand-still task is the running one
+        gaitShown_ = Gait::Still;
         if (lastTask_ != LocoTask::StandStill || forceIssue_)
         {
             o.task = LocoTask::StandStill;
@@ -335,15 +405,6 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     // low-passed velocity's (the sender's heading when it is hardly moving), the lead is leadS seconds
     // of travel clamped to leadMinM..leadMaxM: far enough ahead that the ped does not reach it for
     // seconds (GTAN's 1 s lead made the target "reached" after half a second).
-    const double sp = HLen(vf_.x, vf_.y);
-    double dirx, diry;
-    if (sp >= kDirMinSpeedMs) { dirx = vf_.x / sp; diry = vf_.y / sp; }
-    else
-    {
-        const double r = double(in.heading) * kPi / 180.0; // GTA heading 0 = +y, counter-clockwise
-        dirx = -std::sin(r);
-        diry = std::cos(r);
-    }
     const double leadM = Clamp(sp * cfg_.leadS, cfg_.leadMinM, cfg_.leadMaxM);
     LocoVec anchor; // the target without its lead: where the pose is, plus the ped's error to it
     anchor.x = static_cast<float>(in.pos.x + (double(in.pos.x) - ped.x));
@@ -373,10 +434,16 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     // blend ratio moved a step (fallback only), or - at most every minReissueMs - the direction turned
     // by more than turnReissueDeg, the target drifted driftM from where the last one has moved to, the
     // ped is about to reach the last target (within max(arriveMinM, arriveFrac * lead)), or it stalled.
-    bool issue = forceIssue_ || lastTask_ != LocoTask::GoStraight || lastTaskGait_ != gait_;
+    // W11 item 1: a change between Walk / Run / Sprint is NOT a re-issue (the task stays, setBlend changes its speed);
+    // a task of the other kind (a stand-still before, or Straight <-> Anchor) is.
+    LocoTask wantTask = anchorMode ? LocoTask::GoToAnchor : LocoTask::GoStraight;
+    bool issue = forceIssue_ || lastTask_ != wantTask;
     LocoWhy why = LocoWhy::None;
     if (issue)
         why = forceIssue_ ? (resetForced_ ? LocoWhy::Reset : LocoWhy::Forced) : LocoWhy::Gait;
+    if (!issue && gait_ != gaitShown_ && gaitShown_ != Gait::Still)
+        ++stats_.gaitKept;
+    gaitShown_ = gait_;
     if (!issue && !in.moveRateAvailable && sinceIssueMs_ >= cfg_.blendReissueMs &&
         std::fabs(blend - lastBlend_) >= cfg_.blendStep - 1e-4f)
     {
@@ -393,19 +460,37 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         // turn rule below covers direction): where the last anchor would be now at its velocity.
         const double px = lastAnchor_.x + double(lastTargetVel_.x) * el;
         const double py = lastAnchor_.y + double(lastTargetVel_.y) * el;
-        const bool drift = HLen(anchor.x - px, anchor.y - py) > cfg_.driftM;
+        // Anchor mode has no fixed target: turn, drift and arrival cannot happen, only a lost task (stall) re-issues.
+        // W11: only the LATERAL part counts. The target is a far point on the path: when the sender speeds up or slows down
+        // (a Run <-> Sprint change) the anchor moves along the track faster or slower than the last velocity predicted, the
+        // target is still ahead on the path, and a re-issue would only restart the stride (drift 4 of 5 re-issues in a
+        // Run <-> Sprint test).
         const double lastSp = HLen(lastTargetVel_.x, lastTargetVel_.y);
+        double driftM = HLen(anchor.x - px, anchor.y - py);
+        if (lastSp >= kDirMinSpeedMs)
+            driftM = std::fabs((anchor.x - px) * (-double(lastTargetVel_.y) / lastSp) + (anchor.y - py) * (double(lastTargetVel_.x) / lastSp));
+        const bool drift = !anchorMode && driftM > cfg_.driftM;
         bool turn = false;
         if (sp >= cfg_.idleUp && lastSp >= cfg_.idleUp)
         {
             const double cosA = (double(vf_.x) * lastTargetVel_.x + double(vf_.y) * lastTargetVel_.y) / (sp * lastSp);
-            turn = cosA < std::cos(double(cfg_.turnReissueDeg) * kPi / 180.0);
+            turn = !anchorMode && cosA < std::cos(double(cfg_.turnReissueDeg) * kPi / 180.0);
         }
         const double arrive = std::fmax(cfg_.arriveMinM, cfg_.arriveFrac * lastLeadM_);
-        const bool arriving = HLen(double(lastTarget_.x) - ped.x, double(lastTarget_.y) - ped.y) < arrive;
+        const bool arriving = !anchorMode && HLen(double(lastTarget_.x) - ped.x, double(lastTarget_.y) - ped.y) < arrive;
         const bool driftNow = drift && (soft || sinceIssueMs_ >= cfg_.driftReissueMs);
         const bool stallNow = !soft && mismatchMs_ >= cfg_.stallMs && sinceIssueMs_ >= cfg_.stallRetryMs;
         issue = turn || driftNow || arriving || stallNow;
+        if (stallNow && anchorMode)
+        {
+            // The anchor task is lost and re-issuing it may not cure it (no navmesh, an interior): the same stall as a
+            // straight run's, but fall back to the straight path for a while instead of repeating.
+            anchorFallbackLeftMs_ = cfg_.anchorFallbackMs;
+            ++stats_.anchorFallbacks;
+            anchorMode = false;
+            o.anchorMode = false;
+            wantTask = LocoTask::GoStraight;
+        }
         why = turn ? LocoWhy::Turn : driftNow ? LocoWhy::Drift : arriving ? LocoWhy::Arrive : stallNow ? LocoWhy::Stall : LocoWhy::None;
     }
     if (soft)
@@ -428,21 +513,37 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         case LocoWhy::Stall:  ++stats_.whyStall;  break;
         case LocoWhy::None:   break;
         }
-        o.task = LocoTask::GoStraight;
-        o.target = target;
+        o.task = wantTask;
+        o.target = wantTask == LocoTask::GoToAnchor ? o.anchorPos : target;
         o.moveBlendRatio = blend;
-        lastTask_ = LocoTask::GoStraight;
+        lastTask_ = wantTask;
         lastTaskGait_ = gait_;
         lastTarget_ = target;
         lastAnchor_ = anchor;
         lastTargetVel_ = vf_;
         lastLeadM_ = static_cast<float>(leadM);
         lastBlend_ = blend;
+        blendSet_ = blend;
         sinceIssueMs_ = 0;
         mismatchMs_ = 0;
         forceIssue_ = false;
         resetForced_ = false;
         ++stats_.goStraight;
+        if (wantTask == LocoTask::GoToAnchor) ++stats_.anchorIssues;
+    }
+    else
+    {
+        // W11 item 1: the running task keeps its issued speed; the commanded gait's blend ratio is set on it (every frame
+        // it differs, the task may reassert its own). Only with the move rate override: without it the blend ratio is the
+        // quantised speed and the Blend rule above re-issues.
+        // Held every frame it differs from the issued one (the task may reassert its own), and once more when it is back at
+        // the issued one (what was set last stays).
+        if (in.moveRateAvailable && (std::fabs(blend - lastBlend_) > 1e-4f || std::fabs(blend - blendSet_) > 1e-4f))
+        {
+            o.setBlend = true;
+            o.moveBlendRatio = blend;
+            blendSet_ = blend;
+        }
     }
     return o;
 }

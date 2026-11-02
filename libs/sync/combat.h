@@ -477,6 +477,72 @@ namespace gage::sync {
         double lastSwingMs_ = -1e9;
     };
 
+    // Receiver (0c): whether a remote ped's swing is due now. A swing is a step of the sender's shotSeq OR the rising
+    // edge of its kPfMelee flag (sent since protocol v5, ignored by the receiver until 0.4.4: a swing whose counter
+    // step was missed was never shown); the two are one swing within the gate's dedupe. Only with a melee-class weapon.
+    // Once per frame per remote ped (the gate tracks the flag's edge).
+    inline bool PeerSwingDue(MeleeSwingGate& gate, double nowMs, int shotSteps, bool meleeWeapon, bool meleeFlag)
+    {
+        return gate.Tick(nowMs, meleeWeapon && shotSteps > 0, meleeWeapon && meleeFlag);
+    }
+
+    // ---- melee hit on a puppet, by the damage EVENT (0.4.4 item 0c) ----------------------------------
+    //
+    // Live test 0.4.3: punches at a friend's puppet counted swings but sent no Hit. A puppet's health pool is
+    // restored after every hit and the pool drop (ProbePeerDamage) is the hit; with the game-wide AI melee damage
+    // modifier at 0 (W8) a fist took nothing off the pool, so nothing was ever seen. A melee blow is therefore also
+    // detected by the damage EVENT (HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(puppet, local ped), cleared after it is read):
+    // a melee-class weapon in hand, the event, and our own swing (counted at the press, TickLocalMelee) or melee
+    // action still in progress => one Hit of the weapon's nominal damage. The server's per-weapon melee ceiling
+    // (apps/server/anticheat.h MeleeNominalMax: fists 40, light 60, heavy 80) and its need for a swing decide the
+    // rest. Guns (a non-melee weapon) keep the pool probe only.
+    constexpr double kMeleeHitWindowMs = 900.0;     // a blow lands within this of the swing counted at the press
+    constexpr int kMeleeNominalDamage = kDeadMeleeCapDamage;   // the claim of an event-detected blow (fists ceiling)
+
+    // Whether the damage event of a puppet is worth reading now: a melee-class weapon in hand and our swing recent
+    // (sinceSwingMs since the last counted swing) or a melee action running. Keeps the native calls to swing windows.
+    inline bool MeleeEventWindow(bool meleeWeaponHeld, double sinceSwingMs, bool meleeActionNow)
+    {
+        return meleeWeaponHeld && (meleeActionNow || (sinceSwingMs >= 0.0 && sinceSwingMs <= kMeleeHitWindowMs));
+    }
+
+    enum class MeleeHitSource : uint8_t { None, Pool, Event };
+    struct MeleeHitIn
+    {
+        bool   meleeWeaponHeld = false;   // the local ped's weapon is melee-class (fists, GROUP_MELEE / GROUP_UNARMED)
+        bool   eventDamaged = false;      // HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(puppet, local ped), read in the window only
+        double sinceSwingMs = 1e9;        // since our last counted swing (TickLocalMelee)
+        bool   meleeActionNow = false;    // IS_PED_PERFORMING_MELEE_ACTION(local ped)
+        bool   poolReport = false;        // ProbePeerDamage says "report" (a pool drop we caused)
+        int    poolDamage = 0;            // ... and its damage
+    };
+    struct MeleeHitOut
+    {
+        MeleeHitSource source = MeleeHitSource::None;   // which detector produced the report
+        int  damage = 0;                                // 0 with source None
+        bool clearEvent = false;                        // CLEAR_ENTITY_LAST_DAMAGE_ENTITY: the event was read (also a stale one)
+    };
+    inline MeleeHitOut DecideMeleeHit(const MeleeHitIn& in)
+    {
+        MeleeHitOut o;
+        if (in.meleeWeaponHeld && in.eventDamaged)
+        {
+            o.clearEvent = true;                        // read once; a stale event must not fire on the next swing
+            if (MeleeEventWindow(true, in.sinceSwingMs, in.meleeActionNow))
+            {
+                o.source = MeleeHitSource::Event;
+                o.damage = kMeleeNominalDamage;         // the event replaces the pool number: never both for one blow
+                return o;
+            }
+        }
+        if (in.poolReport && in.poolDamage > 0)
+        {
+            o.source = MeleeHitSource::Pool;            // guns, vehicles, and a melee drop with no event in the window
+            o.damage = in.poolDamage;
+        }
+        return o;
+    }
+
     // ---- geometry and timing helpers -----------------------------------------------------------------
 
     // Whether the segment a -> b passes within `radius` of the vertical axis of a standing player (centre
