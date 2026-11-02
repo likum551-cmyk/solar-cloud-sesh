@@ -279,6 +279,221 @@ namespace gage::sync {
         double startMs_ = 0, settleUntilMs_ = 0;
     };
 
+    // ---- receiver: 0d, the pose a vault / climb / cover task starts from ----
+
+    // TASK_CLIMB probes the obstacle in front of the ped it is given to, and TASK_PUT_PED_DIRECTLY_INTO_COVER looks for a cover
+    // point at the coordinates it is given. Both are issued on the sender's rising edge, when the puppet is wherever its gait
+    // task and the ~100 ms render delay left it: 5 of 8 climbs of the 0.4.3 live test never started (300 ms timeout, the puppet
+    // was placed with its collision off, no animation). So the puppet is first put on the pose of the edge (position and
+    // heading), the task goes out the same frame.
+    //   Keep   close enough (< kPrePlaceKeepM): the position is left, the heading is still corrected.
+    //   Blend  under kPrePlaceSetM off: the position is nudged onto the pose with the puppet's tasks and momentum kept (no
+    //          visible restart; a time blend cannot wait for the task, which must go out the same frame).
+    //   Set    kPrePlaceSetM or more off, or the ped's position is unreadable: placed outright and its tasks cleared first.
+    constexpr float kPrePlaceKeepM = 0.12f;
+    constexpr float kPrePlaceSetM = 1.0f;
+    constexpr float kPrePlaceHeadingDeg = 8.0f;
+    enum class PrePlaceMode : uint8_t { Keep, Blend, Set };
+    struct PrePlace
+    {
+        PrePlaceMode mode = PrePlaceMode::Keep;
+        bool setHeading = false;    // SET_ENTITY_HEADING to the pose's heading
+        bool clearTasks = false;    // the old task (a go-to-entity on the anchor, ...) is dropped before the placement
+    };
+    // distM: horizontal-plus-vertical distance of the ped from the pose (< 0 = not readable). headingErrDeg: |ped heading - pose
+    // heading| folded to 0..180.
+    inline PrePlace DecidePrePlace(float distM, float headingErrDeg)
+    {
+        PrePlace p;
+        if (distM < 0.0f || distM >= kPrePlaceSetM)
+        {
+            p.mode = PrePlaceMode::Set;
+            p.clearTasks = true;
+            p.setHeading = true;
+        }
+        else if (distM >= kPrePlaceKeepM)
+        {
+            p.mode = PrePlaceMode::Blend;
+            p.setHeading = true;
+        }
+        else
+            p.setHeading = headingErrDeg > kPrePlaceHeadingDeg;
+        return p;
+    }
+
+    // Started-versus-fallback accounting of the 10 s sync line: a window that issued a task, the ones that started (the puppet
+    // really climbs / is in cover), the ones that fell back to the placement, and the ones that ended.
+    struct TaskWindowTally
+    {
+        uint32_t issued = 0, started = 0, fellBack = 0, ended = 0;
+    };
+
+    // One ClimbWindow::Update, counted: `before` and `after` are CurrentPhase() around it, `issued` is Out::issueClimb. A task
+    // that could not be called (NoteIssueFailed moves Pending to Fallback) is counted by the caller's second call with the
+    // phases before and after that.
+    inline void CountClimb(TaskWindowTally& t, ClimbWindow::Phase before, ClimbWindow::Phase after, bool issued)
+    {
+        using P = ClimbWindow::Phase;
+        if (issued)
+            ++t.issued;
+        if (before == P::Pending && after == P::Active)
+            ++t.started;
+        if (before != P::Fallback && after == P::Fallback)
+            ++t.fellBack;
+        if (before == P::Settle && after == P::Idle)
+            ++t.ended;
+    }
+
+    // ---- receiver: cover (0d) ----
+
+    // The sender's kPfCover (alive, on foot, not ragdolling) as a window around TASK_PUT_PED_DIRECTLY_INTO_COVER. The 0.4.3 code
+    // set its "cover hold" as soon as the native was CALLED and kept the gait controller, the velocity push and the anchor off
+    // the ped for as long as the flag stayed up, whether or not the puppet ever got into cover: with no cover point at the
+    // coordinates (a car is not one) the puppet then stood frozen wherever it was, up to 4 m from the sender, no animation.
+    //   Idle     -> flag rises: issue (the engine puts the puppet on the pose first, DecidePrePlace), phase Pending, suspend.
+    //   Pending  -> pedInCover: phase Held (started). Not within startTimeoutMs: one more issue (the pose moved on), then
+    //               Fallback (failed): the engine clears the task and hands the ped back to the controller, which keeps it on the
+    //               sender's pose (standing, placed) until the flag falls.
+    //   Held     -> suspend (no gait task, no velocity push, no anchor move). The puppet leaving cover by itself (pedInCover
+    //               false for lostMs) or drifting off the sender (> driftReissueM for driftMs, or > driftPlaceM at once) issues
+    //               again, at most every reissueGapMs.
+    //   flag falls (Pending / Held) -> ended: the engine clears the task and Resets the controller; Fallback -> Idle quietly.
+    class CoverWindow
+    {
+    public:
+        struct Out
+        {
+            bool issue = false;      // TASK_PUT_PED_DIRECTLY_INTO_COVER now (put the puppet on the pose first)
+            bool suspend = false;    // no gait task, no velocity push, no anchor move this frame
+            bool failed = false;     // the task never started: clear it, Reset the controller (once)
+            bool ended = false;      // the sender left cover while the task was held: clear it, Reset the controller (once)
+        };
+        enum class Phase : uint8_t { Idle, Pending, Held, Fallback };
+
+        explicit CoverWindow(double startTimeoutMs = 350.0, double lostMs = 400.0, double driftMs = 600.0,
+                             double reissueGapMs = 1000.0, float driftReissueM = 1.5f, float driftPlaceM = 4.0f)
+            : startTimeoutMs_(startTimeoutMs), lostMs_(lostMs), driftMs_(driftMs), reissueGapMs_(reissueGapMs),
+              driftReissueM_(driftReissueM), driftPlaceM_(driftPlaceM) {}
+
+        // flag: the sender is in cover and the puppet may take it. pedInCover: IS_PED_IN_COVER of the puppet (only asked while
+        // Busy()). driftM: horizontal distance of the puppet from the sender's pose.
+        Out Update(bool flag, bool pedInCover, float driftM, double nowMs)
+        {
+            Out o;
+            switch (phase_)
+            {
+            case Phase::Idle:
+                if (flag)
+                {
+                    issuesThisHold_ = 0;
+                    Issue(o, nowMs, Phase::Pending);
+                }
+                break;
+            case Phase::Pending:
+                if (!flag)
+                {
+                    o.ended = true;
+                    phase_ = Phase::Idle;
+                    ++tally_.ended;
+                    break;
+                }
+                o.suspend = true;
+                if (pedInCover)
+                {
+                    phase_ = Phase::Held;
+                    lostSince_ = -1.0;
+                    driftSince_ = -1.0;
+                    ++tally_.started;
+                }
+                else if (nowMs - issueMs_ >= startTimeoutMs_)
+                {
+                    if (issuesThisHold_ < 2)
+                        Issue(o, nowMs, Phase::Pending);
+                    else
+                    {
+                        phase_ = Phase::Fallback;
+                        o.failed = true;
+                        o.suspend = false;
+                        ++tally_.fellBack;
+                    }
+                }
+                break;
+            case Phase::Held:
+                if (!flag)
+                {
+                    o.ended = true;
+                    phase_ = Phase::Idle;
+                    ++tally_.ended;
+                    break;
+                }
+                o.suspend = true;
+                if (pedInCover)
+                    lostSince_ = -1.0;
+                else if (lostSince_ < 0.0)
+                    lostSince_ = nowMs;
+                if (driftM > driftReissueM_)
+                {
+                    if (driftSince_ < 0.0)
+                        driftSince_ = nowMs;
+                }
+                else
+                    driftSince_ = -1.0;
+                {
+                    const bool lost = lostSince_ >= 0.0 && nowMs - lostSince_ >= lostMs_;
+                    const bool drifted = (driftSince_ >= 0.0 && nowMs - driftSince_ >= driftMs_) || driftM > driftPlaceM_;
+                    if ((lost || drifted) && (nowMs - issueMs_ >= reissueGapMs_ || driftM > driftPlaceM_))
+                    {
+                        issuesThisHold_ = 0;
+                        Issue(o, nowMs, Phase::Pending);
+                    }
+                }
+                break;
+            case Phase::Fallback:
+                if (!flag)
+                    phase_ = Phase::Idle;              // the task never ran: nothing to clear, the controller owns the ped
+                break;
+            }
+            return o;
+        }
+        // The native could not be called at all: straight to the fallback (the controller keeps the ped on the pose).
+        void NoteIssueFailed()
+        {
+            if (phase_ == Phase::Pending)
+            {
+                phase_ = Phase::Fallback;
+                ++tally_.fellBack;
+            }
+        }
+        Phase CurrentPhase() const { return phase_; }
+        bool Busy() const { return phase_ == Phase::Pending || phase_ == Phase::Held; }
+        const TaskWindowTally& Tally() const { return tally_; }
+        // A new ped, or the engine took the ped over (death, seat): forget the window; the tally lives on.
+        void Reset()
+        {
+            phase_ = Phase::Idle;
+            issuesThisHold_ = 0;
+            lostSince_ = driftSince_ = -1.0;
+        }
+
+    private:
+        void Issue(Out& o, double nowMs, Phase next)
+        {
+            o.issue = true;
+            o.suspend = true;
+            phase_ = next;
+            issueMs_ = nowMs;
+            ++issuesThisHold_;
+            ++tally_.issued;
+        }
+
+        double startTimeoutMs_, lostMs_, driftMs_, reissueGapMs_;
+        float driftReissueM_, driftPlaceM_;
+        Phase phase_ = Phase::Idle;
+        double issueMs_ = 0, lostSince_ = -1.0, driftSince_ = -1.0;
+        int issuesThisHold_ = 0;
+        TaskWindowTally tally_;
+    };
+
     // ---- receiver: when a puppet aims (item 8) ----
 
     // The aim task is wanted while the sender's kPfAiming is set, it is not ragdolling and it holds a weapon: weapon 0

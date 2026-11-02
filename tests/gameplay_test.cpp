@@ -1960,6 +1960,121 @@ static void TestW8()
               F("early %d late %d hold %d released %d done %d direct %d again %d fin %d", (int)early.fallbackPlace, (int)late.fallbackPlace, (int)hold.fallbackPlace,
                 (int)released.fallbackPlace, (int)done.reset, (int)direct.fallbackPlace, (int)again.issueClimb, (int)fin.reset));
     }
+    // 0d: the puppet goes onto the sender's pose of the edge before TASK_CLIMB / the cover task, and the task windows are counted started-vs-fallback.
+    {
+        const PrePlace keep = DecidePrePlace(0.05f, 3.0f);
+        const PrePlace turn = DecidePrePlace(0.05f, 30.0f);
+        const PrePlace nudge = DecidePrePlace(0.5f, 2.0f);
+        const PrePlace edgeBelow = DecidePrePlace(0.99f, 0.0f);
+        const PrePlace set1 = DecidePrePlace(1.0f, 0.0f);
+        const PrePlace far5 = DecidePrePlace(5.0f, 0.0f);
+        const PrePlace unreadable = DecidePrePlace(-1.0f, 0.0f);
+        Check("0d: pre-vault placement: within 0.12 m the position is left (the heading only when > 8 deg off); 0.12..1 m is a nudge that keeps the task and the heading is set; "
+              "1 m and more (or an unreadable ped) is set outright with the old task cleared",
+              keep.mode == PrePlaceMode::Keep && !keep.setHeading && !keep.clearTasks && turn.mode == PrePlaceMode::Keep && turn.setHeading &&
+                  nudge.mode == PrePlaceMode::Blend && nudge.setHeading && !nudge.clearTasks && edgeBelow.mode == PrePlaceMode::Blend && !edgeBelow.clearTasks &&
+                  set1.mode == PrePlaceMode::Set && set1.clearTasks && set1.setHeading && far5.mode == PrePlaceMode::Set && far5.clearTasks &&
+                  unreadable.mode == PrePlaceMode::Set && unreadable.clearTasks,
+              F("keep %d turn %d%d nudge %d%d below %d set %d%d far %d unreadable %d", (int)keep.mode, (int)turn.mode, (int)turn.setHeading, (int)nudge.mode, (int)nudge.setHeading,
+                (int)edgeBelow.mode, (int)set1.mode, (int)set1.clearTasks, (int)far5.mode, (int)unreadable.mode));
+
+        // Three vaults: one starts (the puppet vaults 100 ms after the task), one never starts (300 ms), one cannot be issued. The tally says 3 issued, 1 started, 2 fell back.
+        TaskWindowTally tally;
+        auto step = [&](ClimbWindow& w, bool flag, bool climbing, double t) {
+            const ClimbWindow::Phase before = w.CurrentPhase();
+            const ClimbWindow::Out o = w.Update(flag, climbing, t);
+            CountClimb(tally, before, w.CurrentPhase(), o.issueClimb);
+            return o;
+        };
+        ClimbWindow a, b, c;
+        step(a, true, false, 0);                               // issued
+        step(a, true, true, 100);                              // started
+        step(a, false, false, 600);
+        step(a, false, false, 1000);                           // settle over: ended
+        step(b, true, false, 0);                               // issued
+        step(b, true, false, 299);
+        step(b, true, false, 300);                             // never started: fallback
+        step(c, true, false, 0);                               // issued ...
+        {
+            const ClimbWindow::Phase before = c.CurrentPhase();
+            c.NoteIssueFailed();                               // ... but the native could not be called
+            CountClimb(tally, before, c.CurrentPhase(), false);
+        }
+        Check("0d: climb accounting: 3 TASK_CLIMB windows = 3 issued, 1 started (the puppet really vaulted), 2 placement fallbacks (timeout, uncallable), 1 settled to its end",
+              tally.issued == 3 && tally.started == 1 && tally.fellBack == 2 && tally.ended == 1,
+              F("issued %u started %u fellBack %u ended %u", tally.issued, tally.started, tally.fellBack, tally.ended));
+    }
+    // 0d cover: the window around TASK_PUT_PED_DIRECTLY_INTO_COVER. The old hold was set when the native was CALLED and kept the controller, the velocity push and the anchor
+    // off the ped for as long as the flag stayed up, in cover or not.
+    {
+        using CP = CoverWindow::Phase;
+        CoverWindow w;                                         // 350 ms start timeout, one retry
+        const auto idle = w.Update(false, false, 0.0f, 0);
+        const auto rise = w.Update(true, false, 2.0f, 1000);
+        const auto pend = w.Update(true, false, 2.0f, 1200);
+        const auto retry = w.Update(true, false, 2.0f, 1350);    // 350 ms in, still not in cover: the pose moved on, once more
+        const auto pend2 = w.Update(true, false, 2.0f, 1500);
+        const auto fail = w.Update(true, false, 2.0f, 1700);     // 350 ms after the retry: it never starts
+        const auto after1 = w.Update(true, false, 2.0f, 1800);
+        const auto after2 = w.Update(true, false, 2.0f, 5000);
+        const auto fell = w.Update(false, false, 2.0f, 5100);
+        Check("0d cover: the rising flag issues the task once and suspends the controller / velocity push / anchor; after one retry a puppet that never got into cover is RELEASED "
+              "(failed once, no more suspend, no more issue) instead of being held frozen for as long as the flag stays up; the flag falling after that is quiet",
+              !idle.issue && !idle.suspend && rise.issue && rise.suspend && !pend.issue && pend.suspend && retry.issue && retry.suspend && !pend2.issue && pend2.suspend &&
+                  fail.failed && !fail.suspend && !after1.suspend && !after1.issue && !after1.failed && !after2.suspend && !after2.issue && !fell.ended && !fell.suspend &&
+                  w.CurrentPhase() == CP::Idle && w.Tally().issued == 2 && w.Tally().started == 0 && w.Tally().fellBack == 1,
+              F("rise %d%d retry %d%d fail %d%d after %d%d%d fell %d tally %u/%u/%u", (int)rise.issue, (int)rise.suspend, (int)retry.issue, (int)retry.suspend, (int)fail.failed,
+                (int)fail.suspend, (int)after1.suspend, (int)after1.issue, (int)after1.failed, (int)fell.ended, w.Tally().issued, w.Tally().started, w.Tally().fellBack));
+
+        CoverWindow h;
+        h.Update(true, false, 0.0f, 0);
+        const auto in = h.Update(true, true, 0.3f, 100);         // IS_PED_IN_COVER: started
+        bool heldAll = h.CurrentPhase() == CP::Held && in.suspend && !in.issue;
+        for (int i = 1; i <= 100; ++i)                           // 3 s in cover, the sender stands still: suspended every frame, no task churn
+        {
+            const auto o = h.Update(true, true, 0.4f, 100 + i * 30);
+            heldAll = heldAll && o.suspend && !o.issue && !o.failed && !o.ended;
+        }
+        const auto out = h.Update(false, true, 0.4f, 3300);
+        const auto out2 = h.Update(false, false, 0.4f, 3330);
+        Check("0d cover: a puppet that IS in cover stays suspended frame after frame without a second issue; the flag falling ends the window once (clear the task, Reset the controller)",
+              heldAll && out.ended && !out.suspend && !out2.ended && !out2.suspend && h.Tally().started == 1 && h.Tally().ended == 1 && h.Tally().issued == 1,
+              F("heldAll %d out %d%d out2 %d%d tally %u/%u/%u", (int)heldAll, (int)out.ended, (int)out.suspend, (int)out2.ended, (int)out2.suspend, h.Tally().issued,
+                h.Tally().started, h.Tally().ended));
+
+        CoverWindow l;                                           // the puppet leaves cover by itself, or the sender shuffles away
+        l.Update(true, false, 0.0f, 0);
+        l.Update(true, true, 0.0f, 50);
+        const auto brief = l.Update(true, false, 0.0f, 1100);    // out of cover (first sight) ...
+        const auto brief2 = l.Update(true, false, 0.0f, 1499);   // ... 399 ms: not yet
+        const auto lost = l.Update(true, false, 0.0f, 1500);     // 400 ms: issue again
+        CoverWindow d;
+        d.Update(true, false, 0.0f, 0);
+        d.Update(true, true, 0.0f, 50);
+        const auto near1 = d.Update(true, true, 1.0f, 1100);      // 1 m off: fine
+        const auto d1 = d.Update(true, true, 2.0f, 1200);         // 2 m off starts the clock
+        const auto d2 = d.Update(true, true, 2.0f, 1799);
+        const auto d3 = d.Update(true, true, 2.0f, 1800);         // 600 ms: issue again, from the sender's pose
+        CoverWindow g;
+        g.Update(true, false, 0.0f, 0);
+        g.Update(true, true, 0.0f, 50);
+        const auto gap = g.Update(true, true, 5.0f, 400);         // > 4 m: at once, even inside the 1 s gap
+        Check("0d cover: leaving cover for 400 ms, or drifting > 1.5 m for 600 ms, issues again (rate-limited to once a second); > 4 m at once",
+              !brief.issue && brief.suspend && !brief2.issue && lost.issue && lost.suspend && !near1.issue && !d1.issue && !d2.issue && d3.issue && gap.issue && gap.suspend,
+              F("brief %d %d lost %d near %d d %d%d%d gap %d", (int)brief.issue, (int)brief2.issue, (int)lost.issue, (int)near1.issue, (int)d1.issue, (int)d2.issue, (int)d3.issue,
+                (int)gap.issue));
+
+        CoverWindow u;                                            // the native could not be called: no suspend, the controller keeps the ped on the pose
+        u.Update(true, false, 0.0f, 0);
+        u.NoteIssueFailed();
+        const auto free1 = u.Update(true, false, 0.0f, 10);
+        CoverWindow e;                                            // the sender left cover before the puppet got in: ended once
+        e.Update(true, false, 0.0f, 0);
+        const auto early = e.Update(false, false, 0.0f, 100);
+        Check("0d cover: an uncallable native releases the ped at once; a flag that falls while the task is pending ends the window once",
+              free1.suspend == false && !free1.issue && u.CurrentPhase() == CP::Fallback && early.ended && !early.suspend && e.CurrentPhase() == CP::Idle && !e.Busy(),
+              F("free %d early %d", (int)free1.suspend, (int)early.ended));
+    }
     // Item 8: the aim task is only wanted with a weapon; the alt-tab fallback state.
     {
         Check("W8 item 8: the aim task needs the aiming flag, no ragdoll and a weapon (weapon 0 = none / not reported clears a stale one)",
@@ -2145,7 +2260,8 @@ int main()
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
     // + 0c 7 (hit by event, no event, gun, stale / action / edge, one report for both detectors, window gate, receiver swing trigger)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7;
+    // + 0d 6 (in TestW8 beside the climb window: pre-vault placement 1, climb accounting 1, cover window 4)
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {
