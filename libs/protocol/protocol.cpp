@@ -130,7 +130,10 @@ namespace gage::proto {
 
         // A full VehicleWorld entry after its id and header byte: u32 model, the motion (22), u8 flags,
         // u16 body, u16 engine, u16 fuel, u8 colour1, u8 colour2, (v5) u8 ageMs, u16 ctrl, u16 ownerId,
-        // u8 flags2, u8 doors, u8 seat mask, u16 player id per set bit (seat order). 43 bytes + 2 per occupant.
+        // u8 flags2, u8 doors, (v6) u8 tyres, u8 tyresRim, u8 windows, u8 seat mask, u16 player id per set bit (seat
+        // order). 46 bytes + 2 per occupant.
+        bool VisualValid(uint8_t tyres, uint8_t rim) { return (rim & ~tyres) == 0; } // a rim bit needs its tyre bit
+
         void PutVehicleFull(wire::Writer& w, const VehicleState& v)
         {
             w.u32(v.model);
@@ -146,6 +149,9 @@ namespace gage::proto {
             w.u16(v.ownerId);
             w.u8(v.flags2);
             w.u8(v.doors);
+            w.u8(v.tyres);
+            w.u8(v.tyresRim);
+            w.u8(v.windows);
             uint8_t mask = 0;
             for (size_t i = 0; i < kVehSeats; i++)
                 if (v.seats[i] != kNoPlayer) mask |= (uint8_t)(1u << i);
@@ -169,6 +175,9 @@ namespace gage::proto {
             v.ownerId = r.u16();
             v.flags2 = r.u8();
             v.doors = r.u8();
+            v.tyres = r.u8();
+            v.tyresRim = r.u8();
+            v.windows = r.u8();
             const uint8_t mask = r.u8();
             for (size_t i = 0; i < kVehSeats; i++)
             {
@@ -179,7 +188,7 @@ namespace gage::proto {
             }
             if (!r.ok()) return false;
             if (v.flags & ~kVehKnown) return false;
-            if (v.flags2 & ~kVeh2Known || v.doors & ~kDoorsKnown) return false;
+            if (v.flags2 & ~kVeh2Known || v.doors & ~kDoorsKnown || !VisualValid(v.tyres, v.tyresRim)) return false;
             if ((v.ctrl != kNoPlayer && v.ctrl >= kMaxPlayers) || (v.ownerId != kNoPlayer && v.ownerId >= kMaxPlayers)) return false;
             if (v.bodyHealth > kMaxVehicleHealth || v.engineHealth > kMaxVehicleHealth || v.fuelPermille > 1000) return false;
             return true;
@@ -390,7 +399,7 @@ namespace gage::proto {
             if (std::binary_search(m.removed.begin(), m.removed.end(), m.present[i])) return {}; // destroyed AND present
         }
         for (const VehicleState& v : m.vehicles)
-            if (!MotionEncodable(v.k, v.rot, v.avx, v.avy, v.avz, v.steer)) return {};
+            if (!MotionEncodable(v.k, v.rot, v.avx, v.avy, v.avz, v.steer) || (!v.motionOnly && !VisualValid(v.tyres, v.tyresRim))) return {};
         wire::Writer w;
         w.u8((uint8_t)Msg::VehicleWorld);
         w.u32(m.tick);
@@ -443,7 +452,7 @@ namespace gage::proto {
 
     Bytes Encode(const VehicleUpdate& m)
     {
-        if (m.vehId >= kMaxVehicles || !MotionEncodable(m.k, m.rot, m.avx, m.avy, m.avz, m.steer)) return {};
+        if (m.vehId >= kMaxVehicles || !MotionEncodable(m.k, m.rot, m.avx, m.avy, m.avz, m.steer) || !VisualValid(m.tyres, m.tyresRim)) return {};
         wire::Writer w;
         w.u8((uint8_t)Msg::VehicleUpdate);
         w.u32(m.seq);
@@ -455,6 +464,9 @@ namespace gage::proto {
         w.u16(m.sampleMs);
         w.u8(m.flags2);
         w.u8(m.doors);
+        w.u8(m.tyres);
+        w.u8(m.tyresRim);
+        w.u8(m.windows);
         return w.take();
     }
 
@@ -494,6 +506,46 @@ namespace gage::proto {
         w.u8(m.killed ? 1 : 0);
         w.i16(m.bone);
         w.u8(m.flags);
+        return w.take();
+    }
+
+    namespace
+    {
+        int16_t SatI16(double v)
+        {
+            const double r = std::floor(v + 0.5);
+            return (int16_t)(r > 32767.0 ? 32767 : (r < -32767.0 ? -32767 : r));
+        }
+        int8_t SatI8Unit(double v)
+        {
+            const double r = std::floor(v * 127.0 + 0.5);
+            return (int8_t)(r > 127.0 ? 127 : (r < -127.0 ? -127 : r));
+        }
+        uint8_t SatU8(double v)
+        {
+            const double r = std::floor(v + 0.5);
+            return (uint8_t)(r > 255.0 ? 255 : (r < 0.0 ? 0 : r));
+        }
+    }
+
+    Bytes Encode(const VehicleImpact& m)
+    {
+        if (m.vehId >= kMaxVehicles || m.otherId >= kMaxVehicles || !Finite(m.dvx) || !Finite(m.dvy) || !Finite(m.dyaw) || !Finite(m.nx) ||
+            !Finite(m.ny) || !Finite(m.closing) || !Finite(m.depth))
+            return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::VehicleImpact);
+        w.u32(m.seq);
+        w.u16(m.vehId);
+        w.u16(m.otherId);
+        w.u16(m.sampleMs);
+        w.i16(SatI16((double)m.dvx * 64.0));
+        w.i16(SatI16((double)m.dvy * 64.0));
+        w.i16(SatI16((double)m.dyaw * 256.0));
+        w.u8((uint8_t)SatI8Unit(m.nx));
+        w.u8((uint8_t)SatI8Unit(m.ny));
+        w.u8(SatU8((double)m.closing * 4.0));
+        w.u8(SatU8((double)m.depth * 100.0));
         return w.take();
     }
 
@@ -571,6 +623,37 @@ namespace gage::proto {
         wire::Writer w;
         w.u8((uint8_t)Msg::PeerAnimStop);
         w.u16(m.id);
+        return w.take();
+    }
+
+    namespace {
+        // The one place that says which SeatNotice fields are valid (Encode refuses, Decode refuses).
+        bool SeatNoticeValid(const SeatNotice& m)
+        {
+            const uint8_t kind = (uint8_t)m.kind;
+            if (kind < (uint8_t)SeatNoticeKind::Reserved || kind > (uint8_t)SeatNoticeKind::Exited) return false;
+            if (m.player >= kMaxPlayers || m.vehId >= kMaxVehicles || m.seat >= kVehSeats) return false;
+            switch (m.kind)
+            {
+            case SeatNoticeKind::Reserved:  return (m.detail & ~kSeatNoticeRun) == 0;
+            case SeatNoticeKind::Cancelled: return m.detail <= kSeatCancelLast;
+            case SeatNoticeKind::Seated:
+            case SeatNoticeKind::Exited:    return m.detail == 0;
+            }
+            return false;
+        }
+    }
+
+    Bytes Encode(const SeatNotice& m)
+    {
+        if (!SeatNoticeValid(m)) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::SeatNotice);
+        w.u8((uint8_t)m.kind);
+        w.u16(m.player);
+        w.u16(m.vehId);
+        w.u8(m.seat);
+        w.u8(m.detail);
         return w.take();
     }
 
@@ -841,7 +924,10 @@ namespace gage::proto {
         m.sampleMs = r.u16();
         m.flags2 = r.u8();
         m.doors = r.u8();
-        if (!r.done() || (m.flags & ~kVehKnown) || (m.flags2 & ~kVeh2Known) || (m.doors & ~kDoorsKnown) ||
+        m.tyres = r.u8();
+        m.tyresRim = r.u8();
+        m.windows = r.u8();
+        if (!r.done() || (m.flags & ~kVehKnown) || (m.flags2 & ~kVeh2Known) || (m.doors & ~kDoorsKnown) || !VisualValid(m.tyres, m.tyresRim) ||
             m.bodyHealth > kMaxVehicleHealth || m.engineHealth > kMaxVehicleHealth)
             return false;
         out = m;
@@ -897,6 +983,32 @@ namespace gage::proto {
         if (!r.done() || killed > 1 || (m.flags & ~kDmgKnown) || m.victimId >= kMaxPlayers || !PlayerIdOrNone(m.attackerId))
             return false;
         m.killed = killed == 1;
+        out = m;
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, VehicleImpact& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::VehicleImpact)) return false;
+        VehicleImpact m;
+        m.seq = r.u32();
+        m.vehId = r.u16();
+        m.otherId = r.u16();
+        m.sampleMs = r.u16();
+        const int16_t dvx = r.i16(), dvy = r.i16(), dyaw = r.i16();
+        const int8_t nx = (int8_t)r.u8(), ny = (int8_t)r.u8();
+        const uint8_t closing = r.u8(), depth = r.u8();
+        if (!r.done() || m.vehId >= kMaxVehicles || m.otherId >= kMaxVehicles || nx == -128 || ny == -128 || dvx == -32768 || dvy == -32768 ||
+            dyaw == -32768)
+            return false;
+        m.dvx = (float)dvx / 64.0f;
+        m.dvy = (float)dvy / 64.0f;
+        m.dyaw = (float)dyaw / 256.0f;
+        m.nx = (float)nx / 127.0f;
+        m.ny = (float)ny / 127.0f;
+        m.closing = (float)closing / 4.0f;
+        m.depth = (float)depth / 100.0f;
         out = m;
         return true;
     }
@@ -998,6 +1110,21 @@ namespace gage::proto {
         PeerAnimStop m;
         m.id = r.u16();
         if (!r.done() || m.id >= kMaxPlayers) return false;
+        out = m;
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, SeatNotice& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::SeatNotice)) return false;
+        SeatNotice m;
+        m.kind = (SeatNoticeKind)r.u8();
+        m.player = r.u16();
+        m.vehId = r.u16();
+        m.seat = r.u8();
+        m.detail = r.u8();
+        if (!r.done() || !SeatNoticeValid(m)) return false;
         out = m;
         return true;
     }
@@ -1156,7 +1283,7 @@ namespace gage::proto {
         if (!(Finite(u.avx) && Finite(u.avy) && Finite(u.avz) && Finite(u.steer))) return false;
         if (u.steer < -1.0f || u.steer > 1.0f) return false;
         return u.bodyHealth <= kMaxVehicleHealth && u.engineHealth <= kMaxVehicleHealth && (u.flags & ~kVehKnown) == 0 &&
-               (u.flags2 & ~kVeh2Known) == 0 && (u.doors & ~kDoorsKnown) == 0;
+               (u.flags2 & ~kVeh2Known) == 0 && (u.doors & ~kDoorsKnown) == 0 && VisualValid(u.tyres, u.tyresRim);
     }
 
     bool ValidAnimName(const std::string& name)
@@ -1223,6 +1350,8 @@ namespace gage::proto {
         case Msg::PeerAnim:         return "PeerAnim";
         case Msg::PeerScenario:     return "PeerScenario";
         case Msg::PeerAnimStop:     return "PeerAnimStop";
+        case Msg::SeatNotice:       return "SeatNotice";
+        case Msg::VehicleImpact:    return "VehicleImpact";
         }
         return "?";
     }
@@ -1267,6 +1396,33 @@ namespace gage::proto {
         case VehicleOp::SetColours: return "SetColours";
         case VehicleOp::Register:   return "Register";
         case VehicleOp::Release:    return "Release";
+        case VehicleOp::EnterIntent:  return "EnterIntent";
+        case VehicleOp::CancelIntent: return "CancelIntent";
+        }
+        return "?";
+    }
+
+    const char* ToString(SeatNoticeKind k)
+    {
+        switch (k)
+        {
+        case SeatNoticeKind::Reserved:  return "Reserved";
+        case SeatNoticeKind::Seated:    return "Seated";
+        case SeatNoticeKind::Cancelled: return "Cancelled";
+        case SeatNoticeKind::Exited:    return "Exited";
+        }
+        return "?";
+    }
+
+    const char* ToString(SeatCancelReason r)
+    {
+        switch (r)
+        {
+        case SeatCancelReason::ByPlayer:    return "ByPlayer";
+        case SeatCancelReason::Expired:     return "Expired";
+        case SeatCancelReason::Replaced:    return "Replaced";
+        case SeatCancelReason::VehicleGone: return "VehicleGone";
+        case SeatCancelReason::PlayerGone:  return "PlayerGone";
         }
         return "?";
     }

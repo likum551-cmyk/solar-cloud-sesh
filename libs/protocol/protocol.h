@@ -1,4 +1,4 @@
-// GAGE protocol v5: the messages between the GAGE client engine and the GAGE server
+// GAGE protocol v6: the messages between the GAGE client engine and the GAGE server
 // (docs/api/protocol.md has every byte layout; docs/ENGINE-PLAN.md the history). Transport is
 // ENet: channel kChanReliable carries control and chat (reliable, ordered), kChanState carries
 // per-tick movement (unreliable, sequenced).
@@ -45,6 +45,13 @@
 //   * Emotes: PlayAnim / PlayScenario / StopAnim (C->S) relayed as PeerAnim / PeerScenario /
 //     PeerAnimStop; the current looping one is replayed to newcomers like a look.
 //
+// v6 against v5 (desync overhaul round 2; the byte layouts are in docs/api/protocol.md, sections T1, 16 and T4):
+//   * T1 seats: VehicleOp EnterIntent (10) / CancelIntent (11) and Msg::SeatNotice (31): the server reserves a seat on an enter
+//     intent and tells every client, which replay the game's own enter task on the puppet.
+//   * T3 vehicle visual state: VehicleUpdate and the full VehicleWorld entry grow by u8 tyres, u8 tyresRim, u8 windows; flags2 bits
+//     6 / 7 are brake lights and handbrake; a vehicle Hit names a part in `bone` ((part << 8) | slot).
+//   * T4 collisions: Msg::VehicleImpact (40): the server's resolution of a contact between two controllers' vehicles.
+//
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
 //   * Sender-side sample time: PlayerState and VehicleUpdate carry a u16 sampleMs (the sender's own clock,
@@ -74,7 +81,8 @@ namespace gage::proto {
     // v4: live vehicles (VehicleUpdate, per-receiver VehicleWorld), health/hits/death, shotSeq, emotes.
     // v5: sampleMs, vehicle controller / owner / ageMs / motion-only entries / lights and doors, damage
     //     scaling inputs (Welcome.playerHealth, Damage bone and flags, Killed flags), PedState.vehId.
-    constexpr uint16_t kVersion = 5;
+    // v6: seat intents + SeatNotice, vehicle visual state (tyres, windows, brake lights), VehicleImpact.
+    constexpr uint16_t kVersion = 6;
 
     constexpr uint8_t kChanReliable = 0; // control, chat, join/leave: reliable ordered
     constexpr uint8_t kChanState    = 1; // PlayerState, WorldState, WorldCoarse: unreliable sequenced
@@ -172,8 +180,12 @@ namespace gage::proto {
         PeerAnim         = 28, // S->C reliable (v4): another player plays an animation
         PeerScenario     = 29, // S->C reliable (v4): another player starts a scenario
         PeerAnimStop     = 30, // S->C reliable (v4): another player stopped its animation / scenario
+        SeatNotice       = 31, // S->C reliable (T1 seats, wire v6): a player's enter / exit INTENT on a vehicle seat (see SeatNotice)
+        // 32..39 are reserved for further desync-round-2 messages (31 is T1 SeatNotice): the numbers
+        // between are not defined messages, a Decode of them fails and PeekType only range-checks.
+        VehicleImpact    = 40, // S->C reliable (T4, vehicle collisions): the server's resolution of a contact between two vehicles for one controller
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::PeerAnimStop;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::VehicleImpact;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -391,14 +403,16 @@ namespace gage::proto {
     constexpr uint8_t kVehDriverFlags = kVehEngine | kVehSiren | kVehHorn;
 
     // VehicleState.flags2 / VehicleUpdate.flags2 (v5, u8, CONTROLLER-owned: what the vehicle's controlling client
-    // sees on its own car). Bits 6..7 are reserved: Decode refuses them.
+    // sees on its own car). v6 uses the last two bits (brake lights, handbrake): none is reserved any more.
     constexpr uint8_t kVeh2Headlights  = 1u << 0; // headlights actually on (the controller's game state)
     constexpr uint8_t kVeh2HighBeam    = 1u << 1;
     constexpr uint8_t kVeh2Interior    = 1u << 2; // interior light
     constexpr uint8_t kVeh2IndicatorL  = 1u << 3;
     constexpr uint8_t kVeh2IndicatorR  = 1u << 4;
     constexpr uint8_t kVeh2RoofDown    = 1u << 5; // convertible roof lowered
-    constexpr uint8_t kVeh2Known       = (1u << 6) - 1;
+    constexpr uint8_t kVeh2Brake       = 1u << 6; // v6: brake lights on (the driver's foot brake while rolling forward, or the handbrake)
+    constexpr uint8_t kVeh2Handbrake   = 1u << 7; // v6: the driver holds the handbrake (the copy's wheels lock; clear = they roll free)
+    constexpr uint8_t kVeh2Known       = 0xFF;
     // VehicleState.doors / VehicleUpdate.doors (v5, u8): which doors stand open. Bits 6..7 are reserved.
     constexpr uint8_t kDoorFrontLeft   = 1u << 0;
     constexpr uint8_t kDoorFrontRight  = 1u << 1;
@@ -407,6 +421,26 @@ namespace gage::proto {
     constexpr uint8_t kDoorHood        = 1u << 4;
     constexpr uint8_t kDoorTrunk       = 1u << 5;
     constexpr uint8_t kDoorsKnown      = (1u << 6) - 1;
+
+    // v6 visual damage (VehicleState / VehicleUpdate `tyres`, `tyresRim`, `windows`; Hit.bone for a vehicle Hit). Wheel and
+    // window numbers are the game's own slots 0..7 (a car: 0/1 front left/right, 4/5 rear, 2/3 the middle pair of a
+    // 6-wheeler; a bike: 0 front, 4 rear; windows 0..5 front/rear doors, windscreens): the wire never names a model.
+    constexpr size_t kVehWheelSlots  = 8;
+    constexpr size_t kVehWindowSlots = 8;
+    // What a vehicle Hit reports besides body damage: `Hit.bone` = (part << 8) | slot, -1 (or anything else) = none.
+    enum class VehiclePart : uint8_t { None = 0, Tyre = 1, TyreRim = 2, Window = 3 };
+    constexpr int16_t VehiclePartCode(VehiclePart part, unsigned slot) { return (int16_t)(((unsigned)part << 8) | (slot & 0xFFu)); }
+    // False for a plain bone (-1 or a ped bone id) and for a slot out of range.
+    inline bool ParseVehiclePart(int16_t bone, VehiclePart& part, unsigned& slot)
+    {
+        if (bone < 0) return false;
+        const unsigned hi = ((unsigned)bone >> 8) & 0xFFu, lo = (unsigned)bone & 0xFFu;
+        if (hi < (unsigned)VehiclePart::Tyre || hi > (unsigned)VehiclePart::Window) return false;
+        if (lo >= (hi == (unsigned)VehiclePart::Window ? kVehWindowSlots : kVehWheelSlots)) return false;
+        part = (VehiclePart)hi;
+        slot = lo;
+        return true;
+    }
 
     // A rotation (unit quaternion, GTA's GET_ENTITY_QUATERNION order x, y, z, w). On the wire it is
     // a smallest-three u32 (quant.h): at most 0.28 degrees of rotation error.
@@ -426,8 +460,20 @@ namespace gage::proto {
         Register   = 8, // v4: adopt a local (ambient) car: arg = model hash, the tail carries where it is; the server
                         // creates a networked vehicle there and seats the requester in `seat`
         Release    = 9, // v5: give up ownership of vehId (its owner only): anybody may drive it from then on
+        EnterIntent  = 10, // T1 seats (wire v6): "I am about to get into seat N of vehId" (arg = seat | kIntentRun): the server RESERVES the
+                           // seat (same checks as Enter: range, NotOwner, taken or reserved by someone else, distance, lock, dead, not
+                           // already seated), answers Ok or the refusal, and tells every relevant client with a SeatNotice::Reserved.
+                           // The reservation ends with the player's Enter (SeatNotice::Seated), CancelIntent, Exit, a new intent, death,
+                           // disconnect, the vehicle's despawn or kIntentTtlMs (SeatNotice::Cancelled). It never seats anybody.
+        CancelIntent = 11, // T1 seats (wire v6): drop my reservation on vehId (Ok also when there is none); Exit while a reservation is
+                           // pending is the same
     };
-    constexpr uint8_t kVehicleOpLast = (uint8_t)VehicleOp::Release;
+    constexpr uint8_t kVehicleOpLast = (uint8_t)VehicleOp::CancelIntent;
+    // EnterIntent.arg: bits 0..7 the wire seat (0..kVehSeats-1), bit 8 kIntentRun (the player ran to the door; the replay walks
+    // when clear), every other bit reserved and refused (BadArg).
+    constexpr uint32_t kIntentRun = 0x100u;
+    constexpr uint32_t kIntentArgMask = 0x1FFu;
+    constexpr uint32_t kIntentTtlMs = 6000;  // a reservation the player never completes or cancels is dropped by the server after this
 
     // One networked vehicle as a client sees it in a VehicleWorld full entry.
     //   id            0..kMaxVehicles-1
@@ -449,11 +495,18 @@ namespace gage::proto {
     //                 empty vehicle keeps its last driver while that player is near, else the nearest player takes it
     //   ownerId       (v5) the player who owns the vehicle (spawned it and has not released it), kNoPlayer = nobody.
     //                 Only the owner may take its driver's seat (VehicleResultCode::NotOwner)
-    //   flags2, doors (v5) kVeh2* and kDoor* bit sets, the controller's lights and open doors
+    //   flags2, doors (v5) kVeh2* and kDoor* bit sets, the controller's lights and open doors; v6 adds brake lights and
+    //                 the handbrake (kVeh2Brake / kVeh2Handbrake) to flags2
+    //   tyres, tyresRim, windows (v6) per-wheel / per-window visual damage, bit i = slot i: `tyres` bit set = the tyre is
+    //                 burst (flat), `tyresRim` bit set = completely burst, off the rim (always a subset of `tyres`:
+    //                 Decode refuses a rim bit without its tyre bit), `windows` bit set = smashed. The server merges the
+    //                 controller's report with the Hits that popped something of a car the shooter does not control
+    //                 (VehicleStore::HitPart); full entries only, a change rides the usual 3 fresh frames
     //   motionOnly    (v5) decode only: this entry was a motion-only entry (header 2) carrying id, ageMs, k, rot,
     //                 avx..avz, steer and flags; every other field above is NOT in it and holds a default, and the
     //                 receiver keeps what it already has. Encode writes the motion-only form for a state with this
     //                 set. flags is complete (kVeh* bits), flags2 and doors are not in a motion-only entry
+    //                 (nor are tyres, tyresRim and windows, v6)
     struct VehicleState
     {
         uint16_t   id = 0;
@@ -473,6 +526,7 @@ namespace gage::proto {
         uint16_t   ownerId = kNoPlayer;
         uint8_t    flags2 = 0;
         uint8_t    doors = 0;
+        uint8_t    tyres = 0, tyresRim = 0, windows = 0;   // v6
         bool       motionOnly = false;
     };
 
@@ -485,7 +539,7 @@ namespace gage::proto {
     //             the distance rate, parked ones about once a second, any change or newcomer at once
     //             and for 3 frames). A present vehicle without a state keeps what you have. v5: an entry
     //             is a full state or, for a vehicle that moves and whose static fields (model, health,
-    //             fuel, colours, seats, ctrl, owner, flags2, doors) did not change, a motion-only entry
+    //             fuel, colours, seats, ctrl, owner, flags2, doors, v6 tyres/tyresRim/windows) did not change, a motion-only entry
     //             (VehicleState::motionOnly); a newcomer, a change and one entry a second are full.
     //   removed   ascending, never also present: vehicles that were DESTROYED (despawned), repeated in
     //             3 frames. Apply removals before anything else.
@@ -518,7 +572,9 @@ namespace gage::proto {
     // VehicleUpdate from that player, inside the world box and under Config::vehicleMaxSpeed. The
     // server copies position, velocity, rotation, angular velocity, steering, the driver flags
     // (kVehDriverFlags; the others in `flags` are ignored) and, v5, flags2 and doors; a health can only
-    // go down this way. `sampleMs` (v5): the sender's clock when the sample was taken, as in PlayerState.
+    // go down this way. v6: `tyres`, `tyresRim` and `windows` are what the controller's own car shows (the server merges
+    // them with the visual-damage Hits it took for this car; a bit the controller does not show is dropped once it
+    // had its chance to show it, see VehicleStore::Update). `sampleMs` (v5): the sender's clock when the sample was taken, as in PlayerState.
     struct VehicleUpdate
     {
         uint32_t   seq = 0;
@@ -533,6 +589,7 @@ namespace gage::proto {
         uint16_t   sampleMs = 0;
         uint8_t    flags2 = 0;
         uint8_t    doors = 0;
+        uint8_t    tyres = 0, tyresRim = 0, windows = 0;   // v6
     };
 
     // The answer to every VehicleCmd, to its sender (reliable): `op` and `vehId` (the assigned id for
@@ -561,13 +618,49 @@ namespace gage::proto {
         uint16_t          vehId = 0;
     };
 
+    // T1 seats (wire v6): the server's account of a player's enter / exit INTENT, to every client that has the vehicle in range
+    // (and to the actor), reliable and in order with the server's other reliable traffic. VehicleWorld.seats stays the only
+    // truth about OCCUPANCY; this carries what the seat list cannot: that somebody is ON THE WAY into a seat (so every screen
+    // can play the real enter task instead of a warp), which seat, and when an intent died without a seating.
+    //   Reserved   `player` reserved `seat` of `vehId` (detail bit 0 kSeatNoticeRun: it ran to the door). Replaces that player's
+    //              older reservation (a Cancelled/Replaced for the old one precedes it).
+    //   Seated     the reservation became occupancy: `player` now holds `seat` (the VehicleWorld names it from the same tick on).
+    //   Cancelled  the reservation ended without a seating; detail = SeatCancelReason.
+    //   Exited     `player` left `seat` by its own Exit (the normal exit animation is due; a death, disconnect or despawn is NOT
+    //              announced this way, those only drop the seat from the list).
+    // Decode refuses an unknown kind, a player at or above kMaxPlayers, a vehicle at or above kMaxVehicles, a seat at or above
+    // kVehSeats, and a detail that is not defined for the kind (Reserved: only bit 0; Cancelled: a SeatCancelReason; others 0).
+    enum class SeatNoticeKind : uint8_t { Reserved = 1, Seated = 2, Cancelled = 3, Exited = 4 };
+    enum class SeatCancelReason : uint8_t
+    {
+        ByPlayer    = 0, // CancelIntent / Exit while pending
+        Expired     = 1, // kIntentTtlMs passed
+        Replaced    = 2, // the same player reserved another seat (or entered another seat / vehicle)
+        VehicleGone = 3, // the vehicle was despawned
+        PlayerGone  = 4, // the player disconnected, died or was put elsewhere
+    };
+    constexpr uint8_t kSeatCancelLast = (uint8_t)SeatCancelReason::PlayerGone;
+    constexpr uint8_t kSeatNoticeRun = 1;
+    struct SeatNotice
+    {
+        SeatNoticeKind kind = SeatNoticeKind::Reserved;
+        uint16_t       player = kNoPlayer;
+        uint16_t       vehId = 0;
+        uint8_t        seat = 0;
+        uint8_t        detail = 0;
+    };
+
     // ---- combat (v4): server-owned health -------------------------------------
     // A shooter's client reports each hit its game registered (Hit); the server validates it
     // (shooter and target alive, target relevant to the shooter, within Config::maxHitDistance, at
     // most 30 hits a second, damage clamped to kMaxHitDamage) and applies it: armour first, then
     // health. A Hit whose target is the sender itself is environmental damage (a fall, fire, a crash):
     // always accepted while alive, without the range checks. A vehicle hit takes `damage` off the
-    // body health and half of it off the engine health.
+    // body health and half of it off the engine health. v6: a vehicle Hit may also name a part in `bone`
+    // (VehiclePartCode: a tyre burst, a tyre off its rim, a smashed window): the shooter's client saw that
+    // happen on its copy of a car it does not control, and once the Hit passes the same checks the server
+    // sets that bit of the car's visual state for everybody (VehicleStore::HitPart). A bone that is not a part
+    // is ignored for vehicles, as before.
     enum class HitKind : uint8_t { Player = 1, Vehicle = 2 };
     constexpr uint16_t kMaxHitDamage = 250;
     struct Hit
@@ -644,6 +737,27 @@ namespace gage::proto {
     struct PeerScenario { uint16_t id = 0; std::string name; };
     struct PeerAnimStop { uint16_t id = 0; };
 
+    // ---- T4: vehicle collisions (docs/sync-specs/vehicle-collisions.md, docs/api/protocol.md "T4 vehicle impact") ----
+    // The server resolves a contact between two vehicles that DIFFERENT clients simulate (it has both tracks on one time base) and tells
+    // each controller its half, once per contact. Reliable; to the vehicle's controller only.
+    //   seq        the server's impact counter (a duplicate or older one is ignored)
+    //   vehId      the vehicle YOU control that was hit; otherId the vehicle it hit
+    //   sampleMs   the contact time on YOUR sample clock (the VehicleUpdate.sampleMs domain: whole ms of your clock, wraps at 65536)
+    //   dvx, dvy   the change of your vehicle's velocity (world x, y; m/s); dyaw the change of its yaw rate (rad/s, counter-clockwise)
+    //   nx, ny     the contact normal from your vehicle toward the other one (unit)
+    //   closing    the closing speed along the normal before the impact (m/s); depth the overlap of the two (m, 0 = they only touched)
+    // On the wire dv is an i16 in 1/64 m/s, dyaw an i16 in 1/256 rad/s, n an i8 pair in 1/127, closing a u8 in 0.25 m/s, depth a u8 in cm.
+    struct VehicleImpact
+    {
+        uint32_t seq = 0;
+        uint16_t vehId = 0, otherId = 0;
+        uint16_t sampleMs = 0;
+        float    dvx = 0, dvy = 0, dyaw = 0;
+        float    nx = 0, ny = 0;
+        float    closing = 0, depth = 0;
+    };
+    constexpr size_t kVehicleImpactBytes = 21;
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -691,6 +805,9 @@ namespace gage::proto {
     Bytes Encode(const PeerAnim& m);
     Bytes Encode(const PeerScenario& m);
     Bytes Encode(const PeerAnimStop& m);
+    Bytes Encode(const SeatNotice& m);   // T1 seats: empty (refused) for a field Decode would refuse
+    // T4: refuses a non-finite value or a vehicle id at or above kMaxVehicles; saturates dv, dyaw, closing and depth at the wire's range.
+    Bytes Encode(const VehicleImpact& m);
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -721,6 +838,7 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, VehicleCmd& out);
     // PlayerLook / PeerLook decode any wire value (a PeerLook id must be below kMaxPlayers);
     // ValidLook is the range policy.
+    bool Decode(const uint8_t* p, size_t n, SeatNotice& out);   // T1 seats
     bool Decode(const uint8_t* p, size_t n, PlayerLook& out);
     bool Decode(const uint8_t* p, size_t n, PeerLook& out);
     bool Decode(const uint8_t* p, size_t n, VehicleUpdate& out);
@@ -736,6 +854,8 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, PeerAnim& out);
     bool Decode(const uint8_t* p, size_t n, PeerScenario& out);
     bool Decode(const uint8_t* p, size_t n, PeerAnimStop& out);
+    // T4: exactly kVehicleImpactBytes bytes; refuses a vehicle id at or above kMaxVehicles and -128 in an i8 field.
+    bool Decode(const uint8_t* p, size_t n, VehicleImpact& out);
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would
@@ -789,5 +909,7 @@ namespace gage::proto {
     const char* ToString(LeaveReason r);
     const char* ToString(VehicleOp op);
     const char* ToString(VehicleResultCode c);
+    const char* ToString(SeatNoticeKind k);
+    const char* ToString(SeatCancelReason r);
 
 }

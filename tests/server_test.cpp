@@ -945,8 +945,8 @@ static void QueryLiveTests()
         int size = 0;
         const query::Nonce n1 = MakeNonce(0xA1);
         const bool got = AskQuery(rig, udp, n1, rep, &size);
-        Check("query live: a request is answered with exactly 24 bytes carrying protocol 5 (kVersion), players 2, maxPlayers 8 and the nonce",
-              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 5 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
+        Check("query live: a request is answered with exactly 24 bytes carrying protocol 6 (kVersion), players 2, maxPlayers 8 and the nonce",
+              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 6 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
               got ? "players " + std::to_string(rep.players) : "no reply");
         query::Reply rep2;
         const query::Nonce n2 = MakeNonce(0x5C);
@@ -1337,7 +1337,7 @@ static void AnnounceTests()
                   NumField(p.v, "port") == rig.srv.port() && StrField(p.v, "name") == cfg.name &&
                   StrField(p.v, "gamemode") == "race" && StrField(p.v, "lang") == "pt-BR" &&
                   StrField(p.v, "url") == "https://example.org/x" && NumField(p.v, "players") == 0 &&
-                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 5, // v5: the master list shows protocol 5
+                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 6, // v6: the master list shows protocol 6
               first ? r0.head + "\n" + r0.body : "no request");
 
         Probe a(rig);
@@ -2604,9 +2604,9 @@ static void VehicleV5UnitTests()
         const Code fromOther = vs.Update(1, other, 1010);
         const bool unchanged = vs.Get(v)->s.flags2 == u.flags2 && vs.Get(v)->s.doors == u.doors;
         proto::VehicleUpdate reserved = UnitDrive(v, 0, 1, 10);
-        reserved.flags2 = 0x40;
+        reserved.tyresRim = 0x04;                        // v6: flags2 has no reserved bit left; a rim bit without its tyre bit is the refusal
         const Code badFlags = vs.Update(0, reserved, 1020);
-        reserved.flags2 = 0;
+        reserved.tyresRim = 0;
         reserved.doors = 0x80;
         const Code badDoors = vs.Update(0, reserved, 1030);
         proto::VehicleWorld w;
@@ -2614,7 +2614,7 @@ static void VehicleV5UnitTests()
         const bool wire = w.vehicles.size() == 1 && w.vehicles[0].flags2 == u.flags2 && w.vehicles[0].doors == u.doors &&
                           w.vehicles[0].ctrl == 0 && w.vehicles[0].ownerId == proto::kNoPlayer;
         Check("vehicles v5: flags2 (lights, indicators, roof) and doors are the controller's alone - taken from its Update, ignored from anybody else (NotAllowed), "
-              "BadArg with a reserved bit - and ride the VehicleWorld entry with ctrl and ownerId",
+              "BadArg with a reserved doors bit or a rim bit without its tyre bit - and ride the VehicleWorld entry with ctrl and ownerId",
               fromCtrl == Code::Ok && stored && fromOther == Code::NotAllowed && unchanged && badFlags == Code::BadArg && badDoors == Code::BadArg && wire);
     }
 
@@ -2656,10 +2656,10 @@ static void VehicleV5UnitTests()
             proto::VehicleWorld mine;
             if (vs.BuildFrame(0, true, At(0, 0), tick, now, mine) && !mine.vehicles.empty()) driverFulls++;
         }
-        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 43 + 2 per occupant when full (one occupant: 47).
+        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 46 + 2 per occupant when full (v6: tyres, rim, windows; one occupant: 50).
         Check("vehicles v5: for a receiver of a driven car the entries are full for the first 3 frames and then about once a second (20 ticks) and motion-only "
               "(a 34-byte frame, entry 26 bytes) in between, every one with its age; the driver itself gets full states only at the parked rate",
-              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 43 + 2 &&
+              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 46 + 2 &&
                   driverFulls <= 5,
               std::to_string(fulls) + " full, " + std::to_string(motion) + " motion-only, " + std::to_string(motionBytes) + "/" + std::to_string(fullBytes) +
                   " bytes, driver " + std::to_string(driverFulls));
@@ -3106,6 +3106,8 @@ static void PipelineHealthTests()
     }
 }
 
+#include "t4_server_tests.h"
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -3134,6 +3136,8 @@ int main()
     AuthorityUnitTests();
     std::printf("-- vehicles v5: ownership, controller, ages, motion-only entries\n");
     VehicleV5UnitTests();
+    std::printf("-- T4: vehicle collisions (claim of a driverless vehicle, speed cap clamp)\n");
+    t4srv::T4ServerTests();
     std::printf("-- damage scaling (damage.h)\n");
     DamageScaleUnitTests();
     std::printf("-- tick clock and sample ages (N6c)\n");
@@ -3146,7 +3150,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 111; // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 111 + t4srv::kT4ServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

@@ -249,10 +249,10 @@ static void CodecTests()
                                               0x20, 0x00, 0xE0, 0xFF, 0x10, 0x00};            // velocity
         proto::Hello h;
         h.name = "Al";
-        // v5 (deliberate): the frozen Hello layout now carries version 5.
-        const proto::Bytes wantHello = {1, 5, 0, 2, 0, 'A', 'l'}; // type, u16 version 5, u16 length, bytes
-        Check("codec: Hello is type, u16 version (5), u16-length string, little-endian",
-              proto::kVersion == 5 && proto::Encode(h) == wantHello, Hex(proto::Encode(h)));
+        // v6 (deliberate): the frozen Hello layout now carries version 6.
+        const proto::Bytes wantHello = {1, 6, 0, 2, 0, 'A', 'l'}; // type, u16 version 6, u16 length, bytes
+        Check("codec: Hello is type, u16 version (6), u16-length string, little-endian",
+              proto::kVersion == 6 && proto::Encode(h) == wantHello, Hex(proto::Encode(h)));
 
         // v3 (deliberate): PlayerState is the v2 29 bytes plus the ped block; v4 (deliberate): the ped block
         // gains the shot byte (8 bytes): 37, 43 while aiming; v5 (deliberate): + u16 sampleMs after the ack: 39, 45.
@@ -381,14 +381,15 @@ static void CodecTests()
     // PeekType.
     {
         proto::Msg m = proto::Msg::Hello;
-        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; 31 is the first unknown one.
-        const uint8_t zero = 0, firstUnknown = 31, ff = 255;
+        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; T1 (v6): 31 SeatNotice; T4 (v6): 40 VehicleImpact
+        // (32..39 are reserved for other round-2 messages; PeekType only range-checks them). 41 is the first value past the last message.
+        const uint8_t zero = 0, firstUnknown = 41, ff = 255, impact = 40;
         bool allKnown = true;
-        for (uint8_t t = 1; t <= 30; t++)
+        for (uint8_t t = 1; t <= 31; t++)
             allKnown = allKnown && proto::PeekType(&t, 1, m) && (uint8_t)m == t;
-        Check("codec: PeekType accepts 1..30 and rejects empty, 0, 31, 255",
-              allKnown && proto::kMsgLast == 30 && !proto::PeekType(&zero, 0, m) && !proto::PeekType(nullptr, 0, m) &&
-                  !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
+        Check("codec: PeekType accepts 1..31 and 40 and rejects empty, 0, 41, 255",
+              allKnown && proto::kMsgLast == 40 && proto::PeekType(&impact, 1, m) && m == proto::Msg::VehicleImpact && !proto::PeekType(&zero, 0, m) &&
+                  !proto::PeekType(nullptr, 0, m) && !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
     }
 
     // Non-finite floats, in each of the seven fields, in PlayerState and a WorldState entry.
@@ -1771,6 +1772,9 @@ static proto::VehicleState SampleVehicle()
     v.ownerId = 5;
     v.flags2 = proto::kVeh2Headlights | proto::kVeh2Interior | proto::kVeh2IndicatorR; // 0x15
     v.doors = proto::kDoorFrontLeft | proto::kDoorTrunk;                              // 0x21
+    v.tyres = 0x11;                                                                    // v6: wheel slots 0 and 4 burst
+    v.tyresRim = 0x10;                                                                 // ... slot 4 off its rim
+    v.windows = 0x30;                                                                  // ... windows 4 and 5 smashed
     return v;
 }
 
@@ -1823,6 +1827,9 @@ static std::vector<VSample> V4Samples()
     up.sampleMs = 0x5566;                                    // v5
     up.flags2 = proto::kVeh2Headlights | proto::kVeh2IndicatorL; // 0x09
     up.doors = proto::kDoorFrontRight | proto::kDoorHood;        // 0x12
+    up.tyres = 0x06;                                             // v6: slots 1 and 2 burst
+    up.tyresRim = 0x02;                                          // ... slot 1 off its rim
+    up.windows = 0x01;                                           // ... window 0 smashed
     up.vehId = 5;
     up.k = Kin(1.0f, 2.0f, 3.0f, 0.0f, 5.0f, 6.0f, 7.0f);
     up.avz = 0.25f;
@@ -1938,7 +1945,9 @@ static void VehicleCodecTests()
             v && w.tick == 0x01020304u && w.removed == std::vector<uint16_t>{7} && w.present == std::vector<uint16_t>{5, 9, 11} &&
             w.vehicles.size() == 2 && !v->motionOnly && v->ageMs == 12 && v->ctrl == 3 && v->ownerId == 5 &&
             v->flags2 == (proto::kVeh2Headlights | proto::kVeh2Interior | proto::kVeh2IndicatorR) &&
-            v->doors == (proto::kDoorFrontLeft | proto::kDoorTrunk) && w.vehicles[1].motionOnly && w.vehicles[1].id == 11 &&
+            v->doors == (proto::kDoorFrontLeft | proto::kDoorTrunk) && v->tyres == 0x11 && v->tyresRim == 0x10 && v->windows == 0x30 &&
+            w.vehicles[1].tyres == 0 && w.vehicles[1].windows == 0 && up.tyres == 0x06 && up.tyresRim == 0x02 && up.windows == 0x01 &&
+            w.vehicles[1].motionOnly && w.vehicles[1].id == 11 &&
             w.vehicles[1].ageMs == 30 && w.vehicles[1].flags == proto::kVehEngine && w.vehicles[1].k.vz == 7.0f &&
             w.vehicles[1].steer == -1.0f && w.vehicles[1].model == 0 && w.vehicles[1].ctrl == proto::kNoPlayer &&
             up.sampleMs == 0x5566 && up.flags2 == (proto::kVeh2Headlights | proto::kVeh2IndicatorL) &&
@@ -1978,6 +1987,7 @@ static void VehicleCodecTests()
             0x0C,                                           // v5: ageMs 12
             0x03, 0x00, 0x05, 0x00,                         // v5: ctrl player 3, ownerId player 5
             0x15, 0x21,                                     // v5: flags2 headlights | interior | indicator R, doors FL | trunk
+            0x11, 0x10, 0x30,                               // v6: tyres slots 0 + 4 burst, rim slot 4, windows 4 + 5 smashed
             0x05, 0x03, 0x00, 0x05, 0x00,                   // seat mask 0b101: seat 0 = player 3, seat 2 = player 5
             0x09, 0x00,                                     // id 9, header 0 = present, no full state
             0x0B, 0x02,                                     // v5: id 11, header 2 = motion-only entry follows
@@ -1995,7 +2005,8 @@ static void VehicleCodecTests()
                                      0xFF, 0xFD, 0xF7, 0xDF, 0x00, 0x00, 0x04, 0x7F,       // rotation, av 0 0 4, steer 127
                                      0x14, 0xE7, 0x03, 0xE8, 0x03,                          // flags engine | horn, body 999, engine 1000
                                      0x66, 0x55,                                            // v5: sampleMs 0x5566
-                                     0x09, 0x12};                                           // v5: flags2 headlights | indicator L, doors FR | hood
+                                     0x09, 0x12,                                            // v5: flags2 headlights | indicator L, doors FR | hood
+                                     0x06, 0x02, 0x01};                                     // v6: tyres slots 1 + 2, rim slot 1, window 0
         const proto::Bytes wantHit = {0x14, 0x01, 0x02, 0x00, 0x71, 0xD5, 0x06, 0x1B, 0x22, 0x00, 0x6E, 0x79, 0x09};
         const proto::Bytes wantDmg = {0x15, 0x02, 0x00, 0x01, 0x00, 0x71, 0xD5, 0x06, 0x1B, 0x22, 0x00, 0x42, 0x00, 0x00,
                                       0x6E, 0x79,   // v5: bone 31086
@@ -2003,10 +2014,10 @@ static void VehicleCodecTests()
         const proto::Bytes wantKilled = {0x16, 0x02, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
                                          0x03};     // v5: flags headshot | melee
         const proto::Bytes wantStop = {0x1E, 0x04, 0x00};
-        Check("codec v5: VehicleWorld (u8 ids, presence list, 43 + 2-per-occupant full entry, 24-byte motion-only entry), VehicleCmd (Register tail), "
-              "VehicleUpdate (37 bytes), Hit, Damage (17), Killed (10) and PeerAnimStop are laid out byte for byte",
+        Check("codec v6: VehicleWorld (u8 ids, presence list, 46 + 2-per-occupant full entry, 24-byte motion-only entry), VehicleCmd (Register tail), "
+              "VehicleUpdate (40 bytes), Hit, Damage (17), Killed (10) and PeerAnimStop are laid out byte for byte",
               vs[0].bytes == wantWorld && vs[1].bytes == wantLock && vs[2].bytes == wantReg && vs[3].bytes == wantUp &&
-                  vs[5].bytes == wantHit && vs[6].bytes == wantDmg && vs[7].bytes == wantKilled && wantUp.size() == 37 &&
+                  vs[5].bytes == wantHit && vs[6].bytes == wantDmg && vs[7].bytes == wantKilled && wantUp.size() == 40 &&
                   wantDmg.size() == 17 && wantKilled.size() == 10 && vs[15].bytes == wantStop && proto::Encode(proto::Respawn()).size() == 1,
               Hex(vs[0].bytes) + "| " + Hex(vs[2].bytes) + "| " + Hex(vs[3].bytes) + "| " + Hex(vs[5].bytes) + "| " + Hex(vs[6].bytes) + "| " +
                   Hex(vs[7].bytes));
@@ -2055,23 +2066,24 @@ static void VehicleCodecTests()
             return DecodeAs<proto::VehicleWorld>(b.data(), b.size());
         };
         // Offsets: 9 id 5, 10 its header, 15..22 position, 29..32 rotation, 33..35 av, 36 steer, 37 flags,
-        // 38/39 body, 42/43 fuel, 46 ageMs, 47/48 ctrl, 49/50 ownerId, 51 flags2, 52 doors, 53 seat mask, 54/55 the first
-        // occupant, 58 the second entry's id, 59 its header, 60 the third entry's id, 61 its header (2: motion-only),
-        // 62 its ageMs, 63..84 its motion (84 steering), 85 its flags.
+        // 38/39 body, 42/43 fuel, 46 ageMs, 47/48 ctrl, 49/50 ownerId, 51 flags2, 52 doors, 53 tyres, 54 tyresRim (v6),
+        // 55 windows, 56 seat mask, 57/58 the first occupant, 61 the second entry's id, 62 its header, 63 the third entry's id,
+        // 64 its header (2: motion-only), 65 its ageMs, 66..87 its motion (87 steering), 88 its flags.
         std::string bad;
         if (worldWith(10, 0x03)) bad += "[reserved header bit]";
         if (worldWith(10, 0x04)) bad += "[header 4]";
-        if (worldWith(59, 0x04)) bad += "[reserved header bit, no state]";
-        if (worldWith(59, 0x03)) bad += "[header 3 on a presence-only entry]";
-        if (worldWith(61, 0x01)) bad += "[motion-only entry read as a full one]";
-        if (worldWith(61, 0x00)) bad += "[motion-only entry read as presence-only]";
-        if (worldWith(51, 0x55)) bad += "[flags2 bit 6]";
+        if (worldWith(62, 0x04)) bad += "[reserved header bit, no state]";
+        if (worldWith(62, 0x03)) bad += "[header 3 on a presence-only entry]";
+        if (worldWith(64, 0x01)) bad += "[motion-only entry read as a full one]";
+        if (worldWith(64, 0x00)) bad += "[motion-only entry read as presence-only]";
+        if (!worldWith(51, 0xFF)) bad += "[flags2 with bits 6 and 7 (brake lights, handbrake) is legal in v6]";
+        if (worldWith(53, 0x00)) bad += "[rim bit without its tyre bit]";
         if (worldWith(52, 0x61)) bad += "[doors bit 6]";
         if (worldWith(48, 0x04)) bad += "[ctrl over kMaxPlayers]";
         if (worldWith(50, 0x04)) bad += "[ownerId over kMaxPlayers]";
-        if (worldWith(84, 0x80)) bad += "[motion-only steering -128]";
-        if (worldWith(85, 0x24)) bad += "[motion-only unknown flag 32]";
-        if (worldWith(58, 0x05)) bad += "[present not ascending]";
+        if (worldWith(87, 0x80)) bad += "[motion-only steering -128]";
+        if (worldWith(88, 0x24)) bad += "[motion-only unknown flag 32]";
+        if (worldWith(61, 0x05)) bad += "[present not ascending]";
         if (worldWith(9, 0x07)) bad += "[present and removed]";
         if (worldWith(6, 0x09)) bad += "[removed and present]";
         if (worldWith(32, 0xFF)) bad += "[rotation code 1023]"; // 0xFFF7FDFF: bits 20..29 = 1023
@@ -2080,8 +2092,8 @@ static void VehicleCodecTests()
         if (worldWith(37, 0x23)) bad += "[unknown flag 32]";
         if (worldWith(39, 0x04)) bad += "[body over 1000]";
         if (worldWith(43, 0x04)) bad += "[fuel over 1000]";
-        if (worldWith(55, 0x04)) bad += "[occupant id over kMaxPlayers]";
-        if (worldWith(53, 0x07)) bad += "[seat mask lies]";
+        if (worldWith(58, 0x04)) bad += "[occupant id over kMaxPlayers]";
+        if (worldWith(56, 0x07)) bad += "[seat mask lies]";
         if (worldWith(8, 0x01) || worldWith(7, 0x04)) bad += "[present count lies]"; // 259 present; 4 present with 3 listed
         // Out of the box: z = -2^19 cm (-5243 m, the 20-bit field's minimum) fits the field but not the box.
         {
@@ -2115,16 +2127,18 @@ static void VehicleCodecTests()
             b[off] = v;
             return DecodeAs<proto::VehicleUpdate>(b.data(), b.size());
         };
-        // Offsets: 27 steering, 28 flags, 29/30 body, 33/34 sampleMs, 35 flags2, 36 doors.
+        // Offsets: 27 steering, 28 flags, 29/30 body, 33/34 sampleMs, 35 flags2, 36 doors, 37 tyres, 38 tyresRim, 39 windows.
         if (upWith(28, 0x34)) bad += "[update flag 32]";
         if (upWith(30, 0x04)) bad += "[update body over 1000]";
         if (upWith(27, 0x80)) bad += "[update steering -128]";
-        if (upWith(35, 0x49)) bad += "[update flags2 bit 6]";
-        if (upWith(35, 0x89)) bad += "[update flags2 bit 7]";
+        if (!upWith(35, 0xFF)) bad += "[update flags2 bits 6 and 7 are legal in v6]";
+        if (upWith(37, 0x00)) bad += "[update rim bit without its tyre bit]";
+        if (upWith(38, 0x07)) bad += "[update rim bits beyond the tyre bits]";
+        if (!upWith(37, 0xFF) || !upWith(39, 0xFF) || !upWith(38, 0x00)) bad += "[update: any tyre / window mask is legal when rim is a subset]";
         if (upWith(36, 0x52)) bad += "[update doors bit 6]";
         if (upWith(36, 0x92)) bad += "[update doors bit 7]";
         if (!upWith(33, 0xFF) || !upWith(35, 0x3F) || !upWith(36, 0x3F)) bad += "[update: every sampleMs, all 6 flags2 and door bits are legal]";
-        Check("codec v5: VehicleWorld refuses reserved header bits, unordered or doubly listed ids, rotation code 1023, "
+        Check("codec v6: VehicleWorld refuses reserved header bits, unordered or doubly listed ids, rotation code 1023, "
               "-128 in an i8, unknown flags, health or fuel over 1000, a bad occupant id, lying counts and out-of-box positions; "
               "256 present ids decode, 257 do not; VehicleUpdate refuses the same field errors",
               bad.empty(), bad);
@@ -2133,7 +2147,7 @@ static void VehicleCodecTests()
     // VehicleCmd ops and the Register tail.
     {
         int known = 0, accepted = 0;
-        for (int op = 1; op <= 9; op++)
+        for (int op = 1; op <= 11; op++)
         {
             proto::VehicleCmd c;
             c.vehId = 1;
@@ -2141,7 +2155,7 @@ static void VehicleCodecTests()
             const proto::Bytes b = proto::Encode(c);
             if (DecodeAs<proto::VehicleCmd>(b.data(), b.size())) known++;
         }
-        for (int op : {0, 10, 255})
+        for (int op : {0, 12, 255})
         {
             wire::Writer w;
             w.u8((uint8_t)proto::Msg::VehicleCmd);
@@ -2159,9 +2173,9 @@ static void VehicleCodecTests()
         const bool tails = !DecodeAs<proto::VehicleCmd>(regNoTail.data(), regNoTail.size()) &&
                            !DecodeAs<proto::VehicleCmd>(lockWithTail.data(), lockWithTail.size()) &&
                            !DecodeAs<proto::VehicleCmd>(regBadRot.data(), regBadRot.size());
-        Check("codec v5: VehicleCmd accepts ops 1..9 (Release new), rejects 0, 10 and 255, a Register without its tail, "
+        Check("codec v5/v6: VehicleCmd accepts ops 1..11 (Release v5, EnterIntent and CancelIntent v6), rejects 0, 12 and 255, a Register without its tail, "
               "a tail on another op and an invalid rotation",
-              known == 9 && accepted == 0 && tails, std::to_string(known) + " known, " + std::to_string(accepted) + " bad accepted");
+              known == 11 && accepted == 0 && tails, std::to_string(known) + " known, " + std::to_string(accepted) + " bad accepted");
     }
 
     // Combat and emote refusals, and the Valid* helpers.
@@ -2181,8 +2195,8 @@ static void VehicleCodecTests()
         if (!patched(7, 9, 0x00) || !patched(7, 9, 0x01)) bad += "[killed flags 0..3 are legal]";
         if (patched(4, 2, 13)) bad += "[result code 13]";
         if (!patched(4, 2, 12)) bad += "[result code 12 (NotOwner) refused]";
-        if (patched(4, 1, 10)) bad += "[result op 10]";
-        if (!patched(4, 1, 9)) bad += "[result op 9 (Release) refused]";
+        if (patched(4, 1, 12)) bad += "[result op 12]";
+        if (!patched(4, 1, 9) || !patched(4, 1, 10) || !patched(4, 1, 11)) bad += "[result op 9 (Release) / 10 (EnterIntent) / 11 (CancelIntent) refused]";
         {
             proto::RespawnOk r;
             r.x = std::numeric_limits<float>::quiet_NaN();
@@ -2223,7 +2237,7 @@ static void VehicleCodecTests()
         if (!proto::ValidVehicleUpdate(u) || proto::ValidVehicleUpdate(uBad) || !proto::Encode(uBad).empty() ||
             proto::ValidVehicleUpdate(uRot))
             bad += "[ValidVehicleUpdate]";
-        Check("codec v5: Hit kind, Damage killed / victim / flags, Killed flags, VehicleResult op (Release 9 legal, 10 not) / code (NotOwner 12 legal, 13 not) and non-finite RespawnOk are refused; anim names "
+        Check("codec v5: Hit kind, Damage killed / victim / flags, Killed flags, VehicleResult op (Release 9, EnterIntent 10 and CancelIntent 11 legal, 12 not) / code (NotOwner 12 legal, 13 not) and non-finite RespawnOk are refused; anim names "
               "are 1..63 of [A-Za-z0-9_@/.-], blends finite within +-1000, duration -1 or more; a 64-byte name never decodes; "
               "ValidVehicleUpdate refuses NaN and a zero rotation",
               bad.empty(), bad);
@@ -2820,7 +2834,7 @@ static void VehicleNetworkTests()
         alice.s.SendVehicleState(Drive(vid, 100, 120, 10, 600));
         const bool moved = rig.Until([&] { const proto::VehicleState* v = bob.Vehicle(vid); return v && std::fabs(v->k.y - 120.0f) < 0.02f; }, 2000);
         bob.s.SendVehicleState(Drive(vid, 100, 300, 0));                  // a passenger
-        alice.s.SendVehicleState(Drive(vid, 100, 130, 200));              // 200 m/s
+        alice.s.SendVehicleState(Drive(vid, 100, 130, 400));              // 400 m/s (T4: under twice the cap is clamped, not dropped)
         rig.Pump(200);
         alice.s.SendVehicleState(Drive(vid, 100, 121, 10, 900));          // health up: ignored
         rig.Until([&] { return rig.srv.stats().vehicleUpdatesAccepted >= s0.vehicleUpdatesAccepted + 2; }, 2000);
@@ -2829,7 +2843,7 @@ static void VehicleNetworkTests()
         const server::VehicleStore::Vehicle* v = rig.srv.FindVehicle(vid);
         const bool state = v && std::fabs(v->s.k.y - 121.0f) < 0.02f && v->s.bodyHealth == 600 && (v->s.flags & proto::kVehLocked) &&
                            (v->s.flags & proto::kVehEngine) && std::fabs(v->s.k.vy - 10.0f) < 0.05f;
-        Check("vehicles: only the server's driver moves a vehicle (a passenger's update is dropped), over 150 m/s is dropped, "
+        Check("vehicles: only the server's driver moves a vehicle (a passenger's update is dropped), over twice the 150 m/s cap is dropped, "
               "health only goes down, the lock stays the server's while the engine flag is the driver's; the others see it",
               moved && state && s1.vehicleUpdatesRejected == s0.vehicleUpdatesRejected + 1 &&
                   s1.vehicleUpdatesInvalid == s0.vehicleUpdatesInvalid + 1 && s1.vehicleUpdatesAccepted == s0.vehicleUpdatesAccepted + 2,
@@ -4301,6 +4315,11 @@ static void MeleeFightSimTests()
     }
 }
 
+#define T6_HEALTH_NETWORK
+#include "t6_health_tests.h"   // T6 health: the real server and session into the client's tracker and HUD (uses the helpers above)
+#include "t1_seats_net_tests.h"   // T1 seats (wire v6): the three-client scenario against the real server
+#include "t4_netcode_tests.h"
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -4343,6 +4362,11 @@ int main()
     ReconnectTests();
     VehicleAbuseTests();
     AnimAuthorityTests();
+    t6health::NetworkTests();   // T6 health: Welcome.playerHealth / Hit / Damage / heal / kill / Respawn into the tracker and the HUD
+    std::printf("-- T1 seats: enter / exit intents, three clients, the real server (wire v6)\n");
+    t1net::SeatNetworkTests();
+    std::printf("-- T4: vehicle collisions (VehicleImpact over the real server)\n");
+    t4net::T4NetworkTests();
     std::printf("-- metrics and budget\n");
     MetricsTests();
     ShutdownTests();
@@ -4351,7 +4375,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1 + 12; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
+    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks + t1net::kNetChecks + t4net::kT4NetChecks; // 0.4.5 melee audit +12; W8 +1 melee ceiling; T6 health network checks; T1 seats (reworded checks, not added, + the three-client scenario and the wire rules); T4 collisions (+3: VehicleImpact wire, head-on arbitration, the speed clamp)
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

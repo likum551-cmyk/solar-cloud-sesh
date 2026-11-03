@@ -1,4 +1,6 @@
-# GAGE game protocol v5
+# GAGE game protocol v6
+
+v6 (desync overhaul round 2, client 0.4.7) adds, against v5: seat/enter intents and `SeatNotice` (31) [T1 section], vehicle visual state (`tyres`, `tyresRim`, `windows`, brake/handbrake bits, part Hits) [section 16, T3] and `VehicleImpact` (40) [T4 section]. Every other layout is the v5 one described below. A v5 peer is refused by the version gate (`Refuse(VersionMismatch)`).
 
 The wire protocol between the GAGE client engine and a GAGE server: every message, every byte, the quantisation
 formulas, the limits and the refusal codes. It describes what the shipped code does. The code is
@@ -367,7 +369,7 @@ player relevance radii, `relevanceEnterRadius` / `relevanceLeaveRadius`, plus th
 | 2 | `u16` count, at most 256 |
 | | `count` entries, strictly ascending by id: `u8` id, `u8` header (0 presence only, 1 a full state follows, v5: 2 a motion-only state follows; 3 and above are refused), then the state when the header says so |
 
-A **full state** (v5: 43 bytes, plus 2 per occupant; v4: 36):
+A **full state** (v6: 46 bytes, plus 2 per occupant; v5: 43; v4: 36):
 
 | Offset | Size | Field |
 |---|---|---|
@@ -381,14 +383,17 @@ A **full state** (v5: 43 bytes, plus 2 per occupant; v4: 36):
 | 35 | 1 | v5: `u8` ageMs, how old the motion is: the frame's tick time minus the time the controller sampled it, 0..255 (saturating; never negative) |
 | 36 | 2 | v5: `u16` ctrl, the player whose client controls the vehicle right now (the only one whose `VehicleUpdate` the server takes), `0xFFFF` = nobody (then the vehicle stands still) |
 | 38 | 2 | v5: `u16` ownerId, the player who owns the vehicle (spawned it and has not released it), `0xFFFF` = nobody; either is below 1024 or `0xFFFF` |
-| 40 | 1 | v5: `u8` flags2: bit 0 `kVeh2Headlights`, 1 `kVeh2HighBeam`, 2 `kVeh2Interior`, 3 `kVeh2IndicatorL`, 4 `kVeh2IndicatorR`, 5 `kVeh2RoofDown`; bits 6..7 must be 0 |
+| 40 | 1 | v5: `u8` flags2: bit 0 `kVeh2Headlights`, 1 `kVeh2HighBeam`, 2 `kVeh2Interior`, 3 `kVeh2IndicatorL`, 4 `kVeh2IndicatorR`, 5 `kVeh2RoofDown`; v6: 6 `kVeh2Brake`, 7 `kVeh2Handbrake` (no bit is reserved any more) |
 | 41 | 1 | v5: `u8` doors, the open doors: bit 0 front left, 1 front right, 2 rear left, 3 rear right, 4 hood, 5 trunk (`kDoor*`); bits 6..7 must be 0 |
-| 42 | 1 | `u8` seat mask: bit i = seat i is occupied (seat 0 is the driver) |
-| 43 | 2 x n | `u16` player id per set bit, in seat order (each below 1024) |
+| 42 | 1 | v6: `u8` tyres, the burst tyres: bit i = wheel slot i (0..7) is burst (section 16) |
+| 43 | 1 | v6: `u8` tyresRim, the tyres completely burst (off the rim); must be a subset of `tyres` |
+| 44 | 1 | v6: `u8` windows, the smashed windows: bit i = window slot i |
+| 45 | 1 | `u8` seat mask: bit i = seat i is occupied (seat 0 is the driver) |
+| 46 | 2 x n | `u16` player id per set bit, in seat order (each below 1024) |
 
 A **motion-only state** (v5, header 2): `u8` ageMs, the 22-byte motion, `u8` flags (the complete `kVeh*` set, as above):
 24 bytes after the id and header (26 with them; a full entry is 45 or more). It leaves out the model, health, fuel,
-colours, seats, ctrl, owner, flags2 and doors: the receiver keeps what it holds for them. The server sends a full entry
+colours, seats, ctrl, owner, flags2, doors and (v6) tyres, tyresRim and windows: the receiver keeps what it holds for them. The server sends a full entry
 for a vehicle that is new to the client, for 3 frames after any of those fields changed, and about once a second
 (`refreshTicks`, 20 ticks) otherwise, and the motion-only entry in between, so a driven car costs about a third less.
 A client that has no full state yet for a motion-only entry (its first one was lost) waits for the next full one.
@@ -484,20 +489,20 @@ published look changes, and to a newly accepted client once for every player tha
 `PlayerJoined` burst (`looksReplayed`). The sender never receives its own. The client checks `ValidLook` and drops (counts
 as malformed) a look that fails it; a `PeerLook` before the client's own `Welcome` is ignored.
 
-### 18 `VehicleUpdate` (client to server, state channel): 37 bytes
+### 18 `VehicleUpdate` (client to server, state channel): 40 bytes (v6; 37 in v5)
 
 The controlled vehicle, every send tick: type `12`, `u32` seq, `u8` vehId, the 22-byte motion, `u8` flags, `u16`
-body health, `u16` engine health, (v5) `u16` sampleMs, `u8` flags2, `u8` doors. `sampleMs` is the sender's millisecond
+body health, `u16` engine health, (v5) `u16` sampleMs, `u8` flags2, `u8` doors, (v6) `u8` tyres, `u8` tyresRim, `u8` windows. `sampleMs` is the sender's millisecond
 clock when the motion was sampled, exactly as in `PlayerState` (section 6; its own clock on the server, one per
-connection and message stream); `flags2` and `doors` are the `kVeh2*` and `kDoor*` sets of section 14 (bits 6..7
-refused). Taken only from the vehicle's **controller** (v4: the player the server has in seat 0 of `vehId`; v5: the
+connection and message stream); `flags2` and `doors` are the `kVeh2*` and `kDoor*` sets of section 14 (`doors` bits 6..7
+refused); the three v6 masks are what the controller's own car shows (section 16: a rim bit without its tyre bit is refused). Taken only from the vehicle's **controller** (v4: the player the server has in seat 0 of `vehId`; v5: the
 player named in `VehicleState.ctrl`, which is the driver, or for a driverless vehicle the nearby player the server
 picked, section 14), with a seq newer
 than the last accepted `VehicleUpdate` from that player, inside the world box (`ValidVehicleUpdate`: finite, the
 `PlayerState` box, a rotation of non-zero length, steering within +-1) and at most `vehicleMaxSpeed` (150 m/s), from a living player. The
 server copies position, velocity, rotation, angular velocity, steering and the driver flags (`kVehEngine`, `kVehSiren`,
-`kVehHorn`; lock and lights in `flags` are ignored, they are server-owned), and (v5) `flags2` and `doors`; a health can only go down this way (a
-crash). Anything else is dropped and counted (`vehicleUpdatesRejected` / `Invalid` / `Stale`), never fatal. With fuel 0
+`kVehHorn`; lock and lights in `flags` are ignored, they are server-owned), and (v5) `flags2` and `doors`, and (v6) the visual masks, merged with the
+Hits (section 16); a health can only go down this way (a crash). Anything else is dropped and counted (`vehicleUpdatesRejected` / `Invalid` / `Stale`), never fatal. With fuel 0
 the engine stays off. The displacement check (`untrustedWindowMs`) runs on the server's receipt times, not on `sampleMs`, so a
 forged stamp cannot hide a jump.
 
@@ -542,7 +547,8 @@ shot or weapon that has not arrived yet is held up to 300 ms. A shooter whose po
 window) has its Hits on others refused; Hits on it still land.
 
 A player hit takes the damage from armour first, then from health. A vehicle hit takes it off the body health and
-half of it off the engine health (seen by everybody in `VehicleWorld`).
+half of it off the engine health (seen by everybody in `VehicleWorld`). v6: a vehicle Hit may also name a tyre or window in
+`bone` (section 16).
 
 **Damage scaling** (v5, `apps/server/damage.h`): the number the shooter's client reports is the single-player game's
 damage, without Online's freemode factor, so the server scales what it applies to a player (after the clamp to 250, the
@@ -797,7 +803,7 @@ angular velocity or steering byte, unknown vehicle flags, a health or fuel over 
 move-5 or move-6 ped block without its `vehId` byte or a `vehId` byte after any other move (in a `PlayerState`, an
 absolute entry or after a delta's move byte), the vehicle-id extension bit on a delta whose resulting move names no
 vehicle, a `VehicleWorld` entry header above 2, a `ctrl` or `ownerId` that is neither `0xFFFF` nor below
-1024, reserved `flags2` or `doors` bits (in an entry or a `VehicleUpdate`), unknown flags or a steering of -128 in a
+1024, reserved `doors` bits (in an entry or a `VehicleUpdate`; v6: `flags2` has no reserved bit left), (v6) a `tyresRim` bit without its `tyres` bit, unknown flags or a steering of -128 in a
 motion-only entry, a `VehicleCmd` op over 9, a `VehicleResult` code over 12, reserved `Damage.flags` bits (4..7) and
 reserved `Killed.flags` bits (2..7).
 `WorldDecoder` additionally refuses (and counts separately) a frame whose tick is not newer than the newest accepted.
@@ -865,17 +871,17 @@ The vehicle below: id 5, model 0x0A0B0C0D, position (1, 2, 3) m = 100 | 200 << 2
 0x0012C00032000064, velocity (5, 6, 7) m/s = 160, 192, 224, identity rotation 0xDFF7FDFF, angular velocity
 (0.5, -1, 0) rad/s = 8, -16, 0, steering -1 = -127, locked | lights, body 900, engine 800, fuel 700, colours 12 / 34,
 (v5) age 12 ms, controller player 3, owner player 5, flags2 headlights | interior | right indicator = 0x15, doors front
-left | trunk = 0x21, player 3 driving and player 5 in seat 2. Vehicle 11 is a motion-only entry with the same motion,
+left | trunk = 0x21, (v6) tyres slots 0 + 4 burst = 0x11, rim slot 4 = 0x10, windows 4 + 5 smashed = 0x30, player 3 driving and player 5 in seat 2. Vehicle 11 is a motion-only entry with the same motion,
 age 30 ms and flags `kVehEngine`.
 
-VehicleWorld tick 0x01020304, removed {7}, present {5 with a full state, 9 without, 11 motion-only} (86 bytes)
+VehicleWorld tick 0x01020304, removed {7}, present {5 with a full state, 9 without, 11 motion-only} (89 bytes)
           0E 04 03 02 01  01 07  03 00
           05 01  0D 0C 0B 0A  64 00 00 32 00 C0 12 00  A0 00 C0 00 E0 00  FF FD F7 DF  08 F0 00  81
-                 03  84 03  20 03  BC 02  0C 22  0C  03 00  05 00  15 21  05  03 00 05 00
+                 03  84 03  20 03  BC 02  0C 22  0C  03 00  05 00  15 21  11 10 30  05  03 00 05 00
           09 00
           0B 02  1E  64 00 00 32 00 C0 12 00  A0 00 C0 00 E0 00  FF FD F7 DF  08 F0 00  81  04
           type, tick, nRemoved, removed, count; id, header 1, model, position, velocity, rotation, angular velocity,
-          steering, flags, body, engine, fuel, colours, ageMs, ctrl, ownerId, flags2, doors, seat mask 0b101,
+          steering, flags, body, engine, fuel, colours, ageMs, ctrl, ownerId, flags2, doors, tyres, tyresRim, windows, seat mask 0b101,
           occupants; id, header 0; id, header 2, ageMs, the motion, flags
 
 VehicleCmd SetLocked vehicle 5 (8 bytes)
@@ -884,8 +890,9 @@ VehicleCmd Register model 0xB779A091 at (1, 2, 3) m, identity, colours 4 / 5, se
           0F 00 00 08 91 A0 79 B7  64 00 00 32 00 C0 12 00  FF FD F7 DF  04 05 01
 
 VehicleUpdate seq 0x11223344, vehicle 5, the motion above but angular velocity (0, 0, 0.25), steering +1, engine | horn,
-body 999, engine 1000, sampleMs 0x5566, flags2 headlights | left indicator = 0x09, doors front right | hood = 0x12 (37 bytes)
-          12 44 33 22 11 05  64 00 00 32 00 C0 12 00  A0 00 C0 00 E0 00  FF FD F7 DF  00 00 04  7F  14  E7 03  E8 03  66 55  09 12
+body 999, engine 1000, sampleMs 0x5566, flags2 headlights | left indicator = 0x09, doors front right | hood = 0x12,
+(v6) tyres slots 1 + 2 = 0x06, rim slot 1 = 0x02, window 0 = 0x01 (40 bytes)
+          12 44 33 22 11 05  64 00 00 32 00 C0 12 00  A0 00 C0 00 E0 00  FF FD F7 DF  00 00 04  7F  14  E7 03  E8 03  66 55  09 12  06 02 01
 
 Hit player 2, WEAPON_PISTOL 0x1B06D571, 34 damage, bone 31086, shot 9 (13 bytes)
           14 01 02 00 71 D5 06 1B 22 00 6E 79 09
@@ -962,3 +969,189 @@ Client and server ship together: a v4 client gets `Refuse(VersionMismatch)` from
 | `RespawnOk` (24) | health 100, armour 0 | health `playerHealth` (200), armour `respawnArmour` (0) |
 | health | 100 by default (GTA ped health 200) | 200 by default (GTA ped health 300); a carbine kills in 9 hits instead of 4 |
 | `Hello`, `Refuse` | | unchanged |
+
+<!-- ===== T1 seats (desync overhaul round 2) ===== begin: append-only section, owned by the T1 task -->
+
+## T1 seats: enter / exit intents (wire v6, additive)
+
+Why: the seat list (`VehicleWorld.seats`) says who SITS where, but nothing said that a player is ON THE WAY to a seat, so every other
+screen could only warp the puppet into the seat the moment the list named it ("sometimes the player is teleported in, sometimes other
+players never see the enter animation at all"). v6 makes the intent authoritative on the server and replays it on every client with the
+game's own enter task; the seat warp stays only as a bounded fallback. `VehicleWorld`, `VehicleState`, `VehicleUpdate` and `PedState`
+are NOT touched by this section. Client and server must ship together, like every wire change (the orchestrator does the single
+`kVersion` bump; this section is written against v6).
+
+### New ops of `VehicleCmd` (15), new range `1..11` (`kVehicleOpLast = CancelIntent`)
+
+| op | value | `arg` | meaning |
+|---|---|---|---|
+| `EnterIntent` | 10 | bits 0..7 the wire seat (0..7), bit 8 `kIntentRun` (the player runs to the door; clear = walks); every other bit must be 0 (`BadArg`) | reserve seat `arg & 0xFF` of `vehId` for the sender. Same gates as `Enter` (dead, no state, untrusted window, `NoVehicle`, `BadArg` seat, `NotOwner` driver seat of an owned car, `SeatTaken` when the seat is occupied OR reserved by somebody else, `TooFar` over `vehicleEnterDistance`, `Locked`), plus `NotAllowed` when the sender already sits in a vehicle. Ok seats NOBODY: the reservation lives `kIntentTtlMs` (6000 ms) |
+| `CancelIntent` | 11 | 0 | drop the sender's reservation on `vehId`; Ok also when there is none (idempotent); `NoVehicle` when the car does not exist |
+
+A player has at most one reservation: a new `EnterIntent` for another seat cancels the old one (`Cancelled/Replaced`), the same seat
+renews it silently. `Exit` while only a reservation is held answers Ok and cancels it (`Cancelled/ByPlayer`). `Enter` by the holder
+turns it into occupancy; an `Enter` of another seat cancels it (`Cancelled/Replaced`). An `Enter` of a seat somebody else has reserved is
+`SeatTaken`. The answer to both ops is the usual `VehicleResult` (19) with `op` = 10 / 11 (the link of `libs/sync/vehicle_link.h` never
+sees these ops).
+
+### 31 `SeatNotice` (server to client, reliable): 8 bytes
+
+```
+u8 type=31 | u8 kind | u16 player | u16 vehId | u8 seat | u8 detail
+```
+
+Sent to every client that has the vehicle in its relevant set (`VehicleStore::RelevantTo`) and to the player concerned, in order with
+the other reliable traffic (a `VehicleResult` to the actor first). Never relayed back: a client that sends one is refused
+(`Refuse(Protocol)`).
+
+| kind | value | `detail` | meaning |
+|---|---|---|---|
+| `Reserved` | 1 | bit 0 `kSeatNoticeRun` | `player` reserved `seat` of `vehId`: replay the entry (the real enter task toward that seat) |
+| `Seated` | 2 | 0 | the reservation became occupancy: `player` holds `seat` (the next `VehicleWorld` lists it) |
+| `Cancelled` | 3 | `SeatCancelReason` 0 ByPlayer, 1 Expired, 2 Replaced, 3 VehicleGone, 4 PlayerGone | the reservation ended without a seating |
+| `Exited` | 4 | 0 | `player` left `seat` by its own `Exit`: play the normal exit animation now. NOT sent for a death, a respawn, a disconnect or a despawn (those only drop the seat from the list) |
+
+Strict decoding: unknown kind, `player >= kMaxPlayers` (1024), `vehId >= kMaxVehicles` (256), `seat >= 8`, or a `detail` the kind does
+not define (Reserved: only bit 0; Cancelled: 0..4; Seated / Exited: 0) refuse the message; `Encode` returns an empty packet for the same
+fields. Extra or missing bytes refuse it. Test: `tests/decode_fuzz_test.cpp` (four `SeatNotice` cases, two new `VehicleCmd` cases),
+`tests/gameplay_test.cpp` `TestWire`, `tests/netcode_test.cpp` (`VehicleCmd` ops 1..11, `PeekType` 1..31).
+
+### What the clients do with it (libs/sync/seat_intent.h, apps/engine/engine.cpp)
+
+* The player's own client, on F / G: `EnterIntent`, wait for the Ok, then GTA's `TASK_ENTER_VEHICLE` for exactly that seat (flags 1, no
+  jack flag); the link's `Enter` follows when the game has seated the ped. A refusal starts nothing; no answer within 2 s cancels. The
+  teleport-in (`SET_PED_INTO_VEHICLE`) only happens when the task never starts (1 s), stops without a seat (0.4 s after) or runs out of
+  time (4.5 s door, 3.5 s bike / cycle), or for a locked car (its owner's entry).
+* Every other client: `Reserved` starts the same task on the puppet ONCE; the seat warp waits `confirmGraceMs` (1.5 s) after `Seated` / the
+  list naming the player and is never allowed while the task still runs inside that grace; `Cancelled` clears the task; `Exited` runs the
+  normal exit animation at once and refuses a stale seat list for 0.7 s.
+* `HKCU\Software\GAGE-MP` value `seat_intent=0` restores the pre-v6 behaviour on the client for A/B testing (the server keeps sending).
+
+Server diagnostics: `seats: last 10 s: ...` in the server log while intents flow. Client: `engine: seats (T1), last 10 s: ...` and
+`engine: seats: ...` lines in `gage.log`.
+
+<!-- ===== T1 seats ===== end -->
+
+<!-- ===== T3 (Desync Overhaul round 2): vehicle visual state, protocol v6. Append-only section; the orchestrator bumps kVersion. ===== -->
+
+## 16. T3: vehicle visual state (burst tyres, windows, brake lights, steering) for the other clients (protocol v6)
+
+**Why.** A burst tyre, a smashed window, a lit brake light and a steering wheel turned were only ever seen by the machine whose
+game produced them: the vehicle messages carried no such state, and a vehicle `Hit` only lowered the body and engine health. This
+section is the wire, the server's merge and the client rules; the client logic is `libs/sync/vehicle_visual.h`, the tests are
+`tests/t3_vehvisual_test.cpp`. Client and server ship together (the orchestrator raises `kVersion` and `kClientVersion` once).
+
+**Wire (all in the codec, `libs/protocol`).**
+
+| Message | v5 | v6 |
+|---|---|---|
+| `VehicleUpdate` (18) | 37 bytes | 40: + `u8 tyres`, `u8 tyresRim`, `u8 windows` after `doors` |
+| `VehicleWorld` (14) full entry | 43 bytes + 2 per occupant | 46: + the same three bytes after `doors`. A motion-only entry (header 2) does not carry them |
+| `flags2` | bits 6..7 reserved (refused) | bit 6 `kVeh2Brake` (brake lights on), bit 7 `kVeh2Handbrake`; every bit is defined |
+| `Hit` (20) | `bone` carried, not checked | unchanged layout; for `kind` = vehicle a `bone` of `(part << 8) \| slot` names a tyre / window (below) |
+
+`tyres`, `tyresRim` and `windows` are slot bit sets (bit i = slot i, 0..7): `tyres` = the tyre is burst (flat), `tyresRim` = it is
+completely burst, off the rim (always a subset of `tyres`: both decoders and both encoders refuse a rim bit without its tyre bit,
+`ValidVehicleUpdate` too), `windows` = the window is smashed. Slots are the game's own numbers (a car: 0 / 1 the front left / right wheel, 4 / 5
+the rear pair, 2 / 3 the middle pair of a 6-wheeler; a bike: 0 front, 4 rear; windows 0..7); the wire never names a model, so a bike
+and a truck need no special case. Wheels the game numbers above 7 (the second middle pair of some trucks) are not carried.
+
+**Brake lights and handbrake** are the controller's pedals as its client reads them (`sync::ClassifyBrake`: the handbrake; the foot
+brake while rolling forward; the accelerator while rolling backward; below 0.5 m/s a pedal is throttle / reverse, not braking). They
+ride `flags2`, so a change is a full entry for 3 frames like the other body bits. A car nobody controls is sent with `kVeh2Brake`
+clear (`BuildFrame`).
+
+**Steering** was already on the wire (`steer`, `i8`, -1 left .. +1 right, in the motion of both messages). v6 changes how the sender
+fills it: the yaw rate now comes from two successive rotations (unit-independent) and, for the car the local player drives, the
+steering axis replaces the estimate below 1 m/s, so a standing car shows turned wheels (`sync::ChooseSteer`). The wire and the
+receiver's `SET_VEHICLE_STEER_BIAS` write are unchanged.
+
+**Server rules** (`apps/server/vehicles.h`).
+1. *The controller reports.* `VehicleStore::Update` takes the three masks from the vehicle's controller. A bit the controller shows is
+   truth; a bit it does not show is cleared (a repair).
+2. *A Hit names a part.* `HitPart` runs after a vehicle `Hit` passed every existing check (alive, in range, in the shooter's
+   `VehicleWorld`, 30 per second, bound to a real shot of the shooter's with the weapon reported; see "Hit"): `bone` = `(part << 8) | slot`,
+   part 1 = a tyre burst, 2 = a tyre off its rim (sets the tyre bit too), 3 = a window smashed, slot below 8. Any other `bone` (-1,
+   a ped bone id) is ignored for a vehicle, exactly as before. The bit is set for every receiver at once (full entries for 3 frames)
+   and is kept **unconfirmed**: the controller's next reports that show it confirm it (it then follows the controller like any bit);
+   if the controller never shows it, it is dropped `3000 ms` after the Hit (`kVisAckMs`), so a controller that cannot show a pop
+   (native missing, the pop rejected on its machine) does not leave a phantom for ever. A car with **no controller** gets no reports, so
+   nothing expires and nothing clears: its bits stay. The Hit's `damage` must be non-zero as always (the engine sends 1); it is
+   applied to the body health like any vehicle damage.
+3. *Stream-in, hand-over.* The masks are static fields: a newcomer gets them in its first full entry, a change is told for 3 frames, and
+   one entry a second repeats them. A new controller reports what its car shows, which is what the server told it.
+
+**Client rules** (`libs/sync/vehicle_visual.h`, engine glue in `TickVehicleVisual`, `SendControlledVehicles`, `ApplyVehicleBody`).
+- *Controller* (`ctrl` is me): reads its car's tyres and windows every 250 ms and sends them in `VehicleUpdate`; when the server's mask
+  gains a bit (a Hit by somebody else) it bursts / smashes it on its own car **once** (the rising edge, all bits on the first sight),
+  never clears one (a repair is its own business, reported by the next update).
+- *Copy* (somebody else's car): applies the server's mask level-wise (burst what is missing, fix what is extra), on every change of the
+  mask and every 1.5 s for copies within 150 m. While the local player has shot lately (1.5 s) it scans the copy every 200 ms: a burst
+  its own game produced that the server's mask lacks (and that the server did not just clear) is reported once as a vehicle `Hit`
+  (`weapon` = the weapon in hand, `shotSeq` = the shot counter, `damage` 1, `bone` = the part code) and kept for 2.5 s as pending, so the
+  round trip is not drawn as pop, fix, pop; confirmed by the server's mask, or put right after 2.5 s (the server refused it: no shot
+  behind it, out of range, over the rate).
+- *Natives.* Every native needed is one of the nine in hook.h whose hash is still 0 (UNRESOLVED: lookup needed). A wrapper with hash 0
+  returns false without calling anything and logs once; a failed read is "no information" (nothing is reported, the controller reports
+  what it applied), a failed command round is retried 3 times and then the car is left alone for 5 s. Adding the hashes switches the
+  feature on with no other change.
+
+**Wheel spin.** Nothing is sent for spin: wheels roll from ground contact because the copy's body gets real velocity. What can stop
+that is a brake the game itself applies to an empty or task-less car, so the copy's handbrake is **released explicitly** on the first
+sight and mirrored afterwards (`kVeh2Handbrake`), and the brake lights follow the controller's pedals. A burnout (wheels spinning on a
+standing car) and a locked wheel at speed need a wheel-speed native and a way to write wheel rotation, neither of which exists in
+hook.h; they are not carried.
+
+**Not carried (and why).** Body deformation (a per-vertex damage map: dozens of samples of `GET_VEHICLE_DEFORMATION_AT_POS` per car, not
+cheap), broken-off doors, broken lights and dirt: no cheap bit set, no native checked. Tyre and window repair by a gamemode or an
+admin command is not a thing yet: the server's repair path (`fix`) does not touch visual state; a controller that repairs its car
+reports the clear and everybody follows.
+
+**Diagnostics.** The engine prints `engine: vehicle visual (T3), last 10 s: ...` with every 10 s of vehicles lines (see the report of
+the task for the fields); the server counts `vehiclePartHits`.
+
+<!-- T4-BEGIN: vehicle collisions (desync overhaul round 2). Append-only section; the orchestrator does the single kVersion 5 -> 6 bump. -->
+## T4: vehicle collisions (`VehicleImpact`, message 40)
+
+Wire change for protocol v6 (the orchestrator bumps `kVersion` once, in lockstep with the client version): ONE new message and no change to any existing layout.
+Design, numbers and the live test: docs/sync-specs/vehicle-collisions.md.
+
+### 40 `VehicleImpact` (server to client, reliable): 21 bytes
+
+The server keeps the last few `VehicleUpdate` samples of every vehicle on one time base. For two vehicles with DIFFERENT controllers it finds the first
+instant their boxes touch (boxes by mass class, grown 0.3 m each because each controller's physics stops its car at the other's copy), solves one planar
+two-body impulse there (restitution 0.25, friction 0.3, masses 250 / 1500 / 7000 kg by model) and sends each controller its half, once per contact. Pairs with
+the same controller are never arbitrated. No message is sent for a pass, a graze, a closing speed under 1.2 m/s or an untrusted controller.
+
+| offset | size | field | |
+|---|---|---|---|
+| 0 | 1 | type | 40 |
+| 1 | 4 | `seq` | `u32`, the server's impact counter; both controllers of one contact get the same value |
+| 5 | 2 | `vehId` | `u16` (< 256): the vehicle YOU control that was hit |
+| 7 | 2 | `otherId` | `u16` (< 256): the vehicle it hit |
+| 9 | 2 | `sampleMs` | `u16`: the contact time on YOUR OWN sample clock (the `VehicleUpdate.sampleMs` domain: whole ms of your clock, wraps at 65536). Unwrap against your current clock reading (+-32 s) |
+| 11 | 2 | `dvx` | `i16`, 1/64 m/s: the change of your vehicle's world-x velocity |
+| 13 | 2 | `dvy` | `i16`, 1/64 m/s |
+| 15 | 2 | `dyaw` | `i16`, 1/256 rad/s: the change of its yaw rate (counter-clockwise) |
+| 17 | 1 | `nx` | `i8`, 1/127: the contact normal from your vehicle toward the other one |
+| 18 | 1 | `ny` | `i8`, 1/127 |
+| 19 | 1 | `closing` | `u8`, 0.25 m/s: the closing speed along the normal before the impact |
+| 20 | 1 | `depth` | `u8`, cm: the overlap of the two TRUE boxes within 120 ms after the touch (0: they only came within the margin) |
+
+Strict decoding: exactly 21 bytes; `vehId` and `otherId` below 256; an `i8` of -128 and an `i16` of -32768 are refused (the encoder never writes them). `Encode`
+refuses a non-finite value or an id of 256 and saturates `dv` at +-511.98 m/s, `dyaw` at +-127.99 rad/s. The server never sends a change above 30 m/s.
+
+Client rules (engine, `libs/sync/vehicle_impact.h`):
+* The game has already bounced the car off the kinematic copy, so the message is a CORRECTION target: the engine writes `authoritative - what the game's own physics did`
+  (the velocity jumps it measured around the contact time) onto the car's velocity and yaw rate. A message whose contact the local physics did not feel is applied only if
+  the server's true boxes overlapped (`depth >= 0.10 m`) and our copy of the other car is within 7 m; a message older than 1.5 s, a duplicate `seq` and a change under 0.6 m/s are ignored.
+* A copy that takes an impulse inside a frame (the drive controller's contact trigger) has its own response adopted as its trajectory
+  (`VehicleInterpolator::ReplaceFrom`): the stream, which still shows the pre-impact motion for the whole latency, is refused until it shows the impact (or 300 ms).
+* `impact_sync=0` (HKCU\Software\GAGE-MP, read at Welcome) ignores the message and keeps the W9 contact grace as the only handling.
+
+Server policy changes that need no wire change (T4):
+* `VehicleStore::Rules::claimBaseMeters` / `claimLookSeconds` / `claimMinSpeed` / `claimHoldMs`: a driven vehicle about to hit a driverless one (closing speed above 1 m/s, within
+  10 m + 0.5 s of travel) takes the driverless vehicle's control (`VehicleState.ctrl` changes), so the rammer's own physics resolves the hit.
+* `Rules::maxSpeedSoftFactor` (2.0): a `VehicleUpdate` whose velocity is over `vehicleMaxSpeed` (150) but under twice it is accepted with the velocity clamped to the cap (it used to be
+  refused as `BadArg`, which froze a hyper car for everybody else); above twice the cap it is refused as before.
+<!-- T4-END -->

@@ -35,6 +35,7 @@ build/win/selftest/legacy_handoff_test.exe  # the one-time RAGE-MP registry clea
 build/win/selftest/crash_diag_test.exe   # stack scan, minidump struct, MSVC throw decode, main-thread lookup
 build/win/selftest/join_test.exe         # the engine's session adapter against an in-process server, loopback
 build/win/selftest/netcode_test.exe      # protocol v1 + server over real ENet on loopback, about 12 s
+build/win/selftest/t3_vehvisual_test.exe  # vehicle visual state (v6 tyres / windows / brake lights / steering): wire, store merge, sync module, real server, about 8 s
 build/win/selftest/server_test.exe       # UDP query, master announce, bans, admin channel, about 16 s
 build/win/selftest/sync_test.exe         # the remote-player smoother (libs/sync) under loss, jitter and teleports
 build/win/selftest/locomotion_test.exe   # remote-ped gait controller against a simulated ped
@@ -42,6 +43,7 @@ build/win/selftest/vehicle_drive_test.exe  # remote-vehicle interpolator + drive
 build/win/selftest/gameplay_test.exe     # v4 pure units: vitals/respawn/hit batcher/emotes/vehicle link
 build/win/selftest/brand_apparel_test.exe  # branded-tee texture swap on a WARP D3D11 device
 build/win/selftest/present_hook_test.exe   # Present vtable hook + watchdog (fake vtable), then World::HookTick on a real dxgi swap chain next to a simulated re-asserting overlay (the RTSS failure); part 2 needs a D3D11 device (hardware or WARP)
+build/win/selftest/ambient_test.exe       # T5: no ambient NPCs / traffic: when it runs (any connection state), the exemption list, sweep planner, breaker, counters
 # also built: crash_filter_test serverquery_test interest_test quant_test launch_shim_test script_suppress_test
 # NEVER run build/win/selftest/*.exe by glob: gage_v.exe there launches GTA.
 ```

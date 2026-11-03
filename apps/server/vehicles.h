@@ -26,6 +26,12 @@
 //    steering zeroed, horn off). PlayerGone (disconnect) frees the seat; the player's EMPTY vehicles are
 //    destroyed with it and the ones somebody else sits in become orphans (no spawner, but still counted
 //    against the address) that go Rules::orphanMs after they empty.
+//  * T1 seats (wire v6) INTENTS: Reserve (VehicleOp::EnterIntent) holds a seat for a player who is on the way to it
+//    (at most one reservation per player, kIntentTtlMs long, never in the seat list), so a second player's Enter or
+//    Reserve of the same seat is refused SeatTaken while the first walks in. Every change (Reserved, Seated when the
+//    player's Enter takes the reserved seat, Cancelled with a reason, Exited for an announced Exit) is queued as a
+//    proto::SeatNotice for the caller to deliver (TakeNotices); the store has no sockets. Occupancy is still only
+//    ever the seat list: a reservation seats nobody.
 //  * Motion: Update accepts a VehicleUpdate only from the vehicle's controller (v4: the player in seat 0), finite,
 //    in the world box, with a reported velocity under Rules::maxSpeed; it copies the motion, the driver flags
 //    and (v5) flags2 and doors; health only goes down. The sample time the caller passes (the sender's
@@ -87,6 +93,18 @@ namespace gage::server {
             uint32_t ctrlSilenceMs = 1500;       // a driverless controller silent this long is skipped...
             uint32_t ctrlSkipMs = 10000;         // ...for this long
             uint32_t movedWithinMs = 1000;       // MovedRecently window that makes a driverless vehicle "driven" for the send rate
+            // T4 (vehicle collisions): a driverless vehicle is simulated by one client, and every other client sees a kinematic copy that
+            // cannot be pushed. So a driven vehicle that is about to hit a driverless one TAKES its control (ClaimFor): the rammer's own
+            // physics then resolves the contact natively. The approach test: the driver is faster than claimMinSpeed, heads for the
+            // vehicle (closing speed above 1 m/s) and is within claimBaseMeters + claimLookSeconds * speed of it; a claim holds
+            // claimHoldMs before it can change again. 0 claimBaseMeters switches the rule off.
+            float    claimBaseMeters = 10.0f;
+            float    claimLookSeconds = 0.5f;
+            float    claimMinSpeed = 3.0f;       // m/s
+            uint32_t claimHoldMs = 1500;
+            // T4: a reported velocity above maxSpeed but below maxSpeed * maxSpeedSoftFactor is CLAMPED to maxSpeed and accepted (a hyper car's
+            // overshoot must not freeze it for everybody else); above that it is BadArg as before. The position is still judged by displacement.
+            float    maxSpeedSoftFactor = 2.0f;
         };
 
         // One player as AssignControllers sees them: where they are, whether the server has a position of theirs, and
@@ -122,6 +140,21 @@ namespace gage::server {
             uint32_t changedTick = 0;  // a server-owned field, the occupancy or a park changed at this tick
             double fuelAcc = 0;        // fractional permille drained so far
             double driveSec = 0;       // seconds driven with the engine on (by displacement) since the last Tick
+            uint16_t resBy[proto::kVehSeats] = {proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer,
+                                                proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer}; // T1: who holds each seat's reservation
+            // v6 visual damage: s.tyres / s.tyresRim / s.windows are the merged truth (the controller's report plus the Hits that
+            // popped something of this car). visPendMs[group * 8 + slot] (group 0 tyre, 1 rim, 2 window) is when a Hit set a bit
+            // the controller has not shown yet, plus 1 (0 = none): see MergeVisual.
+            uint64_t visPendMs[3 * proto::kVehWheelSlots] = {};
+        };
+
+        // T1 seats: one player's pending reservation (at most one each).
+        struct Intent
+        {
+            uint16_t veh = 0xFFFF;     // kNone = no reservation
+            uint8_t  seat = 0;
+            bool     run = false;
+            uint64_t sinceMs = 0;
         };
 
         struct Seat { uint16_t veh = kNone; uint8_t seat = 0; };
@@ -136,6 +169,9 @@ namespace gage::server {
                 if (*e < 1) *e = 1;
             v_.assign(proto::kMaxVehicles, Vehicle());
             occ_.assign(maxPlayers, Seat());
+            intent_.assign(maxPlayers, Intent());
+            notices_.clear();
+            audiences_.clear();
             rx_.assign(maxPlayers, Rx());
             removed_.clear();
             nextId_ = 0;
@@ -163,6 +199,30 @@ namespace gage::server {
         size_t Count() const { return count_; }
         const Vehicle* Get(uint16_t id) const { return id < v_.size() && v_[id].exists ? &v_[id] : nullptr; }
         Seat Occupancy(uint16_t player) const { return player < occ_.size() ? occ_[player] : Seat(); }
+        // T1: the player's pending reservation (veh == kNone: none).
+        Intent PendingIntent(uint16_t player) const { return player < intent_.size() ? intent_[player] : Intent(); }
+        // T1: who holds the reservation on (id, seat), kNoPlayer when nobody (a reservation older than kIntentTtlMs counts as gone).
+        uint16_t ReservedBy(uint16_t id, uint32_t seat, uint64_t nowMs) const
+        {
+            if (id >= v_.size() || !v_[id].exists || seat >= proto::kVehSeats) return proto::kNoPlayer;
+            const uint16_t p = v_[id].resBy[seat];
+            if (p == proto::kNoPlayer || p >= intent_.size()) return proto::kNoPlayer;
+            return nowMs >= intent_[p].sinceMs && nowMs - intent_[p].sinceMs >= proto::kIntentTtlMs ? proto::kNoPlayer : p;
+        }
+        // T1: the SeatNotices queued since the last call (oldest first); the caller delivers them. `audiences` (optional) gets, per notice, the
+        // players to tell: the actor plus every receiver that had the vehicle in its relevant set WHEN THE NOTICE WAS QUEUED (so the notice about a
+        // vehicle being destroyed still reaches the players who had it, though the destroy has cleared their relevance since).
+        std::vector<proto::SeatNotice> TakeNotices(std::vector<std::vector<uint16_t>>* audiences = nullptr)
+        {
+            std::vector<proto::SeatNotice> out;
+            out.swap(notices_);
+            if (audiences)
+                audiences->swap(audiences_);
+            else
+                audiences_.clear();
+            return out;
+        }
+        size_t PendingNotices() const { return notices_.size(); }
         // True when vehicle `id` is in `player`'s relevant set (what its client is told about).
         bool RelevantTo(uint16_t player, uint16_t id) const
         {
@@ -273,6 +333,9 @@ namespace gage::server {
                 if (p < occ_.size()) occ_[p] = Seat();
                 if (ejected) ejected->push_back(p);
             }
+            for (size_t s = 0; s < proto::kVehSeats; s++)   // T1: whoever was on the way in is not any more
+                if (V.resBy[s] != proto::kNoPlayer)
+                    DropIntent(V.resBy[s], proto::SeatCancelReason::VehicleGone);
             V = Vehicle();
             count_--;
             removed_.push_back(Removed{id, tick});
@@ -298,6 +361,11 @@ namespace gage::server {
             if (seat == 0 && V.owned && V.spawner != player) return Code::NotOwner;
             if (V.s.seats[seat] == player) return Code::Ok; // already there
             if (V.s.seats[seat] != proto::kNoPlayer) return Code::SeatTaken;
+            {
+                // T1: a seat somebody else is walking to is theirs until they sit, cancel or time out.
+                const uint16_t held = ReservedBy(id, seat, nowMs);
+                if (held != proto::kNoPlayer && held != player) return Code::SeatTaken;
+            }
             const Seat cur = occ_[player];
             if (cur.veh != id) // a seat shuffle inside the same vehicle skips the door checks
             {
@@ -306,6 +374,7 @@ namespace gage::server {
             }
             NoteTick(tick);
             if (cur.veh != kNone) Leave(player, nowMs, tick);
+            ConsumeIntent(player, id, (uint8_t)seat);   // T1: the walk ends here: Seated for the seat it was for, else Cancelled
             V.s.seats[seat] = player;
             occ_[player] = Seat{id, (uint8_t)seat};
             V.changedTick = tick;
@@ -326,14 +395,75 @@ namespace gage::server {
             return Code::Ok;
         }
 
-        // Leaves vehicle `id` (the one the player sits in).
-        Code Exit(uint16_t player, uint16_t id, uint64_t nowMs, uint32_t tick)
+        // Leaves vehicle `id` (the one the player sits in). T1: `announce` (a player's own Exit command, not a death or a
+        // respawn) queues SeatNotice::Exited so every screen plays the normal exit animation; an Exit while the player only
+        // holds a reservation on `id` cancels it (Ok).
+        Code Exit(uint16_t player, uint16_t id, uint64_t nowMs, uint32_t tick, bool announce = false)
         {
             if (player >= occ_.size()) return Code::NotAllowed;
             if (id >= v_.size() || !v_[id].exists) return Code::NoVehicle;
-            if (occ_[player].veh != id) return Code::NotInVehicle;
+            if (occ_[player].veh != id)
+            {
+                if (intent_[player].veh == id)
+                {
+                    DropIntent(player, proto::SeatCancelReason::ByPlayer);
+                    return Code::Ok;
+                }
+                return Code::NotInVehicle;
+            }
+            const uint8_t seat = occ_[player].seat;
             Leave(player, nowMs, tick);
+            if (announce) Notice(proto::SeatNoticeKind::Exited, player, id, seat, 0);
             return Code::Ok;
+        }
+
+        // T1 seats: `player` reserves `seat` of vehicle `id` (VehicleOp::EnterIntent). The checks are Enter's, plus: a player
+        // who sits somewhere already is NotAllowed (an intent is a walk from outside), and a seat somebody else holds (seated or
+        // reserved) is SeatTaken. Ok when the reservation stands (a repeat of the same one just renews it).
+        Code Reserve(uint16_t player, uint16_t id, uint32_t seat, bool run, const proto::Kinematics& playerPos, uint64_t nowMs, uint32_t tick)
+        {
+            if (player >= occ_.size()) return Code::NotAllowed;
+            if (id >= v_.size() || !v_[id].exists) return Code::NoVehicle;
+            if (seat >= proto::kVehSeats) return Code::BadArg;
+            Vehicle& V = v_[id];
+            if (seat == 0 && V.owned && V.spawner != player) return Code::NotOwner;
+            if (occ_[player].veh != kNone) return Code::NotAllowed;
+            if (V.s.seats[seat] != proto::kNoPlayer) return Code::SeatTaken;
+            const uint16_t held = ReservedBy(id, seat, nowMs);
+            if (held != proto::kNoPlayer && held != player) return Code::SeatTaken;
+            if (Dist2(playerPos, V.s.k) > rules_.enterDistance * rules_.enterDistance) return Code::TooFar;
+            if ((V.s.flags & proto::kVehLocked) && V.spawner != player) return Code::Locked;
+            NoteTick(tick);
+            Intent& I = intent_[player];
+            if (I.veh == id && I.seat == seat)
+            {
+                I.sinceMs = nowMs;            // the same walk, renewed: nobody needs telling again
+                I.run = run;
+                return Code::Ok;
+            }
+            if (I.veh != kNone) DropIntent(player, proto::SeatCancelReason::Replaced);
+            I.veh = id;
+            I.seat = (uint8_t)seat;
+            I.run = run;
+            I.sinceMs = nowMs;
+            V.resBy[seat] = player;
+            Notice(proto::SeatNoticeKind::Reserved, player, id, (uint8_t)seat, run ? proto::kSeatNoticeRun : 0);
+            return Code::Ok;
+        }
+
+        // T1 seats: drops `player`'s reservation on `id` (VehicleOp::CancelIntent). Ok also when there is none.
+        Code CancelIntent(uint16_t player, uint16_t id)
+        {
+            if (player >= occ_.size()) return Code::NotAllowed;
+            if (id >= v_.size() || !v_[id].exists) return Code::NoVehicle;
+            if (intent_[player].veh == id) DropIntent(player, proto::SeatCancelReason::ByPlayer);
+            return Code::Ok;
+        }
+
+        // T1 seats: the player died, respawned or was put elsewhere: whatever it was walking to is over.
+        void CancelIntentOf(uint16_t player, proto::SeatCancelReason why)
+        {
+            if (player < intent_.size() && intent_[player].veh != kNone) DropIntent(player, why);
         }
 
         // A player left the server: out of its seat. Its EMPTY vehicles are destroyed (ids to `destroyed`),
@@ -344,6 +474,7 @@ namespace gage::server {
                         size_t* orphaned = nullptr)
         {
             if (player >= occ_.size()) return;
+            if (intent_[player].veh != kNone) DropIntent(player, proto::SeatCancelReason::PlayerGone);
             if (occ_[player].veh != kNone) Leave(player, nowMs, tick);
             for (Vehicle& V : v_)
             {
@@ -391,6 +522,17 @@ namespace gage::server {
                 }
                 const float sticky2 = rules_.ctrlStickyMeters * rules_.ctrlStickyMeters;
                 const float fresh2 = rules_.ctrlNewMeters * rules_.ctrlNewMeters;
+                // T4: a driven vehicle about to hit this one takes its control, so the hit is resolved by ONE physics instance
+                if (rules_.claimBaseMeters > 0.0f && (V.s.ctrl == proto::kNoPlayer || nowMs >= V.ctrlSinceMs + rules_.claimHoldMs))
+                {
+                    const uint16_t toucher = FindToucher(V, players);
+                    if (toucher != proto::kNoPlayer && toucher != V.s.ctrl)
+                    {
+                        SetController(V, toucher, nowMs, tick);
+                        ++claims_;
+                        continue;
+                    }
+                }
                 if (V.s.ctrl != proto::kNoPlayer)
                 {
                     const ControlCandidate* c = FindCandidate(players, V.s.ctrl);
@@ -422,6 +564,10 @@ namespace gage::server {
             }
         }
 
+        // T4 counters (the server's 10 s contact line)
+        uint64_t Claims() const { return claims_; }
+        uint64_t SpeedClamps() const { return speedClamps_; }
+
         // ---- the controller's motion ----
         // Ok when taken; NoVehicle, NotAllowed (not the vehicle's controller: v4 required seat 0), BadArg (invalid,
         // or a REPORTED velocity over the speed cap: the replicated velocity must be sane). The position is judged
@@ -440,7 +586,17 @@ namespace gage::server {
             if (V.s.ctrl != player) return Code::NotAllowed;
             if (!proto::ValidVehicleUpdate(u)) return Code::BadArg;
             const double speed2 = (double)u.k.vx * u.k.vx + (double)u.k.vy * u.k.vy + (double)u.k.vz * u.k.vz;
-            if (speed2 > (double)rules_.maxSpeed * rules_.maxSpeed) return Code::BadArg;
+            const double cap = (double)rules_.maxSpeed;
+            double velScale = 1.0;
+            if (speed2 > cap * cap)
+            {
+                // T4: over the cap. A hard overshoot (a cheat or a broken read) is still refused; a small one is clamped, not dropped
+                // (a dropped update froze the car for everybody else for as long as the overshoot lasted).
+                const double soft = cap * (double)rules_.maxSpeedSoftFactor;
+                if (!(rules_.maxSpeedSoftFactor > 1.0f) || speed2 > soft * soft) return Code::BadArg;
+                velScale = cap / std::sqrt(speed2);
+                ++speedClamps_;
+            }
             const double dtSec = nowMs > V.recvMs ? (double)(nowMs - V.recvMs) / 1000.0 : 0.0;
             const float moved = ac::Dist(u.k, V.s.k);
             const bool jump = moved > ac::AllowedMove(rules_.maxSpeed, dtSec);
@@ -451,9 +607,9 @@ namespace gage::server {
             V.s.k.x = u.k.x;
             V.s.k.y = u.k.y;
             V.s.k.z = u.k.z;
-            V.s.k.vx = u.k.vx;
-            V.s.k.vy = u.k.vy;
-            V.s.k.vz = u.k.vz;
+            V.s.k.vx = (float)(u.k.vx * velScale);
+            V.s.k.vy = (float)(u.k.vy * velScale);
+            V.s.k.vz = (float)(u.k.vz * velScale);
             V.s.rot = u.rot;
             V.s.k.heading = proto::QuatHeading(u.rot);
             V.s.avx = u.avx;
@@ -466,7 +622,8 @@ namespace gage::server {
             // Health only goes down from the controller's side (a crash); never repaired by a client. What the
             // motion-only entry leaves out (health, lights, doors) and changes is sent in full for a few frames.
             const uint16_t body = std::min(V.s.bodyHealth, u.bodyHealth), engine = std::min(V.s.engineHealth, u.engineHealth);
-            if (body != V.s.bodyHealth || engine != V.s.engineHealth || u.flags2 != V.s.flags2 || u.doors != V.s.doors)
+            const bool visChanged = MergeVisual(V, u.tyres, u.tyresRim, u.windows, nowMs); // v6
+            if (body != V.s.bodyHealth || engine != V.s.engineHealth || u.flags2 != V.s.flags2 || u.doors != V.s.doors || visChanged)
                 V.changedTick = lastTick_ + 1; // told in full from the next frame on
             V.s.bodyHealth = body;
             V.s.engineHealth = engine;
@@ -518,6 +675,56 @@ namespace gage::server {
             V->changedTick = tick;
             return Code::Ok;
         }
+        // v6: a validated vehicle Hit that names a part (protocol.h VehiclePartCode): a tyre burst, a tyre off its rim or
+        // a smashed window of a car whose shooter does not necessarily control it. The bit is set for everybody at once
+        // (told in full for a few frames) and kept as unconfirmed until the controller shows it in a VehicleUpdate or
+        // kVisAckMs pass with it not showing it (MergeVisual). Idempotent. True when the visual state changed.
+        bool HitPart(uint16_t id, proto::VehiclePart part, unsigned slot, uint64_t nowMs, uint32_t tick)
+        {
+            Vehicle* V = Mutable(id);
+            if (!V || slot >= proto::kVehWheelSlots) return false;
+            const uint8_t b = (uint8_t)(1u << slot);
+            const uint64_t stamp = nowMs + 1;
+            bool changed = false;
+            switch (part)
+            {
+            case proto::VehiclePart::Tyre:
+                if (!(V->s.tyres & b))
+                {
+                    V->s.tyres |= b;
+                    V->visPendMs[slot] = stamp;
+                    changed = true;
+                }
+                break;
+            case proto::VehiclePart::TyreRim:
+                if (!(V->s.tyresRim & b))
+                {
+                    if (!(V->s.tyres & b)) V->visPendMs[slot] = stamp;
+                    V->s.tyres |= b;
+                    V->s.tyresRim |= b;
+                    V->visPendMs[proto::kVehWheelSlots + slot] = stamp;
+                    changed = true;
+                }
+                break;
+            case proto::VehiclePart::Window:
+                if (!(V->s.windows & b))
+                {
+                    V->s.windows |= b;
+                    V->visPendMs[2 * proto::kVehWheelSlots + slot] = stamp;
+                    changed = true;
+                }
+                break;
+            default:
+                break;
+            }
+            if (changed)
+            {
+                NoteTick(tick);
+                V->changedTick = tick;
+            }
+            return changed;
+        }
+
         // A validated hit: `damage` off the body health, half of it off the engine health.
         void Damage(uint16_t id, uint16_t damage, uint32_t tick)
         {
@@ -536,6 +743,9 @@ namespace gage::server {
         void Tick(uint64_t nowMs, uint32_t tick, std::vector<uint16_t>* despawned)
         {
             NoteTick(tick);
+            for (uint16_t p = 0; p < intent_.size(); p++)   // T1: a walk that never ended
+                if (intent_[p].veh != kNone && nowMs >= intent_[p].sinceMs && nowMs - intent_[p].sinceMs >= proto::kIntentTtlMs)
+                    DropIntent(p, proto::SeatCancelReason::Expired);
             for (Vehicle& V : v_)
             {
                 if (!V.exists) continue;
@@ -683,6 +893,7 @@ namespace gage::server {
                 out.vehicles.push_back(V.s);
                 proto::VehicleState& e = out.vehicles.back();
                 e.motionOnly = !c.full;
+                if (V.s.ctrl == proto::kNoPlayer) e.flags2 &= (uint8_t)~proto::kVeh2Brake; // nobody brakes a car nobody controls
                 e.ageMs = (uint8_t)(nowMs > V.posMs ? std::min<uint64_t>(nowMs - V.posMs, 255) : 0);
                 R.v[c.id].lastFull = tick;
                 if (c.full) R.v[c.id].lastStatic = tick;
@@ -692,12 +903,12 @@ namespace gage::server {
             return true;
         }
 
-        // Encoded size of an entry after its id and header byte: a full one (43 bytes + 2 per occupant), or the
-        // motion-only one (24).
+        // Encoded size of an entry after its id and header byte: a full one (46 bytes + 2 per occupant; v6 added the
+        // tyre, rim and window masks), or the motion-only one (24).
         static constexpr size_t kMotionOnlyBytes = 24;
         static size_t FullBytes(const proto::VehicleState& s)
         {
-            size_t n = 43;
+            size_t n = 46;
             for (uint16_t p : s.seats)
                 if (p != proto::kNoPlayer) n += 2;
             return n;
@@ -705,6 +916,7 @@ namespace gage::server {
 
     private:
         static constexpr uint32_t kFreshFrames = 3;   // a newcomer / change is sent in this many frames
+        static constexpr uint64_t kVisAckMs = 3000;   // a Hit's visual bit waits this long for the controller to show it
         static constexpr uint32_t kRemovedRepeat = 3; // a "destroyed" notice rides this many frames
         static constexpr size_t kMaxRemovedPerFrame = 255; // the wire's u8 nRemoved
 
@@ -718,6 +930,33 @@ namespace gage::server {
         void NoteTick(uint32_t tick)
         {
             if (tick > lastTick_) lastTick_ = tick;
+        }
+        // The driver of the nearest driven vehicle that is about to hit the driverless V (see Rules::claimBaseMeters), or kNoPlayer.
+        // The driver must be a trusted candidate with a position and have V in view.
+        uint16_t FindToucher(const Vehicle& V, const std::vector<ControlCandidate>& players) const
+        {
+            uint16_t best = proto::kNoPlayer;
+            float bestD2 = 0;
+            for (const Vehicle& W : v_)
+            {
+                if (!W.exists || W.s.id == V.s.id) continue;
+                const uint16_t driver = W.s.seats[0];
+                if (driver == proto::kNoPlayer || W.s.ctrl != driver) continue;
+                const float vx = W.s.k.vx, vy = W.s.k.vy;
+                const float speed = std::sqrt(vx * vx + vy * vy);
+                if (speed < rules_.claimMinSpeed) continue;
+                const float dx = V.s.k.x - W.s.k.x, dy = V.s.k.y - W.s.k.y, dz = V.s.k.z - W.s.k.z;
+                const float d2 = dx * dx + dy * dy;
+                const float reach = rules_.claimBaseMeters + rules_.claimLookSeconds * speed;
+                if (d2 > reach * reach || std::fabs(dz) > 6.0f) continue;
+                const float d = std::sqrt(d2);
+                const float closing = d > 0.1f ? (vx * dx + vy * dy) / d : speed;   // speed of the driver toward V
+                if (closing < 1.0f) continue;
+                const ControlCandidate* c = FindCandidate(players, driver);
+                if (!c || !c->hasState || !c->trusted || !RelevantTo(driver, V.s.id)) continue;
+                if (best == proto::kNoPlayer || d2 < bestD2) { best = driver; bestD2 = d2; }
+            }
+            return best;
         }
         static const ControlCandidate* FindCandidate(const std::vector<ControlCandidate>& players, uint16_t id)
         {
@@ -750,6 +989,41 @@ namespace gage::server {
             V.ctrlUpdateMs = 0;
             V.recvMs = nowMs;
             V.changedTick = tick;
+        }
+        // v6: the controller's visual report (tyre burst, off-rim and smashed-window masks) merged into V's truth.
+        // A bit the controller shows is truth (and acks a Hit's pending bit); a bit it does not show is dropped, except
+        // a Hit's bit that is still inside kVisAckMs (the controller has not had its chance to show it yet). So a
+        // repair (the controller reports the bit clear) clears it, a pop by somebody else survives until the controller
+        // shows it, and a controller that cannot show it (native missing, the pop rejected there) does not keep a
+        // phantom for ever. With no controller nothing calls this: the truth stays what the last report and Hits said.
+        // True when the merged state changed.
+        static bool MergeVisual(Vehicle& V, uint8_t reportTyres, uint8_t reportRim, uint8_t reportWindows, uint64_t nowMs)
+        {
+            const uint8_t rep[3] = { (uint8_t)(reportTyres | reportRim), reportRim, reportWindows };
+            uint8_t next[3];
+            for (size_t g = 0; g < 3; g++)
+            {
+                uint8_t n = rep[g];
+                for (size_t slot = 0; slot < proto::kVehWheelSlots; slot++)
+                {
+                    uint64_t& t = V.visPendMs[g * proto::kVehWheelSlots + slot];
+                    if (!t) continue;
+                    const uint8_t b = (uint8_t)(1u << slot);
+                    if (rep[g] & b)
+                        t = 0;                                  // the controller shows it: confirmed
+                    else if (nowMs + 1 >= t && nowMs + 1 - t >= kVisAckMs)
+                        t = 0;                                  // it never showed it: dropped
+                    else
+                        n |= b;                                 // not yet
+                }
+                next[g] = n;
+            }
+            next[0] |= next[1];
+            const bool changed = next[0] != V.s.tyres || next[1] != V.s.tyresRim || next[2] != V.s.windows;
+            V.s.tyres = next[0];
+            V.s.tyresRim = next[1];
+            V.s.windows = next[2];
+            return changed;
         }
         // Nobody controls V: it stands still.
         static void ClearController(Vehicle& V, uint32_t tick)
@@ -801,6 +1075,48 @@ namespace gage::server {
             }
             return best;
         }
+        // T1 seats helpers. Notice queues one SeatNotice; DropIntent ends a reservation with Cancelled(why);
+        // ConsumeIntent is Enter's: the reservation for exactly this seat becomes Seated, any other one is Cancelled(Replaced).
+        void Notice(proto::SeatNoticeKind kind, uint16_t player, uint16_t veh, uint8_t seat, uint8_t detail)
+        {
+            proto::SeatNotice n;
+            n.kind = kind;
+            n.player = player;
+            n.vehId = veh;
+            n.seat = seat;
+            n.detail = detail;
+            notices_.push_back(n);
+            std::vector<uint16_t> to;
+            for (uint16_t p = 0; p < rx_.size(); p++)
+                if (p == player || (rx_[p].active && veh < rx_[p].v.size() && rx_[p].v[veh].relevant)) to.push_back(p);
+            audiences_.push_back(std::move(to));
+        }
+        void ReleaseIntent(uint16_t player)
+        {
+            Intent& I = intent_[player];
+            if (I.veh < v_.size() && v_[I.veh].resBy[I.seat] == player) v_[I.veh].resBy[I.seat] = proto::kNoPlayer;
+            I = Intent();
+        }
+        void DropIntent(uint16_t player, proto::SeatCancelReason why)
+        {
+            const Intent I = intent_[player];
+            if (I.veh == kNone) return;
+            ReleaseIntent(player);
+            Notice(proto::SeatNoticeKind::Cancelled, player, I.veh, I.seat, (uint8_t)why);
+        }
+        void ConsumeIntent(uint16_t player, uint16_t id, uint8_t seat)
+        {
+            const Intent I = intent_[player];
+            if (I.veh == kNone) return;
+            if (I.veh == id && I.seat == seat)
+            {
+                ReleaseIntent(player);
+                Notice(proto::SeatNoticeKind::Seated, player, id, seat, 0);
+            }
+            else
+                DropIntent(player, proto::SeatCancelReason::Replaced);
+        }
+
         // Out of its seat; a driver's vehicle parks.
         void Leave(uint16_t player, uint64_t nowMs, uint32_t tick)
         {
@@ -831,11 +1147,15 @@ namespace gage::server {
         Rules rules_;
         std::vector<Vehicle> v_;  // by id, kMaxVehicles slots
         std::vector<Seat> occ_;   // by player id
+        std::vector<Intent> intent_;           // T1: by player id
+        std::vector<proto::SeatNotice> notices_;   // T1: queued, oldest first
+        std::vector<std::vector<uint16_t>> audiences_;   // T1: the players to tell, per queued notice
         std::vector<Rx> rx_;      // by player id
         std::vector<Removed> removed_;
         std::vector<Cand> cands_;
         uint16_t nextId_ = 0;
         size_t count_ = 0;
+        uint64_t claims_ = 0, speedClamps_ = 0; // T4 counters
         uint32_t lastTick_ = 0; // the newest tick any call carried: a change made between ticks is told from the next one on
     };
 

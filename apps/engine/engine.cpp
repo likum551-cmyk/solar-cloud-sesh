@@ -15,18 +15,23 @@
 #include "brand_apparel.h"
 #include "pack_stream.h"
 #include "quit_gate.h"
+#include "ambient.h"
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/smoother.h"
 #include "sync/locomotion.h"
+#include "sync/oneshot.h"
 #include "sync/vehicle_drive.h"
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
+#include "sync/vehicle_visual.h"
 #include "sync/pedstate.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
+#include "sync/vehicle_impact.h"
 #include "sync/vehicle_syncd.h"
+#include "sync/seat_intent.h"
 #include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
@@ -134,10 +139,20 @@ namespace {
     // frame without an anchor entity, while aiming, and for 20 s after a lost task.
     // Read by the join worker's OnWelcome and by the game thread's SyncNet (Peer construction): atomic.
     std::atomic<bool> g_locoAnchor{true};
+    // T2 (desync round 2): loco_push = nudge (default) | velocity: how a walking puppet's position error is closed. Nudge = a few mm of
+    // SET_ENTITY_COORDS_NO_OFFSET per frame (exact whatever SET_ENTITY_VELOCITY does to a ped under a task); velocity = the 0.4.6 push.
+    // loco_selfcheck = 0 turns the degradation ladder off (anchor -> straight -> blend-carried speed -> rigid follow, each step
+    // logged as "engine: loco level"). Both re-read at every Welcome like loco_mode.
+    std::atomic<bool> g_locoPushNudge{true};
+    std::atomic<bool> g_locoSelfCheck{true};
+    sync::LevelWitness g_locoDegrade;     // script tick only
+    std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
     {
-        sync::LocoConfig c;
-        c.mode = g_locoAnchor.load() ? sync::LocoMode::Anchor : sync::LocoMode::Straight;
+        sync::LocoConfig c = sync::ShippedLocoConfig(g_locoAnchor.load());
+        if (!g_locoPushNudge.load())
+            c.push = sync::PushMode::Velocity;
+        c.selfCheck = g_locoSelfCheck.load();
         return c;
     }
 
@@ -174,6 +189,8 @@ namespace {
         sync::SiteTally<kLocoSites> hardSites, softSites;
         sync::WaterEdge water;
         sync::ClimbWindow climb;
+        sync::OneShotAudit audit;   // T2: did the game SHOW the jump / reload / stealth / swim / ragdoll we asked for (script tick)
+        uint32_t levelLogged = 0;   // T2: "engine: loco level" lines written for this puppet (rate limit)
 
         // Stage 3 (protocol v3). Appearance: the newest PeerLook (PeerNet::look, copied by SyncNet, applied
         // by the script tick); lookDirty until it is on the ped. pedModel is the model the ped was spawned with.
@@ -402,6 +419,14 @@ namespace {
         uint8_t sentFlags = 0, sentFlags2 = 0, sentDoors = 0;
         bool sentOnce = false;
         float steerPrev = 0.0f;       // the steering estimate's held value (below 1 m/s)
+        // ---- T3 (vehicle visual state, protocol v6) ----
+        sync::VisualSync vis;         // tyres / windows: the controller's edge apply and a copy's level apply (libs/sync/vehicle_visual.h)
+        sync::DriveQuat steerPrevRot; // the rotation of the previous steering sample (the yaw rate comes from successive rotations)
+        double steerPrevRotMs = -1e9;
+        sync::VisualMask visReport;   // controller: what the car showed at the last read (visReadMs), sent in VehicleUpdate
+        sync::VisualMask sentVis;
+        double visReadMs = -1e9;
+        float sentSteer = 0.0f;       // the steering that went out last (a change of it is sent at once)
         // ---- W9 (script tick) ----
         sync::PresentLead lead;       // item 6: how far past the interpolation time this copy is drawn (near the local player)
         double leadMs = 0;            // ... the lead of this frame (for the 10 s line)
@@ -414,6 +439,10 @@ namespace {
         uint32_t contactKickMutesSeen = 0;   // drive stats at the last collision line
         float contactLastPosX = 0, contactLastPosY = 0, contactLastPosZ = 0;   // where the copy was this frame (the pair pass)
         bool contactPosValid = false;
+        // ---- T4 (vehicle collisions, libs/sync/vehicle_impact.h; script tick) ----
+        sync::impact::ImpactTracker impactTracker;   // a car we control: the velocity jumps the game's physics gave it (a contact with a copy)
+        uint32_t lastImpactSeq = 0;                  // the newest server VehicleImpact applied / judged for this car
+        double divCheckAtMs = 0;                     // a copy whose response we adopted: when to compare it with its controller's stream (0 = none)
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -434,6 +463,25 @@ namespace {
     std::atomic<bool> g_vehDriveByAimOnly{false};
     // peer_hits=0 keeps remote peds invincible (no local hit detection); default 1.
     std::atomic<bool> g_peerHits{true};
+    // T4 (vehicle collisions): impact_sync=0 in HKCU\Software\GAGE-MP keeps the contact grace (W9 / Sync B) as the only contact handling and
+    // ignores the server's VehicleImpact messages. Default on; re-read at every Welcome.
+    std::atomic<bool> g_impactSync{true};
+    // The server's VehicleImpact messages (join worker -> script tick), newest last, at most kMaxImpactQueue waiting.
+    std::mutex g_impactMtx;
+    std::vector<proto::VehicleImpact> g_impactQueue;   // g_impactMtx
+    constexpr size_t kMaxImpactQueue = 16;
+    // T4 counters (script tick except the atomic ones), reported every 10 s with the other vehicle lines.
+    struct T4Stats
+    {
+        uint32_t adopted = 0, adoptRefused = 0, guardRefused = 0;      // copies whose response became their trajectory / contacts left to the grace / stream pushes refused
+        uint32_t jumpEpisodes = 0;                                      // velocity jumps (contacts) our controlled cars felt
+        uint32_t impactsIn = 0, applied = 0, noLocal = 0, tiny = 0, stale = 0, dup = 0, noVehicle = 0;   // server impacts: received and what became of them
+        double appliedDvSum = 0, appliedDvMax = 0;
+        uint32_t divN = 0;                                              // copies compared with their controller 500 ms after the adoption
+        double divSum = 0, divMax = 0;
+        uint32_t dropped = 0;                                           // queue overflow
+    };
+    T4Stats g_t4;                                                       // script tick (dropped: g_impactMtx)
     constexpr int kPeerHpPool = 1000;             // a remote ped's local health, restored after every hit
     // Sync plan W3 (combat client), re-read at every Welcome:
     //   hit_react = off | bullet | ragdoll | both (default both): bullet = a flinch from a 1-damage point-blank
@@ -475,9 +523,10 @@ namespace {
     // the bounded queue, where an answer evicts a feed line when it is full and a feed line is refused.
     struct NetEvent
     {
-        enum Kind { Killed, VehResult } kind = Killed;
+        enum Kind { Killed, VehResult, SeatNote } kind = Killed;
         proto::Killed killed;
         proto::VehicleResult veh;
+        proto::SeatNotice seat;       // T1 seats (wire v6)
     };
     std::mutex g_evMtx;
     constexpr size_t kMaxEvents = 256;
@@ -531,6 +580,21 @@ namespace {
         sync::EntryVec target;     // its last target
     };
     EntryWalk g_entryWalk;
+    // T1 seats (wire v6, libs/sync/seat_intent.h): the server's enter / exit intents. g_seats holds the reservation book and one replay per
+    // remote player; g_localEnter is OUR entry (intent -> the game's TASK_ENTER_VEHICLE -> bounded fallback warp). HKCU seat_intent=0
+    // (read at Welcome) restores the pre-v6 behaviour: walk + teleport-in locally, follow + seat warp on the other screens.
+    // Script tick only (the net sinks queue their events).
+    sync::SeatClientModel g_seats;
+    sync::LocalEnterFlow g_localEnter;
+    std::atomic<bool> g_seatIntentOn{true};
+    struct T1Stats
+    {
+        uint32_t intentsSent = 0, intentsOk = 0, intentsRefused = 0, cancelsSent = 0, noticesIn = 0, noticesAboutUs = 0, exitsReplayed = 0, exitsNoPed = 0;
+        uint32_t refusedBy[16] = {};                 // by VehicleResultCode
+        uint32_t localIssueFailed = 0;
+        uint32_t evictLog = 0;
+    };
+    T1Stats g_t1;
     // W9 item 3: INPUT_ENTER (23) stays disabled from our handled F / G press until 500 ms after the ped sat down, and a
     // quick exit after an entry is counted (the 0.4.2 log: enter, exit 1.4 s later, enter, exit). Script tick only.
     sync::EntryPressGuard g_entryGuard;
@@ -1183,6 +1247,11 @@ namespace {
     void OnWelcome(uint16_t myId, uint16_t tickHz, uint8_t playerHealth)
     {
         g_tickHz.store(tickHz);
+        // T6: the server's maximum health BEFORE g_v4Reset is raised below (and before the g_peersMtx wait further down): the script tick
+        // that handles the reset sizes the ped and the tracker from it, and used to be able to read the previous session's value.
+        g_playerHealth.store(playerHealth ? playerHealth : proto::kDefaultHealth);
+        GLOGI("engine: health: Welcome.playerHealth %u -> the ped's maximum will be %d (100 + it)", (unsigned)playerHealth,
+              sync::PedMaxHealth(playerHealth));
         // peer_drive: anything but "place" (absent, empty, a typo) is the default "tasks".
         const std::wstring drive = reg::Get(L"peer_drive");
         g_peerDrive.store(drive == L"place" ? kDrivePlace : kDriveTasks);
@@ -1195,6 +1264,13 @@ namespace {
         GLOGI("engine: remote on-foot walking via %s (loco_mode)",
               g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
                                   : "TASK_GO_STRAIGHT_TO_COORD at a far point");
+        // T2: the position-error push and the degradation ladder (see LocoCfg).
+        g_locoPushNudge.store(reg::Get(L"loco_push") != L"velocity");
+        g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
+        GLOGI("engine: remote on-foot position error closed by %s (loco_push), self-checks / degradation ladder %s (loco_selfcheck)",
+              g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
+              g_locoSelfCheck.load() ? "ON (anchor -> straight -> blend-carried speed -> rigid follow, each step logged)" : "OFF");
+        g_locoDegradeReset.store(true);
         // W10: name tags on by default; nametags=0 turns them off, nametags_los=<int> the LOS trace flags.
         g_nameTags.store(reg::Get(L"nametags") != L"0");
         {
@@ -1211,7 +1287,9 @@ namespace {
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
+        g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
+        g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
             // Sync plan W3: hit_react off|bullet|ragdoll|both (anything else, the default: both),
             // peer_muzzle=0, peer_shoot=script (real fire is the default since the 0.4.3 fixes).
@@ -1265,7 +1343,6 @@ namespace {
                 ++kv.second.ctrlSeq;
                 ++kv.second.driveResetSeq;             // a new source of motion: the drive controller snaps onto its first sample
             }
-            g_playerHealth.store(playerHealth ? playerHealth : proto::kDefaultHealth);
         }
         GLOGI("engine: remote-player sync for %u Hz (smoother tick %.0f Hz, one render clock for peds and cars, shared delay "
               "%.0f..%.0f ms, start %.0f ms); own id %u", (unsigned)tickHz, cfg.tickHz, cfg.minDelayMs, cfg.maxDelayMs,
@@ -1515,6 +1592,26 @@ namespace {
         }
     }
 
+    void OnSeatNotice(const proto::SeatNotice& n)
+    {
+        NetEvent e;
+        e.kind = NetEvent::SeatNote;
+        e.seat = n;
+        PushEvent(std::move(e), true);                 // reliable and ordered with the VehicleResults: never the one dropped
+    }
+
+    // T4: the server's resolution of a contact of a vehicle we control; queued for the script tick (TickVehicles applies it).
+    void OnVehicleImpact(const proto::VehicleImpact& m)
+    {
+        std::lock_guard<std::mutex> lk(g_impactMtx);
+        if (g_impactQueue.size() >= kMaxImpactQueue)
+        {
+            g_impactQueue.erase(g_impactQueue.begin());
+            ++g_t4.dropped;
+        }
+        g_impactQueue.push_back(m);
+    }
+
     void OnVehicleResult(const proto::VehicleResult& r)
     {
         NetEvent e;
@@ -1684,10 +1781,39 @@ namespace {
     // is 100, so a ped left at the game default of 200 would hold a server value of 150+ only after the vitals tracker
     // clamped it to 100. Set at the entry, on every respawn, after a model swap and whenever the vitals units start
     // over. Script tick.
-    void ApplyServerMaxHealth(int32_t ped)
+    // T6: the native's result and the value GTA kept are read back and counted (VitalsStats), the first calls of a session
+    // and every disagreement are logged. `why` names the caller.
+    void ApplyServerMaxHealth(int32_t ped, const char* why = "?")
     {
-        if (ped)
-            g_world->SetEntityMaxHealth(ped, sync::PedMaxHealth(g_playerHealth.load()));
+        if (!ped)
+            return;
+        struct Port
+        {
+            int32_t ped;
+            bool SetMax(int m) { return g_world->SetEntityMaxHealth(ped, m); }
+            int  GetMax() { return g_world->GetEntityMaxHealth(ped); }
+        } port{ped};
+        const int back = sync::ApplyMaxHealth(port, g_playerHealth.load(), g_vitals);
+        const sync::VitalsStats& st = g_vitals.Stats();
+        static uint32_t logged = 0;
+        static ULONG offAt = 0;
+        const bool off = back != st.lastMaxWanted;
+        const ULONG nowT = GetTickCount();
+        if (logged < 16 || (off && (!offAt || nowT - offAt >= 10000)))
+        {
+            ++logged;
+            if (off)
+                offAt = nowT;
+            const char* const fmt = "engine: health: SET_ENTITY_MAX_HEALTH(ped %d, %d) [%s] read back %d%s; ped health %d, "
+                                    "playerHealth %u (calls %u, failed %u, read-back differs %u)";
+            const char* const note = off ? "  <-- GTA did not keep the wish" : "";
+            if (off)
+                GLOGW(fmt, (int)ped, st.lastMaxWanted, why, back, note, g_world->GetEntityHealth(ped),
+                      (unsigned)g_playerHealth.load(), st.maxWrites, st.maxWriteFails, st.maxReadBackOff);
+            else
+                GLOGI(fmt, (int)ped, st.lastMaxWanted, why, back, note, g_world->GetEntityHealth(ped),
+                      (unsigned)g_playerHealth.load(), st.maxWrites, st.maxWriteFails, st.maxReadBackOff);
+        }
     }
 
     // Dress the freemode ped GTA just gave the player (script tick only). Called right after every
@@ -1741,6 +1867,214 @@ namespace {
                 else
                     game::brand::NoteDressed(when);
             }
+        }
+    }
+
+    // ===== T5 ambient: no ambient NPCs and no ambient traffic for anyone (apps/engine/ambient.h) =====
+    // The suppression used to sit behind EnterServer() (join::IsConnected() and the entry Done), so it never ran
+    // before a session, during join retries, after "session ended", or while the script tick was not live. It now
+    // runs from the top of GameWork, every tick, whatever the connection state (TickAmbient). The remote players'
+    // puppets, the server's cars and everything else the engine itself made are on the exemption list
+    // (AmbientGatherExempt): any NEW entity the engine creates must be added there, or a sweep would take it.
+    ambient::Scheduler g_ambSched;
+    ambient::ExemptSet g_ambExempt;
+    ambient::Report g_ambRep;                      // this window's numbers (reset at each report)
+    ambient::Tally g_ambTallySeen;                 // World::ambientTally at the previous report
+    double g_ambReportMs = 0;                      // NowMs of the last `engine: ambient` line (0 = none yet)
+    bool g_ambEverConnected = false;
+    int g_ambLinkSeen = -1;
+    std::once_flag g_ambConfigured;
+
+    // The handles no clean-up may touch. Script tick only (g_peers / g_vehs are its own). Complete only with a
+    // local ped: with no ped nothing is provable and MayDelete() refuses everything.
+    void AmbientGatherExempt(int32_t lp)
+    {
+        g_ambExempt.Clear();
+        g_ambExempt.Add(lp);
+        g_ambExempt.Add(g_localPed.load());
+        for (const auto& kv : g_peers)
+        {
+            g_ambExempt.Add(kv.second.ped);            // the puppet
+            g_ambExempt.Add(kv.second.anchor);         // its go-to-entity anchor (a real mission ped)
+        }
+        for (const auto& kv : g_vehs)
+            g_ambExempt.Add(kv.second.handle);         // server vehicles (their occupants are the puppets above)
+        g_ambExempt.Add(g_companion);                  // the render-thread test ped
+        for (const int32_t v : g_ownedVehicles)
+            g_ambExempt.Add(v);                        // /car vehicles
+        if (lp)
+        {
+            g_ambExempt.Add(g_world->GetVehiclePedIsIn(lp));      // the car we sit in
+            g_ambExempt.Add(g_world->GetVehiclePedIsUsing(lp));   // ... or are entering / last used
+        }
+        g_ambExempt.SetComplete(lp != 0);
+    }
+
+    // How many exempt handles exist right now (an unresolved DOES_ENTITY_EXIST counts as existing: the breaker then
+    // cannot see a loss, which the `engine: ambient` line shows as calls with failed counts on the other natives).
+    int AmbientAliveCount()
+    {
+        int n = 0;
+        for (const int32_t h : g_ambExempt.Handles())
+            if (g_world->EntityExists(h) != 0)
+                ++n;
+        return n;
+    }
+
+    // The breaker: an exempt handle that existed before a clean-up and is gone right after it (same tick) means the
+    // clean-up took it. Clears and sweeps then stay off for the rest of the process.
+    void AmbientCheckProtected(int before, int after, const char* what)
+    {
+        if (!g_ambSched.CheckProtected(before, after))
+            return;
+        GLOGW("ambient: %s removed %d exempt entity(ies) (a puppet, a server car, our own ped or car) -> area clears and "
+              "sweeps are now OFF for this run (their semantics on mission entities are unverified live); "
+              "send this line and the 10 s `engine: ambient` lines", what, before - after);
+    }
+
+    // CLEAR_AREA_OF_PEDS / COPS + REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA around (x, y, z): the entry, the respawn and
+    // the periodic clear all come through here, guarded by the registry switch (ambient_clear), the exemption list and
+    // the breaker. Script tick only.
+    void AmbientClearGuarded(int32_t lp, float x, float y, float z, float radius, const char* why)
+    {
+        if (!g_ambSched.Sw().master || !g_ambSched.Sw().areaClear || g_ambSched.BreakerTripped())
+            return;
+        AmbientGatherExempt(lp);
+        const int before = AmbientAliveCount();
+        g_world->ClearAmbientAround(x, y, z, radius);
+        const int after = AmbientAliveCount();
+        ++g_ambRep.clears;
+        g_ambRep.exemptCount = (int)g_ambExempt.Size();
+        g_ambRep.protectedSeen += (uint32_t)before;
+        AmbientCheckProtected(before, after, why);
+    }
+
+    // The entity sweep (enumeration natives; inert until their hashes exist): delete what is not exempt. Script tick only.
+    void AmbientSweep(int32_t lp)
+    {
+        int32_t found[ambient::kNearbyCap];
+        std::vector<int32_t> plan;
+        AmbientGatherExempt(lp);
+        const int before = AmbientAliveCount();
+        g_ambRep.exemptCount = (int)g_ambExempt.Size();
+        int budget = ambient::kSweepMaxDeletes;
+        for (int pass = 0; pass < 2; ++pass)           // 0: peds, 1: vehicles
+        {
+            const int n = pass == 0 ? g_world->NearbyPeds(lp, found, ambient::kNearbyCap)
+                                    : g_world->NearbyVehicles(lp, found, ambient::kNearbyCap);
+            (pass == 0 ? g_ambRep.nearPeds : g_ambRep.nearVehs) = n;
+            if (n <= 0)
+                continue;
+            const ambient::SweepStats st = ambient::PlanSweep(found, n, g_ambExempt, budget, plan);
+            g_ambRep.protectedSeen += (uint32_t)st.exempt;
+            for (const int32_t h : plan)
+                if (g_world->EntityExists(h) == 1 && g_world->DeleteAmbientEntity(h))
+                {
+                    ++g_ambRep.deleted;
+                    --budget;
+                }
+        }
+        ++g_ambRep.sweeps;
+        AmbientCheckProtected(before, AmbientAliveCount(), "the entity sweep");
+    }
+
+    // Every tick, from the top of GameWork (script tick or render-thread fallback), whatever the connection.
+    void TickAmbient(bool inScript, int32_t lp, WorkProbe* probe)
+    {
+        std::call_once(g_ambConfigured, [] {
+            g_ambSched.Configure(ambient::LoadSwitches([](const char* name) {
+                return reg::Get(std::wstring(name, name + std::strlen(name)));
+            }));
+            const ambient::Switches& sw = g_ambSched.Sw();
+            GLOGI("ambient: suppression %s; render-thread fallback %s; periodic area clear %s (breaker armed); entity sweep %s "
+                  "(registry: ambient / ambient_render / ambient_clear / ambient_sweep = 0 turns one off)",
+                  sw.master ? "ON" : "OFF (ambient=0)", sw.renderFallback ? "on" : "off",
+                  sw.areaClear ? "on" : "off", sw.sweep ? "on" : "off");
+        });
+        const double nowMs = NowMs();
+        const bool connected = join::IsConnected();
+        g_ambEverConnected = g_ambEverConnected || connected;
+        const ambient::Link link = ambient::LinkOf(connected, g_entry.load() == Entry::Done, g_ambEverConnected);
+        if (inScript && (int)link != g_ambLinkSeen)
+        {
+            if (g_ambLinkSeen >= 0)
+                GLOGI("ambient: connection %s -> %s (the suppression keeps running)",
+                      ambient::Name((ambient::Link)g_ambLinkSeen), ambient::Name(link));
+            g_ambLinkSeen = (int)link;
+        }
+        ambient::Ctx c;
+        c.inScript = inScript;
+        c.spawnMode = g_world->spawnMode;
+        c.nativesUp = g_world->HaveNatives();
+        c.havePlayer = inScript && lp != 0;
+        c.sweepAvailable = g_world->AmbientSweepAvailable();
+        c.nowMs = (uint64_t)nowMs;
+        const ambient::Plan p = g_ambSched.Next(c);
+        if (!p.frame)
+            ++g_ambRep.skipped[(int)p.skip];
+        else
+        {
+            static bool loggedFirst = false;
+            if (!loggedFirst)
+            {
+                loggedFirst = true;
+                GLOGI("ambient: first suppression frame via the %s (connection %s, spawn mode %d, player %s)",
+                      inScript ? "script tick" : "render-thread fallback", ambient::Name(link), c.spawnMode,
+                      lp ? "known" : "not yet");
+            }
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                g_world->SuppressAmbientFrame();       // the five density multipliers, every frame, at the source
+            }
+            if (inScript)
+            {
+                ++g_ambRep.frameScript;
+                ++g_ambRep.ticks[(int)link];
+            }
+            else
+                ++g_ambRep.frameRender;
+            float x = 0, y = 0, z = 0;
+            const bool haveCoords = (p.periodic || p.clear) && g_world->GetEntityCoords(lp, x, y, z);
+            if (p.periodic)
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                g_world->SuppressAmbientSystems(x, y, z, haveCoords);
+                ++g_ambRep.periodic;
+            }
+            if (p.clear && haveCoords)
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                AmbientClearGuarded(lp, x, y, z, ambient::kClearRadiusM, "the periodic area clear");
+            }
+            if (p.sweep)
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                AmbientSweep(lp);
+            }
+        }
+        // The 10 s line: key=value, parseable; written in every connection state, also while nothing runs.
+        if (g_ambReportMs == 0)
+            g_ambReportMs = nowMs;
+        else if (nowMs - g_ambReportMs >= 10000.0)
+        {
+            ambient::Report& r = g_ambRep;
+            r.windowSec = (nowMs - g_ambReportMs) / 1000.0;
+            r.link = link;
+            r.calls = ambient::Delta(g_world->ambientTally, g_ambTallySeen);
+            g_ambTallySeen = g_world->ambientTally;
+            r.breaker = g_ambSched.BreakerTripped();
+            r.breakerLost = g_ambSched.ExemptLost();
+            r.sw = g_ambSched.Sw();
+            r.sweepAvailable = g_world->AmbientSweepAvailable();
+            char line[1400];
+            ambient::FormatLine(line, sizeof(line), r);
+            GLOGI("%s", line);
+            const int keepPeds = r.nearPeds, keepVehs = r.nearVehs, keepExempt = r.exemptCount;
+            r = ambient::Report();
+            r.nearPeds = keepPeds;
+            r.nearVehs = keepVehs;
+            r.exemptCount = keepExempt;
+            g_ambReportMs = nowMs;
         }
     }
 
@@ -1822,7 +2156,7 @@ namespace {
                 // freemode model keeps streaming meanwhile for the swap at entry. With stock scripts
                 // off (no_sp_scripts=1) no SP script executes, so there is no flow to kill: the
                 // terminate loop is skipped (the entry runs SuppressEntryBoot once instead).
-                g_world->SuppressAmbientFrame();
+                // (the ambient density multipliers run from TickAmbient at the top of GameWork, T5)
                 if (!g_world->StockScriptsOff())
                     g_world->SuppressEntryBoot();
                 static ULONG lastLog = 0;
@@ -1857,7 +2191,7 @@ namespace {
         g_world->SetEntityHeading(ped, kSpawn[3]);
         g_world->FreezeEntityPosition(ped, true);   // held hidden until the spawn's collision streams in
         g_world->RequestCollisionAt(kSpawn[0], kSpawn[1], kSpawn[2]);
-        g_world->ClearAmbientAround(kSpawn[0], kSpawn[1], kSpawn[2], kSpawnClearRadius);
+        AmbientClearGuarded(ped, kSpawn[0], kSpawn[1], kSpawn[2], kSpawnClearRadius, "the entry area clear");
         g_world->ClearSpBlips();
         g_world->DisableWanted();
         g_world->DumpLiveScripts("pristine");   // which SP scripts are running at entry (diagnostic)
@@ -1924,7 +2258,12 @@ namespace {
         if (swapped)
         {
             DressPlayer("ped guard");       // the new ped needs the GAGE-MP look again
-            ApplyServerMaxHealth(g_world->LocalPlayer());   // ... and the server maximum health
+            const int32_t np = g_world->LocalPlayer();
+            GLOGI("engine: health: ped guard swap: new ped %d has health %d / max %d (GTA defaults) before the server maximum %d",
+                  (int)np, g_world->GetEntityHealth(np), g_world->GetEntityMaxHealth(np),
+                  sync::PedMaxHealth(g_playerHealth.load()));
+            ApplyServerMaxHealth(np, "ped guard swap");     // ... and the server maximum health
+            g_vitals.NotePedReplaced();     // T6: the new ped's default 200 is no loss; the server's value goes on it
         }
         static int loggedFixes = 0;
         if (loggedFixes < 10)
@@ -1950,7 +2289,7 @@ namespace {
     {
         const float* s = g_lifeSpawn;
         g_world->ReviveLocalPlayer(s[0], s[1], s[2], s[3]);
-        g_world->ClearAmbientAround(s[0], s[1], s[2], kSpawnClearRadius);
+        AmbientClearGuarded(g_world->LocalPlayer(), s[0], s[1], s[2], kSpawnClearRadius, "the respawn area clear");
         g_world->ClearDeathEffects();
         g_world->RestoreDeathDefaults();
         g_world->RequestCollisionAt(s[0], s[1], s[2]);
@@ -2091,7 +2430,7 @@ namespace {
             const int32_t ped = g_world->LocalPlayer();
             if (ped && !g_vitals.ServerDead())
             {
-                ApplyServerMaxHealth(ped);             // before the health: a value above the old maximum would be cut
+                ApplyServerMaxHealth(ped, "respawn");  // before the health: a value above the old maximum would be cut
                 g_world->SetEntityHealth(ped, 100 + (int)g_vitals.Health());
                 g_world->SetPedArmour(ped, (int)g_vitals.Armour());
             }
@@ -2348,7 +2687,8 @@ namespace {
         // The ped maximum is 100 + the server playerHealth (ApplyServerMaxHealth), so the bar follows the server.
         const int hp = g_world->GetEntityHealth(lp);
         const int maxHp = g_world->GetEntityMaxHealth(lp);
-        const float hpFrac = sync::HealthFraction(hp, maxHp);
+        // T6: a frame whose max reads 0 (native failure) draws the last good / the server's maximum, not an empty bar.
+        const float hpFrac = sync::HudHealthFraction(hp, maxHp, g_playerHealth.load(), g_vitals.LastGoodMax());
         float satFrac = g_satiety / 100.0f;
         satFrac = satFrac < 0 ? 0 : (satFrac > 1 ? 1 : satFrac);
 
@@ -2907,6 +3247,7 @@ namespace {
         pe.emote.OnNewPed(NowMs());
         pe.swingProbe.Cancel();                        // 0e: a swing issued on the old ped is nobody's to judge
         pe.swingPending.Clear();
+        pe.audit.CancelAll();                          // T2: a one-shot asked of the old ped is nobody's to judge
         pe.water.Reset();                              // W8: a fresh ped has no water edge and no climb in progress
         pe.climb.Reset();
         pe.seatLimiter.Reset();                        // W9: a fresh ped has no warp history, no bail-out velocity, no impact
@@ -2933,6 +3274,68 @@ namespace {
             PeerLog(true, "engine: remote peer id=%d: health pool %d did not take (reads %d): remote peds stay "
                     "invincible, local hit detection OFF", id, kPeerHpPool, got);
         }
+    }
+
+    // T2: the puppet one-shots the game was asked to show, and whether it did (libs/sync/oneshot.h). Totals for the 10 s line
+    // "engine: anims onfoot (T2)"; script tick only.
+    sync::OneShotStats g_oneShot[(size_t)sync::OneShot::kCount], g_oneShotLast[(size_t)sync::OneShot::kCount];
+    void TallyOneShot(sync::OneShot k, sync::OneShotEvent ev, double showMs)
+    {
+        sync::OneShotStats& t = g_oneShot[(size_t)k];
+        if (ev == sync::OneShotEvent::Shown)
+        {
+            ++t.shown;
+            t.showMsSum += showMs;
+            if (showMs > t.showMsMax) t.showMsMax = showMs;
+        }
+        else if (ev == sync::OneShotEvent::Missed) ++t.missed;
+        else if (ev == sync::OneShotEvent::Unknown) ++t.unknown;
+    }
+    void ArmOneShot(Peer& pe, sync::OneShot k, double nowMs, bool expect = true)
+    {
+        ++g_oneShot[(size_t)k].issued;
+        TallyOneShot(k, pe.audit.Arm(k, nowMs, expect), 0.0);   // a request this one replaced is judged on the spot
+    }
+    // Every frame a kind is armed: the game's own readback on the puppet. Script tick, ped valid.
+    void ObservePeerOneShots(Peer& pe, double nowMs)
+    {
+        for (size_t i = 0; i < (size_t)sync::OneShot::kCount; ++i)
+        {
+            const sync::OneShot k = (sync::OneShot)i;
+            if (!pe.audit.Armed(k))
+                continue;
+            int playing = 0;
+            switch (k)
+            {
+            case sync::OneShot::Jump:    playing = g_world->IsPedJumping(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Reload:  playing = g_world->IsPedReloading(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Stealth: playing = g_world->GetPedStealthMovement(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Swim:    playing = g_world->IsPedSwimming(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Ragdoll: playing = g_world->IsPedRagdoll(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::kCount:  break;
+            }
+            const sync::OneShotEvent ev = pe.audit.Observe(k, playing, nowMs);
+            if (ev != sync::OneShotEvent::None)
+                TallyOneShot(k, ev, pe.audit.LastShowMs());
+        }
+    }
+    std::string OneShotLine()
+    {
+        std::string out;
+        char buf[160];
+        for (size_t i = 0; i < (size_t)sync::OneShot::kCount; ++i)
+        {
+            const sync::OneShotStats& a = g_oneShot[i];
+            const sync::OneShotStats& b = g_oneShotLast[i];
+            const uint32_t issued = a.issued - b.issued, shown = a.shown - b.shown, missed = a.missed - b.missed, unknown = a.unknown - b.unknown;
+            if (!issued && !shown && !missed && !unknown)
+                continue;
+            const double avg = shown ? (a.showMsSum - b.showMsSum) / shown : 0.0;
+            std::snprintf(buf, sizeof(buf), "%s%s asked %u, SHOWN %u (avg %.0f ms), NOT shown %u, unreadable %u", out.empty() ? "" : "; ",
+                          sync::OneShotName((sync::OneShot)i), issued, shown, avg, missed, unknown);
+            out += buf;
+        }
+        return out.empty() ? std::string("none asked") : out;
     }
 
     // W8 item 3: every locomotion Reset goes through here so the 10 s line can name the caller. Reset = the task list was
@@ -4101,6 +4504,35 @@ namespace {
         return "?";
     }
 
+    const char* LocoLevelName(sync::LocoLevel l)
+    {
+        switch (l)
+        {
+        case sync::LocoLevel::Full:     return "full (anchor task + move rate + nudge)";
+        case sync::LocoLevel::Straight: return "straight task";
+        case sync::LocoLevel::NoRate:   return "straight task, speed carried by the blend ratio";
+        case sync::LocoLevel::Placed:   return "rigid follow of the pose";
+        }
+        return "?";
+    }
+    const char* LocoLevelWhyName(sync::LocoLevelWhy w)
+    {
+        switch (w)
+        {
+        case sync::LocoLevelWhy::None:            return "-";
+        case sync::LocoLevelWhy::AnchorLost:      return "the go-to-entity task ran but the ped showed no gait";
+        case sync::LocoLevelWhy::AnchorStuck:     return "the ped's own speed stayed far under the pose's, or it was snapped again and again";
+        case sync::LocoLevelWhy::AnchorDragging:  return "the nudges had to carry more than a tenth of the distance: the task does not follow the anchor";
+        case sync::LocoLevelWhy::RateIneffective: return "SET_PED_MOVE_RATE_OVERRIDE does not change the ped's speed";
+        case sync::LocoLevelWhy::StraightStuck:   return "the straight task stalled again after a re-issue: nothing moves the ped";
+        case sync::LocoLevelWhy::Recovered:       return "a fallback timer ran out: the better level is tried again";
+        case sync::LocoLevelWhy::Shared:          return "another puppet's controller found the same failure";
+        }
+        return "?";
+    }
+    uint32_t g_locoNudgeCalls = 0;
+    uint32_t g_locoLevelLines = 0;      // T2: "engine: loco level" lines this session (rate limit, script tick)
+
     // "name n, name n" for the sites with a count, "none" without any.
     std::string SiteList(const sync::SiteTally<kLocoSites>& t)
     {
@@ -4142,7 +4574,30 @@ namespace {
                       a.settles - b.settles, a.graceFrames - b.graceFrames, a.contaminated - b.contaminated,
                       pe.loco.NominalScale(sync::Gait::Walk), pe.loco.NominalScale(sync::Gait::Run),
                       pe.loco.NominalScale(sync::Gait::Sprint), pe.loco.LastMoveRate());
-        return buf;
+        // T2: appended so the older fields keep their place. level = the degradation ladder (full | straight | blend-carried |
+        // rigid); nudge = the coordinate writes that closed the position error (share = metres nudged / metres travelled while a
+        // gait was shown); rate = SET_PED_MOVE_RATE_OVERRIDE as applied (min / mean / max, share of frames at a limit); own speed =
+        // the ped's displacement net of our writes (the one measurement that needs no model of the game).
+        std::string line = buf;
+        const double dTravel = a.travelledM - b.travelledM, dNudge = a.nudgedM - b.nudgedM;
+        char t2[700];
+        std::snprintf(t2, sizeof(t2),
+                      " | T2: level %d (%s), nudge %u frames %.2f m (mean %.2f max %.2f m/s, %.1f%% of the distance), move rate applied "
+                      "min %.2f mean %.2f max %.2f (%.0f%% of %u frames at a limit), own speed %.2f vs pose %.2f m/s, level changes %u "
+                      "(anchor-lost %u, stuck %u, dragging %u, rate-ineffective %u, straight-stuck %u, recovered %u, shared %u), push %s",
+                      (int)pe.loco.Level(), LocoLevelName(pe.loco.Level()), d.nudgeFrames, d.nudgedM, d.meanNudgeMs, d.maxNudgeMs,
+                      dTravel > 0.5 ? 100.0 * dNudge / dTravel : 0.0, d.rateMin, d.rateMean, d.rateMax, d.rateClampFrac * 100.0, d.rateFrames,
+                      d.selfSpeedMs, d.poseSpeedMs, a.levelChanges - b.levelChanges,
+                      a.levelWhy[(int)sync::LocoLevelWhy::AnchorLost] - b.levelWhy[(int)sync::LocoLevelWhy::AnchorLost],
+                      a.levelWhy[(int)sync::LocoLevelWhy::AnchorStuck] - b.levelWhy[(int)sync::LocoLevelWhy::AnchorStuck],
+                      a.levelWhy[(int)sync::LocoLevelWhy::AnchorDragging] - b.levelWhy[(int)sync::LocoLevelWhy::AnchorDragging],
+                      a.levelWhy[(int)sync::LocoLevelWhy::RateIneffective] - b.levelWhy[(int)sync::LocoLevelWhy::RateIneffective],
+                      a.levelWhy[(int)sync::LocoLevelWhy::StraightStuck] - b.levelWhy[(int)sync::LocoLevelWhy::StraightStuck],
+                      a.levelWhy[(int)sync::LocoLevelWhy::Recovered] - b.levelWhy[(int)sync::LocoLevelWhy::Recovered],
+                      a.levelWhy[(int)sync::LocoLevelWhy::Shared] - b.levelWhy[(int)sync::LocoLevelWhy::Shared],
+                      g_locoPushNudge.load() ? "nudge" : "velocity");
+        line += t2;
+        return line;
     }
 
     std::string LocoLine(int id, const Peer& pe)
@@ -4242,6 +4697,24 @@ namespace {
     // steer, heading and the rare snap; this applies them in the order its header gives.
     void UnseatPeer(Peer& pe, int32_t leaveVeh);   // defined below (its default argument is declared there)
 
+    // T2: a puppet's controller moved to another level of the degradation ladder: say so (the numbers that decided it are in the
+    // line), count it, and tell the witness (two puppets finding the same failure make it machine-wide).
+    void NoteLocoLevel(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
+    {
+        ++pe.levelLogged;
+        const bool shared = g_locoDegrade.Report(o.levelWhy, id, nowMs);
+        if (g_locoLevelLines < 60)
+        {
+            ++g_locoLevelLines;
+            const float sp = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+            PeerLog(true, "engine: loco level id=%d (%s): -> %s because %s (pose speed %.2f m/s, the ped's own speed %.2f m/s, %s, "
+                    "anchor %s, learned stride x walk %.2f run %.2f sprint %.2f)%s", id, pe.name.c_str(), LocoLevelName(o.level),
+                    LocoLevelWhyName(o.levelWhy), sp, pe.loco.SelfSpeed(), pe.slide.Summary().meanAnchorM > 0.0 ? "anchor distance measured" : "no anchor frames",
+                    pe.anchor ? "present" : "absent", pe.loco.NominalScale(sync::Gait::Walk), pe.loco.NominalScale(sync::Gait::Run),
+                    pe.loco.NominalScale(sync::Gait::Sprint), shared ? "; a SECOND puppet found it: imposed on every puppet for a while" : "");
+        }
+    }
+
     // 0d: cover as a window (sync::CoverWindow), once per DrivePeer from TickPeerTierB. The puppet is put on the sender's pose of the
     // edge first (the native looks for a cover point at the coordinates it is given), then TASK_PUT_PED_DIRECTLY_INTO_COVER(ped, pose,
     // timeout -1, allowPeekingAndFiring false, blendIn 0, forceInitialFacingDirection false, forceFaceLeft false, identifier -1,
@@ -4321,15 +4794,100 @@ namespace {
     // the way out on the exiting move. INFERRED live checks: that the native seat -2 takes any free seat, that
     // SET_PED_STEALTH_MOVEMENT's second argument true means "on", and that cover finds a point. Returns true while
     // the enter walk or the cover owns the ped (DrivePeer then issues no gait task over it).
+    // T1 seats (wire v6): the replay of one remote player's enter intent (libs/sync/seat_intent.h PuppetSeatReplay), once per DrivePeer from
+    // TickPeerTierB. SeatNotice::Reserved started it (HandleSeatNotice); this issues GTA's own TASK_ENTER_VEHICLE for the reserved seat ONCE,
+    // watches it (is the car named by GET_VEHICLE_PED_IS_TRYING_TO_ENTER, is the ped in the seat), clears it when the server cancels the
+    // intent, and tells the seat loop (TickVehicles, AllowsSeatWarp) when the BOUNDED fallback warp is allowed. Returns true while the
+    // task owns the ped (no gait task over it, also when it is seated by the task and the server's list has not named it yet).
+    // Natives: GET_VEHICLE_PED_IS_TRYING_TO_ENTER naming a puppet's scripted TASK_ENTER_VEHICLE, GET_VEHICLE_CLASS 8 / 13 for bikes and
+    // cycles, TASK_ENTER_VEHICLE's seat / speed arguments on a puppet: all INFERRED, live-unverified (the counters tell: issued / started /
+    // finished / neverStarted / warps in the "engine: seats (T1)" line). Script tick, no lock.
+    bool TickPeerSeatReplay(Peer& pe, int id, double nowMs)
+    {
+        sync::PuppetSeatReplay* rp = g_seats.Find((uint16_t)id);
+        if (!rp || !rp->NeedsReadings())
+            return false;
+        sync::SeatReplayIn in;
+        in.nowMs = nowMs;
+        in.pedReady = pe.ped != 0;
+        int32_t h = 0;
+        const int veh = rp->Veh();
+        if (veh >= 0)
+        {
+            const auto vit = g_vehs.find((uint16_t)veh);
+            if (vit != g_vehs.end() && vit->second.handle && !vit->second.removed)
+            {
+                h = vit->second.handle;
+                in.vehReady = true;
+                for (size_t s = 0; s < proto::kVehSeats; ++s)
+                    in.listedSomewhere = in.listedSomewhere || vit->second.st.seats[s] == (uint16_t)id;
+            }
+        }
+        if (h && pe.ped)
+        {
+            in.inSeat = g_world->GetPedInVehicleSeat(h, rp->Seat() - 1) == pe.ped;
+            // "running" = the game says this ped is entering that car by either native (TRYING_TO_ENTER, or USING = in or entering; a ped that is
+            // in the seat is already caught by inSeat above): one native that does not answer for a scripted task must not read as a task that never ran.
+            in.tryingToEnter = g_world->GetVehiclePedIsTryingToEnter(pe.ped) == h || g_world->GetVehiclePedIsUsing(pe.ped) == h;
+            const int cls = g_world->GetVehicleClass(h);
+            in.mount = cls == 8 || cls == 13;          // motorcycles, cycles (hook.h)
+        }
+        const sync::SeatReplayOut o = rp->Tick(in);
+        switch (o.act)
+        {
+        case sync::SeatAct::IssueEnter:
+        {
+            ClearPedTasksNow(pe.ped);                  // the gait task goes; the enter task replaces it
+            const bool ok = g_world->TaskEnterVehicle(pe.ped, h, o.timeoutMs, o.seat - 1, o.run ? 2.0f : 1.0f, 1);
+            pe.aimTask = false;
+            LocoReset(pe, kSiteEnterWalk);
+            if (!ok)
+                rp->NoteIssueFailed();                 // TASK_ENTER_VEHICLE not callable: behave as a task that never ran (the bounded warp)
+            static int logged = 0;
+            if (logged < 12)
+            {
+                ++logged;
+                PeerLog(!ok, "engine: seats: replaying player %d's entry: TASK_ENTER_VEHICLE vehicle id=%d seat %d (%s, %s, limit %d ms): %s", id,
+                        o.veh, o.seat, o.run ? "run" : "walk", in.mount ? "bike/cycle" : "door", o.timeoutMs, ok ? "issued" : "NOT callable");
+            }
+            break;
+        }
+        case sync::SeatAct::ClearTask:
+            ClearPedTasksNow(pe.ped);                  // cancelled or over without a seat: the controller re-issues its gait
+            pe.aimTask = false;
+            LocoReset(pe, kSiteEnterTimeout);
+            break;
+        case sync::SeatAct::Evict:
+        {
+            // Seated by the task, and the server's list never named the player: the screens disagree. Out of the car.
+            const auto vit = g_vehs.find((uint16_t)veh);
+            ++g_t1.evictLog;
+            if (g_t1.evictLog <= 8)
+                PeerLog(true, "engine: seats: DIVERGENCE player %d sits in vehicle id=%d seat %d here but the server's seat list never named it: put out", id,
+                        veh, rp->Seat());
+            UnseatPeer(pe, vit != g_vehs.end() && !vit->second.removed ? vit->second.handle : 0);
+            break;
+        }
+        case sync::SeatAct::None:
+            break;
+        }
+        return o.holdsPed;
+    }
+
     bool TickPeerTierB(Peer& pe, int id, const sync::Pose& pose, double nowMs)
     {
         const proto::PedState& ps = pose.ped;
         const sync::PedEdges e = pe.edges.Update({ ps.flags, ps.move, ps.vehId });
         const int32_t ped = pe.ped;
         if (e.reloadStart && pe.seatedVeh < 0)
+        {
             g_world->TaskReloadWeapon(ped, false);
+            ArmOneShot(pe, sync::OneShot::Reload, nowMs);
+        }
         if (e.stealthChanged || (e.stealthOn && nowMs - pe.stealthAtMs > 2000.0))
         {
+            if (e.stealthChanged)
+                ArmOneShot(pe, sync::OneShot::Stealth, nowMs, e.stealthOn);
             g_world->SetPedStealthMovement(ped, e.stealthOn, "DEFAULT_ACTION");
             pe.stealthOn = e.stealthOn;
             pe.stealthAtMs = nowMs;
@@ -4347,8 +4905,11 @@ namespace {
         // puppet keeps FOLLOWING the sender's pose with the ordinary locomotion and is warped into the seat when the seat list names
         // the player (a few tens of cm); its own TASK_ENTER_VEHICLE walk (blend 1.0, its own path, a door animation) fell behind a
         // running sender and was warped from half the door distance away. puppet_enter=task restores it (sync::EnterWalkMode).
-        const bool enterTask = sync::PuppetUsesEnterTask(g_peerEnterTask.load() ? sync::EnterWalkMode::Task : sync::EnterWalkMode::Follow);
-        if (e.enterStart && !enterTask)
+        // T1 seats: with the server's intent (default) the walk to the door is the real TASK_ENTER_VEHICLE, started by SeatNotice::Reserved and
+        // replayed by TickPeerSeatReplay; the two older modes below only run with HKCU seat_intent=0.
+        const bool seatIntent = g_seatIntentOn.load();
+        const bool enterTask = !seatIntent && sync::PuppetUsesEnterTask(g_peerEnterTask.load() ? sync::EnterWalkMode::Task : sync::EnterWalkMode::Follow);
+        if (e.enterStart && !enterTask && !seatIntent)
             ++g_syncD.enterFollowed;
         if (e.enterStart && enterTask && pe.seatedVeh < 0 && !g_world->IsPedInVehicle(ped))
         {
@@ -4411,7 +4972,8 @@ namespace {
                 LocoReset(pe, kSiteEnterGaveUp);
             }
         }
-        return coverHolds;
+        const bool seatHolds = seatIntent && TickPeerSeatReplay(pe, id, nowMs);
+        return coverHolds || seatHolds;
     }
 
     void DrivePeer(Peer& pe, int id, const sync::Pose& pose, double dtMs, double nowMs)
@@ -4435,7 +4997,10 @@ namespace {
         const bool notRagdoll = (ps.flags & proto::kPfRagdoll) == 0;
         const sync::WaterEdge::Out waterEdge = pe.water.Update((ps.flags & proto::kPfSwimming) != 0);
         if (waterEdge.entered || waterEdge.left)
+        {
             LocoSoft(pe, kSiteWater);
+            ArmOneShot(pe, sync::OneShot::Swim, nowMs, waterEdge.entered);   // T2: IS_PED_SWIMMING must follow the sender's water edge
+        }
         const bool climbFlag = notRagdoll && (ps.flags & (proto::kPfClimbing | proto::kPfVaulting)) != 0;
         const bool parachute = notRagdoll && (ps.flags & proto::kPfParachute) != 0;
         const bool placeInAir = parachute || (climbFlag && pe.climb.CurrentPhase() == sync::ClimbWindow::Phase::Fallback);
@@ -4454,8 +5019,10 @@ namespace {
         {
             pe.climb.Reset();
             pe.cover.Reset();
+            pe.audit.CancelAll();
             return;                                    // playing dead (UpdatePeerDeath): no tasks, no placing
         }
+        ObservePeerOneShots(pe, nowMs);                // T2: the game's readback of the one-shots asked for (only while one is armed)
         const bool tierBHolds = !reactHolds && TickPeerTierB(pe, id, pose, nowMs);   // W6: reload / stealth / cover / enter / exit
         if (pe.seatedVeh >= 0)
         {
@@ -4651,9 +5218,18 @@ namespace {
             const bool anchorWanted = g_locoAnchor.load() && !g_anchorBroken && !aiming;
             in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
         }
+        // T2: a failure two puppets' controllers found is imposed on this one too (the game is one game), until its timer runs out.
+        if (g_locoDegradeReset.exchange(false))
+            g_locoDegrade.Reset();
+        if (const double ms = g_locoDegrade.ActiveMs(sync::LocoLevel::Straight, nowMs); ms > 0.0)
+            pe.loco.Degrade(sync::LocoLevel::Straight, sync::LocoLevelWhy::Shared, ms);
+        if (const double ms = g_locoDegrade.ActiveMs(sync::LocoLevel::NoRate, nowMs); ms > 0.0)
+            pe.loco.Degrade(sync::LocoLevel::NoRate, sync::LocoLevelWhy::Shared, ms);
         const sync::LocoOutput o = pe.loco.Update(in);
         if (o.paused)
             return;                                    // leaving a vehicle: the exit animation owns the ped
+        if (o.levelChanged)
+            NoteLocoLevel(pe, id, o, in, nowMs);
         {
             // Sync A: the slide metric (libs/sync LocoDiag), from what this frame read and what the controller decided
             sync::LocoDiagFrame df;
@@ -4669,6 +5245,12 @@ namespace {
             df.havePedVel = in.havePedVel;
             df.anchorMode = o.anchorMode && o.moveAnchor;
             df.anchor = o.anchorPos;
+            df.nudged = o.nudge && !o.snap;                // T2
+            df.nudge = o.nudgeDelta;
+            df.rateSet = o.setMoveRate;
+            df.rate = o.moveRate;
+            df.rateClamped = o.rateClamped;
+            df.selfSpeed = pe.loco.SelfSpeed();
             pe.slide.Observe(df);
         }
 
@@ -4681,6 +5263,14 @@ namespace {
         }
         if (o.moveAnchor && pe.anchor)
             g_world->SetEntityCoordsNoOffset(pe.anchor, o.anchorPos.x, o.anchorPos.y, o.anchorPos.z);   // W11: every frame
+        if (o.nudge && !o.snap)
+        {
+            // T2: the position error closed by a coordinate write of a few millimetres (exact in every model of what the game does
+            // with SET_ENTITY_VELOCITY on a ped under a task). z stays the ped's own unless the controller asked for a vertical step.
+            g_world->SetEntityCoordsNoOffset(ped, in.pedPos.x + o.nudgeDelta.x, in.pedPos.y + o.nudgeDelta.y,
+                                             in.pedPos.z + o.nudgeDelta.z);
+            ++g_locoNudgeCalls;
+        }
         if (o.snap)
         {
             g_world->SetEntityCoordsNoOffset(ped, o.snapPos.x, o.snapPos.y, o.snapPos.z);
@@ -4690,6 +5280,7 @@ namespace {
         {
             g_world->SetPedCanRagdoll(ped, true);      // SpawnRemotePed spawns it with ragdoll off
             g_world->SetPedToRagdoll(ped, 50000, 60000); // held until ragdollEnd clears it
+            ArmOneShot(pe, sync::OneShot::Ragdoll, nowMs);
         }
         if (o.ragdollEnd)
         {
@@ -4698,7 +5289,10 @@ namespace {
             pe.aimTask = false;                        // cleared with the ragdoll
         }
         if (o.jumpStart)
+        {
             g_world->TaskJump(ped);
+            ArmOneShot(pe, sync::OneShot::Jump, nowMs);
+        }
         if (aiming && !in.ragdoll)
         {
             // The aim point: the sender's offset (PedState.aim*) from the shown position. Every issue
@@ -4983,7 +5577,7 @@ namespace {
     // 30 m of the local player and 0 beyond 45 m (`distM`), the interpolator extrapolating past its newest snapshot
     // by the velocity (arc, capped at 500 ms). `leadMs` returns what was added. dtMs is the frame gap for the slew.
     bool SampleVehInterp(uint16_t id, double nowMs, sync::VehicleSample& out, sync::PresentLead* lead = nullptr,
-                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr)
+                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr, double* dispOut = nullptr)
     {
         PeersLock lk(g_peersMtx, true);
         if (!g_syncLive || !g_sync.Clock().Ready())
@@ -4997,7 +5591,25 @@ namespace {
         const double add = lead ? lead->Update(distM, clock.DelayMs() + extra, dtMs) : 0.0;
         if (leadMs)
             *leadMs = add;
-        return v.interp.Sample(clock.RenderT(nowMs) - extra + add, out);
+        const double disp = clock.RenderT(nowMs) - extra + add;
+        if (dispOut)
+            *dispOut = disp;
+        return v.interp.Sample(disp, out);
+    }
+    // T4: the copy's own response to a hit becomes its trajectory from `snap.tMs` on (VehicleInterpolator::ReplaceFrom); the stream's pushes are
+    // refused until they show the impact (preVel = the stream's velocity before it) or guardMs have passed.
+    void AdoptVehInterp(uint16_t id, const sync::VehicleSnapshot& snap, double guardMs, const sync::DriveVec& preVel)
+    {
+        PeersLock lk(g_peersMtx, true);
+        const auto it = g_vehNet.find(id);
+        if (it != g_vehNet.end())
+            it->second.interp.ReplaceFrom(snap, guardMs, &preVel);
+    }
+    uint32_t VehInterpGuarded(uint16_t id)
+    {
+        PeersLock lk(g_peersMtx, true);
+        const auto it = g_vehNet.find(id);
+        return it != g_vehNet.end() ? it->second.interp.Stats().guarded : 0u;
     }
     void ClearVehInterp(uint16_t id)
     {
@@ -5064,6 +5676,7 @@ namespace {
                     SyncEmoteDict(pe.emoteDict, false, std::string());   // its ped is gone: free the dictionary
                     ReleaseRequest(pe);
                     removedPeers.push_back(it->first);
+                    g_seats.DropPlayer(it->first);          // T1: whatever it was walking to is moot
                     it = g_peers.erase(it);
                     continue;
                 }
@@ -5288,7 +5901,8 @@ namespace {
         {
         case 1: return "Spawn";     case 2: return "Despawn";   case 3: return "Enter";
         case 4: return "Exit";      case 5: return "SetLocked"; case 6: return "SetLights";
-        case 7: return "SetColours"; case 8: return "Register";
+        case 7: return "SetColours"; case 8: return "Register";   case 9: return "Release";
+        case 10: return "EnterIntent"; case 11: return "CancelIntent";
         }
         return "?";
     }
@@ -5402,6 +6016,108 @@ namespace {
         v.appliedBody = v.appliedEngineHp = 0xFFFF;
         v.lastDriveMs = 0;
         v.drive.Reset();
+        v.vis.Reset();                 // T3: a new entity shows nothing of the server's visual state yet
+        v.visReadMs = -1e9;
+        v.steerPrevRotMs = -1e9;
+    }
+
+    // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
+    // Burst tyres, smashed windows, brake lights / handbrake and a standing car's steering for the OTHER clients. The logic is
+    // libs/sync/vehicle_visual.h (tested offline, tests/t3_vehvisual_test.cpp); this is the glue. Every native here is one of
+    // the hook.h ones whose hash is still 0 (UNRESOLVED: lookup needed): a World:: wrapper then returns false, the sync module
+    // treats that as "no information / not done", and nothing below changes behaviour until GI adds the hashes.
+    // Control ids (INFERRED, GET_CONTROL_NORMAL(0, id)): INPUT_VEH_MOVE_LR 59 (-1 left .. +1 right), INPUT_VEH_ACCELERATE 71,
+    // INPUT_VEH_BRAKE 72, INPUT_VEH_HANDBRAKE 76. The steering-axis agreement counters in the 10 s line show a wrong id or sign.
+    constexpr int kCtlVehMoveLR = 59, kCtlVehAccelerate = 71, kCtlVehBrake = 72, kCtlVehHandbrake = 76;
+    constexpr double kVisReadMs = 250.0;          // the controller reads its car's tyres / windows this often
+    constexpr double kVisNearM = 150.0;           // a copy within this distance of us is re-checked and scanned after our shots
+    struct VisStats
+    {
+        // tyres / windows
+        uint32_t reads = 0, tyreReadOk = 0, tyreReadFail = 0, winReadOk = 0, winReadFail = 0;
+        uint32_t sentUpdates = 0, sentWithTyres = 0, sentWithWindows = 0;   // controller reports (VehicleUpdates) and those showing a burst tyre / smashed window
+        uint32_t partHits = 0, partHitsRefused = 0;                         // pops on copies reported as vehicle Hits, and the ones the session refused locally
+        // brake lights / handbrake / steering
+        uint32_t brakeSet = 0, brakeFail = 0, handSet = 0, handFail = 0, brakeBitsSent = 0, handBitsSent = 0, pedalReadFail = 0;
+        uint32_t steerApplied = 0, steerApplyFail = 0;
+        float steerAppliedMin = 0.0f, steerAppliedMax = 0.0f;
+        double steerAppliedSum = 0.0;
+        sync::SteerStats steerSent;
+        double yawRatioSum = 0.0;
+        uint32_t yawRatioN = 0;                                              // sender: avz (GET_ENTITY_ROTATION_VELOCITY) / the rotation-derived yaw rate
+    };
+    VisStats g_vis;
+    // One entity as vehicle_visual.h's templates see it.
+    struct VehVisualGame
+    {
+        int32_t h;
+        bool TyreBurst(int slot, bool completely, bool& burst)
+        {
+            const bool ok = g_world->IsVehicleTyreBurst(h, slot, completely, burst);
+            ++(ok ? g_vis.tyreReadOk : g_vis.tyreReadFail);
+            return ok;
+        }
+        bool WindowIntact(int slot, bool& intact)
+        {
+            const bool ok = g_world->IsVehicleWindowIntact(h, slot, intact);
+            ++(ok ? g_vis.winReadOk : g_vis.winReadFail);
+            return ok;
+        }
+        bool BurstTyre(int slot, bool onRim) { return g_world->SetVehicleTyreBurst(h, slot, onRim, 1000.0f); }
+        bool FixTyre(int slot) { return g_world->SetVehicleTyreFixed(h, slot); }
+        bool SmashWindow(int slot) { return g_world->SmashVehicleWindow(h, slot); }
+        bool FixWindow(int slot) { return g_world->FixVehicleWindow(h, slot); }
+    };
+
+    // One spawned server vehicle, every script frame: the visual state (tyres, windows). Cheap when nothing is due (Due()).
+    // iControl: we control it - the server's bits are burst on our car once (a Hit by somebody else) and the controller's report
+    // goes out in SendControlledVehicles. A copy: the server's mask is applied level-wise, and what OUR game popped on it (we shot
+    // a tyre of a car we do not control) is reported to the server as a vehicle Hit (a part code in Hit.bone), kept pending for
+    // 2.5 s so the round trip is not drawn as pop, fix, pop. Script tick.
+    void TickVehicleVisual(NetVeh& v, uint16_t id, bool iControl, double nowMs, bool nearUs, int32_t lp)
+    {
+        const proto::VehicleState& st = v.st;
+        const sync::VisualMask server{ st.tyres, st.tyresRim, st.windows };
+        const bool shotRecent = nowMs - g_lastShotMs < 1500.0;
+        VehVisualGame game{ v.handle };
+        bool ran = false;
+        const sync::VisualOut o = sync::StepVisual(v.vis, game, server, iControl, nearUs, shotRecent, nowMs, &ran);
+        if (!ran)
+            return;
+        ++g_vis.reads;
+        static int appliedLogged = 0;
+        if (o.cmd.Any() && appliedLogged < 12)
+        {
+            ++appliedLogged;
+            PeerLog(false, "engine: vehicle id=%u visual (%s): server mask tyres %02x rim %02x windows %02x -> burst %02x, off rim %02x, fixed %02x, "
+                    "windows smashed %02x fixed %02x", id, iControl ? "ours" : "copy", st.tyres, st.tyresRim, st.windows, o.cmd.burst, o.cmd.rim,
+                    o.cmd.fixTyre, o.cmd.smash, o.cmd.fixWindow);
+        }
+        if (!o.report.Any())
+            return;
+        int16_t codes[24];
+        const int n = sync::ReportToParts(o.report, codes, 24);
+        for (int i = 0; i < n; ++i)
+        {
+            proto::Hit h;
+            h.kind = proto::HitKind::Vehicle;
+            h.targetId = id;
+            h.weapon = lp ? g_world->GetSelectedPedWeapon(lp) : 0;
+            h.damage = 1;                              // the server needs a non-zero damage; the part code is what it is sent for
+            h.bone = codes[i];
+            h.shotSeq = (uint8_t)(g_shotSeq & 15);
+            if (join::SendHit(h))
+                ++g_vis.partHits;
+            else
+                ++g_vis.partHitsRefused;
+        }
+        static int reportLogged = 0;
+        if (reportLogged < 12)
+        {
+            ++reportLogged;
+            PeerLog(false, "engine: vehicle id=%u visual: our game popped tyres %02x (off rim %02x) windows %02x on this copy: reported to the server as %d vehicle Hit(s), "
+                    "weapon 0x%08x", id, o.report.tyres, o.report.rim, o.report.windows, n, (unsigned)(lp ? g_world->GetSelectedPedWeapon(lp) : 0));
+        }
     }
 
     // The server's own fields of a vehicle state onto its entity, when a new full state came in.
@@ -5427,6 +6143,10 @@ namespace {
             g_world->SetVehicleIndicatorLights(h, 1, (st.flags2 & proto::kVeh2IndicatorL) != 0);
         if (d.flags2 & proto::kVeh2IndicatorR)
             g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0);
+        if (d.flags2 & proto::kVeh2Brake)
+            ++(g_world->SetVehicleBrakeLights(h, (st.flags2 & proto::kVeh2Brake) != 0) ? g_vis.brakeSet : g_vis.brakeFail);
+        if (d.flags2 & proto::kVeh2Handbrake)   // the first sight applies "released" too: a copy must not keep a handbrake of its own
+            ++(g_world->SetVehicleHandbrake(h, (st.flags2 & proto::kVeh2Handbrake) != 0) ? g_vis.handSet : g_vis.handFail);
         if (d.flags2 & proto::kVeh2RoofDown)
         {
             if (st.flags2 & proto::kVeh2RoofDown)
@@ -5481,6 +6201,8 @@ namespace {
         if (iControl)
             return;
         ApplyVehicleBody(v);
+        if (st.flags2 & proto::kVeh2Brake)
+            g_world->SetVehicleBrakeLights(h, true);       // renewed by every full state while they are on (INFERRED: the native may not hold)
         const int engine = (st.flags & proto::kVehEngine) ? 1 : 0;
         if (engine != v.appliedEngine)
         {
@@ -5571,6 +6293,122 @@ namespace {
 
     // Vehicles: delete the gone ones, spawn the new ones, apply the server's fields, drive the ones
     // someone else drives (interpolator + drive controller), seat the remote peds per occupancy.
+    // ---- T4: vehicle collisions (libs/sync/vehicle_impact.h, docs/sync-specs/vehicle-collisions.md) ----
+    constexpr double kAdoptGuardMs = 300.0;      // the longest the stale stream is held back from an adopted copy
+    constexpr double kAdoptCooldownMs = 150.0;   // after an adoption no new contact is looked for on that copy this long
+    constexpr double kImpactNearM = 7.0;         // a copy this close (origins) to our car around a server impact counts as "isNear"
+    constexpr double kImpactWatchM = 30.0;       // a controlled car with another vehicle within this is watched for velocity jumps
+
+    // A car we control (the local player's, or an empty one the server handed us): feed its velocity to the jump tracker once per frame,
+    // but only while another vehicle is isNear (two natives per frame).
+    void FeedImpactTracker(uint16_t id, NetVeh& v, double nowMs)
+    {
+        bool isNear = false;
+        for (const auto& kv : g_vehs)
+        {
+            if (kv.first == id || !kv.second.handle || !kv.second.haveState)
+                continue;
+            const float dx = kv.second.st.k.x - v.st.k.x, dy = kv.second.st.k.y - v.st.k.y;
+            if (dx * dx + dy * dy < kImpactWatchM * kImpactWatchM)
+            {
+                isNear = true;
+                break;
+            }
+        }
+        if (!isNear)
+        {
+            v.impactTracker.Reset();
+            return;
+        }
+        float vx = 0, vy = 0, vz = 0, ax = 0, ay = 0, az = 0;
+        if (!g_world->GetEntityVelocity(v.handle, vx, vy, vz) || !g_world->GetEntityRotationVelocity(v.handle, ax, ay, az))
+            return;
+        if (v.impactTracker.Feed(nowMs, { vx, vy }, az))
+            ++g_t4.jumpEpisodes;
+    }
+
+    // The server's VehicleImpact messages for cars we control: the authoritative change of the car's velocity and yaw rate for the contact, less
+    // what the game's own physics already did (the tracker's jumps): the difference is written onto the car.
+    void DrainImpacts(double nowMs, uint16_t me)
+    {
+        static std::vector<proto::VehicleImpact> got;   // script tick only
+        got.clear();
+        {
+            std::lock_guard<std::mutex> lk(g_impactMtx);
+            got.swap(g_impactQueue);
+        }
+        for (const proto::VehicleImpact& m : got)
+        {
+            ++g_t4.impactsIn;
+            if (!g_impactSync.load(std::memory_order_relaxed))
+                continue;
+            const auto it = g_vehs.find(m.vehId);
+            if (it == g_vehs.end() || !it->second.handle || it->second.st.ctrl != me)
+            {
+                ++g_t4.noVehicle;
+                continue;
+            }
+            NetVeh& v = it->second;
+            if (!proto::SeqNewer(m.seq, v.lastImpactSeq) && v.lastImpactSeq != 0)
+            {
+                ++g_t4.dup;
+                continue;
+            }
+            v.lastImpactSeq = m.seq;
+            float cx = 0, cy = 0, cz = 0;
+            bool isNear = false;
+            if (g_world->GetEntityCoords(v.handle, cx, cy, cz))
+            {
+                const auto ot = g_vehs.find(m.otherId);
+                float ox = 0, oy = 0, oz = 0;
+                if (ot != g_vehs.end() && ot->second.handle && g_world->GetEntityCoords(ot->second.handle, ox, oy, oz))
+                {
+                    const double dx = ox - cx, dy = oy - cy;
+                    isNear = dx * dx + dy * dy < kImpactNearM * kImpactNearM;
+                }
+            }
+            const double tc = sync::impact::UnwrapStampMs(m.sampleMs, nowMs);
+            const sync::impact::ApplyDecision d = sync::impact::DecideImpactApply(v.impactTracker, { m.dvx, m.dvy }, m.dyaw, tc, nowMs, isNear, m.depth);
+            static int logged = 0;
+            if (d.why != sync::impact::ApplyWhy::Applied)
+            {
+                if (d.why == sync::impact::ApplyWhy::NoLocalContact) ++g_t4.noLocal;
+                else if (d.why == sync::impact::ApplyWhy::Tiny) ++g_t4.tiny;
+                else ++g_t4.stale;
+                if (logged < 12)
+                {
+                    ++logged;
+                    PeerLog(false, "engine: vehicle id=%u: server impact #%u with vehicle %u (change %.1f,%.1f m/s, closing %.1f, depth %.2f m, contact %.0f ms ago) "
+                            "not applied (%s)", (unsigned)m.vehId, m.seq, (unsigned)m.otherId, (double)m.dvx, (double)m.dvy, (double)m.closing, (double)m.depth,
+                            nowMs - tc, d.why == sync::impact::ApplyWhy::NoLocalContact ? "our physics felt no contact and the server's boxes barely met" :
+                            d.why == sync::impact::ApplyWhy::Tiny ? "too small" : "too old");
+                }
+                continue;
+            }
+            float vx = 0, vy = 0, vz = 0, ax = 0, ay = 0, az = 0;
+            if (!g_world->GetEntityVelocity(v.handle, vx, vy, vz))
+                continue;
+            const float nvx = vx + (float)d.dv.x, nvy = vy + (float)d.dv.y;
+            g_world->SetEntityVelocity(v.handle, nvx, nvy, vz);
+            const bool haveRot = g_world->GetEntityRotationVelocity(v.handle, ax, ay, az);
+            if (haveRot && std::fabs(d.dw) > 1e-3)
+                g_world->SetEntityAngularVelocity(v.handle, ax, ay, az + (float)d.dw);
+            v.impactTracker.NoteWritten({ nvx, nvy }, haveRot ? az + d.dw : 0.0, d.dv, d.dw);
+            ++g_t4.applied;
+            const double dvLen = sync::impact::Len(d.dv);
+            g_t4.appliedDvSum += dvLen;
+            g_t4.appliedDvMax = std::max(g_t4.appliedDvMax, dvLen);
+            if (logged < 12)
+            {
+                ++logged;
+                PeerLog(false, "engine: vehicle id=%u: server impact #%u with vehicle %u (closing %.1f m/s, depth %.2f m, contact %.0f ms ago): authoritative "
+                        "change %.1f,%.1f m/s / yaw %.2f, our physics had done %.1f,%.1f m/s%s; applied the difference %.1f,%.1f m/s / yaw %.2f",
+                        (unsigned)m.vehId, m.seq, (unsigned)m.otherId, (double)m.closing, (double)m.depth, nowMs - tc, (double)m.dvx, (double)m.dvy,
+                        (double)m.dyaw, d.dvLocal.x, d.dvLocal.y, d.localContact ? "" : " (it felt no contact)", d.dv.x, d.dv.y, d.dw);
+            }
+        }
+    }
+
     void TickVehicles(int32_t lp, int32_t lpVeh)
     {
         static std::vector<uint16_t> removedVehs;     // script tick only
@@ -5579,6 +6417,7 @@ namespace {
             // No lock: g_vehs / g_peers are the game thread's own, SyncNet (TickPeers, this frame) brought them up to date.
             const double nowMs = NowMs();
             const uint16_t me = join::MyId();
+            DrainImpacts(nowMs, me);   // T4: the server's impacts for cars we control
             float lpx = 0, lpy = 0, lpz = 0;
             const bool haveLp = lp && g_world->GetEntityCoords(lp, lpx, lpy, lpz);
             // Sync B: where the local player's own vehicle is (the penetration estimate of the collision line: a remote copy whose
@@ -5637,6 +6476,7 @@ namespace {
                     if (v.requestedModel)
                         g_world->ModelNoLongerNeeded(v.requestedModel);
                     removedVehs.push_back(id);
+                    g_seats.OnVehicleGone((int)id);         // T1: nobody is walking to a car that is gone
                     it = g_vehs.erase(it);
                     continue;
                 }
@@ -5697,11 +6537,22 @@ namespace {
                     v.moving = false;
                     v.lastReadMs = v.bodyReadMs = -1e9;
                     v.steerPrev = 0.0f;
+                    v.vis.Reset();                     // T3: the new controller's tyres / windows are read and applied afresh
+                    v.visReadMs = -1e9;
+                    v.sentVis = sync::VisualMask();
+                    v.steerPrevRotMs = -1e9;
                 }
                 if (v.appliedVersion != v.stVersion)
                 {
                     ApplyVehicleFields(v, iControl);
                     v.appliedVersion = v.stVersion;
+                }
+                {
+                    // T3: tyres / windows. "Near" = the server position within kVisNearM of us (a far copy is only brought to the
+                    // server's state when it changes, never re-read or scanned).
+                    const float vdx = st.k.x - lpx, vdy = st.k.y - lpy, vdz = st.k.z - lpz;
+                    const bool visNear = mine || (haveLp && vdx * vdx + vdy * vdy + vdz * vdz <= kVisNearM * kVisNearM);
+                    TickVehicleVisual(v, id, iControl, nowMs, visNear, lp);
                 }
                 // W9 item 4 (passenger engine sound): the engine flag above is applied only when the server's flag CHANGES, and the
                 // server clears it at 0 fuel, so a car the local ped rides in as a passenger could sit with its engine stopped on
@@ -5750,7 +6601,8 @@ namespace {
                     const double leadDist = haveLp ? std::sqrt((double)(st.k.x - lpx) * (st.k.x - lpx) + (double)(st.k.y - lpy) * (st.k.y - lpy) +
                                                                (double)(st.k.z - lpz) * (st.k.z - lpz))
                                                    : 1e9;
-                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs))
+                    double dispT = 0.0;   // T4: the interpolation time of this frame (an adopted response is stored at it)
+                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT))
                     {
                         if (v.leadMs > 1.0)
                             ++g_v4.leadFrames;
@@ -5778,7 +6630,55 @@ namespace {
                             }
                             else
                                 v.lastContactFlag = false;
-                            const sync::VehicleDriveOutput o = v.drive.Update(in);
+                            sync::VehicleDriveOutput o = v.drive.Update(in);
+                            // T4 (vehicle collisions): when this copy took an impulse inside the last frame (the contact the controller just
+                            // detected), that is the OTHER car's response to the hit from the game's own physics. The controller's next command
+                            // would pull it back to the stream, which still carries the pre-impact motion for the whole network latency: the copy
+                            // ploughs back through the car it hit (ours) and hits it again. So the response becomes the copy's trajectory
+                            // (VehicleInterpolator::ReplaceFrom: the stale stream is refused until it shows the impact), the grace the contact
+                            // opened is ended, and this frame's commands are not written. impact_sync=0 leaves the grace as the only handling.
+                            if (o.contactOpened && !o.snap && g_impactSync.load(std::memory_order_relaxed))
+                            {
+                                float wx = 0, wy = 0, wz = 0;
+                                const sync::impact::AdoptOut ad =
+                                    g_world->GetEntityRotationVelocity(h, wx, wy, wz)
+                                        ? sync::impact::DecideAdopt(s.vel.x, s.vel.y, s.vel.z, in.localVel.x, in.localVel.y, wz,
+                                                                  sync::vq::HeadingDeg(in.localRot) * (3.14159265358979323846 / 180.0), sync::impact::AdoptCfg())
+                                        : sync::impact::AdoptOut();
+                                if (ad.adopt)
+                                {
+                                    sync::VehicleSnapshot sn;
+                                    sn.tMs = dispT;
+                                    sn.pos = in.localPos;
+                                    sn.rot = in.localRot;
+                                    sn.vel = { (float)ad.vx, (float)ad.vy, (float)ad.vz };
+                                    sn.hasAngVel = true;
+                                    sn.angVel = { 0.0f, 0.0f, (float)ad.yawRate };   // the yaw only: the frame of the native's pitch / roll is unverified
+                                    AdoptVehInterp(id, sn, kAdoptGuardMs, s.vel);
+                                    v.drive.EndGrace(kAdoptCooldownMs);
+                                    o.setVelocity = o.setAngularVelocity = o.setQuaternion = false;
+                                    ++g_t4.adopted;
+                                    v.divCheckAtMs = nowMs + 500.0;
+                                    static int adoptLogged = 0;
+                                    if (adoptLogged < 12)
+                                    {
+                                        ++adoptLogged;
+                                        PeerLog(false, "engine: vehicle id=%u: contact on the remote copy -- its own response (%.1f m/s change, yaw rate %.2f) "
+                                                "adopted as its trajectory; the stream is held back until it shows the impact (max %.0f ms)", id, ad.dv,
+                                                ad.yawRate, kAdoptGuardMs);
+                                    }
+                                }
+                                else
+                                    ++g_t4.adoptRefused;
+                            }
+                            if (v.divCheckAtMs > 0.0 && nowMs >= v.divCheckAtMs)
+                            {
+                                // the divergence estimate: this copy against its controller's stream 500 ms after the contact
+                                v.divCheckAtMs = 0.0;
+                                ++g_t4.divN;
+                                g_t4.divSum += o.posErrorM;
+                                g_t4.divMax = std::max(g_t4.divMax, (double)o.posErrorM);
+                            }
                             v.errWin.Add(o.posErrorM, o.rotErrorDeg, sync::LateralErrorM(s.pos, s.rot, in.localPos), s.mode, o.snap);   // Sync D
                             if (o.contactOpened)
                             {
@@ -5854,11 +6754,25 @@ namespace {
                             // is -1 right .. +1 left, so the sign flips. Every frame, the native holds only while
                             // called. Whether it turns a puppet's visible wheels is INFERRED (verify live).
                             if (o.setSteering)
-                                g_world->SetVehicleSteerBias(h, -o.steering);
+                            {
+                                const bool steerOk = g_world->SetVehicleSteerBias(h, -o.steering);
+                                if (steerOk)
+                                {
+                                    const float w = -o.steering;
+                                    if (g_vis.steerApplied == 0 || w < g_vis.steerAppliedMin) g_vis.steerAppliedMin = w;
+                                    if (g_vis.steerApplied == 0 || w > g_vis.steerAppliedMax) g_vis.steerAppliedMax = w;
+                                    g_vis.steerAppliedSum += w;
+                                    ++g_vis.steerApplied;
+                                }
+                                else
+                                    ++g_vis.steerApplyFail;
+                            }
                             v.lastDriveMs = nowMs;
                         }
                     }
                 }
+                else if (g_impactSync.load(std::memory_order_relaxed) && v.handle)
+                    FeedImpactTracker(id, v, nowMs);
                 // Remote occupants: warp each into its seat (wire seat s = GTA seat s - 1). The retry gap is
                 // 100 ms for the car we sit in and the cars within kSeatNearM of us (a driver seat that stays
                 // empty for half a second reads as "nobody is driving" to whoever stands there), 500 ms for the
@@ -5922,10 +6836,33 @@ namespace {
                                     dsp == sync::SeatDisplacement::OtherSeat ? (std::string("wire seat ") + std::to_string(seatNow)).c_str() : "a re-warp follows");
                         }
                     }
+                    // T1 seats: the seat warp is the BOUNDED FALLBACK of the server's enter intent. A ped the real TASK_ENTER_VEHICLE already
+                    // put into this seat is only recorded; a ped whose task is still running is left to it until sync::PuppetSeatReplay
+                    // allows the warp (confirmGraceMs after the server's Seated, or the task ended / timed out); right after an Exited notice a
+                    // stale list may not seat it again. With HKCU seat_intent=0 the W6 / W9 rule below stands.
+                    sync::WarpWhy warpWhy = sync::WarpWhy::None;
+                    const bool seatIntent = g_seatIntentOn.load();
+                    if (seatIntent)
+                    {
+                        if (g_world->IsPedInVehicle(pe.ped) && g_world->GetPedInVehicleSeat(h, gtaSeat) == pe.ped)
+                        {
+                            pe.seatedVeh = (int)id;    // seated by the game's own task: nothing to warp
+                            pe.seatedSeat = (int)s;
+                            pe.aimTask = false;
+                            pe.emote.Clear();
+                            SyncPeerEmoteDict(pe);
+                            g_world->SetPedConfigFlag(pe.ped, 184, true);
+                            continue;
+                        }
+                        const sync::WarpDecision wd = g_seats.Puppet(pid).AllowsSeatWarp((int)id, (int)s, nowMs);
+                        if (!wd.allow)
+                            continue;
+                        warpWhy = wd.why;
+                    }
                     // W6: a ped walking to this car with TASK_ENTER_VEHICLE (TickPeerTierB) is left to the walk; the
                     // old seat warp takes over once it has had sync::kEnterTaskMaxMs (or the ped is already inside).
                     // W9 item 1: ... and no longer once the sender's move says it is not entering (it was put into the seat).
-                    if (pe.enterTaskMs > 0.0 && pe.seatedVeh < 0 && pe.enterVeh == (int)id &&
+                    if (!seatIntent && pe.enterTaskMs > 0.0 && pe.seatedVeh < 0 && pe.enterVeh == (int)id &&
                         !g_world->IsPedInVehicle(pe.ped) &&
                         !sync::EnterWarpDue(true, false, nowMs - pe.enterTaskMs, pe.lastPed.move == proto::kMoveEnteringVehicle))
                         continue;
@@ -5963,6 +6900,8 @@ namespace {
                         }
                     }
                     g_world->SetPedIntoVehicle(pe.ped, h, gtaSeat);
+                    if (seatIntent)
+                        g_seats.Puppet(pid).NoteWarp(warpWhy);   // T1: counted by reason (the 10 s "seats (T1)" line)
                     pe.enterTaskMs = 0.0;              // the walk (if any) is over: the ped is seated
                     pe.enterVeh = -1;
                     pe.seatedVeh = id;
@@ -6040,6 +6979,7 @@ namespace {
     constexpr float kEntryReachM = 8.0f;        // a networked car this close (to its origin) takes the keys over
     constexpr float kEntryWalkMaxM = 5.0f;      // the farthest door the ped is walked to
     constexpr float kEntryWarpM = 1.6f;         // this close to the door (seat bone): put into the seat
+    constexpr float kEntryRunM = 3.0f;          // T1: farther than this from the door the entry task is issued at a run (the wire's run flag)
     constexpr double kEntryWalkMaxMs = 4000.0;  // give up a walk that has not arrived by then
     constexpr double kEntryReissueMs = 1500.0;  // the go-to task is re-issued at least this often (it has a 3 s timeout)
     // Seat bones by wire seat (driver, front passenger, rear left, rear right, then the third and fourth
@@ -6133,8 +7073,19 @@ namespace {
             if (dx * dx + dy * dy + dz * dz > kEntryReachM * kEntryReachM)
                 continue;
             car.c.netId = (int)kv.first;
+            const double bookNow = NowMs();
             for (size_t s = 0; s < proto::kVehSeats; ++s)
+            {
                 car.c.seats[s] = v.st.seats[s];
+                // T1 seats: a seat somebody else is walking to counts as taken (the server's reservation), so F never picks a seat that is
+                // about to be refused; our own reservation stays ours.
+                if (car.c.seats[s] == sync::kEntryNobody && g_seatIntentOn.load(std::memory_order_relaxed))
+                {
+                    const uint16_t holder = g_seats.Book().Holder((int)kv.first, (int)s, bookNow);
+                    if (holder != sync::kSeatNobody && holder != join::MyId())
+                        car.c.seats[s] = holder;
+                }
+            }
             car.c.locked = (v.st.flags & proto::kVehLocked) != 0;
             // VehicleState.ownerId (v5): the pick avoids the driver's seat of a car somebody else owns (PickEntry),
             // and the server's NotOwner (12) is the authority if a stale view picked it anyway.
@@ -6143,9 +7094,24 @@ namespace {
         }
     }
 
-    // Ends a walk in progress: the go-to task, if one was issued, is blended out.
+    void ApplyLocalEnterOut(const sync::LocalEnterOut& o, int32_t lp, double nowMs);   // below, with EntryNotice
+
+    // T1 seats: our own entry is given up (the player moved off, ragdolled, died, pressed F again, the car went away): the flow clears the
+    // task and tells the server (CancelIntent) when it had got that far. No effect when no entry is under way.
+    void AbortLocalEnter(int32_t lp)
+    {
+        if (!g_localEnter.Active())
+            return;
+        sync::LocalEnterIn in;
+        in.nowMs = NowMs();
+        in.abort = true;
+        ApplyLocalEnterOut(g_localEnter.Tick(in), lp, in.nowMs);
+    }
+
+    // Ends a walk in progress: the go-to task, if one was issued, is blended out; an entry by the server's intent is aborted.
     void CancelEntryWalk(int32_t lp)
     {
+        AbortLocalEnter(lp);
         if (g_entryWalk.active && g_entryWalk.tasked && lp)
             g_world->ClearPedTasks(lp);
         g_entryWalk = EntryWalk();
@@ -6162,9 +7128,103 @@ namespace {
         ++g_v4.entryRefused;
     }
 
+    // T1 seats: applies what LocalEnterFlow::Tick returned (the natives and the wire; the decisions are the flow's). Script tick.
+    //   SendIntent / SendCancel  VehicleCmd EnterIntent / CancelIntent (answered by HandleIntentResult / the Cancelled notice)
+    //   IssueEnter               GTA's own TASK_ENTER_VEHICLE for the reserved seat (flags 1: no jack flag, never takes a held seat)
+    //   FallbackWarp             the task never started / stopped without a seat / ran out of time: the BOUNDED teleport-in
+    void ApplyLocalEnterOut(const sync::LocalEnterOut& o, int32_t lp, double nowMs)
+    {
+        const int netId = g_localEnter.NetId(), seat = g_localEnter.Seat();
+        int32_t h = 0;
+        if (netId >= 0)
+        {
+            const auto it = g_vehs.find((uint16_t)netId);
+            if (it != g_vehs.end() && !it->second.removed)
+                h = it->second.handle;
+        }
+        bool fellBack = false;
+        for (const sync::LocalAct a : { o.act, o.also })
+        {
+            switch (a)
+            {
+            case sync::LocalAct::None:
+                break;
+            case sync::LocalAct::SendIntent:
+            case sync::LocalAct::SendCancel:
+            {
+                proto::VehicleCmd c;
+                c.op = a == sync::LocalAct::SendIntent ? proto::VehicleOp::EnterIntent : proto::VehicleOp::CancelIntent;
+                c.vehId = (uint16_t)netId;
+                c.arg = a == sync::LocalAct::SendIntent ? sync::PackIntentArg(seat, g_localEnter.Run()) : 0u;
+                const bool sent = join::SendVehicleCmd(c);
+                ++g_v4.vehCmds;
+                if (a == sync::LocalAct::SendIntent) ++g_t1.intentsSent; else ++g_t1.cancelsSent;
+                GLOGI("engine: seats: %s vehicle id=%d seat %d (%s) %s", a == sync::LocalAct::SendIntent ? "EnterIntent" : "CancelIntent", netId, seat,
+                      g_localEnter.Run() ? "run" : "walk", sent ? "sent" : "NOT sent (no session)");
+                break;
+            }
+            case sync::LocalAct::IssueEnter:
+            {
+                const bool ok = lp && h && g_world->TaskEnterVehicle(lp, h, o.timeoutMs, seat - 1, g_localEnter.Run() ? 2.0f : 1.0f, 1);
+                if (!ok) ++g_t1.localIssueFailed;
+                GLOGI("engine: seats: the server reserved seat %d of vehicle id=%d: TASK_ENTER_VEHICLE %s (%s, limit %d ms)", seat, netId,
+                      ok ? "issued" : "NOT issued (native not callable or the car is not here): the fallback warp follows", g_localEnter.Run() ? "run" : "walk",
+                      o.timeoutMs);
+                break;
+            }
+            case sync::LocalAct::ClearTask:
+                if (lp) g_world->ClearPedTasks(lp);
+                break;
+            case sync::LocalAct::FallbackWarp:
+            {
+                fellBack = true;
+                if (!lp || !h)
+                    break;
+                g_world->ClearPedTasks(lp);
+                const int32_t holder = g_world->GetPedInVehicleSeat(h, seat - 1);
+                const bool ok = (!holder || holder == lp) && g_world->SetPedIntoVehicle(lp, h, seat - 1);
+                g_localSeatAtMs = 0;                   // read the real seat next tick; the link then sends Enter
+                ++g_v4.entryPicks;
+                g_entryGuard.OnSeated(nowMs);
+                GLOGW("engine: seats: FALLBACK WARP into seat %d of vehicle id=%d (%s): the enter task %s: %s", seat, netId,
+                      o.why == sync::LocalWhy::NeverStarted ? "never started" : o.why == sync::LocalWhy::EndedNoSeat ? "stopped without a seat" : "ran out of time",
+                      o.why == sync::LocalWhy::TimedOut ? "(limit reached)" : "", ok ? "SET_PED_INTO_VEHICLE called" : "SET_PED_INTO_VEHICLE FAILED or the seat is held");
+                break;
+            }
+            }
+        }
+        if (o.why == sync::LocalWhy::Refused)
+        {
+            const char* text = sync::LocalVehicleLink::RefusalText(o.refusal);
+            EntryNotice(*text ? text : "The server refused that vehicle seat.", nowMs);
+            GLOGI("engine: seats: entry refused by the server (%s)", VehResultName(o.refusal));
+        }
+        else if (o.why == sync::LocalWhy::NoAnswer)
+            GLOGW("engine: seats: no answer to our EnterIntent within %.0f ms: entry dropped", sync::LocalEnterCfg().answerWaitMs);
+        else if (o.why == sync::LocalWhy::ServerCancelled)
+            GLOGI("engine: seats: the server cancelled our reservation (expired, replaced or the car went): entry dropped");
+        if (!g_localEnter.Active())
+        {
+            g_entryWalk = EntryWalk();                 // the entry is over, one way or the other
+            if (!fellBack)
+                g_entryGuard.OnCancel();
+        }
+    }
+
     // Runs every script tick on the connected, entered player, BEFORE TickLocalVehicle.
     void TickVehicleEntry(int32_t lp, int32_t lpVeh, bool dead, double nowMs)
     {
+        if (lp && lpVeh && !dead && g_localEnter.Active())
+        {
+            // T1 seats: the game's own TASK_ENTER_VEHICLE seated us (GET_VEHICLE_PED_IS_IN names the car): done, no warp. The link's Enter follows.
+            sync::LocalEnterIn in;
+            in.nowMs = nowMs;
+            in.seatedNow = true;
+            ApplyLocalEnterOut(g_localEnter.Tick(in), lp, nowMs);
+            g_entryGuard.OnSeated(nowMs);
+            g_entryWalk = EntryWalk();
+            GLOGI("engine: seats: seated by the game's own enter task (no warp)");
+        }
         if (!lp || lpVeh || dead)
         {
             // W9 item 3: just seated by our press: GTA's own INPUT_ENTER must not consume the same press (or the next
@@ -6218,7 +7278,7 @@ namespace {
         // Safety net: GTA started entering a networked car anyway (a path the disabled keys do not cover).
         // Take the ped out of that task at once and treat it as F for that car.
         bool net = false;
-        if (!pressF && !pressG)
+        if (!pressF && !pressG && !g_localEnter.Active())      // T1: the enter task running now is OURS, not GTA's own
         {
             const int32_t trying = g_world->GetVehiclePedIsTryingToEnter(lp);
             for (size_t i = 0; trying && i < cars.size(); ++i)
@@ -6262,9 +7322,22 @@ namespace {
                 if (car.c.netId == g_entryWalk.netId)
                     only.push_back(car);
             cars.swap(only);
-            if (cars.empty() || nowMs - g_entryWalk.startMs > kEntryWalkMaxMs || g_world->IsPedRagdoll(lp))
+            const bool inFlow = g_localEnter.Active();         // T1: the flow has its own limits (the answer wait, the task limit)
+            if (cars.empty() || (!inFlow && nowMs - g_entryWalk.startMs > kEntryWalkMaxMs) || g_world->IsPedRagdoll(lp))
             {
                 CancelEntryWalk(lp);
+                return;
+            }
+            if (inFlow)
+            {
+                sync::LocalEnterIn in;
+                in.nowMs = nowMs;
+                // either native counts (see TickPeerSeatReplay): the fallback warp must not fire on a task that runs but is not named by one of them
+                in.tryingToEnter = g_world->GetVehiclePedIsTryingToEnter(lp) == cars[0].handle || g_world->GetVehiclePedIsUsing(lp) == cars[0].handle;
+                const int cls = g_world->GetVehicleClass(cars[0].handle);
+                in.mount = cls == 8 || cls == 13;
+                in.abort = g_world->IsPedFalling(lp) || g_world->IsPedJumping(lp);
+                ApplyLocalEnterOut(g_localEnter.Tick(in), lp, nowMs);
                 return;
             }
         }
@@ -6300,6 +7373,27 @@ namespace {
             if (begin)
                 EntryNotice(sync::LocalVehicleLink::RefusalText(3 /* TooFar */), nowMs);
             CancelEntryWalk(lp);
+            return;
+        }
+        if (begin && g_seatIntentOn.load() && !car->c.locked)
+        {
+            // T1 seats (wire v6): the real entry. The seat is RESERVED on the server first (EnterIntent); only its Ok starts GTA's own
+            // TASK_ENTER_VEHICLE for exactly that seat (no jack flag), on every screen. A locked car (its owner's entry) and HKCU seat_intent=0 keep
+            // the walk + teleport-in below.
+            const int32_t holder = g_world->GetPedInVehicleSeat(car->handle, pick.seat - 1);
+            if (holder && holder != lp)
+            {
+                CancelEntryWalk(lp);                   // the server's list can run ahead of a remote occupant's ped: not now
+                return;
+            }
+            g_entryWalk.tasked = false;
+            g_localEnter.Begin(pick.netId, pick.seat, pick.doorDistM > kEntryRunM, nowMs);
+            ++g_v4.entryPicks;
+            GLOGI("engine: seats: %s -> seat %d of vehicle id=%d (door %.2f m): asking the server", wantDriver ? "F" : "G", pick.seat, pick.netId,
+                  pick.doorDistM);
+            sync::LocalEnterIn in;
+            in.nowMs = nowMs;
+            ApplyLocalEnterOut(g_localEnter.Tick(in), lp, nowMs);   // SendIntent
             return;
         }
         if (pick.doorDistM <= kEntryWarpM)
@@ -6579,7 +7673,7 @@ namespace {
     constexpr double kVehReadStillMs = 100.0, kBodyReadMs = 100.0;
     constexpr int kMaxVehicleSends = 12;
     uint16_t g_vehSendCursor = 0;                      // the id after the last car served
-    void SendControlledVehicles(double nowMs, int32_t sampleMs)
+    void SendControlledVehicles(double nowMs, int32_t sampleMs, int32_t lpVeh)
     {
         const uint16_t me = join::MyId();
         if (g_vehs.empty())
@@ -6619,12 +7713,38 @@ namespace {
             // the yaw rate and the speed along the body's forward axis (a kinematic bicycle). The rotation
             // velocity's unit (rad/s) and frame (world vs body; both read the same for a level car's yaw, which
             // is all this uses) are INFERRED, like the sender's avx..avz. Held below 1 m/s, per vehicle.
+            // T3: the yaw rate comes from successive rotations (a unit-safe source: the unit and frame of GET_ENTITY_ROTATION_VELOCITY are
+            // unverified) when two reads 5..300 ms apart exist, else from that native as before; the ratio between the two is logged so the
+            // first live run shows whether avz was in rad/s. When the local player DRIVES this car and the control native answers, its
+            // steering axis is the value below 1 m/s, where the estimate is noise: a standing car shows its wheels turned. Pedals: brake
+            // lights and handbrake (flags2 bits 6 and 7).
+            const bool drivenByMe = v.handle == lpVeh && g_localSeat == 0;
+            float vFwd = 0.0f;
             {
                 const sync::DriveQuat bq = sync::vq::Normalize({ u.rot.x, u.rot.y, u.rot.z, u.rot.w });
                 const sync::DriveVec fwd = sync::vq::Rotate(bq, { 0.0f, 1.0f, 0.0f });
-                const float vFwd = u.k.vx * fwd.x + u.k.vy * fwd.y + u.k.vz * fwd.z;
-                u.steer = sync::EstimateSteer(vFwd, u.avz, VehicleWheelbaseM(v.handle), v.steerPrev);
+                vFwd = u.k.vx * fwd.x + u.k.vy * fwd.y + u.k.vz * fwd.z;
+                float yaw = u.avz;
+                float yawQ = 0.0f;
+                if (v.steerPrevRotMs > -1e8 && sync::YawRateFromRotations(v.steerPrevRot, bq, (nowMs - v.steerPrevRotMs) / 1000.0, yawQ))
+                {
+                    if (std::fabs(yawQ) > 0.15f && std::isfinite(u.avz))
+                    {
+                        g_vis.yawRatioSum += (double)u.avz / (double)yawQ;
+                        ++g_vis.yawRatioN;
+                    }
+                    yaw = yawQ;
+                }
+                v.steerPrevRot = bq;
+                v.steerPrevRotMs = nowMs;
+                bool axisOk = false;
+                float axis = 0.0f;
+                if (drivenByMe)
+                    axisOk = g_world->GetControlNormal(0, kCtlVehMoveLR, axis);
+                const sync::SteerChoice sc = sync::ChooseSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), v.steerPrev, axisOk, axis);
+                u.steer = sc.steer;
                 v.steerPrev = u.steer;
+                g_vis.steerSent.Add(sc, axisOk, axis, sync::EstimateSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), 0.0f), vFwd);
             }
             if (g_world->IsVehicleEngineRunning(v.handle)) u.flags |= proto::kVehEngine;
             if (g_world->IsVehicleSirenOn(v.handle))      u.flags |= proto::kVehSiren;
@@ -6635,9 +7755,33 @@ namespace {
                 ReadVehicleBody(v.handle, v.bodyFlags2, v.bodyDoors);
                 v.bodyReadMs = nowMs;
             }
-            u.flags2 = v.bodyFlags2;
+            // T3: the pedals every call (a brake light is seen the moment it is pressed), the tyres / windows every kVisReadMs.
+            bool brakeBit = false, handBit = false;
+            if (drivenByMe)
+            {
+                float accel = 0.0f, brake = 0.0f, hand = 0.0f;
+                const bool pedalsOk = g_world->GetControlNormal(0, kCtlVehAccelerate, accel) && g_world->GetControlNormal(0, kCtlVehBrake, brake) &&
+                                      g_world->GetControlNormal(0, kCtlVehHandbrake, hand);
+                if (!pedalsOk)
+                    ++g_vis.pedalReadFail;
+                const sync::BrakeState bs = sync::ClassifyBrake(pedalsOk, accel, brake, hand, vFwd);
+                brakeBit = bs.brakeLights;
+                handBit = bs.handbrake;
+            }
+            if (nowMs - v.visReadMs >= kVisReadMs)
+            {
+                VehVisualGame game{ v.handle };
+                v.visReport = sync::ReadReport(v.vis, game);
+                v.visReadMs = nowMs;
+            }
+            u.flags2 = (uint8_t)((v.bodyFlags2 & ~(proto::kVeh2Brake | proto::kVeh2Handbrake)) | (brakeBit ? proto::kVeh2Brake : 0) |
+                                 (handBit ? proto::kVeh2Handbrake : 0));
             u.doors = v.bodyDoors;
-            const bool changed = !v.sentOnce || u.flags != v.sentFlags || u.flags2 != v.sentFlags2 || u.doors != v.sentDoors;
+            u.tyres = v.visReport.tyres;
+            u.tyresRim = v.visReport.rim;
+            u.windows = v.visReport.windows;
+            const bool changed = !v.sentOnce || u.flags != v.sentFlags || u.flags2 != v.sentFlags2 || u.doors != v.sentDoors ||
+                                 v.visReport != v.sentVis || std::fabs(u.steer - v.sentSteer) > 0.04f;
             if (!v.sendGate.Due(nowMs, v.moving, changed))
                 return;
             auto clampHp = [](float hp) -> uint16_t {
@@ -6655,6 +7799,13 @@ namespace {
                 v.sentFlags = u.flags;
                 v.sentFlags2 = u.flags2;
                 v.sentDoors = u.doors;
+                v.sentVis = v.visReport;
+                v.sentSteer = u.steer;
+                ++g_vis.sentUpdates;
+                if (u.tyres) ++g_vis.sentWithTyres;
+                if (u.windows) ++g_vis.sentWithWindows;
+                if (u.flags2 & proto::kVeh2Brake) ++g_vis.brakeBitsSent;
+                if (u.flags2 & proto::kVeh2Handbrake) ++g_vis.handBitsSent;
             }
             ++sent;
         };
@@ -6678,6 +7829,65 @@ namespace {
     }
 
     // ---- protocol v4: health, hits, respawn (script tick) ------------------------------------------
+
+    // T1 seats: one SeatNotice, in the order the server sent it (DrainEvents). Script tick.
+    //   Reserved / Seated / Cancelled go to the book and to the replay of the player concerned (TickPeerSeatReplay acts on them);
+    //   a Cancelled about US also voids our own walk (LocalEnterFlow); Exited about someone else runs the normal exit animation at once.
+    void HandleSeatNotice(const proto::SeatNotice& n, double nowMs)
+    {
+        ++g_t1.noticesIn;
+        if (!g_seatIntentOn.load())
+            return;
+        const uint16_t me = join::MyId();
+        const sync::NoticeEffect fx = g_seats.OnNotice(n, me, nowMs);
+        static int logged = 0;
+        if (logged < 40)
+        {
+            ++logged;
+            GLOGI("engine: seats: notice %s player %u vehicle id=%u seat %u detail %u%s", proto::ToString(n.kind), (unsigned)n.player, (unsigned)n.vehId,
+                  (unsigned)n.seat, (unsigned)n.detail, fx.aboutMe ? " (about us)" : "");
+        }
+        if (fx.aboutMe)
+        {
+            ++g_t1.noticesAboutUs;
+            if (n.kind == proto::SeatNoticeKind::Cancelled)
+                g_localEnter.OnServerCancel(n.vehId, n.seat);
+            return;
+        }
+        if (fx.unseatPuppet)
+        {
+            const auto pit = g_peers.find(fx.player);
+            if (pit == g_peers.end() || !pit->second.ped || pit->second.deadShown)
+            {
+                ++g_t1.exitsNoPed;
+                return;
+            }
+            Peer& pe = pit->second;
+            const auto vit = g_vehs.find((uint16_t)fx.veh);
+            if (pe.seatedVeh == fx.veh || g_world->IsPedInVehicle(pe.ped))
+            {
+                UnseatPeer(pe, vit != g_vehs.end() && !vit->second.removed ? vit->second.handle : 0);
+                ++g_t1.exitsReplayed;
+            }
+        }
+    }
+
+    // T1 seats: the server's answer to our EnterIntent / CancelIntent (not the link's: it must never see these ops). Script tick.
+    void HandleIntentResult(const proto::VehicleResult& r)
+    {
+        if (r.op == proto::VehicleOp::CancelIntent)
+            return;                                    // Ok whether or not there was a reservation: nothing to learn
+        const uint8_t code = (uint8_t)r.code;
+        if (r.code == proto::VehicleResultCode::Ok)
+            ++g_t1.intentsOk;
+        else
+        {
+            ++g_t1.intentsRefused;
+            ++g_t1.refusedBy[code < 16 ? code : 15];
+            GLOGW("engine: seats: the server REFUSED our entry intent on vehicle id=%u: %s", (unsigned)r.vehId, VehResultName(code));
+        }
+        g_localEnter.OnResult((int)r.vehId, code);
+    }
 
     // Damage about us / RespawnOk / Killed / VehicleResult from the join worker. Runs before TickLife,
     // so a RespawnOk is seen the frame it is taken. The first two never pass through the bounded queue
@@ -6756,9 +7966,17 @@ namespace {
                       (unsigned)k.victimId, (unsigned)k.killerId, (unsigned)k.weapon, (unsigned)k.flags);
                 break;
             }
+            case NetEvent::SeatNote:
+                HandleSeatNotice(e.seat, nowMs);
+                break;
             case NetEvent::VehResult:
             {
                 const proto::VehicleResult& r = e.veh;
+                if (r.op == proto::VehicleOp::EnterIntent || r.op == proto::VehicleOp::CancelIntent)
+                {
+                    HandleIntentResult(r);             // T1: ours, not the link's
+                    break;
+                }
                 g_link.OnResult((uint8_t)r.op, (uint8_t)r.code, r.vehId);
                 if (r.code == proto::VehicleResultCode::Ok)
                 {
@@ -7038,7 +8256,7 @@ namespace {
         }
         g_link.Reset();
         g_vitals.Reset(g_playerHealth.load(), 0);     // the server playerHealth, no armour (Welcome)
-        ApplyServerMaxHealth(g_world->LocalPlayer());
+        ApplyServerMaxHealth(g_world->LocalPlayer(), "session start");
         g_respawnGate.OnAlive();
         g_hits.Clear();
         g_localEmote.Clear();
@@ -7051,6 +8269,8 @@ namespace {
         g_lastMarkedVeh = 0;
         g_noShuffleVeh = 0;
         g_entryWalk = EntryWalk();
+        g_localEnter.Reset();
+        g_seats.Reset();
         g_entryGuard.Reset();
         g_vitalsPrevTotal = -1;
         g_serverDeadNoticed = false;
@@ -7067,7 +8287,17 @@ namespace {
         const bool server = ServerMode();
         if (server != rechargeOff || (server && nowMs - rechargeAtMs >= 5000.0))
         {
-            g_world->SetLocalHealthRecharge(server ? 0.0f : 1.0f);
+            const bool rechargeOk = g_world->SetLocalHealthRecharge(server ? 0.0f : 1.0f);
+            static bool rechargeLogged = false;
+            if (!rechargeOk || !rechargeLogged)    // T6: the first call and any failure (a failure lets GTA regenerate to 50 %)
+            {
+                rechargeLogged = true;
+                if (rechargeOk)
+                    GLOGI("engine: health: SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(%.1f) -> ok", server ? 0.0 : 1.0);
+                else
+                    GLOGW("engine: health: SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(%.1f) -> FAILED (GTA may regenerate to 50 %%)",
+                          server ? 0.0 : 1.0);
+            }
             rechargeOff = server;
             rechargeAtMs = nowMs;
         }
@@ -7079,6 +8309,7 @@ namespace {
             ob.nowMs = nowMs;
             ob.health = g_world->GetEntityHealth(lp);
             ob.maxHealth = g_world->GetEntityMaxHealth(lp);
+            ob.ped = lp;                               // T6: a changed handle is a new ped, not a loss
             ob.armour = g_world->GetPedArmour(lp);
             ob.dead = g_world->IsPedDeadOrDying(lp);
             // A loss a remote puppet caused (a ram, a thrown car, its car's wheels) is reported by the
@@ -7131,6 +8362,21 @@ namespace {
                 if (!fallHash)
                     fallHash = g_world->HashKey("WEAPON_FALL");
                 const bool fell = g_world->IsPedFalling(lp) || g_world->IsPedRagdoll(lp);
+                for (int i = 0; i < v.selfHitCount; ++i)
+                    if (v.selfHits[i] >= 50 && !fell && !ob.puppetDamage)
+                    {
+                        // T6: a big loss with no fall and no puppet behind it is what a mismatched ped looked like (a swapped
+                        // ped's default 200 under a max of 300 was a self-hit of 100): say so, with the numbers that explain it.
+                        static double warnedMs = -1e9;
+                        if (nowMs - warnedMs >= 2000.0)
+                        {
+                            warnedMs = nowMs;
+                            GLOGW("engine: health: self-hit of %d with no fall and no puppet cause: ped health %d / max %d "
+                                  "(wanted max %d), server health %u, playerHealth %u, tracker pending %d",
+                                  v.selfHits[i], ob.health, ob.maxHealth, sync::PedMaxHealth(g_playerHealth.load()),
+                                  (unsigned)g_vitals.Health(), (unsigned)g_playerHealth.load(), g_vitals.Pending());
+                        }
+                    }
                 for (int i = 0; i < v.selfHitCount; ++i)
                 {
                     sync::BatchedHit h;
@@ -7341,6 +8587,117 @@ namespace {
               hand1 - lastHand[1]);
     }
 
+    // T1 seats (wire v6), every 10 s with the vehicle lines: what the server's enter / exit intents did on THIS machine. One line, only when
+    // something happened in the window. Grep "engine: seats (T1)". Script tick.
+    //   our entries: begun, EnterIntent sent / Ok / refused (by code), the game's task issued / seen running / finished with us seated /
+    //                never started / stopped without a seat / timed out, the BOUNDED fallback warps, entries aborted / cancelled by the server
+    //   other players' entries (replays): Reserved notices, TASK_ENTER_VEHICLE issued (must equal the Reserved count minus the cancelled
+    //                before the car was here) / started / finished by the game / never started / stopped / timed out / not callable, cancelled
+    //                by the server, exit animations replayed, stale lists refused after an exit, the seat WARPS by reason (the fallback), puppets put
+    //                out because the server never named them
+    //   divergences: puppets put out + warped puppets found out of their seat (SyncD displaced counters, last window)
+    void ReportSeats()
+    {
+        static T1Stats last;
+        static uint32_t lastDisplaced = 0;
+        const T1Stats& c = g_t1;
+        const sync::SeatReplayStats p = g_seats.TakeStats();
+        const sync::LocalEnterStats l = g_localEnter.TakeStats();
+        const uint32_t displaced = g_syncD.displacedOtherSeat + g_syncD.displacedOtherVeh + g_syncD.displacedOutside + g_syncD.displacedUnknown;
+        const uint32_t sent = c.intentsSent - last.intentsSent, ok = c.intentsOk - last.intentsOk, refused = c.intentsRefused - last.intentsRefused,
+                       notices = c.noticesIn - last.noticesIn, exitsRep = c.exitsReplayed - last.exitsReplayed;
+        const bool active = sent || ok || refused || notices || p.issued || p.warpNoIntent || p.Warps() || p.exits || l.begun || exitsRep || p.evicted;
+        if (active)
+        {
+            std::string by;
+            for (int i = 1; i < 16; ++i)
+                if (c.refusedBy[i] != last.refusedBy[i])
+                {
+                    char b[40];
+                    std::snprintf(b, sizeof(b), "%s%s=%u", by.empty() ? "" : " ", VehResultName((uint8_t)i), c.refusedBy[i] - last.refusedBy[i]);
+                    by += b;
+                }
+            GLOGI("engine: seats (T1), last 10 s: OUR entries: %u begun, intents sent %u / Ok %u / refused %u [%s]; the game's task issued %u (not callable %u) / "
+                  "running %u / finished with us seated %u / never started %u / stopped without a seat %u / timed out %u; FALLBACK WARPS %u; aborted %u, "
+                  "cancelled by the server %u, no answer %u, cancels sent %u. OTHERS: %u notices in (%u about us), replays: Reserved %u -> task issued %u "
+                  "(bike/cycle %u, not callable %u) / running %u / finished by the game %u / never started %u / stopped %u / timed out %u / cancelled %u / "
+                  "dropped (car never came) %u / gave up unconfirmed %u; exit animations replayed %u (no ped %u), stale-list denials after an exit %u (per check); "
+                  "seat WARPS %u (no intent %u, confirmed before the task %u, grace over %u, task ended %u, task timed out %u); DIVERGENCES: puppets put out "
+                  "(seated here, never in the server's list) %u, warped puppets found out of their seat %u",
+                  l.begun, l.sent, l.accepted, l.refused, by.empty() ? "none" : by.c_str(), l.issued, c.localIssueFailed - last.localIssueFailed, l.started,
+                  l.finished, l.neverStarted, l.endedNoSeat, l.timedOut, l.fallbackWarps, l.aborted, l.serverCancelled, l.noAnswer, c.cancelsSent - last.cancelsSent,
+                  notices, c.noticesAboutUs - last.noticesAboutUs, p.intents, p.issued, p.mounts, p.issueFailed, p.started, p.finished, p.neverStarted,
+                  p.endedNoSeat, p.timeouts, p.cancelled, p.droppedNotReady, p.gaveUp, exitsRep, c.exitsNoPed - last.exitsNoPed, p.latchDenied, p.Warps(),
+                  p.warpNoIntent, p.warpConfirmed, p.warpGraceOver, p.warpTaskEnded, p.warpTaskTimeout, p.evicted, displaced - lastDisplaced);
+        }
+        last = c;
+        lastDisplaced = displaced;
+    }
+
+    // T3, every 10 s with the vehicles lines: the vehicle visual state (tyres, windows, brake lights, handbrake, steering). Counters of the
+    // last window (the VisStats ones) and totals since the first sight of each car (the per-car sync::VisualSync stats): see
+    // docs/api/protocol.md "T3". Script tick.
+    void ReportVehVisual()
+    {
+        sync::VisualStats tot;
+        uint32_t carsTyres = 0, tyreBits = 0, carsWindows = 0;
+        for (auto& kv : g_vehs)
+        {
+            const sync::VisualStats& vs = kv.second.vis.Stats();
+            tot.reads += vs.reads;
+            tot.divergent += vs.divergent;
+            tot.stuck += vs.stuck;
+            tot.burstsApplied += vs.burstsApplied;
+            tot.rimsApplied += vs.rimsApplied;
+            tot.tyresFixed += vs.tyresFixed;
+            tot.windowsSmashed += vs.windowsSmashed;
+            tot.windowsFixed += vs.windowsFixed;
+            tot.reported += vs.reported;
+            tot.confirmed += vs.confirmed;
+            tot.expired += vs.expired;
+            tot.cmdFailures += vs.cmdFailures;
+            tot.suspends += vs.suspends;
+            if (kv.second.handle && kv.second.haveState)
+            {
+                if (kv.second.st.tyres)
+                {
+                    ++carsTyres;
+                    tyreBits += (uint32_t)sync::PopCount8(kv.second.st.tyres);
+                }
+                if (kv.second.st.windows)
+                    ++carsWindows;
+            }
+        }
+        const VisStats& c = g_vis;
+        const bool active = c.reads || c.sentUpdates || c.steerSent.n || c.steerApplied || c.steerApplyFail || c.brakeSet || c.brakeFail ||
+                            c.handSet || c.handFail || c.partHits || carsTyres || carsWindows || tot.reads;
+        if (join::IsConnected() && active)
+            GLOGI("engine: vehicle visual (T3), last 10 s: natives: tyre reads ok %u / failed %u, window reads ok %u / failed %u, brake lights set %u (failed %u), "
+                  "handbrake set %u (failed %u), pedal reads failed %u; as controller: %u updates sent (%u with a burst tyre, %u with a smashed window, %u with "
+                  "brake lights, %u with the handbrake); copies: %u cars show tyre damage (%u tyres), %u show window damage; our shots: %u pops reported as vehicle "
+                  "Hits (%u refused locally); since each car's first sight: %u reads, %u tyres burst / %u off the rim / %u fixed, %u windows smashed / %u fixed, "
+                  "%u pops reported of which %u confirmed and %u expired, %u divergent reads of which %u stuck, %u failed command rounds (%u back-offs); steering "
+                  "sent: n=%u min %.2f mean %.2f max %.2f (axis %u, held %u, estimate %u; axis agrees %u / disagrees %u with the estimate above 3 m/s); steering "
+                  "applied: n=%u (failed %u) min %.2f mean %.2f max %.2f; sender yaw rate, GET_ENTITY_ROTATION_VELOCITY / rotation-derived: mean %.2f over %u samples",
+                  c.tyreReadOk, c.tyreReadFail, c.winReadOk, c.winReadFail, c.brakeSet, c.brakeFail, c.handSet, c.handFail, c.pedalReadFail, c.sentUpdates,
+                  c.sentWithTyres, c.sentWithWindows, c.brakeBitsSent, c.handBitsSent, carsTyres, tyreBits, carsWindows, c.partHits, c.partHitsRefused, tot.reads,
+                  tot.burstsApplied, tot.rimsApplied, tot.tyresFixed, tot.windowsSmashed, tot.windowsFixed, tot.reported, tot.confirmed, tot.expired, tot.divergent,
+                  tot.stuck, tot.cmdFailures, tot.suspends, c.steerSent.n, (double)c.steerSent.min, c.steerSent.Mean(), (double)c.steerSent.max, c.steerSent.axis,
+                  c.steerSent.held, c.steerSent.estimate, c.steerSent.agree, c.steerSent.disagree, c.steerApplied, c.steerApplyFail, (double)g_vis.steerAppliedMin,
+                  c.steerApplied ? g_vis.steerAppliedSum / c.steerApplied : 0.0, (double)g_vis.steerAppliedMax, c.yawRatioN ? c.yawRatioSum / c.yawRatioN : 0.0,
+                  c.yawRatioN);
+        // The window counters start over; the sync::VisualSync totals above run on.
+        g_vis.reads = g_vis.tyreReadOk = g_vis.tyreReadFail = g_vis.winReadOk = g_vis.winReadFail = 0;
+        g_vis.sentUpdates = g_vis.sentWithTyres = g_vis.sentWithWindows = g_vis.partHits = g_vis.partHitsRefused = 0;
+        g_vis.brakeSet = g_vis.brakeFail = g_vis.handSet = g_vis.handFail = g_vis.brakeBitsSent = g_vis.handBitsSent = g_vis.pedalReadFail = 0;
+        g_vis.steerApplied = g_vis.steerApplyFail = 0;
+        g_vis.steerAppliedMin = g_vis.steerAppliedMax = 0.0f;
+        g_vis.steerAppliedSum = 0.0;
+        g_vis.steerSent.Reset();
+        g_vis.yawRatioSum = 0.0;
+        g_vis.yawRatioN = 0;
+    }
+
     // Every 10 s: one line each for vehicles, combat and anims (only while connected).
     void ReportV4(double nowMs)
     {
@@ -7350,6 +8707,7 @@ namespace {
         if (nowMs - lastMs < 10000.0)
             return;
         lastMs = nowMs;
+        ReportVehVisual();                             // T3
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
         g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;
@@ -7479,12 +8837,40 @@ namespace {
                 }
             }
             {
+                // T4 (vehicle collisions): the contacts our cars felt, the copies whose response was adopted, the server's impacts and what became of
+                // them, and the divergence estimate (a copy against its controller's stream 500 ms after the contact). Read with
+                // docs/sync-specs/vehicle-collisions.md: "adopted" > 0 with "refused" 0 = the copy path ran; "applied" > 0 = the server's resolution
+                // reached a car we control and differed from the game's; "no local contact" many = the server's boxes met where our physics felt nothing.
+                static T4Stats lastT4;
+                static uint32_t lastGuard = 0;
+                uint32_t guardNow = 0;
+                for (auto& kv : g_vehs)
+                    guardNow += VehInterpGuarded(kv.first);
+                const T4Stats& t = g_t4;
+                if (t.adopted != lastT4.adopted || t.adoptRefused != lastT4.adoptRefused || t.jumpEpisodes != lastT4.jumpEpisodes ||
+                    t.impactsIn != lastT4.impactsIn || t.divN != lastT4.divN)
+                    GLOGI("engine: vehicle impacts (T4), last 10 s: impact_sync %s; copies whose response was adopted %u (contacts left to the grace "
+                          "%u, stream pushes held back %u); velocity jumps our cars felt %u; server impacts in %u: applied %u (change written: %.1f m/s "
+                          "total, largest %.1f), no local contact %u, too small %u, too old %u, duplicate %u, car not ours %u, queue overflow %u; "
+                          "copy vs controller's stream 500 ms after the adoption: %u compared, mean error %.2f m, worst %.2f m",
+                          g_impactSync.load() ? "on" : "OFF", t.adopted - lastT4.adopted, t.adoptRefused - lastT4.adoptRefused, guardNow - lastGuard,
+                          t.jumpEpisodes - lastT4.jumpEpisodes, t.impactsIn - lastT4.impactsIn, t.applied - lastT4.applied, t.appliedDvSum - lastT4.appliedDvSum,
+                          t.appliedDvMax, t.noLocal - lastT4.noLocal, t.tiny - lastT4.tiny, t.stale - lastT4.stale, t.dup - lastT4.dup,
+                          t.noVehicle - lastT4.noVehicle, t.dropped - lastT4.dropped, t.divN - lastT4.divN,
+                          t.divN > lastT4.divN ? (t.divSum - lastT4.divSum) / (t.divN - lastT4.divN) : 0.0, t.divMax);
+                lastT4 = g_t4;
+                lastT4.divMax = 0.0;
+                g_t4.divMax = 0.0;
+                lastGuard = guardNow;
+            }
+            {
                 static SyncDStats lastD;
                 static uint32_t lastHand[2] = { 0, 0 };
                 ReportSyncD(lastD, lastHand);
                 lastD = g_syncD;
                 lastHand[0] = g_syncDHandovers[0].load();
                 lastHand[1] = g_syncDHandovers[1].load();
+                ReportSeats();                             // T1 seats
             }
             const sync::VitalsStats& vs = g_vitals.Stats();
             const sync::HitBatchStats& hs = g_hits.Stats();
@@ -7500,6 +8886,16 @@ namespace {
                   c.peerDeaths - last.peerDeaths, c.peerRecoveries - last.peerRecoveries,
                   c.peerLocalDeaths - last.peerLocalDeaths, vs.selfHits, vs.selfDamage, vs.acks, vs.resyncs,
                   vs.clampsDown, vs.kills, hs.dropped, hs.rateHeld);
+            // T6 health line: what the ped really holds against what the server says, and the counters that explain a
+            // mismatch (see the T6 report for how to read it).
+            GLOGI("engine: health: ped %d / max %d, server health %u of playerHealth %u (ped max should be %d), bar %.0f%%; "
+                  "totals: max changes %u, gains undone %u, largest self-hit %u, ped swaps %u, reconciles %u (gave up %u), "
+                  "max reads unreadable %u, max writes %u (failed %u, read-back differs %u, last wish %d / read %d)",
+                  vs.obsHealth, vs.obsMax, (unsigned)g_vitals.Health(), (unsigned)g_playerHealth.load(),
+                  sync::PedMaxHealth(g_playerHealth.load()),
+                  sync::HudHealthFraction(vs.obsHealth, vs.obsMax, g_playerHealth.load(), g_vitals.LastGoodMax()) * 100.0f,
+                  vs.maxChanges, vs.clampsDown, vs.largestSelfHit, vs.pedSwaps, vs.reconciles, vs.reconcileGaveUp,
+                  vs.maxUnreadable, vs.maxWrites, vs.maxWriteFails, vs.maxReadBackOff, vs.lastMaxWanted, vs.lastMaxReadBack);
             uint32_t evEvicted = 0, evRefused = 0;
             {
                 std::lock_guard<std::mutex> lk(g_evMtx);
@@ -7557,7 +8953,12 @@ namespace {
             // 0e: per animation kind, what the last 10 s asked for, loaded, issued and actually SAW playing; "unseen" is a clip
             // IS_ENTITY_PLAYING_ANIM never saw (wrong name), "ended(...)" says what ended the emotes.
             GLOGI("engine: anims (0e), last 10 s: %s", sync::AnimDiagLine(g_animDiag, g_animDiagLast).c_str());
+            // T2: the on-foot one-shots asked of the puppets against the game's own readback ("SHOWN" = IS_PED_JUMPING etc. said yes within
+            // the kind's window after the task). A kind that is asked but never SHOWN is an animation the others do not see.
+            GLOGI("engine: anims onfoot (T2), last 10 s: %s", OneShotLine().c_str());
         }
+        for (size_t i = 0; i < (size_t)sync::OneShot::kCount; ++i)
+            g_oneShotLast[i] = g_oneShot[i];
         g_animDiagLast = g_animDiag;
         last = c;
         lastWorlds = worlds;
@@ -7725,6 +9126,7 @@ namespace {
         }
 
         int32_t lp = g_world->LocalPlayer();
+        TickAmbient(inScript, lp, probe);              // T5: no ambient NPCs / traffic, every tick, before the connection / entry gates
         if (!lp) {
             // Player not spawned yet — render the GAGE loading overlay.
             void* sc = game::GetSwapChain();
@@ -7915,7 +9317,7 @@ namespace {
             const int32_t sampleMs = (int32_t)((uint64_t)nowMs & 0xFFFFu);
             join::SendState(k, ped, sampleMs);
             if (inScript)
-                SendControlledVehicles(nowMs, sampleMs);   // v5: every car the server says we control, not only ours
+                SendControlledVehicles(nowMs, sampleMs, lpVeh);   // v5: every car the server says we control, not only ours
         }
 
         if (!mayChange)
@@ -7933,10 +9335,7 @@ namespace {
                 WorkSection s(probe, kSecSpFrame);
                 g_world->SuppressSPFrame();
             }
-            {
-                WorkSection s(probe, kSecAmbientFrame);
-                g_world->SuppressAmbientFrame();    // hold the singleplayer ambient world off, every frame
-            }
+            // (the ambient world is held off from TickAmbient at the top of GameWork, every tick, whatever the connection: T5)
             // For the first 30 s after entry, keep terminating the SP mission-flow scripts
             // (flow_controller + prologue1) every tick: flow_controller relaunches the Prologue a
             // few seconds in (gage.log: prologue1 reappeared as id 68, then teleported the player to
@@ -8224,6 +9623,8 @@ namespace gage::engine {
         sinks.onEnded = OnEnded;
         sinks.onVehicles = OnVehicles;                 // protocol v4
         sinks.onVehicleResult = OnVehicleResult;
+        sinks.onSeatNotice = OnSeatNotice;
+        sinks.onVehicleImpact = OnVehicleImpact;   // T4
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

@@ -290,6 +290,16 @@ namespace gage::server {
             line += first ? "none]" : "]";
             Log(line);
         }
+        {
+            // T1 seats: one line while intents flowed, so the next live log says what the seat protocol did. Key=value.
+            const uint64_t ok = n.seatIntents - o.seatIntents, ref = n.seatIntentsRefused - o.seatIntentsRefused;
+            const uint64_t seated = n.seatSeated - o.seatSeated, canc = n.seatCancelled - o.seatCancelled;
+            const uint64_t exits = n.seatExits - o.seatExits;
+            if (ok + ref + seated + canc + exits != 0)
+                Log("seats: last 10 s: intents reserved " + std::to_string(ok) + " refused " + std::to_string(ref) + ", seated from a reservation " +
+                    std::to_string(seated) + ", cancelled " + std::to_string(canc) + " (expired " + std::to_string(n.seatExpired - o.seatExpired) +
+                    "), announced exits " + std::to_string(exits) + ", notices sent " + std::to_string(n.seatNoticesSent - o.seatNoticesSent));
+        }
         hitLogMark_ = stats_;
     }
 
@@ -1177,6 +1187,7 @@ namespace gage::server {
 
     void Server::VehicleDestroyed(uint16_t id)
     {
+        contact_.Forget(id);
         stats_.vehiclesDestroyed++;
         Log("vehicle " + std::to_string(id) + " removed");
     }
@@ -1186,6 +1197,7 @@ namespace gage::server {
         std::vector<uint16_t> gone;
         vehicles_.Tick(nowMs, tick_, &gone);
         for (uint16_t id : gone) VehicleDestroyed(id);
+        FlushSeatNotices(); // T1: reservations that expired, vehicles that went, players that died or left since the last tick
         // v5: who controls each vehicle (the driver, else the nearest trusted player who has it in view), decided
         // once per tick before the frames are built, so every receiver is told the same ctrl.
         controlCandidates_.clear();
@@ -1200,6 +1212,7 @@ namespace gage::server {
             controlCandidates_.push_back(cand);
         }
         vehicles_.AssignControllers(nowMs, tick_, controlCandidates_);
+        BroadcastImpacts(nowMs);
         // The entries' ageMs is measured against the tick's NOMINAL time (its slot), not the clock of a loop that got
         // round to it late (the same rule as the WorldState entries').
         const uint64_t nominalMs = tickNominalUs_ / 1000;
@@ -1212,6 +1225,70 @@ namespace gage::server {
             if (bytes.empty()) continue; // cannot happen with the store's own data; never send a broken frame
             SendTo(c, proto::kChanState, bytes, false);
             stats_.vehicleFrames++;
+        }
+    }
+
+    // T4: resolve the contacts between vehicles different clients simulate, once each, and tell the two controllers their halves.
+    void Server::BroadcastImpacts(uint64_t nowMs)
+    {
+        contactLive_.clear();
+        for (uint16_t id = 0; id < proto::kMaxVehicles; id++)
+        {
+            const VehicleStore::Vehicle* v = vehicles_.Get(id);
+            if (!v || v->s.ctrl == proto::kNoPlayer) continue;
+            sync::impact::ContactArbiter::Live l;
+            l.id = id;
+            l.ctrl = v->s.ctrl;
+            l.mc = sync::impact::MassClassOfModel(v->s.model);
+            const auto pit = players_.find(v->s.ctrl);
+            l.trusted = pit != players_.end() && !Untrusted(*pit->second, nowMs) && !pit->second->dead;
+            contactLive_.push_back(l);
+        }
+        contactOut_.clear();
+        contact_.Step((double)(tickNominalUs_ / 1000), contactLive_, contactOut_);
+        for (sync::impact::ImpactOut& io : contactOut_)
+        {
+            io.seq = ++impactSeq_;
+            stats_.vehicleImpacts++;
+            impactLogCount_++;
+            for (int k = 0; k < 2; k++)
+            {
+                if (!io.stampOk[k]) continue;
+                const auto pit = players_.find(io.ctrl[k]);
+                if (pit == players_.end()) continue;
+                proto::VehicleImpact m;
+                m.seq = io.seq;
+                m.vehId = io.id[k];
+                m.otherId = io.id[1 - k];
+                m.sampleMs = io.stamp[k];
+                m.dvx = (float)io.dv[k].x;
+                m.dvy = (float)io.dv[k].y;
+                m.dyaw = (float)io.dw[k];
+                const double sgn = k == 0 ? 1.0 : -1.0;   // the normal points from the first vehicle to the second
+                m.nx = (float)(io.n.x * sgn);
+                m.ny = (float)(io.n.y * sgn);
+                m.closing = (float)io.closing;
+                m.depth = (float)io.depth;
+                const proto::Bytes bytes = proto::Encode(m);
+                if (bytes.empty()) continue;
+                SendTo(*pit->second, proto::kChanReliable, bytes, true);
+                stats_.vehicleImpactsSent++;
+            }
+        }
+        if (nowMs - impactLogMs_ >= 10000)
+        {
+            if (impactLogCount_ > 0 || vehicles_.SpeedClamps() > impactLogClaims_)
+            {
+                const sync::impact::ContactArbiter::Stats& a = contact_.stats();
+                Log("contact: " + std::to_string(impactLogCount_) + " impact(s) in the last 10 s (" + std::to_string(stats_.vehicleImpacts) + " total, " +
+                    std::to_string(stats_.vehicleImpactsSent) + " messages), pairs examined " + std::to_string(a.pairsExamined) + ", soft touches " +
+                    std::to_string(a.softTouches) + ", skipped untrusted " + std::to_string(a.untrusted) + ", dv capped " + std::to_string(a.capped) +
+                    ", max closing " + std::to_string((int)a.maxClosing) + " m/s; empty-car claims " + std::to_string(vehicles_.Claims()) + ", velocity clamps " +
+                    std::to_string(vehicles_.SpeedClamps()));
+            }
+            impactLogMs_ = nowMs;
+            impactLogCount_ = 0;
+            impactLogClaims_ = vehicles_.SpeedClamps();
         }
     }
 
@@ -1253,7 +1330,7 @@ namespace gage::server {
         {
             stats_.vehicleUpdatesInvalid++;
             LogDrop(c, kDropVehicle, "VehicleUpdate for vehicle " + std::to_string(u.vehId) +
-                                         " outside the world box or over " + std::to_string(cfg_.vehicleMaxSpeed) + " m/s");
+                                         " outside the world box or over twice the " + std::to_string(cfg_.vehicleMaxSpeed) + " m/s cap");
             return;
         }
         if (r != proto::VehicleResultCode::Ok)
@@ -1266,6 +1343,17 @@ namespace gage::server {
         c.vehSeq = u.seq;
         c.hasVehSeq = true;
         stats_.vehicleUpdatesAccepted++;
+        {
+            // T4: the arbiter keeps the controller's recent track (on the server's time base) to resolve contacts with other controllers' vehicles
+            sync::impact::ArbSample as;
+            as.tMs = (double)std::min(sampleMs, nowMs);
+            as.p = {u.k.x, u.k.y};
+            as.v = {u.k.vx, u.k.vy};
+            as.h = (double)proto::QuatHeading(u.rot) * (3.14159265358979323846 / 180.0);
+            as.w = u.avz;
+            as.stamp = u.sampleMs;
+            contact_.Note(u.vehId, c.id, as);
+        }
         // The vehicle's position is judged by displacement like the player's (it was taken either way).
         if (jumped && cfg_.untrustedWindowMs != 0 && nowMs >= c.graceUntilMs)
             MarkUntrusted(c, nowMs, "VehicleUpdate for vehicle " + std::to_string(u.vehId) +
@@ -1322,6 +1410,36 @@ namespace gage::server {
         res.code = code;
         res.vehId = vehId;
         SendTo(c, proto::kChanReliable, proto::Encode(res), true);
+        FlushSeatNotices(); // T1: after the actor's answer, before anything else this tick
+    }
+
+    // T1 seats: delivers the SeatNotices the store queued to every client that has the vehicle in range, and to the actor
+    // (who learns of an Expired / Replaced / VehicleGone cancel of its own walk this way). Reliable, in order.
+    void Server::FlushSeatNotices()
+    {
+        if (vehicles_.PendingNotices() == 0) return;
+        std::vector<std::vector<uint16_t>> audiences;
+        const std::vector<proto::SeatNotice> notices = vehicles_.TakeNotices(&audiences);
+        for (size_t i = 0; i < notices.size(); i++)
+        {
+            const proto::SeatNotice& n = notices[i];
+            const proto::Bytes bytes = proto::Encode(n);
+            if (bytes.empty()) continue; // cannot happen with the store's own data
+            switch (n.kind)
+            {
+            case proto::SeatNoticeKind::Seated:    stats_.seatSeated++; break;
+            case proto::SeatNoticeKind::Cancelled: stats_.seatCancelled++; if (n.detail == (uint8_t)proto::SeatCancelReason::Expired) stats_.seatExpired++; break;
+            case proto::SeatNoticeKind::Exited:    stats_.seatExits++; break;
+            case proto::SeatNoticeKind::Reserved:  break;
+            }
+            for (const uint16_t to : audiences[i])
+            {
+                const auto it = players_.find(to);
+                if (it == players_.end()) continue; // left since (the departing player's own cancel)
+                SendTo(*it->second, proto::kChanReliable, bytes, true);
+                stats_.seatNoticesSent++;
+            }
+        }
     }
 
     proto::VehicleResultCode Server::RunVehicleCmd(Conn& c, const proto::VehicleCmd& m, uint16_t& vehId)
@@ -1422,7 +1540,25 @@ namespace gage::server {
             }
             return vehicles_.Enter(c.id, m.vehId, m.arg, c.k, nowMs, tick_);
         case proto::VehicleOp::Exit:
-            return vehicles_.Exit(c.id, m.vehId, nowMs, tick_);
+            return vehicles_.Exit(c.id, m.vehId, nowMs, tick_, true); // T1: announced (SeatNotice::Exited), or a pending reservation cancelled
+        case proto::VehicleOp::EnterIntent:
+        {
+            // T1 seats: the same gates as Enter (a dead or position-less player, the untrusted window) before the store's own.
+            if (c.dead) return Code::Dead;
+            if (!c.hasState) return Code::NoState;
+            if (Untrusted(c, nowMs))
+            {
+                stats_.untrustedRefusals++;
+                return Code::RateLimited;
+            }
+            if (m.arg & ~proto::kIntentArgMask) return Code::BadArg; // reserved bits
+            const Code r = vehicles_.Reserve(c.id, m.vehId, m.arg & 0xFF, (m.arg & proto::kIntentRun) != 0, c.k, nowMs, tick_);
+            if (r == Code::Ok) stats_.seatIntents++;
+            else stats_.seatIntentsRefused++;
+            return r;
+        }
+        case proto::VehicleOp::CancelIntent:
+            return vehicles_.CancelIntent(c.id, m.vehId);
         case proto::VehicleOp::Release:
             return vehicles_.Release(c.id, m.vehId, tick_); // v5: the owner gives the driver's seat to anybody
         case proto::VehicleOp::SetLocked:
@@ -1483,6 +1619,7 @@ namespace gage::server {
             // that was still waiting for its shot dies with it).
             const VehicleStore::Seat seat = vehicles_.Occupancy(victim.id);
             if (seat.veh != VehicleStore::kNone) vehicles_.Exit(victim.id, seat.veh, victim.deathMs, tick_);
+            vehicles_.CancelIntentOf(victim.id, proto::SeatCancelReason::PlayerGone); // T1: a dead player walks nowhere
             ClearAnim(victim, true);
             victim.deferred.clear();
         }
@@ -1769,7 +1906,15 @@ namespace gage::server {
         if (tp)
             stats_.hitsDamageApplied += HurtPlayer(*tp, c.id, h.weapon, scaled.damage, h.bone, DamageFlags(scaled.headshot, eff, false));
         else
+        {
             vehicles_.Damage(h.targetId, damage, tick_); // a vehicle's body health is not a player's: the clamped number, unscaled
+            // v6: the Hit names a part (a tyre the shooter saw burst on its copy, a smashed window): set it for everybody. A bone
+            // that is not a part (-1, a ped bone id) is ignored for a vehicle, as before.
+            proto::VehiclePart part;
+            unsigned slot;
+            if (proto::ParseVehiclePart(h.bone, part, slot) && vehicles_.HitPart(h.targetId, part, slot, nowMs, tick_))
+                stats_.vehiclePartHits++;
+        }
         return HitVerdict::Accept;
     }
 
@@ -1823,6 +1968,7 @@ namespace gage::server {
         c.armor = (uint8_t)cfg_.respawnArmour; // v5: Config::respawnArmour (0 by default)
         const VehicleStore::Seat seat = vehicles_.Occupancy(c.id);
         if (seat.veh != VehicleStore::kNone) vehicles_.Exit(c.id, seat.veh, nowMs, tick_);
+        vehicles_.CancelIntentOf(c.id, proto::SeatCancelReason::PlayerGone); // T1
         ClearAnim(c, true);
         c.k = proto::Kinematics();
         c.k.x = sp.x;

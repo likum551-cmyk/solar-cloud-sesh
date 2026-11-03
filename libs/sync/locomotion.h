@@ -195,6 +195,7 @@
 //   jumpGraceMs        700 ms           ours: GTA jump airtime estimate
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace gage::sync {
@@ -212,6 +213,34 @@ namespace gage::sync {
     // W11: how a moving gait is tasked. Straight: TASK_GO_STRAIGHT_TO_COORD at a far point, re-issued on turn / drift /
     // arrival. Anchor: TASK_GO_TO_ENTITY once at an invisible entity the engine moves every frame (LocoOutput::anchorPos).
     enum class LocoMode : uint8_t { Straight, Anchor };
+
+    // T2 (desync round 2): how the position error of a walking / running puppet is closed.
+    //   Velocity: SET_ENTITY_VELOCITY (animation velocity + a correction). Its effect on a ped under a task is a MODEL (replaces the
+    //             animation's velocity / adds to it / is ignored: unverified live); it is kept for jumps, ragdolls, swimming and the
+    //             legacy tests.
+    //   Nudge:    SET_ENTITY_COORDS_NO_OFFSET of a few millimetres per frame toward the pose (LocoOutput::nudge). Whatever the game does
+    //             with velocities, a coordinate write is exact, so the error is bounded in every model of the game; the price is
+    //             foot skate by the nudge speed, which the closed-loop move rate keeps small.
+    enum class PushMode : uint8_t { Velocity, Nudge };
+
+    // T2: the degradation ladder (LocoOutput::level). Each step down trades looks for certainty:
+    //   Full      the configured mode (anchor), move rate, nudge
+    //   Straight  TASK_GO_STRAIGHT_TO_COORD (the anchor task was lost / does not move the ped / is dropped)
+    //   NoRate    + the move blend ratio carries the speed (SET_PED_MOVE_RATE_OVERRIDE does not scale the stride)
+    //   Placed    + the pose is followed almost rigidly (the task does not move the ped at all): looks like a slide, never a drift
+    enum class LocoLevel : uint8_t { Full = 0, Straight = 1, NoRate = 2, Placed = 3 };
+    // Why the level changed (LocoOutput::levelWhy), for the engine's log line.
+    enum class LocoLevelWhy : uint8_t
+    {
+        None,
+        AnchorLost,       // the ped showed no gait while a moving one was commanded (the go-to-entity task is not running)
+        AnchorStuck,      // the ped's own speed stayed under stuckRatio of the pose's for stuckMs: the task runs but does not carry it
+        AnchorDragging,   // the nudge did more than nudgeShareMax of the distance for nudgeShareWindowMs: the task does not follow the anchor
+        RateIneffective,  // the move rate sat at its limit with the ped still off in speed: the native does not scale the stride
+        StraightStuck,    // a straight task re-issued after a stall stalled again: nothing moves the ped, follow the pose rigidly
+        Recovered,        // a fallback timer ran out: the better level is tried again
+        Shared,           // another puppet's controller found the same failure (LevelWitness): imposed here without waiting to see it
+    };
 
     struct LocoVec { float x = 0, y = 0, z = 0; };
 
@@ -292,6 +321,30 @@ namespace gage::sync {
         float upDebounceMs = 150.0f, startWindowMs = 400.0f;
         float stallFirstMs = 900.0f;
 
+        // T2: position nudge + self-checks (see PushMode / LocoLevel). Defaults keep the legacy behaviour (velocity push, no
+        // self-checks) so the older tests stay what they were; the engine uses ShippedLocoConfig() (below).
+        PushMode push = PushMode::Velocity;
+        float nudgeDeadM = 0.12f;          // a moving ped is nudged only beyond this horizontal error
+        float nudgeStillDeadM = 0.25f;     // a standing one (inside the dead band an idle ped is left alone)
+        float nudgeTauMs = 250.0f;         // the excess over the dead band closes with this time constant
+        float nudgeMaxMs = 3.0f;           // cap of the nudge speed (anti-fling; beyond it the persistent-error snap takes over)
+        float nudgeStillMaxMs = 1.0f;      // cap while commanded Still (an idle pose slid sideways is the most visible skate)
+        float nudgeStartGraceM = 1.0f;     // the first startGraceMs of a movement tolerate this much error (the start clip is still getting up to speed)
+        float nudgeZBandM = 0.5f;          // |dz| beyond this is nudged too (capped zCorrMaxMs); inside it ground physics owns z
+        bool  selfCheck = false;           // the degradation ladder (LocoLevel): measured with the ped's own displacement
+        float stuckRatio = 0.35f, stuckMs = 1200.0f, stuckMinPoseMs = 1.5f;     // own speed under ratio * pose speed (pose over stuckMinPoseMs)
+        float stuckSettleMs = 900.0f;      // ... and only this long after the movement, task or gait began
+        float nudgeShareMax = 0.10f, nudgeShareWindowMs = 3000.0f;   // nudged distance / travelled distance over this window of STEADY motion
+        float steadyAccMs2 = 1.5f;         // the pose's low-passed acceleration under this is steady motion (a start, stop or reversal is not)
+        int   snapStormN = 3;              // this many failure snaps within 6 s are a stall (nothing carries the ped)
+        float ratePinMs = 2000.0f;                                   // the regression must show "no effect" this long
+        float rateSlopeMin = 0.25f, rateVarMin = 0.004f, rateProbeTauMs = 5000.0f, rateProbeMinMs = 1500.0f, rateProbeAccMs2 = 3.0f;   // regression of own speed on the rate
+        float rateOffMs = 60000.0f, rateOffMaxMs = 600000.0f;        // NoRate for this long (doubling per failure in a row), then tried again
+        float placedMs = 30000.0f, placedDurMaxMs = 300000.0f;       // Placed for this long (doubling), then tried again
+        float placedTauMs = 60.0f, placedNudgeMaxMs = 8.0f, placedDeadM = 0.03f;   // the rigid follow of the Placed level
+
+        float fastDownFrac = 0.0f, fastDownMs = 100.0f;   // T2: a pose under this fraction of the gait's down edge drops the gait after fastDownMs (0 = off)
+
         float velTauMs = 120.0f;       // one-pole low-pass of the pose velocity (W1 item 4)
         float steerDeadbandM = 0.08f;  // no steering under this horizontal error
         float ragdollMaxMs = 8.0f;     // cap of the whole velocity while ragdolling
@@ -302,6 +355,11 @@ namespace gage::sync {
         float headingTauMs = 50.0f;
         float jumpGraceMs = 700.0f;
     };
+
+    // T2: the config the ENGINE uses (apps/engine LocoCfg) and the tests of tests/t2_onfoot_tests.h measure: the position nudge, the
+    // self-checks and the degradation ladder on. `anchor` picks the first level (Anchor or Straight). One definition, so the
+    // numbers measured are the numbers shipped.
+    LocoConfig ShippedLocoConfig(bool anchor);
 
     struct LocoInput
     {
@@ -401,6 +459,15 @@ namespace gage::sync {
         bool anchorMode = false;
         bool moveAnchor = false;
         LocoVec anchorPos;
+
+        // T2. nudge: SET_ENTITY_COORDS_NO_OFFSET(ped, pedPos + nudgeDelta) once this frame (PushMode::Nudge); pedPos is the position
+        // LocoInput carried. level / levelWhy: the degradation ladder; levelChanged is true on the frame it moved.
+        bool nudge = false;
+        LocoVec nudgeDelta;
+        LocoLevel level = LocoLevel::Full;
+        bool levelChanged = false;
+        LocoLevelWhy levelWhy = LocoLevelWhy::None;
+        bool rateClamped = false;   // with setMoveRate: the rate sits at moveRateMin / moveRateMax
     };
 
     struct LocoStats
@@ -416,6 +483,9 @@ namespace gage::sync {
         // Sync A: stops that walked the rest to the pose before standing still, pushes skipped by the start grace, frames
         // whose velocity read was our own last push fed back (GET_ENTITY_VELOCITY returned what we set)
         uint32_t settles = 0, graceFrames = 0, contaminated = 0;
+        // T2: nudge frames, level changes (and by LocoLevelWhy)
+        uint32_t nudgeFrames = 0, levelChanges = 0, levelWhy[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        double nudgedM = 0, travelledM = 0;   // metres written by nudges / metres the ped moved while a moving gait was shown (cumulative)
     };
 
     class LocomotionController
@@ -448,6 +518,9 @@ namespace gage::sync {
         // empty output (paused = true) until it has run out, then re-issues the gait task. A pause
         // replaces the previous one; Pause(0) cancels it.
         void Pause(double ms);
+        // T2: pass on a level another puppet's controller found (the game is one game): the anchor task dropped (Straight) or the
+        // move rate ignored (NoRate) for `ms`. Reported through the next Update's levelChanged like a level it found itself.
+        void Degrade(LocoLevel to, LocoLevelWhy why, double ms);
 
         Gait CurrentGait() const { return gait_; }
         // The task the controller last issued (None until the first): what the ped is latched on, for the 10 s log line.
@@ -457,6 +530,9 @@ namespace gage::sync {
         // Sync A: the learned animation speed of a gait as a factor of its nominal (1 = as guessed), and the last move rate asked for
         float NominalScale(Gait g) const { return g == Gait::Walk ? nScale_[1] : g == Gait::Run ? nScale_[2] : g == Gait::Sprint ? nScale_[3] : 1.0f; }
         float LastMoveRate() const { return lastRate_; }
+        // T2: the level now, and the ped's own speed (m/s, from its position differences net of our nudges; -1 until measured)
+        LocoLevel Level() const { return level_; }
+        float SelfSpeed() const { return haveSelf_ ? static_cast<float>(std::sqrt(double(selfV_.x) * selfV_.x + double(selfV_.y) * selfV_.y)) : -1.0f; }
 
         // Gait inference with hysteresis: the gait after `current` sees `speed` (m/s).
         static Gait InferGait(Gait current, float speed, const LocoConfig& cfg);
@@ -511,6 +587,28 @@ namespace gage::sync {
         bool lastIssueWasStall_ = false;
         double sinceCleanMs_ = 1e9;          // time since animEst_ was a clean read
 
+        // T2: the ped's own displacement, the self-checks and the ladder
+        bool havePrevPed_ = false;
+        LocoVec prevPedAfter_;               // where the ped was after last frame's snap / nudge (the baseline of its own movement)
+        bool haveSelf_ = false;
+        LocoVec selfV_;                      // low-passed own velocity (position differences net of what we wrote)
+        double lagMs_ = 0;                   // how long the ped's own speed has been far under the pose's
+        double ratePinnedMs_ = 0;            // how long the move rate has sat at a limit with the speed still off
+        double rateOffLeftMs_ = 0, placedLeftMs_ = 0;
+        int rateFailStreak_ = 0, placedFailStreak_ = 0;
+        double sinceRateFailMs_ = 1e9, sincePlacedMs_ = 1e9;
+        double winNudgedM_ = 0, winTravelM_ = 0, winMs_ = 0;   // the nudge-share window
+        LocoLevel level_ = LocoLevel::Full;
+        double healthyMs_ = 0;               // moving frames without a stall / stuck event (ends a failure streak)
+        LocoLevelWhy pendingWhy_ = LocoLevelWhy::None;
+        // exponentially weighted regression of (own speed / gait nominal) on the applied move rate: slope ~ the learned scale
+        // when the native scales the stride, ~ 0 when it is ignored (only a decision when the rate has varied)
+        double rpW_ = 0, rpX_ = 0, rpY_ = 0, rpXX_ = 0, rpXY_ = 0;
+        double rateIneffMs_ = 0;
+        LocoVec vfPrev_; bool haveVfPrev_ = false; double accLp_ = 0;   // the pose's low-passed acceleration (m/s^2)
+        int stallEvents_ = 0; double sinceStallEventMs_ = 1e9;           // straight-task stalls in a row (Placed from the second)
+        int failSnaps_ = 0; double sinceFailSnapMs_ = 1e9; bool snapStorm_ = false;
+
         bool ragdollActive_ = false;
         bool haveJumpSeq_ = false;
         int32_t lastJumpSeq_ = 0;
@@ -544,6 +642,13 @@ namespace gage::sync {
         bool havePedVel = false;
         bool anchorMode = false;
         LocoVec anchor;              // LocoOutput::anchorPos, valid while anchorMode
+        // T2
+        bool nudged = false;         // LocoOutput::nudge
+        LocoVec nudge;               // LocoOutput::nudgeDelta (metres this frame)
+        bool rateSet = false;        // LocoOutput::setMoveRate
+        float rate = 1.0f;           // LocoOutput::moveRate
+        bool rateClamped = false;    // LocoOutput::rateClamped
+        float selfSpeed = -1.0f;     // LocomotionController::SelfSpeed() (the ped's own speed, m/s)
     };
 
     struct LocoDiagSummary
@@ -556,6 +661,12 @@ namespace gage::sync {
         double derivedSpeedMs = 0, poseSpeedMs = 0;
         double meanAnchorM = 0, maxAnchorM = 0;    // ped -> anchor distance (anchor mode frames only)
         uint32_t anchorFrames = 0;
+        // T2: nudges (m/s of the position written), the move rate applied (min / mean / max, share of frames at a limit)
+        uint32_t nudgeFrames = 0;
+        double nudgedM = 0, meanNudgeMs = 0, maxNudgeMs = 0;
+        uint32_t rateFrames = 0;
+        double rateMin = 0, rateMean = 0, rateMax = 0, rateClampFrac = 0;
+        double selfSpeedMs = 0;                    // mean own speed over the moving frames (net of nudges)
     };
 
     class LocoDiag
@@ -570,11 +681,33 @@ namespace gage::sync {
         double errSum_ = 0, errMax_ = 0, pushSum_ = 0, pushMax_ = 0;
         double pushDist_ = 0, totalDist_ = 0, idleSlide_ = 0;
         double derivedSum_ = 0, poseSum_ = 0, anchorSum_ = 0, anchorMax_ = 0;
+        uint32_t nudgeFrames_ = 0, rateFrames_ = 0, rateClamped_ = 0, selfN_ = 0;
+        double nudgeDist_ = 0, nudgeSpeedSum_ = 0, nudgeSpeedMax_ = 0, rateSum_ = 0, rateMin_ = 0, rateMax_ = 0, selfSum_ = 0;
         bool havePrev_ = false;
         LocoVec prevPed_;
         double prevNowMs_ = 0;
         double stuckMs_ = 0;
         bool stuckCounted_ = false;
+    };
+
+    // T2: the game is one game for every puppet. A failure two DIFFERENT puppets' controllers report within witnessMs (the anchor
+    // task that does not carry the ped, the move rate that does not scale the stride) is machine-wide: it is imposed on every
+    // puppet (LocomotionController::Degrade) for imposeMs, so the next puppet does not spend its own seconds finding out. One
+    // puppet alone (stuck in geometry, a bad spawn) never degrades the others. Pure; the engine owns one instance.
+    class LevelWitness
+    {
+    public:
+        // true when this report turned the finding machine-wide
+        bool Report(LocoLevelWhy why, int id, double nowMs);
+        // ms left of an imposed level (Straight or NoRate), 0 = none
+        double ActiveMs(LocoLevel level, double nowMs) const;
+        void Reset() { *this = LevelWitness(); }
+        uint32_t Globals() const { return globals_; }
+        static constexpr double kWitnessMs = 60000.0, kImposeStraightMs = 45000.0, kImposeNoRateMs = 120000.0;
+    private:
+        struct Slot { bool have = false; int id = -1; double atMs = 0, untilMs = 0; };
+        Slot slot_[2];   // 0 = anchor failures (-> Straight), 1 = rate ineffective (-> NoRate)
+        uint32_t globals_ = 0;
     };
 
     // When a remote ped's aim task (TASK_AIM_GUN_AT_COORD / TASK_GO_TO_COORD_WHILE_AIMING_AT_COORD)

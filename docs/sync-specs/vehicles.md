@@ -107,3 +107,39 @@ What it found wrong, and the change:
 Diagnostics added (10 s, `engine: vehicle drive (D)` and `engine: occupants (D)`): position / heading / sideways error mean and max against the sender's sample at the instant it claims, drive frames by interpolator mode (interpolating / extrapolating / holding / buffering), snaps, persistent and under-floor snaps, blends, graces; door walks followed vs tasked, a warped puppet found out of its seat (another seat / another car / outside / unknown), exits by flag (0 / 4160 / the flag-16 fallback / pops), controller hand-overs kept vs snapped.
 
 Not changed, reported: the present-time lead (W9) trades a constant 110 ms lag for a prediction error that peaks at the onset of a manoeuvre (hairpin: up to 1 m / 17 degrees, versus 0.2 m / 6 degrees without it, but then about 1.3 m behind the sender at 12 m/s).
+
+<!-- ===== T3 (Desync Overhaul round 2): vehicle visual state, protocol v6. Append-only. Wire and server rules: docs/api/protocol.md section 16. ===== -->
+
+## T3. Vehicle visual state for the other clients (burst tyres, windows, brake lights, steering, wheel spin)
+
+Live symptom (GI, 0.4.6): "Wheel pop (burst tyre) is only seen by the player who popped it. Wheel spin and the driver's steering are only seen by the driver."
+
+First-hand facts (code at 4e2ef63): no message carried a tyre or window; no tyre / window / wheel native existed in `hook.h`; a vehicle `Hit` only lowered
+body and engine health (and the engine never even sent one); the steering estimate was sent (`VehicleUpdate.steer`) and applied (`SET_VEHICLE_STEER_BIAS`, every
+frame) but is held below 1 m/s, so a standing car showed no wheel turn, and its input (`GET_ENTITY_ROTATION_VELOCITY`) has an unverified unit and frame.
+
+What T3 does (all items need protocol v6; the natives are `UNRESOLVED: lookup needed`, see below):
+1. Per-wheel burst state (`tyres`) and off-the-rim state (`tyresRim`), 8 slots, bikes included (slots 0 and 4), and smashed windows (`windows`): three bytes in
+   `VehicleUpdate` and in the full `VehicleWorld` entry. The controller reports its own car; the shooter's client reports a pop it made on a copy as a vehicle
+   `Hit` whose `bone` is a part code; the server merges (report + Hits, ack and a 3 s drop for a bit the controller never shows); the controller applies a bit
+   somebody else added (once, on its rising edge); every copy applies the mask level-wise. First sight, stream-in and hand-over all start from the full entry.
+2. Steering: the sender's yaw rate comes from successive rotations (unit-safe); when the local player drives the car, its steering axis (INPUT_VEH_MOVE_LR) is the
+   value below 1 m/s, so a standing car shows turned wheels. A running tally (min / mean / max, source, agreement of axis and estimate above 3 m/s, ratio of the
+   native yaw rate to the rotation-derived one) is in the 10 s line, so the first live run shows a wrong control id, sign or unit.
+3. Wheel spin / brake: nothing carries spin itself. The copy's wheels roll because its body gets real velocity; what could stop that is a brake the game applies to a
+   task-less car, so the copy's handbrake is released at first sight and mirrored afterwards, and the brake lights follow the controller's pedals (flags2 bits 6, 7).
+   A burnout or a locked wheel at speed would need wheel-speed / wheel-rotation natives that do not exist in hook.h: not carried.
+4. Not cheap, not done: body deformation (a per-vertex map), broken-off doors, broken lights, dirt.
+
+The pure logic is `libs/sync/vehicle_visual.h` (VisualSync, ChooseSteer, ClassifyBrake, YawRateFromRotations, the StepVisual / ReadVisual / ExecuteVisual templates the
+engine and the test both run); the wire and merge are tested in `tests/t3_vehvisual_test.cpp`, including the real server over ENet.
+
+Natives (hook.h, hash 0 = UNRESOLVED): IS_VEHICLE_TYRE_BURST, SET_VEHICLE_TYRE_BURST, SET_VEHICLE_TYRE_FIXED, IS_VEHICLE_WINDOW_INTACT, SMASH_VEHICLE_WINDOW,
+FIX_VEHICLE_WINDOW, GET_CONTROL_NORMAL, SET_VEHICLE_HANDBRAKE, SET_VEHICLE_BRAKE_LIGHTS. Until GI adds a hash, the wrapper returns false and logs once, and the
+feature that needs it stays off with no other effect (proven in the test with a car whose natives all fail).
+
+## T4: vehicle collisions (2026-11-03)
+
+Server-arbitrated contact resolution (`VehicleImpact`, message 40), adoption of a hit copy's own response, the empty-car claim and the speed-cap clamp: docs/sync-specs/vehicle-collisions.md
+(design, the two-machine simulation numbers, diagnostics, GI's live test). It supersedes the "Not fixed" notes of Sync B above for parked / empty cars (claimed by the rammer) and for the two screens'
+different contact (one resolution per contact); the contact grace stays as the fallback (`impact_sync=0`, or a contact adoption refused).

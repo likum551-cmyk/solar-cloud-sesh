@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -239,8 +240,11 @@ static std::vector<Case> Corpus()
         a.ageMs = 20;
         a.ctrl = 4;
         a.ownerId = 4;
-        a.flags2 = kVeh2Headlights;
+        a.flags2 = kVeh2Headlights | kVeh2Brake;
         a.doors = kDoorHood;
+        a.tyres = 0x35;        // v6: slots 0, 2, 4, 5 burst
+        a.tyresRim = 0x14;     // ... 2 and 4 off the rim
+        a.windows = 0xA1;
         VehicleState b = a;
         b.id = 5;
         b.motionOnly = true;
@@ -281,8 +285,11 @@ static std::vector<Case> Corpus()
         m.bodyHealth = 1000;
         m.engineHealth = 1000;
         m.sampleMs = 12345;
-        m.flags2 = kVeh2IndicatorL;
+        m.flags2 = kVeh2IndicatorL | kVeh2Handbrake;
         m.doors = kDoorTrunk;
+        m.tyres = 0x0E;        // v6
+        m.tyresRim = 0x06;
+        m.windows = 0x11;
         v.push_back(Make("VehicleUpdate", m));
     }
     { VehicleResult m; m.op = VehicleOp::Enter; m.code = VehicleResultCode::SeatTaken; m.vehId = 6; v.push_back(Make("VehicleResult", m)); }
@@ -309,6 +316,20 @@ static std::vector<Case> Corpus()
     { PeerAnim m; m.id = 4; m.anim = SampleAnim(); v.push_back(Make("PeerAnim", m)); }
     { PeerScenario m; m.id = 4; m.name = "WORLD_HUMAN_SMOKING"; v.push_back(Make("PeerScenario", m)); }
     { PeerAnimStop m; m.id = 4; v.push_back(Make("PeerAnimStop", m)); }
+    // T1 seats (wire v6): one case per SeatNotice kind (each kind has its own detail rule: Reserved bit 0 only, Cancelled a reason, the
+    // others 0), and the two new VehicleCmd ops (their arg is validated by the server, not the codec).
+    { SeatNotice m; m.kind = SeatNoticeKind::Reserved; m.player = 7; m.vehId = 12; m.seat = 3; m.detail = kSeatNoticeRun; v.push_back(Make("SeatNotice reserved", m)); }
+    { SeatNotice m; m.kind = SeatNoticeKind::Seated; m.player = 7; m.vehId = 12; m.seat = 3; v.push_back(Make("SeatNotice seated", m)); }
+    { SeatNotice m; m.kind = SeatNoticeKind::Cancelled; m.player = 7; m.vehId = 12; m.seat = 3; m.detail = (uint8_t)SeatCancelReason::Expired; v.push_back(Make("SeatNotice cancelled", m)); }
+    { SeatNotice m; m.kind = SeatNoticeKind::Exited; m.player = 7; m.vehId = 12; m.seat = 3; v.push_back(Make("SeatNotice exited", m)); }
+    { VehicleCmd m; m.vehId = 12; m.op = VehicleOp::EnterIntent; m.arg = 3u | kIntentRun; v.push_back(Make("VehicleCmd enter intent", m)); }
+    { VehicleCmd m; m.vehId = 12; m.op = VehicleOp::CancelIntent; v.push_back(Make("VehicleCmd cancel intent", m)); }
+    {   // T4: the server's resolution of a vehicle contact, for one controller
+        VehicleImpact m;
+        m.seq = 4242; m.vehId = 3; m.otherId = 17; m.sampleMs = 54321;
+        m.dvx = -12.5f; m.dvy = 24.5f; m.dyaw = -2.25f; m.nx = 0.5f; m.ny = -0.75f; m.closing = 38.5f; m.depth = 0.31f;
+        v.push_back(Make("VehicleImpact", m));
+    }
     for (Case& c : v)
         if (c.name == "VehicleWorld" || c.name == "VehicleUpdate" || c.name == "VehicleCmd register") c.lossy = true;
     return v;
@@ -525,6 +546,27 @@ static void HostileCounts()
         }
         Check("PeekType accepts exactly the " + std::to_string((int)kMsgLast) + " defined type bytes", accepted == (int)kMsgLast, std::to_string(accepted));
     }
+    {   // T4 VehicleImpact: what the encoder never writes is refused (an i8 normal of -128, an i16 of -32768, a vehicle id at kMaxVehicles); the encoder
+        // refuses a non-finite value or such an id and saturates an absurd change at the wire's range
+        VehicleImpact m;
+        m.vehId = 3; m.otherId = 17; m.dvx = 1.0f;
+        const Bytes good = Encode(m);
+        Bytes nx = good, id = good, dv = good, oid = good;
+        nx[17] = 0x80;                 // nx
+        dv[11] = 0x00; dv[12] = 0x80;  // dvx = -32768
+        id[5] = 0x00; id[6] = 0x01;    // vehId 256
+        oid[7] = 0x00; oid[8] = 0x01;  // otherId 256
+        VehicleImpact out, nan = m, far = m, big = m;
+        nan.dvy = std::numeric_limits<float>::quiet_NaN();
+        far.otherId = (uint16_t)kMaxVehicles;
+        big.dvx = 1.0e6f;
+        const Bytes bb = Encode(big);
+        VehicleImpact back;
+        const bool sat = !bb.empty() && Decode(bb.data(), bb.size(), back) && back.dvx > 511.0f && back.dvx < 512.0f;
+        Check("hostile: VehicleImpact refuses an i8 of -128, an i16 of -32768 and a vehicle id of 256; Encode refuses NaN and an id of 256 and saturates 1e6 m/s at the wire's +-512",
+              good.size() == kVehicleImpactBytes && Decode(good.data(), good.size(), out) && !Decode(nx.data(), nx.size(), out) && !Decode(dv.data(), dv.size(), out) &&
+                  !Decode(id.data(), id.size(), out) && !Decode(oid.data(), oid.size(), out) && Encode(nan).empty() && Encode(far).empty() && sat);
+    }
 }
 
 // The UDP query datagrams (query.h): exactly 24 bytes, every single-bit flip, every other length.
@@ -708,7 +750,7 @@ int main()
     QueryFuzz();
     ValidatorFuzz();
     // per case: valid + prefix + trailing + bit flips + random = 5 checks; 11 hostile-count checks; 5 query checks; 1 validator check.
-    const size_t expected = corpus.size() * 5 + 11 + 5 + 1;
+    const size_t expected = corpus.size() * 5 + 11 + 5 + 1 + 1;
     std::printf("\n%d checks, %d failed (%zu message cases)\n", g_run, g_failed, corpus.size());
     if (g_run != (int)expected)
     {
