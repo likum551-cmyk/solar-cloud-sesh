@@ -454,6 +454,53 @@ namespace gage::game {
         constexpr uint64_t GET_CONTROL_NORMAL                          = 0xEC3C9B8D5327B563;
         constexpr uint64_t SET_VEHICLE_HANDBRAKE                       = 0x684785568EF26A22;
         constexpr uint64_t SET_VEHICLE_BRAKE_LIGHTS                    = 0x92B35082E0B42F66;
+        // Desync round 3 (0.4.8 work): natives confirmed by two independent crossmaps (public hash here, 3889 hash in kCrossmap3889).
+        //   SET_PED_MAX_HEALTH  PED void(Ped, int)
+        //   SET_PLAYER_MAX_ARMOUR  PLAYER void(Player, int)
+        //   GET_VEHICLE_PETROL_TANK_HEALTH  VEHICLE float(Vehicle)
+        //   SET_VEHICLE_PETROL_TANK_HEALTH  VEHICLE void(Vehicle, float)
+        //   SET_VEHICLE_DAMAGE  VEHICLE void(Vehicle, float x, float y, float z, float damage, float radius, BOOL focusOnModel)
+        //   GET_VEHICLE_DEFORMATION_AT_POS  VEHICLE Vector3(Vehicle, float x, float y, float z)
+        //   IS_VEHICLE_DOOR_DAMAGED  VEHICLE BOOL(Vehicle, int door)
+        //   SET_VEHICLE_DOOR_BROKEN  VEHICLE void(Vehicle, int door, BOOL deleteDoor)
+        //   SET_VEHICLE_DOOR_CONTROL  VEHICLE void(Vehicle, int door, int speed, float angle)
+        //   IS_VEHICLE_DOOR_FULLY_OPEN  VEHICLE BOOL(Vehicle, int door)
+        //   GET_IS_DOOR_VALID  VEHICLE BOOL(Vehicle, int door)
+        //   GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED  VEHICLE BOOL(Vehicle)
+        //   GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED  VEHICLE BOOL(Vehicle)
+        //   SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED  VEHICLE void(Vehicle, BOOL)
+        //   SET_VEHICLE_ENGINE_CAN_DEGRADE  VEHICLE void(Vehicle, BOOL)
+        //   SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE  VEHICLE void(Vehicle, BOOL)
+        //   IS_PED_GOING_INTO_COVER  PED BOOL(Ped)
+        //   TASK_STAY_IN_COVER  TASK void(Ped)
+        //   IS_PED_AIMING_FROM_COVER  PED BOOL(Ped)
+        //   TASK_COMBAT_PED  TASK void(Ped, Ped target, int combatFlags, int threatResponseFlags)
+        //   IS_PED_IN_MELEE_COMBAT  PED BOOL(Ped)
+        //   TASK_PUT_PED_DIRECTLY_INTO_MELEE  TASK void(Ped, Ped target, float blendIn, float timeInMelee, float strafePhaseSync, int aiCombatFlags)
+        //   SET_PED_COMBAT_ATTRIBUTES  PED void(Ped, int attributeId, BOOL enabled)
+        constexpr uint64_t SET_PED_MAX_HEALTH                           = 0xF5F6378C4F3419D3;
+        constexpr uint64_t SET_PLAYER_MAX_ARMOUR                        = 0x77DFCCF5948B8C71;
+        constexpr uint64_t GET_VEHICLE_PETROL_TANK_HEALTH               = 0x7D5DABE888D2D074;
+        constexpr uint64_t SET_VEHICLE_PETROL_TANK_HEALTH               = 0x70DB57649FA8D0D8;
+        constexpr uint64_t SET_VEHICLE_DAMAGE                           = 0xA1DD317EA8FD4F29;
+        constexpr uint64_t GET_VEHICLE_DEFORMATION_AT_POS               = 0x4EC6CFBC7B2E9536;
+        constexpr uint64_t IS_VEHICLE_DOOR_DAMAGED                      = 0xB8E181E559464527;
+        constexpr uint64_t SET_VEHICLE_DOOR_BROKEN                      = 0xD4D4F6A4AB575A33;
+        constexpr uint64_t SET_VEHICLE_DOOR_CONTROL                     = 0xF2BFA0430F0A0FCB;
+        constexpr uint64_t IS_VEHICLE_DOOR_FULLY_OPEN                   = 0x3E933CFF7B111C22;
+        constexpr uint64_t GET_IS_DOOR_VALID                            = 0x645F4B6E8499F632;
+        constexpr uint64_t GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED        = 0x5EF77C9ADD3B11A3;
+        constexpr uint64_t GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED       = 0xA7ECB73355EB2F20;
+        constexpr uint64_t SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED           = 0x4C7028F78FFD3681;
+        constexpr uint64_t SET_VEHICLE_ENGINE_CAN_DEGRADE               = 0x983765856F2564F9;
+        constexpr uint64_t SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE       = 0x37C8252A7C92D017;
+        constexpr uint64_t IS_PED_GOING_INTO_COVER                      = 0x9F65DBC537E59AD5;
+        constexpr uint64_t TASK_STAY_IN_COVER                           = 0xE5DA8615A6180789;
+        constexpr uint64_t IS_PED_AIMING_FROM_COVER                     = 0x3998B1276A3300E5;
+        constexpr uint64_t TASK_COMBAT_PED                              = 0xF166E48407BAC484;
+        constexpr uint64_t IS_PED_IN_MELEE_COMBAT                       = 0x4E209B2C1EAD5159;
+        constexpr uint64_t TASK_PUT_PED_DIRECTLY_INTO_MELEE             = 0x1C6CD14A876FFE39;
+        constexpr uint64_t SET_PED_COMBAT_ATTRIBUTES                    = 0x9F7794730795E019;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
