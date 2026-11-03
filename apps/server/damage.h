@@ -44,6 +44,7 @@ namespace gage::server {
     {
         uint16_t damage = 0;
         bool headshot = false;
+        bool floored = false;   // the scaled value rounded to under 1 and the 1-point floor was applied instead (0.4.5 diagnostics)
     };
 
     // A weapon class that can score a headshot: every firearm (and a weapon not in the table, which is treated
@@ -96,6 +97,7 @@ namespace gage::server {
         // Never 0 for a Hit that carried damage; the largest result is kMaxHitDamage (250) x 1000 percent x 1000
         // percent = 25000, inside a u16, and the min below keeps it so whatever the caller passes.
         const double rounded = std::floor(scaled + 0.5);
+        out.floored = claimed > 0 && rounded < 1.0;
         out.damage = (uint16_t)std::min<double>(std::max<double>(rounded, claimed > 0 ? 1.0 : 0.0), 65535.0);
         return out;
     }

@@ -241,6 +241,17 @@ namespace gage::server::ac {
     // ---- constants of the hit rules ------------------------------------------------------------------
 
     constexpr uint32_t kShotWindowMs = 500;      // default Config::hitShotWindowMs: a Hit's shot was received this recently
+    // A MELEE Hit lands when the blow does, not when the swing starts: the client counts the swing at the button press (shotSeq
+    // step) and reports the damage event up to its 900 ms swing window later (sync::kMeleeHitWindowMs), then holds it 50 ms in
+    // its batcher, and the Hit and the state that carries the swing travel on two channels. With the 500 ms hitShotWindowMs a
+    // blow that landed more than about 450 ms after the press (a heavy swing, a bat's wind-up, a laggy link) was refused as "no
+    // shot with that shotSeq", with no feedback to anybody (0.4.5 melee audit). A melee Hit may name a swing this recent; the
+    // operator's window still applies when it is larger, and 0 (shot binding off) stays off.
+    constexpr uint32_t kMeleeShotWindowMs = 1500;
+    inline uint32_t ShotWindowFor(WeaponKind k, uint32_t cfgWindowMs)
+    {
+        return (cfgWindowMs != 0 && k == WeaponKind::Melee && cfgWindowMs < kMeleeShotWindowMs) ? kMeleeShotWindowMs : cfgWindowMs;
+    }
     constexpr uint64_t kShotDeferMs = 300;       // a Hit whose shot (or weapon) has not arrived yet waits this long for it
     constexpr size_t   kMaxDeferredHits = 4;     // per player
     constexpr uint64_t kWeaponHeldMs = 500;      // the claimed weapon was reported in a state this recently
