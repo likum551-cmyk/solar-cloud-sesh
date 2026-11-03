@@ -48,7 +48,7 @@ crash_diag_test       | soft   |  120 |        | MiniDumpWriteDump from a vector
 crash_filter_test     | soft   |  120 |        | vectored exception handler behaviour; wine's exception dispatch is close but not identical
 launch_shim_test      | soft   |  120 |        | IAT hook on CreateProcessW that spawns cmd.exe (exit 42); needs wine's cmd.exe
 serverquery_test      | soft   |  120 |        | the launcher's UDP server query over winsock loopback
-netcode_test          | soft   |  300 |        | protocol v4 + server over real ENet on loopback with the WINDOWS build of ENet/winsock (the client's network path); about 12 s native. The native Linux copy is the gate in deploy-server.sh
+netcode_test          | soft   |  900 |        | protocol v4 + server over real ENet on loopback with the WINDOWS build of ENet/winsock (the client's network path); about 5 min native since 0.4.7 (the T6 health network scenarios run 7-17 s each in real time; was about 12 s). The native Linux copy is the gate in deploy-server.sh
 server_test           | soft   |  300 |        | UDP query, master announce, bans, admin channel; about 16 s native. Same: the native copy gates the server deploy
 t3_vehvisual_test     | soft   |  120 |        | vehicle visual state (tyres, windows, brake lights, steering): v6 wire bytes, VehicleStore merge, libs/sync/vehicle_visual.h against a fake car, then the real server over loopback ENet (winsock threads); about 8 s; soft until it has passed twice on the VPS (then gate)
 join_test             | soft   |  300 |        | the engine's session adapter against an in-process server on loopback (winsock threads)

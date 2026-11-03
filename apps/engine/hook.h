@@ -171,21 +171,21 @@ namespace gage::game {
         constexpr uint64_t CLEAR_AREA_OF_PEDS                               = 0xBE31FD6CE464AC59;
         constexpr uint64_t CLEAR_AREA_OF_COPS                               = 0x04F8FC8FCF58F88D;
         constexpr uint64_t REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA          = 0x46A1E1A299EC4BBA;
-        // T5 ambient: natives whose hash nobody has looked up yet. 0 = UNRESOLVED: every World:: wrapper that
-        // uses one is inert (returns false / -1, logs once, counts "inert") until the public hash is put here and
-        // its 3889 hash is added to kCrossmap3889 + logNewNativeResolution (hook.cpp). Never fill one in from memory.
+        // T5 ambient sweep natives, resolved for 0.4.7 (public hash = alloc8or native DB; 3889 hash = kCrossmap3889 row, found by
+        // the lookup tool and confirmed by two crossmaps). The wrappers still treat a 0 constant as UNRESOLVED (inert, logged once),
+        // so a native that ever has to be pulled again is switched off by setting it back to 0. Never fill one in from memory.
         //   SET_PED_POPULATION_BUDGET(int budget)                             0 = no ambient peds, persistent
         //   SET_VEHICLE_POPULATION_BUDGET(int budget)                         0 = no ambient vehicles, persistent
         //   SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA(float x1, y1, z1, x2, y2, z2, BOOL toggle, BOOL p7)
         //   DELETE_ALL_TRAINS()                                               trains that already exist
         //   GET_PED_NEARBY_PEDS(Ped ped, int* sizeAndPeds, int ignore)        returns the count; slot 0 = capacity in
         //   GET_PED_NEARBY_VEHICLES(Ped ped, int* sizeAndVehs)                returns the count; slot 0 = capacity in
-        constexpr uint64_t SET_PED_POPULATION_BUDGET                        = 0;  // UNRESOLVED: lookup needed
-        constexpr uint64_t SET_VEHICLE_POPULATION_BUDGET                    = 0;  // UNRESOLVED: lookup needed
-        constexpr uint64_t SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA        = 0;  // UNRESOLVED: lookup needed
-        constexpr uint64_t DELETE_ALL_TRAINS                                = 0;  // UNRESOLVED: lookup needed
-        constexpr uint64_t GET_PED_NEARBY_PEDS                              = 0;  // UNRESOLVED: lookup needed
-        constexpr uint64_t GET_PED_NEARBY_VEHICLES                          = 0;  // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_PED_POPULATION_BUDGET                        = 0x8C95333CFC3340F3;
+        constexpr uint64_t SET_VEHICLE_POPULATION_BUDGET                    = 0xCB9E1EB3BE2AF4E9;
+        constexpr uint64_t SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA        = 0xC12321827687FE4D;
+        constexpr uint64_t DELETE_ALL_TRAINS                                = 0x736A718577F39C7D;
+        constexpr uint64_t GET_PED_NEARBY_PEDS                              = 0x23F8F5FC7E8C4A6B;
+        constexpr uint64_t GET_PED_NEARBY_VEHICLES                          = 0xCFF869CBFA210D82;
 
         // join readiness gate (loading screen, fade, player switch, control) and model verify
         constexpr uint64_t GET_IS_LOADING_SCREEN_ACTIVE                     = 0x10D0A8F259E93EC9;
@@ -432,11 +432,10 @@ namespace gage::game {
         constexpr uint64_t GET_FINAL_RENDERED_CAM_COORD                = 0xA200EB1EE790F448;
         constexpr uint64_t HAS_ENTITY_CLEAR_LOS_TO_ENTITY              = 0xFCDFF7B72D23A1AC;
         constexpr uint64_t GET_PED_BONE_COORDS                         = 0x17C07FC640E86B4E;
-        // Desync overhaul round 2 / T3 (vehicle visual state, protocol v6). UNRESOLVED: lookup needed. The hashes are 0 on purpose:
-        // never guess one. A World:: wrapper whose constant is 0 returns false without calling anything (and logs once), the
-        // sync code around it (libs/sync/vehicle_visual.h) treats that as "no information / could not do it". To switch a
-        // native on, GI looks it up on the PC (public hash = the constant here, the 3889 hash = a kCrossmap3889 row in hook.cpp
-        // beside the commented placeholder, plus its GAGE_NEW_NATIVE line is already there); nothing else changes.
+        // Desync overhaul round 2 / T3 (vehicle visual state, protocol v6). Resolved for 0.4.7: public hash = the constant here,
+        // 3889 hash = the kCrossmap3889 row in hook.cpp. A World:: wrapper whose constant is 0 still returns false without
+        // calling anything (and logs once), and the sync code around it (libs/sync/vehicle_visual.h) treats that as "no
+        // information / could not do it", so setting one back to 0 switches that native off. Never guess a hash.
         //   IS_VEHICLE_TYRE_BURST       VEHICLE  BOOL (Vehicle, int wheelId, BOOL completely)
         //   SET_VEHICLE_TYRE_BURST      VEHICLE  void (Vehicle, int wheelId, BOOL onRim, float damage)
         //   SET_VEHICLE_TYRE_FIXED      VEHICLE  void (Vehicle, int wheelId)
@@ -446,15 +445,15 @@ namespace gage::game {
         //   GET_CONTROL_NORMAL          PAD      float (int inputGroup, int control)
         //   SET_VEHICLE_HANDBRAKE       VEHICLE  void (Vehicle, BOOL toggle)
         //   SET_VEHICLE_BRAKE_LIGHTS    VEHICLE  void (Vehicle, BOOL toggle)
-        constexpr uint64_t IS_VEHICLE_TYRE_BURST                       = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t SET_VEHICLE_TYRE_BURST                      = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t SET_VEHICLE_TYRE_FIXED                      = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t IS_VEHICLE_WINDOW_INTACT                    = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t SMASH_VEHICLE_WINDOW                        = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t FIX_VEHICLE_WINDOW                          = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t GET_CONTROL_NORMAL                          = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t SET_VEHICLE_HANDBRAKE                       = 0;   // UNRESOLVED: lookup needed
-        constexpr uint64_t SET_VEHICLE_BRAKE_LIGHTS                    = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t IS_VEHICLE_TYRE_BURST                       = 0xBA291848A0815CA9;
+        constexpr uint64_t SET_VEHICLE_TYRE_BURST                      = 0xEC6A202EE4960385;
+        constexpr uint64_t SET_VEHICLE_TYRE_FIXED                      = 0x6E13FC662B882D1D;
+        constexpr uint64_t IS_VEHICLE_WINDOW_INTACT                    = 0x46E571A0E20D01F1;
+        constexpr uint64_t SMASH_VEHICLE_WINDOW                        = 0x9E5B5E4D2CCD2259;
+        constexpr uint64_t FIX_VEHICLE_WINDOW                          = 0x772282EBEB95E682;
+        constexpr uint64_t GET_CONTROL_NORMAL                          = 0xEC3C9B8D5327B563;
+        constexpr uint64_t SET_VEHICLE_HANDBRAKE                       = 0x684785568EF26A22;
+        constexpr uint64_t SET_VEHICLE_BRAKE_LIGHTS                    = 0x92B35082E0B42F66;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).

@@ -264,7 +264,7 @@ CMAKE_SRC=$GAGE_SRC/apps/server     # the standalone entry point: independent of
 if [ "$DRY_RUN" = 1 ]; then
   log "dry-run plan for release $STAMP (nothing is built or changed):"
   log "  1 cmake -S $CMAKE_SRC -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release ; cmake --build $BUILD --target gage-server netcode_test server_test --parallel $JOBS"
-  log "  2 run by name in a scratch dir: $BUILD/selftest/netcode_test, $BUILD/selftest/server_test (timeout 300 s each)"
+  log "  2 run by name in a scratch dir: $BUILD/selftest/netcode_test, $BUILD/selftest/server_test (timeout 900 s each)"
   log "  3 canary: the new binary with $CONF (sanitized: no admin, no master, memory-only bans) on a spare UDP port for 5 s"
   log "  4 install -m 755 gage-server -> $NEW_REL/ ; BUILD-INFO with sha256 and a source fingerprint"
   if [ -f "$CONF" ]; then log "  server.json: $CONF (game port $(game_port))"
@@ -290,9 +290,9 @@ SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/gage-deploy-server.XXXXXX")
 defer "rm -rf -- $(printf '%q' "$SCRATCH")"
 tests_run=0
 for t in netcode_test server_test; do
-  log "running $t (timeout 300 s)"
+  log "running $t (timeout 900 s)"
   set +e
-  ( cd "$SCRATCH" && timeout -k 10 300 "$BUILD/selftest/$t" ) < /dev/null > "$LOGDIR/$STAMP-$t.log" 2>&1
+  ( cd "$SCRATCH" && timeout -k 10 900 "$BUILD/selftest/$t" ) < /dev/null > "$LOGDIR/$STAMP-$t.log" 2>&1
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then

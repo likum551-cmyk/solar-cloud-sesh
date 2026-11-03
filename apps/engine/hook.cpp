@@ -656,9 +656,7 @@ const HashMapping kCrossmap3889[] = {
     {native::CLEAR_AREA_OF_PEDS,                               0x55F7AC4B2B875901},
     {native::CLEAR_AREA_OF_COPS,                               0x8B0110C1F1D9D177},
     {native::REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA,          0xC4BCE90F7242F354},
-    // T5 ambient, awaiting hashes (hook.h constants are 0): add one row per native here when the public hash is filled in:
-    //   SET_PED_POPULATION_BUDGET, SET_VEHICLE_POPULATION_BUDGET, SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA,
-    //   DELETE_ALL_TRAINS, GET_PED_NEARBY_PEDS, GET_PED_NEARBY_VEHICLES.
+    // T5 ambient sweep natives (population budgets, generators, trains, nearby peds/vehicles): rows are further down, under 0.4.7.
     // join readiness gate + model verify.
     {native::GET_IS_LOADING_SCREEN_ACTIVE,                     0xDCE42B3C644D1A4E},
     {native::IS_SCREEN_FADED_IN,                               0x9390801B06EE998F},
@@ -872,11 +870,23 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_FINAL_RENDERED_CAM_COORD,                0x02AF3EA0F67D2329},
     {native::HAS_ENTITY_CLEAR_LOS_TO_ENTITY,              0xAD915B5E38F323E5},
     {native::GET_PED_BONE_COORDS,                         0x83FDC027F0BEA202},
-    // T3 (vehicle visual state): UNRESOLVED, lookup needed. When a native's constant in hook.h is set, add its row here (public
-    // constant, 3889 hash) in place of its placeholder below; a row with public hash 0 must never be active.
-    //   {native::IS_VEHICLE_TYRE_BURST,    0x...},   {native::SET_VEHICLE_TYRE_BURST,   0x...},   {native::SET_VEHICLE_TYRE_FIXED, 0x...},
-    //   {native::IS_VEHICLE_WINDOW_INTACT, 0x...},   {native::SMASH_VEHICLE_WINDOW,     0x...},   {native::FIX_VEHICLE_WINDOW,     0x...},
-    //   {native::GET_CONTROL_NORMAL,       0x...},   {native::SET_VEHICLE_HANDBRAKE,    0x...},   {native::SET_VEHICLE_BRAKE_LIGHTS, 0x...},
+    // 0.4.7 (desync round 2): T3 vehicle visual state + T5 ambient sweep. Public hashes from the alloc8or native DB; 3889 hashes from
+    // the YimMenu crossmap, each one confirmed by the YimMenuV2 enhanced crossmap (peddrive lookup tool: both AGREE for all 15).
+    {native::IS_VEHICLE_TYRE_BURST,                       0x548F6F43A7CB6F45},
+    {native::SET_VEHICLE_TYRE_BURST,                      0xE488FDAA43A181AE},
+    {native::SET_VEHICLE_TYRE_FIXED,                      0xF516E954BCB89C18},
+    {native::IS_VEHICLE_WINDOW_INTACT,                    0x01D37530E5C420F5},
+    {native::SMASH_VEHICLE_WINDOW,                        0x62DFD44586348C12},
+    {native::FIX_VEHICLE_WINDOW,                          0x3BFC7329EC766FED},
+    {native::GET_CONTROL_NORMAL,                          0xB504E1B50AA21FC5},
+    {native::SET_VEHICLE_HANDBRAKE,                       0xB2FD24D644A68449},
+    {native::SET_VEHICLE_BRAKE_LIGHTS,                    0xE456FB21FF21AE99},
+    {native::SET_PED_POPULATION_BUDGET,                   0xAD9B1C8FED6B4D96},
+    {native::SET_VEHICLE_POPULATION_BUDGET,               0x283C0970282AA5F3},
+    {native::SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA,   0xA63572E348CC4CFB},
+    {native::DELETE_ALL_TRAINS,                           0x47931C69C0D75B43},
+    {native::GET_PED_NEARBY_PEDS,                         0xAA3F0A9E20917995},
+    {native::GET_PED_NEARBY_VEHICLES,                     0xD65B4E942A960E26},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -5745,9 +5755,13 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(CLEAR_AREA_OF_PEDS),
         GAGE_NEW_NATIVE(CLEAR_AREA_OF_COPS),
         GAGE_NEW_NATIVE(REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA),
-        // T5 ambient: add GAGE_NEW_NATIVE(...) here for each of SET_PED_POPULATION_BUDGET, SET_VEHICLE_POPULATION_BUDGET,
-        // SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA, DELETE_ALL_TRAINS, GET_PED_NEARBY_PEDS, GET_PED_NEARBY_VEHICLES once
-        // their hook.h constant is non-zero (a 0 entry would only list itself as unresolved on every launch).
+        // T5 ambient sweep (0.4.7): the six that used to be hash-0 sentinels.
+        GAGE_NEW_NATIVE(SET_PED_POPULATION_BUDGET),
+        GAGE_NEW_NATIVE(SET_VEHICLE_POPULATION_BUDGET),
+        GAGE_NEW_NATIVE(SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA),
+        GAGE_NEW_NATIVE(DELETE_ALL_TRAINS),
+        GAGE_NEW_NATIVE(GET_PED_NEARBY_PEDS),
+        GAGE_NEW_NATIVE(GET_PED_NEARBY_VEHICLES),
         GAGE_NEW_NATIVE(GET_IS_LOADING_SCREEN_ACTIVE),
         GAGE_NEW_NATIVE(IS_SCREEN_FADED_IN),
         GAGE_NEW_NATIVE(IS_PLAYER_SWITCH_IN_PROGRESS),
@@ -5935,7 +5949,7 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_FINAL_RENDERED_CAM_COORD),
         GAGE_NEW_NATIVE(HAS_ENTITY_CLEAR_LOS_TO_ENTITY),
         GAGE_NEW_NATIVE(GET_PED_BONE_COORDS),
-        // T3: hash 0 = UNRESOLVED, lookup needed (skipped below, with one line each); resolves like the others once set.
+        // T3 vehicle visual state (0.4.7). A hash of 0 would be skipped below, with one line each.
         GAGE_NEW_NATIVE(IS_VEHICLE_TYRE_BURST),
         GAGE_NEW_NATIVE(SET_VEHICLE_TYRE_BURST),
         GAGE_NEW_NATIVE(SET_VEHICLE_TYRE_FIXED),
