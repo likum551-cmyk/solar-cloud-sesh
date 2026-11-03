@@ -497,6 +497,46 @@ namespace gage::proto {
         return w.take();
     }
 
+    namespace
+    {
+        int16_t SatI16(double v)
+        {
+            const double r = std::floor(v + 0.5);
+            return (int16_t)(r > 32767.0 ? 32767 : (r < -32767.0 ? -32767 : r));
+        }
+        int8_t SatI8Unit(double v)
+        {
+            const double r = std::floor(v * 127.0 + 0.5);
+            return (int8_t)(r > 127.0 ? 127 : (r < -127.0 ? -127 : r));
+        }
+        uint8_t SatU8(double v)
+        {
+            const double r = std::floor(v + 0.5);
+            return (uint8_t)(r > 255.0 ? 255 : (r < 0.0 ? 0 : r));
+        }
+    }
+
+    Bytes Encode(const VehicleImpact& m)
+    {
+        if (m.vehId >= kMaxVehicles || m.otherId >= kMaxVehicles || !Finite(m.dvx) || !Finite(m.dvy) || !Finite(m.dyaw) || !Finite(m.nx) ||
+            !Finite(m.ny) || !Finite(m.closing) || !Finite(m.depth))
+            return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::VehicleImpact);
+        w.u32(m.seq);
+        w.u16(m.vehId);
+        w.u16(m.otherId);
+        w.u16(m.sampleMs);
+        w.i16(SatI16((double)m.dvx * 64.0));
+        w.i16(SatI16((double)m.dvy * 64.0));
+        w.i16(SatI16((double)m.dyaw * 256.0));
+        w.u8((uint8_t)SatI8Unit(m.nx));
+        w.u8((uint8_t)SatI8Unit(m.ny));
+        w.u8(SatU8((double)m.closing * 4.0));
+        w.u8(SatU8((double)m.depth * 100.0));
+        return w.take();
+    }
+
     Bytes Encode(const Killed& m)
     {
         wire::Writer w;
@@ -901,6 +941,32 @@ namespace gage::proto {
         return true;
     }
 
+    bool Decode(const uint8_t* p, size_t n, VehicleImpact& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::VehicleImpact)) return false;
+        VehicleImpact m;
+        m.seq = r.u32();
+        m.vehId = r.u16();
+        m.otherId = r.u16();
+        m.sampleMs = r.u16();
+        const int16_t dvx = r.i16(), dvy = r.i16(), dyaw = r.i16();
+        const int8_t nx = (int8_t)r.u8(), ny = (int8_t)r.u8();
+        const uint8_t closing = r.u8(), depth = r.u8();
+        if (!r.done() || m.vehId >= kMaxVehicles || m.otherId >= kMaxVehicles || nx == -128 || ny == -128 || dvx == -32768 || dvy == -32768 ||
+            dyaw == -32768)
+            return false;
+        m.dvx = (float)dvx / 64.0f;
+        m.dvy = (float)dvy / 64.0f;
+        m.dyaw = (float)dyaw / 256.0f;
+        m.nx = (float)nx / 127.0f;
+        m.ny = (float)ny / 127.0f;
+        m.closing = (float)closing / 4.0f;
+        m.depth = (float)depth / 100.0f;
+        out = m;
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, Killed& out)
     {
         wire::Reader r(p, n);
@@ -1223,6 +1289,7 @@ namespace gage::proto {
         case Msg::PeerAnim:         return "PeerAnim";
         case Msg::PeerScenario:     return "PeerScenario";
         case Msg::PeerAnimStop:     return "PeerAnimStop";
+        case Msg::VehicleImpact:    return "VehicleImpact";
         }
         return "?";
     }

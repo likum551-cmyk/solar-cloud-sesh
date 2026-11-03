@@ -86,6 +86,7 @@
 #include "metrics.h"
 #include "protocol/protocol.h"
 #include "replication.h"
+#include "sync/vehicle_impact.h"
 #include "tickclock.h"
 #include "vehicles.h"
 
@@ -171,6 +172,8 @@ namespace gage::server {
         uint64_t vehicleUpdatesInvalid = 0;  // malformed, out of the box, over vehicleMaxSpeed
         uint64_t vehicleUpdatesStale = 0;    // seq not newer than the last accepted
         uint64_t vehicleFrames = 0;          // VehicleWorld packets sent
+        uint64_t vehicleImpacts = 0;         // T4: contacts between two controllers' vehicles the arbiter resolved
+        uint64_t vehicleImpactsSent = 0;     // ... VehicleImpact messages sent (one per controller)
         uint64_t hitsAccepted = 0;
         uint64_t hitsRejected = 0;           // failed validation (dead, unknown, range, relevance, rate, 0 damage)
         uint64_t kills = 0;
@@ -319,6 +322,9 @@ namespace gage::server {
         std::vector<proto::VehicleState> Vehicles() const;
         // Vehicle `id` (spawner, adopted, ...), or null. The pointer is valid until the next Poll().
         const VehicleStore::Vehicle* FindVehicle(uint16_t id) const { return vehicles_.Get(id); }
+        // T4: VehicleUpdates whose velocity was over vehicleMaxSpeed (but under twice it) and was clamped, and driverless vehicles a driver took the control of.
+        uint64_t VehicleSpeedClamps() const { return vehicles_.SpeedClamps(); }
+        uint64_t VehicleClaims() const { return vehicles_.Claims(); }
         // Console `heal`: full health (Config::playerHealth) for a live player; `kill`: health and
         // armour 0, dead, Killed (killer kServerId); `armor`: sets the armour. Each tells the player
         // with a Damage (attacker kServerId). False with *err for an unknown target or a dead one
@@ -423,6 +429,7 @@ namespace gage::server {
         void PushShown(Conn& c);
         proto::PedState Shown(const Conn& c) const;
         void BroadcastVehicles(uint64_t nowMs);
+        void BroadcastImpacts(uint64_t nowMs);   // T4
         void VehicleDestroyed(uint16_t id);
         void Accept(Conn& c, const std::string& name);
         void Refuse(Conn& c, proto::RefuseReason reason, const std::string& text);
@@ -455,6 +462,11 @@ namespace gage::server {
         Replicator repl_;
         VehicleStore vehicles_;
         std::vector<VehicleStore::ControlCandidate> controlCandidates_; // scratch of BroadcastVehicles (one allocation, reused)
+        sync::impact::ContactArbiter contact_;                           // T4: one resolution per contact between two controllers' vehicles
+        std::vector<sync::impact::ContactArbiter::Live> contactLive_;    // scratch
+        std::vector<sync::impact::ImpactOut> contactOut_;                // scratch
+        uint32_t impactSeq_ = 0;
+        uint64_t impactLogMs_ = 0, impactLogCount_ = 0, impactLogClaims_ = 0;
         uint32_t nextSpawnPoint_ = 0;
         Metrics metrics_;
         Metrics statsMark_;           // metrics_ as of the previous `stats` report

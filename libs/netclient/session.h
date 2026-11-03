@@ -94,6 +94,7 @@ namespace gage::net {
         {
             Welcome, Refused, PlayerJoined, PlayerLeft, World, Chat, Disconnected, Coarse, PeerLook,
             VehicleWorld, VehicleResult, Damage, Killed, RespawnOk, PeerAnim, PeerScenario, PeerAnimStop, // v4
+            VehicleImpact,   // T4 (v6)
         };
         Type type = Type::Disconnected;
 
@@ -124,6 +125,7 @@ namespace gage::net {
         proto::PeerAnim anim;               // player anim.id plays an animation
         proto::PeerScenario scenario;       // player scenario.id starts a scenario
         proto::PeerAnimStop animStop;       // player animStop.id stopped its animation / scenario
+        proto::VehicleImpact impact;        // T4: the server's resolution of a contact of a vehicle WE control (reliable, once per contact)
     };
 
     class ClientSession

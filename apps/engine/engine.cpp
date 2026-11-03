@@ -26,6 +26,7 @@
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
+#include "sync/vehicle_impact.h"
 #include "sync/vehicle_syncd.h"
 #include "sync/nametag.h"
 #include "sync/combat.h"
@@ -414,6 +415,10 @@ namespace {
         uint32_t contactKickMutesSeen = 0;   // drive stats at the last collision line
         float contactLastPosX = 0, contactLastPosY = 0, contactLastPosZ = 0;   // where the copy was this frame (the pair pass)
         bool contactPosValid = false;
+        // ---- T4 (vehicle collisions, libs/sync/vehicle_impact.h; script tick) ----
+        sync::impact::ImpactTracker impactTracker;   // a car we control: the velocity jumps the game's physics gave it (a contact with a copy)
+        uint32_t lastImpactSeq = 0;                  // the newest server VehicleImpact applied / judged for this car
+        double divCheckAtMs = 0;                     // a copy whose response we adopted: when to compare it with its controller's stream (0 = none)
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -434,6 +439,25 @@ namespace {
     std::atomic<bool> g_vehDriveByAimOnly{false};
     // peer_hits=0 keeps remote peds invincible (no local hit detection); default 1.
     std::atomic<bool> g_peerHits{true};
+    // T4 (vehicle collisions): impact_sync=0 in HKCU\Software\GAGE-MP keeps the contact grace (W9 / Sync B) as the only contact handling and
+    // ignores the server's VehicleImpact messages. Default on; re-read at every Welcome.
+    std::atomic<bool> g_impactSync{true};
+    // The server's VehicleImpact messages (join worker -> script tick), newest last, at most kMaxImpactQueue waiting.
+    std::mutex g_impactMtx;
+    std::vector<proto::VehicleImpact> g_impactQueue;   // g_impactMtx
+    constexpr size_t kMaxImpactQueue = 16;
+    // T4 counters (script tick except the atomic ones), reported every 10 s with the other vehicle lines.
+    struct T4Stats
+    {
+        uint32_t adopted = 0, adoptRefused = 0, guardRefused = 0;      // copies whose response became their trajectory / contacts left to the grace / stream pushes refused
+        uint32_t jumpEpisodes = 0;                                      // velocity jumps (contacts) our controlled cars felt
+        uint32_t impactsIn = 0, applied = 0, noLocal = 0, tiny = 0, stale = 0, dup = 0, noVehicle = 0;   // server impacts: received and what became of them
+        double appliedDvSum = 0, appliedDvMax = 0;
+        uint32_t divN = 0;                                              // copies compared with their controller 500 ms after the adoption
+        double divSum = 0, divMax = 0;
+        uint32_t dropped = 0;                                           // queue overflow
+    };
+    T4Stats g_t4;                                                       // script tick (dropped: g_impactMtx)
     constexpr int kPeerHpPool = 1000;             // a remote ped's local health, restored after every hit
     // Sync plan W3 (combat client), re-read at every Welcome:
     //   hit_react = off | bullet | ragdoll | both (default both): bullet = a flinch from a 1-damage point-blank
@@ -1211,6 +1235,7 @@ namespace {
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
+        g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         {
             // Sync plan W3: hit_react off|bullet|ragdoll|both (anything else, the default: both),
@@ -1513,6 +1538,18 @@ namespace {
             if (pushed == sync::VehPush::Accepted || pushed == sync::VehPush::Teleported)
                 clock.NoteAge((double)st.ageMs);
         }
+    }
+
+    // T4: the server's resolution of a contact of a vehicle we control; queued for the script tick (TickVehicles applies it).
+    void OnVehicleImpact(const proto::VehicleImpact& m)
+    {
+        std::lock_guard<std::mutex> lk(g_impactMtx);
+        if (g_impactQueue.size() >= kMaxImpactQueue)
+        {
+            g_impactQueue.erase(g_impactQueue.begin());
+            ++g_t4.dropped;
+        }
+        g_impactQueue.push_back(m);
     }
 
     void OnVehicleResult(const proto::VehicleResult& r)
@@ -4983,7 +5020,7 @@ namespace {
     // 30 m of the local player and 0 beyond 45 m (`distM`), the interpolator extrapolating past its newest snapshot
     // by the velocity (arc, capped at 500 ms). `leadMs` returns what was added. dtMs is the frame gap for the slew.
     bool SampleVehInterp(uint16_t id, double nowMs, sync::VehicleSample& out, sync::PresentLead* lead = nullptr,
-                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr)
+                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr, double* dispOut = nullptr)
     {
         PeersLock lk(g_peersMtx, true);
         if (!g_syncLive || !g_sync.Clock().Ready())
@@ -4997,7 +5034,25 @@ namespace {
         const double add = lead ? lead->Update(distM, clock.DelayMs() + extra, dtMs) : 0.0;
         if (leadMs)
             *leadMs = add;
-        return v.interp.Sample(clock.RenderT(nowMs) - extra + add, out);
+        const double disp = clock.RenderT(nowMs) - extra + add;
+        if (dispOut)
+            *dispOut = disp;
+        return v.interp.Sample(disp, out);
+    }
+    // T4: the copy's own response to a hit becomes its trajectory from `snap.tMs` on (VehicleInterpolator::ReplaceFrom); the stream's pushes are
+    // refused until they show the impact (preVel = the stream's velocity before it) or guardMs have passed.
+    void AdoptVehInterp(uint16_t id, const sync::VehicleSnapshot& snap, double guardMs, const sync::DriveVec& preVel)
+    {
+        PeersLock lk(g_peersMtx, true);
+        const auto it = g_vehNet.find(id);
+        if (it != g_vehNet.end())
+            it->second.interp.ReplaceFrom(snap, guardMs, &preVel);
+    }
+    uint32_t VehInterpGuarded(uint16_t id)
+    {
+        PeersLock lk(g_peersMtx, true);
+        const auto it = g_vehNet.find(id);
+        return it != g_vehNet.end() ? it->second.interp.Stats().guarded : 0u;
     }
     void ClearVehInterp(uint16_t id)
     {
@@ -5571,6 +5626,122 @@ namespace {
 
     // Vehicles: delete the gone ones, spawn the new ones, apply the server's fields, drive the ones
     // someone else drives (interpolator + drive controller), seat the remote peds per occupancy.
+    // ---- T4: vehicle collisions (libs/sync/vehicle_impact.h, docs/sync-specs/vehicle-collisions.md) ----
+    constexpr double kAdoptGuardMs = 300.0;      // the longest the stale stream is held back from an adopted copy
+    constexpr double kAdoptCooldownMs = 150.0;   // after an adoption no new contact is looked for on that copy this long
+    constexpr double kImpactNearM = 7.0;         // a copy this close (origins) to our car around a server impact counts as "isNear"
+    constexpr double kImpactWatchM = 30.0;       // a controlled car with another vehicle within this is watched for velocity jumps
+
+    // A car we control (the local player's, or an empty one the server handed us): feed its velocity to the jump tracker once per frame,
+    // but only while another vehicle is isNear (two natives per frame).
+    void FeedImpactTracker(uint16_t id, NetVeh& v, double nowMs)
+    {
+        bool isNear = false;
+        for (const auto& kv : g_vehs)
+        {
+            if (kv.first == id || !kv.second.handle || !kv.second.haveState)
+                continue;
+            const float dx = kv.second.st.k.x - v.st.k.x, dy = kv.second.st.k.y - v.st.k.y;
+            if (dx * dx + dy * dy < kImpactWatchM * kImpactWatchM)
+            {
+                isNear = true;
+                break;
+            }
+        }
+        if (!isNear)
+        {
+            v.impactTracker.Reset();
+            return;
+        }
+        float vx = 0, vy = 0, vz = 0, ax = 0, ay = 0, az = 0;
+        if (!g_world->GetEntityVelocity(v.handle, vx, vy, vz) || !g_world->GetEntityRotationVelocity(v.handle, ax, ay, az))
+            return;
+        if (v.impactTracker.Feed(nowMs, { vx, vy }, az))
+            ++g_t4.jumpEpisodes;
+    }
+
+    // The server's VehicleImpact messages for cars we control: the authoritative change of the car's velocity and yaw rate for the contact, less
+    // what the game's own physics already did (the tracker's jumps): the difference is written onto the car.
+    void DrainImpacts(double nowMs, uint16_t me)
+    {
+        static std::vector<proto::VehicleImpact> got;   // script tick only
+        got.clear();
+        {
+            std::lock_guard<std::mutex> lk(g_impactMtx);
+            got.swap(g_impactQueue);
+        }
+        for (const proto::VehicleImpact& m : got)
+        {
+            ++g_t4.impactsIn;
+            if (!g_impactSync.load(std::memory_order_relaxed))
+                continue;
+            const auto it = g_vehs.find(m.vehId);
+            if (it == g_vehs.end() || !it->second.handle || it->second.st.ctrl != me)
+            {
+                ++g_t4.noVehicle;
+                continue;
+            }
+            NetVeh& v = it->second;
+            if (!proto::SeqNewer(m.seq, v.lastImpactSeq) && v.lastImpactSeq != 0)
+            {
+                ++g_t4.dup;
+                continue;
+            }
+            v.lastImpactSeq = m.seq;
+            float cx = 0, cy = 0, cz = 0;
+            bool isNear = false;
+            if (g_world->GetEntityCoords(v.handle, cx, cy, cz))
+            {
+                const auto ot = g_vehs.find(m.otherId);
+                float ox = 0, oy = 0, oz = 0;
+                if (ot != g_vehs.end() && ot->second.handle && g_world->GetEntityCoords(ot->second.handle, ox, oy, oz))
+                {
+                    const double dx = ox - cx, dy = oy - cy;
+                    isNear = dx * dx + dy * dy < kImpactNearM * kImpactNearM;
+                }
+            }
+            const double tc = sync::impact::UnwrapStampMs(m.sampleMs, nowMs);
+            const sync::impact::ApplyDecision d = sync::impact::DecideImpactApply(v.impactTracker, { m.dvx, m.dvy }, m.dyaw, tc, nowMs, isNear, m.depth);
+            static int logged = 0;
+            if (d.why != sync::impact::ApplyWhy::Applied)
+            {
+                if (d.why == sync::impact::ApplyWhy::NoLocalContact) ++g_t4.noLocal;
+                else if (d.why == sync::impact::ApplyWhy::Tiny) ++g_t4.tiny;
+                else ++g_t4.stale;
+                if (logged < 12)
+                {
+                    ++logged;
+                    PeerLog(false, "engine: vehicle id=%u: server impact #%u with vehicle %u (change %.1f,%.1f m/s, closing %.1f, depth %.2f m, contact %.0f ms ago) "
+                            "not applied (%s)", (unsigned)m.vehId, m.seq, (unsigned)m.otherId, (double)m.dvx, (double)m.dvy, (double)m.closing, (double)m.depth,
+                            nowMs - tc, d.why == sync::impact::ApplyWhy::NoLocalContact ? "our physics felt no contact and the server's boxes barely met" :
+                            d.why == sync::impact::ApplyWhy::Tiny ? "too small" : "too old");
+                }
+                continue;
+            }
+            float vx = 0, vy = 0, vz = 0, ax = 0, ay = 0, az = 0;
+            if (!g_world->GetEntityVelocity(v.handle, vx, vy, vz))
+                continue;
+            const float nvx = vx + (float)d.dv.x, nvy = vy + (float)d.dv.y;
+            g_world->SetEntityVelocity(v.handle, nvx, nvy, vz);
+            const bool haveRot = g_world->GetEntityRotationVelocity(v.handle, ax, ay, az);
+            if (haveRot && std::fabs(d.dw) > 1e-3)
+                g_world->SetEntityAngularVelocity(v.handle, ax, ay, az + (float)d.dw);
+            v.impactTracker.NoteWritten({ nvx, nvy }, haveRot ? az + d.dw : 0.0, d.dv, d.dw);
+            ++g_t4.applied;
+            const double dvLen = sync::impact::Len(d.dv);
+            g_t4.appliedDvSum += dvLen;
+            g_t4.appliedDvMax = std::max(g_t4.appliedDvMax, dvLen);
+            if (logged < 12)
+            {
+                ++logged;
+                PeerLog(false, "engine: vehicle id=%u: server impact #%u with vehicle %u (closing %.1f m/s, depth %.2f m, contact %.0f ms ago): authoritative "
+                        "change %.1f,%.1f m/s / yaw %.2f, our physics had done %.1f,%.1f m/s%s; applied the difference %.1f,%.1f m/s / yaw %.2f",
+                        (unsigned)m.vehId, m.seq, (unsigned)m.otherId, (double)m.closing, (double)m.depth, nowMs - tc, (double)m.dvx, (double)m.dvy,
+                        (double)m.dyaw, d.dvLocal.x, d.dvLocal.y, d.localContact ? "" : " (it felt no contact)", d.dv.x, d.dv.y, d.dw);
+            }
+        }
+    }
+
     void TickVehicles(int32_t lp, int32_t lpVeh)
     {
         static std::vector<uint16_t> removedVehs;     // script tick only
@@ -5579,6 +5750,7 @@ namespace {
             // No lock: g_vehs / g_peers are the game thread's own, SyncNet (TickPeers, this frame) brought them up to date.
             const double nowMs = NowMs();
             const uint16_t me = join::MyId();
+            DrainImpacts(nowMs, me);   // T4: the server's impacts for cars we control
             float lpx = 0, lpy = 0, lpz = 0;
             const bool haveLp = lp && g_world->GetEntityCoords(lp, lpx, lpy, lpz);
             // Sync B: where the local player's own vehicle is (the penetration estimate of the collision line: a remote copy whose
@@ -5750,7 +5922,8 @@ namespace {
                     const double leadDist = haveLp ? std::sqrt((double)(st.k.x - lpx) * (st.k.x - lpx) + (double)(st.k.y - lpy) * (st.k.y - lpy) +
                                                                (double)(st.k.z - lpz) * (st.k.z - lpz))
                                                    : 1e9;
-                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs))
+                    double dispT = 0.0;   // T4: the interpolation time of this frame (an adopted response is stored at it)
+                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT))
                     {
                         if (v.leadMs > 1.0)
                             ++g_v4.leadFrames;
@@ -5778,7 +5951,55 @@ namespace {
                             }
                             else
                                 v.lastContactFlag = false;
-                            const sync::VehicleDriveOutput o = v.drive.Update(in);
+                            sync::VehicleDriveOutput o = v.drive.Update(in);
+                            // T4 (vehicle collisions): when this copy took an impulse inside the last frame (the contact the controller just
+                            // detected), that is the OTHER car's response to the hit from the game's own physics. The controller's next command
+                            // would pull it back to the stream, which still carries the pre-impact motion for the whole network latency: the copy
+                            // ploughs back through the car it hit (ours) and hits it again. So the response becomes the copy's trajectory
+                            // (VehicleInterpolator::ReplaceFrom: the stale stream is refused until it shows the impact), the grace the contact
+                            // opened is ended, and this frame's commands are not written. impact_sync=0 leaves the grace as the only handling.
+                            if (o.contactOpened && !o.snap && g_impactSync.load(std::memory_order_relaxed))
+                            {
+                                float wx = 0, wy = 0, wz = 0;
+                                const sync::impact::AdoptOut ad =
+                                    g_world->GetEntityRotationVelocity(h, wx, wy, wz)
+                                        ? sync::impact::DecideAdopt(s.vel.x, s.vel.y, s.vel.z, in.localVel.x, in.localVel.y, wz,
+                                                                  sync::vq::HeadingDeg(in.localRot) * (3.14159265358979323846 / 180.0), sync::impact::AdoptCfg())
+                                        : sync::impact::AdoptOut();
+                                if (ad.adopt)
+                                {
+                                    sync::VehicleSnapshot sn;
+                                    sn.tMs = dispT;
+                                    sn.pos = in.localPos;
+                                    sn.rot = in.localRot;
+                                    sn.vel = { (float)ad.vx, (float)ad.vy, (float)ad.vz };
+                                    sn.hasAngVel = true;
+                                    sn.angVel = { 0.0f, 0.0f, (float)ad.yawRate };   // the yaw only: the frame of the native's pitch / roll is unverified
+                                    AdoptVehInterp(id, sn, kAdoptGuardMs, s.vel);
+                                    v.drive.EndGrace(kAdoptCooldownMs);
+                                    o.setVelocity = o.setAngularVelocity = o.setQuaternion = false;
+                                    ++g_t4.adopted;
+                                    v.divCheckAtMs = nowMs + 500.0;
+                                    static int adoptLogged = 0;
+                                    if (adoptLogged < 12)
+                                    {
+                                        ++adoptLogged;
+                                        PeerLog(false, "engine: vehicle id=%u: contact on the remote copy -- its own response (%.1f m/s change, yaw rate %.2f) "
+                                                "adopted as its trajectory; the stream is held back until it shows the impact (max %.0f ms)", id, ad.dv,
+                                                ad.yawRate, kAdoptGuardMs);
+                                    }
+                                }
+                                else
+                                    ++g_t4.adoptRefused;
+                            }
+                            if (v.divCheckAtMs > 0.0 && nowMs >= v.divCheckAtMs)
+                            {
+                                // the divergence estimate: this copy against its controller's stream 500 ms after the contact
+                                v.divCheckAtMs = 0.0;
+                                ++g_t4.divN;
+                                g_t4.divSum += o.posErrorM;
+                                g_t4.divMax = std::max(g_t4.divMax, (double)o.posErrorM);
+                            }
                             v.errWin.Add(o.posErrorM, o.rotErrorDeg, sync::LateralErrorM(s.pos, s.rot, in.localPos), s.mode, o.snap);   // Sync D
                             if (o.contactOpened)
                             {
@@ -5859,6 +6080,8 @@ namespace {
                         }
                     }
                 }
+                else if (g_impactSync.load(std::memory_order_relaxed) && v.handle)
+                    FeedImpactTracker(id, v, nowMs);
                 // Remote occupants: warp each into its seat (wire seat s = GTA seat s - 1). The retry gap is
                 // 100 ms for the car we sit in and the cars within kSeatNearM of us (a driver seat that stays
                 // empty for half a second reads as "nobody is driving" to whoever stands there), 500 ms for the
@@ -7479,6 +7702,33 @@ namespace {
                 }
             }
             {
+                // T4 (vehicle collisions): the contacts our cars felt, the copies whose response was adopted, the server's impacts and what became of
+                // them, and the divergence estimate (a copy against its controller's stream 500 ms after the contact). Read with
+                // docs/sync-specs/vehicle-collisions.md: "adopted" > 0 with "refused" 0 = the copy path ran; "applied" > 0 = the server's resolution
+                // reached a car we control and differed from the game's; "no local contact" many = the server's boxes met where our physics felt nothing.
+                static T4Stats lastT4;
+                static uint32_t lastGuard = 0;
+                uint32_t guardNow = 0;
+                for (auto& kv : g_vehs)
+                    guardNow += VehInterpGuarded(kv.first);
+                const T4Stats& t = g_t4;
+                if (t.adopted != lastT4.adopted || t.adoptRefused != lastT4.adoptRefused || t.jumpEpisodes != lastT4.jumpEpisodes ||
+                    t.impactsIn != lastT4.impactsIn || t.divN != lastT4.divN)
+                    GLOGI("engine: vehicle impacts (T4), last 10 s: impact_sync %s; copies whose response was adopted %u (contacts left to the grace "
+                          "%u, stream pushes held back %u); velocity jumps our cars felt %u; server impacts in %u: applied %u (change written: %.1f m/s "
+                          "total, largest %.1f), no local contact %u, too small %u, too old %u, duplicate %u, car not ours %u, queue overflow %u; "
+                          "copy vs controller's stream 500 ms after the adoption: %u compared, mean error %.2f m, worst %.2f m",
+                          g_impactSync.load() ? "on" : "OFF", t.adopted - lastT4.adopted, t.adoptRefused - lastT4.adoptRefused, guardNow - lastGuard,
+                          t.jumpEpisodes - lastT4.jumpEpisodes, t.impactsIn - lastT4.impactsIn, t.applied - lastT4.applied, t.appliedDvSum - lastT4.appliedDvSum,
+                          t.appliedDvMax, t.noLocal - lastT4.noLocal, t.tiny - lastT4.tiny, t.stale - lastT4.stale, t.dup - lastT4.dup,
+                          t.noVehicle - lastT4.noVehicle, t.dropped - lastT4.dropped, t.divN - lastT4.divN,
+                          t.divN > lastT4.divN ? (t.divSum - lastT4.divSum) / (t.divN - lastT4.divN) : 0.0, t.divMax);
+                lastT4 = g_t4;
+                lastT4.divMax = 0.0;
+                g_t4.divMax = 0.0;
+                lastGuard = guardNow;
+            }
+            {
                 static SyncDStats lastD;
                 static uint32_t lastHand[2] = { 0, 0 };
                 ReportSyncD(lastD, lastHand);
@@ -8224,6 +8474,7 @@ namespace gage::engine {
         sinks.onEnded = OnEnded;
         sinks.onVehicles = OnVehicles;                 // protocol v4
         sinks.onVehicleResult = OnVehicleResult;
+        sinks.onVehicleImpact = OnVehicleImpact;   // T4
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

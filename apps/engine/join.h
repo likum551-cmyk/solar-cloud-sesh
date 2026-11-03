@@ -125,6 +125,8 @@ namespace gage::join {
         std::function<void(const proto::PeerAnim&)> onPeerAnim;
         std::function<void(const proto::PeerScenario&)> onPeerScenario;
         std::function<void(const proto::PeerAnimStop&)> onPeerAnimStop;
+        // T4: the server's resolution of a contact of a vehicle we control (a copy elsewhere, a real car here); once per contact, reliable.
+        std::function<void(const proto::VehicleImpact&)> onVehicleImpact;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;

@@ -3106,6 +3106,8 @@ static void PipelineHealthTests()
     }
 }
 
+#include "t4_server_tests.h"
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -3134,6 +3136,8 @@ int main()
     AuthorityUnitTests();
     std::printf("-- vehicles v5: ownership, controller, ages, motion-only entries\n");
     VehicleV5UnitTests();
+    std::printf("-- T4: vehicle collisions (claim of a driverless vehicle, speed cap clamp)\n");
+    t4srv::T4ServerTests();
     std::printf("-- damage scaling (damage.h)\n");
     DamageScaleUnitTests();
     std::printf("-- tick clock and sample ages (N6c)\n");
@@ -3146,7 +3150,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 111; // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 111 + t4srv::kT4ServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

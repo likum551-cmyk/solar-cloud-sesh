@@ -382,13 +382,14 @@ static void CodecTests()
     {
         proto::Msg m = proto::Msg::Hello;
         // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; 31 is the first unknown one.
-        const uint8_t zero = 0, firstUnknown = 31, ff = 255;
+        // T4: 40 is VehicleImpact (31..39 are reserved for the other round-2 tasks' messages; PeekType only range-checks them).
+        const uint8_t zero = 0, firstUnknown = 41, ff = 255, impact = 40;
         bool allKnown = true;
         for (uint8_t t = 1; t <= 30; t++)
             allKnown = allKnown && proto::PeekType(&t, 1, m) && (uint8_t)m == t;
-        Check("codec: PeekType accepts 1..30 and rejects empty, 0, 31, 255",
-              allKnown && proto::kMsgLast == 30 && !proto::PeekType(&zero, 0, m) && !proto::PeekType(nullptr, 0, m) &&
-                  !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
+        Check("codec: PeekType accepts 1..30 and 40 and rejects empty, 0, 41, 255",
+              allKnown && proto::kMsgLast == 40 && proto::PeekType(&impact, 1, m) && m == proto::Msg::VehicleImpact && !proto::PeekType(&zero, 0, m) &&
+                  !proto::PeekType(nullptr, 0, m) && !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
     }
 
     // Non-finite floats, in each of the seven fields, in PlayerState and a WorldState entry.
@@ -2820,7 +2821,7 @@ static void VehicleNetworkTests()
         alice.s.SendVehicleState(Drive(vid, 100, 120, 10, 600));
         const bool moved = rig.Until([&] { const proto::VehicleState* v = bob.Vehicle(vid); return v && std::fabs(v->k.y - 120.0f) < 0.02f; }, 2000);
         bob.s.SendVehicleState(Drive(vid, 100, 300, 0));                  // a passenger
-        alice.s.SendVehicleState(Drive(vid, 100, 130, 200));              // 200 m/s
+        alice.s.SendVehicleState(Drive(vid, 100, 130, 400));              // 400 m/s (T4: under twice the cap is clamped, not dropped)
         rig.Pump(200);
         alice.s.SendVehicleState(Drive(vid, 100, 121, 10, 900));          // health up: ignored
         rig.Until([&] { return rig.srv.stats().vehicleUpdatesAccepted >= s0.vehicleUpdatesAccepted + 2; }, 2000);
@@ -2829,7 +2830,7 @@ static void VehicleNetworkTests()
         const server::VehicleStore::Vehicle* v = rig.srv.FindVehicle(vid);
         const bool state = v && std::fabs(v->s.k.y - 121.0f) < 0.02f && v->s.bodyHealth == 600 && (v->s.flags & proto::kVehLocked) &&
                            (v->s.flags & proto::kVehEngine) && std::fabs(v->s.k.vy - 10.0f) < 0.05f;
-        Check("vehicles: only the server's driver moves a vehicle (a passenger's update is dropped), over 150 m/s is dropped, "
+        Check("vehicles: only the server's driver moves a vehicle (a passenger's update is dropped), over twice the 150 m/s cap is dropped, "
               "health only goes down, the lock stays the server's while the engine flag is the driver's; the others see it",
               moved && state && s1.vehicleUpdatesRejected == s0.vehicleUpdatesRejected + 1 &&
                   s1.vehicleUpdatesInvalid == s0.vehicleUpdatesInvalid + 1 && s1.vehicleUpdatesAccepted == s0.vehicleUpdatesAccepted + 2,
@@ -4301,6 +4302,8 @@ static void MeleeFightSimTests()
     }
 }
 
+#include "t4_netcode_tests.h"
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -4343,6 +4346,8 @@ int main()
     ReconnectTests();
     VehicleAbuseTests();
     AnimAuthorityTests();
+    std::printf("-- T4: vehicle collisions (VehicleImpact over the real server)\n");
+    t4net::T4NetworkTests();
     std::printf("-- metrics and budget\n");
     MetricsTests();
     ShutdownTests();
@@ -4351,7 +4356,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1 + 12; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
+    const int expected = 195 + 1 + 12 + t4net::kT4NetChecks; // T4: +3 (VehicleImpact wire, head-on arbitration, the speed clamp) // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

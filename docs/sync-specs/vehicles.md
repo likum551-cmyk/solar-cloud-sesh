@@ -107,3 +107,9 @@ What it found wrong, and the change:
 Diagnostics added (10 s, `engine: vehicle drive (D)` and `engine: occupants (D)`): position / heading / sideways error mean and max against the sender's sample at the instant it claims, drive frames by interpolator mode (interpolating / extrapolating / holding / buffering), snaps, persistent and under-floor snaps, blends, graces; door walks followed vs tasked, a warped puppet found out of its seat (another seat / another car / outside / unknown), exits by flag (0 / 4160 / the flag-16 fallback / pops), controller hand-overs kept vs snapped.
 
 Not changed, reported: the present-time lead (W9) trades a constant 110 ms lag for a prediction error that peaks at the onset of a manoeuvre (hairpin: up to 1 m / 17 degrees, versus 0.2 m / 6 degrees without it, but then about 1.3 m behind the sender at 12 m/s).
+
+## T4: vehicle collisions (2026-11-03)
+
+Server-arbitrated contact resolution (`VehicleImpact`, message 40), adoption of a hit copy's own response, the empty-car claim and the speed-cap clamp: docs/sync-specs/vehicle-collisions.md
+(design, the two-machine simulation numbers, diagnostics, GI's live test). It supersedes the "Not fixed" notes of Sync B above for parked / empty cars (claimed by the rammer) and for the two screens'
+different contact (one resolution per contact); the contact grace stays as the fallback (`impact_sync=0`, or a contact adoption refused).
