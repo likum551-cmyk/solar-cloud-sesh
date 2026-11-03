@@ -469,6 +469,11 @@ namespace gage::game {
         // Set before Init: resolve Present (dummy device) but never detour it
         // (hooks=2), to tell the probe apart from the detour.
         bool      noDetour = false;
+        // Set before Init: how HookTick takes the Present hook (HKCU\Software\GAGE-MP present_mode).
+        // -1 unset = replace the swap chain vtable's Present slot, with the inline hook as the watchdog's fallback;
+        // 0 = the inline hook only (the pre-0.4.7 behaviour: it loses to RTSS-style re-asserting overlays);
+        // 1 = the vtable hook only, no fallback. See present_hook.h.
+        int       presentMode = -1;
         // Set before Init: natives that create or change game state (spawning
         // peds, the server entry, suppressing SP systems), HKCU\Software\GAGE-MP
         // spawn: -1 unset = on inside GTA's script tick and off on the render-thread
@@ -511,8 +516,9 @@ namespace gage::game {
         int       noSpScripts = 1;
 
         // -- per-frame hook --------------------------------------------------
-        // Inline-detour D3D11 Present so `onTick` runs every frame on the
-        // main/render thread. Replaces any previously installed hook.
+        // Hook D3D11 Present so `onTick` runs every frame on the main/render
+        // thread (presentMode: the swap chain vtable slot by default, see
+        // present_hook.h). Replaces any previously installed hook.
         // onTick must not block.
         bool     HookTick(void (*onTick)());
         void     Unhook();

@@ -19,6 +19,7 @@
 #include "hook.h"
 #include "sp_scripts.h"
 #include "net_guard.h"
+#include "present_hook.h"
 
 #include <windows.h>
 #include <cmath>
@@ -327,8 +328,9 @@ struct HookState {
     bool      active = false;
 };
 HookState g_hook;
-void (*g_onTick)() = nullptr;         // called by the detour each frame
-void* g_swapChainPtr = nullptr;       // IDXGISwapChain* captured from RCX on Present entry
+void (*g_onTick)() = nullptr;         // called by the inline detour each frame (present_mode=0)
+// The IDXGISwapChain* of the latest Present lives in presenthook::SwapChainStorage(): the vtable detour and the
+// inline thunk (RCX on entry) both write it.
 
 // Allocate an RWX page within ±1 GB of `nearAddr` for cross-module E9 jmp.
 // Falls back to any-address allocation if no nearby region is found.
@@ -1143,6 +1145,8 @@ NativeHandler findNativeHandler(uint64_t hash) {
 // D3D11 Present address (resolved by findPresent below)
 // ---------------------------------------------------------------------------
 uint8_t* g_presentAddr = nullptr;
+// Slot 8 of the swap chain vtable (dxgi's data): the address the vtable hook replaces (present_hook.h).
+void** g_presentSlot = nullptr;
 
 // ---------------------------------------------------------------------------
 // CE-style pattern scanner (for the native table scan)
@@ -1895,6 +1899,17 @@ uint8_t* findPresent() {
     // D3D_DRIVER_TYPE_HARDWARE = 1, D3D11_SDK_VERSION = 7
     long hr = createFn(nullptr, 1, nullptr, 0, nullptr, 0, 7,
                        scdBuf, &pSwapChain, &pDevice, nullptr, &pContext);
+    if (hr < 0 || !pSwapChain) {
+        // No usable hardware device (a VM, a GPU-less box, a driver mid-reset): the software rasteriser makes the
+        // same dxgi swap chain class, hence the same Present function and vtable. D3D_DRIVER_TYPE_WARP = 5.
+        GLOGW("hook: hardware D3D11 probe failed (0x%08lx); retrying on WARP", (unsigned long)hr);
+        if (pSwapChain) ((void(__stdcall*)(void*))(*(void***)pSwapChain)[2])(pSwapChain);
+        if (pDevice) ((void(__stdcall*)(void*))(*(void***)pDevice)[2])(pDevice);
+        if (pContext) ((void(__stdcall*)(void*))(*(void***)pContext)[2])(pContext);
+        pSwapChain = pDevice = pContext = nullptr;
+        hr = createFn(nullptr, 5, nullptr, 0, nullptr, 0, 7,
+                      scdBuf, &pSwapChain, &pDevice, nullptr, &pContext);
+    }
 
     if (hr < 0 || !pSwapChain) {
         GLOGW("hook: D3D11CreateDeviceAndSwapChain failed (0x%08lx)", (unsigned long)hr);
@@ -1907,8 +1922,11 @@ uint8_t* findPresent() {
     // Read vtable[8] = Present.
     void** vtable = *(void***)pSwapChain;
     uint8_t* present = (uint8_t*)vtable[8];
+    // The class vtable is shared by every swap chain of this class (the game's included) and stays mapped as long
+    // as dxgi.dll does: the vtable hook replaces this slot rather than patching the function's code.
+    g_presentSlot = &vtable[8];
 
-    GLOGI("hook: D3D11 Present at %p (from dummy swap chain)", present);
+    GLOGI("hook: D3D11 Present at %p, vtable slot %p (from dummy swap chain)", present, (void*)g_presentSlot);
 
     // Release all COM objects: Release = vtable[2].
     ((void(__stdcall*)(void*))vtable[2])(pSwapChain);
@@ -3060,11 +3078,21 @@ bool tryInstallScriptTick() {
     return true;
 }
 
+// The watchdog's last resort (present_hook.h): the inline hook on Present's code, whose thunk stores the swap chain
+// and calls OnInlineEntry, which ticks only when the vtable detour has not already done so for this Present.
+void (*g_inlineEntry)() = &gage::presenthook::OnInlineEntry;
+bool installPresentInlineFallback(uint8_t* fn) {
+    return installInlineHook(fn, g_hook, gage::presenthook::SwapChainStorage(), (void* const*)&g_inlineEntry,
+                             "D3D11 Present (fallback)");
+}
+void removePresentInlineFallback() { removeInlineHook(g_hook); }
+
 } // namespace
 
 void World::Unhook() {
     removeInlineHook(g_scriptHook);
     g_scriptTickThunk = nullptr;
+    gage::presenthook::Uninstall();     // the slot back, the watchdog stopped, its inline fallback removed
     removeInlineHook(g_hook);
     g_onTick = nullptr;
     netUnpatchAll();
@@ -3078,9 +3106,32 @@ bool World::HookTick(void (*onTick)()) {
         GLOGW("hook: hooks=2: Present resolved at %p but not detoured", target);
         return false;
     }
+    gage::presenthook::Uninstall();
     removeInlineHook(g_hook);
     g_onTick = onTick;
-    return installInlineHook(target, g_hook, &g_swapChainPtr, (void* const*)&g_onTick, "D3D11 Present");
+
+    // Default: replace the Present slot in dxgi's vtable (present_hook.h). Overlays (RTSS, Afterburner, Steam,
+    // Discord, NVIDIA, OBS) patch Present's CODE and re-assert their patch; an inline E9 of ours on the same bytes
+    // lived for one frame and then the engine never ticked again (RTSS, 2026-11-03). The slot is data none of them
+    // touch, and their patch stays in the chain beneath us. The inline hook remains as the watchdog's fallback for a
+    // swap chain that bypasses the vtable, and as present_mode=0, the pre-0.4.7 behaviour.
+    if (presentMode != 0 && g_presentSlot) {
+        gage::presenthook::Callbacks cb;
+        cb.tick = onTick;
+        if (presentMode != 1) {
+            cb.installInline = installPresentInlineFallback;
+            cb.removeInline = removePresentInlineFallback;
+        }
+        if (gage::presenthook::Install(g_presentSlot, target, cb))
+            return true;
+        GLOGW("hook: Present vtable hook not installed%s", presentMode == 1 ? " (present_mode=1: no inline fallback)"
+                                                                           : "; using the inline hook");
+        if (presentMode == 1) return false;
+    } else {
+        GLOGI("hook: Present: inline hook (%s)", presentMode == 0 ? "present_mode=0" : "no vtable slot resolved");
+    }
+    return installInlineHook(target, g_hook, gage::presenthook::SwapChainStorage(), (void* const*)&g_onTick,
+                             "D3D11 Present");
 }
 
 void World::HookScriptTick(void (*onScriptTick)()) { g_onScriptTick = onScriptTick; }
@@ -3102,7 +3153,7 @@ void installScriptTickWhenReady() {
     GLOGW("hook: script threads signature not found in 2 minutes; script tick off");
 }
 
-bool World::Hooked() const { return g_hook.active; }
+bool World::Hooked() const { return gage::presenthook::Active() || g_hook.active; }
 
 bool World::StockScriptsOff() const { return g_noSpActive; }
 
@@ -6386,5 +6437,5 @@ void gage::game::retryNativeTableOnce() {
 }
 
 void* gage::game::GetSwapChain() {
-    return g_swapChainPtr;
+    return gage::presenthook::SwapChain();
 }

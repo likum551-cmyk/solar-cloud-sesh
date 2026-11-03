@@ -29,6 +29,7 @@
 # ---- pure computation: a failure is a real regression or a compiler/ABI difference -----------------------------
 quant_test            | gate   |  300 |        | protocol quantisation: exhaustive round trips and float error bounds; no OS calls, so a failure is a codegen or logic difference
 decode_fuzz_test      | soft   |  120 |        | every protocol Decode and the UDP query datagrams against truncation, trailing bytes, bit flips and random packets (deterministic, about 1 s, no OS calls); new in 0.4.5-sync, soft until it has passed twice on the VPS (then gate)
+pack_collection_test  | soft   |  120 |        | streaming content-pack TOC builder (apps/engine/pack_collection): entry bit-packing against golden vectors, collection image sector layout, RSC7 page-flag decode; pure computation (cstdint/cstring/string/vector only, no OS calls), never shipped; new in R3, soft until it has passed twice on the VPS (then gate)
 interest_test         | gate   |  300 |        | Replicator (interest management, delta frames) driven directly, simulated time; no sockets
 sync_test             | gate   |  300 |        | remote-player smoother under loss and jitter; pure
 locomotion_test       | gate   |  300 |        | remote-ped locomotion controller against scripted poses; seeded, pure
@@ -49,6 +50,7 @@ serverquery_test      | soft   |  120 |        | the launcher's UDP server query
 netcode_test          | soft   |  300 |        | protocol v4 + server over real ENet on loopback with the WINDOWS build of ENet/winsock (the client's network path); about 12 s native. The native Linux copy is the gate in deploy-server.sh
 server_test           | soft   |  300 |        | UDP query, master announce, bans, admin channel; about 16 s native. Same: the native copy gates the server deploy
 join_test             | soft   |  300 |        | the engine's session adapter against an in-process server on loopback (winsock threads)
+present_hook_test     | soft   |  120 |        | the Present vtable hook + watchdog on a fake vtable (pure), then the real dxgi swap chain next to a simulated re-asserting overlay; part 2 prints SKIP and still exits 0 when wine/the VPS has no D3D11 device (no GPU); soft until it has passed twice on the VPS
 update_check_test     | driver |  600 | -      | driver: node tests/update_check_test.mjs --exe <wrapper>; the .mjs signs fixtures, serves them over HTTP and runs the exe (winhttp, bcrypt ECDSA via wine's bcrypt)
 
 # ---- never run here --------------------------------------------------------------------------------------------

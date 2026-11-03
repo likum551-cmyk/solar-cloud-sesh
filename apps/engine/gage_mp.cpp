@@ -151,6 +151,13 @@ namespace {
         const std::wstring hooks = reg::Get(L"hooks");
         world.passive = hooks == L"0";
         world.noDetour = hooks == L"2";
+        // present_mode (engine-only, like pack_*): unset = Present vtable slot with the inline fallback,
+        // 0 = the old inline hook only, 1 = vtable only. Support switch for a machine where the default misbehaves.
+        const std::wstring presentMode = reg::Get(L"present_mode");
+        world.presentMode = presentMode == L"0" ? 0 : presentMode == L"1" ? 1 : -1;
+        if (world.presentMode != -1)
+            GLOGW("gage_mp: present_mode=%d (%s)", world.presentMode,
+                  world.presentMode == 0 ? "inline Present hook only" : "Present vtable hook only, no fallback");
         if (world.passive)
             GLOGW("gage_mp: PASSIVE MODE (hooks=0): no Present detour, no per-frame driver");
         else if (world.noDetour)

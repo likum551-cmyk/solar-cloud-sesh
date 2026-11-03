@@ -316,6 +316,7 @@ add_library(gage_mp SHARED
     apps/engine/gage_mp.cpp
     apps/engine/join.cpp
     apps/engine/hook.cpp
+    apps/engine/present_hook.cpp
     apps/engine/net_guard.cpp
     apps/engine/engine.cpp
     apps/engine/loading_screen.cpp
@@ -335,6 +336,7 @@ add_executable(gage_mp_test
     tests/gage_mp_test.cpp
     apps/engine/join.cpp
     apps/engine/hook.cpp
+    apps/engine/present_hook.cpp
     apps/engine/net_guard.cpp
     apps/engine/engine.cpp
     apps/engine/loading_screen.cpp
@@ -348,6 +350,17 @@ set_target_properties(gage_mp_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_B
 add_executable(brand_apparel_test tests/brand_apparel_test.cpp apps/engine/brand_apparel.cpp)
 target_link_libraries(brand_apparel_test PRIVATE gage_common d3d11 dxgi)
 set_target_properties(brand_apparel_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
+# present_hook_test.exe: the Present hook (vtable slot + watchdog + inline fallback) on a fake vtable, then the production
+# World::HookTick on a real dxgi swap chain next to a simulated re-asserting overlay hooker. It includes hook.cpp as its
+# own translation unit (like gage_mp_test includes gage_mp.cpp), so hook.cpp is not in the source list. Never shipped.
+add_executable(present_hook_test
+    tests/present_hook_test.cpp
+    apps/engine/present_hook.cpp
+    apps/engine/net_guard.cpp
+)
+target_link_libraries(present_hook_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
+set_target_properties(present_hook_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
 # ---------------------------------------------------------------------------
 # Bundle the in-game UI (consumer of the mp.* bridge) next to the exe.
