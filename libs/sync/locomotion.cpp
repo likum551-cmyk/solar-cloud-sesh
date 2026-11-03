@@ -56,6 +56,7 @@ namespace {
 
     const double kPi = 3.14159265358979323846;
     const double kDirMinSpeedMs = 0.2; // below this the velocity has no usable direction: use the heading
+    const double kHeldAnimMs = 300.0;  // a read that was our own push: the last clean one is held this long, then the model
 
 } // namespace
 
@@ -72,6 +73,7 @@ void LocomotionController::Reset()
     reevaluate_ = false;
     offAcc_ = 0;
     mismatchMs_ = 0;
+    steadyMs_ = 0;
     ++stats_.resets;
 }
 
@@ -91,6 +93,10 @@ void LocomotionController::ResetHard()
     gait_ = inferred_ = pendingGait_ = gaitShown_ = Gait::Still;
     stillMs_ = pendingMs_ = 0;
     corrFx_ = corrFy_ = 0.0f;
+    settling_ = false;
+    pushedLast_ = false;
+    animEst_ = LocoVec();
+    sinceMoveStartMs_ = 1e9;
 }
 
 void LocomotionController::Pause(double ms) { pauseMs_ = ms > 0.0 ? ms : 0.0; }
@@ -126,6 +132,14 @@ Gait LocomotionController::InferGait(Gait cur, float speed, const LocoConfig& c)
 
 LocoOutput LocomotionController::Update(const LocoInput& in)
 {
+    const LocoOutput o = UpdateImpl(in);
+    pushedLast_ = o.setVelocity;      // Sync A: next frame's read of the ped's velocity may be this push (see animEst_)
+    if (o.setVelocity) lastPush_ = o.velocity;
+    return o;
+}
+
+LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
+{
     LocoOutput o;
     ++stats_.frames;
     if (!Finite(in.pos) || !Finite(in.vel) || !Finite(in.pedPos) || !std::isfinite(in.heading) ||
@@ -138,6 +152,9 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     const double dtS = dt / 1000.0;
     sinceIssueMs_ += dt;
     sinceJumpMs_ += dt;
+    steadyMs_ += dt;
+    sinceMoveStartMs_ += dt;
+    sinceAnchorStallMs_ += dt;
     if (anchorFallbackLeftMs_ > 0.0) anchorFallbackLeftMs_ = anchorFallbackLeftMs_ > dt ? anchorFallbackLeftMs_ - dt : 0.0;
     // W11 item 2: anchor mode now? (the engine reports no anchor entity or an aim task with noAnchor; a stall dropped it)
     bool anchorMode = cfg_.mode == LocoMode::Anchor && !in.noAnchor && anchorFallbackLeftMs_ <= 0.0;
@@ -185,21 +202,48 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     // (leaving Still is immediate: a ped sliding in an idle pose is the worse error).
     inferred_ = InferGait(inferred_, static_cast<float>(rawSpeed), cfg_);
     Gait cand = ApplyAuthority(inferred_, in.moveState);
-    bool holding = false;
+    bool holding = false, settling = false;
+    // Sync A: how far the ped is from the pose (the horizontal distance, before any snap): a stop is not over until it is there.
+    const double pedErrH = HLen(double(in.pos.x) - in.pedPos.x, double(in.pos.y) - in.pedPos.y);
     if (cand == Gait::Still && gait_ != Gait::Still)
     {
         stillMs_ += dt;
         if (stillMs_ < cfg_.stillHoldMs) { cand = gait_; holding = true; }
+        else if (cfg_.settleMaxMs > 0.0f && !in.teleported && !in.swimming && !in.ragdoll && !in.jumping &&
+                 pedErrH > (settling_ ? cfg_.settleDoneM : cfg_.settleM) && stillMs_ < cfg_.stillHoldMs + cfg_.settleMaxMs &&
+                 pedErrH < cfg_.snapBaseM)
+        {
+            // The pose has stopped and the ped has not reached it: it walks the rest (the task keeps running, the anchor is
+            // on the pose) instead of standing still where it is and being dragged there in an idle pose.
+            cand = Gait::Walk;
+            settling = true;
+            gait_ = Gait::Walk;
+            pendingGait_ = Gait::Walk;
+            pendingMs_ = 0;
+            if (!settling_) { ++stats_.settles; steadyMs_ = 0; if (cfg_.mode == LocoMode::Straight || in.noAnchor) forceIssue_ = true; }
+        }
     }
     else stillMs_ = 0;
-    if (cand != gait_ && cand != Gait::Still && gait_ != Gait::Still)
+    settling_ = settling;
+    if (!settling && cand != gait_ && cand != Gait::Still && gait_ != Gait::Still)
     {
+        // A change DOWN holds gaitDebounceMs; a change UP only upDebounceMs, and not at all in the first startWindowMs of
+        // a movement (the first frames of a start read a walking speed while the pose is already running).
+        const bool up = static_cast<int>(cand) > static_cast<int>(gait_);
+        // (only the SPEED's own gait is trusted that fast: a gait the sender's hint lifted above it holds gaitDebounceMs)
+        const bool speedUp = up && static_cast<int>(cand) <= static_cast<int>(inferred_);
+        const double need = speedUp ? (sinceMoveStartMs_ < cfg_.startWindowMs ? 0.0 : cfg_.upDebounceMs) : cfg_.gaitDebounceMs;
         if (cand != pendingGait_) { pendingGait_ = cand; pendingMs_ = 0; }
         pendingMs_ += dt;
-        if (pendingMs_ < cfg_.gaitDebounceMs) cand = gait_;
+        if (pendingMs_ < need) cand = gait_;
     }
-    else { pendingGait_ = gait_; pendingMs_ = 0; }
-    gait_ = cand;
+    else if (!settling) { pendingGait_ = gait_; pendingMs_ = 0; }
+    if (!settling)
+    {
+        if (gait_ == Gait::Still && cand != Gait::Still) sinceMoveStartMs_ = 0;
+        gait_ = cand;
+    }
+    if (gait_ != gaitPrev_) { steadyMs_ = 0; gaitPrev_ = gait_; }
     o.gait = gait_;
 
     // ---- jump / ragdoll edges (v3) ----
@@ -258,6 +302,37 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         }
     }
 
+    // ---- the ped's animation velocity (Sync A) ----
+    // GET_ENTITY_VELOCITY is the base of the residual push (the push is that velocity plus a correction). If the game keeps
+    // the velocity we set (a read after a push returning the push itself), feeding it back makes the push integrate every
+    // frame: the simulated ped ran at 2x the pose speed, 7 m behind it, with a snap every second. A read that equals our last
+    // push (to 0.05 m/s) is therefore not used: the base is then a model of the animation (the learned nominal speed x the
+    // move rate asked for, along the ped's facing; nothing while no gait is shown).
+    bool contaminated = false;
+    if (in.havePedVel)
+    {
+        contaminated = pushedLast_ && HLen(double(in.pedVel.x) - lastPush_.x, double(in.pedVel.y) - lastPush_.y) < 0.05;
+        if (contaminated)
+        {
+            ++stats_.contaminated;
+            sinceCleanMs_ += dt;
+            if (sinceCleanMs_ >= kHeldAnimMs)
+            {
+                // the last clean read is stale: the model
+                const double h = double(in.pedHeading) * kPi / 180.0;
+                const double sp = (gait_ != Gait::Still) ? Nominal(gait_, cfg_) * nScale_[static_cast<int>(gait_)] * lastRate_ : 0.0;
+                animEst_.x = static_cast<float>(-std::sin(h) * sp);
+                animEst_.y = static_cast<float>(std::cos(h) * sp);
+                animEst_.z = 0.0f;
+            }   // else: the last clean read is held
+        }
+        else
+        {
+            sinceCleanMs_ = 0.0;
+            animEst_ = in.pedVel;
+        }
+    }
+
     // ---- velocity ----
     // The low-passed pose velocity plus a correction toward the pose. No correction inside the
     // steerDeadbandM dead band (the capsule is never exactly on the pose, steering it would only buzz).
@@ -280,10 +355,19 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
             const double hx = double(in.pos.x) - ped.x, hy = double(in.pos.y) - ped.y;
             const double he = HLen(hx, hy);
             double cx = 0, cy = 0;
-            if (he >= cfg_.steerDeadbandM)
+            // Sync A: a moving gait is pushed only beyond residualDeadM (the rate loop closes the rest; the ramp starts from
+            // the dead band's edge), and not at all in the start grace window (below startGraceMaxM); a standing ped keeps
+            // the small steerDeadbandM.
+            const bool moving = gait_ != Gait::Still;
+            const double dead = moving ? cfg_.residualDeadM : cfg_.stillDeadM;
+            const bool grace = moving && sinceMoveStartMs_ < cfg_.startGraceMs && he < cfg_.startGraceMaxM;
+            if (grace) ++stats_.graceFrames;
+            if (he >= dead && !grace)
             {
-                cx = (cfg_.corrGainBase + cfg_.corrGainPerM * he) * hx;
-                cy = (cfg_.corrGainBase + cfg_.corrGainPerM * he) * hy;
+                const double ex = he - dead;
+                const double gain = (cfg_.corrGainBase + cfg_.corrGainPerM * ex) * (ex / he);
+                cx = gain * hx;
+                cy = gain * hy;
                 const double cl = HLen(cx, cy);
                 if (cl > cfg_.residualMaxMs && cl > 0.0) { cx *= cfg_.residualMaxMs / cl; cy *= cfg_.residualMaxMs / cl; }
             }
@@ -306,9 +390,9 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
             }
             else
             {
-                o.velocity.x = static_cast<float>(in.pedVel.x + corrFx_);
-                o.velocity.y = static_cast<float>(in.pedVel.y + corrFy_);
-                o.velocity.z = static_cast<float>(in.pedVel.z + cz);
+                o.velocity.x = static_cast<float>(animEst_.x + corrFx_);
+                o.velocity.y = static_cast<float>(animEst_.y + corrFy_);
+                o.velocity.z = static_cast<float>(animEst_.z + cz);
             }
         }
         else
@@ -365,7 +449,8 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     {
         // Anchor mode: the entity the ped runs to is moved EVERY frame to pose + direction * lead (the pose is already the
         // smoother's predicted position), so a turn bends the path instead of re-issuing a task.
-        const double aLead = Clamp(sp * cfg_.anchorLeadS, cfg_.anchorLeadMinM, cfg_.anchorLeadMaxM);
+        // Sync A: no floor (a stop was run through) and none at all while settling (the anchor IS the pose).
+        const double aLead = settling ? 0.0 : Clamp(sp * cfg_.anchorLeadS, cfg_.anchorLeadMinM, cfg_.anchorLeadMaxM);
         o.moveAnchor = true;
         o.anchorPos.x = static_cast<float>(in.pos.x + dirx * aLead);
         o.anchorPos.y = static_cast<float>(in.pos.y + diry * aLead);
@@ -382,7 +467,11 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         return o; // a task now would cancel the ragdoll / jump; forceIssue_ re-issues after
     }
     if (holding)
-        return o; // about to stand still: let the running task finish, issue nothing new
+    {
+        // about to stand still: let the running task finish, issue nothing new (the move rate is held: it only lasts while called)
+        if (in.moveRateAvailable && !in.swimming) { o.setMoveRate = true; o.moveRate = lastRate_; }
+        return o;
+    }
     if (gait_ == Gait::Still)
     {
         mismatchMs_ = 0;
@@ -405,7 +494,7 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     // low-passed velocity's (the sender's heading when it is hardly moving), the lead is leadS seconds
     // of travel clamped to leadMinM..leadMaxM: far enough ahead that the ped does not reach it for
     // seconds (GTAN's 1 s lead made the target "reached" after half a second).
-    const double leadM = Clamp(sp * cfg_.leadS, cfg_.leadMinM, cfg_.leadMaxM);
+    const double leadM = settling ? 0.0 : Clamp(sp * cfg_.leadS, cfg_.leadMinM, cfg_.leadMaxM);
     LocoVec anchor; // the target without its lead: where the pose is, plus the ped's error to it
     anchor.x = static_cast<float>(in.pos.x + (double(in.pos.x) - ped.x));
     anchor.y = static_cast<float>(in.pos.y + (double(in.pos.y) - ped.y));
@@ -420,8 +509,36 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     float blend = BlendRatio(gait_);
     if (in.moveRateAvailable && !in.swimming)
     {
+        // Sync A: the closed loop. The speed to show is the pose's plus what closes the along-track error in rateTcS (a ped
+        // behind the pose runs faster, one ahead slower; settling: the distance to the pose), over the gait's LEARNED nominal.
+        double vdes = sp;
+        if (cfg_.rateLoop)
+        {
+            double e;
+            if (settling || sp < kDirMinSpeedMs) e = pedErrH;
+            else e = (double(in.pos.x) - ped.x) * dirx + (double(in.pos.y) - ped.y) * diry;
+            vdes = sp + Clamp(e, cfg_.rateErrMinM, cfg_.rateErrMaxM) / (cfg_.rateTcS > 0.0f ? cfg_.rateTcS : 0.7f);
+            if (vdes < 0.0) vdes = 0.0;
+        }
         o.setMoveRate = true;
-        o.moveRate = static_cast<float>(Clamp(sp / Nominal(gait_, cfg_), cfg_.moveRateMin, cfg_.moveRateMax));
+        o.moveRate = static_cast<float>(Clamp(vdes / (Nominal(gait_, cfg_) * nScale_[static_cast<int>(gait_)]), cfg_.moveRateMin, cfg_.moveRateMax));
+        // the learning sample: the ped's own speed over the rate that made it (the rate low-passed like the ped's lag)
+        if (cfg_.rateLoop && in.havePedVel && !contaminated && !pushedLast_ && !settling && sp >= 1.0 && steadyMs_ >= cfg_.learnSteadyMs)
+        {
+            const double ps = HLen(in.pedVel.x, in.pedVel.y);
+            if (ps > 0.8 && rateEmaNum_ > 0.05)
+            {
+                const double scale = Clamp(ps / rateEmaNum_ / Nominal(gait_, cfg_), cfg_.learnMinScale, cfg_.learnMaxScale);
+                const double k = 1.0 - std::exp(-dt / static_cast<double>(cfg_.learnTauMs > 0 ? cfg_.learnTauMs : 1.0f));
+                float& ns = nScale_[static_cast<int>(gait_)];
+                ns = static_cast<float>(ns + (scale - ns) * k);
+            }
+        }
+        {
+            const double k = 1.0 - std::exp(-dt / 300.0);
+            rateEmaNum_ += (double(o.moveRate) - rateEmaNum_) * k;
+        }
+        lastRate_ = o.moveRate;
     }
     else
         blend = QuantisedBlend(sp, gait_, cfg_);
@@ -479,13 +596,23 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         const double arrive = std::fmax(cfg_.arriveMinM, cfg_.arriveFrac * lastLeadM_);
         const bool arriving = !anchorMode && HLen(double(lastTarget_.x) - ped.x, double(lastTarget_.y) - ped.y) < arrive;
         const bool driftNow = drift && (soft || sinceIssueMs_ >= cfg_.driftReissueMs);
-        const bool stallNow = !soft && mismatchMs_ >= cfg_.stallMs && sinceIssueMs_ >= cfg_.stallRetryMs;
+        // Sync A: a lost task is noticed stallFirstMs after its issue; only after a stall re-issue does stallRetryMs apply (the first
+        // stall used to wait 2.5 s: a puppet whose go-to failed was dragged along in an idle pose for that long, at every start).
+        const bool stallNow = !soft && mismatchMs_ >= cfg_.stallMs && sinceIssueMs_ >= (lastIssueWasStall_ ? cfg_.stallRetryMs : cfg_.stallFirstMs);
         issue = turn || driftNow || arriving || stallNow;
         if (stallNow && anchorMode)
         {
             // The anchor task is lost and re-issuing it may not cure it (no navmesh, an interior): the same stall as a
             // straight run's, but fall back to the straight path for a while instead of repeating.
-            anchorFallbackLeftMs_ = cfg_.anchorFallbackMs;
+            // Sync A: a go-to-entity that keeps failing (the entity task never runs on this machine / in this place) must not be
+            // retried every 20 s for a lifetime: the fallback doubles for each stall in a row.
+            if (sinceAnchorStallMs_ > cfg_.anchorStreakResetMs) anchorFailStreak_ = 0;
+            double fb = cfg_.anchorFallbackMs;
+            for (int i = 0; i < anchorFailStreak_ && fb < cfg_.anchorFallbackMaxMs; ++i) fb *= 2.0;
+            if (fb > cfg_.anchorFallbackMaxMs) fb = cfg_.anchorFallbackMaxMs;
+            ++anchorFailStreak_;
+            sinceAnchorStallMs_ = 0.0;
+            anchorFallbackLeftMs_ = fb;
             ++stats_.anchorFallbacks;
             anchorMode = false;
             o.anchorMode = false;
@@ -517,6 +644,8 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         o.target = wantTask == LocoTask::GoToAnchor ? o.anchorPos : target;
         o.moveBlendRatio = blend;
         lastTask_ = wantTask;
+        lastIssueWasStall_ = why == LocoWhy::Stall;
+        steadyMs_ = 0;
         lastTaskGait_ = gait_;
         lastTarget_ = target;
         lastAnchor_ = anchor;
@@ -546,6 +675,74 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         }
     }
     return o;
+}
+
+void LocoDiag::Observe(const LocoDiagFrame& f)
+{
+    ++frames_;
+    const double hx = double(f.pose.x) - f.pedPos.x, hy = double(f.pose.y) - f.pedPos.y;
+    const double err = HLen(hx, hy);
+    errSum_ += err;
+    if (err > errMax_) errMax_ = err;
+    const double dtS = f.dtMs > 0 ? f.dtMs / 1000.0 : 0.0;
+    // the ped's speed from its positions: this frame's read against the previous one (the distance it moved in dt)
+    double derived = 0;
+    const double gapMs = f.nowMs - prevNowMs_;
+    const bool had = havePrev_ && gapMs > 0.0 && gapMs <= 250.0;
+    if (had)
+        derived = HLen(double(f.pedPos.x) - prevPed_.x, double(f.pedPos.y) - prevPed_.y) / (gapMs / 1000.0);
+    prevPed_ = f.pedPos;
+    prevNowMs_ = f.nowMs;
+    havePrev_ = true;
+    if (f.anchorMode)
+    {
+        const double ad = HLen(double(f.anchor.x) - f.pedPos.x, double(f.anchor.y) - f.pedPos.y);
+        anchorSum_ += ad;
+        if (ad > anchorMax_) anchorMax_ = ad;
+        ++anchorFrames_;
+    }
+    if (f.pushed)
+    {
+        double px = f.push.x, py = f.push.y;
+        if (f.havePedVel) { px -= f.pedVel.x; py -= f.pedVel.y; }
+        const double pm = HLen(px, py);
+        ++pushFrames_;
+        pushSum_ += pm;
+        if (pm > pushMax_) pushMax_ = pm;
+        if (f.gait == Gait::Still) idleSlide_ += pm * dtS;
+        else if (f.poseSpeed > 1.0f) pushDist_ += pm * dtS;
+    }
+    if (f.poseSpeed > 1.0f && had)
+    {
+        ++moving_;
+        totalDist_ += derived * (gapMs / 1000.0);
+        derivedSum_ += derived;
+        poseSum_ += f.poseSpeed;
+        if (derived < 0.3)
+        {
+            stuckMs_ += gapMs;
+            if (stuckMs_ >= 200.0 && !stuckCounted_) { ++stops_; stuckCounted_ = true; }
+        }
+        else { stuckMs_ = 0; stuckCounted_ = false; }
+    }
+    else { stuckMs_ = 0; stuckCounted_ = false; }
+}
+
+LocoDiagSummary LocoDiag::Summary() const
+{
+    LocoDiagSummary s;
+    s.frames = frames_;
+    s.movingFrames = moving_;
+    s.stops = stops_;
+    s.pushFrames = pushFrames_;
+    if (frames_) { s.meanErrM = errSum_ / frames_; s.maxErrM = errMax_; }
+    if (pushFrames_) { s.meanPushMs = pushSum_ / pushFrames_; s.maxPushMs = pushMax_; }
+    if (totalDist_ > 1e-6) { s.skate = pushDist_ / totalDist_; if (s.skate > 1.0) s.skate = 1.0; }
+    s.idleSlideM = idleSlide_;
+    if (moving_) { s.derivedSpeedMs = derivedSum_ / moving_; s.poseSpeedMs = poseSum_ / moving_; }
+    s.anchorFrames = anchorFrames_;
+    if (anchorFrames_) { s.meanAnchorM = anchorSum_ / anchorFrames_; s.maxAnchorM = anchorMax_; }
+    return s;
 }
 
 bool AimGate::ShouldIssue(const LocoVec& aim, const LocoVec& ped, Gait gait, bool haveTask, bool locoIssuedGoStraight,

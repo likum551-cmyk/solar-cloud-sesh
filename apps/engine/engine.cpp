@@ -166,6 +166,7 @@ namespace {
         // W8: the controller's churn per trigger (LocoStats at the last "engine: loco" line, and the Reset / SoftReset callers
         // since then), the sender's swimming edges (item 4) and its climb / vault as one TASK_CLIMB window (item 5).
         sync::LocoStats locoSeen;
+        sync::LocoDiag slide;    // Sync A: the slide metric of the last 10 s ("engine: loco slide"); script tick only
         sync::SiteTally<kLocoSites> hardSites, softSites;
         sync::WaterEdge water;
         sync::ClimbWindow climb;
@@ -3828,6 +3829,31 @@ namespace {
     // W8 items 3 and 8: the 10 s line that says WHY the controller issued tasks (per trigger, with the Reset callers) and what
     // was last applied to the ped, so an alt-tab freeze or a re-issue storm can be read from gage.log. Deltas against pe.locoSeen,
     // which the caller refreshes after the line.
+    // Sync A: one line per peer per 10 s with the numbers that say whether a puppet slides (libs/sync LocoDiag, the same code the
+    // simulated-ped tests measured). skate = metres our velocity pushes moved the ped / metres it moved, while the pose moves;
+    // ~0 means the stride carries it. idle slide = metres pushed while the ped is told to stand. "speed" = from the ped's positions
+    // against the pose's. Tasks and the learned animation speeds come from the controller.
+    std::string LocoSlideLine(int id, const Peer& pe)
+    {
+        const sync::LocoDiagSummary d = pe.slide.Summary();
+        const sync::LocoStats& a = pe.loco.Stats();
+        const sync::LocoStats& b = pe.locoSeen;
+        char buf[900];
+        std::snprintf(buf, sizeof(buf),
+                      "engine: loco slide id=%d (%s): last 10 s %u frames, %u with the pose moving: skate %.1f%%, idle slide %.2f m, "
+                      "speed from positions %.2f vs pose %.2f m/s, push mean %.2f max %.2f m/s on %u frames, pose-ped error mean %.2f "
+                      "max %.2f m, ped-anchor distance mean %.2f max %.2f m (%u anchor frames), %u stop-starts (ped under 0.3 m/s for "
+                      "200 ms while the pose runs), tasks %u go + %u stand-still, anchor stalls %u, %u settles, %u grace frames, %u "
+                      "contaminated velocity reads; learned animation speed x walk %.2f run %.2f sprint %.2f, move rate %.2f",
+                      id, pe.name.c_str(), d.frames, d.movingFrames, d.skate * 100.0, d.idleSlideM, d.derivedSpeedMs, d.poseSpeedMs,
+                      d.meanPushMs, d.maxPushMs, d.pushFrames, d.meanErrM, d.maxErrM, d.meanAnchorM, d.maxAnchorM, d.anchorFrames,
+                      d.stops, a.goStraight - b.goStraight, a.standStill - b.standStill, a.anchorFallbacks - b.anchorFallbacks,
+                      a.settles - b.settles, a.graceFrames - b.graceFrames, a.contaminated - b.contaminated,
+                      pe.loco.NominalScale(sync::Gait::Walk), pe.loco.NominalScale(sync::Gait::Run),
+                      pe.loco.NominalScale(sync::Gait::Sprint), pe.loco.LastMoveRate());
+        return buf;
+    }
+
     std::string LocoLine(int id, const Peer& pe)
     {
         const sync::LocoStats& a = pe.loco.Stats();
@@ -4329,6 +4355,23 @@ namespace {
         const sync::LocoOutput o = pe.loco.Update(in);
         if (o.paused)
             return;                                    // leaving a vehicle: the exit animation owns the ped
+        {
+            // Sync A: the slide metric (libs/sync LocoDiag), from what this frame read and what the controller decided
+            sync::LocoDiagFrame df;
+            df.dtMs = dtMs;
+            df.nowMs = nowMs;
+            df.pose = in.pos;
+            df.pedPos = in.pedPos;
+            df.poseSpeed = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+            df.gait = o.gait;
+            df.pushed = o.setVelocity;
+            df.push = o.velocity;
+            df.pedVel = in.pedVel;
+            df.havePedVel = in.havePedVel;
+            df.anchorMode = o.anchorMode && o.moveAnchor;
+            df.anchor = o.anchorPos;
+            pe.slide.Observe(df);
+        }
 
         const int32_t ped = pe.ped;
         if (o.task == sync::LocoTask::GoStraight)
@@ -4864,7 +4907,9 @@ namespace {
                                       pe.aimTask ? " (aim task)" : "", pe.shootingFrames);
                         report.emplace_back(line);
                         report.emplace_back(LocoLine(it->first, pe));   // W8: why the controller issued tasks, what was last applied
+                        report.emplace_back(LocoSlideLine(it->first, pe));   // Sync A: the slide metric
                     }
+                    pe.slide.Reset();
                     pe.shootingFrames = 0;
                     const sync::LocoStats& ls = pe.loco.Stats();
                     pe.locoGoSeen = ls.goStraight;

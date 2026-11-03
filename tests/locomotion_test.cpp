@@ -41,6 +41,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -946,10 +947,11 @@ static void TestSwimming() {
         return r;
     };
     const Run land = run(false), swim = run(true);
-    // A land ped that reads Still while a moving gait is commanded stalls: a re-issue per stallRetryMs (2.5 s: W8 item 3, it
-    // was one per 0.5 s = 11 in 6 s); a swimmer reads Still all the time and must not stall at all.
-    Check("swimming: a Still-reading swimmer is not a stall (a land ped is: exactly 2 stall re-issues in 6 s, not 11; the swimmer 0), no land move-rate override, still tracked",
-          land.frames == 360 && swim.frames == 360 && land.stall == 2 && swim.stall == 0 && swim.goStraight <= 3 &&
+    // A land ped that reads Still while a moving gait is commanded stalls: the first re-issue stallFirstMs (Sync A: 0.9 s, was
+    // 2.5 s) after the task, then one per stallRetryMs (2.5 s: W8 item 3, it was one per 0.5 s = 11 in 6 s); a swimmer reads
+    // Still all the time and must not stall at all.
+    Check("swimming: a Still-reading swimmer is not a stall (a land ped is: exactly 3 stall re-issues in 6 s, at ~0.9 / 3.4 / 5.9 s, not 11; the swimmer 0), no land move-rate override, still tracked",
+          land.frames == 360 && swim.frames == 360 && land.stall == 3 && swim.stall == 0 && swim.goStraight <= 3 &&
               land.moveRateFrames > 300 && swim.moveRateFrames == 0 && swim.maxErr < 1.0,
           F("land: go-straight %u stall %u move-rate frames %d; swim: go-straight %u stall %u move-rate frames %d max err %.3f", land.goStraight, land.stall,
             land.moveRateFrames, swim.goStraight, swim.stall, swim.moveRateFrames, swim.maxErr));
@@ -1367,7 +1369,7 @@ static void TestW11() {
     }
     {
         // A lost task (the ped reads Still for 500 ms+ while a gait is commanded): anchor mode re-issues ONCE as the straight task
-        // (stall, 2.5 s after the issue), stays Straight for anchorFallbackMs (20 s), then goes back to the anchor task.
+        // (stall, stallFirstMs = 0.9 s after the issue), stays Straight for anchorFallbackMs (20 s), then goes back to the anchor task.
         LocoConfig cfg;
         cfg.mode = LocoMode::Anchor;
         LocomotionController lc(cfg);
@@ -1394,9 +1396,9 @@ static void TestW11() {
         }
         for (size_t i = 1; i < is.size(); ++i)
             if (is[i].k == LocoTask::GoToAnchor && is[i].t != backT) onlyStraightBetween = false;
-        Check("W11 item 2: a lost anchor task (ped reads Still) is re-issued once as go-straight after ~2.5 s (cause stall), 20 s of straight, then one anchor task again",
+        Check("W11 item 2: a lost anchor task (ped reads Still) is re-issued once as go-straight after ~0.9 s (cause stall; Sync A: was 2.5 s), 20 s of straight, then one anchor task again",
               is.size() >= 3 && is[0].k == LocoTask::GoToAnchor && is[1].k == LocoTask::GoStraight && is[1].why == LocoWhy::Stall &&
-                  is[1].t >= 2400 && is[1].t <= 3200 && backT >= is[1].t + 19900 && backT <= is[1].t + 20400 && onlyStraightBetween &&
+                  is[1].t >= 800 && is[1].t <= 1300 && backT >= is[1].t + 19900 && backT <= is[1].t + 20400 && onlyStraightBetween &&
                   lc.Stats().anchorFallbacks == 1,
               F("%zu issues: %.0f ms kind %d, %.0f ms kind %d why %d, back to anchor at %.0f ms (%d); fallbacks %u", is.size(), is.size() > 0 ? is[0].t : -1,
                 is.size() > 0 ? int(is[0].k) : -1, is.size() > 1 ? is[1].t : -1, is.size() > 1 ? int(is[1].k) : -1, is.size() > 1 ? int(is[1].why) : -1,
@@ -1431,7 +1433,9 @@ static void TestW11() {
         double firstFrame[2] = {}, settled[2] = {};
         bool snapped[2] = {};
         for (int i = 0; i < 2; ++i) {
-            LocomotionController lc;
+            LocoConfig cfg;
+            cfg.residualDeadM = 0; cfg.startGraceMs = 0;   // Sync A added a dead band and a start grace: this checks the plain gain law, low-pass and cap
+            LocomotionController lc(cfg);
             LocoInput in;
             in.vel = V(4.5f, 0, 0); in.heading = 270;
             in.pedVel = V(4.5f, 0, 0); in.havePedVel = true;
@@ -1490,6 +1494,536 @@ static void TestW11() {
     }
 }
 
+// ---- 10: Sync A (docs/sync-specs/onfoot.md "Sync A"): the slide metric against a more realistic simulated ped ---------------
+//
+// RealPed is the AnimPed's richer sibling. What it models: an animation speed that follows the commanded one (blend ratio x
+// move rate x the ped's TRUE nominal speeds, which the controller only guesses) with a first-order lag (a start takes ~0.25 s
+// to get going, a stop ~0.18 s), a stride ripple on the displacement, the ped moving along its FACING with a limited turn rate
+// (so a turn bends the path late), go-to arrival (it stops within 0.1 m of the anchor / 0.25 m of a coordinate), a move rate
+// that only holds while it is set every frame, IS_PED_* gait readings from the real speed, ground height (a ramp and a curb) and
+// two readings of GET_ENTITY_VELOCITY after we set it: the animation's own velocity (the W11 assumption) or the velocity we set
+// (it persists: the push would then be fed back). Not modelled: the real GTA animation set (foot plants, start / stop / turn
+// transition clips), navmesh pathing, collision, how SET_ENTITY_VELOCITY really combines with the animation, the strafing and
+// aim blends, and the real smoother (PoseFeed below is a plain 30 Hz sample interpolator with a fixed delay, jitter and loss).
+struct RealPed {
+    LocoVec pos = V(0, 0, 30);
+    float facing = 0;                 // GTA heading, degrees (0 = +y, counter-clockwise)
+    double speed = 0;                 // the animation's current speed (scalar, before the ripple)
+    int task = 0;                     // 0 none / stand-still, 1 go-straight coordinate, 2 go-to-entity
+    LocoVec target, anchor;
+    float blend = 0, rate = 1;
+    bool lost = false;
+    // the TRUE nominal speeds at blend 1, 2, 3 and rate 1 (the controller assumes 1.5 / 4.5 / 7)
+    double nomWalk = 1.5, nomRun = 4.5, nomSprint = 7.0;
+    double accelTauMs = 250, decelTauMs = 180, ripple = 0.10, rippleHz = 1.9, turnDps = 300;
+    bool persist = false;             // GET_ENTITY_VELOCITY returns the velocity we last set (else the animation's own)
+    bool anchorDead = false;          // TASK_GO_TO_ENTITY never runs here: the ped stands (reads Still) while it is the task
+    bool additive = false;            // SET_ENTITY_VELOCITY ADDS to the animation (displacement = animation + set) instead of replacing it
+    LocoVec lastSet; bool hasLastSet = false;
+    LocoVec animVel;                  // the animation's velocity this frame (what a read returns unless persist)
+    double t = 0;
+
+    double AnimSpeed(double b) const {
+        if (b <= 0) return 0;
+        if (b <= 1) return nomWalk * b;
+        if (b <= 2) return nomWalk + (nomRun - nomWalk) * (b - 1);
+        return nomRun + (nomSprint - nomRun) * (std::min(b, 3.0) - 2);
+    }
+    Gait GameGait() const {
+        const double s = std::hypot(animVel.x, animVel.y);
+        return s < 0.5 ? Gait::Still : s < 2.65 ? Gait::Walk : s < 5.75 ? Gait::Run : Gait::Sprint;
+    }
+    LocoVec Readback() const { return persist && hasLastSet ? lastSet : animVel; }
+    // advance the animation state by dtMs; fills animVel (the displacement the animation produces this frame)
+    void Anim(double dtMs) {
+        double vd = 0;
+        double arriveR = task == 2 ? 0.1 : 0.25;
+        const LocoVec& tg = task == 2 ? anchor : target;
+        const double dx = double(tg.x) - pos.x, dy = double(tg.y) - pos.y, d = std::hypot(dx, dy);
+        if (task != 0 && !lost) {
+            if (d < arriveR) { if (task == 1) lost = true; }
+            else vd = (task == 2 && anchorDead) ? 0.0 : AnimSpeed(blend) * rate;
+            // turn toward the bearing, limited rate
+            const double want = std::atan2(-dx, dy) * 180.0 / kPi; // GTA heading of the bearing
+            const double diff = WrapDeg(want - facing);
+            const double maxTurn = turnDps * dtMs / 1000.0;
+            facing = float(WrapDeg(facing + std::max(-maxTurn, std::min(maxTurn, diff))));
+        }
+        const double k = 1.0 - std::exp(-dtMs / (vd > speed ? accelTauMs : decelTauMs));
+        speed += (vd - speed) * k;
+        if (speed < 0.02) speed = 0;
+        t += dtMs / 1000.0;
+        const double rip = 1.0 + ripple * std::min(1.0, speed / 2.0) * std::sin(2 * kPi * rippleHz * t);
+        const double a = double(facing) * kPi / 180.0;
+        animVel = V(-std::sin(a) * speed * rip, std::cos(a) * speed * rip, 0);
+    }
+};
+
+// A scripted remote: position integrated from speedAt / dirAt at 1 ms, sampled at 30 Hz (+- 3 ms), uplink U(0, 10) ms, loss.
+struct SlideScenario {
+    const char* name;
+    std::function<double(double)> speed, dirDeg;   // m/s, degrees (math convention 0 = +x)
+    double durMs = 20000;
+    double teleportAtMs = -1;                      // a 30 m jump along +y here
+    bool slopes = false;                           // ground = 0.25 * x, plus a 0.7 m curb at x = 25
+    bool reverse = false;                          // nothing: reserved
+};
+
+struct SlideOpts {
+    double scaleWalk = 1.0, scaleRun = 1.0, scaleSprint = 1.0;   // the ped's TRUE nominal speeds against the controller's guess
+    bool persist = false, anchorDead = false, additive = false;
+    double loss = 0.02, jitterMs = 10.0, delayMs = 130.0, fps = 60.0;
+    LocoMode mode = LocoMode::Anchor;
+    uint64_t seed = 7;
+    LocoConfig cfg;
+    double traceFromMs = -1, traceToMs = -1; // debugging: print one line per frame in this window
+};
+
+struct SlideResult {
+    LocoStats st;
+    LocoDiagSummary d;
+    double p95Err = 0, maxErr = 0, tasksPer10s = 0, speedRatio = 0, zPushFrames = 0;
+    uint32_t snaps = 0;
+    float learned[3] = {1, 1, 1};   // the controller's learned nominal factors: walk, run, sprint
+};
+
+static double Ground(const SlideScenario& sc, double x) {
+    return !sc.slopes ? 30.0 : 30.0 + 0.25 * x + (x > 25 ? 0.7 : 0.0);
+}
+
+static SlideResult RunSlide(const SlideScenario& sc, const SlideOpts& op) {
+    Rng rng(op.seed);
+    LocoConfig cfg = op.cfg;
+    cfg.mode = op.mode;
+    LocomotionController lc(cfg);
+    LocoDiag diag;
+    RealPed ped;
+    ped.nomWalk = 1.5 * op.scaleWalk; ped.nomRun = 4.5 * op.scaleRun; ped.nomSprint = 7.0 * op.scaleSprint;
+    ped.persist = op.persist;
+    ped.anchorDead = op.anchorDead;
+    ped.additive = op.additive;
+    struct Smp { double t, arr; LocoVec pos, vel; float heading; bool tele; };
+    std::vector<Smp> smp;
+    double tx = 0, ty = 0, yOff = 0, nextSmp = 0, tele = 0;
+    double tSub = 0;
+    SlideResult res;
+    std::vector<double> errs;
+    double speedRatioSum = 0; int speedRatioN = 0;
+    bool teleDone = false;
+    const double dtBase = 1000.0 / op.fps;
+    bool first = true;
+    double now = 0, lastNow = 0;
+    while (now < sc.durMs) {
+        const double dt = first ? dtBase : now - lastNow;
+        // truth + sampling up to `now`
+        while (tSub < now) {
+            const double a = sc.dirDeg(tSub / 1000.0) * kPi / 180.0, sp = sc.speed(tSub / 1000.0);
+            tx += std::cos(a) * sp * 0.001; ty += std::sin(a) * sp * 0.001;
+            if (!teleDone && sc.teleportAtMs >= 0 && tSub >= sc.teleportAtMs) { yOff += 30.0; teleDone = true; tele = 1; }
+            tSub += 1.0;
+            if (tSub >= nextSmp) {
+                Smp s;
+                s.t = tSub;
+                s.arr = tSub + rng.Uniform() * op.jitterMs + 5.0;
+                const double rip = 1.0 + 0.10 * std::min(1.0, sp / 2.0) * std::sin(2 * kPi * 1.9 * tSub / 1000.0 + 1.0);
+                s.pos = V(tx, ty + yOff, Ground(sc, tx));
+                s.vel = V(std::cos(a) * sp * rip, std::sin(a) * sp * rip, 0);
+                s.heading = float(WrapDeg(std::atan2(-std::cos(a), std::sin(a)) * 180.0 / kPi));
+                s.tele = tele > 0; tele = 0;
+                if (rng.Uniform() >= op.loss || s.tele) smp.push_back(s);
+                nextSmp += 1000.0 / 30.0 + (rng.Uniform() - 0.5) * 6.0;
+            }
+        }
+        // pose at renderT from the samples that have arrived
+        const double renderT = now - op.delayMs;
+        LocoVec ppos, pvel; float phead = 0; bool ptele = false;
+        {
+            int a = -1;
+            for (int i = int(smp.size()) - 1; i >= 0; --i) if (smp[i].arr <= now) { a = i; break; }
+            if (a < 0) { now += dtBase; lastNow = now - dtBase; first = false; continue; }
+            // newest arrived sample at or before renderT, and the next one if it has arrived
+            int lo = -1;
+            for (int i = a; i >= 0; --i) if (smp[i].t <= renderT) { lo = i; break; }
+            if (lo < 0) lo = 0;
+            const Smp& A = smp[lo];
+            if (lo + 1 <= a && smp[lo + 1].t > A.t && !smp[lo + 1].tele) {
+                const Smp& B = smp[lo + 1];
+                const double f = std::max(0.0, std::min(1.0, (renderT - A.t) / (B.t - A.t)));
+                ppos = V(A.pos.x + (B.pos.x - A.pos.x) * f, A.pos.y + (B.pos.y - A.pos.y) * f, A.pos.z + (B.pos.z - A.pos.z) * f);
+                pvel = V(A.vel.x + (B.vel.x - A.vel.x) * f, A.vel.y + (B.vel.y - A.vel.y) * f, 0);
+                phead = float(WrapDeg(A.heading + WrapDeg(B.heading - A.heading) * f));
+            } else {
+                const double ex = std::min(250.0, std::max(0.0, renderT - A.t)) / 1000.0; // extrapolate <= 250 ms, then hold
+                ppos = V(A.pos.x + A.vel.x * ex, A.pos.y + A.vel.y * ex, A.pos.z);
+                pvel = A.vel; phead = A.heading;
+            }
+            ptele = A.tele && (renderT - A.t) < dtBase * 1.5 && renderT >= A.t;
+        }
+        const double poseSp = std::hypot(pvel.x, pvel.y);
+        // controller input (as DrivePeer builds it)
+        LocoInput in;
+        in.pos = ppos; in.vel = pvel; in.heading = phead; in.teleported = ptele;
+        ped.pos.z = float(Ground(sc, ped.pos.x));
+        in.pedPos = ped.pos; in.pedHeading = ped.facing; in.pedGait = ped.GameGait();
+        in.dtMs = dt;
+        in.moveState = int8_t(poseSp < 0.5 ? 0 : poseSp < 3.1 ? 1 : poseSp < 6.1 ? 2 : 3);
+        const LocoVec rb = ped.Readback();
+        in.pedVel = rb; in.havePedVel = true;
+        in.noAnchor = false;
+        const LocoOutput o = lc.Update(in);
+        // apply as the engine does
+        if (o.snap) { ped.pos = o.snapPos; ped.facing = o.heading; ped.speed = 0; ped.lost = false; }
+        if (o.setHeading && !o.snap && o.gait == Gait::Still && ped.task == 0) ped.facing = o.heading;
+        if (o.moveAnchor) ped.anchor = o.anchorPos;
+        if (o.task == LocoTask::GoStraight) { ped.task = 1; ped.target = o.target; ped.blend = o.moveBlendRatio; ped.lost = false; }
+        else if (o.task == LocoTask::GoToAnchor) { ped.task = 2; ped.blend = o.moveBlendRatio; ped.lost = false; }
+        else if (o.task == LocoTask::StandStill) { ped.task = 0; }
+        if (o.setBlend) ped.blend = o.moveBlendRatio;
+        ped.rate = o.setMoveRate ? o.moveRate : 1.0f;
+        ped.Anim(dt);
+        LocoVec v = ped.animVel;
+        if (o.setVelocity) {
+            if (ped.additive) { v.x += o.velocity.x; v.y += o.velocity.y; }
+            else { v.x = o.velocity.x; v.y = o.velocity.y; }
+            ped.lastSet = o.velocity; ped.hasLastSet = true;
+        }
+        else ped.hasLastSet = false;
+        // diagnostics from the same inputs the engine has: positions as read at the top of the frame
+        LocoDiagFrame df;
+        df.dtMs = dt; df.nowMs = now; df.pose = ppos; df.pedPos = in.pedPos; df.poseSpeed = float(poseSp); df.gait = o.gait;
+        df.pushed = o.setVelocity; df.push = o.velocity; df.pedVel = rb; df.havePedVel = true;
+        df.anchorMode = o.anchorMode; df.anchor = o.anchorPos;
+        diag.Observe(df);
+        if (o.setVelocity && std::fabs(double(ppos.z) - in.pedPos.z) > 0.5) res.zPushFrames += 1;
+        if (op.traceFromMs >= 0 && now >= op.traceFromMs && now < op.traceToMs)
+            std::printf("    t=%6.0f poseSp %.2f pedSp %.2f anim %.2f gait %d task %d why %d push %d (%.2f,%.2f) err %.2f rate %.2f blend %.1f\n", now, poseSp,
+                        std::hypot(v.x, v.y), std::hypot(ped.animVel.x, ped.animVel.y), int(o.gait), int(o.task), int(o.why), int(o.setVelocity),
+                        o.velocity.x - ped.animVel.x, o.velocity.y - ped.animVel.y, std::hypot(double(ppos.x) - in.pedPos.x, double(ppos.y) - in.pedPos.y),
+                        ped.rate, ped.blend);
+        ped.pos.x = float(ped.pos.x + v.x * dt / 1000.0);
+        ped.pos.y = float(ped.pos.y + v.y * dt / 1000.0);
+        if (now >= 2000) {
+            errs.push_back(std::hypot(double(ppos.x) - in.pedPos.x, double(ppos.y) - in.pedPos.y));
+            if (poseSp > 1.0) { speedRatioSum += std::hypot(v.x, v.y) / poseSp; ++speedRatioN; }
+        }
+        first = false;
+        lastNow = now;
+        now += dtBase * (0.8 + 0.4 * rng.Uniform()); // render frame time jitter +-20%
+    }
+    res.st = lc.Stats();
+    res.d = diag.Summary();
+    std::sort(errs.begin(), errs.end());
+    if (!errs.empty()) { res.p95Err = errs[size_t(errs.size() * 0.95)]; res.maxErr = errs.back(); }
+    res.tasksPer10s = double(res.st.goStraight + res.st.standStill) * 10000.0 / sc.durMs;
+    res.speedRatio = speedRatioN ? speedRatioSum / speedRatioN : 0;
+    res.snaps = res.st.snaps;
+    res.learned[0] = lc.NominalScale(Gait::Walk); res.learned[1] = lc.NominalScale(Gait::Run); res.learned[2] = lc.NominalScale(Gait::Sprint);
+    return res;
+}
+
+static std::vector<SlideScenario> SlideScenarios() {
+    std::vector<SlideScenario> v;
+    auto C = [](double s) { return [s](double) { return s; }; };
+    auto D0 = [](double) { return 0.0; };
+    v.push_back({"walk 1.5 straight", C(1.5), D0});
+    v.push_back({"run 4.5 straight", C(4.5), D0});
+    v.push_back({"sprint 7 straight", C(7.0), D0});
+    v.push_back({"gait changes walk-run-sprint-run-walk", [](double t) {
+        const double k = std::fmod(t, 15.0);
+        return k < 3 ? 1.5 : k < 4 ? 1.5 + (4.5 - 1.5) * (k - 3) : k < 7 ? 4.5 : k < 8 ? 4.5 + 2.5 * (k - 7) : k < 10 ? 7.0 : k < 11 ? 7.0 - 2.5 * (k - 10) : k < 13 ? 4.5 : k < 14 ? 4.5 - 3.0 * (k - 13) : 1.5;
+    }, D0});
+    v.push_back({"circle R=15 at 4.5", C(4.5), [](double t) { return t * (4.5 / 15.0) * 180.0 / kPi; }});
+    v.push_back({"gentle S-curve at 4.5", C(4.5), [](double t) { return 25.0 * std::sin(2 * kPi * t / 8.0); }});
+    v.push_back({"run 3 s / stop 2 s", [](double t) { return std::fmod(t, 5.0) < 3.0 ? 4.5 : 0.0; }, D0});
+    v.push_back({"walk 2 s / stop 2 s", [](double t) { return std::fmod(t, 4.0) < 2.0 ? 1.5 : 0.0; }, D0});
+    v.push_back({"reversal: 180 deg turn every 4 s (0.4 m/s at the turn)", [](double t) {
+        const double d = std::fabs(t - 4.0 * std::floor(t / 4.0 + 0.5));   // distance to the nearest turn
+        return t > 2.0 && d < 0.6 ? 0.4 + 4.1 * d / 0.6 : 4.5;
+    }, [](double t) { return int((t + 2.0) / 4) % 2 ? 180.0 : 0.0; }});
+    v.push_back({"run up a ramp and a curb", C(4.5), D0, 20000, -1, true});
+    SlideScenario tp{"teleport 30 m mid-run", C(4.5), D0, 20000, 8000};
+    v.push_back(tp);
+    return v;
+}
+
+static void PrintSlideTable(const char* title, const SlideOpts& op) {
+    std::printf("  [%s]\n  %-40s %6s %6s %6s %6s %6s %6s %6s %5s\n", title, "scenario", "tasks", "skate", "idle m", "stops", "p95err", "maxerr", "spd/ps", "snaps");
+    for (const SlideScenario& sc : SlideScenarios()) {
+        const SlideResult r = RunSlide(sc, op);
+        std::printf("  %-40s %6.1f %6.3f %6.2f %6u %6.2f %6.2f %6.2f %5u\n", sc.name, r.tasksPer10s, r.d.skate, r.d.idleSlideM, r.d.stops, r.p95Err, r.maxErr, r.speedRatio, r.snaps);
+    }
+}
+
+// A one-frame unit input: a run at 4.5 m/s along +x, the ped `behind` m behind the pose with its own velocity `pedSpeed`.
+static LocoInput UnitIn(double behind, double pedSpeed, double dtMs = 1000.0 / 60) {
+    LocoInput in;
+    in.vel = V(4.5, 0, 0); in.heading = 270;
+    in.pos = V(100, 0, 30); in.pedPos = V(100 - behind, 0, 30);
+    in.pedVel = V(pedSpeed, 0, 0); in.havePedVel = true;
+    in.pedHeading = 270;
+    in.pedGait = Gait::Run;
+    in.dtMs = dtMs;
+    return in;
+}
+
+static void TestSyncA() {
+    if (std::getenv("SLIDE_TRACE")) {
+        SlideOpts t; t.traceFromMs = std::atof(std::getenv("SLIDE_TRACE")); t.traceToMs = t.traceFromMs + 1500;
+        const std::vector<SlideScenario> sc = SlideScenarios();
+        RunSlide(sc[std::getenv("SLIDE_SC") ? std::atoi(std::getenv("SLIDE_SC")) : 6], t);
+        return;
+    }
+    SlideOpts o;
+    PrintSlideTable("anchor, true nominals = assumed", o);
+    SlideOpts o2; o2.scaleWalk = 0.85; o2.scaleRun = 0.85; o2.scaleSprint = 0.85;
+    PrintSlideTable("anchor, ped 15% slower than assumed", o2);
+    SlideOpts o3; o3.scaleWalk = 1.15; o3.scaleRun = 1.15; o3.scaleSprint = 1.15;
+    PrintSlideTable("anchor, ped 15% faster than assumed", o3);
+    SlideOpts o4 = o; o4.persist = true;
+    PrintSlideTable("anchor, readback = last set velocity", o4);
+    SlideOpts o5 = o; o5.mode = LocoMode::Straight;
+    PrintSlideTable("straight, true nominals = assumed", o5);
+    SlideOpts o7 = o; o7.additive = true;
+    PrintSlideTable("anchor, SET_ENTITY_VELOCITY adds to the animation", o7);
+    SlideOpts o6 = o; o6.anchorDead = true;
+    PrintSlideTable("anchor task never runs (go-to-entity dead on this machine)", o6);
+
+    auto sc = [](const char* name) {
+        for (const SlideScenario& c : SlideScenarios())
+            if (std::string(c.name) == name) return c;
+        return SlideScenarios()[0];
+    };
+    // ---- the simulated ped: the numbers the next live log's "engine: loco slide" line carries ----
+    {
+        // A ped whose real run animation is 15% slower / faster than the controller's guess: the animation rate is a closed loop
+        // with a learned nominal, so the stride carries the ped (old: the velocity push carried the difference, skate 14-16%).
+        SlideOpts a = o; a.scaleRun = 0.85;
+        SlideOpts b = o; b.scaleRun = 1.15;
+        const SlideResult ra = RunSlide(sc("run 4.5 straight"), a), rb = RunSlide(sc("run 4.5 straight"), b);
+        Check("Sync A sim: a run animation 15% slower / faster than guessed is carried by the stride (skate <= 2%, old 14-16%), the learned nominal converges (+-0.06), error p95 <= 0.35 m",
+              ra.d.skate <= 0.02 && rb.d.skate <= 0.02 && std::fabs(ra.learned[1] - 0.85) <= 0.06 && std::fabs(rb.learned[1] - 1.15) <= 0.06 && ra.p95Err <= 0.35 && rb.p95Err <= 0.35,
+              F("slower: skate %.3f learned %.2f p95 %.2f; faster: skate %.3f learned %.2f p95 %.2f", ra.d.skate, ra.learned[1], ra.p95Err, rb.d.skate, rb.learned[1], rb.p95Err));
+    }
+    {
+        // Run 3 s, stand 2 s, four times: the ped is not dragged in an idle pose after each stop (old: 4.6-7.4 m of idle slide in 20 s, the
+        // 1.5 m anchor lead ran the ped through the pose and the push then pulled it back ~1 s).
+        const char* nm = "run 3 s / stop 2 s";
+        double worst = 0, worstP95 = 0;
+        for (double scale : {1.0, 0.85, 1.15}) {
+            SlideOpts a = o; a.scaleRun = a.scaleWalk = a.scaleSprint = scale;
+            const SlideResult r = RunSlide(sc(nm), a);
+            worst = std::max(worst, r.d.idleSlideM);
+            worstP95 = std::max(worstP95, r.p95Err);
+        }
+        Check("Sync A sim: 4 stops of a run (nominal x1, x0.85, x1.15): at most 1.5 m of idle slide in 20 s (old 4.6-7.4 m), error p95 <= 1.2 m",
+              worst <= 1.5 && worstP95 <= 1.2, F("worst idle slide %.2f m, worst p95 %.2f m", worst, worstP95));
+    }
+    {
+        // GET_ENTITY_VELOCITY returning the velocity we set last frame (it persists): the push must not be fed back. Old: the ped ran at
+        // 2.0-2.7x the pose speed, 6 m off, a snap every second.
+        SlideOpts a = o; a.persist = true;
+        const SlideResult r1 = RunSlide(sc("run 4.5 straight"), a), r2 = RunSlide(sc("gait changes walk-run-sprint-run-walk"), a);
+        Check("Sync A sim: with a velocity read that returns our own last push, the ped stays on the pose (speed ratio <= 1.1, <= 1 snap, error p95 <= 0.8 m; old 2.0-2.7x, 12-17 snaps)",
+              r1.speedRatio <= 1.1 && r2.speedRatio <= 1.1 && r1.snaps <= 1 && r2.snaps <= 1 && r1.p95Err <= 0.8 && r2.p95Err <= 0.8,
+              F("run: ratio %.2f snaps %u p95 %.2f; gait changes: ratio %.2f snaps %u p95 %.2f", r1.speedRatio, r1.snaps, r1.p95Err, r2.speedRatio, r2.snaps, r2.p95Err));
+    }
+    {
+        // TASK_GO_TO_ENTITY never moving the ped (frozen invisible anchor unusable): found after ~0.9 s, no dragging in the meantime.
+        SlideOpts a = o; a.anchorDead = true;
+        const SlideResult r = RunSlide(sc("run 4.5 straight"), a);
+        Check("Sync A sim: a dead go-to-entity task (the ped stands) costs at most 1 stop-start, 2 snaps, error p95 <= 1 m and skate <= 10% (old: p95 4.4 m, 12 snaps, skate 41%)",
+              r.d.stops <= 1 && r.snaps <= 2 && r.p95Err <= 1.0 && r.d.skate <= 0.10,
+              F("stops %u snaps %u p95 %.2f skate %.3f", r.d.stops, r.snaps, r.p95Err, r.d.skate));
+    }
+    {
+        // Scoreboard over every scenario but the two that move the pose discontinuously (an instant reversal, a teleport): at the assumed
+        // and +-15% animation speeds, skate <= 7%, error p95 <= 1.2 m, tasks <= 5.5 per 10 s.
+        double worstSkate = 0, worstP95 = 0, worstTasks = 0;
+        std::string worstAt;
+        int runs = 0;
+        for (double scale : {1.0, 0.85, 1.15}) {
+            SlideOpts a = o; a.scaleRun = a.scaleWalk = a.scaleSprint = scale;
+            for (const SlideScenario& c : SlideScenarios()) {
+                if (std::string(c.name).find("reversal") != std::string::npos || std::string(c.name).find("teleport") != std::string::npos) continue;
+                const SlideResult r = RunSlide(c, a);
+                ++runs;
+                if (r.d.skate > worstSkate) { worstSkate = r.d.skate; worstAt = c.name; }
+                worstP95 = std::max(worstP95, r.p95Err);
+                worstTasks = std::max(worstTasks, r.tasksPer10s);
+            }
+        }
+        Check("Sync A sim: 9 scenarios x nominal x1 / x0.85 / x1.15 (27 runs): worst skate <= 7%, worst error p95 <= 1.2 m, at most 5.5 tasks per 10 s",
+              runs == 27 && worstSkate <= 0.07 && worstP95 <= 1.2 && worstTasks <= 5.5,
+              F("%d runs, worst skate %.3f (%s), worst p95 %.2f m, worst tasks %.1f / 10 s", runs, worstSkate, worstAt.c_str(), worstP95, worstTasks));
+    }
+
+    // ---- pure units ----
+    {
+        // Leaving Still: the pose speed ramps 0 -> 1 -> 4.5 m/s over two frames (the interpolation across the first moving sample): the
+        // shown gait is Run within 100 ms, not Walk for 400 ms (old).
+        LocomotionController lc;
+        LocoInput in = UnitIn(0, 0);
+        in.vel = V(0, 0, 0); in.pedGait = Gait::Still;
+        lc.Update(in);
+        for (int i = 0; i < 20; ++i) lc.Update(in);
+        double runAt = -1, t = 0;
+        const double speeds[] = {1.0, 1.0, 4.5};
+        for (int i = 0; i < 40; ++i, t += 1000.0 / 60) {
+            in.vel = V(i < 2 ? speeds[i] : 4.5, 0, 0);
+            const LocoOutput o = lc.Update(in);
+            if (o.gait == Gait::Run && runAt < 0) runAt = t;
+        }
+        Check("Sync A: leaving Still with a one-frame speed ramp, the shown gait is Run within 100 ms (old: stuck at Walk for the 400 ms debounce)",
+              runAt >= 0 && runAt <= 100, F("Run shown at %.0f ms", runAt));
+    }
+    {
+        // A sender-hint (moveState) lifted gait still holds the full debounce; only the SPEED's own gait is followed fast.
+        LocomotionController lc;
+        LocoInput in = UnitIn(0, 0);
+        in.vel = V(1.5, 0, 0); in.pedGait = Gait::Walk; in.moveState = 1;
+        for (int i = 0; i < 60; ++i) lc.Update(in);           // walking for 1 s
+        in.moveState = 3;                                      // the hint says sprint at 1.5 m/s: capped to Run, and held 400 ms
+        double firstRun = -1, t = 0;
+        for (int i = 0; i < 60; ++i, t += 1000.0 / 60) {
+            const LocoOutput o = lc.Update(in);
+            if (o.gait == Gait::Run && firstRun < 0) firstRun = t;
+        }
+        Check("Sync A: a gait the sender's hint lifted above the speed's still holds the 400 ms debounce (Run shown at ~400 ms, not at once)",
+              firstRun >= 350 && firstRun <= 480, F("Run shown at %.0f ms", firstRun));
+    }
+    {
+        // Start grace: the ped is 1 m behind a pose that has just started to run; for 1 s no velocity push (the start animation is
+        // still getting up to speed), after 1.2 s the persistent error is pushed again. Old: pushed from the first frame.
+        LocomotionController lc;
+        LocoInput in = UnitIn(0, 0);
+        in.vel = V(0, 0, 0); in.pedGait = Gait::Still;
+        lc.Update(in);
+        for (int i = 0; i < 20; ++i) lc.Update(in);
+        size_t early = 0, late = 0;
+        for (int i = 0; i < 120; ++i) {
+            in = UnitIn(1.0, 4.5);
+            const LocoOutput o = lc.Update(in);
+            if (i >= 3 && i < 60 && o.setVelocity) ++early;
+            if (i >= 90 && o.setVelocity) ++late;
+        }
+        Check("Sync A: no velocity push in the first second after leaving Still while the ped is under 2.5 m behind; pushed again after 1.2 s (old: from the first frame)",
+              early == 0 && late > 20 && lc.Stats().graceFrames > 40, F("push frames early %zu, late %zu, grace frames %u", early, late, lc.Stats().graceFrames));
+    }
+    {
+        // Dead band: a ped 0.25 m behind a running pose (animation at the pose speed) is not pushed; 0.6 m behind: the push ramps up from the
+        // band's edge, (2 + 5 x 0.3) x 0.3 = 1.05 m/s on top of its own velocity (old band 0.08 m: 0.25 m gave 0.8 m/s).
+        double push[2] = {};
+        size_t frames0 = 0;
+        const double behind[2] = {0.25, 0.6};
+        for (int k = 0; k < 2; ++k) {
+            LocomotionController lc;
+            lc.Update(UnitIn(0, 4.5));
+            for (int i = 0; i < 150; ++i) lc.Update(UnitIn(0, 4.5));     // 2.5 s of running on the pose: grace over
+            for (int i = 0; i < 90; ++i) {
+                const LocoOutput o = lc.Update(UnitIn(behind[k], 4.5));
+                if (k == 0 && o.setVelocity) ++frames0;
+                if (o.setVelocity) push[k] = o.velocity.x - 4.5;
+            }
+        }
+        Check("Sync A: a running ped 0.25 m behind the pose is not pushed (dead band 0.30 m); 0.6 m behind it is pushed by about 1.05 m/s on top of its own velocity",
+              frames0 == 0 && push[0] == 0.0 && std::fabs(push[1] - 1.05) < 0.1, F("0.25 m: %zu push frames; 0.6 m: %.3f m/s", frames0, push[1]));
+    }
+    {
+        // A velocity read that is our own last push (the game keeps what we set) is not the animation: the push must not integrate.
+        // The ped is 0.6 m behind, every read returns the last push. Old: the push grew by the correction EVERY frame.
+        LocomotionController lc;
+        LocoVec last = V(4.5, 0, 0);
+        bool pushedBefore = false;
+        double maxV = 0;
+        for (int i = 0; i < 240; ++i) {
+            LocoInput in = UnitIn(i < 150 ? 0.0 : 0.6, 4.5);
+            if (pushedBefore) in.pedVel = last;
+            const LocoOutput o = lc.Update(in);
+            if (o.setVelocity) { last = o.velocity; pushedBefore = true; maxV = std::max(maxV, double(o.velocity.x)); }
+            else pushedBefore = false;
+        }
+        Check("Sync A: a velocity read that returns our last push is not fed back: the push stays under 4.5 + 2 m/s after 90 frames of a 0.6 m error (old: grows every frame)",
+              maxV <= 6.6 && lc.Stats().contaminated > 10, F("max pushed vx %.2f m/s, %u contaminated reads", maxV, lc.Stats().contaminated));
+    }
+    {
+        // Settle: the pose has stopped, the ped is 1.0 m behind it (and stays there: it does not walk in this unit): no stand-still for
+        // 1.5 s, the controller keeps a Walk toward the pose with the anchor ON the pose, then it stands. 0.1 m behind: stands after 150 ms.
+        auto run = [](double behind, double* standAtMs, bool* anchorOnPose, Gait* gaitAt1s) {
+            LocoConfig cfg; cfg.mode = LocoMode::Anchor;
+            LocomotionController lc(cfg);
+            for (int i = 0; i < 120; ++i) lc.Update(UnitIn(0, 4.5));
+            *standAtMs = -1; *anchorOnPose = true;
+            double t = 0;
+            for (int i = 0; i < 150; ++i, t += 1000.0 / 60) {
+                LocoInput in = UnitIn(behind, 0);
+                in.vel = V(0, 0, 0); in.pedGait = Gait::Walk;
+                const LocoOutput o = lc.Update(in);
+                if (o.task == LocoTask::StandStill && *standAtMs < 0) *standAtMs = t;
+                if (o.moveAnchor && std::hypot(double(o.anchorPos.x) - 100.0, double(o.anchorPos.y)) > 0.01) *anchorOnPose = false;
+                if (i == 60) *gaitAt1s = o.gait;
+            }
+            return lc.Stats().settles;
+        };
+        double standFar, standNear; bool onFar, onNear; Gait g1 = Gait::Still, g2 = Gait::Still;
+        const uint32_t settlesFar = run(1.0, &standFar, &onFar, &g1), settlesNear = run(0.1, &standNear, &onNear, &g2);
+        Check("Sync A: a stop with the ped 1.0 m short of the pose keeps a Walk to the pose (anchor on the pose) for ~1.5 s before the stand-still; 0.1 m short stands after ~150 ms (old: 150 ms either way)",
+              standFar >= 1500 && standFar <= 1800 && onFar && g1 == Gait::Walk && settlesFar == 1 && standNear >= 100 && standNear <= 250 && settlesNear == 0,
+              F("1.0 m: stand-still at %.0f ms, anchor on pose %d, gait at 1 s %d, %u settles; 0.1 m: at %.0f ms, %u settles", standFar, int(onFar), int(g1), settlesFar, standNear, settlesNear));
+    }
+    {
+        // The anchor has no floor under a slow pose: a pose at 0.6 m/s gets an anchor 0.48 m ahead (0.8 s of travel), not 1.5 m (old floor).
+        LocoConfig cfg; cfg.mode = LocoMode::Anchor;
+        LocomotionController lc(cfg);
+        LocoInput in = UnitIn(0, 0.6);
+        in.vel = V(0.6, 0, 0);
+        LocoOutput o;
+        for (int i = 0; i < 30; ++i) o = lc.Update(in);
+        const double lead = o.anchorPos.x - 100.0;
+        Check("Sync A: the anchor leads a slow pose by its speed only (0.6 m/s -> 0.48 m; old floor 1.5 m)", o.moveAnchor && std::fabs(lead - 0.48) < 0.03, F("lead %.3f m", lead));
+    }
+    {
+        // A go-to-entity that keeps failing is not retried every 20 s for ever: the straight fallback doubles for each stall in a row.
+        LocoConfig cfg; cfg.mode = LocoMode::Anchor;
+        LocomotionController lc(cfg);
+        AnimPed ped;
+        Path p;
+        p.speed = [](double) { return 4.5; };
+        p.dirDeg = [](double) { return 0.0; };
+        for (double t = 0; t < 200000; t += 1000.0 / 30) {
+            StepAnim(lc, ped, p.At(t / 1000.0), 1000.0 / 30, false, true);   // the ped always reads Still: every anchor task "fails"
+            p.Advance(t / 1000.0, 1000.0 / 30);
+        }
+        Check("Sync A: a go-to-entity that always stalls is retried after 20, 40, 80 s (4 anchor stalls in 200 s; old: every ~21 s, 9)",
+              lc.Stats().anchorFallbacks >= 3 && lc.Stats().anchorFallbacks <= 5, F("%u anchor stalls", lc.Stats().anchorFallbacks));
+    }
+    {
+        // LocoDiag: skate, idle slide, stop-starts, error and anchor distance from synthetic frames.
+        auto frame = [](double nowMs, double pedX, double poseX, double poseSp, Gait g, bool pushed, double pushV, double pedV) {
+            LocoDiagFrame f;
+            f.dtMs = 1000.0 / 60; f.nowMs = nowMs;
+            f.pose = V(poseX, 0, 0); f.pedPos = V(pedX, 0, 0); f.poseSpeed = float(poseSp); f.gait = g;
+            f.pushed = pushed; f.push = V(pushV, 0, 0); f.pedVel = V(pedV, 0, 0); f.havePedVel = true;
+            return f;
+        };
+        const double dt = 1000.0 / 60;
+        LocoDiag carried, dragged, idle, stuck, brief;
+        for (int i = 0; i < 120; ++i) {
+            carried.Observe(frame(i * dt, 4.0 * i * dt / 1000.0, 4.0 * i * dt / 1000.0 + 0.2, 4.0, Gait::Run, false, 0, 4.0));
+            dragged.Observe(frame(i * dt, 4.0 * i * dt / 1000.0, 4.0 * i * dt / 1000.0 + 0.2, 4.0, Gait::Run, true, 4.0, 0.0));
+            idle.Observe(frame(i * dt, 0, 0.3, 0.0, Gait::Still, true, 1.0, 0.0));
+            // stuck: the pose runs, the ped stands for frames 20..49 (500 ms), then moves; brief: stands for 4 frames only
+            const double stuckX = i < 20 ? 4.0 * i * dt / 1000.0 : i < 50 ? 4.0 * 20 * dt / 1000.0 : 4.0 * (i - 30) * dt / 1000.0;
+            stuck.Observe(frame(i * dt, stuckX, 4.0 * i * dt / 1000.0, 4.0, Gait::Run, false, 0, 0));
+            const double briefX = i < 20 ? 4.0 * i * dt / 1000.0 : i < 24 ? 4.0 * 20 * dt / 1000.0 : 4.0 * (i - 4) * dt / 1000.0;
+            brief.Observe(frame(i * dt, briefX, 4.0 * i * dt / 1000.0, 4.0, Gait::Run, false, 0, 0));
+        }
+        const LocoDiagSummary a = carried.Summary(), b = dragged.Summary(), c = idle.Summary(), d = stuck.Summary(), e = brief.Summary();
+        Check("Sync A: LocoDiag reads 0% skate for a ped carried by its stride, 100% for one dragged by pushes, 2 m of idle slide for 120 frames of a 1 m/s push on a Still ped, 1 stop-start for 500 ms standing under a running pose (0 for 67 ms)",
+              a.skate < 0.01 && b.skate > 0.99 && std::fabs(c.idleSlideM - 2.0) < 0.1 && d.stops == 1 && e.stops == 0 && std::fabs(a.derivedSpeedMs - 4.0) < 0.2 && std::fabs(a.meanErrM - 0.2) < 0.01,
+              F("carried skate %.3f, dragged %.3f, idle %.2f m, stops %u / %u, derived %.2f m/s, err %.2f m", a.skate, b.skate, c.idleSlideM, d.stops, e.stops, a.derivedSpeedMs, a.meanErrM));
+    }
+}
+
 int main() {
     std::printf("-- gait\n");
     TestGait();
@@ -1523,10 +2057,13 @@ int main() {
     std::printf("-- W11: gait changes without re-issue, anchor steering, residual push\n");
     TestW11();
 
+    std::printf("-- Sync A: slide metric against RealPed\n");
+    TestSyncA();
+
     // gait 3 + task 6 + snap 4 + velocity 6 + heading 2 + jump/ragdoll 4 + closed loop 3 + 60 s circle 1
     // + authoritative gait / debounce 7 + move rate 3 + pause 1 + aim gate 3 + swimming 1
-    // + W8: churn 2 + soft reset 2 + swim correction 1 + W11 14
-    const int expected = 3 + 6 + 4 + 6 + 2 + 4 + 3 + 1 + 7 + 3 + 1 + 3 + 1 + 2 + 2 + 1 + 14;
+    // + W8: churn 2 + soft reset 2 + swim correction 1 + W11 14 + Sync A 14
+    const int expected = 3 + 6 + 4 + 6 + 2 + 4 + 3 + 1 + 7 + 3 + 1 + 3 + 1 + 2 + 2 + 1 + 14 + 14;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

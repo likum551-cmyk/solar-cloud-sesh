@@ -80,6 +80,20 @@ Live 0.4.3 still issued 8-12 TASK_GO_STRAIGHT_TO_COORD per 10 s (first of a gait
 - Velocity push: with the ped's own velocity (GET_ENTITY_VELOCITY) only the residual error is pushed on top of it, low-passed (150 ms) and capped at 2 m/s, nothing inside the 0.08 m dead band. Jumps, ragdoll and swimming keep the pose-velocity push.
 - INFERRED, to confirm live: that TASK_GO_TO_ENTITY on a frozen invisible ped follows a moved target without pathing detours, and that SET_PED_DESIRED_MOVE_BLEND_RATIO on a running task changes its speed. The 10 s `engine: loco` line shows anchor on/off, go-to-entity issues, gait changes carried, stall fallbacks.
 
+## Sync A (0.4.6): why the receiver still slid, and what changed
+
+GI after 0.4.4/0.4.5: "players slide". W11 was never run in a game, so this is a code audit plus a simulation (`tests/locomotion_test.cpp`: `RealPed`, `RunSlide`, `SlideScenarios`; only what the code lets a simulator model: a lagged animation speed with a stride ripple, limited turn rate, go-to arrival, true nominal speeds the controller only guesses, three readings of SET_ENTITY_VELOCITY, a plain 30 Hz sample interpolator for the pose). Not modelled: real GTA clips, foot plants, navmesh, collision, the real smoother.
+
+Slide metric (`LocoDiag`, the same code runs in the test and in the engine): skate = metres our velocity pushes moved the ped / metres it moved while the pose moves; idle slide = metres pushed while the ped is told to stand; stop-starts; pose-ped error; ped-anchor distance.
+
+Findings (old logic, simulated): (1) a stop ran the ped THROUGH the pose (anchor lead floor 1.5 m, the ped runs at full gait until the stand-still) and the residual push then dragged it back ~1 s in an idle pose: 1.5 m of idle slide per stop of a run, 4.6-7.4 m in a 20 s stop-and-go; (2) the animation speed was open loop on INFERRED nominals: a ped 15% off was carried by the push for the whole run (skate 14-16%); (3) the push base is GET_ENTITY_VELOCITY: if the game keeps the velocity we set, the push integrates every frame (ped 2-2.7x the pose speed, 6 m off, a snap a second); (4) a start was dragged at +2 m/s over a half-speed stride (~40% skate for the first 1.5 s) and held a Walk for 400 ms because the first frames of a start read a walking speed; (5) a lost go-to-entity task (frozen invisible anchor not followed) dragged the ped at 2 m/s in an idle pose for 2.5 s at every start, then every 20 s again.
+
+Changes (`libs/sync/locomotion.*`, see the header's item 9): closed-loop move rate with learned nominals; push dead band 0.30 m (0.20 m standing) and a 1.2 s start grace; contaminated-read guard; settle (a stop is walked out) and an anchor lead without a floor; faster up-debounce / start window; first stall after 0.9 s and a doubling anchor fallback.
+
+Simulated result (27 runs: 9 scenarios x animation x1 / x0.85 / x1.15): worst skate 6.4% (old 25%), idle slide of a stop-and-go 0.05-1.2 m (old 4.6-7.4 m); with a persisting velocity read the ped stays on the pose (old: 2.0-2.7x speed, 12-17 snaps); with a dead go-to-entity task p95 error 0.06 m (old 4.4 m). The reversal and teleport scenarios (a discontinuous pose) are not improved and not asserted.
+
+Next live test: the new 10 s line `engine: loco slide id=... skate X%, idle slide Y m, speed from positions A vs pose B, ..., learned animation speed x walk / run / sprint, move rate`. Healthy: skate under ~5%, idle slide under ~0.5 m, speed from positions within 5% of the pose speed, stop-starts 0, learned factors steady (a run near 1.0 means the guessed nominals were right), contaminated reads 0 (if > 0 the game keeps our velocity: the guard works but tell us), tasks 1 per 10 s, anchor stalls 0.
+
 ## Sequencing
 
 Items 1-4 (libs/sync only) first; then 5(a)+(c) and 6 Tier A; then the v5 bump with 5(b) and Tier B. Server and client redeploy together (docs/api/protocol.md:751).
