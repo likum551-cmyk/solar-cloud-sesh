@@ -45,6 +45,12 @@
 //      blended back beyond 45 m, slewed), and a bike's lean (RollDeg conventions; the roll survives the
 //      controller on a banked circle).
 //
+// 11. Sync B (collision audit, docs/sync-specs/vehicles.md): the contact grace's third trigger (a velocity KICK: the car's own
+//      velocity differs from what the controller commanded by more than 3 m/s, in any direction, at any target speed) and its
+//      budget, measured on a planar rigid-body model (T-bone with a silent / stuck / late collision flag, a hit on a standing car,
+//      normal driving, a body that does not honour its commands, penetration against a car and a wall), and the 10 s contact
+//      diagnostics window (libs/sync/vehicle_contact.h).
+//
 // Every loop-shaped check also asserts how many frames it measured; the run asserts
 // the total number of checks.
 
@@ -52,12 +58,14 @@
 #include "sync/vehicle_drive.h"
 #include "sync/hypertune.h"
 #include "sync/vehicle_w9.h"
+#include "sync/vehicle_contact.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -462,9 +470,17 @@ static VehicleSample Moving(const DriveVec& pos, double vy) {
     return s;
 }
 
+// The snap tests hold the car still while the controller commands it (open loop): the commanded velocity is never honoured, which
+// is exactly what the velocity-kick trigger (Sync B) reads as a hit. They test the snap rules, so the kick trigger is off here.
+static VehicleDriveConfig NoKickCfg() {
+    VehicleDriveConfig cfg;
+    cfg.contactKickMs = 0.0f;
+    return cfg;
+}
+
 // ms until a persistent snap with the car held `off` metres beside a target moving at vy
 static double PersistentSnapMs(double off, double vy, double fps, int* frames) {
-    VehicleDriveController c;
+    VehicleDriveController c(NoKickCfg());
     const double dt = 1000.0 / fps;
     c.Update(Input(Moving(V(0, 0, 0), vy), V(0, 0, 0), vq::FromHeadingDeg(0), V(0, vy, 0), dt)); // first-frame snap
     double t = 0;
@@ -519,7 +535,7 @@ static void TestSnap() {
     {
         // under floor: target 1 m above, not climbing -> snap after 250 ms; climbing (vz 1) -> never
         auto run = [](double vz, double* when) {
-            VehicleDriveController c;
+            VehicleDriveController c(NoKickCfg());
             VehicleSample s = Still(V(0, 0, 1), vq::FromHeadingDeg(0));
             s.vel = V(0, 0, vz);
             c.Update(Input(s, V(0, 0, 1), vq::FromHeadingDeg(0), V(0, 0, 0), 10));
@@ -1013,6 +1029,7 @@ static void TestW9() {
             VehicleInterpolator ip;
             VehicleDriveController c;
             SimCar car;
+            car.velLagMs = 1e-3;                 // Sync B: a car that honours SET_ENTITY_VELOCITY within the frame (the kick trigger's premise)
             car.rot = vq::FromHeadingDeg(0);
             car.pos = V(30, -20, 5);
             Feed feed([&route](double t) { return route.At(t); }, 13000, true, 31 + i);
@@ -1098,6 +1115,363 @@ static void TestW9() {
     }
 }
 
+// ---- 11. Sync B: the collision audit (docs/sync-specs/vehicles.md), a planar contact simulation -----------------------------------
+//
+// Real GTA physics is not modelled and cannot be here: what follows is the controller against a plausible rigid-body world, so the
+// cases the audit named (a hit the collision flag does not report, a hit on a car that stands, a flag that never falls or comes a frame
+// late, a car pushed into something it cannot move) can be measured instead of argued. Bodies are oriented boxes in the plane with an
+// impulse + positional-correction contact (restitution 0.25, 240 Hz sub-steps), tyre grip (lateral velocity relaxes at 6 /s), rolling
+// drag and yaw damping; a "script frame" reads the puppet, runs the controller and writes SET_ENTITY_VELOCITY / ANGULAR_VELOCITY /
+// QUATERNION / COORDS at once (a body that honours its command within the frame; the lag model of SimCar is the opposite and is used
+// below for exactly that reason). The contact flag is what the game would report: any contact of the puppet in the previous frame's
+// physics (mode 1), the same one frame late (2), never (0), or stuck true (3).
+namespace pl {
+struct V2 { double x = 0, y = 0; };
+static V2 operator+(V2 a, V2 b) { return {a.x + b.x, a.y + b.y}; }
+static V2 operator-(V2 a, V2 b) { return {a.x - b.x, a.y - b.y}; }
+static V2 operator*(V2 a, double k) { return {a.x * k, a.y * k}; }
+static double Dot(V2 a, V2 b) { return a.x * b.x + a.y * b.y; }
+static double Cross(V2 a, V2 b) { return a.x * b.y - a.y * b.x; }
+static double Norm(V2 a) { return std::sqrt(Dot(a, a)); }
+struct Body {
+    V2 p, v;
+    double h = 0, w = 0;                 // heading rad (0 = +y, as GTA), yaw rate rad/s (counter-clockwise)
+    double m = 1500, hl = 2.3, hw = 1.0; // mass kg, half length, half width (a 4.6 x 2.0 m car)
+    bool fixed = false;
+    double Inertia() const { return m * (4 * hl * hl + 4 * hw * hw) / 12.0; }
+    V2 Fwd() const { return {-std::sin(h), std::cos(h)}; }
+    V2 Right() const { return {std::cos(h), std::sin(h)}; }
+    void Corners(V2 c[4]) const {
+        const V2 f = Fwd(), r = Right();
+        c[0] = p + f * hl + r * hw; c[1] = p + f * hl - r * hw; c[2] = p - f * hl - r * hw; c[3] = p - f * hl + r * hw;
+    }
+};
+struct Hit { bool hit = false; double depth = 0; V2 n, pt; };
+static Hit Sat(const Body& a, const Body& b) {   // separating axis; the normal points from a to b
+    Hit r;
+    V2 ca[4], cb[4];
+    a.Corners(ca); b.Corners(cb);
+    const V2 axes[4] = {a.Fwd(), a.Right(), b.Fwd(), b.Right()};
+    double best = 1e9;
+    V2 bn;
+    for (const V2& ax : axes) {
+        double mn1 = 1e9, mx1 = -1e9, mn2 = 1e9, mx2 = -1e9;
+        for (int i = 0; i < 4; ++i) {
+            double d = Dot(ca[i], ax); mn1 = std::min(mn1, d); mx1 = std::max(mx1, d);
+            d = Dot(cb[i], ax); mn2 = std::min(mn2, d); mx2 = std::max(mx2, d);
+        }
+        const double o = std::min(mx1, mx2) - std::max(mn1, mn2);
+        if (o <= 0) return r;
+        if (o < best) { best = o; bn = ax; }
+    }
+    if (Dot(bn, b.p - a.p) < 0) bn = bn * -1.0;
+    r.hit = true; r.depth = best; r.n = bn;
+    double dmin = 1e9, dmax = -1e9;
+    V2 p1, p2;
+    for (int i = 0; i < 4; ++i) {
+        const double d1 = Dot(cb[i], bn), d2 = Dot(ca[i], bn);
+        if (d1 < dmin) { dmin = d1; p1 = cb[i]; }
+        if (d2 > dmax) { dmax = d2; p2 = ca[i]; }
+    }
+    r.pt = (p1 + p2) * 0.5;
+    return r;
+}
+struct World {
+    std::vector<Body> b;
+    double rest = 0.25, grip = 6.0, rollDrag = 0.1, angDamp = 3.0, baum = 0.25, slop = 0.01;
+    std::vector<std::vector<char>> touched;
+    void Step(double dt) {
+        const int n = (int)b.size();
+        for (Body& x : b) {
+            if (x.fixed) continue;
+            const V2 f = x.Fwd(), r = x.Right();
+            const double vf = Dot(x.v, f) * std::exp(-rollDrag * dt), vl = Dot(x.v, r) * std::exp(-grip * dt);
+            x.v = f * vf + r * vl;
+            x.w *= std::exp(-angDamp * dt);
+            x.p = x.p + x.v * dt;
+            x.h += x.w * dt;
+        }
+        for (int i = 0; i < n; ++i)
+            for (int j = i + 1; j < n; ++j) {
+                Body &A = b[i], &B = b[j];
+                if (A.fixed && B.fixed) continue;
+                const Hit c = Sat(A, B);
+                if (!c.hit) continue;
+                touched[i][j] = touched[j][i] = 1;
+                const double iA = A.fixed ? 0 : 1 / A.m, iB = B.fixed ? 0 : 1 / B.m;
+                const double IA = A.fixed ? 0 : 1 / A.Inertia(), IB = B.fixed ? 0 : 1 / B.Inertia();
+                const V2 rA = c.pt - A.p, rB = c.pt - B.p;
+                const V2 vA = A.v + V2{-A.w * rA.y, A.w * rA.x}, vB = B.v + V2{-B.w * rB.y, B.w * rB.x};
+                const double vn = Dot(vB - vA, c.n);
+                if (vn < 0) {
+                    const double den = iA + iB + IA * Cross(rA, c.n) * Cross(rA, c.n) + IB * Cross(rB, c.n) * Cross(rB, c.n);
+                    const double jn = -(1 + rest) * vn / den;
+                    A.v = A.v - c.n * (jn * iA); B.v = B.v + c.n * (jn * iB);
+                    A.w -= IA * Cross(rA, c.n * jn); B.w += IB * Cross(rB, c.n * jn);
+                }
+                const double corr = std::max(0.0, c.depth - slop) * baum / std::max(1e-9, iA + iB);
+                A.p = A.p - c.n * (corr * iA); B.p = B.p + c.n * (corr * iB);
+            }
+    }
+};
+static double Overlap(const Body& a, const Body& b) { const Hit c = Sat(a, b); return c.hit ? c.depth : 0.0; }
+}   // namespace pl
+
+struct PlTarget { pl::V2 p, v; double h = 0, w = 0; };
+static PlTarget PlStraight(pl::V2 p0, pl::V2 v, double tMs) {
+    const double s = tMs / 1000.0;
+    return {p0 + v * s, v, pl::Norm(v) > 0 ? std::atan2(-v.x, v.y) : 0.0, 0.0};
+}
+static pl::Body PlCar(pl::V2 p, double h, pl::V2 v) { pl::Body b; b.p = p; b.h = h; b.v = v; return b; }
+
+struct PlRun {
+    double peakOverlap = 0, aMinSpeed = 1e9, aEndSpeed = 0, pupMaxDisp = 0, devMax = 0, wallEndY = 0;
+    uint32_t contacts = 0, byFlag = 0, byDecel = 0, byKick = 0, kickMutes = 0, snaps = 0, persistent = 0;
+    int firstGraceFrame = -1, firstDevFrame = -1, edges = 0;
+    double graceMs = 0, hardMs = 0;
+};
+struct PlScn {
+    std::function<PlTarget(double)> target;
+    pl::World w;                         // body 0 = the puppet, 1 = the local car (A), further ones are fixed or parked
+    bool aThrottle = false;              // A holds aSpeed with 6 m/s^2 (a driver with the foot down)
+    double aSpeed = 0, tEndMs = 5000;
+    int flagMode = 1;                    // 0 never, 1 previous frame's contacts, 2 the same one frame late, 3 stuck true
+    double fps = 60;
+    VehicleDriveConfig cfg;
+};
+
+static PlRun RunPl(PlScn s) {
+    VehicleDriveController c(s.cfg);
+    pl::World& w = s.w;
+    const int n = (int)w.b.size();
+    w.touched.assign(n, std::vector<char>(n, 0));
+    PlRun r;
+    bool lastFlag = false, prevTouch = false, lateTouch = false;
+    const double dtF = 1000.0 / s.fps;
+    const int sub = std::max(1, (int)std::ceil(dtF / (1000.0 / 240.0)));
+    int frame = 0;
+    for (double t = 0; t < s.tEndMs; t += dtF, ++frame) {
+        pl::Body& P = w.b[0];
+        const PlTarget tg = s.target(t);
+        VehicleDriveInput in;
+        in.target.pos = V(tg.p.x, tg.p.y, 0);
+        in.target.vel = V(tg.v.x, tg.v.y, 0);
+        in.target.rot = vq::FromHeadingDeg(Deg(tg.h));
+        in.target.angVel = V(0, 0, tg.w);
+        in.target.mode = VehMode::Interpolating;
+        in.localPos = V(P.p.x, P.p.y, 0);
+        in.localVel = V(P.v.x, P.v.y, 0);
+        in.localRot = vq::FromHeadingDeg(Deg(P.h));
+        in.dtMs = t == 0 ? 0 : dtF;
+        const bool flag = s.flagMode == 0 ? false : s.flagMode == 3 ? true : s.flagMode == 2 ? lateTouch : prevTouch;
+        in.contact = flag && !lastFlag;
+        lastFlag = flag;
+        if (in.contact) ++r.edges;
+        const VehicleDriveOutput o = c.Update(in);
+        r.devMax = std::max(r.devMax, double(o.devMs));
+        if (o.devMs > 3.0f && r.firstDevFrame < 0) r.firstDevFrame = frame;
+        if (o.graceActive && r.firstGraceFrame < 0) r.firstGraceFrame = frame;
+        (o.graceActive ? r.graceMs : r.hardMs) += dtF;
+        if (o.snap) { P.p = {o.snapPos.x, o.snapPos.y}; P.h = vq::HeadingDeg(o.snapRot) * kPi / 180.0; }
+        else if (o.setQuaternion) P.h = vq::HeadingDeg(o.rot) * kPi / 180.0;
+        if (o.setVelocity) P.v = {o.velocity.x, o.velocity.y};
+        if (o.setAngularVelocity) P.w = o.angularVelocity.z;
+        for (auto& row : w.touched) std::fill(row.begin(), row.end(), 0);
+        for (int k = 0; k < sub; ++k) {
+            if (s.aThrottle && n > 1) {
+                pl::Body& A = w.b[1];
+                const double vf = pl::Dot(A.v, A.Fwd());
+                if (vf < s.aSpeed) A.v = A.v + A.Fwd() * std::min(6.0 * dtF / 1000.0 / sub, s.aSpeed - vf);
+            }
+            w.Step(dtF / 1000.0 / sub);
+        }
+        bool touch = false;
+        for (int j = 1; j < n; ++j) if (w.touched[0][j]) touch = true;
+        lateTouch = prevTouch;                    // mode 2 reads last frame's flag value
+        prevTouch = touch;
+        for (int j = 1; j < n; ++j) r.peakOverlap = std::max(r.peakOverlap, pl::Overlap(w.b[0], w.b[j]));
+        if (n > 1 && t > 200) r.aMinSpeed = std::min(r.aMinSpeed, pl::Norm(w.b[1].v));
+        r.pupMaxDisp = std::max(r.pupMaxDisp, pl::Norm(w.b[0].p - tg.p));
+    }
+    r.contacts = c.Stats().contacts; r.byFlag = c.Stats().contactsByFlag; r.byDecel = c.Stats().contactsByDecel;
+    r.byKick = c.Stats().contactsByKick; r.kickMutes = c.Stats().kickMutes;
+    r.snaps = c.Stats().snaps - 1; r.persistent = c.Stats().persistentSnaps;
+    if (n > 1) r.aEndSpeed = pl::Norm(w.b[1].v);
+    r.wallEndY = w.b[0].p.y;
+    return r;
+}
+
+// the scenarios (all on the RECEIVER: the puppet follows its sender's straight path, A is the local player's real car)
+static PlScn PlTBone() {            // A (12 m/s, from the left) hits the side of a puppet doing 15 m/s
+    PlScn s;
+    s.target = [](double t) { return PlStraight({0, 0}, {0, 15}, t); };
+    s.w.b.push_back(PlCar({0, 0}, 0, {0, 15}));
+    s.w.b.push_back(PlCar({-12, 10.8}, -kPi / 2, {12, 0}));
+    s.aThrottle = true; s.aSpeed = 12; s.tEndMs = 4000;
+    return s;
+}
+static PlScn PlRamStanding() {      // A (15 m/s) rear-ends a puppet whose sender stands still
+    PlScn s;
+    s.target = [](double) { return PlTarget{{0, 0}, {0, 0}, 0, 0}; };
+    s.w.b.push_back(PlCar({0, 0}, 0, {0, 0}));
+    s.w.b.push_back(PlCar({0, -40}, 0, {0, 15}));
+    s.aThrottle = true; s.aSpeed = 15; s.tEndMs = 5000;
+    return s;
+}
+static PlScn PlThroughParked() {    // the sender's path runs through A, which stands (the sender's own screen shows A elsewhere)
+    PlScn s;
+    s.target = [](double t) { return PlStraight({0, -30}, {0, 15}, t); };
+    s.w.b.push_back(PlCar({0, -30}, 0, {0, 15}));
+    s.w.b.push_back(PlCar({0, 0}, 0, {0, 0}));
+    s.tEndMs = 5000;
+    return s;
+}
+static PlScn PlIntoWall() {         // the same path, a fixed wall (an obstacle that exists on this machine only)
+    PlScn s = PlThroughParked();
+    pl::Body wall; wall.p = {0, 0}; wall.hl = 0.5; wall.hw = 6; wall.fixed = true;
+    s.w.b[1] = wall;
+    return s;
+}
+static PlScn PlCircle(double tEndMs) {   // normal driving: 30 m/s on a 50 m circle, nothing near
+    PlScn s;
+    s.target = [](double t) {
+        const double R = 50, wz = 0.6, ph = wz * t / 1000.0;
+        return PlTarget{{R * std::cos(ph) - R, R * std::sin(ph)}, {-30 * std::sin(ph), 30 * std::cos(ph)}, ph, wz};
+    };
+    s.w.b.push_back(PlCar({0, 0}, 0, {0, 30}));
+    s.tEndMs = tEndMs;
+    return s;
+}
+
+static void TestSyncB() {
+    // the audit's table in one place (vehicle_drive_test prints it; the report quotes it)
+    // 1. a side hit the collision flag does not report
+    {
+        PlScn on = PlTBone(), off = PlTBone();
+        on.flagMode = off.flagMode = 0;
+        off.cfg.contactKickMs = 0.0f;                          // the W9 trigger set: flag and speed loss only
+        const PlRun a = RunPl(on), b = RunPl(off);
+        Check("Sync B kick: a 12 m/s side hit on a moving puppet that the collision flag does NOT report opens a grace (by kick) in the impact frame, where flag + speed loss open none (the lateral hit is no loss along the travel direction)",
+              a.contacts == 1 && a.byKick == 1 && a.firstGraceFrame == a.firstDevFrame && a.firstGraceFrame > 0 && b.contacts == 0 && a.devMax > 3.0,
+              F("kick: %u graces (%u by kick) at frame %d, deviation >3 m/s first at %d, max %.1f m/s; W9 triggers: %u graces", a.contacts, a.byKick,
+                a.firstGraceFrame, a.firstDevFrame, a.devMax, b.contacts));
+    }
+    // 2. a hit on a car that stands
+    {
+        PlScn on = PlRamStanding(), off = PlRamStanding();
+        on.flagMode = off.flagMode = 0;
+        off.cfg.contactKickMs = 0.0f;
+        const PlRun a = RunPl(on), b = RunPl(off);
+        Check("Sync B kick: a puppet whose sender stands still, rammed at 15 m/s with a silent flag, gets a grace (the speed-loss trigger needs a target faster than 3 m/s, so it never could)",
+              a.byKick >= 1 && a.firstGraceFrame > 0 && b.contacts == 0 && a.pupMaxDisp > b.pupMaxDisp,
+              F("kick: %u graces, puppet pushed %.2f m (W9 triggers: %u graces, %.2f m)", a.byKick, a.pupMaxDisp, b.contacts, b.pupMaxDisp));
+    }
+    // 3. a flag that never falls: one rising edge (before anything happened), no flag grace afterwards; and one that arrives a frame late
+    {
+        PlScn stuck = PlTBone(), stuckOld = PlTBone(), late = PlTBone(), lateOld = PlTBone();
+        stuck.flagMode = stuckOld.flagMode = 3;
+        late.flagMode = lateOld.flagMode = 2;
+        stuckOld.cfg.contactKickMs = 0.0f;
+        lateOld.cfg.contactKickMs = 0.0f;
+        const PlRun a = RunPl(stuck), b = RunPl(stuckOld), c = RunPl(late), d = RunPl(lateOld);
+        Check("Sync B flag failure modes: a flag stuck true gives no edge at the hit (W9: no grace at all, kick: one), a flag one frame late opens the grace one frame after the impulse (W9) where the kick opens it in the impact frame",
+              a.edges <= 1 && a.contacts == 1 && a.byKick == 1 && b.contacts == 0 && c.firstGraceFrame == c.firstDevFrame && d.firstGraceFrame > d.firstDevFrame,
+              F("stuck: %d edge(s), kick %u graces / W9 %u; late: grace at frame %d (impulse %d) / W9 grace at %d (impulse %d)", a.edges, a.contacts, b.contacts,
+                c.firstGraceFrame, c.firstDevFrame, d.firstGraceFrame, d.firstDevFrame));
+    }
+    // 4. normal driving: a body that honours its command deviates by a fraction of a m/s, never opens a kick
+    {
+        uint32_t kicks = 0, contacts = 0;
+        double worst = 0;
+        std::string got;
+        for (int i = 0; i < 3; ++i) {
+            PlScn s = PlCircle(10000);
+            s.fps = kFps[i];
+            const PlRun r = RunPl(s);
+            kicks += r.byKick; contacts += r.contacts;
+            worst = std::max(worst, r.devMax);
+            got += F("%g fps: dev %.2f  ", kFps[i], r.devMax);
+        }
+        Check("Sync B kick: a 30 m/s circle at 30/60/144 fps against a body that honours its command opens no grace and deviates by under 1 m/s (the 3 m/s trigger has 3x margin)",
+              kicks == 0 && contacts == 0 && worst < 1.0, got);
+    }
+    // 5. a body that does NOT honour the command (SimCar's 100 ms lag): the kick budget mutes itself, the damage is bounded
+    {
+        auto run = [](bool budget, uint32_t* mutes, uint32_t* contacts) {
+            VehicleDriveConfig cfg;
+            if (!budget) cfg.contactKickStormN = 0;
+            const Route route;
+            VehicleInterpolator ip;
+            VehicleDriveController c(cfg);
+            SimCar car;
+            car.velLagMs = 200;                                 // a sluggish body: it follows a command with a 200 ms lag
+            car.rot = vq::FromHeadingDeg(0);
+            car.pos = V(30, -20, 5);
+            Feed feed([&route](double t) { return route.At(t); }, 13000, true, 31);
+            double nextKnock = 1500;                            // and a 2.5 m positional disturbance every second (a big correction each time)
+            const double dt = 1000.0 / 60.0;
+            for (double now = 0; now < 13150; now += dt) {
+                feed.Deliver(now, ip);
+                VehicleSample s;
+                if (now - 120 < 0 || !ip.Sample(now - 120, s)) continue;
+                if (now - 120 >= nextKnock) { nextKnock += 1000; car.pos = V(car.pos.x + 2.5, car.pos.y, car.pos.z); }
+                car.Apply(c.Update(Input(s, car.pos, car.rot, car.vel, dt)), dt);
+            }
+            *mutes = c.Stats().kickMutes;
+            *contacts = c.Stats().contactsByKick;
+            return c.Stats().contactsByKick;
+        };
+        uint32_t mutesOn = 0, kicksOn = 0, mutesOff = 0, kicksOff = 0;
+        run(true, &mutesOn, &kicksOn);
+        run(false, &mutesOff, &kicksOff);
+        Check("Sync B kick budget: against a body that lags its commands (a big correction reads as a kick) 3 kicks in 6 s mute the trigger for 15 s: a 13 s route with a disturbance every second opens 3 kick graces, not one per disturbance",
+              mutesOn >= 1 && kicksOn <= 3 && mutesOff == 0 && kicksOff >= 6,
+              F("budget: %u kick graces, %u mutes; no budget: %u kick graces", kicksOn, mutesOn, kicksOff));
+    }
+    // 6. penetration: the controller never drives a puppet more than a few cm into what it hits, and never launches the car it hits past its own speed
+    {
+        PlScn tb = PlTBone(), ram = PlRamStanding(), thr = PlThroughParked(), wall = PlIntoWall();
+        tb.flagMode = ram.flagMode = thr.flagMode = wall.flagMode = 1;
+        const PlRun a = RunPl(tb), b = RunPl(ram), c = RunPl(thr), d = RunPl(wall);
+        Check("Sync B penetration (planar model, default controller, flag reported): T-bone, ram, a sender path through a standing car and into a wall stay under 0.5 m of overlap; the car in the path is pushed at most to the puppet's speed",
+              a.peakOverlap < 0.5 && b.peakOverlap < 0.5 && c.peakOverlap < 0.5 && d.peakOverlap < 0.5 && c.aEndSpeed < 15.5,
+              F("peak overlap: T-bone %.2f, ram %.2f, through parked %.2f (car pushed to %.1f m/s), wall %.2f m (puppet ends at y %.1f: the wall is at 0; %u snap(s), %u persistent)",
+                a.peakOverlap, b.peakOverlap, c.peakOverlap, c.aEndSpeed, d.peakOverlap, d.wallEndY, d.snaps, d.persistent));
+    }
+    // 7. what the grace does to the local car (the numbers the report quotes)
+    {
+        PlScn soft = PlTBone(), hard = PlTBone();
+        soft.flagMode = hard.flagMode = 1;
+        hard.cfg.contactGraceMs = 0.0f;                         // the old every-frame overwrite
+        const PlRun a = RunPl(soft), b = RunPl(hard);
+        Check("Sync B contact grace (planar model): with the grace the local car keeps more of its speed through the T-bone and the puppet gives more than with the every-frame overwrite",
+              a.aMinSpeed > b.aMinSpeed && a.pupMaxDisp > b.pupMaxDisp,
+              F("local car's lowest speed %.2f vs %.2f m/s; puppet pushed %.2f vs %.2f m", a.aMinSpeed, b.aMinSpeed, a.pupMaxDisp, b.pupMaxDisp));
+    }
+    // 8. the diagnostics window
+    {
+        ContactWindow cw;
+        ContactFrame f;
+        f.overwrote = true;
+        for (int i = 0; i < 10; ++i) { f.flagRead = true; f.flag = false; f.devMs = 0.1f; cw.Add(f); }   // quiet frames
+        f.devMs = 6.0f; f.flag = false; cw.Add(f);                                                       // the impulse frame, flag late
+        f.devMs = 0.5f; f.flag = true; f.edge = true; f.opened = 1; f.graceActive = true; cw.Add(f);       // the edge frame
+        f.edge = false; f.opened = 0; f.localCarDistM = 1.2f;
+        for (int i = 0; i < 3; ++i) cw.Add(f);                                                           // flag stays true, grace in force
+        f.graceActive = false; f.localCarDistM = 2.4f; cw.Add(f);                                        // a full-weight frame with the flag true
+        cw.AddPuppetNear(2.0f);
+        const ContactWindow::Window w = cw.Take();
+        const ContactWindow::Window e = cw.Take();
+        Check("Sync B diagnostics window: flag duty, edges, the deviation in the frame before an edge (late flag), graces by trigger, frames overwritten at full weight while the flag was true, distances; Take() clears",
+              w.frames == 16 && w.flagReads == 16 && w.flagTrue == 5 && w.edges == 1 && w.opened[1] == 1 && w.flagTrueHard == 1 && w.graceFrames == 4 &&
+                  std::fabs(w.preEdgeDevMax - 6.0f) < 1e-6f && std::fabs(w.edgeDevMax - 0.5f) < 1e-6f && std::fabs(w.devMax - 6.0f) < 1e-6f &&
+                  w.devOver3 == 1 && w.devOver1 == 1 && std::fabs(w.minLocalM - 1.2f) < 1e-6f && w.localUnder3m == 4 && w.localUnder1_5m == 3 &&
+                  w.puppetUnder3m == 1 && std::fabs(w.minPuppetM - 2.0f) < 1e-6f && w.Interesting() && e.frames == 0 && !e.Interesting() && e.minLocalM < 0.0f,
+              F("%u frames, flag true %u, edges %u, hard %u, grace frames %u, pre-edge dev %.1f, edge dev %.1f, min local %.1f m", w.frames, w.flagTrue, w.edges,
+                w.flagTrueHard, w.graceFrames, w.preEdgeDevMax, w.edgeDevMax, w.minLocalM));
+    }
+}
+
 int main() {
     std::printf("-- quaternion math\n");
     TestQuatMath();
@@ -1119,10 +1493,13 @@ int main() {
     TestHyperTune();
     std::printf("-- W9: contact grace, present-time lead, bike lean\n");
     TestW9();
+    std::printf("-- Sync B: collision audit (planar contact simulation)\n");
+    TestSyncB();
 
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
     // + hyper tune 4 + W9 11 (RollDeg 1, contact grace 3, no false grace 1, lead weight 1, lead slew 1, lead accuracy 2, bike roll 1, bike log 1)
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11;
+    // + Sync B 8 (kick on a silent flag, kick on a standing car, flag failure modes, no false kick, kick budget, penetration, grace effect, diagnostics window)
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11 + 8;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
