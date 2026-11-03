@@ -122,6 +122,10 @@ namespace gage::server {
             uint32_t changedTick = 0;  // a server-owned field, the occupancy or a park changed at this tick
             double fuelAcc = 0;        // fractional permille drained so far
             double driveSec = 0;       // seconds driven with the engine on (by displacement) since the last Tick
+            // v6 visual damage: s.tyres / s.tyresRim / s.windows are the merged truth (the controller's report plus the Hits that
+            // popped something of this car). visPendMs[group * 8 + slot] (group 0 tyre, 1 rim, 2 window) is when a Hit set a bit
+            // the controller has not shown yet, plus 1 (0 = none): see MergeVisual.
+            uint64_t visPendMs[3 * proto::kVehWheelSlots] = {};
         };
 
         struct Seat { uint16_t veh = kNone; uint8_t seat = 0; };
@@ -466,7 +470,8 @@ namespace gage::server {
             // Health only goes down from the controller's side (a crash); never repaired by a client. What the
             // motion-only entry leaves out (health, lights, doors) and changes is sent in full for a few frames.
             const uint16_t body = std::min(V.s.bodyHealth, u.bodyHealth), engine = std::min(V.s.engineHealth, u.engineHealth);
-            if (body != V.s.bodyHealth || engine != V.s.engineHealth || u.flags2 != V.s.flags2 || u.doors != V.s.doors)
+            const bool visChanged = MergeVisual(V, u.tyres, u.tyresRim, u.windows, nowMs); // v6
+            if (body != V.s.bodyHealth || engine != V.s.engineHealth || u.flags2 != V.s.flags2 || u.doors != V.s.doors || visChanged)
                 V.changedTick = lastTick_ + 1; // told in full from the next frame on
             V.s.bodyHealth = body;
             V.s.engineHealth = engine;
@@ -518,6 +523,56 @@ namespace gage::server {
             V->changedTick = tick;
             return Code::Ok;
         }
+        // v6: a validated vehicle Hit that names a part (protocol.h VehiclePartCode): a tyre burst, a tyre off its rim or
+        // a smashed window of a car whose shooter does not necessarily control it. The bit is set for everybody at once
+        // (told in full for a few frames) and kept as unconfirmed until the controller shows it in a VehicleUpdate or
+        // kVisAckMs pass with it not showing it (MergeVisual). Idempotent. True when the visual state changed.
+        bool HitPart(uint16_t id, proto::VehiclePart part, unsigned slot, uint64_t nowMs, uint32_t tick)
+        {
+            Vehicle* V = Mutable(id);
+            if (!V || slot >= proto::kVehWheelSlots) return false;
+            const uint8_t b = (uint8_t)(1u << slot);
+            const uint64_t stamp = nowMs + 1;
+            bool changed = false;
+            switch (part)
+            {
+            case proto::VehiclePart::Tyre:
+                if (!(V->s.tyres & b))
+                {
+                    V->s.tyres |= b;
+                    V->visPendMs[slot] = stamp;
+                    changed = true;
+                }
+                break;
+            case proto::VehiclePart::TyreRim:
+                if (!(V->s.tyresRim & b))
+                {
+                    if (!(V->s.tyres & b)) V->visPendMs[slot] = stamp;
+                    V->s.tyres |= b;
+                    V->s.tyresRim |= b;
+                    V->visPendMs[proto::kVehWheelSlots + slot] = stamp;
+                    changed = true;
+                }
+                break;
+            case proto::VehiclePart::Window:
+                if (!(V->s.windows & b))
+                {
+                    V->s.windows |= b;
+                    V->visPendMs[2 * proto::kVehWheelSlots + slot] = stamp;
+                    changed = true;
+                }
+                break;
+            default:
+                break;
+            }
+            if (changed)
+            {
+                NoteTick(tick);
+                V->changedTick = tick;
+            }
+            return changed;
+        }
+
         // A validated hit: `damage` off the body health, half of it off the engine health.
         void Damage(uint16_t id, uint16_t damage, uint32_t tick)
         {
@@ -683,6 +738,7 @@ namespace gage::server {
                 out.vehicles.push_back(V.s);
                 proto::VehicleState& e = out.vehicles.back();
                 e.motionOnly = !c.full;
+                if (V.s.ctrl == proto::kNoPlayer) e.flags2 &= (uint8_t)~proto::kVeh2Brake; // nobody brakes a car nobody controls
                 e.ageMs = (uint8_t)(nowMs > V.posMs ? std::min<uint64_t>(nowMs - V.posMs, 255) : 0);
                 R.v[c.id].lastFull = tick;
                 if (c.full) R.v[c.id].lastStatic = tick;
@@ -692,12 +748,12 @@ namespace gage::server {
             return true;
         }
 
-        // Encoded size of an entry after its id and header byte: a full one (43 bytes + 2 per occupant), or the
-        // motion-only one (24).
+        // Encoded size of an entry after its id and header byte: a full one (46 bytes + 2 per occupant; v6 added the
+        // tyre, rim and window masks), or the motion-only one (24).
         static constexpr size_t kMotionOnlyBytes = 24;
         static size_t FullBytes(const proto::VehicleState& s)
         {
-            size_t n = 43;
+            size_t n = 46;
             for (uint16_t p : s.seats)
                 if (p != proto::kNoPlayer) n += 2;
             return n;
@@ -705,6 +761,7 @@ namespace gage::server {
 
     private:
         static constexpr uint32_t kFreshFrames = 3;   // a newcomer / change is sent in this many frames
+        static constexpr uint64_t kVisAckMs = 3000;   // a Hit's visual bit waits this long for the controller to show it
         static constexpr uint32_t kRemovedRepeat = 3; // a "destroyed" notice rides this many frames
         static constexpr size_t kMaxRemovedPerFrame = 255; // the wire's u8 nRemoved
 
@@ -750,6 +807,41 @@ namespace gage::server {
             V.ctrlUpdateMs = 0;
             V.recvMs = nowMs;
             V.changedTick = tick;
+        }
+        // v6: the controller's visual report (tyre burst, off-rim and smashed-window masks) merged into V's truth.
+        // A bit the controller shows is truth (and acks a Hit's pending bit); a bit it does not show is dropped, except
+        // a Hit's bit that is still inside kVisAckMs (the controller has not had its chance to show it yet). So a
+        // repair (the controller reports the bit clear) clears it, a pop by somebody else survives until the controller
+        // shows it, and a controller that cannot show it (native missing, the pop rejected there) does not keep a
+        // phantom for ever. With no controller nothing calls this: the truth stays what the last report and Hits said.
+        // True when the merged state changed.
+        static bool MergeVisual(Vehicle& V, uint8_t reportTyres, uint8_t reportRim, uint8_t reportWindows, uint64_t nowMs)
+        {
+            const uint8_t rep[3] = { (uint8_t)(reportTyres | reportRim), reportRim, reportWindows };
+            uint8_t next[3];
+            for (size_t g = 0; g < 3; g++)
+            {
+                uint8_t n = rep[g];
+                for (size_t slot = 0; slot < proto::kVehWheelSlots; slot++)
+                {
+                    uint64_t& t = V.visPendMs[g * proto::kVehWheelSlots + slot];
+                    if (!t) continue;
+                    const uint8_t b = (uint8_t)(1u << slot);
+                    if (rep[g] & b)
+                        t = 0;                                  // the controller shows it: confirmed
+                    else if (nowMs + 1 >= t && nowMs + 1 - t >= kVisAckMs)
+                        t = 0;                                  // it never showed it: dropped
+                    else
+                        n |= b;                                 // not yet
+                }
+                next[g] = n;
+            }
+            next[0] |= next[1];
+            const bool changed = next[0] != V.s.tyres || next[1] != V.s.tyresRim || next[2] != V.s.windows;
+            V.s.tyres = next[0];
+            V.s.tyresRim = next[1];
+            V.s.windows = next[2];
+            return changed;
         }
         // Nobody controls V: it stands still.
         static void ClearController(Vehicle& V, uint32_t tick)

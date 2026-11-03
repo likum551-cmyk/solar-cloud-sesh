@@ -416,6 +416,29 @@ namespace gage::game {
         constexpr uint64_t GET_FINAL_RENDERED_CAM_COORD                = 0xA200EB1EE790F448;
         constexpr uint64_t HAS_ENTITY_CLEAR_LOS_TO_ENTITY              = 0xFCDFF7B72D23A1AC;
         constexpr uint64_t GET_PED_BONE_COORDS                         = 0x17C07FC640E86B4E;
+        // Desync overhaul round 2 / T3 (vehicle visual state, protocol v6). UNRESOLVED: lookup needed. The hashes are 0 on purpose:
+        // never guess one. A World:: wrapper whose constant is 0 returns false without calling anything (and logs once), the
+        // sync code around it (libs/sync/vehicle_visual.h) treats that as "no information / could not do it". To switch a
+        // native on, GI looks it up on the PC (public hash = the constant here, the 3889 hash = a kCrossmap3889 row in hook.cpp
+        // beside the commented placeholder, plus its GAGE_NEW_NATIVE line is already there); nothing else changes.
+        //   IS_VEHICLE_TYRE_BURST       VEHICLE  BOOL (Vehicle, int wheelId, BOOL completely)
+        //   SET_VEHICLE_TYRE_BURST      VEHICLE  void (Vehicle, int wheelId, BOOL onRim, float damage)
+        //   SET_VEHICLE_TYRE_FIXED      VEHICLE  void (Vehicle, int wheelId)
+        //   IS_VEHICLE_WINDOW_INTACT    VEHICLE  BOOL (Vehicle, int windowId)
+        //   SMASH_VEHICLE_WINDOW        VEHICLE  void (Vehicle, int windowId)
+        //   FIX_VEHICLE_WINDOW          VEHICLE  void (Vehicle, int windowId)
+        //   GET_CONTROL_NORMAL          PAD      float (int inputGroup, int control)
+        //   SET_VEHICLE_HANDBRAKE       VEHICLE  void (Vehicle, BOOL toggle)
+        //   SET_VEHICLE_BRAKE_LIGHTS    VEHICLE  void (Vehicle, BOOL toggle)
+        constexpr uint64_t IS_VEHICLE_TYRE_BURST                       = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_VEHICLE_TYRE_BURST                      = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_VEHICLE_TYRE_FIXED                      = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t IS_VEHICLE_WINDOW_INTACT                    = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t SMASH_VEHICLE_WINDOW                        = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t FIX_VEHICLE_WINDOW                          = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t GET_CONTROL_NORMAL                          = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_VEHICLE_HANDBRAKE                       = 0;   // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_VEHICLE_BRAKE_LIGHTS                    = 0;   // UNRESOLVED: lookup needed
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -983,6 +1006,18 @@ namespace gage::game {
         bool     TaskVehicleAimAtCoord(int32_t ped, float x, float y, float z);
         bool     ClearDrivebyTaskUnderneathDrivingTask(int32_t ped);
         bool     GetIsTaskActive(int32_t ped, int taskType);         // taskType is an eTaskType id
+        // ---- T3 vehicle visual state (protocol v6). Each returns false WITHOUT calling when its hash constant is still 0
+        // (UNRESOLVED: lookup needed, logged once) or the native cannot be called: the caller treats false as "no information"
+        // (a read) or "not done" (a write). `wheel` / `window` are the game's slots 0..7. ----
+        bool     IsVehicleTyreBurst(int32_t veh, int wheel, bool completely, bool& burst);   // completely = off the rim
+        bool     SetVehicleTyreBurst(int32_t veh, int wheel, bool onRim, float damage);      // damage 1000 pops it at once
+        bool     SetVehicleTyreFixed(int32_t veh, int wheel);
+        bool     IsVehicleWindowIntact(int32_t veh, int window, bool& intact);
+        bool     SmashVehicleWindow(int32_t veh, int window);
+        bool     FixVehicleWindow(int32_t veh, int window);
+        bool     GetControlNormal(int inputGroup, int control, float& value);                // -1..1 axis / 0..1 button
+        bool     SetVehicleHandbrake(int32_t veh, bool on);
+        bool     SetVehicleBrakeLights(int32_t veh, bool on);
         // Particle fx: request the asset, wait for HasNamedPtfxAssetLoaded, UseParticleFxAsset, then
         // start (the alloc8or example order). Null / empty names return false without calling.
         bool     RequestNamedPtfxAsset(const char* fxName);

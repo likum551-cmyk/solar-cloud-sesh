@@ -869,6 +869,11 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_FINAL_RENDERED_CAM_COORD,                0x02AF3EA0F67D2329},
     {native::HAS_ENTITY_CLEAR_LOS_TO_ENTITY,              0xAD915B5E38F323E5},
     {native::GET_PED_BONE_COORDS,                         0x83FDC027F0BEA202},
+    // T3 (vehicle visual state): UNRESOLVED, lookup needed. When a native's constant in hook.h is set, add its row here (public
+    // constant, 3889 hash) in place of its placeholder below; a row with public hash 0 must never be active.
+    //   {native::IS_VEHICLE_TYRE_BURST,    0x...},   {native::SET_VEHICLE_TYRE_BURST,   0x...},   {native::SET_VEHICLE_TYRE_FIXED, 0x...},
+    //   {native::IS_VEHICLE_WINDOW_INTACT, 0x...},   {native::SMASH_VEHICLE_WINDOW,     0x...},   {native::FIX_VEHICLE_WINDOW,     0x...},
+    //   {native::GET_CONTROL_NORMAL,       0x...},   {native::SET_VEHICLE_HANDBRAKE,    0x...},   {native::SET_VEHICLE_BRAKE_LIGHTS, 0x...},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -5337,6 +5342,90 @@ bool World::SetVehicleDoorOpen(int32_t veh, int door, bool loose, bool instantly
     return CallNative(native::SET_VEHICLE_DOOR_OPEN, args, 4, nullptr);
 }
 
+// ---- T3 vehicle visual state (protocol v6). A native whose hash constant is still 0 (UNRESOLVED: lookup needed) is never
+// called: the wrapper logs once and returns false, which every caller reads as "no information" / "not done".
+#define GAGE_T3_NEEDS_HASH(NAME)                                                                                          \
+    if (!native::NAME) {                                                                                                  \
+        static bool s_logged = false;                                                                                     \
+        if (!s_logged) {                                                                                                  \
+            s_logged = true;                                                                                              \
+            GLOGI("hook: " #NAME " has no hash yet (UNRESOLVED: lookup needed): the vehicle visual state that needs it stays off"); \
+        }                                                                                                                 \
+        return false;                                                                                                     \
+    }
+
+bool World::IsVehicleTyreBurst(int32_t veh, int wheel, bool completely, bool& burst) {
+    GAGE_T3_NEEDS_HASH(IS_VEHICLE_TYRE_BURST)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)wheel, boolArg(completely) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_VEHICLE_TYRE_BURST, args, 3, r)) return false;
+    burst = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetVehicleTyreBurst(int32_t veh, int wheel, bool onRim, float damage) {
+    GAGE_T3_NEEDS_HASH(SET_VEHICLE_TYRE_BURST)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)wheel, boolArg(onRim), FloatArg(damage) };
+    return CallNative(native::SET_VEHICLE_TYRE_BURST, args, 4, nullptr);
+}
+
+bool World::SetVehicleTyreFixed(int32_t veh, int wheel) {
+    GAGE_T3_NEEDS_HASH(SET_VEHICLE_TYRE_FIXED)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)wheel };
+    return CallNative(native::SET_VEHICLE_TYRE_FIXED, args, 2, nullptr);
+}
+
+bool World::IsVehicleWindowIntact(int32_t veh, int window, bool& intact) {
+    GAGE_T3_NEEDS_HASH(IS_VEHICLE_WINDOW_INTACT)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)window };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_VEHICLE_WINDOW_INTACT, args, 2, r)) return false;
+    intact = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SmashVehicleWindow(int32_t veh, int window) {
+    GAGE_T3_NEEDS_HASH(SMASH_VEHICLE_WINDOW)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)window };
+    return CallNative(native::SMASH_VEHICLE_WINDOW, args, 2, nullptr);
+}
+
+bool World::FixVehicleWindow(int32_t veh, int window) {
+    GAGE_T3_NEEDS_HASH(FIX_VEHICLE_WINDOW)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)window };
+    return CallNative(native::FIX_VEHICLE_WINDOW, args, 2, nullptr);
+}
+
+bool World::GetControlNormal(int inputGroup, int control, float& value) {
+    GAGE_T3_NEEDS_HASH(GET_CONTROL_NORMAL)
+    uint64_t args[] = { (uint64_t)(uint32_t)inputGroup, (uint64_t)(uint32_t)control };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_CONTROL_NORMAL, args, 2, r)) return false;
+    value = floatOf(r[0]);
+    return true;
+}
+
+bool World::SetVehicleHandbrake(int32_t veh, bool on) {
+    GAGE_T3_NEEDS_HASH(SET_VEHICLE_HANDBRAKE)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), boolArg(on) };
+    return CallNative(native::SET_VEHICLE_HANDBRAKE, args, 2, nullptr);
+}
+
+bool World::SetVehicleBrakeLights(int32_t veh, bool on) {
+    GAGE_T3_NEEDS_HASH(SET_VEHICLE_BRAKE_LIGHTS)
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), boolArg(on) };
+    return CallNative(native::SET_VEHICLE_BRAKE_LIGHTS, args, 2, nullptr);
+}
+#undef GAGE_T3_NEEDS_HASH
+
 bool World::GetConvertibleRoofState(int32_t veh, int& state) {
     if (!veh) return false;
     uint64_t arg[] = { entArg(veh) };
@@ -5752,11 +5841,27 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_FINAL_RENDERED_CAM_COORD),
         GAGE_NEW_NATIVE(HAS_ENTITY_CLEAR_LOS_TO_ENTITY),
         GAGE_NEW_NATIVE(GET_PED_BONE_COORDS),
+        // T3: hash 0 = UNRESOLVED, lookup needed (skipped below, with one line each); resolves like the others once set.
+        GAGE_NEW_NATIVE(IS_VEHICLE_TYRE_BURST),
+        GAGE_NEW_NATIVE(SET_VEHICLE_TYRE_BURST),
+        GAGE_NEW_NATIVE(SET_VEHICLE_TYRE_FIXED),
+        GAGE_NEW_NATIVE(IS_VEHICLE_WINDOW_INTACT),
+        GAGE_NEW_NATIVE(SMASH_VEHICLE_WINDOW),
+        GAGE_NEW_NATIVE(FIX_VEHICLE_WINDOW),
+        GAGE_NEW_NATIVE(GET_CONTROL_NORMAL),
+        GAGE_NEW_NATIVE(SET_VEHICLE_HANDBRAKE),
+        GAGE_NEW_NATIVE(SET_VEHICLE_BRAKE_LIGHTS),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));
     bool ok[total] = {};
     int resolved = 0;
+    for (int i = 0; i < total; ++i) {
+        if (kNew[i].hash) continue;
+        ok[i] = true;                                   // not a lookup failure: no hash to look up yet
+        ++resolved;
+        GLOGI("hook: native %s has no hash yet (UNRESOLVED: lookup needed); the feature that needs it stays off", kNew[i].name);
+    }
     for (int pass = 0; pass < 20 && resolved < total; ++pass) {
         if (pass) Sleep(500);
         for (int i = 0; i < total; ++i) {

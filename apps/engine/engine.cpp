@@ -22,6 +22,7 @@
 #include "sync/vehicle_drive.h"
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
+#include "sync/vehicle_visual.h"
 #include "sync/pedstate.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
@@ -402,6 +403,14 @@ namespace {
         uint8_t sentFlags = 0, sentFlags2 = 0, sentDoors = 0;
         bool sentOnce = false;
         float steerPrev = 0.0f;       // the steering estimate's held value (below 1 m/s)
+        // ---- T3 (vehicle visual state, protocol v6) ----
+        sync::VisualSync vis;         // tyres / windows: the controller's edge apply and a copy's level apply (libs/sync/vehicle_visual.h)
+        sync::DriveQuat steerPrevRot; // the rotation of the previous steering sample (the yaw rate comes from successive rotations)
+        double steerPrevRotMs = -1e9;
+        sync::VisualMask visReport;   // controller: what the car showed at the last read (visReadMs), sent in VehicleUpdate
+        sync::VisualMask sentVis;
+        double visReadMs = -1e9;
+        float sentSteer = 0.0f;       // the steering that went out last (a change of it is sent at once)
         // ---- W9 (script tick) ----
         sync::PresentLead lead;       // item 6: how far past the interpolation time this copy is drawn (near the local player)
         double leadMs = 0;            // ... the lead of this frame (for the 10 s line)
@@ -5402,6 +5411,108 @@ namespace {
         v.appliedBody = v.appliedEngineHp = 0xFFFF;
         v.lastDriveMs = 0;
         v.drive.Reset();
+        v.vis.Reset();                 // T3: a new entity shows nothing of the server's visual state yet
+        v.visReadMs = -1e9;
+        v.steerPrevRotMs = -1e9;
+    }
+
+    // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
+    // Burst tyres, smashed windows, brake lights / handbrake and a standing car's steering for the OTHER clients. The logic is
+    // libs/sync/vehicle_visual.h (tested offline, tests/t3_vehvisual_test.cpp); this is the glue. Every native here is one of
+    // the hook.h ones whose hash is still 0 (UNRESOLVED: lookup needed): a World:: wrapper then returns false, the sync module
+    // treats that as "no information / not done", and nothing below changes behaviour until GI adds the hashes.
+    // Control ids (INFERRED, GET_CONTROL_NORMAL(0, id)): INPUT_VEH_MOVE_LR 59 (-1 left .. +1 right), INPUT_VEH_ACCELERATE 71,
+    // INPUT_VEH_BRAKE 72, INPUT_VEH_HANDBRAKE 76. The steering-axis agreement counters in the 10 s line show a wrong id or sign.
+    constexpr int kCtlVehMoveLR = 59, kCtlVehAccelerate = 71, kCtlVehBrake = 72, kCtlVehHandbrake = 76;
+    constexpr double kVisReadMs = 250.0;          // the controller reads its car's tyres / windows this often
+    constexpr double kVisNearM = 150.0;           // a copy within this distance of us is re-checked and scanned after our shots
+    struct VisStats
+    {
+        // tyres / windows
+        uint32_t reads = 0, tyreReadOk = 0, tyreReadFail = 0, winReadOk = 0, winReadFail = 0;
+        uint32_t sentUpdates = 0, sentWithTyres = 0, sentWithWindows = 0;   // controller reports (VehicleUpdates) and those showing a burst tyre / smashed window
+        uint32_t partHits = 0, partHitsRefused = 0;                         // pops on copies reported as vehicle Hits, and the ones the session refused locally
+        // brake lights / handbrake / steering
+        uint32_t brakeSet = 0, brakeFail = 0, handSet = 0, handFail = 0, brakeBitsSent = 0, handBitsSent = 0, pedalReadFail = 0;
+        uint32_t steerApplied = 0, steerApplyFail = 0;
+        float steerAppliedMin = 0.0f, steerAppliedMax = 0.0f;
+        double steerAppliedSum = 0.0;
+        sync::SteerStats steerSent;
+        double yawRatioSum = 0.0;
+        uint32_t yawRatioN = 0;                                              // sender: avz (GET_ENTITY_ROTATION_VELOCITY) / the rotation-derived yaw rate
+    };
+    VisStats g_vis;
+    // One entity as vehicle_visual.h's templates see it.
+    struct VehVisualGame
+    {
+        int32_t h;
+        bool TyreBurst(int slot, bool completely, bool& burst)
+        {
+            const bool ok = g_world->IsVehicleTyreBurst(h, slot, completely, burst);
+            ++(ok ? g_vis.tyreReadOk : g_vis.tyreReadFail);
+            return ok;
+        }
+        bool WindowIntact(int slot, bool& intact)
+        {
+            const bool ok = g_world->IsVehicleWindowIntact(h, slot, intact);
+            ++(ok ? g_vis.winReadOk : g_vis.winReadFail);
+            return ok;
+        }
+        bool BurstTyre(int slot, bool onRim) { return g_world->SetVehicleTyreBurst(h, slot, onRim, 1000.0f); }
+        bool FixTyre(int slot) { return g_world->SetVehicleTyreFixed(h, slot); }
+        bool SmashWindow(int slot) { return g_world->SmashVehicleWindow(h, slot); }
+        bool FixWindow(int slot) { return g_world->FixVehicleWindow(h, slot); }
+    };
+
+    // One spawned server vehicle, every script frame: the visual state (tyres, windows). Cheap when nothing is due (Due()).
+    // iControl: we control it - the server's bits are burst on our car once (a Hit by somebody else) and the controller's report
+    // goes out in SendControlledVehicles. A copy: the server's mask is applied level-wise, and what OUR game popped on it (we shot
+    // a tyre of a car we do not control) is reported to the server as a vehicle Hit (a part code in Hit.bone), kept pending for
+    // 2.5 s so the round trip is not drawn as pop, fix, pop. Script tick.
+    void TickVehicleVisual(NetVeh& v, uint16_t id, bool iControl, double nowMs, bool nearUs, int32_t lp)
+    {
+        const proto::VehicleState& st = v.st;
+        const sync::VisualMask server{ st.tyres, st.tyresRim, st.windows };
+        const bool shotRecent = nowMs - g_lastShotMs < 1500.0;
+        VehVisualGame game{ v.handle };
+        bool ran = false;
+        const sync::VisualOut o = sync::StepVisual(v.vis, game, server, iControl, nearUs, shotRecent, nowMs, &ran);
+        if (!ran)
+            return;
+        ++g_vis.reads;
+        static int appliedLogged = 0;
+        if (o.cmd.Any() && appliedLogged < 12)
+        {
+            ++appliedLogged;
+            PeerLog(false, "engine: vehicle id=%u visual (%s): server mask tyres %02x rim %02x windows %02x -> burst %02x, off rim %02x, fixed %02x, "
+                    "windows smashed %02x fixed %02x", id, iControl ? "ours" : "copy", st.tyres, st.tyresRim, st.windows, o.cmd.burst, o.cmd.rim,
+                    o.cmd.fixTyre, o.cmd.smash, o.cmd.fixWindow);
+        }
+        if (!o.report.Any())
+            return;
+        int16_t codes[24];
+        const int n = sync::ReportToParts(o.report, codes, 24);
+        for (int i = 0; i < n; ++i)
+        {
+            proto::Hit h;
+            h.kind = proto::HitKind::Vehicle;
+            h.targetId = id;
+            h.weapon = lp ? g_world->GetSelectedPedWeapon(lp) : 0;
+            h.damage = 1;                              // the server needs a non-zero damage; the part code is what it is sent for
+            h.bone = codes[i];
+            h.shotSeq = (uint8_t)(g_shotSeq & 15);
+            if (join::SendHit(h))
+                ++g_vis.partHits;
+            else
+                ++g_vis.partHitsRefused;
+        }
+        static int reportLogged = 0;
+        if (reportLogged < 12)
+        {
+            ++reportLogged;
+            PeerLog(false, "engine: vehicle id=%u visual: our game popped tyres %02x (off rim %02x) windows %02x on this copy: reported to the server as %d vehicle Hit(s), "
+                    "weapon 0x%08x", id, o.report.tyres, o.report.rim, o.report.windows, n, (unsigned)(lp ? g_world->GetSelectedPedWeapon(lp) : 0));
+        }
     }
 
     // The server's own fields of a vehicle state onto its entity, when a new full state came in.
@@ -5427,6 +5538,10 @@ namespace {
             g_world->SetVehicleIndicatorLights(h, 1, (st.flags2 & proto::kVeh2IndicatorL) != 0);
         if (d.flags2 & proto::kVeh2IndicatorR)
             g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0);
+        if (d.flags2 & proto::kVeh2Brake)
+            ++(g_world->SetVehicleBrakeLights(h, (st.flags2 & proto::kVeh2Brake) != 0) ? g_vis.brakeSet : g_vis.brakeFail);
+        if (d.flags2 & proto::kVeh2Handbrake)   // the first sight applies "released" too: a copy must not keep a handbrake of its own
+            ++(g_world->SetVehicleHandbrake(h, (st.flags2 & proto::kVeh2Handbrake) != 0) ? g_vis.handSet : g_vis.handFail);
         if (d.flags2 & proto::kVeh2RoofDown)
         {
             if (st.flags2 & proto::kVeh2RoofDown)
@@ -5481,6 +5596,8 @@ namespace {
         if (iControl)
             return;
         ApplyVehicleBody(v);
+        if (st.flags2 & proto::kVeh2Brake)
+            g_world->SetVehicleBrakeLights(h, true);       // renewed by every full state while they are on (INFERRED: the native may not hold)
         const int engine = (st.flags & proto::kVehEngine) ? 1 : 0;
         if (engine != v.appliedEngine)
         {
@@ -5697,11 +5814,22 @@ namespace {
                     v.moving = false;
                     v.lastReadMs = v.bodyReadMs = -1e9;
                     v.steerPrev = 0.0f;
+                    v.vis.Reset();                     // T3: the new controller's tyres / windows are read and applied afresh
+                    v.visReadMs = -1e9;
+                    v.sentVis = sync::VisualMask();
+                    v.steerPrevRotMs = -1e9;
                 }
                 if (v.appliedVersion != v.stVersion)
                 {
                     ApplyVehicleFields(v, iControl);
                     v.appliedVersion = v.stVersion;
+                }
+                {
+                    // T3: tyres / windows. "Near" = the server position within kVisNearM of us (a far copy is only brought to the
+                    // server's state when it changes, never re-read or scanned).
+                    const float vdx = st.k.x - lpx, vdy = st.k.y - lpy, vdz = st.k.z - lpz;
+                    const bool visNear = mine || (haveLp && vdx * vdx + vdy * vdy + vdz * vdz <= kVisNearM * kVisNearM);
+                    TickVehicleVisual(v, id, iControl, nowMs, visNear, lp);
                 }
                 // W9 item 4 (passenger engine sound): the engine flag above is applied only when the server's flag CHANGES, and the
                 // server clears it at 0 fuel, so a car the local ped rides in as a passenger could sit with its engine stopped on
@@ -5854,7 +5982,19 @@ namespace {
                             // is -1 right .. +1 left, so the sign flips. Every frame, the native holds only while
                             // called. Whether it turns a puppet's visible wheels is INFERRED (verify live).
                             if (o.setSteering)
-                                g_world->SetVehicleSteerBias(h, -o.steering);
+                            {
+                                const bool steerOk = g_world->SetVehicleSteerBias(h, -o.steering);
+                                if (steerOk)
+                                {
+                                    const float w = -o.steering;
+                                    if (g_vis.steerApplied == 0 || w < g_vis.steerAppliedMin) g_vis.steerAppliedMin = w;
+                                    if (g_vis.steerApplied == 0 || w > g_vis.steerAppliedMax) g_vis.steerAppliedMax = w;
+                                    g_vis.steerAppliedSum += w;
+                                    ++g_vis.steerApplied;
+                                }
+                                else
+                                    ++g_vis.steerApplyFail;
+                            }
                             v.lastDriveMs = nowMs;
                         }
                     }
@@ -6579,7 +6719,7 @@ namespace {
     constexpr double kVehReadStillMs = 100.0, kBodyReadMs = 100.0;
     constexpr int kMaxVehicleSends = 12;
     uint16_t g_vehSendCursor = 0;                      // the id after the last car served
-    void SendControlledVehicles(double nowMs, int32_t sampleMs)
+    void SendControlledVehicles(double nowMs, int32_t sampleMs, int32_t lpVeh)
     {
         const uint16_t me = join::MyId();
         if (g_vehs.empty())
@@ -6619,12 +6759,38 @@ namespace {
             // the yaw rate and the speed along the body's forward axis (a kinematic bicycle). The rotation
             // velocity's unit (rad/s) and frame (world vs body; both read the same for a level car's yaw, which
             // is all this uses) are INFERRED, like the sender's avx..avz. Held below 1 m/s, per vehicle.
+            // T3: the yaw rate comes from successive rotations (a unit-safe source: the unit and frame of GET_ENTITY_ROTATION_VELOCITY are
+            // unverified) when two reads 5..300 ms apart exist, else from that native as before; the ratio between the two is logged so the
+            // first live run shows whether avz was in rad/s. When the local player DRIVES this car and the control native answers, its
+            // steering axis is the value below 1 m/s, where the estimate is noise: a standing car shows its wheels turned. Pedals: brake
+            // lights and handbrake (flags2 bits 6 and 7).
+            const bool drivenByMe = v.handle == lpVeh && g_localSeat == 0;
+            float vFwd = 0.0f;
             {
                 const sync::DriveQuat bq = sync::vq::Normalize({ u.rot.x, u.rot.y, u.rot.z, u.rot.w });
                 const sync::DriveVec fwd = sync::vq::Rotate(bq, { 0.0f, 1.0f, 0.0f });
-                const float vFwd = u.k.vx * fwd.x + u.k.vy * fwd.y + u.k.vz * fwd.z;
-                u.steer = sync::EstimateSteer(vFwd, u.avz, VehicleWheelbaseM(v.handle), v.steerPrev);
+                vFwd = u.k.vx * fwd.x + u.k.vy * fwd.y + u.k.vz * fwd.z;
+                float yaw = u.avz;
+                float yawQ = 0.0f;
+                if (v.steerPrevRotMs > -1e8 && sync::YawRateFromRotations(v.steerPrevRot, bq, (nowMs - v.steerPrevRotMs) / 1000.0, yawQ))
+                {
+                    if (std::fabs(yawQ) > 0.15f && std::isfinite(u.avz))
+                    {
+                        g_vis.yawRatioSum += (double)u.avz / (double)yawQ;
+                        ++g_vis.yawRatioN;
+                    }
+                    yaw = yawQ;
+                }
+                v.steerPrevRot = bq;
+                v.steerPrevRotMs = nowMs;
+                bool axisOk = false;
+                float axis = 0.0f;
+                if (drivenByMe)
+                    axisOk = g_world->GetControlNormal(0, kCtlVehMoveLR, axis);
+                const sync::SteerChoice sc = sync::ChooseSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), v.steerPrev, axisOk, axis);
+                u.steer = sc.steer;
                 v.steerPrev = u.steer;
+                g_vis.steerSent.Add(sc, axisOk, axis, sync::EstimateSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), 0.0f), vFwd);
             }
             if (g_world->IsVehicleEngineRunning(v.handle)) u.flags |= proto::kVehEngine;
             if (g_world->IsVehicleSirenOn(v.handle))      u.flags |= proto::kVehSiren;
@@ -6635,9 +6801,33 @@ namespace {
                 ReadVehicleBody(v.handle, v.bodyFlags2, v.bodyDoors);
                 v.bodyReadMs = nowMs;
             }
-            u.flags2 = v.bodyFlags2;
+            // T3: the pedals every call (a brake light is seen the moment it is pressed), the tyres / windows every kVisReadMs.
+            bool brakeBit = false, handBit = false;
+            if (drivenByMe)
+            {
+                float accel = 0.0f, brake = 0.0f, hand = 0.0f;
+                const bool pedalsOk = g_world->GetControlNormal(0, kCtlVehAccelerate, accel) && g_world->GetControlNormal(0, kCtlVehBrake, brake) &&
+                                      g_world->GetControlNormal(0, kCtlVehHandbrake, hand);
+                if (!pedalsOk)
+                    ++g_vis.pedalReadFail;
+                const sync::BrakeState bs = sync::ClassifyBrake(pedalsOk, accel, brake, hand, vFwd);
+                brakeBit = bs.brakeLights;
+                handBit = bs.handbrake;
+            }
+            if (nowMs - v.visReadMs >= kVisReadMs)
+            {
+                VehVisualGame game{ v.handle };
+                v.visReport = sync::ReadReport(v.vis, game);
+                v.visReadMs = nowMs;
+            }
+            u.flags2 = (uint8_t)((v.bodyFlags2 & ~(proto::kVeh2Brake | proto::kVeh2Handbrake)) | (brakeBit ? proto::kVeh2Brake : 0) |
+                                 (handBit ? proto::kVeh2Handbrake : 0));
             u.doors = v.bodyDoors;
-            const bool changed = !v.sentOnce || u.flags != v.sentFlags || u.flags2 != v.sentFlags2 || u.doors != v.sentDoors;
+            u.tyres = v.visReport.tyres;
+            u.tyresRim = v.visReport.rim;
+            u.windows = v.visReport.windows;
+            const bool changed = !v.sentOnce || u.flags != v.sentFlags || u.flags2 != v.sentFlags2 || u.doors != v.sentDoors ||
+                                 v.visReport != v.sentVis || std::fabs(u.steer - v.sentSteer) > 0.04f;
             if (!v.sendGate.Due(nowMs, v.moving, changed))
                 return;
             auto clampHp = [](float hp) -> uint16_t {
@@ -6655,6 +6845,13 @@ namespace {
                 v.sentFlags = u.flags;
                 v.sentFlags2 = u.flags2;
                 v.sentDoors = u.doors;
+                v.sentVis = v.visReport;
+                v.sentSteer = u.steer;
+                ++g_vis.sentUpdates;
+                if (u.tyres) ++g_vis.sentWithTyres;
+                if (u.windows) ++g_vis.sentWithWindows;
+                if (u.flags2 & proto::kVeh2Brake) ++g_vis.brakeBitsSent;
+                if (u.flags2 & proto::kVeh2Handbrake) ++g_vis.handBitsSent;
             }
             ++sent;
         };
@@ -7341,6 +7538,70 @@ namespace {
               hand1 - lastHand[1]);
     }
 
+    // T3, every 10 s with the vehicles lines: the vehicle visual state (tyres, windows, brake lights, handbrake, steering). Counters of the
+    // last window (the VisStats ones) and totals since the first sight of each car (the per-car sync::VisualSync stats): see
+    // docs/api/protocol.md "T3". Script tick.
+    void ReportVehVisual()
+    {
+        sync::VisualStats tot;
+        uint32_t carsTyres = 0, tyreBits = 0, carsWindows = 0;
+        for (auto& kv : g_vehs)
+        {
+            const sync::VisualStats& vs = kv.second.vis.Stats();
+            tot.reads += vs.reads;
+            tot.divergent += vs.divergent;
+            tot.stuck += vs.stuck;
+            tot.burstsApplied += vs.burstsApplied;
+            tot.rimsApplied += vs.rimsApplied;
+            tot.tyresFixed += vs.tyresFixed;
+            tot.windowsSmashed += vs.windowsSmashed;
+            tot.windowsFixed += vs.windowsFixed;
+            tot.reported += vs.reported;
+            tot.confirmed += vs.confirmed;
+            tot.expired += vs.expired;
+            tot.cmdFailures += vs.cmdFailures;
+            tot.suspends += vs.suspends;
+            if (kv.second.handle && kv.second.haveState)
+            {
+                if (kv.second.st.tyres)
+                {
+                    ++carsTyres;
+                    tyreBits += (uint32_t)sync::PopCount8(kv.second.st.tyres);
+                }
+                if (kv.second.st.windows)
+                    ++carsWindows;
+            }
+        }
+        const VisStats& c = g_vis;
+        const bool active = c.reads || c.sentUpdates || c.steerSent.n || c.steerApplied || c.steerApplyFail || c.brakeSet || c.brakeFail ||
+                            c.handSet || c.handFail || c.partHits || carsTyres || carsWindows || tot.reads;
+        if (join::IsConnected() && active)
+            GLOGI("engine: vehicle visual (T3), last 10 s: natives: tyre reads ok %u / failed %u, window reads ok %u / failed %u, brake lights set %u (failed %u), "
+                  "handbrake set %u (failed %u), pedal reads failed %u; as controller: %u updates sent (%u with a burst tyre, %u with a smashed window, %u with "
+                  "brake lights, %u with the handbrake); copies: %u cars show tyre damage (%u tyres), %u show window damage; our shots: %u pops reported as vehicle "
+                  "Hits (%u refused locally); since each car's first sight: %u reads, %u tyres burst / %u off the rim / %u fixed, %u windows smashed / %u fixed, "
+                  "%u pops reported of which %u confirmed and %u expired, %u divergent reads of which %u stuck, %u failed command rounds (%u back-offs); steering "
+                  "sent: n=%u min %.2f mean %.2f max %.2f (axis %u, held %u, estimate %u; axis agrees %u / disagrees %u with the estimate above 3 m/s); steering "
+                  "applied: n=%u (failed %u) min %.2f mean %.2f max %.2f; sender yaw rate, GET_ENTITY_ROTATION_VELOCITY / rotation-derived: mean %.2f over %u samples",
+                  c.tyreReadOk, c.tyreReadFail, c.winReadOk, c.winReadFail, c.brakeSet, c.brakeFail, c.handSet, c.handFail, c.pedalReadFail, c.sentUpdates,
+                  c.sentWithTyres, c.sentWithWindows, c.brakeBitsSent, c.handBitsSent, carsTyres, tyreBits, carsWindows, c.partHits, c.partHitsRefused, tot.reads,
+                  tot.burstsApplied, tot.rimsApplied, tot.tyresFixed, tot.windowsSmashed, tot.windowsFixed, tot.reported, tot.confirmed, tot.expired, tot.divergent,
+                  tot.stuck, tot.cmdFailures, tot.suspends, c.steerSent.n, (double)c.steerSent.min, c.steerSent.Mean(), (double)c.steerSent.max, c.steerSent.axis,
+                  c.steerSent.held, c.steerSent.estimate, c.steerSent.agree, c.steerSent.disagree, c.steerApplied, c.steerApplyFail, (double)g_vis.steerAppliedMin,
+                  c.steerApplied ? g_vis.steerAppliedSum / c.steerApplied : 0.0, (double)g_vis.steerAppliedMax, c.yawRatioN ? c.yawRatioSum / c.yawRatioN : 0.0,
+                  c.yawRatioN);
+        // The window counters start over; the sync::VisualSync totals above run on.
+        g_vis.reads = g_vis.tyreReadOk = g_vis.tyreReadFail = g_vis.winReadOk = g_vis.winReadFail = 0;
+        g_vis.sentUpdates = g_vis.sentWithTyres = g_vis.sentWithWindows = g_vis.partHits = g_vis.partHitsRefused = 0;
+        g_vis.brakeSet = g_vis.brakeFail = g_vis.handSet = g_vis.handFail = g_vis.brakeBitsSent = g_vis.handBitsSent = g_vis.pedalReadFail = 0;
+        g_vis.steerApplied = g_vis.steerApplyFail = 0;
+        g_vis.steerAppliedMin = g_vis.steerAppliedMax = 0.0f;
+        g_vis.steerAppliedSum = 0.0;
+        g_vis.steerSent.Reset();
+        g_vis.yawRatioSum = 0.0;
+        g_vis.yawRatioN = 0;
+    }
+
     // Every 10 s: one line each for vehicles, combat and anims (only while connected).
     void ReportV4(double nowMs)
     {
@@ -7350,6 +7611,7 @@ namespace {
         if (nowMs - lastMs < 10000.0)
             return;
         lastMs = nowMs;
+        ReportVehVisual();                             // T3
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
         g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;
@@ -7915,7 +8177,7 @@ namespace {
             const int32_t sampleMs = (int32_t)((uint64_t)nowMs & 0xFFFFu);
             join::SendState(k, ped, sampleMs);
             if (inScript)
-                SendControlledVehicles(nowMs, sampleMs);   // v5: every car the server says we control, not only ours
+                SendControlledVehicles(nowMs, sampleMs, lpVeh);   // v5: every car the server says we control, not only ours
         }
 
         if (!mayChange)

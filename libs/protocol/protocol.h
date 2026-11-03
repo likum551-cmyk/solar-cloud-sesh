@@ -391,14 +391,16 @@ namespace gage::proto {
     constexpr uint8_t kVehDriverFlags = kVehEngine | kVehSiren | kVehHorn;
 
     // VehicleState.flags2 / VehicleUpdate.flags2 (v5, u8, CONTROLLER-owned: what the vehicle's controlling client
-    // sees on its own car). Bits 6..7 are reserved: Decode refuses them.
+    // sees on its own car). v6 uses the last two bits (brake lights, handbrake): none is reserved any more.
     constexpr uint8_t kVeh2Headlights  = 1u << 0; // headlights actually on (the controller's game state)
     constexpr uint8_t kVeh2HighBeam    = 1u << 1;
     constexpr uint8_t kVeh2Interior    = 1u << 2; // interior light
     constexpr uint8_t kVeh2IndicatorL  = 1u << 3;
     constexpr uint8_t kVeh2IndicatorR  = 1u << 4;
     constexpr uint8_t kVeh2RoofDown    = 1u << 5; // convertible roof lowered
-    constexpr uint8_t kVeh2Known       = (1u << 6) - 1;
+    constexpr uint8_t kVeh2Brake       = 1u << 6; // v6: brake lights on (the driver's foot brake while rolling forward, or the handbrake)
+    constexpr uint8_t kVeh2Handbrake   = 1u << 7; // v6: the driver holds the handbrake (the copy's wheels lock; clear = they roll free)
+    constexpr uint8_t kVeh2Known       = 0xFF;
     // VehicleState.doors / VehicleUpdate.doors (v5, u8): which doors stand open. Bits 6..7 are reserved.
     constexpr uint8_t kDoorFrontLeft   = 1u << 0;
     constexpr uint8_t kDoorFrontRight  = 1u << 1;
@@ -407,6 +409,26 @@ namespace gage::proto {
     constexpr uint8_t kDoorHood        = 1u << 4;
     constexpr uint8_t kDoorTrunk       = 1u << 5;
     constexpr uint8_t kDoorsKnown      = (1u << 6) - 1;
+
+    // v6 visual damage (VehicleState / VehicleUpdate `tyres`, `tyresRim`, `windows`; Hit.bone for a vehicle Hit). Wheel and
+    // window numbers are the game's own slots 0..7 (a car: 0/1 front left/right, 4/5 rear, 2/3 the middle pair of a
+    // 6-wheeler; a bike: 0 front, 4 rear; windows 0..5 front/rear doors, windscreens): the wire never names a model.
+    constexpr size_t kVehWheelSlots  = 8;
+    constexpr size_t kVehWindowSlots = 8;
+    // What a vehicle Hit reports besides body damage: `Hit.bone` = (part << 8) | slot, -1 (or anything else) = none.
+    enum class VehiclePart : uint8_t { None = 0, Tyre = 1, TyreRim = 2, Window = 3 };
+    constexpr int16_t VehiclePartCode(VehiclePart part, unsigned slot) { return (int16_t)(((unsigned)part << 8) | (slot & 0xFFu)); }
+    // False for a plain bone (-1 or a ped bone id) and for a slot out of range.
+    inline bool ParseVehiclePart(int16_t bone, VehiclePart& part, unsigned& slot)
+    {
+        if (bone < 0) return false;
+        const unsigned hi = ((unsigned)bone >> 8) & 0xFFu, lo = (unsigned)bone & 0xFFu;
+        if (hi < (unsigned)VehiclePart::Tyre || hi > (unsigned)VehiclePart::Window) return false;
+        if (lo >= (hi == (unsigned)VehiclePart::Window ? kVehWindowSlots : kVehWheelSlots)) return false;
+        part = (VehiclePart)hi;
+        slot = lo;
+        return true;
+    }
 
     // A rotation (unit quaternion, GTA's GET_ENTITY_QUATERNION order x, y, z, w). On the wire it is
     // a smallest-three u32 (quant.h): at most 0.28 degrees of rotation error.
@@ -449,11 +471,18 @@ namespace gage::proto {
     //                 empty vehicle keeps its last driver while that player is near, else the nearest player takes it
     //   ownerId       (v5) the player who owns the vehicle (spawned it and has not released it), kNoPlayer = nobody.
     //                 Only the owner may take its driver's seat (VehicleResultCode::NotOwner)
-    //   flags2, doors (v5) kVeh2* and kDoor* bit sets, the controller's lights and open doors
+    //   flags2, doors (v5) kVeh2* and kDoor* bit sets, the controller's lights and open doors; v6 adds brake lights and
+    //                 the handbrake (kVeh2Brake / kVeh2Handbrake) to flags2
+    //   tyres, tyresRim, windows (v6) per-wheel / per-window visual damage, bit i = slot i: `tyres` bit set = the tyre is
+    //                 burst (flat), `tyresRim` bit set = completely burst, off the rim (always a subset of `tyres`:
+    //                 Decode refuses a rim bit without its tyre bit), `windows` bit set = smashed. The server merges the
+    //                 controller's report with the Hits that popped something of a car the shooter does not control
+    //                 (VehicleStore::HitPart); full entries only, a change rides the usual 3 fresh frames
     //   motionOnly    (v5) decode only: this entry was a motion-only entry (header 2) carrying id, ageMs, k, rot,
     //                 avx..avz, steer and flags; every other field above is NOT in it and holds a default, and the
     //                 receiver keeps what it already has. Encode writes the motion-only form for a state with this
     //                 set. flags is complete (kVeh* bits), flags2 and doors are not in a motion-only entry
+    //                 (nor are tyres, tyresRim and windows, v6)
     struct VehicleState
     {
         uint16_t   id = 0;
@@ -473,6 +502,7 @@ namespace gage::proto {
         uint16_t   ownerId = kNoPlayer;
         uint8_t    flags2 = 0;
         uint8_t    doors = 0;
+        uint8_t    tyres = 0, tyresRim = 0, windows = 0;   // v6
         bool       motionOnly = false;
     };
 
@@ -485,7 +515,7 @@ namespace gage::proto {
     //             the distance rate, parked ones about once a second, any change or newcomer at once
     //             and for 3 frames). A present vehicle without a state keeps what you have. v5: an entry
     //             is a full state or, for a vehicle that moves and whose static fields (model, health,
-    //             fuel, colours, seats, ctrl, owner, flags2, doors) did not change, a motion-only entry
+    //             fuel, colours, seats, ctrl, owner, flags2, doors, v6 tyres/tyresRim/windows) did not change, a motion-only entry
     //             (VehicleState::motionOnly); a newcomer, a change and one entry a second are full.
     //   removed   ascending, never also present: vehicles that were DESTROYED (despawned), repeated in
     //             3 frames. Apply removals before anything else.
@@ -518,7 +548,9 @@ namespace gage::proto {
     // VehicleUpdate from that player, inside the world box and under Config::vehicleMaxSpeed. The
     // server copies position, velocity, rotation, angular velocity, steering, the driver flags
     // (kVehDriverFlags; the others in `flags` are ignored) and, v5, flags2 and doors; a health can only
-    // go down this way. `sampleMs` (v5): the sender's clock when the sample was taken, as in PlayerState.
+    // go down this way. v6: `tyres`, `tyresRim` and `windows` are what the controller's own car shows (the server merges
+    // them with the visual-damage Hits it took for this car; a bit the controller does not show is dropped once it
+    // had its chance to show it, see VehicleStore::Update). `sampleMs` (v5): the sender's clock when the sample was taken, as in PlayerState.
     struct VehicleUpdate
     {
         uint32_t   seq = 0;
@@ -533,6 +565,7 @@ namespace gage::proto {
         uint16_t   sampleMs = 0;
         uint8_t    flags2 = 0;
         uint8_t    doors = 0;
+        uint8_t    tyres = 0, tyresRim = 0, windows = 0;   // v6
     };
 
     // The answer to every VehicleCmd, to its sender (reliable): `op` and `vehId` (the assigned id for
@@ -567,7 +600,11 @@ namespace gage::proto {
     // most 30 hits a second, damage clamped to kMaxHitDamage) and applies it: armour first, then
     // health. A Hit whose target is the sender itself is environmental damage (a fall, fire, a crash):
     // always accepted while alive, without the range checks. A vehicle hit takes `damage` off the
-    // body health and half of it off the engine health.
+    // body health and half of it off the engine health. v6: a vehicle Hit may also name a part in `bone`
+    // (VehiclePartCode: a tyre burst, a tyre off its rim, a smashed window): the shooter's client saw that
+    // happen on its copy of a car it does not control, and once the Hit passes the same checks the server
+    // sets that bit of the car's visual state for everybody (VehicleStore::HitPart). A bone that is not a part
+    // is ignored for vehicles, as before.
     enum class HitKind : uint8_t { Player = 1, Vehicle = 2 };
     constexpr uint16_t kMaxHitDamage = 250;
     struct Hit

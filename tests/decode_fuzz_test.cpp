@@ -239,8 +239,11 @@ static std::vector<Case> Corpus()
         a.ageMs = 20;
         a.ctrl = 4;
         a.ownerId = 4;
-        a.flags2 = kVeh2Headlights;
+        a.flags2 = kVeh2Headlights | kVeh2Brake;
         a.doors = kDoorHood;
+        a.tyres = 0x35;        // v6: slots 0, 2, 4, 5 burst
+        a.tyresRim = 0x14;     // ... 2 and 4 off the rim
+        a.windows = 0xA1;
         VehicleState b = a;
         b.id = 5;
         b.motionOnly = true;
@@ -281,8 +284,11 @@ static std::vector<Case> Corpus()
         m.bodyHealth = 1000;
         m.engineHealth = 1000;
         m.sampleMs = 12345;
-        m.flags2 = kVeh2IndicatorL;
+        m.flags2 = kVeh2IndicatorL | kVeh2Handbrake;
         m.doors = kDoorTrunk;
+        m.tyres = 0x0E;        // v6
+        m.tyresRim = 0x06;
+        m.windows = 0x11;
         v.push_back(Make("VehicleUpdate", m));
     }
     { VehicleResult m; m.op = VehicleOp::Enter; m.code = VehicleResultCode::SeatTaken; m.vehId = 6; v.push_back(Make("VehicleResult", m)); }

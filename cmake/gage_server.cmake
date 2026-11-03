@@ -109,6 +109,14 @@ add_executable(server_test ${GAGE_ROOT}/tests/server_test.cpp)
 target_link_libraries(server_test PRIVATE gage_server_core gage_netclient enet)
 set_target_properties(server_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
+# t3_vehvisual_test (Desync Overhaul round 2, T3): vehicle visual state for the other clients (burst tyres, smashed windows,
+# brake lights, steering): the v6 wire bytes, the VehicleStore merge, libs/sync/vehicle_visual.h against a fake car, and the
+# whole chain through the real in-process server over loopback ENet. vehicle_drive.cpp is compiled in (the steering helpers
+# and quaternion math live there); nothing here needs a Windows-only library.
+add_executable(t3_vehvisual_test ${GAGE_ROOT}/tests/t3_vehvisual_test.cpp ${GAGE_ROOT}/libs/sync/vehicle_drive.cpp)
+target_link_libraries(t3_vehvisual_test PRIVATE gage_server_core gage_netclient enet)
+set_target_properties(t3_vehvisual_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
 # gage-loadtest: N headless ClientSessions against an embedded (or external) server,
 # reporting tick time, CPU, bytes and packets (apps/loadtest/main.cpp, docs/perf/).
 add_executable(gage-loadtest ${GAGE_ROOT}/apps/loadtest/main.cpp)

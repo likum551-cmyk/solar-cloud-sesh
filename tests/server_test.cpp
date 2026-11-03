@@ -2604,9 +2604,9 @@ static void VehicleV5UnitTests()
         const Code fromOther = vs.Update(1, other, 1010);
         const bool unchanged = vs.Get(v)->s.flags2 == u.flags2 && vs.Get(v)->s.doors == u.doors;
         proto::VehicleUpdate reserved = UnitDrive(v, 0, 1, 10);
-        reserved.flags2 = 0x40;
+        reserved.tyresRim = 0x04;                        // v6: flags2 has no reserved bit left; a rim bit without its tyre bit is the refusal
         const Code badFlags = vs.Update(0, reserved, 1020);
-        reserved.flags2 = 0;
+        reserved.tyresRim = 0;
         reserved.doors = 0x80;
         const Code badDoors = vs.Update(0, reserved, 1030);
         proto::VehicleWorld w;
@@ -2614,7 +2614,7 @@ static void VehicleV5UnitTests()
         const bool wire = w.vehicles.size() == 1 && w.vehicles[0].flags2 == u.flags2 && w.vehicles[0].doors == u.doors &&
                           w.vehicles[0].ctrl == 0 && w.vehicles[0].ownerId == proto::kNoPlayer;
         Check("vehicles v5: flags2 (lights, indicators, roof) and doors are the controller's alone - taken from its Update, ignored from anybody else (NotAllowed), "
-              "BadArg with a reserved bit - and ride the VehicleWorld entry with ctrl and ownerId",
+              "BadArg with a reserved doors bit or a rim bit without its tyre bit - and ride the VehicleWorld entry with ctrl and ownerId",
               fromCtrl == Code::Ok && stored && fromOther == Code::NotAllowed && unchanged && badFlags == Code::BadArg && badDoors == Code::BadArg && wire);
     }
 
@@ -2656,10 +2656,10 @@ static void VehicleV5UnitTests()
             proto::VehicleWorld mine;
             if (vs.BuildFrame(0, true, At(0, 0), tick, now, mine) && !mine.vehicles.empty()) driverFulls++;
         }
-        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 43 + 2 per occupant when full (one occupant: 47).
+        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 46 + 2 per occupant when full (v6: tyres, rim, windows; one occupant: 50).
         Check("vehicles v5: for a receiver of a driven car the entries are full for the first 3 frames and then about once a second (20 ticks) and motion-only "
               "(a 34-byte frame, entry 26 bytes) in between, every one with its age; the driver itself gets full states only at the parked rate",
-              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 43 + 2 &&
+              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 46 + 2 &&
                   driverFulls <= 5,
               std::to_string(fulls) + " full, " + std::to_string(motion) + " motion-only, " + std::to_string(motionBytes) + "/" + std::to_string(fullBytes) +
                   " bytes, driver " + std::to_string(driverFulls));

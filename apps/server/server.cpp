@@ -1769,7 +1769,15 @@ namespace gage::server {
         if (tp)
             stats_.hitsDamageApplied += HurtPlayer(*tp, c.id, h.weapon, scaled.damage, h.bone, DamageFlags(scaled.headshot, eff, false));
         else
+        {
             vehicles_.Damage(h.targetId, damage, tick_); // a vehicle's body health is not a player's: the clamped number, unscaled
+            // v6: the Hit names a part (a tyre the shooter saw burst on its copy, a smashed window): set it for everybody. A bone
+            // that is not a part (-1, a ped bone id) is ignored for a vehicle, as before.
+            proto::VehiclePart part;
+            unsigned slot;
+            if (proto::ParseVehiclePart(h.bone, part, slot) && vehicles_.HitPart(h.targetId, part, slot, nowMs, tick_))
+                stats_.vehiclePartHits++;
+        }
         return HitVerdict::Accept;
     }
 

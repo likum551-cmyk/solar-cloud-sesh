@@ -1771,6 +1771,9 @@ static proto::VehicleState SampleVehicle()
     v.ownerId = 5;
     v.flags2 = proto::kVeh2Headlights | proto::kVeh2Interior | proto::kVeh2IndicatorR; // 0x15
     v.doors = proto::kDoorFrontLeft | proto::kDoorTrunk;                              // 0x21
+    v.tyres = 0x11;                                                                    // v6: wheel slots 0 and 4 burst
+    v.tyresRim = 0x10;                                                                 // ... slot 4 off its rim
+    v.windows = 0x30;                                                                  // ... windows 4 and 5 smashed
     return v;
 }
 
@@ -1823,6 +1826,9 @@ static std::vector<VSample> V4Samples()
     up.sampleMs = 0x5566;                                    // v5
     up.flags2 = proto::kVeh2Headlights | proto::kVeh2IndicatorL; // 0x09
     up.doors = proto::kDoorFrontRight | proto::kDoorHood;        // 0x12
+    up.tyres = 0x06;                                             // v6: slots 1 and 2 burst
+    up.tyresRim = 0x02;                                          // ... slot 1 off its rim
+    up.windows = 0x01;                                           // ... window 0 smashed
     up.vehId = 5;
     up.k = Kin(1.0f, 2.0f, 3.0f, 0.0f, 5.0f, 6.0f, 7.0f);
     up.avz = 0.25f;
@@ -1938,7 +1944,9 @@ static void VehicleCodecTests()
             v && w.tick == 0x01020304u && w.removed == std::vector<uint16_t>{7} && w.present == std::vector<uint16_t>{5, 9, 11} &&
             w.vehicles.size() == 2 && !v->motionOnly && v->ageMs == 12 && v->ctrl == 3 && v->ownerId == 5 &&
             v->flags2 == (proto::kVeh2Headlights | proto::kVeh2Interior | proto::kVeh2IndicatorR) &&
-            v->doors == (proto::kDoorFrontLeft | proto::kDoorTrunk) && w.vehicles[1].motionOnly && w.vehicles[1].id == 11 &&
+            v->doors == (proto::kDoorFrontLeft | proto::kDoorTrunk) && v->tyres == 0x11 && v->tyresRim == 0x10 && v->windows == 0x30 &&
+            w.vehicles[1].tyres == 0 && w.vehicles[1].windows == 0 && up.tyres == 0x06 && up.tyresRim == 0x02 && up.windows == 0x01 &&
+            w.vehicles[1].motionOnly && w.vehicles[1].id == 11 &&
             w.vehicles[1].ageMs == 30 && w.vehicles[1].flags == proto::kVehEngine && w.vehicles[1].k.vz == 7.0f &&
             w.vehicles[1].steer == -1.0f && w.vehicles[1].model == 0 && w.vehicles[1].ctrl == proto::kNoPlayer &&
             up.sampleMs == 0x5566 && up.flags2 == (proto::kVeh2Headlights | proto::kVeh2IndicatorL) &&
@@ -1978,6 +1986,7 @@ static void VehicleCodecTests()
             0x0C,                                           // v5: ageMs 12
             0x03, 0x00, 0x05, 0x00,                         // v5: ctrl player 3, ownerId player 5
             0x15, 0x21,                                     // v5: flags2 headlights | interior | indicator R, doors FL | trunk
+            0x11, 0x10, 0x30,                               // v6: tyres slots 0 + 4 burst, rim slot 4, windows 4 + 5 smashed
             0x05, 0x03, 0x00, 0x05, 0x00,                   // seat mask 0b101: seat 0 = player 3, seat 2 = player 5
             0x09, 0x00,                                     // id 9, header 0 = present, no full state
             0x0B, 0x02,                                     // v5: id 11, header 2 = motion-only entry follows
@@ -1995,7 +2004,8 @@ static void VehicleCodecTests()
                                      0xFF, 0xFD, 0xF7, 0xDF, 0x00, 0x00, 0x04, 0x7F,       // rotation, av 0 0 4, steer 127
                                      0x14, 0xE7, 0x03, 0xE8, 0x03,                          // flags engine | horn, body 999, engine 1000
                                      0x66, 0x55,                                            // v5: sampleMs 0x5566
-                                     0x09, 0x12};                                           // v5: flags2 headlights | indicator L, doors FR | hood
+                                     0x09, 0x12,                                            // v5: flags2 headlights | indicator L, doors FR | hood
+                                     0x06, 0x02, 0x01};                                     // v6: tyres slots 1 + 2, rim slot 1, window 0
         const proto::Bytes wantHit = {0x14, 0x01, 0x02, 0x00, 0x71, 0xD5, 0x06, 0x1B, 0x22, 0x00, 0x6E, 0x79, 0x09};
         const proto::Bytes wantDmg = {0x15, 0x02, 0x00, 0x01, 0x00, 0x71, 0xD5, 0x06, 0x1B, 0x22, 0x00, 0x42, 0x00, 0x00,
                                       0x6E, 0x79,   // v5: bone 31086
@@ -2003,10 +2013,10 @@ static void VehicleCodecTests()
         const proto::Bytes wantKilled = {0x16, 0x02, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
                                          0x03};     // v5: flags headshot | melee
         const proto::Bytes wantStop = {0x1E, 0x04, 0x00};
-        Check("codec v5: VehicleWorld (u8 ids, presence list, 43 + 2-per-occupant full entry, 24-byte motion-only entry), VehicleCmd (Register tail), "
-              "VehicleUpdate (37 bytes), Hit, Damage (17), Killed (10) and PeerAnimStop are laid out byte for byte",
+        Check("codec v6: VehicleWorld (u8 ids, presence list, 46 + 2-per-occupant full entry, 24-byte motion-only entry), VehicleCmd (Register tail), "
+              "VehicleUpdate (40 bytes), Hit, Damage (17), Killed (10) and PeerAnimStop are laid out byte for byte",
               vs[0].bytes == wantWorld && vs[1].bytes == wantLock && vs[2].bytes == wantReg && vs[3].bytes == wantUp &&
-                  vs[5].bytes == wantHit && vs[6].bytes == wantDmg && vs[7].bytes == wantKilled && wantUp.size() == 37 &&
+                  vs[5].bytes == wantHit && vs[6].bytes == wantDmg && vs[7].bytes == wantKilled && wantUp.size() == 40 &&
                   wantDmg.size() == 17 && wantKilled.size() == 10 && vs[15].bytes == wantStop && proto::Encode(proto::Respawn()).size() == 1,
               Hex(vs[0].bytes) + "| " + Hex(vs[2].bytes) + "| " + Hex(vs[3].bytes) + "| " + Hex(vs[5].bytes) + "| " + Hex(vs[6].bytes) + "| " +
                   Hex(vs[7].bytes));
@@ -2055,23 +2065,24 @@ static void VehicleCodecTests()
             return DecodeAs<proto::VehicleWorld>(b.data(), b.size());
         };
         // Offsets: 9 id 5, 10 its header, 15..22 position, 29..32 rotation, 33..35 av, 36 steer, 37 flags,
-        // 38/39 body, 42/43 fuel, 46 ageMs, 47/48 ctrl, 49/50 ownerId, 51 flags2, 52 doors, 53 seat mask, 54/55 the first
-        // occupant, 58 the second entry's id, 59 its header, 60 the third entry's id, 61 its header (2: motion-only),
-        // 62 its ageMs, 63..84 its motion (84 steering), 85 its flags.
+        // 38/39 body, 42/43 fuel, 46 ageMs, 47/48 ctrl, 49/50 ownerId, 51 flags2, 52 doors, 53 tyres, 54 tyresRim (v6),
+        // 55 windows, 56 seat mask, 57/58 the first occupant, 61 the second entry's id, 62 its header, 63 the third entry's id,
+        // 64 its header (2: motion-only), 65 its ageMs, 66..87 its motion (87 steering), 88 its flags.
         std::string bad;
         if (worldWith(10, 0x03)) bad += "[reserved header bit]";
         if (worldWith(10, 0x04)) bad += "[header 4]";
-        if (worldWith(59, 0x04)) bad += "[reserved header bit, no state]";
-        if (worldWith(59, 0x03)) bad += "[header 3 on a presence-only entry]";
-        if (worldWith(61, 0x01)) bad += "[motion-only entry read as a full one]";
-        if (worldWith(61, 0x00)) bad += "[motion-only entry read as presence-only]";
-        if (worldWith(51, 0x55)) bad += "[flags2 bit 6]";
+        if (worldWith(62, 0x04)) bad += "[reserved header bit, no state]";
+        if (worldWith(62, 0x03)) bad += "[header 3 on a presence-only entry]";
+        if (worldWith(64, 0x01)) bad += "[motion-only entry read as a full one]";
+        if (worldWith(64, 0x00)) bad += "[motion-only entry read as presence-only]";
+        if (!worldWith(51, 0xFF)) bad += "[flags2 with bits 6 and 7 (brake lights, handbrake) is legal in v6]";
+        if (worldWith(53, 0x00)) bad += "[rim bit without its tyre bit]";
         if (worldWith(52, 0x61)) bad += "[doors bit 6]";
         if (worldWith(48, 0x04)) bad += "[ctrl over kMaxPlayers]";
         if (worldWith(50, 0x04)) bad += "[ownerId over kMaxPlayers]";
-        if (worldWith(84, 0x80)) bad += "[motion-only steering -128]";
-        if (worldWith(85, 0x24)) bad += "[motion-only unknown flag 32]";
-        if (worldWith(58, 0x05)) bad += "[present not ascending]";
+        if (worldWith(87, 0x80)) bad += "[motion-only steering -128]";
+        if (worldWith(88, 0x24)) bad += "[motion-only unknown flag 32]";
+        if (worldWith(61, 0x05)) bad += "[present not ascending]";
         if (worldWith(9, 0x07)) bad += "[present and removed]";
         if (worldWith(6, 0x09)) bad += "[removed and present]";
         if (worldWith(32, 0xFF)) bad += "[rotation code 1023]"; // 0xFFF7FDFF: bits 20..29 = 1023
@@ -2080,8 +2091,8 @@ static void VehicleCodecTests()
         if (worldWith(37, 0x23)) bad += "[unknown flag 32]";
         if (worldWith(39, 0x04)) bad += "[body over 1000]";
         if (worldWith(43, 0x04)) bad += "[fuel over 1000]";
-        if (worldWith(55, 0x04)) bad += "[occupant id over kMaxPlayers]";
-        if (worldWith(53, 0x07)) bad += "[seat mask lies]";
+        if (worldWith(58, 0x04)) bad += "[occupant id over kMaxPlayers]";
+        if (worldWith(56, 0x07)) bad += "[seat mask lies]";
         if (worldWith(8, 0x01) || worldWith(7, 0x04)) bad += "[present count lies]"; // 259 present; 4 present with 3 listed
         // Out of the box: z = -2^19 cm (-5243 m, the 20-bit field's minimum) fits the field but not the box.
         {
@@ -2115,16 +2126,18 @@ static void VehicleCodecTests()
             b[off] = v;
             return DecodeAs<proto::VehicleUpdate>(b.data(), b.size());
         };
-        // Offsets: 27 steering, 28 flags, 29/30 body, 33/34 sampleMs, 35 flags2, 36 doors.
+        // Offsets: 27 steering, 28 flags, 29/30 body, 33/34 sampleMs, 35 flags2, 36 doors, 37 tyres, 38 tyresRim, 39 windows.
         if (upWith(28, 0x34)) bad += "[update flag 32]";
         if (upWith(30, 0x04)) bad += "[update body over 1000]";
         if (upWith(27, 0x80)) bad += "[update steering -128]";
-        if (upWith(35, 0x49)) bad += "[update flags2 bit 6]";
-        if (upWith(35, 0x89)) bad += "[update flags2 bit 7]";
+        if (!upWith(35, 0xFF)) bad += "[update flags2 bits 6 and 7 are legal in v6]";
+        if (upWith(37, 0x00)) bad += "[update rim bit without its tyre bit]";
+        if (upWith(38, 0x07)) bad += "[update rim bits beyond the tyre bits]";
+        if (!upWith(37, 0xFF) || !upWith(39, 0xFF) || !upWith(38, 0x00)) bad += "[update: any tyre / window mask is legal when rim is a subset]";
         if (upWith(36, 0x52)) bad += "[update doors bit 6]";
         if (upWith(36, 0x92)) bad += "[update doors bit 7]";
         if (!upWith(33, 0xFF) || !upWith(35, 0x3F) || !upWith(36, 0x3F)) bad += "[update: every sampleMs, all 6 flags2 and door bits are legal]";
-        Check("codec v5: VehicleWorld refuses reserved header bits, unordered or doubly listed ids, rotation code 1023, "
+        Check("codec v6: VehicleWorld refuses reserved header bits, unordered or doubly listed ids, rotation code 1023, "
               "-128 in an i8, unknown flags, health or fuel over 1000, a bad occupant id, lying counts and out-of-box positions; "
               "256 present ids decode, 257 do not; VehicleUpdate refuses the same field errors",
               bad.empty(), bad);
