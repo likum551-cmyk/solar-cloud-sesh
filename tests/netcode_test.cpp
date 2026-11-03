@@ -4301,6 +4301,9 @@ static void MeleeFightSimTests()
     }
 }
 
+#define T6_HEALTH_NETWORK
+#include "t6_health_tests.h"   // T6 health: the real server and session into the client's tracker and HUD (uses the helpers above)
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -4343,6 +4346,7 @@ int main()
     ReconnectTests();
     VehicleAbuseTests();
     AnimAuthorityTests();
+    t6health::NetworkTests();   // T6 health: Welcome.playerHealth / Hit / Damage / heal / kill / Respawn into the tracker and the HUD
     std::printf("-- metrics and budget\n");
     MetricsTests();
     ShutdownTests();
@@ -4351,7 +4355,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1 + 12; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
+    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

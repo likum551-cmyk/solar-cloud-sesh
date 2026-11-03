@@ -41,6 +41,12 @@ namespace gage::sync {
         int    maxChunks = 4;         // at most this many self-hits per tick (a 1000-point fall = 4 x 250)
         double puppetGraceMs = 1500.0; // after a puppet-caused loss a lethal self-hit waits this long for the attacker's Hit,
                                        // and a loss no Damage followed is undone (the server's value is put back)
+        // T6 (absolute reconciliation): a ped whose health sits, steady, off the server's value for this long with
+        // nothing pending and no puppet in play gets the server's value put on again (the 0e fix only reacted to an
+        // OBSERVED max change; a ped swap that lands max and health in one tick left 200 / 300 for good).
+        double reconcileAfterMs = 1000.0;
+        double reconcileRetryMs = 3000.0; // between two reconciliations of the same mismatch
+        int    reconcileTries = 3;        // a mismatch that survives this many writes is GTA holding the ped there: stop writing
     };
 
     // What the ped shows this tick (the engine reads it with natives).
@@ -55,6 +61,10 @@ namespace gage::sync {
         // on a peer ped or a server vehicle other than ours): its owner's Hit is the authority, so the
         // loss is taken as the new baseline and NOT reported as an environmental self-hit.
         bool   puppetDamage = false;
+        // T6: the local ped's entity handle (0 = unknown). A handle that changes between two ticks is a NEW ped
+        // (SET_PLAYER_MODEL, the default-ped guard, a respawn that re-created it): GTA gives it its own default
+        // health (200), which is not a loss, so the tick takes a baseline and the server's value is put on it.
+        int32_t ped = 0;
     };
 
     struct VitalsOut
@@ -80,6 +90,15 @@ namespace gage::sync {
         uint32_t puppetLosses = 0;                 // ticks whose loss a remote puppet caused (the attacker's Hit reports it)
         uint32_t puppetRestores = 0;               // ... of which no Damage followed in puppetGraceMs: the server's value put back
         uint32_t skippedReads = 0;                 // ticks skipped for an unreadable health or armour
+        // T6 diagnostics
+        uint32_t pedSwaps = 0;                     // the ped handle changed (a model swap): baseline + the server's value, no self-hit
+        uint32_t maxUnreadable = 0;                // ticks whose GET_ENTITY_MAX_HEALTH read 100 or less (0 = the native failed)
+        uint32_t reconciles = 0;                   // steady mismatches with the server's value corrected (absolute check)
+        uint32_t reconcileGaveUp = 0;              // ... mismatches GTA kept (the write did not take reconcileTries times)
+        uint32_t largestSelfHit = 0;               // the biggest single environmental self-hit handed out
+        uint32_t maxWrites = 0, maxWriteFails = 0, maxReadBackOff = 0; // SET_ENTITY_MAX_HEALTH calls, failed calls, reads that differ from the wish
+        int      lastMaxWanted = 0, lastMaxReadBack = 0;
+        int      obsHealth = 0, obsMax = 0;        // the ped's health and max at the last readable tick
     };
 
     class VitalsTracker
@@ -104,6 +123,12 @@ namespace gage::sync {
         void OnKilled();
         // RespawnOk: alive with these values; applied on the next Tick.
         void OnRespawn(uint8_t health, uint8_t armour);
+        // The engine replaced the local ped (default-ped guard swap): the next tick takes a baseline and the
+        // server's value goes on the new ped. Also detected by VitalsObs::ped changing; this covers a reused handle.
+        void NotePedReplaced();
+        // The result of a SET_ENTITY_MAX_HEALTH the engine just made (wanted value, the native's result, and
+        // GET_ENTITY_MAX_HEALTH read straight back): counted for the 10 s diagnostics.
+        void NoteMaxWrite(int wanted, bool ok, int readBack);
 
         // Once per script tick while the player is in the world (not while respawning).
         VitalsOut Tick(const VitalsObs& o);
@@ -113,6 +138,8 @@ namespace gage::sync {
         uint8_t Armour() const { return armour_; }
         int Pending() const { return pending_; }
         const VitalsStats& Stats() const { return stats_; }
+        // The newest readable max health of the ped (0 = none yet): the HUD's fallback when a frame reads 0.
+        int LastGoodMax() const { return lastGoodMax_; }
 
     private:
         VitalsConfig cfg_;
@@ -122,6 +149,12 @@ namespace gage::sync {
         bool rebase_ = true;       // the next Tick only takes a baseline (after our own write)
         int lastLocal_ = 0;        // the ped's total (health above 100 + armour) at the last Tick
         int lastMax_ = 0;          // the ped's max health at the last readable Tick (0 = none yet)
+        int lastGoodMax_ = 0;      // T6: the newest max above 100 (a failed read substitutes it, not a blind 200)
+        int32_t pedHandle_ = 0;    // T6: the ped handle of the last tick
+        double mismatchSinceMs_ = 0; // T6: when the ped's health first sat steady off the server's value (0 = it does not)
+        int mismatchHealth_ = -1;  // ... and what it read then
+        int reconcileTries_ = 0;
+        double lastReconcileMs_ = -1e9;
         int pending_ = 0;          // self-damage sent and not yet answered
         double pendingSinceMs_ = 0;
         double puppetUntilMs_ = 0; // a lethal self-hit waits until then after a puppet-caused loss
@@ -609,6 +642,28 @@ namespace gage::sync {
         else
             f = maxHp > 0 ? (float)hp / (float)maxHp : 0.0f;
         return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    }
+
+    // Put the server's maximum on a ped and read it straight back (T6: the old code ignored both the native's
+    // result and whether GTA kept the value). `P` offers `bool SetMax(int)` and `int GetMax()`; the engine wraps
+    // World::SetEntityMaxHealth / GetEntityMaxHealth, the tests a simulated ped. Returns the max read back.
+    template <class P>
+    inline int ApplyMaxHealth(P& ped, int playerHealth, VitalsTracker& tracker)
+    {
+        const int wanted = PedMaxHealth(playerHealth);
+        const bool ok = ped.SetMax(wanted);
+        const int back = ped.GetMax();
+        tracker.NoteMaxWrite(wanted, ok, back);
+        return back;
+    }
+
+    // The HUD's health fraction (DrawHud): the ped's own health over its own maximum, except that a frame whose
+    // GET_ENTITY_MAX_HEALTH reads 100 or less (0 = the native failed) must not draw an empty bar. The newest good
+    // maximum stands in, then the maximum the server's playerHealth implies.
+    inline float HudHealthFraction(int hp, int maxHp, int playerHealth, int lastGoodMax = 0)
+    {
+        const int m = maxHp > 100 ? maxHp : (lastGoodMax > 100 ? lastGoodMax : PedMaxHealth(playerHealth));
+        return HealthFraction(hp, m);
     }
 
     // What a protocol v5 Damage is to this client (it reaches every relevant player, not only the two involved).

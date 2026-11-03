@@ -30,6 +30,34 @@ void VitalsTracker::Reset(uint8_t health, uint8_t armour)
     puppetUntilMs_ = 0;
     puppetApplyAtMs_ = 0;
     lastLocal_ = 0;
+    mismatchSinceMs_ = 0;
+    mismatchHealth_ = -1;
+    reconcileTries_ = 0;
+}
+
+void VitalsTracker::NotePedReplaced()
+{
+    // A new ped has GTA's default health, not ours, and its maximum may not be ours yet: nothing about the
+    // change from the old ped is a loss. Baseline next tick, and the server's value goes on (once nothing is
+    // pending; a self-hit in flight is answered first, the absolute check then corrects what is left).
+    applyPending_ = true;
+    rebase_ = true;
+    lastMax_ = 0;
+    lastGoodMax_ = 0;
+    mismatchSinceMs_ = 0;
+    mismatchHealth_ = -1;
+    reconcileTries_ = 0;
+}
+
+void VitalsTracker::NoteMaxWrite(int wanted, bool ok, int readBack)
+{
+    ++stats_.maxWrites;
+    if (!ok)
+        ++stats_.maxWriteFails;
+    if (readBack != wanted)
+        ++stats_.maxReadBackOff;
+    stats_.lastMaxWanted = wanted;
+    stats_.lastMaxReadBack = readBack;
 }
 
 void VitalsTracker::OnDamage(uint8_t health, uint8_t armour, uint16_t damage, bool selfInflicted, bool killed)
@@ -82,7 +110,25 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
         ++stats_.skippedReads;
         return out;
     }
-    const int maxH = o.maxHealth > 100 ? o.maxHealth : 200;
+    // A max of 100 or less is a failed read (0) or a ped with no span: never take it for the real maximum. The
+    // newest good one stands in (a blind 200 clamped the server's 300 to 200 and the next good read re-raised it).
+    const bool maxReadable = o.maxHealth > 100;
+    if (maxReadable)
+        lastGoodMax_ = o.maxHealth;
+    else
+        ++stats_.maxUnreadable;
+    const int maxH = maxReadable ? o.maxHealth : (lastGoodMax_ > 100 ? lastGoodMax_ : 200);
+    if (o.ped != 0)
+    {
+        if (pedHandle_ != 0 && o.ped != pedHandle_)
+        {
+            ++stats_.pedSwaps;
+            NotePedReplaced();
+        }
+        pedHandle_ = o.ped;
+    }
+    stats_.obsHealth = o.health;
+    stats_.obsMax = o.maxHealth;
     const int expHealth = MinI((int)health_, maxH - 100);   // what the ped can show of the server's health
     const int localTotal = o.dead ? 0 : MaxI(0, o.health - 100) + MaxI(0, o.armour);
 
@@ -110,8 +156,9 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
         rebase_ = true;
         puppetApplyAtMs_ = 0;          // the server's value is on the ped: a scheduled put-back is spent
     };
-    const bool maxChanged = lastMax_ != 0 && maxH != lastMax_;
-    lastMax_ = maxH;
+    const bool maxChanged = maxReadable && lastMax_ != 0 && maxH != lastMax_;
+    if (maxReadable)
+        lastMax_ = maxH;
     if (applyPending_ && pending_ == 0 && !o.dead)
     {
         applyPending_ = false;
@@ -160,6 +207,43 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
     if (o.dead && o.nowMs < puppetUntilMs_)
         return out;                    // rammed to death: the attacker's Hit gets its grace to kill us first
 
+    // Absolute check (T6). Loss detection above works on CHANGES, so a ped that sits off the server's value without
+    // any change (a swapped ped's default 200 under a max of 300, a write GTA cut) is never noticed by it. A steady
+    // mismatch with nothing pending, no puppet in play and a living ped is put right after reconcileAfterMs; if the
+    // write does not take reconcileTries times GTA is holding the ped there and the tracker stops fighting it.
+    if (delta == 0 && !o.dead && pending_ == 0 && puppetApplyAtMs_ == 0 && o.nowMs >= puppetUntilMs_ &&
+        o.health != 100 + expHealth)
+    {
+        if (mismatchSinceMs_ == 0 || o.health != mismatchHealth_)
+        {
+            mismatchSinceMs_ = o.nowMs > 0 ? o.nowMs : 1e-3;
+            mismatchHealth_ = o.health;
+            reconcileTries_ = 0;
+        }
+        else if (o.nowMs - mismatchSinceMs_ >= cfg_.reconcileAfterMs && o.nowMs - lastReconcileMs_ >= cfg_.reconcileRetryMs)
+        {
+            if (reconcileTries_ < cfg_.reconcileTries)
+            {
+                ++reconcileTries_;
+                lastReconcileMs_ = o.nowMs;
+                ++stats_.reconciles;
+                applyServer();
+                return out;
+            }
+            if (reconcileTries_ == cfg_.reconcileTries)
+            {
+                ++reconcileTries_;          // counted once per mismatch
+                ++stats_.reconcileGaveUp;
+            }
+        }
+    }
+    else
+    {
+        mismatchSinceMs_ = 0;
+        mismatchHealth_ = -1;
+        reconcileTries_ = 0;
+    }
+
     int send = 0;
     if (o.dead)
         send = MaxI(delta, (int)health_ + (int)armour_ - pending_); // dead here: the server's WHOLE value (it may exceed what a ped shows)
@@ -179,6 +263,8 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
     {
         const int d = MinI(send, cfg_.maxHitDamage);
         out.selfHits[out.selfHitCount++] = d;
+        if ((uint32_t)d > stats_.largestSelfHit)
+            stats_.largestSelfHit = (uint32_t)d;
         send -= d;
         pending_ += d;
         ++stats_.selfHits;

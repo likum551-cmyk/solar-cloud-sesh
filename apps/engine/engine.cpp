@@ -1184,6 +1184,11 @@ namespace {
     void OnWelcome(uint16_t myId, uint16_t tickHz, uint8_t playerHealth)
     {
         g_tickHz.store(tickHz);
+        // T6: the server's maximum health BEFORE g_v4Reset is raised below (and before the g_peersMtx wait further down): the script tick
+        // that handles the reset sizes the ped and the tracker from it, and used to be able to read the previous session's value.
+        g_playerHealth.store(playerHealth ? playerHealth : proto::kDefaultHealth);
+        GLOGI("engine: health: Welcome.playerHealth %u -> the ped's maximum will be %d (100 + it)", (unsigned)playerHealth,
+              sync::PedMaxHealth(playerHealth));
         // peer_drive: anything but "place" (absent, empty, a typo) is the default "tasks".
         const std::wstring drive = reg::Get(L"peer_drive");
         g_peerDrive.store(drive == L"place" ? kDrivePlace : kDriveTasks);
@@ -1266,7 +1271,6 @@ namespace {
                 ++kv.second.ctrlSeq;
                 ++kv.second.driveResetSeq;             // a new source of motion: the drive controller snaps onto its first sample
             }
-            g_playerHealth.store(playerHealth ? playerHealth : proto::kDefaultHealth);
         }
         GLOGI("engine: remote-player sync for %u Hz (smoother tick %.0f Hz, one render clock for peds and cars, shared delay "
               "%.0f..%.0f ms, start %.0f ms); own id %u", (unsigned)tickHz, cfg.tickHz, cfg.minDelayMs, cfg.maxDelayMs,
@@ -1685,10 +1689,39 @@ namespace {
     // is 100, so a ped left at the game default of 200 would hold a server value of 150+ only after the vitals tracker
     // clamped it to 100. Set at the entry, on every respawn, after a model swap and whenever the vitals units start
     // over. Script tick.
-    void ApplyServerMaxHealth(int32_t ped)
+    // T6: the native's result and the value GTA kept are read back and counted (VitalsStats), the first calls of a session
+    // and every disagreement are logged. `why` names the caller.
+    void ApplyServerMaxHealth(int32_t ped, const char* why = "?")
     {
-        if (ped)
-            g_world->SetEntityMaxHealth(ped, sync::PedMaxHealth(g_playerHealth.load()));
+        if (!ped)
+            return;
+        struct Port
+        {
+            int32_t ped;
+            bool SetMax(int m) { return g_world->SetEntityMaxHealth(ped, m); }
+            int  GetMax() { return g_world->GetEntityMaxHealth(ped); }
+        } port{ped};
+        const int back = sync::ApplyMaxHealth(port, g_playerHealth.load(), g_vitals);
+        const sync::VitalsStats& st = g_vitals.Stats();
+        static uint32_t logged = 0;
+        static ULONG offAt = 0;
+        const bool off = back != st.lastMaxWanted;
+        const ULONG nowT = GetTickCount();
+        if (logged < 16 || (off && (!offAt || nowT - offAt >= 10000)))
+        {
+            ++logged;
+            if (off)
+                offAt = nowT;
+            const char* const fmt = "engine: health: SET_ENTITY_MAX_HEALTH(ped %d, %d) [%s] read back %d%s; ped health %d, "
+                                    "playerHealth %u (calls %u, failed %u, read-back differs %u)";
+            const char* const note = off ? "  <-- GTA did not keep the wish" : "";
+            if (off)
+                GLOGW(fmt, (int)ped, st.lastMaxWanted, why, back, note, g_world->GetEntityHealth(ped),
+                      (unsigned)g_playerHealth.load(), st.maxWrites, st.maxWriteFails, st.maxReadBackOff);
+            else
+                GLOGI(fmt, (int)ped, st.lastMaxWanted, why, back, note, g_world->GetEntityHealth(ped),
+                      (unsigned)g_playerHealth.load(), st.maxWrites, st.maxWriteFails, st.maxReadBackOff);
+        }
     }
 
     // Dress the freemode ped GTA just gave the player (script tick only). Called right after every
@@ -2133,7 +2166,12 @@ namespace {
         if (swapped)
         {
             DressPlayer("ped guard");       // the new ped needs the GAGE-MP look again
-            ApplyServerMaxHealth(g_world->LocalPlayer());   // ... and the server maximum health
+            const int32_t np = g_world->LocalPlayer();
+            GLOGI("engine: health: ped guard swap: new ped %d has health %d / max %d (GTA defaults) before the server maximum %d",
+                  (int)np, g_world->GetEntityHealth(np), g_world->GetEntityMaxHealth(np),
+                  sync::PedMaxHealth(g_playerHealth.load()));
+            ApplyServerMaxHealth(np, "ped guard swap");     // ... and the server maximum health
+            g_vitals.NotePedReplaced();     // T6: the new ped's default 200 is no loss; the server's value goes on it
         }
         static int loggedFixes = 0;
         if (loggedFixes < 10)
@@ -2300,7 +2338,7 @@ namespace {
             const int32_t ped = g_world->LocalPlayer();
             if (ped && !g_vitals.ServerDead())
             {
-                ApplyServerMaxHealth(ped);             // before the health: a value above the old maximum would be cut
+                ApplyServerMaxHealth(ped, "respawn");  // before the health: a value above the old maximum would be cut
                 g_world->SetEntityHealth(ped, 100 + (int)g_vitals.Health());
                 g_world->SetPedArmour(ped, (int)g_vitals.Armour());
             }
@@ -2557,7 +2595,8 @@ namespace {
         // The ped maximum is 100 + the server playerHealth (ApplyServerMaxHealth), so the bar follows the server.
         const int hp = g_world->GetEntityHealth(lp);
         const int maxHp = g_world->GetEntityMaxHealth(lp);
-        const float hpFrac = sync::HealthFraction(hp, maxHp);
+        // T6: a frame whose max reads 0 (native failure) draws the last good / the server's maximum, not an empty bar.
+        const float hpFrac = sync::HudHealthFraction(hp, maxHp, g_playerHealth.load(), g_vitals.LastGoodMax());
         float satFrac = g_satiety / 100.0f;
         satFrac = satFrac < 0 ? 0 : (satFrac > 1 ? 1 : satFrac);
 
@@ -7247,7 +7286,7 @@ namespace {
         }
         g_link.Reset();
         g_vitals.Reset(g_playerHealth.load(), 0);     // the server playerHealth, no armour (Welcome)
-        ApplyServerMaxHealth(g_world->LocalPlayer());
+        ApplyServerMaxHealth(g_world->LocalPlayer(), "session start");
         g_respawnGate.OnAlive();
         g_hits.Clear();
         g_localEmote.Clear();
@@ -7276,7 +7315,17 @@ namespace {
         const bool server = ServerMode();
         if (server != rechargeOff || (server && nowMs - rechargeAtMs >= 5000.0))
         {
-            g_world->SetLocalHealthRecharge(server ? 0.0f : 1.0f);
+            const bool rechargeOk = g_world->SetLocalHealthRecharge(server ? 0.0f : 1.0f);
+            static bool rechargeLogged = false;
+            if (!rechargeOk || !rechargeLogged)    // T6: the first call and any failure (a failure lets GTA regenerate to 50 %)
+            {
+                rechargeLogged = true;
+                if (rechargeOk)
+                    GLOGI("engine: health: SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(%.1f) -> ok", server ? 0.0 : 1.0);
+                else
+                    GLOGW("engine: health: SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(%.1f) -> FAILED (GTA may regenerate to 50 %%)",
+                          server ? 0.0 : 1.0);
+            }
             rechargeOff = server;
             rechargeAtMs = nowMs;
         }
@@ -7288,6 +7337,7 @@ namespace {
             ob.nowMs = nowMs;
             ob.health = g_world->GetEntityHealth(lp);
             ob.maxHealth = g_world->GetEntityMaxHealth(lp);
+            ob.ped = lp;                               // T6: a changed handle is a new ped, not a loss
             ob.armour = g_world->GetPedArmour(lp);
             ob.dead = g_world->IsPedDeadOrDying(lp);
             // A loss a remote puppet caused (a ram, a thrown car, its car's wheels) is reported by the
@@ -7340,6 +7390,21 @@ namespace {
                 if (!fallHash)
                     fallHash = g_world->HashKey("WEAPON_FALL");
                 const bool fell = g_world->IsPedFalling(lp) || g_world->IsPedRagdoll(lp);
+                for (int i = 0; i < v.selfHitCount; ++i)
+                    if (v.selfHits[i] >= 50 && !fell && !ob.puppetDamage)
+                    {
+                        // T6: a big loss with no fall and no puppet behind it is what a mismatched ped looked like (a swapped
+                        // ped's default 200 under a max of 300 was a self-hit of 100): say so, with the numbers that explain it.
+                        static double warnedMs = -1e9;
+                        if (nowMs - warnedMs >= 2000.0)
+                        {
+                            warnedMs = nowMs;
+                            GLOGW("engine: health: self-hit of %d with no fall and no puppet cause: ped health %d / max %d "
+                                  "(wanted max %d), server health %u, playerHealth %u, tracker pending %d",
+                                  v.selfHits[i], ob.health, ob.maxHealth, sync::PedMaxHealth(g_playerHealth.load()),
+                                  (unsigned)g_vitals.Health(), (unsigned)g_playerHealth.load(), g_vitals.Pending());
+                        }
+                    }
                 for (int i = 0; i < v.selfHitCount; ++i)
                 {
                     sync::BatchedHit h;
@@ -7709,6 +7774,16 @@ namespace {
                   c.peerDeaths - last.peerDeaths, c.peerRecoveries - last.peerRecoveries,
                   c.peerLocalDeaths - last.peerLocalDeaths, vs.selfHits, vs.selfDamage, vs.acks, vs.resyncs,
                   vs.clampsDown, vs.kills, hs.dropped, hs.rateHeld);
+            // T6 health line: what the ped really holds against what the server says, and the counters that explain a
+            // mismatch (see the T6 report for how to read it).
+            GLOGI("engine: health: ped %d / max %d, server health %u of playerHealth %u (ped max should be %d), bar %.0f%%; "
+                  "totals: max changes %u, gains undone %u, largest self-hit %u, ped swaps %u, reconciles %u (gave up %u), "
+                  "max reads unreadable %u, max writes %u (failed %u, read-back differs %u, last wish %d / read %d)",
+                  vs.obsHealth, vs.obsMax, (unsigned)g_vitals.Health(), (unsigned)g_playerHealth.load(),
+                  sync::PedMaxHealth(g_playerHealth.load()),
+                  sync::HudHealthFraction(vs.obsHealth, vs.obsMax, g_playerHealth.load(), g_vitals.LastGoodMax()) * 100.0f,
+                  vs.maxChanges, vs.clampsDown, vs.largestSelfHit, vs.pedSwaps, vs.reconciles, vs.reconcileGaveUp,
+                  vs.maxUnreadable, vs.maxWrites, vs.maxWriteFails, vs.maxReadBackOff, vs.lastMaxWanted, vs.lastMaxReadBack);
             uint32_t evEvicted = 0, evRefused = 0;
             {
                 std::lock_guard<std::mutex> lk(g_evMtx);
