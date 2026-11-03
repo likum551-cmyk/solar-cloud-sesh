@@ -458,6 +458,8 @@ namespace gage::server {
         uint32_t nextSpawnPoint_ = 0;
         Metrics metrics_;
         Metrics statsMark_;           // metrics_ as of the previous `stats` report
+        Metrics logMark_;             // metrics_ as of the previous 10 s sync log line
+        uint64_t nextSyncLogUs_ = 0;  // when that line is next due
         uint64_t statsMarkUs_ = 0;
         uint64_t startUs_ = 0;        // Start() time on the NowUs() clock
         uint64_t nextSecondUs_ = 0;   // next once-a-second sampling (per-client bytes)

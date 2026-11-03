@@ -56,3 +56,61 @@ Client (join.cpp:145 beat + engine sync line): frames decoded/stale/rejected/mal
 Server (total and per receiver): per pair-tick outcome (sent, idle-suppressed, rate-not-due, budget-deferred, packet-cap, no-state); wakes and noise-wakes; samples received / forwarded / never-forwarded / forwarded-twice; PlayerState rate, inter-arrival p95, seq gaps per sender; age at forward p50/p95; ack lag; absolute-because-no-baseline; tickLate p95/max, ticksMissed; vehicle frames full vs motion-only, bytes, VehicleUpdate inter-arrival; ENet throttle and loss per peer.
 
 Critical files: apps/server/replication.cpp, apps/server/server.cpp, apps/engine/engine.cpp, apps/engine/join.cpp, libs/protocol/protocol.cpp.
+
+---
+
+# Pipeline review, 2026-11-03 (sender to render, simulated end to end)
+
+Owner complaint after 0.4.4 / 0.4.5: "players slide, cars don't collide". This review looked for a SYSTEMATIC time-base, delivery, smoothing or
+bandwidth defect under the receiver-side symptoms. CODE + SIMULATION only: nothing here ran in a game. `tests/sync_test.cpp` section 14 drives the
+REAL server `Replicator` (tiers, idle gate, quantiser, delta frames, acks), `SampleClock`, `WorldDecoder`, `NetClock`, `RemoteSync` and, for cars, the real
+`VehicleStore` and `VehicleInterpolator`, with scripted links (jitter 20..80 ms, loss 2..10%, drift, stop / start, tier change, hitch, bursts) against ground truth.
+
+## Latency / jitter budget (what the code uses, 30 Hz tick, tiers 30 / 15 / 10 Hz, 45 Hz sender)
+
+| Stage | Where | Value | Jitter it adds |
+|---|---|---|---|
+| Frame the sample is read in | engine.cpp script tick, `GetEntityCoords` then `NowMs()` (QPC, sub-ms) | 16.7 ms at 60 fps; velocity / ped state read a few hundred microseconds later in the same frame | 0 (the stamp is the frame time) |
+| Send beat | engine.cpp `intervalMs = tick / 1.5` = 22.2 ms, scheduled on QPC | a sample every 22..33 ms depending on the frame rate | none: each sample carries its own time |
+| Timestamp | `sampleMs = (uint64)nowMs & 0xFFFF`, whole ms, wraps every 65.536 s | 1 ms truncation | +-0.5 ms (0.3 cm at 6 m/s) |
+| Mailbox + worker | join.cpp `Poll(2)` | 0..2 ms | none after the server's SampleClock |
+| Uplink | network | RTT / 2 | removed by `SampleClock` (min offset over 2 s, first 8 samples at receipt, placed within [recv - 300 ms, recv]) |
+| Server placement | `SampleClock::Place`, `Replicator::SetState` | sender time + the fastest path | p95 about 1 ms |
+| Tick alignment | `TickClock`: tick number follows wall time, sample ages measured to the tick's NOMINAL slot, the packet leaves up to the loop's lateness later | 0..33 ms between a sample and the tick that carries it | the age saw-tooth (age p95 16..21 ms) is in the delay, not the placement; tick lateness (0.6 ms typical) is network jitter to the client |
+| Tier relay | `Replicator` accumulator: 30 Hz every tick, 15 Hz every 2nd, 10 Hz every 3rd, idle 1 Hz after 500 ms | stored entry gap 33 / 67 / 100 ms; 30 / 45 Hz into 30 Hz forwards only the newest: 1/3 of near samples never leave the server (by design) | none (regular); a tier change shifts the class extra by one tick |
+| Wire | `quant.h`: 1 cm position, 1/32 m/s velocity, 0.0055 degree heading | position error <= 0.5 cm per axis (0.87 cm 3D); velocity <= 1.6 cm/s per axis | position grid: +-0.3 m/s of CHORD noise per 33 ms tick: the old pose-speed ripple (fixed, below) |
+| Downlink | network | RTT / 2 | NetClock excess |
+| Receiver clock offset | `NetClock` baseline = min of (recv - tick * tickMs) over 5 s of WALL time | follows a +60 ms link change after 5 s; client clock drift of +-300 ppm moves it 1.5 ms per 5 s (no visible effect) | steps counted per 10 s in `engine: pipe clock` |
+| Interpolation delay | `NetClock::DelayMs` = tick + p95(age) + p95(excess) + half a tick, clamped [50, 300] ms; rises at once, falls with a 2.5 s time constant | 75 ms calm near, 109 mid, 142 far (class extra = (k - 1) ticks); 150..250 ms on a 80 ms jittery link | render clock slewed +-10% |
+| Class extra | `ClassHold` + `ClassDelay`: up after 1.5 s of a larger gap, down after 8 s, slewed 10% | 0 / 33 / 67 ms | a near / mid / far crossing shifts the render time by one tick |
+| Extrapolation | smoother: 250 ms linear, then hold; standing snapshot at most 0.3 m | far tier gap 100 ms: never needed in calm; longest seen 217 ms in 150 ms bursts | none |
+| Snap / teleport | 8 m from the prediction (prediction time capped at 250 ms) | never fired in any scenario | |
+| End to end (sender frame to shown) | | 126 ms near, 160 mid, 193 far at 25 ms links; 220..290 ms with 80 ms downlink jitter | latency sd 0.6..1.5 ms in steady state |
+
+## Findings (ranked)
+
+1. **Pose speed ripple from the 1 cm position grid (FIXED, libs/sync/smoother, no wire change).** The Hermite curve goes through the rounded positions: +-0.5 cm of
+   rounding is +-0.3 m/s of chord noise over a 33 ms tick, while the velocity the sender reports is 1.6 cm/s accurate. A ped walking at 1.8 m/s near the receiver showed a
+   pose speed that wobbled by 6% (sd), p95 error 0.24 m/s (13%); at 6 m/s 1.9%, mid tier 3.3%. `Pose::k.v` feeds the locomotion controller's gait choice and animation rate. Fix:
+   velocity-aided denoise at ingest (smoother.h item 13): 6.0 -> 1.5% (walking), p95 speed error 0.24 -> 0.06 m/s, position error unchanged or lower, real stops / starts / turns not smeared.
+2. **ENet's unreliable packet throttle (FIXED server side, applies to both directions).** ENet deletes a share of UNRELIABLE packets (our whole state channel) when round trips run
+   above the quietest of the last 5 s; a 6 s storm costs ~20% of the packets over 10 s and up to 2/3 at the worst moment, with no counter anywhere. The server now sends
+   `enet_peer_throttle_configure(peer, 5000, 2, 0)` for every peer; the client's peer applies it too (older clients covered). `enet throttle` is in the join heartbeat and the server's 10 s line.
+3. **Tier change shifts the time base by one tick (by design, measured).** A ped crossing the near / mid or mid / far boundary moves the latency by 33 ms (latency sd 26..29 ms in the
+   shuttle scenario, p95 position error 17 cm at 5 m/s). Not changed: the class extra must exist (a mid ped needs a tick more delay) and 10% slewing keeps it smooth. A faster downgrade would
+   make a flapping boundary (a player standing on 120 m) ripple.
+4. Server-side losses are by design: near samples not forwarded (1/3), idle 1 Hz, far 10 Hz. Counters make them visible (`samples ... never`, `pairs_sent_*_per_s`).
+5. Nothing found wrong in: timestamps (sample time, not send time), u16 wrap (tested across the wrap), clock offset (asymmetric RTT is a constant), first-sample bias, reorder / duplicate handling,
+   idle -> move bridging (latency does not move), sender hitch (400 ms bridged by extrapolation, no snap), snap threshold (never fires for walking, running, sprinting or 35 m/s cars),
+   extrapolation cap vs the far gap, tick wrap, clock drift.
+
+## New 10 s diagnostics
+
+Client (gage.log): `engine: pipe clock: ...` (frames, arrival gap mean / p95 / max, clock offset movement, steps over 5 ms, delay rises, reordered frames, resyncs, delay and its target, lateness
+p95 split into excess + age); `engine: pipe id=N (...)` per remote (stored snapshots, arrival gap mean / p95 / max, repeats split identical / earlier-placed, stale, denoised, delay, class and
+extra, class changes, extrapolating frames and the longest run, holding, snaps, bridge resets, resyncs); the `join: network thread alive` heartbeat gains `enet throttle a/b (deceleration d),
+reliable loss, rtt deviation, world frames dropped by the decoder: stale / rejected`. Server: the 10 s `sync` line and `stats` keys (`pairs_sent_{near,mid,far,idle}_per_s`, `enet_*`).
+
+## Wire changes considered and NOT made (protocol stays v5)
+
+None needed. If the 1 cm grid ever has to go further than the denoise can take it: a finer position step for the NEAR tier only would need a new WorldEntry encoding (version 6).

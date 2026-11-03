@@ -383,6 +383,8 @@ namespace gage::server {
         tickNominalUs_ = startUs_;
         metrics_ = Metrics();
         statsMark_ = Metrics();
+        logMark_ = Metrics();
+        nextSyncLogUs_ = NowUs() + 10000000;
         statsMarkUs_ = startUs_;
         nextSecondUs_ = startUs_ + 1000000;
         nextHitLogUs_ = startUs_ + 10000000;
@@ -624,6 +626,36 @@ namespace gage::server {
                 }
             }
             nextSecondUs_ = nowUs + 1000000;
+
+            // ENet's view of the joined peers (gauges): the state channel's silent throttle, loss and round trips.
+            uint64_t peers = 0, throttleMin = ENET_PEER_PACKET_THROTTLE_SCALE, lossMax = 0, rttMax = 0, rttSum = 0, varMax = 0;
+            for (auto& kv : players_)
+            {
+                const ENetPeer* p = kv.second->peer;
+                if (!p) continue;
+                peers++;
+                throttleMin = std::min<uint64_t>(throttleMin, p->packetThrottle);
+                lossMax = std::max<uint64_t>(lossMax, (uint64_t)p->packetLoss * 1000 / ENET_PEER_PACKET_LOSS_SCALE);
+                rttMax = std::max<uint64_t>(rttMax, p->roundTripTime);
+                rttSum += p->roundTripTime;
+                varMax = std::max<uint64_t>(varMax, p->roundTripTimeVariance);
+            }
+            metrics_.enetPeers = peers;
+            metrics_.enetThrottleMin = throttleMin;
+            metrics_.enetLossPermilleMax = lossMax;
+            metrics_.enetRttMsMax = rttMax;
+            metrics_.enetRttMsAvg = peers ? rttSum / peers : 0;
+            metrics_.enetRttVarMsMax = varMax;
+        }
+
+        // The replication health line, every 10 s while somebody is joined (the same numbers as `stats`, compact).
+        if (nowUs >= nextSyncLogUs_)
+        {
+            const double secs = metrics_.wallSeconds - logMark_.wallSeconds;
+            if (!players_.empty() && secs > 0.5)
+                Log(FormatSyncLine(metrics_, logMark_, secs, cfg_.tickHz, players_.size()));
+            logMark_ = metrics_;
+            nextSyncLogUs_ = nowUs + 10000000;
         }
         if (nowUs >= nextHitLogUs_) LogHitSummary(nowUs);
     }
@@ -691,6 +723,14 @@ namespace gage::server {
         c.ownerKey = peer->address.host;
         peer->data = &c;
         enet_peer_timeout(peer, cfg_.peerTimeoutLimit, cfg_.peerTimeoutMinMs, cfg_.peerTimeoutMaxMs);
+        // ENet's packet throttle deletes a share of UNRELIABLE packets (this server's whole state channel, both ways) each
+        // time a round trip is much slower than the last 5 s's quietest (2/32 per such acknowledgement) and wins it back
+        // only as fast as quick ones come: a few seconds of congestion take it to a third of full and cost the state channel
+        // about a fifth of its packets over the next 10 s (tests/server_test.cpp models it on ENet's own function), at the
+        // moment the link is worst, with no counter anywhere (sync pipeline review 2026-11-03). Deceleration 0 keeps it at
+        // full. The command is applied by the client's peer too (it throttles what it sends us), so an older client is
+        // covered as well.
+        enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL, ENET_PEER_PACKET_THROTTLE_ACCELERATION, 0);
         Log("connect " + c.addr + ":" + std::to_string(peer->address.port));
         conns_[peer] = std::move(owned);
 

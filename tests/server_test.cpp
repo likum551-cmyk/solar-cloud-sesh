@@ -2970,6 +2970,142 @@ static void StallTests()
     }
 }
 
+
+// ---- sync pipeline review (2026-11-03): ENet throttle, per-tier counters, the sync log line ---------------------------------------------
+
+// ENet's own bookkeeping, as protocol.c keeps it on every acknowledgement (enet_protocol_handle_acknowledge), around the real
+// enet_peer_throttle(): a model of how the packet throttle reacts to a round-trip trace, so the effect of the deceleration the server now
+// configures is measured on ENet's own function. `calmMs` of 40 ms round trips (a ping every 500 ms), then `stormMs` at 140 ms, then calm again.
+// Returns the lowest throttle (of 32) and the share of unreliable packets ENet would have dropped over the 10 s from the start of the storm.
+struct ThrottleRun { enet_uint32 lowest = 32; double droppedShare = 0; };
+static ThrottleRun RunThrottle(enet_uint32 deceleration)
+{
+    ENetPeer p;
+    std::memset(&p, 0, sizeof(p));
+    p.packetThrottle = ENET_PEER_DEFAULT_PACKET_THROTTLE;
+    p.packetThrottleLimit = ENET_PEER_PACKET_THROTTLE_SCALE;
+    p.packetThrottleAcceleration = ENET_PEER_PACKET_THROTTLE_ACCELERATION;
+    p.packetThrottleDeceleration = deceleration;
+    p.packetThrottleInterval = ENET_PEER_PACKET_THROTTLE_INTERVAL;
+    p.roundTripTime = 40;
+    p.roundTripTimeVariance = 4;
+    p.lowestRoundTripTime = 40;
+    p.highestRoundTripTimeVariance = 4;
+    p.lastRoundTripTime = 40;
+    p.lastRoundTripTimeVariance = 4;
+    ThrottleRun r;
+    double dropped = 0, counted = 0;
+    uint32_t nextEpoch = ENET_PEER_PACKET_THROTTLE_INTERVAL;
+    for (uint32_t t = 0; t < 40000; t += 500)
+    {
+        const bool storm = t >= 20000 && t < 26000;
+        const enet_uint32 rtt = storm ? 140 : 40 + (t / 500) % 4; // 40..43 ms calm
+        enet_peer_throttle(&p, rtt);                                // the real function, as the ack handler calls it
+        p.roundTripTimeVariance -= p.roundTripTimeVariance / 4;
+        if (rtt >= p.roundTripTime) { const enet_uint32 d = rtt - p.roundTripTime; p.roundTripTimeVariance += d / 4; p.roundTripTime += d / 8; }
+        else { const enet_uint32 d = p.roundTripTime - rtt; p.roundTripTimeVariance += d / 4; p.roundTripTime -= d / 8; }
+        if (p.roundTripTime < p.lowestRoundTripTime) p.lowestRoundTripTime = p.roundTripTime;
+        if (p.roundTripTimeVariance > p.highestRoundTripTimeVariance) p.highestRoundTripTimeVariance = p.roundTripTimeVariance;
+        if (t >= nextEpoch)
+        {
+            p.lastRoundTripTime = p.lowestRoundTripTime;
+            p.lastRoundTripTimeVariance = std::max<enet_uint32>(p.highestRoundTripTimeVariance, 1);
+            p.lowestRoundTripTime = p.roundTripTime;
+            p.highestRoundTripTimeVariance = p.roundTripTimeVariance;
+            nextEpoch = t + ENET_PEER_PACKET_THROTTLE_INTERVAL;
+        }
+        r.lowest = std::min(r.lowest, p.packetThrottle);
+        if (t >= 20000 && t < 30000)
+        {
+            dropped += double(ENET_PEER_PACKET_THROTTLE_SCALE - p.packetThrottle) / double(ENET_PEER_PACKET_THROTTLE_SCALE);
+            counted += 1;
+        }
+    }
+    r.droppedShare = counted > 0 ? dropped / counted : 0;
+    return r;
+}
+
+static std::string Str(double v)
+{
+    char b[48];
+    std::snprintf(b, sizeof(b), "%.1f", v);
+    return b;
+}
+
+static void PipelineHealthTests()
+{
+    // 1. The mechanism: a 6 s storm of slow round trips costs the state channel a large share of its packets for the 10 s that follow under
+    // ENet's default deceleration (2) and nothing with 0, which is what the server configures for every peer.
+    const ThrottleRun withDecel = RunThrottle(ENET_PEER_PACKET_THROTTLE_DECELERATION), without = RunThrottle(0);
+    std::printf("      [ENet throttle model] default deceleration: lowest %u/32, %.0f%% of unreliable packets dropped in the 10 s from the storm's start; deceleration 0: lowest %u/32, %.0f%%\n",
+                (unsigned)withDecel.lowest, withDecel.droppedShare * 100, (unsigned)without.lowest, without.droppedShare * 100);
+    Check("enet throttle: with ENet's default deceleration a 6 s storm of slow round trips (40 -> 140 ms) drops the throttle to <= 12/32 (up to 2 in 3 unreliable state packets deleted at the worst moment) and ENet deletes > 15% of them over the 10 s from its start; "
+          "with deceleration 0 (the server's setting) the throttle never leaves 32/32",
+          withDecel.lowest <= 12 && withDecel.droppedShare > 0.15 && without.lowest == 32 && without.droppedShare == 0.0,
+          "default " + std::to_string(withDecel.lowest) + "/32, " + Str(withDecel.droppedShare * 100) + "% dropped; with 0: " + std::to_string(without.lowest) + "/32");
+
+    // 2. The live server: every joined peer is configured (the client's peer takes the command too, so an older client is covered) and the
+    // gauges and per-tier counters show up in `stats`.
+    {
+        Rig rig;
+        if (!rig.Start()) { Check("pipeline health: server starts", false); return; }
+        Probe a(rig), b(rig), c(rig), d(rig);
+        const bool joined = a.Join("Alice") && b.Join("Bob") && c.Join("Carol") && d.Join("Dave");
+        // Alice stands at the origin; Bob walks 50 m away (near tier), Carol 180 m (mid), Dave 320 m (far); they all move, so every pair is replicated
+        // at its distance rate (the idle class would otherwise take them to 1 Hz).
+        float t = 0;
+        const auto t0 = Clock::now();
+        auto next = t0;
+        while (MsSince(t0) < 3400)
+        {
+            if (Clock::now() >= next)
+            {
+                a.s.SendState(Kin(0, 0, 30));
+                b.s.SendState(Kin(50 + t, 0, 30, 0, 2.0f));
+                c.s.SendState(Kin(180 + t, 0, 30, 0, 2.0f));
+                d.s.SendState(Kin(320 + t, 0, 30, 0, 2.0f));
+                t += 0.1f;
+                next += std::chrono::milliseconds(50);
+            }
+            rig.Step();
+        }
+        const server::Metrics& m = rig.srv.metrics();
+        std::string out;
+        rig.srv.Execute("stats", out);
+        const net::ClientSession::LinkInfo link = a.s.link();
+        Check("enet throttle: every joined peer gets deceleration 0 from the server (the client's own peer reports it), the server's gauges read 4 peers at 32/32, and `stats` lists them",
+              joined && link.throttleDeceleration == 0 && link.throttle == link.throttleScale && m.enetPeers == 4 && m.enetThrottleMin == 32 && out.find("enet_throttle_min 32") != std::string::npos &&
+                  out.find("enet_peers 4") != std::string::npos,
+              "client deceleration " + std::to_string(link.throttleDeceleration) + ", throttle " + std::to_string(link.throttle) + "/" + std::to_string(link.throttleScale) + ", server peers " +
+                  std::to_string(m.enetPeers) + " min " + std::to_string(m.enetThrottleMin));
+        // The per-tier counts. The (receiver, moving subject) pairs: Alice <- Bob 50 m is the only near one; Alice <- Carol 180 m, Bob <- Carol 130 m, Carol <- Bob 130 m,
+        // Carol <- Dave 140 m and Dave <- Carol 140 m are mid (5); Alice <- Dave 320 m, Bob <- Dave 270 m and Dave <- Bob 270 m are far (3); everything about the standing
+        // Alice is the idle class. At this rig's legacy 20 / 10 / 5 Hz that is 20, 50 and 15 entries a second.
+        const double secs = (double)m.ticks / 20.0;
+        const double nearPerS = (double)m.pairSentTier[0] / secs, midPerS = (double)m.pairSentTier[1] / secs, farPerS = (double)m.pairSentTier[2] / secs;   // not near / far: windef.h macros
+        Check("sync counters: the entries are counted by the rate that applied (near, mid, far, idle): the rig's pairs give about 20 / 50 / 15 entries a second near / mid / far (within 25%), the standing "
+              "player's pairs are the idle class, and `stats` lists the four rates",
+              joined && secs > 2.5 && nearPerS > 15 && nearPerS < 25 && midPerS > 37.5 && midPerS < 62.5 && farPerS > 11.2 && farPerS < 18.8 && m.pairSentTier[3] > 0 && out.find("pairs_sent_near_per_s") != std::string::npos &&
+                  out.find("pairs_sent_far_per_s") != std::string::npos && out.find("pairs_sent_idle_per_s") != std::string::npos,
+              "near " + Str(nearPerS) + " mid " + Str(midPerS) + " far " + Str(farPerS) + " /s over " + Str(secs) + " s, idle " + Str((double)m.pairSentTier[3]));
+    }
+
+    // 3. The 10 s log line: pure formatting of two metric snapshots.
+    {
+        server::Metrics a, b;
+        b.ticks = 300; b.ticksMissed = 2; b.worldPackets = 600; b.worldEntries = 1500; b.pairSentTier[0] = 900; b.pairSentTier[1] = 300; b.pairSentTier[2] = 200; b.pairSentTier[3] = 100;
+        b.samplesReceived = 1400; b.samplesForwarded = 900; b.samplesForwardedTwice = 120; b.pairBudgetDeferred = 5;
+        b.enetPeers = 3; b.enetThrottleMin = 24; b.enetLossPermilleMax = 15; b.enetRttMsAvg = 41; b.enetRttMsMax = 77; b.enetRttVarMsMax = 9;
+        for (int i = 0; i < 300; i++) b.tickLateUs.Add(500);
+        const std::string line = server::FormatSyncLine(b, a, 10.0, 30, 3);
+        Check("sync log line: 10 s of counters read as 30.0 ticks/s, near 90.0 / mid 30.0 / far 20.0 / idle 10.0 entries/s, samples in 140.0 forwarded 90.0 twice 12.0 never 50.0 /s, and ENet's "
+              "throttle 24/32, loss 1.5%, rtt 41 / 77 ms",
+              line.find("sync 10 s: 3 players, 30.0 ticks/s of 30") != std::string::npos && line.find("near 90.0 mid 30.0 far 20.0 idle 10.0") != std::string::npos &&
+                  line.find("samples in 140.0 /s, forwarded 90.0 twice 12.0 never 50.0 /s") != std::string::npos && line.find("throttle min 24/32 loss max 1.5% rtt avg 41 max 77 ms var max 9 ms") != std::string::npos,
+              line);
+    }
+}
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -3005,10 +3141,12 @@ int main()
     std::printf("-- W8: config warning, start log, melee ceiling\n");
     W8ConfigAndLogTests();
     W8MeleeCeilingTests();
+    std::printf("-- sync pipeline review: ENet throttle, per-tier counters, sync log line\n");
+    PipelineHealthTests();
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 107; // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run
+    const int expected = 111; // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

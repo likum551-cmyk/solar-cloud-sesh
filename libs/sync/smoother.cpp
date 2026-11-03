@@ -76,6 +76,10 @@ namespace {
         c.slewTauMs = PositiveOr(c.slewTauMs, 500.0);
         c.maxSlew = Clamp(std::isfinite(c.maxSlew) ? c.maxSlew : 0.10, 0.0, 0.5);
         c.resyncMs = PositiveOr(c.resyncMs, 500.0);
+        c.denoiseGain = (std::isfinite(c.denoiseGain) && c.denoiseGain > 0.0f) ? (c.denoiseGain > 1.0f ? 1.0f : c.denoiseGain) : 0.0f;
+        c.denoiseBandM = (std::isfinite(c.denoiseBandM) && c.denoiseBandM > 0.0f) ? c.denoiseBandM : 0.015f;
+        c.denoiseBandPerSpeedS = (std::isfinite(c.denoiseBandPerSpeedS) && c.denoiseBandPerSpeedS >= 0.0f) ? c.denoiseBandPerSpeedS : 0.003f;
+        c.denoiseMaxGapMs = PositiveOr(c.denoiseMaxGapMs, 200.0);
         return c;
     }
 
@@ -92,6 +96,7 @@ SmootherConfig SmootherConfig::ForTickHz(double hz)
     c.maxDelayMs = std::max(300.0, 6.0 * tick);
     c.delaySafetyMs = 0.5 * tick;
     c.stillExtrapolateMaxM = 0.3f; // W8 item 8: a standing player is not carried past where it stopped
+    c.denoiseGain = 0.3f;          // item 13: the 1 cm position grid of the wire is not shown as speed ripple
     return c;
 }
 
@@ -254,6 +259,41 @@ void PlayerSmoother::Absorb(const Val& before, const Val& after)
     if (Length(res_.x, res_.y, res_.z) > cfg_.snapDistance) res_ = Residual(); // would be a slide across the map
 }
 
+// Item 13 (smoother.h): pulls the new sample's position toward where the newest stored snapshot says it should be by
+// now (the trapezoid of the two reported velocities), per axis and only inside the noise band. True when it moved.
+// A snapshot was stored at local time nowMs: the gap since the previous one goes into the arrival window.
+void PlayerSmoother::NoteStored(double nowMs)
+{
+    if (haveStoredRecv_ && nowMs >= lastStoredRecvMs_) arrivals_.Add(nowMs - lastStoredRecvMs_);
+    lastStoredRecvMs_ = nowMs;
+    haveStoredRecv_ = true;
+}
+
+bool PlayerSmoother::Denoise(const Snapshot& prev, Snapshot& s) const
+{
+    const double gapMs = s.t - prev.t;
+    if (!(cfg_.denoiseGain > 0.0f) || !(gapMs > 0.0) || gapMs > cfg_.denoiseMaxGapMs) return false;
+    const double dt = gapMs / 1000.0;
+    const double sp0 = Length(prev.k.vx, prev.k.vy, prev.k.vz), sp1 = Length(s.k.vx, s.k.vy, s.k.vz);
+    const double band = cfg_.denoiseBandM + cfg_.denoiseBandPerSpeedS * std::max(sp0, sp1);
+    const double g = cfg_.denoiseGain;
+    bool moved = false;
+    auto axis = [&](float& p, float p0, float v0, float v1) {
+        const double pred = double(p0) + 0.5 * (double(v0) + double(v1)) * dt;
+        const double d = double(p) - pred;
+        if (std::fabs(d) <= band)
+        {
+            const float np = static_cast<float>(pred + g * d);
+            if (np != p) moved = true;
+            p = np;
+        }
+    };
+    axis(s.k.x, prev.k.x, prev.k.vx, s.k.vx);
+    axis(s.k.y, prev.k.y, prev.k.vy, s.k.vy);
+    axis(s.k.z, prev.k.z, prev.k.vz, s.k.vz);
+    return moved;
+}
+
 PushResult PlayerSmoother::Push(uint32_t tick, const proto::Kinematics& in, double nowMs, double ageMs,
                                 const proto::PedState& ped)
 {
@@ -300,17 +340,22 @@ PushResult PlayerSmoother::Push(uint32_t tick, const proto::Kinematics& in, doub
     if (count_ == 0)
     {
         UpdateClock(offset, offset + ageMs);
+        lastRaw_ = k;
+        NoteStored(nowMs);
         Append(s);
         ++stats_.accepted;
         return PushResult::Accepted;
     }
 
     const Snapshot newest = At(count_ - 1); // copy: Append may recycle its slot
-    // A ped-only change (a standing player who starts aiming) is new information.
-    if ((Same(newest.k, k) && SamePed(newest.ped, ped)) || !(placedMs > newest.t))
+    // A ped-only change (a standing player who starts aiming) is new information. The comparison is against the
+    // newest stored sample as the wire delivered it (lastRaw_): the stored one may have been denoised (item 13).
+    const bool identical = Same(lastRaw_, k) && SamePed(newest.ped, ped);
+    if (identical || !(placedMs > newest.t))
     {
         UpdateClock(offset, offset);
         ++stats_.repeats;
+        ++(identical ? stats_.repeatsIdentical : stats_.repeatsEarlier);
         return PushResult::Repeat;
     }
     UpdateClock(offset, offset + ageMs);
@@ -328,6 +373,8 @@ PushResult PlayerSmoother::Push(uint32_t tick, const proto::Kinematics& in, doub
         head_ = 0;
         res_ = Residual();
         teleportPending_ = true;
+        lastRaw_ = k;
+        NoteStored(nowMs);
         Append(s);
         ++stats_.accepted;
         ++stats_.teleports;
@@ -350,7 +397,10 @@ PushResult PlayerSmoother::Push(uint32_t tick, const proto::Kinematics& in, doub
         gaps_[gHead_] = placedMs - newest.t;
         gHead_ = (gHead_ + 1) % kGapWindow;
         if (gCount_ < kGapWindow) ++gCount_;
+        if (Denoise(newest, s)) ++stats_.denoised;
     }
+    lastRaw_ = k;
+    NoteStored(nowMs);
     Append(s);
     if (haveClock_)
     {
@@ -450,6 +500,15 @@ bool PlayerSmoother::Sample(double nowMs, Pose& out)
     out.k.vy = static_cast<float>(v.vy);
     out.k.vz = static_cast<float>(v.vz);
     out.mode = mode;
+    if (mode == PoseMode::Extrapolating) ++stats_.extrapolated;
+    if (mode == PoseMode::Holding) ++stats_.held;
+    if (mode == PoseMode::Extrapolating)
+    {
+        if (!inExtrapRun_) { inExtrapRun_ = true; extrapRunStartMs_ = nowMs; }
+        longestExtrapMs_ = std::max(longestExtrapMs_, nowMs - extrapRunStartMs_);
+    }
+    else
+        inExtrapRun_ = false;
     out.ped = v.ped;
     out.renderTick = clock_ ? clock_->TickAt(renderT_) : static_cast<double>(originTick_) + renderT_ / tickMs_;
     out.teleported = teleportPending_;

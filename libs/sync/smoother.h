@@ -127,6 +127,22 @@
 //     and its car agree on the instant they show to a few ms. A hard resync of the shared clock is
 //     absorbed per player like item 5's.
 //
+// 13. Position denoise (sync pipeline review, 2026-11-03). The wire carries a position in 1 cm steps (round to
+//     nearest: +-0.5 cm per axis) and a velocity in 1/32 m/s steps (+-1.6 cm/s), so the velocity is 30 times
+//     more precise than the position over one 33 ms tick (+-1 cm / 33 ms = +-0.3 m/s of chord noise against
+//     +-0.05 m/s of velocity). The Hermite curve goes through the noisy positions and its derivative inherits the
+//     chord noise: a ped walking at 1.8 m/s near the receiver showed a pose speed that wobbled by 6% (sd), p95 off
+//     by 0.24 m/s, which the locomotion controller reads as gait and animation speed. A stored snapshot's position
+//     is therefore blended toward where the newest stored snapshot says it should be by now (its position plus the
+//     mean of the two reported velocities times the placed time between them: the trapezoid rule, exact for a
+//     constant acceleration): position = predicted + denoiseGain * (measured - predicted), per axis, but only while
+//     |measured - predicted| is inside the noise band (denoiseBandM + denoiseBandPerSpeedS * speed: the wire's
+//     rounding of both samples plus the placement noise at that speed); beyond it the measurement is taken as it
+//     is (a start, a stop, a turn, a hit: real motion is never smoothed). Repeat detection compares the RAW
+//     samples (the filter changes what is stored, not what the player sent). Off when denoiseGain is 0 (the
+//     struct default; ForTickHz, which the engine uses, sets 0.3: the chord noise of a still-moving ped drops by
+//     about 4x for a 4 cm band at walking speed).
+//
 // ASSUMPTION: the server's tick pace equals the tickHz it announced. A server that
 // cannot hold its rate shows up as jitter and pushes the delay toward the max.
 // LIMITS of the placement: ageMs counts from the server's RECEIVE of the sample, so
@@ -167,6 +183,14 @@ namespace gage::sync {
         // 0 (the struct default, and every standalone smoother of the older tests) turns the rule off;
         // ForTickHz, which the engine uses, sets it to 0.3 m.
         float  stillExtrapolateMaxM = 0.0f;
+        // Item 13: velocity-aided position denoise. denoiseGain is the share of the (measured - predicted) position
+        // difference that is believed (1 = the measurement as it is, 0 = off: the struct default); the correction
+        // only applies inside the noise band denoiseBandM + denoiseBandPerSpeedS * |v| (metres, per axis), and
+        // only across gaps up to denoiseMaxGapMs between stored samples. ForTickHz: 0.3, 0.015 m, 0.003 s, 200 ms.
+        float  denoiseGain = 0.0f;
+        float  denoiseBandM = 0.015f;
+        float  denoiseBandPerSpeedS = 0.003f;
+        double denoiseMaxGapMs = 200.0;
         double maxBridgeMs      = 500.0; // do not interpolate across a longer gap
         float  snapDistance     = 8.0f;  // metres from the prediction: teleport (on-foot players)
         double forgetAfterMs    = 5000.0;// silence that forgets a player
@@ -227,6 +251,12 @@ namespace gage::sync {
         uint32_t bridgeResets = 0; // gaps > maxBridgeMs that dropped older data
         uint32_t resyncs = 0;      // hard render clock resyncs
         uint32_t extraChanges = 0; // class-extra changes after the first (ClassHold hysteresis; shared clock only)
+        uint32_t denoised = 0;     // stored snapshots whose position the denoise pulled toward the prediction (item 13)
+        // Split of `repeats` (pipeline diagnostics): the state was bit-identical to the newest stored one (a standing
+        // player, an idle refresh, a sample forwarded twice) versus a sample placed no later than the newest stored one
+        // although its state differs (the sender's timeline went backwards: the server's sample clock re-anchored).
+        uint32_t repeatsIdentical = 0, repeatsEarlier = 0;
+        uint32_t extrapolated = 0, held = 0; // Sample() calls that were Extrapolating / Holding (all frames since the start)
     };
 
     // The PedState of a player who is standing: move 0 and none of the flags under which a zero gait still moves
@@ -277,6 +307,13 @@ namespace gage::sync {
         // The class extra in use (shared clock only; 0 for a standalone smoother).
         double ExtraMs() const { return extra_.Value(); }
         const SmootherStats& Stats() const { return stats_; }
+        // The class the extra is held at (1 = one snapshot per tick, 2 = every 2nd tick ...; shared clock only).
+        int ClassHeld() const { return extra_.HeldClass(); }
+        // Pipeline diagnostics: the gaps between this player's STORED snapshots, as they arrived (local time), since
+        // the last take (the entry rhythm the tier, the loss and the jitter make); the window restarts.
+        ArrivalWindow TakeArrivals() { ArrivalWindow w = arrivals_; arrivals_.Reset(); return w; }
+        // Longest run of consecutive Sample() calls that extrapolated, in ms of local time, since the last take.
+        double TakeLongestExtrapolationMs() { const double m = longestExtrapMs_; longestExtrapMs_ = 0.0; return m; }
 
     private:
         struct Snapshot
@@ -296,6 +333,8 @@ namespace gage::sync {
 
         const Snapshot& At(size_t i) const { return ring_[(head_ + i) % kSnapshotRing]; }
         void Append(const Snapshot& s);
+        bool Denoise(const Snapshot& prev, Snapshot& s) const; // item 13
+        void NoteStored(double nowMs);
         void UpdateClock(double arrivalOffsetMs, double latenessMs);
         double TypicalGapMs() const;
         Val Evaluate(double t, PoseMode* mode) const;
@@ -306,6 +345,10 @@ namespace gage::sync {
 
         Snapshot ring_[kSnapshotRing];
         size_t head_ = 0, count_ = 0;
+        proto::Kinematics lastRaw_;   // the newest stored sample as the wire delivered it (the stored one may be denoised)
+        ArrivalWindow arrivals_;      // gaps between stored snapshots' arrivals (diagnostics)
+        double lastStoredRecvMs_ = 0, extrapRunStartMs_ = 0, longestExtrapMs_ = 0;
+        bool haveStoredRecv_ = false, inExtrapRun_ = false;
 
         bool started_ = false;
         uint32_t originTick_ = 0; // the first tick seen: the origin of the server timeline
@@ -366,6 +409,17 @@ namespace gage::sync {
         NetClock& Clock() { return clock_; }
         const NetClock& Clock() const { return clock_; }
         bool OnFrame(uint32_t tick, double nowMs) { return clock_.OnFrame(tick, nowMs); }
+
+        // Pipeline diagnostics of one player (see PlayerSmoother::TakeArrivals / TakeLongestExtrapolationMs): false for an
+        // unknown player. The windows restart.
+        bool TakeDiagnostics(uint16_t id, ArrivalWindow& arrivals, double& longestExtrapMs)
+        {
+            auto it = players_.find(id);
+            if (it == players_.end()) return false;
+            arrivals = it->second.TakeArrivals();
+            longestExtrapMs = it->second.TakeLongestExtrapolationMs();
+            return true;
+        }
 
         // False for an unknown or expired player.
         bool Sample(uint16_t id, double nowMs, Pose& out);

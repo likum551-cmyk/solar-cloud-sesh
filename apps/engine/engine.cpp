@@ -267,6 +267,12 @@ namespace {
         bool haveSyncStats = false;   // (report ticks only) the smoother's numbers for the sync log line
         double syncDelayMs = 0, syncJitterMs = 0;
         sync::SmootherStats syncStats;
+        // Sync pipeline review (the `engine: pipe` line): the window the smoother kept since the last report (stored-snapshot
+        // arrival gaps, the longest run of extrapolation), its class extra, and the stats as of the previous report.
+        sync::ArrivalWindow pipeArrivals;
+        double pipeLongestExtrapMs = 0, pipeExtraMs = 0;
+        int pipeClass = 1;
+        sync::SmootherStats pipeSeen;
         // What of the PeerNet has been taken over (see SyncNet).
         uint32_t netEpoch = 0, netLookSeq = 0, netEmoteSeq = 0;
     };
@@ -313,6 +319,15 @@ namespace {
     // sampled at it too, so one frame shows one instant of the server's timeline), taken in SyncNet.
     bool s_syncLive = false;
     double s_frameMs = 0;
+    // The connection clock's pipeline numbers for the report tick's `engine: pipe clock` line (SyncNet fills it under the lock).
+    struct PipeClockReport
+    {
+        bool have = false;
+        sync::ArrivalWindow frameGaps;
+        double baselineDriftMs = 0, stepMaxMs = 0, delayMs = 0, targetMs = 0, excessP95Ms = 0, ageP95Ms = 0;
+        sync::NetClockStats stats, seen;   // seen: as of the previous report
+    };
+    PipeClockReport s_pipeClock;
     // Serialises the game thread's work (a script tick or a render-thread fallback frame) with Stop(), which
     // clears the script-owned maps from another thread. Uncontended in play.
     std::mutex g_scriptMtx;
@@ -4809,6 +4824,20 @@ namespace {
             lastReportMs = nowMs;
         s_syncLive = g_syncLive;
         s_frameMs = nowMs;
+        s_pipeClock.have = false;
+        if (reportNow && g_syncLive && g_sync.Clock().Ready())
+        {
+            sync::NetClock& clk = g_sync.Clock();
+            s_pipeClock.have = true;
+            s_pipeClock.frameGaps = clk.TakeFrameGaps();
+            s_pipeClock.baselineDriftMs = clk.TakeBaselineDriftMs();
+            s_pipeClock.stepMaxMs = clk.TakeBaselineStepMaxMs();
+            s_pipeClock.delayMs = clk.DelayMs();
+            s_pipeClock.targetMs = clk.TargetDelayMs();
+            s_pipeClock.excessP95Ms = clk.ExcessP95Ms();
+            s_pipeClock.ageP95Ms = clk.AgeP95Ms();
+            s_pipeClock.stats = clk.Stats();
+        }
         forgotten.clear();
         if (g_syncLive)
             g_sync.Prune(nowMs, &forgotten);
@@ -4893,6 +4922,9 @@ namespace {
                         pe.syncDelayMs = ps->DelayMs();
                         pe.syncJitterMs = ps->JitterMs();
                         pe.syncStats = ps->Stats();
+                        pe.pipeExtraMs = ps->ExtraMs();
+                        pe.pipeClass = ps->ClassHeld();
+                        g_sync.TakeDiagnostics((uint16_t)id, pe.pipeArrivals, pe.pipeLongestExtrapMs);
                     }
             }
             ++it;
@@ -5006,6 +5038,21 @@ namespace {
                 }
             }
             size_t reported = 0, withData = 0;
+            if (reportNow && s_pipeClock.have && !g_peers.empty())
+            {
+                const PipeClockReport& pc = s_pipeClock;
+                char line[420];
+                std::snprintf(line, sizeof(line),
+                              "engine: pipe clock: %u world/vehicle frames in the last 10 s (arrival gap ms mean %.0f p95 %.0f max %.0f), clock offset moved %+.1f ms, "
+                              "%u steps over 5 ms (largest %.0f ms), %u delay rises, %u reordered frames, %u resyncs; shared delay %.0f ms (target %.0f), lateness p95 "
+                              "excess %.0f + age %.0f ms",
+                              pc.frameGaps.n + 1, pc.frameGaps.MeanMs(), pc.frameGaps.PercentileMs(0.95), pc.frameGaps.maxMs, pc.baselineDriftMs,
+                              pc.stats.baselineSteps - pc.seen.baselineSteps, pc.stepMaxMs, pc.stats.delayRises - pc.seen.delayRises,
+                              pc.stats.reorderedFrames - pc.seen.reorderedFrames, pc.stats.resyncs - pc.seen.resyncs, pc.delayMs, pc.targetMs,
+                              pc.excessP95Ms, pc.ageP95Ms);
+                report.emplace_back(line);
+                s_pipeClock.seen = pc.stats;
+            }
             for (auto it = g_peers.begin(); it != g_peers.end();)
             {
                 Peer& pe = it->second;
@@ -5191,6 +5238,22 @@ namespace {
                                       (unsigned)pe.lastPed.flags, (unsigned)pe.lastPed.weapon,
                                       pe.aimTask ? " (aim task)" : "", pe.shootingFrames);
                         report.emplace_back(line);
+                        {
+                            // Sync pipeline review: the rhythm of this player's stored snapshots and what the smoother did with the rest.
+                            const sync::SmootherStats& ps = pe.syncStats;
+                            const sync::SmootherStats& pv = pe.pipeSeen;
+                            char pl[440];
+                            std::snprintf(pl, sizeof(pl),
+                                          "engine: pipe id=%d (%s): %u snapshots stored in 10 s (arrival gap ms mean %.0f p95 %.0f max %.0f), repeats %u identical + %u earlier-placed, "
+                                          "%u stale, %u denoised; delay %.0f ms (class %d, extra %.0f ms, %u class changes); %u extrapolating frames (longest %.0f ms), "
+                                          "%u holding, %u snaps, %u bridge resets, %u resyncs",
+                                          it->first, pe.name.c_str(), pe.pipeArrivals.n + 1, pe.pipeArrivals.MeanMs(), pe.pipeArrivals.PercentileMs(0.95),
+                                          pe.pipeArrivals.maxMs, ps.repeatsIdentical - pv.repeatsIdentical, ps.repeatsEarlier - pv.repeatsEarlier, ps.stale - pv.stale,
+                                          ps.denoised - pv.denoised, pe.syncDelayMs, pe.pipeClass, pe.pipeExtraMs, ps.extraChanges - pv.extraChanges, pe.extrapolated,
+                                          pe.pipeLongestExtrapMs, pe.held, pe.snaps, ps.bridgeResets - pv.bridgeResets, ps.resyncs - pv.resyncs);
+                            report.emplace_back(pl);
+                            pe.pipeSeen = ps;
+                        }
                         report.emplace_back(LocoLine(it->first, pe));   // W8: why the controller issued tasks, what was last applied
                         report.emplace_back(LocoSlideLine(it->first, pe));   // Sync A: the slide metric
                     }

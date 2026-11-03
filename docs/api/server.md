@@ -516,9 +516,18 @@ JSON object with the same keys. Any other argument is an error (`usage: stats [j
 | `pairs_sent_per_s`, `pairs_idle_suppressed_per_s`, `pairs_rate_not_due_per_s`, `pairs_budget_deferred_per_s`, `pairs_packet_cap_deferred_per_s`, `pairs_no_state_per_s` | what became of every relevant (client, player) pair on every tick, exactly one of the six: an entry was sent (equals `world_entries_per_s`); not due because the idle rate held it back; not due at its distance class's rate; due but left out because the client's byte budget ran out; due but left out because of the one-packet size cap (the last two add up to `budget_deferred_per_s`); skipped because the player or the client has sent no state yet. They add up to about `relevant_pairs * ticks_per_s` |
 | `wakes_per_s`, `noise_wakes_held_per_s` | idle players whose sample left the dead-band (so all their pairs were due at once), and the wake-ups a bit-exact idle test would have caused for samples that stayed inside it (see "Idle dead-band") |
 | `samples_received_per_s`, `samples_forwarded_per_s`, `samples_forwarded_twice_per_s`, `samples_never_forwarded_per_s` | samples the replicator got (every accepted `PlayerState`, plus the server's own re-push of a changed health or armour); samples that went into at least one `WorldState`; samples sent again on a later tick (idle refreshes, a sender slower than the tick); and received minus forwarded: samples a newer one replaced before any tick sent them (by design for idle and far pairs; at near range a 30 Hz sender into a 20 Hz tick loses a third) |
+| `pairs_sent_near_per_s`, `pairs_sent_mid_per_s`, `pairs_sent_far_per_s`, `pairs_sent_idle_per_s` | the entries of `pairs_sent_per_s` by the rate that applied to the pair: the distance class (`rateNearHz` / `rateMidHz` / `rateFarHz`) or the idle rate. Each should be about the rate times the number of such pairs; entries moving between the classes are tier changes |
+| `enet_peers`, `enet_throttle_min`, `enet_loss_permille_max`, `enet_rtt_ms_avg`, `enet_rtt_ms_max`, `enet_rttvar_ms_max` | ENet's own view of the joined peers (gauges, read once a second): the lowest packet throttle (of 32: below 32 ENet deletes that share of UNRELIABLE packets, i.e. the state channel, by itself; the server configures deceleration 0 on every peer so it stays at 32), the highest smoothed loss of reliable packets (permille), the average and highest smoothed round trip and the highest round-trip deviation |
 
 Percentiles come from log-scale histograms about 9% wide (within 5% of the true value). Everything is cumulative inside
 the server and costs a few integer operations per event, so it stays on in production.
+
+### Sync log line (every 10 s)
+
+While somebody is joined the server log carries one line every 10 s with the same numbers as `stats`, compact:
+`sync 10 s: 3 players, 30.0 ticks/s of 30 (0 missed, late p95 600 us); world 62.1 pkts/s 140.2 entries/s (near 60.0 mid 40.1 far 20.0 idle 20.1 /s, budget deferred 0.0 /s); samples in 135.0 /s, forwarded 88.0 twice 20.0 never 47.0 /s; enet 3 peers throttle min 32/32 loss max 0.0% rtt avg 41 max 77 ms var max 9 ms`.
+A `throttle min` under 32 means ENet is deleting state packets (it should not with the server's deceleration 0: an older server build
+or a changed config would show it); `never` is the by-design loss of samples a newer one replaced before a tick sent them.
 
 ### Idle dead-band
 
