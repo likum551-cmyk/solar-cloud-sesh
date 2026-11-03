@@ -145,6 +145,23 @@
 //         pose velocity dragging it. A hard snap stays beyond the teleport threshold. Jumps, ragdoll, swimming and
 //         a missing pedVel keep the pose-velocity push of item 4.
 //
+//  9. Sync A (docs/sync-specs/onfoot.md "Sync A"; found with the simulated ped RealPed in tests/locomotion_test.cpp):
+//     (a) the animation rate is a closed loop: moveRate = (pose speed + along-track error / rateTcS) / (nominal x the LEARNED
+//         scale of the gait); the scale is the ped's own measured speed over the rate that made it (one-pole, steady frames only);
+//     (b) the push is the last resort: a moving ped is pushed only beyond residualDeadM (0.30 m, the ramp starts at the edge), a
+//         standing one beyond stillDeadM (0.20 m), and not at all in the first startGraceMs (1.2 s) of a movement while the ped
+//         is under startGraceMaxM (2.5 m) behind (the start animation is still getting up to speed);
+//     (c) the push base is the ped's animation velocity, never our own last push: a GET_ENTITY_VELOCITY read equal to the last push
+//         (0.05 m/s) is "contaminated" and the last clean read (300 ms) or a model of the animation is used instead;
+//     (d) a stop is walked out: while the ped is more than settleM (0.35 m) from a stopped pose it keeps a Walk to the pose (the anchor
+//         IS the pose, the straight target is re-issued once) for up to settleMaxMs (1.5 s), then stands; the anchor leads by the pose
+//         speed with no floor (the 1.5 m floor ran the ped through the pose and the push pulled it back);
+//     (e) a change UP in gait that the speed itself asks for is followed after upDebounceMs (150 ms), at once in the first
+//         startWindowMs (400 ms) of a movement; a gait the sender's hint lifted still holds gaitDebounceMs;
+//     (f) the first stall (a lost task) is noticed stallFirstMs (0.9 s) after its issue; stallRetryMs only after a stall re-issue; the
+//         anchor fallback doubles for each stall in a row (20, 40, 80 ... s, cap 300 s) and the streak ends after 90 s without one.
+//     LocoDiag (above) is the slide metric of the 10 s "engine: loco slide" line.
+//
 // CONSTANTS (LocoConfig defaults)
 //   idleUp/Down        0.50 / 0.25 m/s  old GTAN GetPedSpeed: walk from 0.5; band below
 //   walkRunUp/Down     3.10 / 2.10 m/s  W11: was 2.90 / 2.40; around 2.6, walk max 1.8 .. run min 3.5
@@ -234,8 +251,10 @@ namespace gage::sync {
         // sets Anchor from loco_mode. The anchor leads the pose by anchorLeadS of travel (shorter than the straight path's
         // 3 s: it is moved every frame, so it need not outrun a re-issue; a long lead cuts corners: error ~ lead^2 / 2R), clamped to anchorLeadMinM..anchorLeadMaxM.
         LocoMode mode = LocoMode::Straight;
-        float anchorLeadS = 0.8f, anchorLeadMinM = 1.5f, anchorLeadMaxM = 5.0f;
-        float anchorFallbackMs = 20000.0f; // a stall in anchor mode: Straight for this long, then Anchor again
+        float anchorLeadS = 0.8f, anchorLeadMinM = 0.0f, anchorLeadMaxM = 5.0f;   // Sync A: no floor (was 1.5 m: a stop was run through)
+        float anchorFallbackMs = 20000.0f; // a stall in anchor mode: Straight for this long, then Anchor again;
+                                           // Sync A: doubled for each stall in a row (cap anchorFallbackMaxMs), the streak ends after anchorStreakResetMs without one
+        float anchorFallbackMaxMs = 300000.0f, anchorStreakResetMs = 90000.0f;
 
         // W11 item 3: with LocoInput::pedVel the velocity push is pedVel + a low-passed, capped position correction.
         float residualTauMs = 150.0f, residualMaxMs = 2.0f;
@@ -250,6 +269,29 @@ namespace gage::sync {
         // capped lower (water drag answers a velocity push slowly: the land gain overshoots and buzzes). INFERRED.
         float swimZDeadbandM = 0.9f, swimZGain = 1.0f;
         float swimCorrScale = 0.6f, swimCorrMaxHMs = 1.5f;
+        // Sync A (docs/sync-specs/onfoot.md "Sync A"): what the simulated ped (tests/locomotion_test.cpp, RealPed) showed to be wrong.
+        //  - rateLoop: the animation speed is a CLOSED loop. moveRate = (pose speed + along-track error / rateTcS) / the gait's
+        //    nominal speed, and the nominal is LEARNED from the ped's own velocity (nominal x scale, scale = measured speed / rate,
+        //    one-pole learnTauMs, only from steady frames: the guessed nominals were INFERRED and a wrong one was carried by the
+        //    velocity push, i.e. by sliding, for the whole run).
+        //  - residualDeadM / stillDeadM: while a moving gait is shown (a standing ped: stillDeadM) the push starts only beyond this error (the rate loop closes the rest);
+        //    inside startGraceMs of leaving Still no push below startGraceMaxM (the start animation needs ~1 s to get up to speed:
+        //    dragging it at +2 m/s over a half-speed stride was ~40% of that second).
+        //  - settle: a stop does not stand the ped still while it is more than settleM from the pose (it walks the rest, up to
+        //    settleMaxMs, until it is within settleDoneM); the anchor leads by the pose's speed with no floor, so a stop is not
+        //    run THROUGH (the old 1.5 m floor overshot ~0.9 m and then pushed the ped back ~1 s in an idle pose).
+        //  - upDebounceMs / startWindowMs: a change UP in gait is followed after upDebounceMs, at once within startWindowMs of
+        //    leaving Still (the first frames of a start read a walking speed and held a Walk for 400 ms).
+        //  - stallFirstMs: a lost task is noticed this long after its issue (stallRetryMs only after a stall re-issue).
+        bool rateLoop = true;
+        float rateTcS = 0.7f, rateErrMinM = -1.0f, rateErrMaxM = 2.5f;
+        float learnTauMs = 1200.0f, learnSteadyMs = 600.0f, learnMinScale = 0.55f, learnMaxScale = 1.6f;
+        float residualDeadM = 0.30f, stillDeadM = 0.20f;   // moving gait / standing ped: the push ramps up from beyond this error
+        float startGraceMs = 1200.0f, startGraceMaxM = 2.5f;
+        float settleM = 0.35f, settleDoneM = 0.20f, settleMaxMs = 1500.0f;
+        float upDebounceMs = 150.0f, startWindowMs = 400.0f;
+        float stallFirstMs = 900.0f;
+
         float velTauMs = 120.0f;       // one-pole low-pass of the pose velocity (W1 item 4)
         float steerDeadbandM = 0.08f;  // no steering under this horizontal error
         float ragdollMaxMs = 8.0f;     // cap of the whole velocity while ragdolling
@@ -371,6 +413,9 @@ namespace gage::sync {
         // W11: GoToAnchor issues (also counted in goStraight and by cause), Walk / Run / Sprint changes carried by setBlend
         // without a re-issue, stalls that dropped anchor mode to Straight, frames spent in anchor mode
         uint32_t anchorIssues = 0, gaitKept = 0, anchorFallbacks = 0, anchorFrames = 0;
+        // Sync A: stops that walked the rest to the pose before standing still, pushes skipped by the start grace, frames
+        // whose velocity read was our own last push fed back (GET_ENTITY_VELOCITY returned what we set)
+        uint32_t settles = 0, graceFrames = 0, contaminated = 0;
     };
 
     class LocomotionController
@@ -409,6 +454,9 @@ namespace gage::sync {
         LocoTask LastTask() const { return lastTask_; }
         float OffAccumulator() const { return offAcc_; } // m*s toward a persistent-error snap
         const LocoStats& Stats() const { return stats_; }
+        // Sync A: the learned animation speed of a gait as a factor of its nominal (1 = as guessed), and the last move rate asked for
+        float NominalScale(Gait g) const { return g == Gait::Walk ? nScale_[1] : g == Gait::Run ? nScale_[2] : g == Gait::Sprint ? nScale_[3] : 1.0f; }
+        float LastMoveRate() const { return lastRate_; }
 
         // Gait inference with hysteresis: the gait after `current` sees `speed` (m/s).
         static Gait InferGait(Gait current, float speed, const LocoConfig& cfg);
@@ -417,6 +465,7 @@ namespace gage::sync {
         static Gait ApplyAuthority(Gait inferred, int moveState);
 
     private:
+        LocoOutput UpdateImpl(const LocoInput& in);
         LocoConfig cfg_;
         bool started_ = false;
         Gait gait_ = Gait::Still;           // the gait being shown (debounced)
@@ -443,8 +492,24 @@ namespace gage::sync {
 
         // W11
         double anchorFallbackLeftMs_ = 0;    // > 0: a stall dropped anchor mode to Straight
+        int anchorFailStreak_ = 0;           // Sync A: stalls in anchor mode in a row
+        double sinceAnchorStallMs_ = 1e9;
         Gait gaitShown_ = Gait::Still;       // the moving gait at the last task evaluation (counts gaitKept)
         float corrFx_ = 0, corrFy_ = 0;      // low-passed residual correction (m/s)
+
+        // Sync A
+        float nScale_[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // learned nominal speed factor per gait
+        float lastRate_ = 1.0f;              // the move rate asked for last frame
+        double rateEmaNum_ = 1.0;            // low-passed applied rate (~ the ped's animation lag), the divisor of a learning sample
+        double steadyMs_ = 0;                // time since the gait, the task or the settle state last changed
+        double sinceMoveStartMs_ = 1e9;      // time since the shown gait left Still
+        bool settling_ = false;
+        Gait gaitPrev_ = Gait::Still;
+        bool pushedLast_ = false;
+        LocoVec lastPush_;                   // the velocity set last frame (when pushedLast_)
+        LocoVec animEst_;                    // the ped's animation velocity: its own read, or a model of it when the read is our push
+        bool lastIssueWasStall_ = false;
+        double sinceCleanMs_ = 1e9;          // time since animEst_ was a clean read
 
         bool ragdollActive_ = false;
         bool haveJumpSeq_ = false;
@@ -453,6 +518,63 @@ namespace gage::sync {
         bool wasJumping_ = false;
 
         LocoStats stats_;
+    };
+
+    // Sync A (docs/sync-specs/onfoot.md "Sync A"): the slide metric the next live log needs. One instance per remote ped,
+    // fed once per DrivePeer after LocomotionController::Update, summarised and Reset() every 10 s for the "engine: loco
+    // slide" line. Pure: the same code runs in locomotion_test against a simulated ped, so the number the log prints is the
+    // number the tests measured.
+    //   skate     = the distance our own velocity pushes moved the ped (|pushVel - pedVel| * dt, the part of the displacement
+    //               the animation did not produce) / the distance the ped moved in total, over frames where the pose moves
+    //               (> 1 m/s); 0 = the stride carries the ped, 1 = it is dragged
+    //   idleSlide = metres pushed while the ped is commanded Still (a ped sliding in its idle pose)
+    //   stops     = stop-starts: the ped's position-derived speed under 0.3 m/s for 200 ms while the pose moves over 1 m/s
+    //   derivedSpeed / poseSpeed = mean over the frames the pose moves (the ped's speed from its positions vs the pose's)
+    struct LocoDiagFrame
+    {
+        double dtMs = 0;
+        double nowMs = 0;            // a monotonic clock: the ped's speed from positions is measured between two observations on it
+                                     // (frames the controller did not run in, a gap over 250 ms, are not bridged)
+        LocoVec pose, pedPos;        // the pose and the ped's position as read this frame (before the output is applied)
+        float poseSpeed = 0;         // |pose velocity| horizontal, m/s
+        Gait gait = Gait::Still;     // LocoOutput::gait
+        bool pushed = false;         // LocoOutput::setVelocity
+        LocoVec push;                // the velocity set (LocoOutput::velocity)
+        LocoVec pedVel;              // the ped's own velocity read this frame
+        bool havePedVel = false;
+        bool anchorMode = false;
+        LocoVec anchor;              // LocoOutput::anchorPos, valid while anchorMode
+    };
+
+    struct LocoDiagSummary
+    {
+        uint32_t frames = 0, movingFrames = 0, stops = 0, pushFrames = 0;
+        double meanErrM = 0, maxErrM = 0;          // |pose - ped| horizontal
+        double meanPushMs = 0, maxPushMs = 0;      // |pushVel - pedVel| m/s, over the frames a push was set
+        double skate = 0;                          // see above, 0..1
+        double idleSlideM = 0;                     // metres pushed while commanded Still
+        double derivedSpeedMs = 0, poseSpeedMs = 0;
+        double meanAnchorM = 0, maxAnchorM = 0;    // ped -> anchor distance (anchor mode frames only)
+        uint32_t anchorFrames = 0;
+    };
+
+    class LocoDiag
+    {
+    public:
+        void Observe(const LocoDiagFrame& f);
+        LocoDiagSummary Summary() const;
+        void Reset() { *this = LocoDiag(); }
+
+    private:
+        uint32_t frames_ = 0, moving_ = 0, stops_ = 0, pushFrames_ = 0, anchorFrames_ = 0;
+        double errSum_ = 0, errMax_ = 0, pushSum_ = 0, pushMax_ = 0;
+        double pushDist_ = 0, totalDist_ = 0, idleSlide_ = 0;
+        double derivedSum_ = 0, poseSum_ = 0, anchorSum_ = 0, anchorMax_ = 0;
+        bool havePrev_ = false;
+        LocoVec prevPed_;
+        double prevNowMs_ = 0;
+        double stuckMs_ = 0;
+        bool stuckCounted_ = false;
     };
 
     // When a remote ped's aim task (TASK_AIM_GUN_AT_COORD / TASK_GO_TO_COORD_WHILE_AIMING_AT_COORD)
