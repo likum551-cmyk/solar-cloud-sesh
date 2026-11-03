@@ -9,7 +9,8 @@
 #   --list        print every file that would be packed (and stop)
 #   --dry-run     build and check the file list, print the summary, write no tarball
 #
-# Excluded: build/ (all build output), every node_modules and .impeccable, .git, logs/, "enhanced EXE/" (GTA game files must never
+# Excluded: build/ (all build output), every node_modules and .impeccable, .git, logs/, "DLC PACKS/", fresh_images/ and
+# fresh_videos/ (local content and art work, not source), "enhanced EXE/" (GTA game files must never
 # leave the PC), everything in .toolchain/ EXCEPT innosetup-6.7.3 (the VPS runs it under wine; WinLibs, ffmpeg
 # and the installers stay home), .env*, *.pem, *.key, update-signing-key*, .gage-keys, *.log, *.tgz, *.tar.gz.
 # After the list is built it is CHECKED: nothing forbidden may be in it, the files the VPS needs must be, and no text file may
@@ -57,6 +58,7 @@ cd "$ROOT"
 find . \
   \( -type d \( -name node_modules -o -name .git -o -name .gage-keys -o -path ./build -o -path ./logs \
        -o -path './enhanced EXE' -o -name .impeccable \
+       -o -path './DLC PACKS' -o -path ./fresh_images -o -path ./fresh_videos \
        -o \( -path './.toolchain/*' ! -path './.toolchain/innosetup-6.7.3' ! -path './.toolchain/innosetup-6.7.3/*' \) \) -prune \) \
   -o \( \( -type f -o -type l \) \
         ! -name '.env*' ! -name '*.pem' ! -name '*.key' ! -name 'update-signing-key*' ! -name '*.log' \
@@ -74,7 +76,7 @@ tr '\0' '\n' < "$LISTFILE" > "$SCRATCH/files.txt"
 if [ "$LIST_ONLY" = 1 ]; then cat "$SCRATCH/files.txt"; exit 0; fi
 
 # ---- checks on the list (defence in depth: the find rules above must have done their job) -----------------
-bad=$(grep -E -i '(^|/)(node_modules|\.git|\.gage-keys|\.impeccable|enhanced EXE|winlibs|ffmpeg)(/|$)|\.pem$|\.key$|(^|/)\.env|update-signing-key|^\./build/|^\./logs/|\.tgz$|\.tar\.gz$' "$SCRATCH/files.txt" || true)
+bad=$(grep -E -i '(^|/)(node_modules|\.git|\.gage-keys|\.impeccable|enhanced EXE|DLC PACKS|fresh_images|fresh_videos|winlibs|ffmpeg)(/|$)|\.pem$|\.key$|(^|/)\.env|update-signing-key|^\./build/|^\./logs/|\.tgz$|\.tar\.gz$' "$SCRATCH/files.txt" || true)
 [ -z "$bad" ] || { printf '%s\n' "$bad" | head -n 20 >&2; die "forbidden files are in the list (shown above)"; }
 
 need=(CMakeLists.txt cmake/toolchain-mingw-linux.cmake tools/deploy/build-client.sh tools/deploy/publish-client.sh tools/deploy/deploy-server.sh tools/deploy/release.sh
