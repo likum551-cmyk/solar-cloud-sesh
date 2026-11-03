@@ -42,6 +42,7 @@ build/win/selftest/vehicle_drive_test.exe  # remote-vehicle interpolator + drive
 build/win/selftest/gameplay_test.exe     # v4 pure units: vitals/respawn/hit batcher/emotes/vehicle link
 build/win/selftest/brand_apparel_test.exe  # branded-tee texture swap on a WARP D3D11 device
 build/win/selftest/present_hook_test.exe   # Present vtable hook + watchdog (fake vtable), then World::HookTick on a real dxgi swap chain next to a simulated re-asserting overlay (the RTSS failure); part 2 needs a D3D11 device (hardware or WARP)
+build/win/selftest/ambient_test.exe       # T5: no ambient NPCs / traffic: when it runs (any connection state), the exemption list, sweep planner, breaker, counters
 # also built: crash_filter_test serverquery_test interest_test quant_test launch_shim_test script_suppress_test
 # NEVER run build/win/selftest/*.exe by glob: gage_v.exe there launches GTA.
 ```

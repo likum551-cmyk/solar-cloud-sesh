@@ -15,6 +15,7 @@
 #include "brand_apparel.h"
 #include "pack_stream.h"
 #include "quit_gate.h"
+#include "ambient.h"
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/smoother.h"
@@ -1744,6 +1745,214 @@ namespace {
         }
     }
 
+    // ===== T5 ambient: no ambient NPCs and no ambient traffic for anyone (apps/engine/ambient.h) =====
+    // The suppression used to sit behind EnterServer() (join::IsConnected() and the entry Done), so it never ran
+    // before a session, during join retries, after "session ended", or while the script tick was not live. It now
+    // runs from the top of GameWork, every tick, whatever the connection state (TickAmbient). The remote players'
+    // puppets, the server's cars and everything else the engine itself made are on the exemption list
+    // (AmbientGatherExempt): any NEW entity the engine creates must be added there, or a sweep would take it.
+    ambient::Scheduler g_ambSched;
+    ambient::ExemptSet g_ambExempt;
+    ambient::Report g_ambRep;                      // this window's numbers (reset at each report)
+    ambient::Tally g_ambTallySeen;                 // World::ambientTally at the previous report
+    double g_ambReportMs = 0;                      // NowMs of the last `engine: ambient` line (0 = none yet)
+    bool g_ambEverConnected = false;
+    int g_ambLinkSeen = -1;
+    std::once_flag g_ambConfigured;
+
+    // The handles no clean-up may touch. Script tick only (g_peers / g_vehs are its own). Complete only with a
+    // local ped: with no ped nothing is provable and MayDelete() refuses everything.
+    void AmbientGatherExempt(int32_t lp)
+    {
+        g_ambExempt.Clear();
+        g_ambExempt.Add(lp);
+        g_ambExempt.Add(g_localPed.load());
+        for (const auto& kv : g_peers)
+        {
+            g_ambExempt.Add(kv.second.ped);            // the puppet
+            g_ambExempt.Add(kv.second.anchor);         // its go-to-entity anchor (a real mission ped)
+        }
+        for (const auto& kv : g_vehs)
+            g_ambExempt.Add(kv.second.handle);         // server vehicles (their occupants are the puppets above)
+        g_ambExempt.Add(g_companion);                  // the render-thread test ped
+        for (const int32_t v : g_ownedVehicles)
+            g_ambExempt.Add(v);                        // /car vehicles
+        if (lp)
+        {
+            g_ambExempt.Add(g_world->GetVehiclePedIsIn(lp));      // the car we sit in
+            g_ambExempt.Add(g_world->GetVehiclePedIsUsing(lp));   // ... or are entering / last used
+        }
+        g_ambExempt.SetComplete(lp != 0);
+    }
+
+    // How many exempt handles exist right now (an unresolved DOES_ENTITY_EXIST counts as existing: the breaker then
+    // cannot see a loss, which the `engine: ambient` line shows as calls with failed counts on the other natives).
+    int AmbientAliveCount()
+    {
+        int n = 0;
+        for (const int32_t h : g_ambExempt.Handles())
+            if (g_world->EntityExists(h) != 0)
+                ++n;
+        return n;
+    }
+
+    // The breaker: an exempt handle that existed before a clean-up and is gone right after it (same tick) means the
+    // clean-up took it. Clears and sweeps then stay off for the rest of the process.
+    void AmbientCheckProtected(int before, int after, const char* what)
+    {
+        if (!g_ambSched.CheckProtected(before, after))
+            return;
+        GLOGW("ambient: %s removed %d exempt entity(ies) (a puppet, a server car, our own ped or car) -> area clears and "
+              "sweeps are now OFF for this run (their semantics on mission entities are unverified live); "
+              "send this line and the 10 s `engine: ambient` lines", what, before - after);
+    }
+
+    // CLEAR_AREA_OF_PEDS / COPS + REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA around (x, y, z): the entry, the respawn and
+    // the periodic clear all come through here, guarded by the registry switch (ambient_clear), the exemption list and
+    // the breaker. Script tick only.
+    void AmbientClearGuarded(int32_t lp, float x, float y, float z, float radius, const char* why)
+    {
+        if (!g_ambSched.Sw().master || !g_ambSched.Sw().areaClear || g_ambSched.BreakerTripped())
+            return;
+        AmbientGatherExempt(lp);
+        const int before = AmbientAliveCount();
+        g_world->ClearAmbientAround(x, y, z, radius);
+        const int after = AmbientAliveCount();
+        ++g_ambRep.clears;
+        g_ambRep.exemptCount = (int)g_ambExempt.Size();
+        g_ambRep.protectedSeen += (uint32_t)before;
+        AmbientCheckProtected(before, after, why);
+    }
+
+    // The entity sweep (enumeration natives; inert until their hashes exist): delete what is not exempt. Script tick only.
+    void AmbientSweep(int32_t lp)
+    {
+        int32_t found[ambient::kNearbyCap];
+        std::vector<int32_t> plan;
+        AmbientGatherExempt(lp);
+        const int before = AmbientAliveCount();
+        g_ambRep.exemptCount = (int)g_ambExempt.Size();
+        int budget = ambient::kSweepMaxDeletes;
+        for (int pass = 0; pass < 2; ++pass)           // 0: peds, 1: vehicles
+        {
+            const int n = pass == 0 ? g_world->NearbyPeds(lp, found, ambient::kNearbyCap)
+                                    : g_world->NearbyVehicles(lp, found, ambient::kNearbyCap);
+            (pass == 0 ? g_ambRep.nearPeds : g_ambRep.nearVehs) = n;
+            if (n <= 0)
+                continue;
+            const ambient::SweepStats st = ambient::PlanSweep(found, n, g_ambExempt, budget, plan);
+            g_ambRep.protectedSeen += (uint32_t)st.exempt;
+            for (const int32_t h : plan)
+                if (g_world->EntityExists(h) == 1 && g_world->DeleteAmbientEntity(h))
+                {
+                    ++g_ambRep.deleted;
+                    --budget;
+                }
+        }
+        ++g_ambRep.sweeps;
+        AmbientCheckProtected(before, AmbientAliveCount(), "the entity sweep");
+    }
+
+    // Every tick, from the top of GameWork (script tick or render-thread fallback), whatever the connection.
+    void TickAmbient(bool inScript, int32_t lp, WorkProbe* probe)
+    {
+        std::call_once(g_ambConfigured, [] {
+            g_ambSched.Configure(ambient::LoadSwitches([](const char* name) {
+                return reg::Get(std::wstring(name, name + std::strlen(name)));
+            }));
+            const ambient::Switches& sw = g_ambSched.Sw();
+            GLOGI("ambient: suppression %s; render-thread fallback %s; periodic area clear %s (breaker armed); entity sweep %s "
+                  "(registry: ambient / ambient_render / ambient_clear / ambient_sweep = 0 turns one off)",
+                  sw.master ? "ON" : "OFF (ambient=0)", sw.renderFallback ? "on" : "off",
+                  sw.areaClear ? "on" : "off", sw.sweep ? "on" : "off");
+        });
+        const double nowMs = NowMs();
+        const bool connected = join::IsConnected();
+        g_ambEverConnected = g_ambEverConnected || connected;
+        const ambient::Link link = ambient::LinkOf(connected, g_entry.load() == Entry::Done, g_ambEverConnected);
+        if (inScript && (int)link != g_ambLinkSeen)
+        {
+            if (g_ambLinkSeen >= 0)
+                GLOGI("ambient: connection %s -> %s (the suppression keeps running)",
+                      ambient::Name((ambient::Link)g_ambLinkSeen), ambient::Name(link));
+            g_ambLinkSeen = (int)link;
+        }
+        ambient::Ctx c;
+        c.inScript = inScript;
+        c.spawnMode = g_world->spawnMode;
+        c.nativesUp = g_world->HaveNatives();
+        c.havePlayer = inScript && lp != 0;
+        c.sweepAvailable = g_world->AmbientSweepAvailable();
+        c.nowMs = (uint64_t)nowMs;
+        const ambient::Plan p = g_ambSched.Next(c);
+        if (!p.frame)
+            ++g_ambRep.skipped[(int)p.skip];
+        else
+        {
+            static bool loggedFirst = false;
+            if (!loggedFirst)
+            {
+                loggedFirst = true;
+                GLOGI("ambient: first suppression frame via the %s (connection %s, spawn mode %d, player %s)",
+                      inScript ? "script tick" : "render-thread fallback", ambient::Name(link), c.spawnMode,
+                      lp ? "known" : "not yet");
+            }
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                g_world->SuppressAmbientFrame();       // the five density multipliers, every frame, at the source
+            }
+            if (inScript)
+            {
+                ++g_ambRep.frameScript;
+                ++g_ambRep.ticks[(int)link];
+            }
+            else
+                ++g_ambRep.frameRender;
+            float x = 0, y = 0, z = 0;
+            const bool haveCoords = (p.periodic || p.clear) && g_world->GetEntityCoords(lp, x, y, z);
+            if (p.periodic)
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                g_world->SuppressAmbientSystems(x, y, z, haveCoords);
+                ++g_ambRep.periodic;
+            }
+            if (p.clear && haveCoords)
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                AmbientClearGuarded(lp, x, y, z, ambient::kClearRadiusM, "the periodic area clear");
+            }
+            if (p.sweep)
+            {
+                WorkSection s(probe, kSecAmbientFrame);
+                AmbientSweep(lp);
+            }
+        }
+        // The 10 s line: key=value, parseable; written in every connection state, also while nothing runs.
+        if (g_ambReportMs == 0)
+            g_ambReportMs = nowMs;
+        else if (nowMs - g_ambReportMs >= 10000.0)
+        {
+            ambient::Report& r = g_ambRep;
+            r.windowSec = (nowMs - g_ambReportMs) / 1000.0;
+            r.link = link;
+            r.calls = ambient::Delta(g_world->ambientTally, g_ambTallySeen);
+            g_ambTallySeen = g_world->ambientTally;
+            r.breaker = g_ambSched.BreakerTripped();
+            r.breakerLost = g_ambSched.ExemptLost();
+            r.sw = g_ambSched.Sw();
+            r.sweepAvailable = g_world->AmbientSweepAvailable();
+            char line[1400];
+            ambient::FormatLine(line, sizeof(line), r);
+            GLOGI("%s", line);
+            const int keepPeds = r.nearPeds, keepVehs = r.nearVehs, keepExempt = r.exemptCount;
+            r = ambient::Report();
+            r.nearPeds = keepPeds;
+            r.nearVehs = keepVehs;
+            r.exemptCount = keepExempt;
+            g_ambReportMs = nowMs;
+        }
+    }
+
     // Longstops, so the entry can never block for ever: the readiness gate below gives GTA this
     // long (from the first script tick with a session and a ped) to finish its own load, and the
     // freemode model this long (from readiness) to stream in before the story ped is kept.
@@ -1822,7 +2031,7 @@ namespace {
                 // freemode model keeps streaming meanwhile for the swap at entry. With stock scripts
                 // off (no_sp_scripts=1) no SP script executes, so there is no flow to kill: the
                 // terminate loop is skipped (the entry runs SuppressEntryBoot once instead).
-                g_world->SuppressAmbientFrame();
+                // (the ambient density multipliers run from TickAmbient at the top of GameWork, T5)
                 if (!g_world->StockScriptsOff())
                     g_world->SuppressEntryBoot();
                 static ULONG lastLog = 0;
@@ -1857,7 +2066,7 @@ namespace {
         g_world->SetEntityHeading(ped, kSpawn[3]);
         g_world->FreezeEntityPosition(ped, true);   // held hidden until the spawn's collision streams in
         g_world->RequestCollisionAt(kSpawn[0], kSpawn[1], kSpawn[2]);
-        g_world->ClearAmbientAround(kSpawn[0], kSpawn[1], kSpawn[2], kSpawnClearRadius);
+        AmbientClearGuarded(ped, kSpawn[0], kSpawn[1], kSpawn[2], kSpawnClearRadius, "the entry area clear");
         g_world->ClearSpBlips();
         g_world->DisableWanted();
         g_world->DumpLiveScripts("pristine");   // which SP scripts are running at entry (diagnostic)
@@ -1950,7 +2159,7 @@ namespace {
     {
         const float* s = g_lifeSpawn;
         g_world->ReviveLocalPlayer(s[0], s[1], s[2], s[3]);
-        g_world->ClearAmbientAround(s[0], s[1], s[2], kSpawnClearRadius);
+        AmbientClearGuarded(g_world->LocalPlayer(), s[0], s[1], s[2], kSpawnClearRadius, "the respawn area clear");
         g_world->ClearDeathEffects();
         g_world->RestoreDeathDefaults();
         g_world->RequestCollisionAt(s[0], s[1], s[2]);
@@ -7725,6 +7934,7 @@ namespace {
         }
 
         int32_t lp = g_world->LocalPlayer();
+        TickAmbient(inScript, lp, probe);              // T5: no ambient NPCs / traffic, every tick, before the connection / entry gates
         if (!lp) {
             // Player not spawned yet — render the GAGE loading overlay.
             void* sc = game::GetSwapChain();
@@ -7933,10 +8143,7 @@ namespace {
                 WorkSection s(probe, kSecSpFrame);
                 g_world->SuppressSPFrame();
             }
-            {
-                WorkSection s(probe, kSecAmbientFrame);
-                g_world->SuppressAmbientFrame();    // hold the singleplayer ambient world off, every frame
-            }
+            // (the ambient world is held off from TickAmbient at the top of GameWork, every tick, whatever the connection: T5)
             // For the first 30 s after entry, keep terminating the SP mission-flow scripts
             // (flow_controller + prologue1) every tick: flow_controller relaunches the Prologue a
             // few seconds in (gage.log: prologue1 reappeared as id 68, then teleported the player to

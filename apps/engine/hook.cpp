@@ -656,6 +656,9 @@ const HashMapping kCrossmap3889[] = {
     {native::CLEAR_AREA_OF_PEDS,                               0x55F7AC4B2B875901},
     {native::CLEAR_AREA_OF_COPS,                               0x8B0110C1F1D9D177},
     {native::REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA,          0xC4BCE90F7242F354},
+    // T5 ambient, awaiting hashes (hook.h constants are 0): add one row per native here when the public hash is filled in:
+    //   SET_PED_POPULATION_BUDGET, SET_VEHICLE_POPULATION_BUDGET, SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA,
+    //   DELETE_ALL_TRAINS, GET_PED_NEARBY_PEDS, GET_PED_NEARBY_VEHICLES.
     // join readiness gate + model verify.
     {native::GET_IS_LOADING_SCREEN_ACTIVE,                     0xDCE42B3C644D1A4E},
     {native::IS_SCREEN_FADED_IN,                               0x9390801B06EE998F},
@@ -3495,41 +3498,11 @@ void World::DumpLiveScripts(const char* when) {
 }
 
 void World::SuppressSPSystems() {
-    uint64_t argFalse[] = { 0 };
-    CallNative(native::SET_RANDOM_EVENT_FLAG, argFalse, 1, nullptr);
-    CallNative(native::SET_RANDOM_TRAINS,     argFalse, 1, nullptr);
-    CallNative(native::SET_GARBAGE_TRUCKS,    argFalse, 1, nullptr);
-    CallNative(native::SET_RANDOM_BOATS,      argFalse, 1, nullptr);
-    uint64_t parked[] = { (uint64_t)(uint32_t)(int32_t)-1 };  // SET_NUMBER_OF_PARKED_VEHICLES(-1)
-    CallNative(native::SET_NUMBER_OF_PARKED_VEHICLES, parked, 1, nullptr);
-    CallNative(native::SET_CREATE_RANDOM_COPS, argFalse, 1, nullptr);
-    CallNative(native::SET_CREATE_RANDOM_COPS_NOT_ON_SCENARIOS, argFalse, 1, nullptr);
-    CallNative(native::SET_CREATE_RANDOM_COPS_ON_SCENARIOS,     argFalse, 1, nullptr);
-
-    // Every emergency dispatch service off (1..15: police, fire, ambulance, swat, gangs, army,
-    // boats, helicopters). These are event-driven, not wanted-driven, so clearing the wanted
-    // level alone does not stop them.
-    for (uint64_t svc = 1; svc <= 15; ++svc) {
-        uint64_t dargs[] = { svc, 0 };
-        CallNative(native::ENABLE_DISPATCH_SERVICE, dargs, 2, nullptr);
-    }
-
-    // Per-player cop behaviour.
-    uint64_t player[4] = {};
-    if (CallNative(native::PLAYER_ID, nullptr, 0, player)) {
-        const uint64_t pid = (uint64_t)(uint32_t)player[0];
-        uint64_t ignore[]   = { pid, 1 };  // SET_POLICE_IGNORE_PLAYER(player, true)
-        CallNative(native::SET_POLICE_IGNORE_PLAYER, ignore, 2, nullptr);
-        uint64_t dispatch[] = { pid, 0 };  // SET_DISPATCH_COPS_FOR_PLAYER(player, false)
-        CallNative(native::SET_DISPATCH_COPS_FOR_PLAYER, dispatch, 2, nullptr);
-        uint64_t hassle[]   = { pid, 0 };  // SET_PLAYER_CAN_BE_HASSLED_BY_GANGS(player, false)
-        CallNative(native::SET_PLAYER_CAN_BE_HASSLED_BY_GANGS, hassle, 2, nullptr);
-    }
-    uint64_t mult[] = { FloatArg(0.0f) };  // SET_WANTED_LEVEL_MULTIPLIER(0.0)
-    CallNative(native::SET_WANTED_LEVEL_MULTIPLIER, mult, 1, nullptr);
-    uint64_t blips[] = { 0 };              // SET_POLICE_RADAR_BLIPS(false)
-    CallNative(native::SET_POLICE_RADAR_BLIPS, blips, 1, nullptr);
-
+    // T5 ambient: the ambient half of this function (random events, trains, trucks, boats, parked cars,
+    // random cops, dispatch, police / gang flags, wanted multiplier, radar blips) moved to
+    // SuppressAmbientSystems, which the engine's ambient tick runs every 2 s whatever the connection
+    // state. This one keeps the SP-session protection (autosave, phone, story scripts) and stays at the
+    // entry and the gated 5 s call.
     // Block saving: SET_MISSION_FLAG(true) stops the game writing the multiplayer character into
     // the player's singleplayer savegame; also terminate the autosave controller script.
     uint64_t missionFlag[] = { 1 };
@@ -4060,29 +4033,147 @@ float World::GetEntitySpeed(int32_t handle) {
 // World clean-up (ambient density, area clears, default SP blips), the join
 // readiness gate, and model verify.
 // ---------------------------------------------------------------------------
+// T5 ambient: one native call of the ambient clean-up, counted by native in ambientTally. A hash of 0
+// (UNRESOLVED: lookup needed) never reaches the game: it is counted "inert". The first call of each
+// native logs once, so the density natives' resolution on this build (Epic Legacy vs Steam Enhanced) is
+// in gage.log, and an unresolved hash can no longer hide behind "NPCs still appear".
+static bool ambCall(World& w, gage::ambient::Id id, const char* nativeName, uint64_t hash,
+                    const uint64_t* args, int argc, uint64_t* ret = nullptr) {
+    namespace amb = gage::ambient;
+    amb::Result r = amb::Result::Inert;
+    bool ok = false;
+    if (hash != 0) {
+        ok = w.CallNative(hash, args, argc, ret);
+        r = ok ? amb::Result::Ok : amb::Result::Failed;
+    }
+    if (w.ambientTally.Note(id, r)) {
+        if (r == amb::Result::Ok)
+            GLOGI("ambient: first use of %s: call worked", nativeName);
+        else if (r == amb::Result::Failed)
+            GLOGW("ambient: first use of %s FAILED: the hash does not resolve on this build, or the call failed "
+                  "(what it controls is NOT being held off; see the 'hook: new natives' line)", nativeName);
+        else
+            GLOGW("ambient: %s has no hash yet (UNRESOLVED: lookup needed): inert, what it would stop stays visible",
+                  nativeName);
+    }
+    return ok;
+}
+#define GAGE_AMB(id, NAME, args, argc) ambCall(*this, gage::ambient::Id::id, #NAME, native::NAME, args, argc)
+
 void World::SuppressAmbientFrame() {
     // Each multiplier lasts one frame, so this runs every script tick. 0.0 = none.
     uint64_t zero[] = { FloatArg(0.0f) };
-    CallNative(native::SET_PED_DENSITY_MULTIPLIER_THIS_FRAME,            zero, 1, nullptr);
-    CallNative(native::SET_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME,        zero, 1, nullptr);
-    CallNative(native::SET_RANDOM_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME, zero, 1, nullptr);
-    CallNative(native::SET_PARKED_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME, zero, 1, nullptr);
+    GAGE_AMB(PedDensity,     SET_PED_DENSITY_MULTIPLIER_THIS_FRAME,            zero, 1);
+    GAGE_AMB(VehDensity,     SET_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME,        zero, 1);
+    GAGE_AMB(RandVehDensity, SET_RANDOM_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME, zero, 1);
+    GAGE_AMB(ParkedDensity,  SET_PARKED_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME, zero, 1);
     uint64_t scenario[] = { FloatArg(0.0f), FloatArg(0.0f) };  // both parameters 0.0
-    CallNative(native::SET_SCENARIO_PED_DENSITY_MULTIPLIER_THIS_FRAME, scenario, 2, nullptr);
+    GAGE_AMB(ScenarioDensity, SET_SCENARIO_PED_DENSITY_MULTIPLIER_THIS_FRAME,  scenario, 2);
+}
+
+void World::SuppressAmbientSystems(float x, float y, float z, bool haveCoords) {
+    uint64_t argFalse[] = { 0 };
+    GAGE_AMB(RandomEvents,  SET_RANDOM_EVENT_FLAG, argFalse, 1);
+    GAGE_AMB(Trains,        SET_RANDOM_TRAINS,     argFalse, 1);
+    GAGE_AMB(GarbageTrucks, SET_GARBAGE_TRUCKS,    argFalse, 1);
+    GAGE_AMB(Boats,         SET_RANDOM_BOATS,      argFalse, 1);
+    uint64_t parked[] = { (uint64_t)(uint32_t)(int32_t)-1 };  // SET_NUMBER_OF_PARKED_VEHICLES(-1)
+    GAGE_AMB(ParkedCount,   SET_NUMBER_OF_PARKED_VEHICLES, parked, 1);
+    GAGE_AMB(RandomCops,    SET_CREATE_RANDOM_COPS, argFalse, 1);
+    GAGE_AMB(RandomCops,    SET_CREATE_RANDOM_COPS_NOT_ON_SCENARIOS, argFalse, 1);
+    GAGE_AMB(RandomCops,    SET_CREATE_RANDOM_COPS_ON_SCENARIOS,     argFalse, 1);
+
+    // Every emergency dispatch service off (1..15: police, fire, ambulance, swat, gangs, army,
+    // boats, helicopters). These are event-driven, not wanted-driven, so clearing the wanted
+    // level alone does not stop them.
+    for (uint64_t svc = 1; svc <= 15; ++svc) {
+        uint64_t dargs[] = { svc, 0 };
+        GAGE_AMB(Dispatch, ENABLE_DISPATCH_SERVICE, dargs, 2);
+    }
+
+    // Per-player cop behaviour.
+    uint64_t player[4] = {};
+    if (CallNative(native::PLAYER_ID, nullptr, 0, player)) {
+        const uint64_t pid = (uint64_t)(uint32_t)player[0];
+        uint64_t ignore[]   = { pid, 1 };  // SET_POLICE_IGNORE_PLAYER(player, true)
+        GAGE_AMB(PlayerFlags, SET_POLICE_IGNORE_PLAYER, ignore, 2);
+        uint64_t dispatch[] = { pid, 0 };  // SET_DISPATCH_COPS_FOR_PLAYER(player, false)
+        GAGE_AMB(PlayerFlags, SET_DISPATCH_COPS_FOR_PLAYER, dispatch, 2);
+        uint64_t hassle[]   = { pid, 0 };  // SET_PLAYER_CAN_BE_HASSLED_BY_GANGS(player, false)
+        GAGE_AMB(PlayerFlags, SET_PLAYER_CAN_BE_HASSLED_BY_GANGS, hassle, 2);
+    }
+    uint64_t mult[] = { FloatArg(0.0f) };  // SET_WANTED_LEVEL_MULTIPLIER(0.0)
+    GAGE_AMB(WantedMult, SET_WANTED_LEVEL_MULTIPLIER, mult, 1);
+    uint64_t blips[] = { 0 };              // SET_POLICE_RADAR_BLIPS(false)
+    GAGE_AMB(RadarBlips, SET_POLICE_RADAR_BLIPS, blips, 1);
+
+    // Sentinel natives (hash 0 until looked up: inert, counted, logged once). Persistent budgets: 0 peds and
+    // 0 vehicles; the existing trains; the vehicle generators off in a box around the player.
+    uint64_t budget0[] = { 0 };
+    GAGE_AMB(PedBudget, SET_PED_POPULATION_BUDGET,     budget0, 1);
+    GAGE_AMB(VehBudget, SET_VEHICLE_POPULATION_BUDGET, budget0, 1);
+    GAGE_AMB(DeleteTrains, DELETE_ALL_TRAINS, nullptr, 0);
+    if (haveCoords) {
+        // SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA(x1, y1, z1, x2, y2, z2, toggle = false, p7): a box of +/- 600 m.
+        // p7's meaning is unverified (0 here): GI confirms it when the hash is looked up.
+        constexpr float r = 600.0f;
+        uint64_t box[] = { FloatArg(x - r), FloatArg(y - r), FloatArg(z - r), FloatArg(x + r), FloatArg(y + r), FloatArg(z + r), 0, 0 };
+        GAGE_AMB(GeneratorsArea, SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA, box, 8);
+    }
 }
 
 void World::ClearAmbientAround(float x, float y, float z, float radius) {
     if (!(radius > 0.0f)) return;  // also rejects NaN
     // CLEAR_AREA_OF_PEDS / CLEAR_AREA_OF_COPS(x, y, z, radius, flags = 0)
     uint64_t area[] = { FloatArg(x), FloatArg(y), FloatArg(z), FloatArg(radius), 0 };
-    CallNative(native::CLEAR_AREA_OF_PEDS, area, 5, nullptr);
-    CallNative(native::CLEAR_AREA_OF_COPS, area, 5, nullptr);
+    GAGE_AMB(ClearPeds, CLEAR_AREA_OF_PEDS, area, 5);
+    GAGE_AMB(ClearCops, CLEAR_AREA_OF_COPS, area, 5);
     // REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA(x1, y1, z1, x2, y2, z2, p6 = 0): a box of +/- radius.
     // No CLEAR_AREA_OF_VEHICLES: it can delete the player's own car.
     uint64_t box[] = { FloatArg(x - radius), FloatArg(y - radius), FloatArg(z - radius),
                        FloatArg(x + radius), FloatArg(y + radius), FloatArg(z + radius), 0 };
-    CallNative(native::REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA, box, 7, nullptr);
+    GAGE_AMB(RemoveGenVeh, REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA, box, 7);
 }
+
+bool World::AmbientSweepAvailable() const {
+    return native::GET_PED_NEARBY_PEDS != 0 && native::GET_PED_NEARBY_VEHICLES != 0;
+}
+
+// GET_PED_NEARBY_PEDS(ped, int* sizeAndPeds, ignore) / GET_PED_NEARBY_VEHICLES(ped, int* sizeAndVehs): the
+// array is slot 0 = capacity going in / count coming out, then one handle per 8-byte slot (the layout every
+// other pointer argument in this file uses). UNVERIFIED live: ParseNearby rejects an implausible count, the
+// sweep drops 0 / -1 and checks DOES_ENTITY_EXIST, and the circuit breaker watches the exempt handles.
+static int nearbyCall(World& w, gage::ambient::Id id, const char* name, uint64_t hash, int32_t around,
+                      int32_t* out, int cap, bool withIgnore) {
+    if (!around || !out || cap <= 0) return -1;
+    if (cap > gage::ambient::kNearbyCap) cap = gage::ambient::kNearbyCap;
+    uint64_t buf[1 + gage::ambient::kNearbyCap] = {};
+    buf[0] = (uint64_t)(uint32_t)cap;
+    uint64_t args[] = { (uint64_t)(uint32_t)around, (uint64_t)(uintptr_t)buf, (uint64_t)(uint32_t)(int32_t)-1 };
+    if (!ambCall(w, id, name, hash, args, withIgnore ? 3 : 2))
+        return -1;
+    return gage::ambient::ParseNearby(buf, cap, out);
+}
+
+int World::NearbyPeds(int32_t around, int32_t* out, int cap) {
+    return nearbyCall(*this, gage::ambient::Id::NearbyPeds, "GET_PED_NEARBY_PEDS", native::GET_PED_NEARBY_PEDS,
+                      around, out, cap, true);
+}
+
+int World::NearbyVehicles(int32_t around, int32_t* out, int cap) {
+    return nearbyCall(*this, gage::ambient::Id::NearbyVehs, "GET_PED_NEARBY_VEHICLES", native::GET_PED_NEARBY_VEHICLES,
+                      around, out, cap, false);
+}
+
+bool World::DeleteAmbientEntity(int32_t handle) {
+    if (!gage::ambient::ExemptSet::Valid(handle)) return false;
+    // SET_ENTITY_AS_MISSION_ENTITY(entity, bScriptHostObject, bGrabFromOtherScript), then DELETE_ENTITY(&entity).
+    uint64_t grab[] = { (uint64_t)(uint32_t)handle, 1, 1 };
+    GAGE_AMB(GrabEntity, SET_ENTITY_AS_MISSION_ENTITY, grab, 3);
+    uint64_t del[] = { (uint64_t)(uintptr_t)&handle };
+    return GAGE_AMB(DeleteEntity, DELETE_ENTITY, del, 1);
+}
+#undef GAGE_AMB
 
 void World::ClearSpBlips() {
     static bool loggedUnresolved = false, loggedRun = false;
@@ -5565,6 +5656,9 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(CLEAR_AREA_OF_PEDS),
         GAGE_NEW_NATIVE(CLEAR_AREA_OF_COPS),
         GAGE_NEW_NATIVE(REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA),
+        // T5 ambient: add GAGE_NEW_NATIVE(...) here for each of SET_PED_POPULATION_BUDGET, SET_VEHICLE_POPULATION_BUDGET,
+        // SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA, DELETE_ALL_TRAINS, GET_PED_NEARBY_PEDS, GET_PED_NEARBY_VEHICLES once
+        // their hook.h constant is non-zero (a 0 entry would only list itself as unresolved on every launch).
         GAGE_NEW_NATIVE(GET_IS_LOADING_SCREEN_ACTIVE),
         GAGE_NEW_NATIVE(IS_SCREEN_FADED_IN),
         GAGE_NEW_NATIVE(IS_PLAYER_SWITCH_IN_PROGRESS),

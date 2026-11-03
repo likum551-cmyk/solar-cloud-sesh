@@ -18,6 +18,7 @@
 // zero/false. Nothing aborts the engine.
 #pragma once
 #include "common/common.h"
+#include "ambient.h"
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -170,6 +171,21 @@ namespace gage::game {
         constexpr uint64_t CLEAR_AREA_OF_PEDS                               = 0xBE31FD6CE464AC59;
         constexpr uint64_t CLEAR_AREA_OF_COPS                               = 0x04F8FC8FCF58F88D;
         constexpr uint64_t REMOVE_VEHICLES_FROM_GENERATORS_IN_AREA          = 0x46A1E1A299EC4BBA;
+        // T5 ambient: natives whose hash nobody has looked up yet. 0 = UNRESOLVED: every World:: wrapper that
+        // uses one is inert (returns false / -1, logs once, counts "inert") until the public hash is put here and
+        // its 3889 hash is added to kCrossmap3889 + logNewNativeResolution (hook.cpp). Never fill one in from memory.
+        //   SET_PED_POPULATION_BUDGET(int budget)                             0 = no ambient peds, persistent
+        //   SET_VEHICLE_POPULATION_BUDGET(int budget)                         0 = no ambient vehicles, persistent
+        //   SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA(float x1, y1, z1, x2, y2, z2, BOOL toggle, BOOL p7)
+        //   DELETE_ALL_TRAINS()                                               trains that already exist
+        //   GET_PED_NEARBY_PEDS(Ped ped, int* sizeAndPeds, int ignore)        returns the count; slot 0 = capacity in
+        //   GET_PED_NEARBY_VEHICLES(Ped ped, int* sizeAndVehs)                returns the count; slot 0 = capacity in
+        constexpr uint64_t SET_PED_POPULATION_BUDGET                        = 0;  // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_VEHICLE_POPULATION_BUDGET                    = 0;  // UNRESOLVED: lookup needed
+        constexpr uint64_t SET_ALL_VEHICLE_GENERATORS_ACTIVE_IN_AREA        = 0;  // UNRESOLVED: lookup needed
+        constexpr uint64_t DELETE_ALL_TRAINS                                = 0;  // UNRESOLVED: lookup needed
+        constexpr uint64_t GET_PED_NEARBY_PEDS                              = 0;  // UNRESOLVED: lookup needed
+        constexpr uint64_t GET_PED_NEARBY_VEHICLES                          = 0;  // UNRESOLVED: lookup needed
 
         // join readiness gate (loading screen, fade, player switch, control) and model verify
         constexpr uint64_t GET_IS_LOADING_SCREEN_ACTIVE                     = 0x10D0A8F259E93EC9;
@@ -594,13 +610,20 @@ namespace gage::game {
         bool     IsPedDeadOrDying(int32_t handle);
 
         // -- singleplayer suppression ----------------------------------------
-        // Once-and-periodic (call at entry and re-assert every few seconds): disables random
-        // events, trains, garbage trucks, random boats, parked cars (SET_NUMBER_OF_PARKED_VEHICLES(-1)),
-        // random/scenario cops, every emergency dispatch service
-        // (1..15), gang hassling, the wanted multiplier and cop radar blips, and blocks autosave
+        // Once-and-periodic (call at entry and re-assert every few seconds): blocks autosave
         // (SET_MISSION_FLAG(true) so the game never writes the multiplayer character into the
-        // player's singleplayer savegame; also terminates the autosave_controller script).
+        // player's singleplayer savegame; also terminates the autosave_controller script), the phone
+        // and the story/activity scripts. (T5: the ambient half -- random events, trains, garbage trucks,
+        // boats, parked cars, random cops, dispatch, gang hassling, wanted multiplier, radar blips --
+        // moved to SuppressAmbientSystems, which runs whatever the connection state.)
         void     SuppressSPSystems();
+        // T5 ambient: the persistent ambient switches that used to sit at the top of SuppressSPSystems
+        // (random events, trains, garbage trucks, boats, parked cars, random cops, every dispatch service,
+        // police ignore / dispatch cops / gang hassling, wanted multiplier, cop radar blips), plus the
+        // sentinel ones (population budgets 0, vehicle generators off in a box around (x, y), delete the
+        // existing trains). Re-assert every few seconds, independent of the connection. Counted in
+        // ambientTally. SuppressSPSystems no longer calls it: the engine's ambient tick does.
+        void     SuppressAmbientSystems(float x, float y, float z, bool haveCoords);
         // Every-frame (call each script tick while on the server): holds the character-wheel, weapon
         // wheel, phone and MP character-select controls disabled, hides GTA's minimap and the
         // health/armour arcs around it (we draw our own HUD), hides the notification/SMS feed, blocks
@@ -608,11 +631,25 @@ namespace gage::game {
         // it appears. (The pause menu is left alone here; the engine's HoldMenuControls disables Esc
         // (control 200) so it cannot pause the game; P (199) still opens the pausing menu.)
         void     SuppressSPFrame();
-        // Every-frame (call each script tick while on the server): sets the ped, scenario-ped,
-        // vehicle, random-vehicle and parked-vehicle density multipliers to 0 for this frame, so
-        // the streets stay empty of ambient peds and traffic. (SuppressSPSystems adds the
-        // periodic parked-car and boat switches.)
+        // Every-frame (the engine's TickAmbient calls it on every tick, whatever the connection or
+        // entry state, and on the render-thread fallback): sets the ped, scenario-ped, vehicle,
+        // random-vehicle and parked-vehicle density multipliers to 0 for this frame, so the streets
+        // stay empty of ambient peds and traffic. Each call is counted in ambientTally.
         void     SuppressAmbientFrame();
+        // T5 ambient: every call of SuppressAmbientFrame / SuppressAmbientSystems / ClearAmbientAround /
+        // the sweep, counted by native (ok / failed / inert), and the first call of each logged once. The
+        // engine's `engine: ambient` line reads and diffs it. Game thread (and the render-thread fallback,
+        // which only runs SuppressAmbientFrame; the two never run in the same frame).
+        gage::ambient::Tally ambientTally;
+        // True when the enumeration natives have hashes (the sweep can run at all).
+        bool     AmbientSweepAvailable() const;
+        // GET_PED_NEARBY_PEDS / GET_PED_NEARBY_VEHICLES around `around` into out[0..cap): the count read,
+        // or -1 when the native is inert (hash 0), could not be called or returned an implausible array.
+        int      NearbyPeds(int32_t around, int32_t* out, int cap);
+        int      NearbyVehicles(int32_t around, int32_t* out, int cap);
+        // SET_ENTITY_AS_MISSION_ENTITY(h, true, true) then DELETE_ENTITY: the way a script deletes an
+        // entity it does not own. ONLY for a handle gage::ambient::ExemptSet::MayDelete() accepted.
+        bool     DeleteAmbientEntity(int32_t handle);
         // Entry-time (call each script tick through the entry window): terminate the SP mission-flow
         // scripts (flow_controller, which relaunches the Prologue, plus prologue1 / prologuescreen /
         // the character wheel) and force the playing game-state, so a fresh Story Mode boot's
@@ -626,7 +663,8 @@ namespace gage::game {
         void     SuppressPedHijackers();
         // Clear ambient peds and cops within `radius` of a point and drop generator-spawned
         // vehicles from a box of +/- radius around it. Deliberately not CLEAR_AREA_OF_VEHICLES
-        // (it can delete the player's own car). Call it at the spawn point, not every frame.
+        // (it can delete the player's own car). The engine calls it through AmbientClearGuarded (entry,
+        // respawn, and every 3 s): the exemption list and the breaker watch it. Counted in ambientTally.
         void     ClearAmbientAround(float x, float y, float z, float radius);
         // Strip the default singleplayer map blips (shops, properties, activities) and keep the
         // player's waypoint. A logged no-op while the blip natives do not resolve; it walks

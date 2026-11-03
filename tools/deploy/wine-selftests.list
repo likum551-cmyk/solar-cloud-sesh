@@ -36,6 +36,7 @@ locomotion_test       | gate   |  300 |        | remote-ped locomotion controlle
 vehicle_drive_test    | gate   |  300 |        | remote-vehicle driving model; seeded, pure
 gameplay_test         | gate   |  300 |        | protocol v4 decision units (vitals, respawn gate, emotes, vehicle link); simulated time, asserts its check count
 script_suppress_test  | gate   |   60 |        | the singleplayer-script tables the engine terminates; table integrity only
+ambient_test          | soft   |   60 |        | T5 ambient: scheduler / exemption list / sweep planner / breaker / counters / 10 s line (apps/engine/ambient.h) + a read of engine.cpp's call order; asserts its check count
 version_gate_test     | gate   |   60 |        | the launcher's lockstep policy (version_gate.h): protocol gate table, every update mandatory, poll and gap timing; pure functions, no OS calls
 
 # ---- Windows APIs that wine emulates: advisory until promoted ---------------------------------------------------
