@@ -45,7 +45,10 @@ namespace gage::sync {
     // are "down", raising and up (and anything else, a car with no roof) are "up".
     inline bool RoofDownFromState(int state) { return state == 1 || state == 2; }
 
-    inline uint8_t Flags2FromState(bool headlights, bool highBeam, bool interior, bool indicatorL, bool indicatorR, bool roofDown)
+    // brakeLights / handbrake (v6, kVeh2Brake / kVeh2Handbrake): the driver's pedals as sync::ClassifyBrake reads them
+    // (libs/sync/vehicle_visual.h); a car nobody drives sends both clear.
+    inline uint8_t Flags2FromState(bool headlights, bool highBeam, bool interior, bool indicatorL, bool indicatorR, bool roofDown,
+                                   bool brakeLights = false, bool handbrake = false)
     {
         uint8_t f = 0;
         if (headlights) f = (uint8_t)(f | proto::kVeh2Headlights);
@@ -54,6 +57,8 @@ namespace gage::sync {
         if (indicatorL) f = (uint8_t)(f | proto::kVeh2IndicatorL);
         if (indicatorR) f = (uint8_t)(f | proto::kVeh2IndicatorR);
         if (roofDown)   f = (uint8_t)(f | proto::kVeh2RoofDown);
+        if (brakeLights) f = (uint8_t)(f | proto::kVeh2Brake);
+        if (handbrake)  f = (uint8_t)(f | proto::kVeh2Handbrake);
         return f;
     }
 

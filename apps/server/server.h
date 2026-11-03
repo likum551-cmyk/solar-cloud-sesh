@@ -171,6 +171,7 @@ namespace gage::server {
         uint64_t vehicleUpdatesInvalid = 0;  // malformed, out of the box, over vehicleMaxSpeed
         uint64_t vehicleUpdatesStale = 0;    // seq not newer than the last accepted
         uint64_t vehicleFrames = 0;          // VehicleWorld packets sent
+        uint64_t vehiclePartHits = 0;        // v6: vehicle Hits that set a tyre / window bit (VehicleStore::HitPart)
         uint64_t hitsAccepted = 0;
         uint64_t hitsRejected = 0;           // failed validation (dead, unknown, range, relevance, rate, 0 damage)
         uint64_t kills = 0;
