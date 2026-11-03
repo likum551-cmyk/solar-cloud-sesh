@@ -506,6 +506,39 @@ namespace gage::sync {
         return meleeWeaponHeld && (meleeActionNow || (sinceSwingMs >= 0.0 && sinceSwingMs <= kMeleeHitWindowMs));
     }
 
+    // The stale damage event (0.4.5, melee audit). HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY stays true until it is cleared, and
+    // the event is read ONLY in a swing window (MeleeEventWindow) and cleared only once read. A blow that lands outside any
+    // window (a heavy swing past the 900 ms, a blow the pool did not show because fists took nothing off it) therefore left
+    // its event standing, and the very first frame of the NEXT swing's window read it: a swing that missed was reported as a
+    // hit (a ghost hit, claimed at the nominal 40 on the first frame of the new swing). One per puppet: the first frame a
+    // window opens after it was closed discards whatever event is standing (nothing in a swing can land on its own first
+    // frame: the animation needs 100 ms or more); a new swing counted while the window is still open keeps reading, because
+    // the standing event then belongs to the blow of the swing before it (a combo).
+    class MeleeEventGate
+    {
+    public:
+        enum class Step : uint8_t
+        {
+            Closed,      // no window: do not touch the event
+            ClearStale,  // the window just opened: read the event for the log, clear it, report nothing
+            Read,        // the window is open: the event, if set, is a blow of this window
+        };
+        Step Tick(bool windowOpen)
+        {
+            if (!windowOpen)
+            {
+                open_ = false;
+                return Step::Closed;
+            }
+            const bool fresh = !open_;
+            open_ = true;
+            return fresh ? Step::ClearStale : Step::Read;
+        }
+        void Reset() { open_ = false; }
+    private:
+        bool open_ = false;
+    };
+
     enum class MeleeHitSource : uint8_t { None, Pool, Event };
     struct MeleeHitIn
     {

@@ -195,7 +195,7 @@ The server owns vehicle occupancy and player health (`docs/api/protocol.md`, mes
 | `maxHitDistance` | whole number (m) | `1000` | 10..5000. A Hit with the target farther than this from the shooter is dropped. |
 | `hitsPerSecond` | whole number | `30` | 1..1000. Hits accepted per shooter per second. Damage per hit is clamped to 250 and further to the weapon class's cap (see [Anti-cheat rules](#anti-cheat-rules-protocol-v4)). |
 | `spawnPoints` | array | `[[195.2, -933.8, 30.7, 140]]` | 1..16 points `[x, y, z, heading]` inside the world box (x, y within ±16000, z -2000..3000, heading ±360). Respawns pick from these. |
-| `hitShotWindowMs` | whole number (ms) | `500` | `0` or 100..5000. A firearm or melee Hit must name a shot or swing (`shotSeq` change) the server received within this long. `0` switches the shot requirement off (the damage caps and the melee reach stay). |
+| `hitShotWindowMs` | whole number (ms) | `500` | `0` or 100..5000. A firearm Hit must name a shot, and a melee Hit a swing (`shotSeq` change), the server received within this long. A MELEE Hit may name a swing up to 1500 ms old whatever this is set to when it is smaller (0.4.5: a blow lands up to 900 ms after the button press on the client, so 500 refused late blows with no feedback); a larger value applies to melee too. `0` switches the shot requirement off (the damage caps and the melee reach stay). |
 | `hitDamageScalePercent` | whole number | `100` | 10..1000. Scales every per-class damage cap and damage budget (the shipped numbers are estimates: raise it if legitimate players are clamped, lower it to be stricter). |
 | `onFootMaxSpeed` | whole number (m/s) | `15` | 5..600. The movement check's speed limit for a ped on foot (sprinting is about 7 m/s). |
 | `untrustedWindowMs` | whole number (ms) | `3000` | `0` (movement check off) or 500..60000. How long a player stays "untrusted" after a position jump. |
@@ -246,7 +246,7 @@ last few weapons the state reported. A `Hit` against another player or a vehicle
   last 500 ms, and that shot has not already been credited with all the Hits its class allows (handgun, SMG, rifle 2;
   machine gun 3; shotgun 8; sniper 4: pellets, the engine's 250-point splits of a long burst);
 * **melee** (fists, blades, clubs): v5 needs a **swing**, the client's count of a punch or a swing as a shot (a
-  `shotSeq` change within `hitShotWindowMs`, with the weapon reported lately; 2 Hits per swing), and the target within
+  `shotSeq` change within `max(hitShotWindowMs, 1500 ms)`, with the weapon reported lately; 2 Hits per swing), and the target within
   4 m (7 m to a vehicle's centre) of the shooter's last position (v4 needed no swing: anybody within 4 m could claim 300
   damage a second). A firearm Hit with no shot behind it still passes when the weapon is reported and the target is
   that close (a pistol-whip), at melee damage;
@@ -258,6 +258,12 @@ last few weapons the state reported. A `Hit` against another player or a vehicle
 * **environmental weapons** (fall, fire, explosion, drowning, ...) are accepted only as a **self-hit** (`targetId` =
   the sender; weapon 0 counts too), which can only hurt the sender and needs no shot. Aimed at anybody else they are
   refused.
+
+**Where Hits die (0.4.5).** Every refused Hit is counted in exactly one reason slot (`Stats::hitRefusals`, `server::HitReason`), and while Hits flow the
+server logs one line every 10 s: `combat: last 10 s: hits accepted N (melee M, melee clipped by a cap/ceiling/budget C, melee accepted only
+through the 1500 ms melee window L, clamped K, scaled up to the 1-point floor F), damage applied D, deferred X, refused R [reason=count ...]`. The reasons:
+`rate`, `shooter_dead`, `shooter_no_state`, `zero_damage`, `no_target`, `target_no_state`, `target_dead`, `untrusted`, `range`, `not_relevant`, `environment`,
+`no_shot`, `weapon_not_held`, `shot_used`, `melee_reach`, `run_over`, `no_explosive`, `over_budget`, `defer_full`. The line is silent in a window with no Hit.
 
 A Hit that fails only because its shot or weapon has not arrived yet (the reliable `Hit` can overtake the unreliable
 state that carries the shot) is held up to 300 ms, at most 4 per player, and judged again with every state; after

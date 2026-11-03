@@ -25,10 +25,13 @@
 // Everything is deterministic except wall-clock pacing. The whole run stays well
 // under 30 s; it exits non-zero on any failed check or a wrong check count.
 #include "netrig.h"
+#include "melee_sim.h"        // 0.4.5 melee audit: the engine's melee pipeline as a scripted client ...
+#include "sync/combat.cpp"     // ... built from the real libs/sync code (netcode_test links no sync library, so the TU takes it)
 
 #include "metrics.h"
 #include "protocol/crc32.h"
 
+#include <cstdarg>
 #include <cstdlib>
 #include <memory>
 
@@ -3639,6 +3642,7 @@ static void CombatV5Tests()
     // A melee Hit with no swing behind it is refused (v4: anyone within 4 m could claim 300 damage a second without swinging).
     {
         reset();
+        rig.Pump(1600); // 0.4.5: a melee Hit may name a swing up to 1500 ms old (ac::kMeleeShotWindowMs): every earlier swing must be stale first
         const server::Stats s0 = rig.srv.stats();
         Fire(rig, alice, Kin(0, 0, 30), kUnarmed, 0); // fists out, no swing
         alice.s.SendHit(HitOn(bId, 30, proto::HitKind::Player, kUnarmed, alice.shotSeq));
@@ -3990,6 +3994,313 @@ static void AnimAuthorityTests()
               alice.Joined());
 }
 
+
+// ===========================================================================
+// 0.4.5 melee audit: scripted fights, the client's real melee pipeline (tests/melee_sim.h) into the real server
+// ===========================================================================
+
+// Drives one attacker: the sim client's frames every 16 ms (the script's presses and blows on the wall clock), its PedState
+// (weapon, shotSeq, kPfMelee) every 22 ms, and its Hits straight into the session as the engine's flush does.
+static std::string F2(const char* fmt, ...)
+{
+    char buf[900];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+struct FightRun
+{
+    Rig& rig;
+    Probe& atk;
+    uint16_t victim;
+    meleesim::Client c;
+    FightRun(Rig& r, Probe& a, uint16_t v, uint32_t weapon, bool melee = true) : rig(r), atk(a), victim(v)
+    {
+        c.target = v;
+        c.weapon = weapon;
+        c.held = melee;
+        c.shotSeq = a.shotSeq;
+        c.sink = [this](const sync::BatchedHit& h) {
+            proto::Hit x;
+            x.kind = (proto::HitKind)h.kind;
+            x.targetId = h.target;
+            x.weapon = h.weapon;
+            x.damage = h.damage;
+            x.bone = h.bone;
+            x.shotSeq = h.shotSeq;
+            atk.s.SendHit(x);
+        };
+    }
+    struct Blow { double t; int pool; bool event; };
+    std::vector<double> presses;        // ms from the start
+    std::vector<Blow> blows;
+    std::vector<double> shots;          // gun shots (each also drops the puppet's pool by 30 at the same time)
+    double actionMs = 350.0;
+    bool dead = false;                  // the attacker keeps sending states
+    double nextFrame = 0.0, nextState = 0.0;
+    size_t pi = 0, bi = 0, si = 0;
+    // One slice of the script at `now` ms from the start: the state every 22 ms, the client's frame every 16 ms.
+    void Tick(double now)
+    {
+        if (now >= nextState)
+        {
+            proto::PedState ped;
+            ped.weapon = c.weapon;
+            ped.shotSeq = (uint8_t)(c.shotSeq & 15);
+            if (c.actionNow) ped.flags |= proto::kPfMelee;
+            atk.s.SendState(Kin(0, 0, 30), ped);
+            nextState = now + 22.0;
+        }
+        if (now >= nextFrame)
+        {
+            bool press = false, action = false;
+            while (pi < presses.size() && presses[pi] <= now) { press = true; ++pi; }
+            for (double p : presses)
+                if (actionMs > 0.0 && now >= p && now < p + actionMs) action = true;
+            bool shot = false;
+            while (si < shots.size() && shots[si] <= now) { shot = true; ++si; }
+            if (shot) c.Shot();
+            while (bi < blows.size() && blows[bi].t <= now) { c.pup.Blow(blows[bi].pool, blows[bi].event); ++bi; }
+            if (shot) c.pup.Blow(30, true);
+            c.Frame(now, press, action);
+            nextFrame = now + 16.0;
+        }
+    }
+    // Runs `endMs` of wall time (alone).
+    void Run(double endMs);
+};
+
+// Runs several attackers on one clock for `endMs`.
+static void RunFights(Rig& rig, std::initializer_list<FightRun*> fights, double endMs)
+{
+    const auto t0 = Clock::now();
+    for (double now = 0.0; now < endMs; now = std::chrono::duration<double, std::milli>(Clock::now() - t0).count())
+    {
+        for (FightRun* f : fights) f->Tick(now);
+        rig.Step();
+    }
+    for (FightRun* f : fights) f->atk.shotSeq = (uint8_t)(f->c.shotSeq & 15);
+}
+void FightRun::Run(double endMs) { RunFights(rig, { this }, endMs); }
+
+static void MeleeFightSimTests()
+{
+    Rig rig;
+    if (!rig.Start(ShippedCombatConfig())) { Check("0.4.5 melee sim: server starts", false); return; }
+    Probe alice(rig), bob(rig), carol(rig), dave(rig);
+    if (!alice.Join("Alice") || !bob.Join("Bob") || !carol.Join("Carol") || !dave.Join("Dave"))
+    {
+        Check("0.4.5 melee sim: four players join", false);
+        return;
+    }
+    const uint16_t aId = IdOf(alice), bId = IdOf(bob), cId = IdOf(carol), dId = IdOf(dave);
+    const bool placed = Place(rig, alice, Kin(0, 0, 30)) && Place(rig, bob, Kin(2, 0, 30)) && Place(rig, carol, Kin(20, 0, 30)) &&
+                        Place(rig, dave, Kin(1, 1, 30));
+    const bool relevant = rig.Until([&] { return rig.srv.IsRelevant(aId, bId) && rig.srv.IsRelevant(cId, bId) && rig.srv.IsRelevant(dId, bId); }, 3000);
+    if (!placed || !relevant) { Check("0.4.5 melee sim: players placed and relevant", false); return; }
+    std::string out;
+    auto reset = [&] {
+        rig.srv.Execute("heal Bob", out);
+        rig.srv.Execute("armor Bob 0", out);
+        rig.Pump(80);
+    };
+    const uint32_t kBatW = server::ac::Joaat("WEAPON_BAT");
+    // Damages Bob took (from `from`), their sum, and the attackers
+    auto dmgs = [&](size_t from) { std::vector<proto::Damage> d = bob.Damages(); d.erase(d.begin(), d.begin() + (long)std::min(from, d.size())); return d; };
+    auto sum = [](const std::vector<proto::Damage>& v) { int n = 0; for (const proto::Damage& d : v) n += d.damage; return n; };
+    auto refusals = [&](server::HitReason r) { return rig.srv.stats().hitRefusals[(size_t)r]; };
+
+    // 1. one punch: claimed 40 -> 20 after the shipped 50 percent; Bob, the attacker and the onlooker (Carol at 20 m) each hear it once
+    {
+        reset();
+        const size_t b0 = bob.Damages().size(), a0 = alice.Damages().size(), c0 = carol.Damages().size();
+        FightRun f(rig, alice, bId, kUnarmed);
+        f.presses = { 150 };
+        f.blows = { { 450, 0, true } };
+        f.Run(1300);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: ONE punch (the client's real pipeline) is exactly one Damage of 20 on Bob (claimed 40 x 50%), Bob at 180, the attacker and the onlooker told once each",
+              d.size() == 1 && d[0].damage == 20 && d[0].attackerId == aId && (d[0].flags & proto::kDmgMelee) && HealthOf(rig, bId) == 180 &&
+                  alice.Damages().size() == a0 + 1 && carol.Damages().size() == c0 + 1,
+              F2("%zu damages, %d, bob %d, alice +%zu carol +%zu", d.size(), sum(d), HealthOf(rig, bId), alice.Damages().size() - a0, carol.Damages().size() - c0));
+    }
+    // 2. a combo of three punches 0.5 s apart: three Damages of 20, none lost, none doubled
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        FightRun f(rig, alice, bId, kUnarmed);
+        f.presses = { 100, 600, 1100 };
+        f.blows = { { 400, 0, true }, { 900, 0, true }, { 1400, 0, true } };
+        f.Run(2300);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: a combo of 3 punches 0.5 s apart is three Damages of 20 (60 off Bob: 140), none lost and none doubled",
+              d.size() == 3 && sum(d) == 60 && HealthOf(rig, bId) == 140, F2("%zu damages, %d, bob %d", d.size(), sum(d), HealthOf(rig, bId)));
+    }
+    // 3. a swing that misses, then one that hits: one Damage
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        FightRun f(rig, alice, bId, kUnarmed);
+        f.presses = { 100, 800 };
+        f.blows = { { 1100, 0, true } };
+        f.Run(1900);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: a swing that misses and a swing that hits is one Damage of 20", d.size() == 1 && d[0].damage == 20, F2("%zu damages", d.size()));
+    }
+    // 4. a late blow: 700 ms after the press (inside the client's 900 ms window): the 500 ms shot window refused it as "no shot with that shotSeq"
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        const server::Stats s0 = rig.srv.stats();
+        FightRun f(rig, alice, bId, kUnarmed);
+        f.presses = { 100 };
+        f.blows = { { 800, 0, true } };
+        f.Run(1700);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        const server::Stats s1 = rig.srv.stats();
+        Check("0.4.5 melee sim: a blow 700 ms after the press (heavy swing, bat wind-up, a laggy link) is one Damage of 20 through the melee swing window; it counts as a late melee hit "
+              "and is not refused as 'no shot' (before: refused, nobody told)",
+              d.size() == 1 && d[0].damage == 20 && s1.hitsMeleeLate == s0.hitsMeleeLate + 1 && refusals(server::HitReason::NoShot) == 0,
+              F2("%zu damages, late %llu, no_shot %llu", d.size(), (unsigned long long)(s1.hitsMeleeLate - s0.hitsMeleeLate), (unsigned long long)refusals(server::HitReason::NoShot)));
+    }
+    // 5. the whole pipeline's stale case: a blow outside the window leaves an event; the next swing is a miss: Bob is not hurt
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        FightRun f(rig, alice, bId, kUnarmed);
+        f.presses = { 100, 2300 };
+        f.blows = { { 1300, 0, true } };
+        f.Run(3200);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: a swing that missed after a stale damage event hurts nobody (no ghost Hit): Bob untouched", d.empty() && HealthOf(rig, bId) == 200, F2("%zu damages", d.size()));
+    }
+    // 6. a bat: the client's event claim is the nominal 40 whatever the weapon, so the bat's 80 ceiling never shows: 20 per hit (design question, reported)
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        FightRun f(rig, alice, bId, kBatW);
+        f.presses = { 100 };
+        f.blows = { { 500, 0, true } };
+        f.Run(1300);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: a bat swing is one Damage inside the expected band 20..40 (today exactly 20: the event claims the fist nominal 40, the bat's server ceiling of 80 is never reached)",
+              d.size() == 1 && d[0].damage >= 20 && d[0].damage <= 40 && d[0].weapon == kBatW, F2("%zu damages, first %d", d.size(), d.empty() ? 0 : d[0].damage));
+    }
+    // 7. two attackers punching Bob at once: two Damages, one per attacker, 20 each
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        FightRun f1(rig, alice, bId, kUnarmed), f2(rig, dave, bId, kUnarmed);
+        f1.presses = { 100 };
+        f1.blows = { { 420, 0, true } };
+        f2.presses = { 100 };
+        f2.blows = { { 440, 0, true } };
+        RunFights(rig, { &f1, &f2 }, 1000);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        bool both = d.size() == 2 && d[0].attackerId != d[1].attackerId && sum(d) == 40;
+        Check("0.4.5 melee sim: two attackers each land one punch on Bob: two Damages of 20 from two different attackers (40 off, Bob at 160)",
+              both && HealthOf(rig, bId) == 160, F2("%zu damages, %d, bob %d", d.size(), sum(d), HealthOf(rig, bId)));
+    }
+    // 8. a punch at a dead target is refused as 'target_dead' and counted; after the respawn the next punch lands
+    {
+        reset();
+        rig.srv.Execute("kill Bob", out);
+        rig.Pump(100);
+        const size_t b0 = bob.Damages().size();
+        const uint64_t dead0 = refusals(server::HitReason::TargetDead);
+        FightRun f(rig, alice, bId, kUnarmed);
+        f.presses = { 100 };
+        f.blows = { { 400, 0, true } };
+        f.Run(1000);
+        rig.Pump(200);
+        const bool refused = refusals(server::HitReason::TargetDead) == dead0 + 1 && dmgs(b0).empty();
+        const int n = bob.Count(ET::RespawnOk);
+        rig.Pump(400);
+        bob.s.SendRespawn();
+        rig.Until([&] { return bob.Count(ET::RespawnOk) > n; }, 2000);
+        Place(rig, bob, Kin(2, 0, 30));
+        rig.Until([&] { return rig.srv.IsRelevant(aId, bId) && rig.srv.IsRelevant(cId, bId) && rig.srv.IsRelevant(dId, bId); }, 3000);
+        const size_t b1 = bob.Damages().size();
+        FightRun g(rig, alice, bId, kUnarmed);
+        g.presses = { 100 };
+        g.blows = { { 400, 0, true } };
+        g.Run(1000);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b1);
+        Check("0.4.5 melee sim: a punch at a dead target is refused (target_dead counted, no Damage); after the respawn the next punch is one Damage of 20 on the full 200",
+              refused && d.size() == 1 && d[0].damage == 20 && HealthOf(rig, bId) == 180, F2("refused %d, %zu damages, bob %d", (int)refused, d.size(), HealthOf(rig, bId)));
+    }
+    // 9. guns are not broken: a carbine, 5 shots 120 ms apart, each shot takes 30 off the puppet's pool: five Damages of 22 (30 x 72%), 110 in all
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        FightRun f(rig, alice, bId, kRifle, false);
+        f.shots = { 100, 220, 340, 460, 580 };
+        f.Run(1500);
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: a carbine burst (5 shots 120 ms apart, 30 off the pool each) is five Damages of 22 (30 x 72%), 110 off Bob: guns are exactly once per shot",
+              d.size() == 5 && sum(d) == 110 && HealthOf(rig, bId) == 90, F2("%zu damages, %d, bob %d", d.size(), sum(d), HealthOf(rig, bId)));
+    }
+    // 10. the reliable Hit overtakes the state that carries its swing (reorder): held, then applied exactly once
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        const server::Stats s0 = rig.srv.stats();
+        alice.shotSeq = (uint8_t)((alice.shotSeq + 1) & 15);
+        proto::Hit h = HitOn(bId, 40, proto::HitKind::Player, kUnarmed, alice.shotSeq);
+        alice.s.SendHit(h);
+        rig.Pump(100);
+        proto::PedState ped;
+        ped.weapon = kUnarmed;
+        ped.shotSeq = alice.shotSeq;
+        for (int i = 0; i < 4; ++i) { alice.s.SendState(Kin(0, 0, 30), ped); rig.Pump(30); }
+        rig.Pump(200);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        const server::Stats s1 = rig.srv.stats();
+        Check("0.4.5 melee sim: a punch's Hit that overtakes the state carrying its swing is held and applied exactly once (20)",
+              d.size() == 1 && d[0].damage == 20 && s1.hitsDeferred == s0.hitsDeferred + 1, F2("%zu damages, deferred %llu", d.size(), (unsigned long long)(s1.hitsDeferred - s0.hitsDeferred)));
+    }
+    // 11. the same Hit delivered twice (a client bug or a replay): the slot credits one swing twice (hitsPerShot 2) and refuses the third; the per-swing worst case is 2 x 20
+    {
+        reset();
+        const size_t b0 = bob.Damages().size();
+        const uint64_t used0 = refusals(server::HitReason::ShotUsed);
+        Fire(rig, alice, Kin(0, 0, 30), kUnarmed);
+        for (int i = 0; i < 3; ++i) alice.s.SendHit(ShotHit(alice, bId, 40, kUnarmed));
+        rig.Pump(300);
+        const std::vector<proto::Damage> d = dmgs(b0);
+        Check("0.4.5 melee sim: one swing delivered three identical Hits is two Damages (40 at most per punch, the server cannot tell a repeat from a second hand) and the third is refused as shot_used",
+              d.size() == 2 && sum(d) == 40 && refusals(server::HitReason::ShotUsed) == used0 + 1, F2("%zu damages, %d", d.size(), sum(d)));
+    }
+    // 12. every refusal is counted by reason, in the 10 s `combat:` server line
+    {
+        rig.Pump(300);
+        const server::Stats& s = rig.srv.stats();
+        uint64_t byReason = 0;
+        for (size_t i = 0; i < server::kHitReasons; ++i) byReason += s.hitRefusals[i];
+        std::string combatLines; // the refusal part of each 10 s line the server logged, for the failure message
+        for (const std::string& l : rig.logs)
+            if (l.find("combat: last 10 s") != std::string::npos) combatLines += l.substr(l.find("refused")) + " | ";
+        Check("0.4.5 melee sim: every refused Hit is counted in exactly one reason slot (the per-reason sum equals hitsRejected), and the server's 10 s `combat:` line carries the "
+              "accepted / melee numbers and the reasons (target_dead=1 from the dead-target fight)",
+              byReason == s.hitsRejected && rig.LogHas("combat: last 10 s: hits accepted") && rig.LogHas("target_dead=1") &&
+                  s.hitsMelee >= 8 && s.hitsDamageApplied > 0,
+              F2("%llu by reason, %llu rejected, %llu melee accepted; %s", (unsigned long long)byReason, (unsigned long long)s.hitsRejected, (unsigned long long)s.hitsMelee,
+                 combatLines.c_str()));
+    }
+}
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -4026,6 +4337,8 @@ int main()
     std::printf("-- authority rules against modded clients (v4)\n");
     HitBindingTests();
     CombatV5Tests();
+    std::printf("-- 0.4.5 melee audit: scripted fights, the client's melee pipeline into the real server\n");
+    MeleeFightSimTests();
     MovementTests();
     ReconnectTests();
     VehicleAbuseTests();
@@ -4038,7 +4351,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
+    const int expected = 195 + 1 + 12; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {
