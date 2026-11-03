@@ -1,4 +1,4 @@
-// GAGE protocol v5: the messages between the GAGE client engine and the GAGE server
+// GAGE protocol v6: the messages between the GAGE client engine and the GAGE server
 // (docs/api/protocol.md has every byte layout; docs/ENGINE-PLAN.md the history). Transport is
 // ENet: channel kChanReliable carries control and chat (reliable, ordered), kChanState carries
 // per-tick movement (unreliable, sequenced).
@@ -45,6 +45,13 @@
 //   * Emotes: PlayAnim / PlayScenario / StopAnim (C->S) relayed as PeerAnim / PeerScenario /
 //     PeerAnimStop; the current looping one is replayed to newcomers like a look.
 //
+// v6 against v5 (desync overhaul round 2; the byte layouts are in docs/api/protocol.md, sections T1, 16 and T4):
+//   * T1 seats: VehicleOp EnterIntent (10) / CancelIntent (11) and Msg::SeatNotice (31): the server reserves a seat on an enter
+//     intent and tells every client, which replay the game's own enter task on the puppet.
+//   * T3 vehicle visual state: VehicleUpdate and the full VehicleWorld entry grow by u8 tyres, u8 tyresRim, u8 windows; flags2 bits
+//     6 / 7 are brake lights and handbrake; a vehicle Hit names a part in `bone` ((part << 8) | slot).
+//   * T4 collisions: Msg::VehicleImpact (40): the server's resolution of a contact between two controllers' vehicles.
+//
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
 //   * Sender-side sample time: PlayerState and VehicleUpdate carry a u16 sampleMs (the sender's own clock,
@@ -74,7 +81,8 @@ namespace gage::proto {
     // v4: live vehicles (VehicleUpdate, per-receiver VehicleWorld), health/hits/death, shotSeq, emotes.
     // v5: sampleMs, vehicle controller / owner / ageMs / motion-only entries / lights and doors, damage
     //     scaling inputs (Welcome.playerHealth, Damage bone and flags, Killed flags), PedState.vehId.
-    constexpr uint16_t kVersion = 5;
+    // v6: seat intents + SeatNotice, vehicle visual state (tyres, windows, brake lights), VehicleImpact.
+    constexpr uint16_t kVersion = 6;
 
     constexpr uint8_t kChanReliable = 0; // control, chat, join/leave: reliable ordered
     constexpr uint8_t kChanState    = 1; // PlayerState, WorldState, WorldCoarse: unreliable sequenced

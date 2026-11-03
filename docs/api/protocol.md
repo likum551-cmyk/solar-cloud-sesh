@@ -1,4 +1,6 @@
-# GAGE game protocol v5
+# GAGE game protocol v6
+
+v6 (desync overhaul round 2, client 0.4.7) adds, against v5: seat/enter intents and `SeatNotice` (31) [T1 section], vehicle visual state (`tyres`, `tyresRim`, `windows`, brake/handbrake bits, part Hits) [section 16, T3] and `VehicleImpact` (40) [T4 section]. Every other layout is the v5 one described below. A v5 peer is refused by the version gate (`Refuse(VersionMismatch)`).
 
 The wire protocol between the GAGE client engine and a GAGE server: every message, every byte, the quantisation
 formulas, the limits and the refusal codes. It describes what the shipped code does. The code is
@@ -1109,7 +1111,7 @@ reports the clear and everybody follows.
 the task for the fields); the server counts `vehiclePartHits`.
 
 <!-- T4-BEGIN: vehicle collisions (desync overhaul round 2). Append-only section; the orchestrator does the single kVersion 5 -> 6 bump. -->
-## 16. T4: vehicle collisions (`VehicleImpact`, message 40)
+## T4: vehicle collisions (`VehicleImpact`, message 40)
 
 Wire change for protocol v6 (the orchestrator bumps `kVersion` once, in lockstep with the client version): ONE new message and no change to any existing layout.
 Design, numbers and the live test: docs/sync-specs/vehicle-collisions.md.
