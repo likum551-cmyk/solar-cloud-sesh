@@ -434,13 +434,15 @@ namespace gage::server {
             const float dist = std::sqrt(d2);
             const float dEff = std::max(0.0f, dist - kTierLookaheadSec * vsum);
             float inc = dEff < (float)cfg_.nearDist ? incNear_ : dEff < (float)cfg_.midDist ? incMid_ : incFar_;
+            uint8_t tier = dEff < (float)cfg_.nearDist ? 0 : dEff < (float)cfg_.midDist ? 1 : 2;
             const bool idle = S.idleTicks >= idleAfterTicks_;
             const bool idleHeld = idle && incIdle_ < inc; // the idle rate is slower than the distance class's
             if (idle) inc = std::min(inc, incIdle_);
+            if (idleHeld) tier = 3;
             P.acc = std::min(P.acc + inc, kAccCap);
             if (S.woke && P.acc < 1.0f) P.acc = 1.0f;
             if (P.acc >= kDue)
-                cands_.push_back(Cand{s, P.acc, d2, nullptr, 0, proto::EntryPlan(), 0, P.lastSent});
+                cands_.push_back(Cand{s, P.acc, d2, nullptr, 0, proto::EntryPlan(), 0, P.lastSent, tier});
             else if (idleHeld)
                 m.pairIdleSuppressed++;
             else
@@ -537,6 +539,7 @@ namespace gage::server {
                 W.fwdSeq = W.refSeq;
                 W.fwdTick = tick;
             }
+            m.pairSentTier[c.tier < 4 ? c.tier : 3]++;
             Pair& P = R.pair[c.id];
             P.mask |= 1u;
             P.lastSent = tick;

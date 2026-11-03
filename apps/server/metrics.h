@@ -137,6 +137,10 @@ namespace gage::server {
         uint64_t pairBudgetDeferred = 0;     // due, left out: the receiver's byte budget was the limit
         uint64_t pairPacketCapDeferred = 0;  // due, left out: the one-packet size cap was the limit
         uint64_t pairNoState = 0;            // skipped: the subject or the receiver has sent no state yet
+        // The entries of pairSent by the rate that applied to the pair when it went out: near, mid, far (the
+        // distance classes, rateNearHz / rateMidHz / rateFarHz) and idle (held to rateIdleHz). Tier changes show as
+        // counts moving between them; each should be about tickHz-per-class x seconds x pairs.
+        uint64_t pairSentTier[4] = {0, 0, 0, 0};
         // Idle wake-ups. wakes: an idle player's sample left its dead-band, so its pairs are due at once.
         // noiseWakesHeld: the wake-ups a bit-exact idle test would have caused (a sample that differs from
         // what is replicated but stays inside the dead-band), counted at most once per idleAfterMs per player.
@@ -162,6 +166,13 @@ namespace gage::server {
         uint64_t wireDatagramsIn = 0;
         LogHistogram clientBytesPerSec;  // one sample per joined player per second: payload bytes sent to it
 
+        // ---- ENet's view of the links (gauges, refreshed once a second over the joined peers; sync pipeline review) ----
+        // packetThrottle is out of 32: below 32 ENet drops that share of UNRELIABLE packets (the state channel) by itself;
+        // the server configures every peer with deceleration 0 so it stays at 32. Loss is ENet's smoothed loss of
+        // reliable packets in permille, rtt the smoothed round trip, rttvar its deviation.
+        uint64_t enetPeers = 0;
+        uint64_t enetThrottleMin = 32, enetLossPermilleMax = 0, enetRttMsMax = 0, enetRttMsAvg = 0, enetRttVarMsMax = 0;
+
         // ---- CPU ----
         double cpuSeconds = 0;           // CPU time of the thread that calls Poll(), since Start()
         double wallSeconds = 0;          // wall time since Start() at the last tick
@@ -180,6 +191,12 @@ namespace gage::server {
     // `windowSeconds` of wall time. One block of `key value` lines, easy to grep.
     std::string FormatMetrics(const Metrics& now, const Metrics& since, double windowSeconds, uint32_t tickHz,
                               size_t players);
+
+    // One line of the replication health over the interval (the server log writes it every 10 s while somebody is
+    // joined): ticks and their lateness, WorldState packets / entries and the entries per tier, the sample accounting
+    // (received / forwarded / forwarded twice / never forwarded) and ENet's throttle, loss and round trips.
+    std::string FormatSyncLine(const Metrics& now, const Metrics& since, double windowSeconds, uint32_t tickHz,
+                               size_t players);
 
     // The same numbers as one JSON object on one line (for the admin channel and scripts).
     std::string FormatMetricsJson(const Metrics& now, const Metrics& since, double windowSeconds, uint32_t tickHz,
