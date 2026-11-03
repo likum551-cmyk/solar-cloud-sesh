@@ -95,6 +95,7 @@ namespace gage::net {
             Welcome, Refused, PlayerJoined, PlayerLeft, World, Chat, Disconnected, Coarse, PeerLook,
             VehicleWorld, VehicleResult, Damage, Killed, RespawnOk, PeerAnim, PeerScenario, PeerAnimStop, // v4
             SeatNotice, // T1 seats (wire v6)
+            VehicleImpact,   // T4 (v6)
         };
         Type type = Type::Disconnected;
 
@@ -126,6 +127,7 @@ namespace gage::net {
         proto::PeerScenario scenario;       // player scenario.id starts a scenario
         proto::PeerAnimStop animStop;       // player animStop.id stopped its animation / scenario
         proto::SeatNotice seatNotice;       // T1 seats (v6): a player's enter / exit intent on a vehicle seat (reliable, in order)
+        proto::VehicleImpact impact;        // T4: the server's resolution of a contact of a vehicle WE control (reliable, once per contact)
     };
 
     class ClientSession

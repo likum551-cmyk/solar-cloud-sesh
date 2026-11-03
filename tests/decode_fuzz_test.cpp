@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -323,6 +324,12 @@ static std::vector<Case> Corpus()
     { SeatNotice m; m.kind = SeatNoticeKind::Exited; m.player = 7; m.vehId = 12; m.seat = 3; v.push_back(Make("SeatNotice exited", m)); }
     { VehicleCmd m; m.vehId = 12; m.op = VehicleOp::EnterIntent; m.arg = 3u | kIntentRun; v.push_back(Make("VehicleCmd enter intent", m)); }
     { VehicleCmd m; m.vehId = 12; m.op = VehicleOp::CancelIntent; v.push_back(Make("VehicleCmd cancel intent", m)); }
+    {   // T4: the server's resolution of a vehicle contact, for one controller
+        VehicleImpact m;
+        m.seq = 4242; m.vehId = 3; m.otherId = 17; m.sampleMs = 54321;
+        m.dvx = -12.5f; m.dvy = 24.5f; m.dyaw = -2.25f; m.nx = 0.5f; m.ny = -0.75f; m.closing = 38.5f; m.depth = 0.31f;
+        v.push_back(Make("VehicleImpact", m));
+    }
     for (Case& c : v)
         if (c.name == "VehicleWorld" || c.name == "VehicleUpdate" || c.name == "VehicleCmd register") c.lossy = true;
     return v;
@@ -539,6 +546,27 @@ static void HostileCounts()
         }
         Check("PeekType accepts exactly the " + std::to_string((int)kMsgLast) + " defined type bytes", accepted == (int)kMsgLast, std::to_string(accepted));
     }
+    {   // T4 VehicleImpact: what the encoder never writes is refused (an i8 normal of -128, an i16 of -32768, a vehicle id at kMaxVehicles); the encoder
+        // refuses a non-finite value or such an id and saturates an absurd change at the wire's range
+        VehicleImpact m;
+        m.vehId = 3; m.otherId = 17; m.dvx = 1.0f;
+        const Bytes good = Encode(m);
+        Bytes nx = good, id = good, dv = good, oid = good;
+        nx[17] = 0x80;                 // nx
+        dv[11] = 0x00; dv[12] = 0x80;  // dvx = -32768
+        id[5] = 0x00; id[6] = 0x01;    // vehId 256
+        oid[7] = 0x00; oid[8] = 0x01;  // otherId 256
+        VehicleImpact out, nan = m, far = m, big = m;
+        nan.dvy = std::numeric_limits<float>::quiet_NaN();
+        far.otherId = (uint16_t)kMaxVehicles;
+        big.dvx = 1.0e6f;
+        const Bytes bb = Encode(big);
+        VehicleImpact back;
+        const bool sat = !bb.empty() && Decode(bb.data(), bb.size(), back) && back.dvx > 511.0f && back.dvx < 512.0f;
+        Check("hostile: VehicleImpact refuses an i8 of -128, an i16 of -32768 and a vehicle id of 256; Encode refuses NaN and an id of 256 and saturates 1e6 m/s at the wire's +-512",
+              good.size() == kVehicleImpactBytes && Decode(good.data(), good.size(), out) && !Decode(nx.data(), nx.size(), out) && !Decode(dv.data(), dv.size(), out) &&
+                  !Decode(id.data(), id.size(), out) && !Decode(oid.data(), oid.size(), out) && Encode(nan).empty() && Encode(far).empty() && sat);
+    }
 }
 
 // The UDP query datagrams (query.h): exactly 24 bytes, every single-bit flip, every other length.
@@ -722,7 +750,7 @@ int main()
     QueryFuzz();
     ValidatorFuzz();
     // per case: valid + prefix + trailing + bit flips + random = 5 checks; 11 hostile-count checks; 5 query checks; 1 validator check.
-    const size_t expected = corpus.size() * 5 + 11 + 5 + 1;
+    const size_t expected = corpus.size() * 5 + 11 + 5 + 1 + 1;
     std::printf("\n%d checks, %d failed (%zu message cases)\n", g_run, g_failed, corpus.size());
     if (g_run != (int)expected)
     {

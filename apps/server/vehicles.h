@@ -93,6 +93,18 @@ namespace gage::server {
             uint32_t ctrlSilenceMs = 1500;       // a driverless controller silent this long is skipped...
             uint32_t ctrlSkipMs = 10000;         // ...for this long
             uint32_t movedWithinMs = 1000;       // MovedRecently window that makes a driverless vehicle "driven" for the send rate
+            // T4 (vehicle collisions): a driverless vehicle is simulated by one client, and every other client sees a kinematic copy that
+            // cannot be pushed. So a driven vehicle that is about to hit a driverless one TAKES its control (ClaimFor): the rammer's own
+            // physics then resolves the contact natively. The approach test: the driver is faster than claimMinSpeed, heads for the
+            // vehicle (closing speed above 1 m/s) and is within claimBaseMeters + claimLookSeconds * speed of it; a claim holds
+            // claimHoldMs before it can change again. 0 claimBaseMeters switches the rule off.
+            float    claimBaseMeters = 10.0f;
+            float    claimLookSeconds = 0.5f;
+            float    claimMinSpeed = 3.0f;       // m/s
+            uint32_t claimHoldMs = 1500;
+            // T4: a reported velocity above maxSpeed but below maxSpeed * maxSpeedSoftFactor is CLAMPED to maxSpeed and accepted (a hyper car's
+            // overshoot must not freeze it for everybody else); above that it is BadArg as before. The position is still judged by displacement.
+            float    maxSpeedSoftFactor = 2.0f;
         };
 
         // One player as AssignControllers sees them: where they are, whether the server has a position of theirs, and
@@ -510,6 +522,17 @@ namespace gage::server {
                 }
                 const float sticky2 = rules_.ctrlStickyMeters * rules_.ctrlStickyMeters;
                 const float fresh2 = rules_.ctrlNewMeters * rules_.ctrlNewMeters;
+                // T4: a driven vehicle about to hit this one takes its control, so the hit is resolved by ONE physics instance
+                if (rules_.claimBaseMeters > 0.0f && (V.s.ctrl == proto::kNoPlayer || nowMs >= V.ctrlSinceMs + rules_.claimHoldMs))
+                {
+                    const uint16_t toucher = FindToucher(V, players);
+                    if (toucher != proto::kNoPlayer && toucher != V.s.ctrl)
+                    {
+                        SetController(V, toucher, nowMs, tick);
+                        ++claims_;
+                        continue;
+                    }
+                }
                 if (V.s.ctrl != proto::kNoPlayer)
                 {
                     const ControlCandidate* c = FindCandidate(players, V.s.ctrl);
@@ -541,6 +564,10 @@ namespace gage::server {
             }
         }
 
+        // T4 counters (the server's 10 s contact line)
+        uint64_t Claims() const { return claims_; }
+        uint64_t SpeedClamps() const { return speedClamps_; }
+
         // ---- the controller's motion ----
         // Ok when taken; NoVehicle, NotAllowed (not the vehicle's controller: v4 required seat 0), BadArg (invalid,
         // or a REPORTED velocity over the speed cap: the replicated velocity must be sane). The position is judged
@@ -559,7 +586,17 @@ namespace gage::server {
             if (V.s.ctrl != player) return Code::NotAllowed;
             if (!proto::ValidVehicleUpdate(u)) return Code::BadArg;
             const double speed2 = (double)u.k.vx * u.k.vx + (double)u.k.vy * u.k.vy + (double)u.k.vz * u.k.vz;
-            if (speed2 > (double)rules_.maxSpeed * rules_.maxSpeed) return Code::BadArg;
+            const double cap = (double)rules_.maxSpeed;
+            double velScale = 1.0;
+            if (speed2 > cap * cap)
+            {
+                // T4: over the cap. A hard overshoot (a cheat or a broken read) is still refused; a small one is clamped, not dropped
+                // (a dropped update froze the car for everybody else for as long as the overshoot lasted).
+                const double soft = cap * (double)rules_.maxSpeedSoftFactor;
+                if (!(rules_.maxSpeedSoftFactor > 1.0f) || speed2 > soft * soft) return Code::BadArg;
+                velScale = cap / std::sqrt(speed2);
+                ++speedClamps_;
+            }
             const double dtSec = nowMs > V.recvMs ? (double)(nowMs - V.recvMs) / 1000.0 : 0.0;
             const float moved = ac::Dist(u.k, V.s.k);
             const bool jump = moved > ac::AllowedMove(rules_.maxSpeed, dtSec);
@@ -570,9 +607,9 @@ namespace gage::server {
             V.s.k.x = u.k.x;
             V.s.k.y = u.k.y;
             V.s.k.z = u.k.z;
-            V.s.k.vx = u.k.vx;
-            V.s.k.vy = u.k.vy;
-            V.s.k.vz = u.k.vz;
+            V.s.k.vx = (float)(u.k.vx * velScale);
+            V.s.k.vy = (float)(u.k.vy * velScale);
+            V.s.k.vz = (float)(u.k.vz * velScale);
             V.s.rot = u.rot;
             V.s.k.heading = proto::QuatHeading(u.rot);
             V.s.avx = u.avx;
@@ -894,6 +931,33 @@ namespace gage::server {
         {
             if (tick > lastTick_) lastTick_ = tick;
         }
+        // The driver of the nearest driven vehicle that is about to hit the driverless V (see Rules::claimBaseMeters), or kNoPlayer.
+        // The driver must be a trusted candidate with a position and have V in view.
+        uint16_t FindToucher(const Vehicle& V, const std::vector<ControlCandidate>& players) const
+        {
+            uint16_t best = proto::kNoPlayer;
+            float bestD2 = 0;
+            for (const Vehicle& W : v_)
+            {
+                if (!W.exists || W.s.id == V.s.id) continue;
+                const uint16_t driver = W.s.seats[0];
+                if (driver == proto::kNoPlayer || W.s.ctrl != driver) continue;
+                const float vx = W.s.k.vx, vy = W.s.k.vy;
+                const float speed = std::sqrt(vx * vx + vy * vy);
+                if (speed < rules_.claimMinSpeed) continue;
+                const float dx = V.s.k.x - W.s.k.x, dy = V.s.k.y - W.s.k.y, dz = V.s.k.z - W.s.k.z;
+                const float d2 = dx * dx + dy * dy;
+                const float reach = rules_.claimBaseMeters + rules_.claimLookSeconds * speed;
+                if (d2 > reach * reach || std::fabs(dz) > 6.0f) continue;
+                const float d = std::sqrt(d2);
+                const float closing = d > 0.1f ? (vx * dx + vy * dy) / d : speed;   // speed of the driver toward V
+                if (closing < 1.0f) continue;
+                const ControlCandidate* c = FindCandidate(players, driver);
+                if (!c || !c->hasState || !c->trusted || !RelevantTo(driver, V.s.id)) continue;
+                if (best == proto::kNoPlayer || d2 < bestD2) { best = driver; bestD2 = d2; }
+            }
+            return best;
+        }
         static const ControlCandidate* FindCandidate(const std::vector<ControlCandidate>& players, uint16_t id)
         {
             for (const ControlCandidate& c : players)
@@ -1091,6 +1155,7 @@ namespace gage::server {
         std::vector<Cand> cands_;
         uint16_t nextId_ = 0;
         size_t count_ = 0;
+        uint64_t claims_ = 0, speedClamps_ = 0; // T4 counters
         uint32_t lastTick_ = 0; // the newest tick any call carried: a change made between ticks is told from the next one on
     };
 

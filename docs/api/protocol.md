@@ -1107,3 +1107,49 @@ reports the clear and everybody follows.
 
 **Diagnostics.** The engine prints `engine: vehicle visual (T3), last 10 s: ...` with every 10 s of vehicles lines (see the report of
 the task for the fields); the server counts `vehiclePartHits`.
+
+<!-- T4-BEGIN: vehicle collisions (desync overhaul round 2). Append-only section; the orchestrator does the single kVersion 5 -> 6 bump. -->
+## 16. T4: vehicle collisions (`VehicleImpact`, message 40)
+
+Wire change for protocol v6 (the orchestrator bumps `kVersion` once, in lockstep with the client version): ONE new message and no change to any existing layout.
+Design, numbers and the live test: docs/sync-specs/vehicle-collisions.md.
+
+### 40 `VehicleImpact` (server to client, reliable): 21 bytes
+
+The server keeps the last few `VehicleUpdate` samples of every vehicle on one time base. For two vehicles with DIFFERENT controllers it finds the first
+instant their boxes touch (boxes by mass class, grown 0.3 m each because each controller's physics stops its car at the other's copy), solves one planar
+two-body impulse there (restitution 0.25, friction 0.3, masses 250 / 1500 / 7000 kg by model) and sends each controller its half, once per contact. Pairs with
+the same controller are never arbitrated. No message is sent for a pass, a graze, a closing speed under 1.2 m/s or an untrusted controller.
+
+| offset | size | field | |
+|---|---|---|---|
+| 0 | 1 | type | 40 |
+| 1 | 4 | `seq` | `u32`, the server's impact counter; both controllers of one contact get the same value |
+| 5 | 2 | `vehId` | `u16` (< 256): the vehicle YOU control that was hit |
+| 7 | 2 | `otherId` | `u16` (< 256): the vehicle it hit |
+| 9 | 2 | `sampleMs` | `u16`: the contact time on YOUR OWN sample clock (the `VehicleUpdate.sampleMs` domain: whole ms of your clock, wraps at 65536). Unwrap against your current clock reading (+-32 s) |
+| 11 | 2 | `dvx` | `i16`, 1/64 m/s: the change of your vehicle's world-x velocity |
+| 13 | 2 | `dvy` | `i16`, 1/64 m/s |
+| 15 | 2 | `dyaw` | `i16`, 1/256 rad/s: the change of its yaw rate (counter-clockwise) |
+| 17 | 1 | `nx` | `i8`, 1/127: the contact normal from your vehicle toward the other one |
+| 18 | 1 | `ny` | `i8`, 1/127 |
+| 19 | 1 | `closing` | `u8`, 0.25 m/s: the closing speed along the normal before the impact |
+| 20 | 1 | `depth` | `u8`, cm: the overlap of the two TRUE boxes within 120 ms after the touch (0: they only came within the margin) |
+
+Strict decoding: exactly 21 bytes; `vehId` and `otherId` below 256; an `i8` of -128 and an `i16` of -32768 are refused (the encoder never writes them). `Encode`
+refuses a non-finite value or an id of 256 and saturates `dv` at +-511.98 m/s, `dyaw` at +-127.99 rad/s. The server never sends a change above 30 m/s.
+
+Client rules (engine, `libs/sync/vehicle_impact.h`):
+* The game has already bounced the car off the kinematic copy, so the message is a CORRECTION target: the engine writes `authoritative - what the game's own physics did`
+  (the velocity jumps it measured around the contact time) onto the car's velocity and yaw rate. A message whose contact the local physics did not feel is applied only if
+  the server's true boxes overlapped (`depth >= 0.10 m`) and our copy of the other car is within 7 m; a message older than 1.5 s, a duplicate `seq` and a change under 0.6 m/s are ignored.
+* A copy that takes an impulse inside a frame (the drive controller's contact trigger) has its own response adopted as its trajectory
+  (`VehicleInterpolator::ReplaceFrom`): the stream, which still shows the pre-impact motion for the whole latency, is refused until it shows the impact (or 300 ms).
+* `impact_sync=0` (HKCU\Software\GAGE-MP, read at Welcome) ignores the message and keeps the W9 contact grace as the only handling.
+
+Server policy changes that need no wire change (T4):
+* `VehicleStore::Rules::claimBaseMeters` / `claimLookSeconds` / `claimMinSpeed` / `claimHoldMs`: a driven vehicle about to hit a driverless one (closing speed above 1 m/s, within
+  10 m + 0.5 s of travel) takes the driverless vehicle's control (`VehicleState.ctrl` changes), so the rammer's own physics resolves the hit.
+* `Rules::maxSpeedSoftFactor` (2.0): a `VehicleUpdate` whose velocity is over `vehicleMaxSpeed` (150) but under twice it is accepted with the velocity clamped to the cap (it used to be
+  refused as `BadArg`, which froze a hyper car for everybody else); above twice the cap it is refused as before.
+<!-- T4-END -->

@@ -350,8 +350,8 @@ struct Probe
         static const char* names[] = {"Welcome",      "Refused",       "PlayerJoined", "PlayerLeft", "World",
                                       "Chat",         "Disconnected",  "Coarse",       "PeerLook",   "VehicleWorld",
                                       "VehicleResult", "Damage",       "Killed",       "RespawnOk",  "PeerAnim",
-                                      "PeerScenario", "PeerAnimStop", "SeatNotice"};
-        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::SeatNotice + 1, "a name per event type");
+                                      "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact"};
+        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::VehicleImpact + 1, "a name per event type");
         std::string out;
         for (const net::Event& e : events) out += std::string(names[(int)e.type]) + " ";
         return out;

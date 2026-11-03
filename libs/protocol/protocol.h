@@ -173,8 +173,11 @@ namespace gage::proto {
         PeerScenario     = 29, // S->C reliable (v4): another player starts a scenario
         PeerAnimStop     = 30, // S->C reliable (v4): another player stopped its animation / scenario
         SeatNotice       = 31, // S->C reliable (T1 seats, wire v6): a player's enter / exit INTENT on a vehicle seat (see SeatNotice)
+        // 32..39 are reserved for further desync-round-2 messages (31 is T1 SeatNotice): the numbers
+        // between are not defined messages, a Decode of them fails and PeekType only range-checks.
+        VehicleImpact    = 40, // S->C reliable (T4, vehicle collisions): the server's resolution of a contact between two vehicles for one controller
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::SeatNotice;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::VehicleImpact;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -726,6 +729,27 @@ namespace gage::proto {
     struct PeerScenario { uint16_t id = 0; std::string name; };
     struct PeerAnimStop { uint16_t id = 0; };
 
+    // ---- T4: vehicle collisions (docs/sync-specs/vehicle-collisions.md, docs/api/protocol.md "T4 vehicle impact") ----
+    // The server resolves a contact between two vehicles that DIFFERENT clients simulate (it has both tracks on one time base) and tells
+    // each controller its half, once per contact. Reliable; to the vehicle's controller only.
+    //   seq        the server's impact counter (a duplicate or older one is ignored)
+    //   vehId      the vehicle YOU control that was hit; otherId the vehicle it hit
+    //   sampleMs   the contact time on YOUR sample clock (the VehicleUpdate.sampleMs domain: whole ms of your clock, wraps at 65536)
+    //   dvx, dvy   the change of your vehicle's velocity (world x, y; m/s); dyaw the change of its yaw rate (rad/s, counter-clockwise)
+    //   nx, ny     the contact normal from your vehicle toward the other one (unit)
+    //   closing    the closing speed along the normal before the impact (m/s); depth the overlap of the two (m, 0 = they only touched)
+    // On the wire dv is an i16 in 1/64 m/s, dyaw an i16 in 1/256 rad/s, n an i8 pair in 1/127, closing a u8 in 0.25 m/s, depth a u8 in cm.
+    struct VehicleImpact
+    {
+        uint32_t seq = 0;
+        uint16_t vehId = 0, otherId = 0;
+        uint16_t sampleMs = 0;
+        float    dvx = 0, dvy = 0, dyaw = 0;
+        float    nx = 0, ny = 0;
+        float    closing = 0, depth = 0;
+    };
+    constexpr size_t kVehicleImpactBytes = 21;
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -774,6 +798,8 @@ namespace gage::proto {
     Bytes Encode(const PeerScenario& m);
     Bytes Encode(const PeerAnimStop& m);
     Bytes Encode(const SeatNotice& m);   // T1 seats: empty (refused) for a field Decode would refuse
+    // T4: refuses a non-finite value or a vehicle id at or above kMaxVehicles; saturates dv, dyaw, closing and depth at the wire's range.
+    Bytes Encode(const VehicleImpact& m);
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -820,6 +846,8 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, PeerAnim& out);
     bool Decode(const uint8_t* p, size_t n, PeerScenario& out);
     bool Decode(const uint8_t* p, size_t n, PeerAnimStop& out);
+    // T4: exactly kVehicleImpactBytes bytes; refuses a vehicle id at or above kMaxVehicles and -128 in an i8 field.
+    bool Decode(const uint8_t* p, size_t n, VehicleImpact& out);
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would

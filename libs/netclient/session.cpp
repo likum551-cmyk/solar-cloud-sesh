@@ -438,6 +438,11 @@ namespace gage::net {
             if (!proto::Decode(data, len, e.seatNotice)) { malformed_++; return; }
             e.type = Event::Type::SeatNotice;
             break;
+        case proto::Msg::VehicleImpact:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.impact)) { malformed_++; return; }
+            e.type = Event::Type::VehicleImpact;
+            break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:
             return; // server-to-client types this session does not surface yet: ignored, not an error

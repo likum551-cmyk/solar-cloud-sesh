@@ -1187,6 +1187,7 @@ namespace gage::server {
 
     void Server::VehicleDestroyed(uint16_t id)
     {
+        contact_.Forget(id);
         stats_.vehiclesDestroyed++;
         Log("vehicle " + std::to_string(id) + " removed");
     }
@@ -1211,6 +1212,7 @@ namespace gage::server {
             controlCandidates_.push_back(cand);
         }
         vehicles_.AssignControllers(nowMs, tick_, controlCandidates_);
+        BroadcastImpacts(nowMs);
         // The entries' ageMs is measured against the tick's NOMINAL time (its slot), not the clock of a loop that got
         // round to it late (the same rule as the WorldState entries').
         const uint64_t nominalMs = tickNominalUs_ / 1000;
@@ -1223,6 +1225,70 @@ namespace gage::server {
             if (bytes.empty()) continue; // cannot happen with the store's own data; never send a broken frame
             SendTo(c, proto::kChanState, bytes, false);
             stats_.vehicleFrames++;
+        }
+    }
+
+    // T4: resolve the contacts between vehicles different clients simulate, once each, and tell the two controllers their halves.
+    void Server::BroadcastImpacts(uint64_t nowMs)
+    {
+        contactLive_.clear();
+        for (uint16_t id = 0; id < proto::kMaxVehicles; id++)
+        {
+            const VehicleStore::Vehicle* v = vehicles_.Get(id);
+            if (!v || v->s.ctrl == proto::kNoPlayer) continue;
+            sync::impact::ContactArbiter::Live l;
+            l.id = id;
+            l.ctrl = v->s.ctrl;
+            l.mc = sync::impact::MassClassOfModel(v->s.model);
+            const auto pit = players_.find(v->s.ctrl);
+            l.trusted = pit != players_.end() && !Untrusted(*pit->second, nowMs) && !pit->second->dead;
+            contactLive_.push_back(l);
+        }
+        contactOut_.clear();
+        contact_.Step((double)(tickNominalUs_ / 1000), contactLive_, contactOut_);
+        for (sync::impact::ImpactOut& io : contactOut_)
+        {
+            io.seq = ++impactSeq_;
+            stats_.vehicleImpacts++;
+            impactLogCount_++;
+            for (int k = 0; k < 2; k++)
+            {
+                if (!io.stampOk[k]) continue;
+                const auto pit = players_.find(io.ctrl[k]);
+                if (pit == players_.end()) continue;
+                proto::VehicleImpact m;
+                m.seq = io.seq;
+                m.vehId = io.id[k];
+                m.otherId = io.id[1 - k];
+                m.sampleMs = io.stamp[k];
+                m.dvx = (float)io.dv[k].x;
+                m.dvy = (float)io.dv[k].y;
+                m.dyaw = (float)io.dw[k];
+                const double sgn = k == 0 ? 1.0 : -1.0;   // the normal points from the first vehicle to the second
+                m.nx = (float)(io.n.x * sgn);
+                m.ny = (float)(io.n.y * sgn);
+                m.closing = (float)io.closing;
+                m.depth = (float)io.depth;
+                const proto::Bytes bytes = proto::Encode(m);
+                if (bytes.empty()) continue;
+                SendTo(*pit->second, proto::kChanReliable, bytes, true);
+                stats_.vehicleImpactsSent++;
+            }
+        }
+        if (nowMs - impactLogMs_ >= 10000)
+        {
+            if (impactLogCount_ > 0 || vehicles_.SpeedClamps() > impactLogClaims_)
+            {
+                const sync::impact::ContactArbiter::Stats& a = contact_.stats();
+                Log("contact: " + std::to_string(impactLogCount_) + " impact(s) in the last 10 s (" + std::to_string(stats_.vehicleImpacts) + " total, " +
+                    std::to_string(stats_.vehicleImpactsSent) + " messages), pairs examined " + std::to_string(a.pairsExamined) + ", soft touches " +
+                    std::to_string(a.softTouches) + ", skipped untrusted " + std::to_string(a.untrusted) + ", dv capped " + std::to_string(a.capped) +
+                    ", max closing " + std::to_string((int)a.maxClosing) + " m/s; empty-car claims " + std::to_string(vehicles_.Claims()) + ", velocity clamps " +
+                    std::to_string(vehicles_.SpeedClamps()));
+            }
+            impactLogMs_ = nowMs;
+            impactLogCount_ = 0;
+            impactLogClaims_ = vehicles_.SpeedClamps();
         }
     }
 
@@ -1264,7 +1330,7 @@ namespace gage::server {
         {
             stats_.vehicleUpdatesInvalid++;
             LogDrop(c, kDropVehicle, "VehicleUpdate for vehicle " + std::to_string(u.vehId) +
-                                         " outside the world box or over " + std::to_string(cfg_.vehicleMaxSpeed) + " m/s");
+                                         " outside the world box or over twice the " + std::to_string(cfg_.vehicleMaxSpeed) + " m/s cap");
             return;
         }
         if (r != proto::VehicleResultCode::Ok)
@@ -1277,6 +1343,17 @@ namespace gage::server {
         c.vehSeq = u.seq;
         c.hasVehSeq = true;
         stats_.vehicleUpdatesAccepted++;
+        {
+            // T4: the arbiter keeps the controller's recent track (on the server's time base) to resolve contacts with other controllers' vehicles
+            sync::impact::ArbSample as;
+            as.tMs = (double)std::min(sampleMs, nowMs);
+            as.p = {u.k.x, u.k.y};
+            as.v = {u.k.vx, u.k.vy};
+            as.h = (double)proto::QuatHeading(u.rot) * (3.14159265358979323846 / 180.0);
+            as.w = u.avz;
+            as.stamp = u.sampleMs;
+            contact_.Note(u.vehId, c.id, as);
+        }
         // The vehicle's position is judged by displacement like the player's (it was taken either way).
         if (jumped && cfg_.untrustedWindowMs != 0 && nowMs >= c.graceUntilMs)
             MarkUntrusted(c, nowMs, "VehicleUpdate for vehicle " + std::to_string(u.vehId) +

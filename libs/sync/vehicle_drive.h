@@ -208,7 +208,7 @@ namespace gage::sync {
         float arcMaxRadS = 2.0f;          // ours: above this |w| (a spin) extrapolate straight
     };
 
-    struct VehicleInterpStats { uint32_t accepted = 0, teleports = 0, stale = 0, invalid = 0, bridgeResets = 0, repeats = 0; };
+    struct VehicleInterpStats { uint32_t accepted = 0, teleports = 0, stale = 0, invalid = 0, bridgeResets = 0, repeats = 0, injected = 0, guarded = 0; };
 
     // The snapshot time of a vehicle in a server frame (sync plan W6): the frame's own time (tick * tickMs)
     // minus VehicleState.ageMs (how long before the frame the controller's sample reached the server), so a
@@ -224,6 +224,16 @@ namespace gage::sync {
     public:
         explicit VehicleInterpolator(const VehicleInterpConfig& cfg = VehicleInterpConfig());
         VehPush Push(const VehicleSnapshot& s);
+        // T4 (docs/sync-specs/vehicle-collisions.md): an impact the local machine knows about before the car's own stream
+        // does. `s` is the car's state AFTER the impact at s.tMs (pose from Sample at that instant, velocity and angular
+        // velocity already changed). Every stored snapshot at or after s.tMs is dropped (they show the car's motion without
+        // the impact), `s` is stored, and pushes up to s.tMs + guardMs are refused (counted as guarded): the controller's
+        // samples from that stretch are either pre-impact (its own contact came later) or its un-reconciled bounce; the
+        // car's extrapolation along `s` shows the impact meanwhile, and the first sample after the guard takes over.
+        //   preVel (optional): the car's velocity before the impact. With it the guard ends EARLY, at the first pushed sample
+        //   that shows the impact (its velocity is at least confirmFraction of the impact's change away from preVel): the
+        //   controller's own stream has caught up, whatever its latency and whenever its own contact came.
+        void ReplaceFrom(const VehicleSnapshot& s, double guardMs, const DriveVec* preVel = nullptr, float confirmFraction = 0.5f);
         bool Sample(double renderTMs, VehicleSample& out); // false: nothing stored (or bad time)
         void Clear();
         int Count() const { return count_; }
@@ -252,6 +262,10 @@ namespace gage::sync {
         VehicleSnapshot ring_[kVehicleRing];
         int head_ = 0, count_ = 0;
         bool teleportPending_ = false;
+        double guardUntil_ = -1e18;
+        bool guardConfirm_ = false;
+        DriveVec guardPre_;
+        float guardDvLen_ = 0, guardFrac_ = 0.5f;
         uint32_t session_ = 0;
         double gaps_[kGapRing] = {};
         int gapHead_ = 0, gapCount_ = 0;
@@ -398,6 +412,9 @@ namespace gage::sync {
         explicit VehicleDriveController(const VehicleDriveConfig& cfg = VehicleDriveConfig());
         VehicleDriveOutput Update(const VehicleDriveInput& in);
         void Reset(); // the vehicle was respawned / moved by someone else: next Update snaps
+        // T4: the caller handled the contact itself (VehicleInterpolator::ReplaceFrom with the copy's own response): end the soft
+        // correction the contact opened, and look for the next contact only after cooldownMs. No snap, no other state touched.
+        void EndGrace(double cooldownMs);
         float OffAccumulator() const { return offAcc_; }
         const VehicleDriveStats& Stats() const { return stats_; }
 

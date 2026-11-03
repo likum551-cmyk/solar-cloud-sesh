@@ -1637,6 +1637,8 @@ static void TestSyncD() {
     }
 }
 
+#include "t4_collision_tests.h"
+
 int main() {
     std::printf("-- quaternion math\n");
     TestQuatMath();
@@ -1664,9 +1666,12 @@ int main() {
     std::printf("-- Sync D: the receive pipeline against a simulated relay and car, hand-over, diagnostics\n");
     TestSyncD();
 
+    std::printf("-- T4: vehicle collisions (arbiter, impact apply, copy adoption, two-machine simulation)\n");
+    t4::TestT4();
+
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
     // + hyper tune 4 + W9 11 + Sync B 8 (kSyncBChecks as listed in its header) + Sync D kSyncDChecks
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11 + 8 + kSyncDChecks;
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11 + 8 + kSyncDChecks + t4::kT4Checks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

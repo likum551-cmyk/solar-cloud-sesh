@@ -137,3 +137,9 @@ engine and the test both run); the wire and merge are tested in `tests/t3_vehvis
 Natives (hook.h, hash 0 = UNRESOLVED): IS_VEHICLE_TYRE_BURST, SET_VEHICLE_TYRE_BURST, SET_VEHICLE_TYRE_FIXED, IS_VEHICLE_WINDOW_INTACT, SMASH_VEHICLE_WINDOW,
 FIX_VEHICLE_WINDOW, GET_CONTROL_NORMAL, SET_VEHICLE_HANDBRAKE, SET_VEHICLE_BRAKE_LIGHTS. Until GI adds a hash, the wrapper returns false and logs once, and the
 feature that needs it stays off with no other effect (proven in the test with a car whose natives all fail).
+
+## T4: vehicle collisions (2026-11-03)
+
+Server-arbitrated contact resolution (`VehicleImpact`, message 40), adoption of a hit copy's own response, the empty-car claim and the speed-cap clamp: docs/sync-specs/vehicle-collisions.md
+(design, the two-machine simulation numbers, diagnostics, GI's live test). It supersedes the "Not fixed" notes of Sync B above for parked / empty cars (claimed by the rammer) and for the two screens'
+different contact (one resolution per contact); the contact grace stays as the fallback (`impact_sync=0`, or a contact adoption refused).

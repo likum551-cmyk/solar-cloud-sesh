@@ -7,8 +7,10 @@
 //   MODIFY_VEHICLE_TOP_SPEED(veh, HyperTopSpeedPercent)  once per vehicle, from GET_VEHICLE_ESTIMATED_MAX_SPEED
 //   SET_VEHICLE_MAX_SPEED(veh, kHyperTargetMs)           once per vehicle: the cap the game enforces
 //
-// The server's anti-cheat drops a VehicleUpdate above vehicleMaxSpeed (default 150 m/s = 540 km/h), which is above
-// the target here, so no server change is needed.
+// The server's anti-cheat limits a VehicleUpdate to vehicleMaxSpeed (default 150 m/s = 540 km/h), which is above the
+// target here. T4: an overshoot above the cap (a downhill, a jump, the game's enforcement lagging a frame) is no longer
+// DROPPED, which froze the car for every other client for as long as it lasted: up to twice the cap the server clamps the
+// replicated velocity to the cap and takes the position (VehicleStore::Rules::maxSpeedSoftFactor); above that it refuses.
 
 #include <cstdint>
 

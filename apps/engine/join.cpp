@@ -403,6 +403,10 @@ namespace {
                     if (peers.onPeerAnimStop)
                         timed("peerAnimStop", [&] { peers.onPeerAnimStop(e.animStop); });
                     break;
+                case net::Event::Type::VehicleImpact:
+                    if (peers.onVehicleImpact)
+                        timed("vehicleImpact", [&] { peers.onVehicleImpact(e.impact); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())

@@ -151,6 +151,33 @@ void VehicleInterpolator::Clear()
     head_ = 0;
     count_ = 0;
     teleportPending_ = false;
+    guardUntil_ = -1e18;
+    guardConfirm_ = false;
+}
+
+void VehicleInterpolator::ReplaceFrom(const VehicleSnapshot& in, double guardMs, const DriveVec* preVel, float confirmFraction)
+{
+    if (!std::isfinite(in.tMs) || !FiniteV(in.pos) || !FiniteV(in.vel) || !vq::Finite(in.rot) || !std::isfinite(in.steering) ||
+        (in.hasAngVel && !FiniteV(in.angVel)) || !std::isfinite(guardMs))
+        return;
+    VehicleSnapshot s = in;
+    s.rot = vq::Normalize(in.rot);
+    if (!s.hasAngVel) s.angVel = DriveVec{};
+    while (count_ > 0 && !(At(count_ - 1).tMs < s.tMs))
+        --count_;
+    ring_[(head_ + count_) % kVehicleRing] = s;
+    ++count_;
+    guardUntil_ = s.tMs + (guardMs > 0.0 ? guardMs : 0.0);
+    guardConfirm_ = false;
+    if (preVel && FiniteV(*preVel) && std::isfinite(confirmFraction))
+    {
+        const D3 dv = Sub(ToD(s.vel), ToD(*preVel));
+        guardDvLen_ = float(Len(dv));
+        guardPre_ = *preVel;
+        guardFrac_ = confirmFraction;
+        guardConfirm_ = guardDvLen_ > 0.5f;
+    }
+    ++stats_.injected;
 }
 
 void VehicleInterpolator::SetSession(uint32_t id)
@@ -232,6 +259,17 @@ VehPush VehicleInterpolator::Push(const VehicleSnapshot& in)
     s.rot = vq::Normalize(in.rot);
     if (!s.hasAngVel) s.angVel = DriveVec{};
 
+    if (s.tMs <= guardUntil_)
+    {
+        // guarded: refused, unless it already shows the impact (the controller's stream has caught up)
+        if (guardConfirm_ && Len(Sub(ToD(s.vel), ToD(guardPre_))) >= double(guardFrac_) * double(guardDvLen_))
+            guardUntil_ = -1e18;
+        else
+        {
+            ++stats_.guarded;
+            return VehPush::Stale;
+        }
+    }
     VehPush result = VehPush::Accepted;
     if (count_ > 0)
     {
@@ -387,6 +425,14 @@ void VehicleDriveController::Reset()
     haveCmd_ = false;
     kickN_ = 0;
     kickMuteMs_ = 0;
+}
+
+void VehicleDriveController::EndGrace(double cooldownMs)
+{
+    graceOn_ = false;
+    graceAgeMs_ = 0;
+    cooldownMs_ = cooldownMs > 0.0 ? cooldownMs : 0.0;
+    haveCmd_ = false;    // the next frame's velocity is the adopted one: no deviation test against the last command
 }
 
 VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
