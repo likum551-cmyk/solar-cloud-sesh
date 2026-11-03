@@ -19,6 +19,7 @@
 #include "common/logger.h"
 #include "sync/smoother.h"
 #include "sync/locomotion.h"
+#include "sync/oneshot.h"
 #include "sync/vehicle_drive.h"
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
@@ -134,10 +135,20 @@ namespace {
     // frame without an anchor entity, while aiming, and for 20 s after a lost task.
     // Read by the join worker's OnWelcome and by the game thread's SyncNet (Peer construction): atomic.
     std::atomic<bool> g_locoAnchor{true};
+    // T2 (desync round 2): loco_push = nudge (default) | velocity: how a walking puppet's position error is closed. Nudge = a few mm of
+    // SET_ENTITY_COORDS_NO_OFFSET per frame (exact whatever SET_ENTITY_VELOCITY does to a ped under a task); velocity = the 0.4.6 push.
+    // loco_selfcheck = 0 turns the degradation ladder off (anchor -> straight -> blend-carried speed -> rigid follow, each step
+    // logged as "engine: loco level"). Both re-read at every Welcome like loco_mode.
+    std::atomic<bool> g_locoPushNudge{true};
+    std::atomic<bool> g_locoSelfCheck{true};
+    sync::LevelWitness g_locoDegrade;     // script tick only
+    std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
     {
-        sync::LocoConfig c;
-        c.mode = g_locoAnchor.load() ? sync::LocoMode::Anchor : sync::LocoMode::Straight;
+        sync::LocoConfig c = sync::ShippedLocoConfig(g_locoAnchor.load());
+        if (!g_locoPushNudge.load())
+            c.push = sync::PushMode::Velocity;
+        c.selfCheck = g_locoSelfCheck.load();
         return c;
     }
 
@@ -174,6 +185,8 @@ namespace {
         sync::SiteTally<kLocoSites> hardSites, softSites;
         sync::WaterEdge water;
         sync::ClimbWindow climb;
+        sync::OneShotAudit audit;   // T2: did the game SHOW the jump / reload / stealth / swim / ragdoll we asked for (script tick)
+        uint32_t levelLogged = 0;   // T2: "engine: loco level" lines written for this puppet (rate limit)
 
         // Stage 3 (protocol v3). Appearance: the newest PeerLook (PeerNet::look, copied by SyncNet, applied
         // by the script tick); lookDirty until it is on the ped. pedModel is the model the ped was spawned with.
@@ -1195,6 +1208,13 @@ namespace {
         GLOGI("engine: remote on-foot walking via %s (loco_mode)",
               g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
                                   : "TASK_GO_STRAIGHT_TO_COORD at a far point");
+        // T2: the position-error push and the degradation ladder (see LocoCfg).
+        g_locoPushNudge.store(reg::Get(L"loco_push") != L"velocity");
+        g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
+        GLOGI("engine: remote on-foot position error closed by %s (loco_push), self-checks / degradation ladder %s (loco_selfcheck)",
+              g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
+              g_locoSelfCheck.load() ? "ON (anchor -> straight -> blend-carried speed -> rigid follow, each step logged)" : "OFF");
+        g_locoDegradeReset.store(true);
         // W10: name tags on by default; nametags=0 turns them off, nametags_los=<int> the LOS trace flags.
         g_nameTags.store(reg::Get(L"nametags") != L"0");
         {
@@ -2907,6 +2927,7 @@ namespace {
         pe.emote.OnNewPed(NowMs());
         pe.swingProbe.Cancel();                        // 0e: a swing issued on the old ped is nobody's to judge
         pe.swingPending.Clear();
+        pe.audit.CancelAll();                          // T2: a one-shot asked of the old ped is nobody's to judge
         pe.water.Reset();                              // W8: a fresh ped has no water edge and no climb in progress
         pe.climb.Reset();
         pe.seatLimiter.Reset();                        // W9: a fresh ped has no warp history, no bail-out velocity, no impact
@@ -2933,6 +2954,68 @@ namespace {
             PeerLog(true, "engine: remote peer id=%d: health pool %d did not take (reads %d): remote peds stay "
                     "invincible, local hit detection OFF", id, kPeerHpPool, got);
         }
+    }
+
+    // T2: the puppet one-shots the game was asked to show, and whether it did (libs/sync/oneshot.h). Totals for the 10 s line
+    // "engine: anims onfoot (T2)"; script tick only.
+    sync::OneShotStats g_oneShot[(size_t)sync::OneShot::kCount], g_oneShotLast[(size_t)sync::OneShot::kCount];
+    void TallyOneShot(sync::OneShot k, sync::OneShotEvent ev, double showMs)
+    {
+        sync::OneShotStats& t = g_oneShot[(size_t)k];
+        if (ev == sync::OneShotEvent::Shown)
+        {
+            ++t.shown;
+            t.showMsSum += showMs;
+            if (showMs > t.showMsMax) t.showMsMax = showMs;
+        }
+        else if (ev == sync::OneShotEvent::Missed) ++t.missed;
+        else if (ev == sync::OneShotEvent::Unknown) ++t.unknown;
+    }
+    void ArmOneShot(Peer& pe, sync::OneShot k, double nowMs, bool expect = true)
+    {
+        ++g_oneShot[(size_t)k].issued;
+        TallyOneShot(k, pe.audit.Arm(k, nowMs, expect), 0.0);   // a request this one replaced is judged on the spot
+    }
+    // Every frame a kind is armed: the game's own readback on the puppet. Script tick, ped valid.
+    void ObservePeerOneShots(Peer& pe, double nowMs)
+    {
+        for (size_t i = 0; i < (size_t)sync::OneShot::kCount; ++i)
+        {
+            const sync::OneShot k = (sync::OneShot)i;
+            if (!pe.audit.Armed(k))
+                continue;
+            int playing = 0;
+            switch (k)
+            {
+            case sync::OneShot::Jump:    playing = g_world->IsPedJumping(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Reload:  playing = g_world->IsPedReloading(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Stealth: playing = g_world->GetPedStealthMovement(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Swim:    playing = g_world->IsPedSwimming(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::Ragdoll: playing = g_world->IsPedRagdoll(pe.ped) ? 1 : 0; break;
+            case sync::OneShot::kCount:  break;
+            }
+            const sync::OneShotEvent ev = pe.audit.Observe(k, playing, nowMs);
+            if (ev != sync::OneShotEvent::None)
+                TallyOneShot(k, ev, pe.audit.LastShowMs());
+        }
+    }
+    std::string OneShotLine()
+    {
+        std::string out;
+        char buf[160];
+        for (size_t i = 0; i < (size_t)sync::OneShot::kCount; ++i)
+        {
+            const sync::OneShotStats& a = g_oneShot[i];
+            const sync::OneShotStats& b = g_oneShotLast[i];
+            const uint32_t issued = a.issued - b.issued, shown = a.shown - b.shown, missed = a.missed - b.missed, unknown = a.unknown - b.unknown;
+            if (!issued && !shown && !missed && !unknown)
+                continue;
+            const double avg = shown ? (a.showMsSum - b.showMsSum) / shown : 0.0;
+            std::snprintf(buf, sizeof(buf), "%s%s asked %u, SHOWN %u (avg %.0f ms), NOT shown %u, unreadable %u", out.empty() ? "" : "; ",
+                          sync::OneShotName((sync::OneShot)i), issued, shown, avg, missed, unknown);
+            out += buf;
+        }
+        return out.empty() ? std::string("none asked") : out;
     }
 
     // W8 item 3: every locomotion Reset goes through here so the 10 s line can name the caller. Reset = the task list was
@@ -4101,6 +4184,35 @@ namespace {
         return "?";
     }
 
+    const char* LocoLevelName(sync::LocoLevel l)
+    {
+        switch (l)
+        {
+        case sync::LocoLevel::Full:     return "full (anchor task + move rate + nudge)";
+        case sync::LocoLevel::Straight: return "straight task";
+        case sync::LocoLevel::NoRate:   return "straight task, speed carried by the blend ratio";
+        case sync::LocoLevel::Placed:   return "rigid follow of the pose";
+        }
+        return "?";
+    }
+    const char* LocoLevelWhyName(sync::LocoLevelWhy w)
+    {
+        switch (w)
+        {
+        case sync::LocoLevelWhy::None:            return "-";
+        case sync::LocoLevelWhy::AnchorLost:      return "the go-to-entity task ran but the ped showed no gait";
+        case sync::LocoLevelWhy::AnchorStuck:     return "the ped's own speed stayed far under the pose's, or it was snapped again and again";
+        case sync::LocoLevelWhy::AnchorDragging:  return "the nudges had to carry more than a tenth of the distance: the task does not follow the anchor";
+        case sync::LocoLevelWhy::RateIneffective: return "SET_PED_MOVE_RATE_OVERRIDE does not change the ped's speed";
+        case sync::LocoLevelWhy::StraightStuck:   return "the straight task stalled again after a re-issue: nothing moves the ped";
+        case sync::LocoLevelWhy::Recovered:       return "a fallback timer ran out: the better level is tried again";
+        case sync::LocoLevelWhy::Shared:          return "another puppet's controller found the same failure";
+        }
+        return "?";
+    }
+    uint32_t g_locoNudgeCalls = 0;
+    uint32_t g_locoLevelLines = 0;      // T2: "engine: loco level" lines this session (rate limit, script tick)
+
     // "name n, name n" for the sites with a count, "none" without any.
     std::string SiteList(const sync::SiteTally<kLocoSites>& t)
     {
@@ -4142,7 +4254,30 @@ namespace {
                       a.settles - b.settles, a.graceFrames - b.graceFrames, a.contaminated - b.contaminated,
                       pe.loco.NominalScale(sync::Gait::Walk), pe.loco.NominalScale(sync::Gait::Run),
                       pe.loco.NominalScale(sync::Gait::Sprint), pe.loco.LastMoveRate());
-        return buf;
+        // T2: appended so the older fields keep their place. level = the degradation ladder (full | straight | blend-carried |
+        // rigid); nudge = the coordinate writes that closed the position error (share = metres nudged / metres travelled while a
+        // gait was shown); rate = SET_PED_MOVE_RATE_OVERRIDE as applied (min / mean / max, share of frames at a limit); own speed =
+        // the ped's displacement net of our writes (the one measurement that needs no model of the game).
+        std::string line = buf;
+        const double dTravel = a.travelledM - b.travelledM, dNudge = a.nudgedM - b.nudgedM;
+        char t2[700];
+        std::snprintf(t2, sizeof(t2),
+                      " | T2: level %d (%s), nudge %u frames %.2f m (mean %.2f max %.2f m/s, %.1f%% of the distance), move rate applied "
+                      "min %.2f mean %.2f max %.2f (%.0f%% of %u frames at a limit), own speed %.2f vs pose %.2f m/s, level changes %u "
+                      "(anchor-lost %u, stuck %u, dragging %u, rate-ineffective %u, straight-stuck %u, recovered %u, shared %u), push %s",
+                      (int)pe.loco.Level(), LocoLevelName(pe.loco.Level()), d.nudgeFrames, d.nudgedM, d.meanNudgeMs, d.maxNudgeMs,
+                      dTravel > 0.5 ? 100.0 * dNudge / dTravel : 0.0, d.rateMin, d.rateMean, d.rateMax, d.rateClampFrac * 100.0, d.rateFrames,
+                      d.selfSpeedMs, d.poseSpeedMs, a.levelChanges - b.levelChanges,
+                      a.levelWhy[(int)sync::LocoLevelWhy::AnchorLost] - b.levelWhy[(int)sync::LocoLevelWhy::AnchorLost],
+                      a.levelWhy[(int)sync::LocoLevelWhy::AnchorStuck] - b.levelWhy[(int)sync::LocoLevelWhy::AnchorStuck],
+                      a.levelWhy[(int)sync::LocoLevelWhy::AnchorDragging] - b.levelWhy[(int)sync::LocoLevelWhy::AnchorDragging],
+                      a.levelWhy[(int)sync::LocoLevelWhy::RateIneffective] - b.levelWhy[(int)sync::LocoLevelWhy::RateIneffective],
+                      a.levelWhy[(int)sync::LocoLevelWhy::StraightStuck] - b.levelWhy[(int)sync::LocoLevelWhy::StraightStuck],
+                      a.levelWhy[(int)sync::LocoLevelWhy::Recovered] - b.levelWhy[(int)sync::LocoLevelWhy::Recovered],
+                      a.levelWhy[(int)sync::LocoLevelWhy::Shared] - b.levelWhy[(int)sync::LocoLevelWhy::Shared],
+                      g_locoPushNudge.load() ? "nudge" : "velocity");
+        line += t2;
+        return line;
     }
 
     std::string LocoLine(int id, const Peer& pe)
@@ -4242,6 +4377,24 @@ namespace {
     // steer, heading and the rare snap; this applies them in the order its header gives.
     void UnseatPeer(Peer& pe, int32_t leaveVeh);   // defined below (its default argument is declared there)
 
+    // T2: a puppet's controller moved to another level of the degradation ladder: say so (the numbers that decided it are in the
+    // line), count it, and tell the witness (two puppets finding the same failure make it machine-wide).
+    void NoteLocoLevel(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
+    {
+        ++pe.levelLogged;
+        const bool shared = g_locoDegrade.Report(o.levelWhy, id, nowMs);
+        if (g_locoLevelLines < 60)
+        {
+            ++g_locoLevelLines;
+            const float sp = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+            PeerLog(true, "engine: loco level id=%d (%s): -> %s because %s (pose speed %.2f m/s, the ped's own speed %.2f m/s, %s, "
+                    "anchor %s, learned stride x walk %.2f run %.2f sprint %.2f)%s", id, pe.name.c_str(), LocoLevelName(o.level),
+                    LocoLevelWhyName(o.levelWhy), sp, pe.loco.SelfSpeed(), pe.slide.Summary().meanAnchorM > 0.0 ? "anchor distance measured" : "no anchor frames",
+                    pe.anchor ? "present" : "absent", pe.loco.NominalScale(sync::Gait::Walk), pe.loco.NominalScale(sync::Gait::Run),
+                    pe.loco.NominalScale(sync::Gait::Sprint), shared ? "; a SECOND puppet found it: imposed on every puppet for a while" : "");
+        }
+    }
+
     // 0d: cover as a window (sync::CoverWindow), once per DrivePeer from TickPeerTierB. The puppet is put on the sender's pose of the
     // edge first (the native looks for a cover point at the coordinates it is given), then TASK_PUT_PED_DIRECTLY_INTO_COVER(ped, pose,
     // timeout -1, allowPeekingAndFiring false, blendIn 0, forceInitialFacingDirection false, forceFaceLeft false, identifier -1,
@@ -4327,9 +4480,14 @@ namespace {
         const sync::PedEdges e = pe.edges.Update({ ps.flags, ps.move, ps.vehId });
         const int32_t ped = pe.ped;
         if (e.reloadStart && pe.seatedVeh < 0)
+        {
             g_world->TaskReloadWeapon(ped, false);
+            ArmOneShot(pe, sync::OneShot::Reload, nowMs);
+        }
         if (e.stealthChanged || (e.stealthOn && nowMs - pe.stealthAtMs > 2000.0))
         {
+            if (e.stealthChanged)
+                ArmOneShot(pe, sync::OneShot::Stealth, nowMs, e.stealthOn);
             g_world->SetPedStealthMovement(ped, e.stealthOn, "DEFAULT_ACTION");
             pe.stealthOn = e.stealthOn;
             pe.stealthAtMs = nowMs;
@@ -4435,7 +4593,10 @@ namespace {
         const bool notRagdoll = (ps.flags & proto::kPfRagdoll) == 0;
         const sync::WaterEdge::Out waterEdge = pe.water.Update((ps.flags & proto::kPfSwimming) != 0);
         if (waterEdge.entered || waterEdge.left)
+        {
             LocoSoft(pe, kSiteWater);
+            ArmOneShot(pe, sync::OneShot::Swim, nowMs, waterEdge.entered);   // T2: IS_PED_SWIMMING must follow the sender's water edge
+        }
         const bool climbFlag = notRagdoll && (ps.flags & (proto::kPfClimbing | proto::kPfVaulting)) != 0;
         const bool parachute = notRagdoll && (ps.flags & proto::kPfParachute) != 0;
         const bool placeInAir = parachute || (climbFlag && pe.climb.CurrentPhase() == sync::ClimbWindow::Phase::Fallback);
@@ -4454,8 +4615,10 @@ namespace {
         {
             pe.climb.Reset();
             pe.cover.Reset();
+            pe.audit.CancelAll();
             return;                                    // playing dead (UpdatePeerDeath): no tasks, no placing
         }
+        ObservePeerOneShots(pe, nowMs);                // T2: the game's readback of the one-shots asked for (only while one is armed)
         const bool tierBHolds = !reactHolds && TickPeerTierB(pe, id, pose, nowMs);   // W6: reload / stealth / cover / enter / exit
         if (pe.seatedVeh >= 0)
         {
@@ -4651,9 +4814,18 @@ namespace {
             const bool anchorWanted = g_locoAnchor.load() && !g_anchorBroken && !aiming;
             in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
         }
+        // T2: a failure two puppets' controllers found is imposed on this one too (the game is one game), until its timer runs out.
+        if (g_locoDegradeReset.exchange(false))
+            g_locoDegrade.Reset();
+        if (const double ms = g_locoDegrade.ActiveMs(sync::LocoLevel::Straight, nowMs); ms > 0.0)
+            pe.loco.Degrade(sync::LocoLevel::Straight, sync::LocoLevelWhy::Shared, ms);
+        if (const double ms = g_locoDegrade.ActiveMs(sync::LocoLevel::NoRate, nowMs); ms > 0.0)
+            pe.loco.Degrade(sync::LocoLevel::NoRate, sync::LocoLevelWhy::Shared, ms);
         const sync::LocoOutput o = pe.loco.Update(in);
         if (o.paused)
             return;                                    // leaving a vehicle: the exit animation owns the ped
+        if (o.levelChanged)
+            NoteLocoLevel(pe, id, o, in, nowMs);
         {
             // Sync A: the slide metric (libs/sync LocoDiag), from what this frame read and what the controller decided
             sync::LocoDiagFrame df;
@@ -4669,6 +4841,12 @@ namespace {
             df.havePedVel = in.havePedVel;
             df.anchorMode = o.anchorMode && o.moveAnchor;
             df.anchor = o.anchorPos;
+            df.nudged = o.nudge && !o.snap;                // T2
+            df.nudge = o.nudgeDelta;
+            df.rateSet = o.setMoveRate;
+            df.rate = o.moveRate;
+            df.rateClamped = o.rateClamped;
+            df.selfSpeed = pe.loco.SelfSpeed();
             pe.slide.Observe(df);
         }
 
@@ -4681,6 +4859,14 @@ namespace {
         }
         if (o.moveAnchor && pe.anchor)
             g_world->SetEntityCoordsNoOffset(pe.anchor, o.anchorPos.x, o.anchorPos.y, o.anchorPos.z);   // W11: every frame
+        if (o.nudge && !o.snap)
+        {
+            // T2: the position error closed by a coordinate write of a few millimetres (exact in every model of what the game does
+            // with SET_ENTITY_VELOCITY on a ped under a task). z stays the ped's own unless the controller asked for a vertical step.
+            g_world->SetEntityCoordsNoOffset(ped, in.pedPos.x + o.nudgeDelta.x, in.pedPos.y + o.nudgeDelta.y,
+                                             in.pedPos.z + o.nudgeDelta.z);
+            ++g_locoNudgeCalls;
+        }
         if (o.snap)
         {
             g_world->SetEntityCoordsNoOffset(ped, o.snapPos.x, o.snapPos.y, o.snapPos.z);
@@ -4690,6 +4876,7 @@ namespace {
         {
             g_world->SetPedCanRagdoll(ped, true);      // SpawnRemotePed spawns it with ragdoll off
             g_world->SetPedToRagdoll(ped, 50000, 60000); // held until ragdollEnd clears it
+            ArmOneShot(pe, sync::OneShot::Ragdoll, nowMs);
         }
         if (o.ragdollEnd)
         {
@@ -4698,7 +4885,10 @@ namespace {
             pe.aimTask = false;                        // cleared with the ragdoll
         }
         if (o.jumpStart)
+        {
             g_world->TaskJump(ped);
+            ArmOneShot(pe, sync::OneShot::Jump, nowMs);
+        }
         if (aiming && !in.ragdoll)
         {
             // The aim point: the sender's offset (PedState.aim*) from the shown position. Every issue
@@ -7557,7 +7747,12 @@ namespace {
             // 0e: per animation kind, what the last 10 s asked for, loaded, issued and actually SAW playing; "unseen" is a clip
             // IS_ENTITY_PLAYING_ANIM never saw (wrong name), "ended(...)" says what ended the emotes.
             GLOGI("engine: anims (0e), last 10 s: %s", sync::AnimDiagLine(g_animDiag, g_animDiagLast).c_str());
+            // T2: the on-foot one-shots asked of the puppets against the game's own readback ("SHOWN" = IS_PED_JUMPING etc. said yes within
+            // the kind's window after the task). A kind that is asked but never SHOWN is an animation the others do not see.
+            GLOGI("engine: anims onfoot (T2), last 10 s: %s", OneShotLine().c_str());
         }
+        for (size_t i = 0; i < (size_t)sync::OneShot::kCount; ++i)
+            g_oneShotLast[i] = g_oneShot[i];
         g_animDiagLast = g_animDiag;
         last = c;
         lastWorlds = worlds;
