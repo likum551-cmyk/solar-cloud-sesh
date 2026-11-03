@@ -97,3 +97,70 @@ Next live test: the new 10 s line `engine: loco slide id=... skate X%, idle slid
 ## Sequencing
 
 Items 1-4 (libs/sync only) first; then 5(a)+(c) and 6 Tier A; then the v5 bump with 5(b) and Tier B. Server and client redeploy together (docs/api/protocol.md:751).
+
+## T2 (desync round 2, 0.4.7 candidate): on-foot sliding and puppet animations, designed for a game nobody has measured
+
+GI after 0.4.6: "Peds slide; animations are not in place on other players' screens". There is still no live log after 0.4.3. Everything 0.4.5/0.4.6 added (go-to-entity on a frozen invisible anchor, the closed-loop move rate, the velocity push on top of the ped's own velocity) was verified against a MODEL of the game (T0 sec 9). T2 does not add a fourth model; it makes the controller correct in every model it can imagine, and makes it find out which one is true while it runs.
+
+### What was unknown (the axes of tests/t2_onfoot_tests.h)
+| axis | values |
+|---|---|
+| TASK_GO_TO_ENTITY on the moved anchor | followed / followed at 60% of the commanded speed / never moves the ped / no task moves the ped |
+| SET_ENTITY_VELOCITY on a ped under a task | replaces the animation's displacement / adds to it / is ignored |
+| SET_PED_MOVE_RATE_OVERRIDE | scales the stride / is ignored |
+| turning | arcs round at speed / pivots on the spot |
+| true stride vs the 1.5 / 4.5 / 7 m/s guess | x1, x0.85, x1.15 |
+40 models (120 with the stride factors) x 12 scenarios (steady walk/run/sprint, gait changes, circle, S-curve, run 3 s / stop 2 s, walk 2 s / stop 2 s, ramp and curb, **a realistic reversal (stop, turn on the spot, go) at a run and a walk, a zigzag**, plus the stress case "instant 180 flip at full speed"). `T2_EXPLORE=1 T2_SWEEP=1 locomotion_test` prints the class table below; `T2_BYMODEL=1` one line per model.
+
+The old "reversal" scenario flipped the direction at FULL speed (its speed dip was centred on t = 4k, the flip on t = 4k+2: a 9 m/s velocity step no player can make). It stays as the stress row; the 20% skate / 4 m error that was quoted for "reversals" is that row. A real stop-turn-go at a run: 0.4.6 29% skate / 2.2 m error under the "velocity adds" model, 8.9% / 1.09 m under "replace"; T2: 8% / 0.55 m.
+
+### Findings (simulated; live-unverified)
+1. The velocity push is a model. Under "velocity adds to the animation" the ped runs at 1.2-1.7x the pose speed (gait changes: skate 13.8%, p95 1.37 m; instant flip: 4.1 m); under "ignored" it does nothing and the error grows to 3-5 m (rate also ignored). 0.4.6 is right only if the game replaces the velocity. A coordinate write (SET_ENTITY_COORDS_NO_OFFSET, the call the snap and the anchor already use) is exact in every model.
+2. Stopping and reversing: the Run -> Walk debounce kept the faster gait 400 ms after the pose had stopped (the smallest Run stride, 2.7 m/s, ran 1.1 m past it).
+3. Nothing in 0.4.6 noticed a go-to-entity task that "runs" but carries nothing (the ped reads Run, travels 40%), a stride that does not respond to the rate, or a ped that has to be snapped again and again.
+
+### What T2 does (libs/sync/locomotion.*, no wire change)
+- **Position nudge** (`PushMode::Nudge`, the shipped default): the horizontal error beyond a 0.12 m dead band (0.25 m for a standing ped) closes with a 250 ms time constant, capped at 3 m/s (1 m/s standing), as `LocoOutput::nudge` = SET_ENTITY_COORDS_NO_OFFSET(ped, pedPos + delta). No velocity write on foot (jumps, ragdoll and swimming keep the velocity path). The first 1.2 s of a movement tolerate 1 m (the start clip). `loco_push=velocity` restores the 0.4.6 push.
+- **Own speed**: the ped's displacement net of what we wrote (`SelfSpeed()`), the one measurement that needs no model of GET_ENTITY_VELOCITY. It feeds the learned stride scale and the checks below.
+- **Degradation ladder** (`LocoLevel`, `selfCheck`, `loco_selfcheck=0` turns it off; every step is logged as `engine: loco level`): 0 full (anchor task + move rate + nudge) -> 1 straight task (`AnchorLost`: the ped reads no gait; `AnchorStuck`: own speed under 35% of the pose's for 1.2 s, or three snaps in 6 s; `AnchorDragging`: the nudges had to carry more than 10% of the distance in 3 s of steady motion) -> 2 speed carried by the blend ratio on the running task, no re-issue (`RateIneffective`: the regression of own speed / gait nominal on the applied rate has a slope under 0.25 for 2 s while the rate varied) -> 3 rigid follow (`StraightStuck`: the straight task stalled twice in 15 s; nudge tau 60 ms, cap 8 m/s). Each fallback has a timer that doubles per failure in a row and then tries the better level again (`Recovered`). Steady motion (pose acceleration under 1.5 m/s^2, 1.2 s after a start) is the only evidence for the drag test, so starts, stops and reversals never degrade anything.
+- **Witness** (`LevelWitness`): two DIFFERENT puppets reporting the same anchor or rate failure within 60 s impose the level on every puppet (45 s / 120 s), so the third player does not spend his own seconds finding out; one puppet alone never degrades the others.
+- **Fast down-shift**: a pose under 60% of the gait's down edge drops Run -> Walk / Sprint -> Run after 100 ms instead of 400 ms.
+- **Diagnostics**: `engine: loco slide` gets a `| T2:` tail (level, nudge frames / metres / mean / max m/s / share of the distance, move rate applied min / mean / max and the share of frames at a limit, own speed vs pose speed, level changes by reason, push mode); `engine: loco level` on every ladder step (60 per session); `engine: anims onfoot (T2)` per 10 s.
+
+### Result (sim, mean of the scored scenarios; skate / error p95 in m)
+| design | game works as assumed | stride ignored | go-to follows at 60% | go-to never moves the ped |
+|---|---|---|---|---|
+| 0.4.6 anchor + velocity push | 2.9% / 0.46 | 4.5% / 1.37 | 11.6% / 1.68 | 11.6% / 1.66 |
+| 0.4.6 `loco_mode=straight` | 6.5% / 0.83 | 5.3% / 1.67 | 5.9% / 1.25 | 5.9% / 1.25 |
+| **T2 anchor + nudge + ladder (default)** | **1.5% / 0.27** | 3.8% / 0.34 | 13.9% / 0.64 | 11.1% / 0.42 |
+| T2 straight + nudge + ladder | 5.8% / 0.38 | 7.6% / 0.44 | 6.7% / 0.41 | 6.7% / 0.41 |
+The last two columns of the anchor row are mostly the seconds before the ladder knows (a 20 s run, ~2-4 s of detection); the witness removes that for the second and later puppets. The straight task has no model risk but it has the task churn (6-9 re-issues per 10 s) that the skate figure does not count. The default is therefore the anchor with the ladder; `loco_mode=straight` is one registry value away.
+Where the game works as 0.4.6 assumed: T2 error p95 0.28 m (0.39), skate 1.8% (1.3%): the same. Where it does not (30 models): mean error p95 0.48 m (1.48 m). No level change in 228 runs of a working game.
+
+### Live A/B recipe for GI (HKCU\Software\GAGE-MP string values, read at every Welcome: rejoin to apply)
+1. Default (`loco_mode` unset, `loco_push` unset): two players, walk / run / sprint / stop-and-go / U-turns for 60 s. grep `engine: loco slide` and `engine: loco level`.
+2. `loco_mode=straight`, same walk. 3. `loco_push=velocity`, same walk. 4. (only if 1 shows a problem) `loco_selfcheck=0`.
+Decision numbers (per puppet, 10 s line): healthy = `level 0`, skate < 5%, nudge share < 5% of the distance, own speed within 10% of pose speed, error mean < 0.3 m / max < 1 m, move rate at a limit < 30% of frames, level changes 0, ped-anchor distance about the lead (0.8 s of travel: 1.2 m walk, 3.6 m run, 5 m sprint; much more = the ped is not following).
+- `level changes` with `anchor-lost` / `stuck` / `dragging` on the FIRST seconds of every puppet: TASK_GO_TO_ENTITY on the frozen anchor does not work on that build: ship `loco_mode=straight` as the default.
+- `rate-ineffective`: SET_PED_MOVE_RATE_OVERRIDE does not scale the stride: drop the rate loop.
+- `own speed` near 0 for a walking puppet under the default but normal with `loco_push=velocity`: the per-frame coordinate write breaks the walk animation: ship `loco_push=velocity`.
+- skate high under 2 but fine under 1: the anchor is better than straight on that build; the reverse: straight.
+
+### Animations (no per-ped animation id on the wire; none added)
+| state | sender | wire | receiver | verdict |
+|---|---|---|---|---|
+| walk / run / sprint, start, stop | IS_PED_WALKING.. | `move` (a hint) + velocity | gait from the smoothed speed, move rate / blend ratio, settle at stops | T2 above; start / stop / turn clips are the game's |
+| jump | IS_PED_JUMPING edge | jumpSeq + kPfJumping | TASK_JUMP on the step; falling = jumping (no task) | audited (`jump`) |
+| land | none | none | the jump window ends, the gait task is re-issued | ok |
+| reload | IS_PED_RELOADING | kPfReloading | TASK_RELOAD_WEAPON once | audited |
+| crouch | GET_PED_STEALTH_MOVEMENT | kPfStealth | SET_PED_STEALTH_MOVEMENT | audited |
+| swim | IS_PED_SWIMMING | kPfSwimming | no swim task: the game swims a ped in deep water; velocity path | audited (`swim`, 2.5 s window) |
+| ragdoll | IS_PED_RAGDOLL | kPfRagdoll | SET_PED_TO_RAGDOLL | audited |
+| climb / vault | IS_PED_CLIMBING / VAULTING | kPfClimbing / kPfVaulting | pre-place on the sender's pose, TASK_CLIMB (0d counters) | unchanged |
+| cover | IS_PED_IN_COVER | kPfCover | TASK_PUT_PED_DIRECTLY_INTO_COVER (0d counters) | unchanged |
+| aim / strafe / shoot | aim flags | kPfAiming + aim point | aim tasks | unchanged |
+| melee, emotes | | kPfMelee / PlayAnim | swing clips, TASK_PLAY_ANIM | sync batch E |
+| **ladder** | none | kPfLadder exists (bit 8), never set | never read | **missing: the puppet slides up the ladder in a stand pose**. Needs natives (below); the wire bit already exists, so no wire change |
+| **parachute** | IS_PED_IN_PARACHUTE_FREE_FALL | kPfParachute | placed, collision off, no parachute task | missing: needs natives |
+| enter / exit a vehicle | | move 5 / 6 | | T1 |
+No state found that needs a new wire field AND can be played with a native we have: a wire change would only carry what no puppet can show. `engine: anims onfoot (T2)` prints per 10 s, for jump / reload / stealth / swim / ragdoll: asked, SHOWN (the game's own readback said yes within the kind's window, average ms), NOT shown, unreadable. A kind that is asked but never shown is an animation the other players do not see.
