@@ -371,6 +371,8 @@ void VehicleDriveController::Reset()
     graceOn_ = false;
     graceAgeMs_ = cooldownMs_ = 0;
     haveCmd_ = false;
+    kickN_ = 0;
+    kickMuteMs_ = 0;
 }
 
 VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
@@ -416,22 +418,54 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
         }
         else if (cooldownMs_ > 0.0)
             cooldownMs_ = std::fmax(0.0, cooldownMs_ - dt);
+        // What physics did to the velocity written last frame (Sync B: also the diagnostic devMs, whatever the state).
+        clockMs_ += dt;
+        if (kickMuteMs_ > 0.0)
+            kickMuteMs_ = std::fmax(0.0, kickMuteMs_ - dt);
+        D3 devV{};
+        bool haveDev = false;
+        if (haveCmd_ && dt <= cfg_.contactMaxFrameMs)
+        {
+            devV = Sub(ToD(lastCmdVel_), ToD(in.localVel));
+            haveDev = true;
+            o.devMs = float(Len(devV));
+        }
         if (!graceOn_ && cooldownMs_ <= 0.0 && started_ && !tg.teleported)
         {
-            bool byDecel = false;
-            if (haveCmd_ && dt <= cfg_.contactMaxFrameMs && speed >= cfg_.contactMinSpeedMs)
+            bool byDecel = false, byKick = false;
+            if (haveDev && speed >= cfg_.contactMinSpeedMs)
             {
                 const D3 dir = Scale(tv, 1.0 / speed);
-                const double lost = DotV(Sub(ToD(lastCmdVel_), ToD(in.localVel)), dir);
-                byDecel = lost > cfg_.contactDecelMs;
+                byDecel = DotV(devV, dir) > cfg_.contactDecelMs;
             }
-            if (in.contact || byDecel)
+            if (haveDev && cfg_.contactKickMs > 0.0f && kickMuteMs_ <= 0.0)
+                byKick = Len(devV) > cfg_.contactKickMs;
+            if (in.contact || byDecel || byKick)
             {
                 graceOn_ = true;
                 graceAgeMs_ = 0;
                 ++stats_.contacts;
-                if (in.contact) ++stats_.contactsByFlag;
-                else ++stats_.contactsByDecel;
+                if (in.contact) { ++stats_.contactsByFlag; o.contactOpened = 1; }
+                else if (byDecel) { ++stats_.contactsByDecel; o.contactOpened = 2; }
+                else
+                {
+                    ++stats_.contactsByKick;
+                    o.contactOpened = 3;
+                    // the budget: the last contactKickStormN kicks that stood alone (no flag, no speed loss) within contactKickStormMs
+                    const int n = cfg_.contactKickStormN < 8 ? cfg_.contactKickStormN : 8;
+                    if (n > 0)
+                    {
+                        if (kickN_ < 8) ++kickN_;
+                        for (int i = 7; i > 0; --i) kickAtMs_[i] = kickAtMs_[i - 1];
+                        kickAtMs_[0] = clockMs_;
+                        if (kickN_ >= n && clockMs_ - kickAtMs_[n - 1] <= cfg_.contactKickStormMs)
+                        {
+                            kickMuteMs_ = cfg_.contactKickMuteMs;
+                            kickN_ = 0;
+                            ++stats_.kickMutes;
+                        }
+                    }
+                }
             }
         }
         if (graceOn_)

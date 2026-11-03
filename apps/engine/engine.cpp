@@ -25,6 +25,7 @@
 #include "sync/pedstate.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
+#include "sync/vehicle_contact.h"
 #include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
@@ -381,6 +382,10 @@ namespace {
         uint32_t rollSnapsSeen = 0, rollBlendsSeen = 0, rollGracesSeen = 0;   // drive stats at the last bike line
         sync::EngineReassert engineAssert;   // item 4: the engine is re-asserted while the local ped rides in this copy
         bool lastContactFlag = false; // item 6: HAS_ENTITY_COLLIDED_WITH_ANYTHING at the previous frame (a rising edge opens a grace)
+        sync::ContactWindow contact;  // Sync B: this copy's contact diagnostics of the last 10 s (the collision flag's duty, kicks, distances)
+        uint32_t contactKickMutesSeen = 0;   // drive stats at the last collision line
+        float contactLastPosX = 0, contactLastPosY = 0, contactLastPosZ = 0;   // where the copy was this frame (the pair pass)
+        bool contactPosValid = false;
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -545,7 +550,7 @@ namespace {
         // contact graces opened (flag / speed loss), frames the lead drew a car in the present, shots at seated puppets
         // (the free-aim target), at a puppet's vehicle, hits reported on seated puppets
         uint32_t seatRewarpsHeld = 0, entryPresses = 0, quickExits = 0, engineAsserts = 0, bailOuts = 0, localBailOuts = 0,
-                 vehImpacts = 0, contactsFlag = 0, contactsDecel = 0, leadFrames = 0, shotsAtSeated = 0, shotsAtPuppetCar = 0,
+                 vehImpacts = 0, contactsFlag = 0, contactsDecel = 0, contactsKick = 0, leadFrames = 0, shotsAtSeated = 0, shotsAtPuppetCar = 0,
                  shotsAtFoot = 0, hitsOnSeated = 0, seatedHpDrops = 0;
     };
     V4Stats g_v4;
@@ -5173,6 +5178,12 @@ namespace {
             const uint16_t me = join::MyId();
             float lpx = 0, lpy = 0, lpz = 0;
             const bool haveLp = lp && g_world->GetEntityCoords(lp, lpx, lpy, lpz);
+            // Sync B: where the local player's own vehicle is (the penetration estimate of the collision line: a remote copy whose
+            // origin comes within ~2 m of it overlaps it).
+            float lcx = 0, lcy = 0, lcz = 0;
+            const bool haveLc = lpVeh && g_world->GetEntityCoords(lpVeh, lcx, lcy, lcz);
+            for (auto& kv : g_vehs)
+                kv.second.contactPosValid = false;
             size_t spawned = 0;
             for (const auto& kv : g_vehs)
                 if (kv.second.handle)
@@ -5349,31 +5360,58 @@ namespace {
                             // for a car within 60 m of us (the native is not free); the drive controller also opens a grace by itself
                             // on a speed loss it did not command. Whether the flag stays set on the ground is INFERRED: a flag that
                             // never falls opens one grace, not a stream of them (rising edge, and the controller's cooldown).
+                            bool flagRead = false, flagNow = false;
                             if (leadDist < 60.0)
                             {
                                 const bool flag = g_world->HasEntityCollidedWithAnything(h);
                                 in.contact = flag && !v.lastContactFlag;
                                 v.lastContactFlag = flag;
+                                flagRead = true;
+                                flagNow = flag;
                             }
                             else
                                 v.lastContactFlag = false;
-                            const uint32_t gracesBefore = v.drive.Stats().contacts, flagBefore = v.drive.Stats().contactsByFlag;
                             const sync::VehicleDriveOutput o = v.drive.Update(in);
-                            if (v.drive.Stats().contacts != gracesBefore)
+                            if (o.contactOpened)
                             {
-                                if (v.drive.Stats().contactsByFlag != flagBefore)
+                                if (o.contactOpened == 1)
                                     ++g_v4.contactsFlag;
-                                else
+                                else if (o.contactOpened == 2)
                                     ++g_v4.contactsDecel;
+                                else
+                                    ++g_v4.contactsKick;
                                 static int graceLogged = 0;
                                 if (graceLogged < 12)
                                 {
                                     ++graceLogged;
                                     PeerLog(false, "engine: vehicle id=%u: contact on the remote copy (%s): soft correction for %.0f ms "
-                                            "(speed %.1f m/s, error %.2f m)", id, v.drive.Stats().contactsByFlag != flagBefore ? "collision flag" : "speed loss",
+                                            "(speed %.1f m/s, error %.2f m, deviation from the last command %.1f m/s)", id,
+                                            o.contactOpened == 1 ? "collision flag" : (o.contactOpened == 2 ? "speed loss" : "velocity kick"),
                                             sync::VehicleDriveConfig().contactGraceMs, std::sqrt((double)in.localVel.x * in.localVel.x + (double)in.localVel.y * in.localVel.y +
-                                                                                        (double)in.localVel.z * in.localVel.z), (double)o.posErrorM);
+                                                                                        (double)in.localVel.z * in.localVel.z), (double)o.posErrorM,
+                                            (double)o.devMs);
                                 }
+                            }
+                            {
+                                // Sync B: the contact diagnostics (printed every 10 s by ReportV4)
+                                sync::ContactFrame cf;
+                                cf.flagRead = flagRead;
+                                cf.flag = flagNow;
+                                cf.edge = in.contact;
+                                cf.devMs = o.devMs;
+                                cf.graceActive = o.graceActive;
+                                cf.opened = o.contactOpened;
+                                cf.overwrote = o.setVelocity;
+                                if (haveLc && !mine)
+                                {
+                                    const double dx = (double)in.localPos.x - lcx, dy = (double)in.localPos.y - lcy, dz = (double)in.localPos.z - lcz;
+                                    cf.localCarDistM = (float)std::sqrt(dx * dx + dy * dy + dz * dz);
+                                }
+                                v.contact.Add(cf);
+                                v.contactLastPosX = in.localPos.x;
+                                v.contactLastPosY = in.localPos.y;
+                                v.contactLastPosZ = in.localPos.z;
+                                v.contactPosValid = true;
                             }
                             // W9 item 7: bikes carry their lean in the quaternion (no bike-specific handling exists; none is invented): the
                             // roll error against the sender's goes into a per-bike 10 s line so the next live test shows what is wrong.
@@ -5508,6 +5546,28 @@ namespace {
                     }
                 }
                 ++it;
+            }
+            {
+                // Sync B: remote copies whose origins are close to each other this frame (two copies the senders drove apart on their
+                // own screens that overlap here). At most 64 entries; pairs under 3 m only are noted. No native.
+                static std::vector<NetVeh*> driven;
+                driven.clear();
+                for (auto& kv : g_vehs)
+                    if (kv.second.contactPosValid)
+                        driven.push_back(&kv.second);
+                for (size_t a = 0; a < driven.size(); ++a)
+                    for (size_t b = a + 1; b < driven.size(); ++b)
+                    {
+                        const double dx = (double)driven[a]->contactLastPosX - driven[b]->contactLastPosX;
+                        const double dy = (double)driven[a]->contactLastPosY - driven[b]->contactLastPosY;
+                        const double dz = (double)driven[a]->contactLastPosZ - driven[b]->contactLastPosZ;
+                        const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        if (d < 3.0)
+                        {
+                            driven[a]->contact.AddPuppetNear((float)d);
+                            driven[b]->contact.AddPuppetNear((float)d);
+                        }
+                    }
             }
             // Peds seated in a vehicle whose seat list no longer has them (or that is gone): on foot.
             for (auto& kv : g_peers)
@@ -6791,12 +6851,12 @@ namespace {
                 GLOGI("engine: vehicles (W9), last 10 s: %u seat re-warps done, %u held back by the limiter; %u F/G presses taken (%u quick exits "
                       "after an entry); passenger engine: %u re-asserts, %s; %u peer bail-outs of a moving vehicle, %u forced exits of ours "
                       "by bail-out; %u vehicle impacts shown on puppets; contact graces opened %u by the collision flag / %u by a speed "
-                      "loss; %u car frames drawn in the present (lead); shots: at seated puppets %u, at a puppet's car %u, at puppets on foot "
+                      "loss / %u by a velocity kick; %u car frames drawn in the present (lead); shots: at seated puppets %u, at a puppet's car %u, at puppets on foot "
                       "%u; hits reported on seated puppets %u, pool drops on seated puppets %u",
                       c.seatRewarps - last.seatRewarps, c.seatRewarpsHeld - last.seatRewarpsHeld, c.entryPresses - last.entryPresses,
                       c.quickExits - last.quickExits, c.engineAsserts - last.engineAsserts, pax, c.bailOuts - last.bailOuts,
                       c.localBailOuts - last.localBailOuts, c.vehImpacts - last.vehImpacts, c.contactsFlag - last.contactsFlag,
-                      c.contactsDecel - last.contactsDecel, c.leadFrames - last.leadFrames, c.shotsAtSeated - last.shotsAtSeated,
+                      c.contactsDecel - last.contactsDecel, c.contactsKick - last.contactsKick, c.leadFrames - last.leadFrames, c.shotsAtSeated - last.shotsAtSeated,
                       c.shotsAtPuppetCar - last.shotsAtPuppetCar, c.shotsAtFoot - last.shotsAtFoot, c.hitsOnSeated - last.hitsOnSeated,
                       c.seatedHpDrops - last.seatedHpDrops);
                 for (auto& kv : g_vehs)
@@ -6814,6 +6874,70 @@ namespace {
                     bv.rollSnapsSeen = ds.snaps;
                     bv.rollBlendsSeen = ds.blends;
                     bv.rollGracesSeen = ds.contacts;
+                }
+                {
+                    // Sync B (docs/sync-specs/vehicles.md, collision audit): what the remote copies' collision path really does. One total line
+                    // per 10 s while any copy is driven, one line per copy something touched or came near (at most 6). See
+                    // libs/sync/vehicle_contact.h for how to read the numbers.
+                    sync::ContactWindow::Window tot;
+                    size_t driven = 0, inRange = 0, printed = 0, interesting = 0;
+                    uint32_t mutes = 0;
+                    float worstDev = 0.0f;
+                    for (auto& kv : g_vehs)
+                    {
+                        NetVeh& cv = kv.second;
+                        const sync::ContactWindow::Window w = cv.contact.Take();
+                        const uint32_t kmutes = cv.drive.Stats().kickMutes - cv.contactKickMutesSeen;
+                        cv.contactKickMutesSeen = cv.drive.Stats().kickMutes;
+                        if (!w.frames)
+                            continue;
+                        ++driven;
+                        if (w.flagReads)
+                            ++inRange;
+                        tot.frames += w.frames;
+                        tot.flagReads += w.flagReads;
+                        tot.flagTrue += w.flagTrue;
+                        tot.edges += w.edges;
+                        tot.flagTrueHard += w.flagTrueHard;
+                        for (int i = 1; i < 4; ++i)
+                            tot.opened[i] += w.opened[i];
+                        tot.graceFrames += w.graceFrames;
+                        tot.hardFrames += w.hardFrames;
+                        tot.devOver1 += w.devOver1;
+                        tot.devOver3 += w.devOver3;
+                        tot.localUnder3m += w.localUnder3m;
+                        tot.localUnder1_5m += w.localUnder1_5m;
+                        tot.puppetUnder3m += w.puppetUnder3m;
+                        worstDev = std::max(worstDev, w.devMax);
+                        mutes += kmutes;
+                        if (w.Interesting() || kmutes)
+                        {
+                            ++interesting;
+                            if (printed < 6)
+                            {
+                                ++printed;
+                                GLOGI("engine: vehicle collision (Sync B) id=%u, last 10 s: %u frames; collision flag read %u times, true %u (%.0f%%), %u "
+                                      "rising edges, %u flag-true frames overwritten at full weight (no grace); graces opened %u flag / %u speed loss / "
+                                      "%u kick (%u kick mutes), %u grace frames, %u full-weight frames; deviation from our last velocity command: max "
+                                      "%.1f m/s, %u frames over 1, %u over 3; at an edge max %.1f (the frame before it %.1f); nearest approach to our "
+                                      "own vehicle %.1f m (%u frames under 3 m, %u under 1.5 m), to another remote car %.1f m (%u frames under 3 m)",
+                                      (unsigned)kv.first, w.frames, w.flagReads, w.flagTrue, w.flagReads ? 100.0 * w.flagTrue / w.flagReads : 0.0, w.edges,
+                                      w.flagTrueHard, w.opened[1], w.opened[2], w.opened[3], kmutes, w.graceFrames, w.hardFrames, (double)w.devMax,
+                                      w.devOver1, w.devOver3, (double)w.edgeDevMax, (double)w.preEdgeDevMax, (double)w.minLocalM, w.localUnder3m,
+                                      w.localUnder1_5m, (double)w.minPuppetM, w.puppetUnder3m);
+                            }
+                        }
+                    }
+                    if (driven)
+                        GLOGI("engine: vehicle collision (Sync B), last 10 s, all remote copies: %zu driven (%zu within 60 m, where the flag is read), %u "
+                              "frames; collision flag true in %u of %u reads (%.0f%%), %u rising edges, %u flag-true frames overwritten at full weight; "
+                              "graces opened %u flag / %u speed loss / %u kick (%u kick mutes: a body that does not honour SET_ENTITY_VELOCITY); "
+                              "%u grace frames; deviation from our last velocity command over 1 m/s in %u frames, over 3 m/s in %u (worst %.1f m/s); "
+                              "frames within 3 m of our own vehicle %u (1.5 m: %u), within 3 m of another remote copy %u; %zu copies printed of %zu "
+                              "that were touched or close",
+                              driven, inRange, tot.frames, tot.flagTrue, tot.flagReads, tot.flagReads ? 100.0 * tot.flagTrue / tot.flagReads : 0.0,
+                              tot.edges, tot.flagTrueHard, tot.opened[1], tot.opened[2], tot.opened[3], mutes, tot.graceFrames, tot.devOver1,
+                              tot.devOver3, (double)worstDev, tot.localUnder3m, tot.localUnder1_5m, tot.puppetUnder3m, printed, interesting);
                 }
             }
             const sync::VitalsStats& vs = g_vitals.Stats();

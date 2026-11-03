@@ -116,6 +116,9 @@
 //     0.15 to 1 along a smoothstep), no quaternion blend, and the angular velocity is left to physics until
 //     w >= 0.5. After it the ordinary correction converges the car back; a new contact is not looked for for
 //     contactCooldownMs 800 (a flag that stays set while scraping must not keep the car soft for ever).
+//     Sync B adds a third trigger that needs no game flag: a KICK, |velocity commanded last frame - the car's own
+//     velocity now| above contactKickMs 3 m/s in any direction (a sideways T-bone, a hit on a car that stands), checked
+//     after the flag and the speed loss.
 //
 // PresentLead (W9 item 6, below): a remote car within 30 m of the local player is drawn at the present time,
 // not ~110 ms in the past: the interpolator extrapolates by the render delay (capped), weighted 1 within
@@ -276,6 +279,19 @@ namespace gage::sync {
         float contactGraceMs = 400.0f;      // how long the correction is soft after a contact
         float contactSoftFloor = 0.15f;     // the weight of the full command at the start of the grace
         float contactDecelMs = 4.0f;        // m/s lost along the travel direction in one frame vs the last command = a contact
+        // Sync B (collision audit): a KICK is any change of the car's own velocity the controller did not command, in ANY direction
+        // and at ANY target speed: |last command - the car's velocity now| above this (m/s, 3D). The collision flag alone left a
+        // sideways knock, a hit on a standing car and a flag that never falls (or arrives a frame late) without a grace: the
+        // impulse was erased by the next command. Tyre grip, drag and the ground move a commanded velocity by well under
+        // 1 m/s in one frame (vehicle_drive_test measures it), a car-to-car hit by 5..9. 0 = off.
+        float contactKickMs = 3.0f;
+        // The kick rests on an assumption nobody has verified in the game: that the car honours SET_ENTITY_VELOCITY within a frame.
+        // A body that does not (it lags the command) would report a "kick" in every frame, so kicks that are the ONLY reason for a
+        // grace are budgeted: contactKickStormN of them within contactKickStormMs mute the kick trigger for contactKickMuteMs
+        // (the flag and the speed loss keep working), and the mute is counted (stats.kickMutes, the 10 s line).
+        int contactKickStormN = 3;
+        float contactKickStormMs = 6000.0f;
+        float contactKickMuteMs = 15000.0f;
         float contactMinSpeedMs = 3.0f;     // the deceleration test only for a target faster than this
         float contactCooldownMs = 800.0f;   // after a grace, no new contact is looked for for this long
         float contactMaxFrameMs = 150.0f;   // a frame gap longer than this: the deceleration test is skipped (a hitch)
@@ -314,12 +330,17 @@ namespace gage::sync {
         float rotErrorDeg = 0;
         bool graceActive = false; // W9: a contact grace is in force this frame (soft correction)
         float graceWeight = 1.0f; // ... and the weight of the full command (1 outside a grace)
+        // Sync B: diagnostics. devMs = |the velocity commanded last frame - the car's own now| (3D, m/s; 0 when there was no
+        // previous command or the frame gap was a hitch): how much physics did not honour. contactOpened = what opened a grace THIS frame.
+        float devMs = 0;
+        uint8_t contactOpened = 0; // 0 none, 1 collision flag, 2 speed loss along the travel direction, 3 kick (any-direction deviation)
     };
 
     struct VehicleDriveStats
     {
         uint32_t frames = 0, snaps = 0, persistentSnaps = 0, underFloorSnaps = 0, blends = 0, refused = 0;
         uint32_t contacts = 0, contactsByFlag = 0, contactsByDecel = 0;   // W9: graces opened, and what opened them
+        uint32_t contactsByKick = 0, kickMutes = 0;                       // Sync B: ... by a velocity deviation in any direction; kick budget exhausted
     };
 
     // ---- sender steering ----
@@ -383,6 +404,8 @@ namespace gage::sync {
         // contact grace (W9 item 6)
         bool graceOn_ = false;
         double graceAgeMs_ = 0, cooldownMs_ = 0;
+        double clockMs_ = 0, kickAtMs_[8] = {}, kickMuteMs_ = 0;   // Sync B: the kick budget (sum of dt, the last kick times, the mute left)
+        int kickN_ = 0;
         bool haveCmd_ = false;      // lastCmdVel_ is the previous frame's velocity command (not a snap)
         DriveVec lastCmdVel_;
     };
