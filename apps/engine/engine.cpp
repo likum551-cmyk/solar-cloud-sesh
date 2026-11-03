@@ -239,6 +239,7 @@ namespace {
         // ---- sync plan W3, combat client (script tick unless marked "join worker") ----
         sync::ShotDebt shotDebt;         // shots owed to this ped (shotSeq stepped) and not fired yet: 3 a frame
         sync::MeleeSwingGate swingGate;  // 0c: a shotSeq step or a rising kPfMelee is ONE swing to show (300 ms dedupe)
+        sync::MeleeEventGate meleeEvents; // 0.4.5: the damage event of THIS puppet is cleared on the first frame of a swing window (stale ones)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
         bool reactLifted = false;        // PCF 188 (DisableHurt) and the ragdoll block are lifted for the reaction
@@ -453,6 +454,7 @@ namespace {
     bool g_respawnSlotFull = false;                    // g_evMtx
     proto::RespawnOk g_respawnSlot;                    // g_evMtx
     std::atomic<uint32_t> g_hitDamageConfirmed{0};     // Damage the server credited to our Hits (join worker)
+    std::atomic<uint32_t> g_hitConfirmCount{0};        // ... and how many Damage messages that was (0.4.5 melee audit)
     std::atomic<bool> g_v4Reset{true};            // a session ended or began: the tick resets the units below
 
     // Script tick only.
@@ -535,6 +537,10 @@ namespace {
         // still streaming or missing, the anim task failed)
         uint32_t meleeHitsEvent = 0, meleeHitsPool = 0, meleeEventsRead = 0, peerSwingSteps = 0, peerSwingOwned = 0,
                  peerSwingNoDict = 0, peerSwingFailed = 0;
+        // 0.4.5 melee audit: swing windows opened on a puppet, of which a STALE damage event stood (cleared, not a hit),
+        // swings that opened a window on a puppet within 3 m (a blow could have landed), the damage claimed by each melee
+        // detector (event / pool), and the Damage messages the server confirmed on our Hits
+        uint32_t meleeWindows = 0, meleeStaleEvents = 0, meleeNearSwings = 0, meleePoolDamage = 0, meleeEventDamage = 0, hitsConfirmed = 0;
         // 0d: TASK_CLIMB windows that really started (the puppet climbs / vaults) versus the placement fallbacks (climbTasks,
         // climbFallbacks above), the puppet put on the sender's pose before a task (nudged / set outright), and the cover
         // windows: task issued, the puppet really in cover, never in cover (fallback), ended with the sender's flag
@@ -1451,7 +1457,10 @@ namespace {
         {
             const sync::DamageAbout about = sync::ClassifyDamage(me, d.victimId, d.attackerId);
             if (about == sync::DamageAbout::MyHit)
+            {
                 g_hitDamageConfirmed.fetch_add(d.damage, std::memory_order_relaxed);
+                g_hitConfirmCount.fetch_add(1, std::memory_order_relaxed);
+            }
             // Sync plan W3 / W6: the server confirms a hit of ours on a puppet, and (protocol v5) tells every relevant
             // player about the damage between two others: the victim's puppet flinches / falls on our screen the same
             // way. Queued for the script tick (natives are not callable here) with the damage flags and the attacker;
@@ -2796,6 +2805,7 @@ namespace {
         pe.collisionOff = false;                       // a fresh ped has its collision
         pe.leaveUntilMs = 0;
         pe.shotDebt.Clear();                           // sync plan W3: a fresh ped owes no shots, has no reaction
+        pe.meleeEvents.Reset();
         pe.infiniteAmmo = false;
         pe.hitReact.Clear();
         pe.reactLifted = false;
@@ -3255,10 +3265,32 @@ namespace {
         const double sinceSwing = nowMs - g_lastSwingMs;
         const bool eventWindow = sync::MeleeEventWindow(g_meleeHeld, sinceSwing, g_meleeActionNow);
         bool eventDamaged = false;
-        if (eventWindow)
+        // 0.4.5: the first frame a window opens on this puppet, the standing event (if any) is a STALE one (a blow that landed
+        // outside every window and was never cleared): it is read for the log and cleared, never reported. Without it the
+        // first frame of the next swing, a miss included, reported the old blow as a hit.
+        switch (pe.meleeEvents.Tick(eventWindow))
         {
+        case sync::MeleeEventGate::Step::ClearStale:
+        {
+            ++g_v4.meleeWindows;
+            float px, py, pz;
+            if (g_world->GetEntityCoords(pe.ped, px, py, pz) &&
+                (px - g_localX.load()) * (px - g_localX.load()) + (py - g_localY.load()) * (py - g_localY.load()) <= 9.0f)
+                ++g_v4.meleeNearSwings;            // a puppet within 3 m when a swing began: a blow could have landed
+            if (g_world->DamagedBy(pe.ped, lp))
+            {
+                ++g_v4.meleeStaleEvents;
+                g_world->ClearLastDamage(pe.ped);
+                g_world->ClearLastDamageBone(pe.ped);
+            }
+            break;
+        }
+        case sync::MeleeEventGate::Step::Read:
             ++g_v4.meleeEventsRead;
             eventDamaged = g_world->DamagedBy(pe.ped, lp);
+            break;
+        case sync::MeleeEventGate::Step::Closed:
+            break;
         }
         if (h == pe.hpPool && !eventDamaged)
             return;
@@ -3302,9 +3334,15 @@ namespace {
         if (o.report)
             o.damage = md.damage;
         if (md.source == sync::MeleeHitSource::Event)
+        {
             ++g_v4.meleeHitsEvent;
+            g_v4.meleeEventDamage += (uint32_t)md.damage;
+        }
         else if (md.source == sync::MeleeHitSource::Pool && g_meleeHeld)
+        {
             ++g_v4.meleeHitsPool;
+            g_v4.meleePoolDamage += (uint32_t)md.damage;
+        }
         if (o.report && pe.seatedVeh >= 0)
             ++g_v4.hitsOnSeated;                       // W9 item 8: a Hit reported on a puppet that sits in a vehicle
         if (o.report)
@@ -3322,6 +3360,15 @@ namespace {
             hit.bone = (int16_t)(bone >= -32768 && bone <= 32767 ? bone : -1);
             hit.shotSeq = (uint8_t)(g_shotSeq & 15);
             g_hits.Add(hit, nowMs);
+            static int loggedMeleeHits = 0;
+            if (g_meleeHeld && loggedMeleeHits < 12)    // 0.4.5: the first melee reports with their timing, to read the server's answer against
+            {
+                ++loggedMeleeHits;
+                PeerLog(false, "engine: melee hit on peer id=%d (%s): %s, claimed %u (weapon 0x%08x), %.0f ms after our last counted swing, "
+                        "shotSeq %u, puppet health %d of pool %d, action running %d", id, pe.name.c_str(),
+                        md.source == sync::MeleeHitSource::Event ? "damage EVENT" : "pool drop", (unsigned)hit.damage, (unsigned)hit.weapon,
+                        sinceSwing, (unsigned)hit.shotSeq, h, pe.hpPool, g_meleeActionNow ? 1 : 0);
+            }
         }
         if (o.damage > 0 || h <= 0 || md.clearEvent)   // md.clearEvent: a melee event is read once, never fires the next swing too
         {
@@ -6754,6 +6801,7 @@ namespace {
             return;
         lastMs = nowMs;
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
+        g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;
         const uint32_t worlds = g_vehWorldsIn.load(), emotes = g_emotesIn.load();
         if (join::IsConnected())
@@ -6848,14 +6896,19 @@ namespace {
                   c.puppetStagger - last.puppetStagger);
             GLOGI("engine: melee (0c), last 10 s: hits sent (all weapons) %u; melee hits detected by the damage EVENT %u / by the pool drop %u (event read "
                   "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u shown, %u not shown (ped owned "
-                  "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s",
+                  "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s; audit (0.4.5): swing windows "
+                  "opened on a puppet %u (puppet within 3 m %u), stale damage events cleared %u, claimed %u by event / %u by pool, "
+                  "Damage confirmed by the server on our Hits %u (%u damage)",
                   c.hitsSent - last.hitsSent, c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool,
                   c.meleeEventsRead - last.meleeEventsRead, c.meleeSwings - last.meleeSwings,
                   c.peerSwingSteps - last.peerSwingSteps, c.peerSwings - last.peerSwings,
                   (c.peerSwingOwned - last.peerSwingOwned) + (c.peerSwingNoDict - last.peerSwingNoDict) +
                       (c.peerSwingFailed - last.peerSwingFailed),
                   c.peerSwingOwned - last.peerSwingOwned, c.peerSwingNoDict - last.peerSwingNoDict,
-                  c.peerSwingFailed - last.peerSwingFailed, g_aiMeleeApplied ? "0.0 (ai_melee_mod=1)" : "not set");
+                  c.peerSwingFailed - last.peerSwingFailed, g_aiMeleeApplied ? "0.0 (ai_melee_mod=1)" : "not set",
+                  c.meleeWindows - last.meleeWindows, c.meleeNearSwings - last.meleeNearSwings,
+                  c.meleeStaleEvents - last.meleeStaleEvents, c.meleeEventDamage - last.meleeEventDamage,
+                  c.meleePoolDamage - last.meleePoolDamage, c.hitsConfirmed - last.hitsConfirmed, c.hitDamage - last.hitDamage);
             GLOGI("engine: combat client (W8), last 10 s: local health changed by a puppet ped's gun or fists %u times (our "
                   "own cosmetic flinch bullets included); AI damage modifiers %s; dead-puppet melee reports capped %u, puppets "
                   "killed by a takedown %u; TASK_CLIMB issued %u, placement fallbacks %u; alt-tab fallback states sent %u",

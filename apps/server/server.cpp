@@ -233,6 +233,66 @@ namespace gage::server {
         c.dropSuppressed[kind] = 0;
     }
 
+    const char* HitReasonName(HitReason r)
+    {
+        switch (r)
+        {
+        case HitReason::None:           return "other";
+        case HitReason::Rate:           return "rate";
+        case HitReason::ShooterDead:    return "shooter_dead";
+        case HitReason::ShooterNoState: return "shooter_no_state";
+        case HitReason::ZeroDamage:     return "zero_damage";
+        case HitReason::NoTarget:       return "no_target";
+        case HitReason::TargetNoState:  return "target_no_state";
+        case HitReason::TargetDead:     return "target_dead";
+        case HitReason::Untrusted:      return "untrusted";
+        case HitReason::Range:          return "range";
+        case HitReason::NotRelevant:    return "not_relevant";
+        case HitReason::Environment:    return "environment";
+        case HitReason::NoShot:         return "no_shot";
+        case HitReason::WeaponNotHeld:  return "weapon_not_held";
+        case HitReason::ShotUsed:       return "shot_used";
+        case HitReason::MeleeReach:     return "melee_reach";
+        case HitReason::RunOver:        return "run_over";
+        case HitReason::NoExplosive:    return "no_explosive";
+        case HitReason::OverBudget:     return "over_budget";
+        case HitReason::DeferFull:      return "defer_full";
+        case HitReason::Count:          break;
+        }
+        return "?";
+    }
+
+    // 0.4.5 melee audit: one line every 10 s while Hits flowed, so the next live log says where they died or were cut. Silent
+    // when no Hit came in the window. Key=value, every refusal reason listed with its count.
+    void Server::LogHitSummary(uint64_t nowUs)
+    {
+        nextHitLogUs_ = nowUs + 10000000;
+        const Stats& n = stats_;
+        const Stats& o = hitLogMark_;
+        const uint64_t acc = n.hitsAccepted - o.hitsAccepted, rej = n.hitsRejected - o.hitsRejected, def = n.hitsDeferred - o.hitsDeferred;
+        if (acc + rej + def != 0)
+        {
+            std::string line = "combat: last 10 s: hits accepted " + std::to_string(acc) + " (melee " + std::to_string(n.hitsMelee - o.hitsMelee) +
+                               ", melee clipped by a cap/ceiling/budget " + std::to_string(n.hitsMeleeClipped - o.hitsMeleeClipped) +
+                               ", melee accepted only through the " + std::to_string(ac::kMeleeShotWindowMs) + " ms melee window " +
+                               std::to_string(n.hitsMeleeLate - o.hitsMeleeLate) + ", clamped " + std::to_string(n.hitsClamped - o.hitsClamped) +
+                               ", scaled up to the 1-point floor " + std::to_string(n.hitsFloored - o.hitsFloored) + "), damage applied " +
+                               std::to_string(n.hitsDamageApplied - o.hitsDamageApplied) + ", deferred " + std::to_string(def) + ", refused " +
+                               std::to_string(rej) + " [";
+            bool first = true;
+            for (size_t i = 0; i < kHitReasons; i++)
+            {
+                const uint64_t d = n.hitRefusals[i] - o.hitRefusals[i];
+                if (!d) continue;
+                line += std::string(first ? "" : " ") + HitReasonName((HitReason)i) + "=" + std::to_string(d);
+                first = false;
+            }
+            line += first ? "none]" : "]";
+            Log(line);
+        }
+        hitLogMark_ = stats_;
+    }
+
     uint16_t Server::adminPort() const { return admin_ && admin_->running() ? admin_->port() : 0; }
 
     bool Server::Start(const Config& cfg, std::string* err)
@@ -325,6 +385,7 @@ namespace gage::server {
         statsMark_ = Metrics();
         statsMarkUs_ = startUs_;
         nextSecondUs_ = startUs_ + 1000000;
+        nextHitLogUs_ = startUs_ + 10000000;
         cpuBase_ = ThreadCpuSeconds();
         lastWireSentData_ = host_->totalSentData;
         lastWireSentPackets_ = host_->totalSentPackets;
@@ -345,7 +406,9 @@ namespace gage::server {
         Log(DescribeLatestClient(cfg_));
         for (const std::string& w : ConfigWarnings(cfg_)) Log("WARNING: " + w);
         Log("authority: hits tied to shots within " +
-            (cfg_.hitShotWindowMs ? std::to_string(cfg_.hitShotWindowMs) + " ms" : std::string("(shot binding OFF)")) +
+            (cfg_.hitShotWindowMs ? std::to_string(cfg_.hitShotWindowMs) + " ms (melee swings within " +
+                                        std::to_string(ac::ShotWindowFor(ac::WeaponKind::Melee, cfg_.hitShotWindowMs)) + " ms)"
+                                  : std::string("(shot binding OFF)")) +
             ", damage caps x" + std::to_string(cfg_.hitDamageScalePercent) + "%, movement check " +
             (cfg_.untrustedWindowMs ? std::to_string(cfg_.untrustedWindowMs) + " ms window" : std::string("OFF")) + ", " +
             (cfg_.connectsPerIpPerMinute ? std::to_string(cfg_.connectsPerIpPerMinute) + " connects/min per address"
@@ -562,6 +625,7 @@ namespace gage::server {
             }
             nextSecondUs_ = nowUs + 1000000;
         }
+        if (nowUs >= nextHitLogUs_) LogHitSummary(nowUs);
     }
 
     void Server::BroadcastWorld()
@@ -1364,7 +1428,7 @@ namespace gage::server {
         }
     }
 
-    void Server::HurtPlayer(Conn& victim, uint16_t attacker, uint32_t weapon, uint16_t damage, int16_t bone, uint8_t flags)
+    uint16_t Server::HurtPlayer(Conn& victim, uint16_t attacker, uint32_t weapon, uint16_t damage, int16_t bone, uint8_t flags)
     {
         const uint8_t armourBefore = victim.armor;
         const uint16_t applied = ApplyDamage(victim.health, victim.armor, damage);
@@ -1399,6 +1463,7 @@ namespace gage::server {
                 " weapon=" + w);
         }
         PushShown(victim);
+        return applied;
     }
 
     void Server::OnHit(Conn& c, const uint8_t* data, size_t len)
@@ -1411,12 +1476,17 @@ namespace gage::server {
         }
         auto reject = [&](const std::string& why) {
             stats_.hitsRejected++;
+            stats_.hitRefusals[(size_t)hitReason_]++;
             LogDrop(c, kDropHit, "Hit refused: " + why);
         };
         const uint64_t nowMs = net::NowMs();
+        hitReason_ = HitReason::Rate;
         if (!c.hitRate.Take(nowMs)) return reject("over " + std::to_string(cfg_.hitsPerSecond) + " hits per second");
+        hitReason_ = HitReason::ShooterDead;
         if (c.dead) return reject("the shooter is dead");
+        hitReason_ = HitReason::ShooterNoState;
         if (!c.hasState) return reject("the shooter has sent no state yet");
+        hitReason_ = HitReason::ZeroDamage;
         if (h.damage == 0) return reject("zero damage");
         std::string why;
         switch (ApplyHit(c, h, nowMs, false, why))
@@ -1426,6 +1496,7 @@ namespace gage::server {
         case HitVerdict::Defer:
             // Its shot (or weapon) may be in a state still on its way: the reliable Hit can overtake the
             // unreliable state in the same datagram. Held for the next states, a few at most.
+            hitReason_ = HitReason::DeferFull;
             if (c.deferred.size() >= ac::kMaxDeferredHits) return reject("too many Hits waiting for their shot");
             c.deferred.push_back(Conn::DeferredHit{h, nowMs});
             stats_.hitsDeferred++;
@@ -1447,6 +1518,7 @@ namespace gage::server {
     Server::HitVerdict Server::ApplyHit(Conn& c, const proto::Hit& h, uint64_t nowMs, bool final, std::string& why)
     {
         why.clear();
+        hitReason_ = HitReason::None;
         Conn* tp = nullptr;
         const VehicleStore::Vehicle* tv = nullptr;
         proto::Kinematics tpos;
@@ -1455,17 +1527,20 @@ namespace gage::server {
             const auto it = players_.find(h.targetId);
             if (it == players_.end())
             {
+                hitReason_ = HitReason::NoTarget;
                 why = "no player " + std::to_string(h.targetId);
                 return HitVerdict::Reject;
             }
             tp = it->second;
             if (!tp->hasState)
             {
+                hitReason_ = HitReason::TargetNoState;
                 why = "the target has sent no state yet";
                 return HitVerdict::Reject;
             }
             if (tp->dead)
             {
+                hitReason_ = HitReason::TargetDead;
                 why = "the target is already dead";
                 return HitVerdict::Reject;
             }
@@ -1476,6 +1551,7 @@ namespace gage::server {
             tv = vehicles_.Get(h.targetId);
             if (!tv)
             {
+                hitReason_ = HitReason::NoTarget;
                 why = "no vehicle " + std::to_string(h.targetId);
                 return HitVerdict::Reject;
             }
@@ -1489,17 +1565,20 @@ namespace gage::server {
             if (Untrusted(c, nowMs))
             {
                 stats_.hitsUntrusted++;
+                hitReason_ = HitReason::Untrusted;
                 why = "the shooter is untrusted after a position jump";
                 return HitVerdict::Reject;
             }
             const float maxD = (float)cfg_.maxHitDistance;
             if (ac::Dist(c.k, tpos) > maxD)
             {
+                hitReason_ = HitReason::Range;
                 why = std::string(tv ? "vehicle" : "target") + " beyond " + std::to_string(cfg_.maxHitDistance) + " m";
                 return HitVerdict::Reject;
             }
             if (tp ? !repl_.Relevant(c.id, tp->id) : !vehicles_.RelevantTo(c.id, h.targetId))
             {
+                hitReason_ = HitReason::NotRelevant;
                 why = std::string("the ") + (tv ? "vehicle" : "target") + " is not in the shooter's view (not relevant)";
                 return HitVerdict::Reject;
             }
@@ -1508,13 +1587,19 @@ namespace gage::server {
             if (kind == ac::WeaponKind::Environment)
             {
                 stats_.hitsUnbound++;
+                hitReason_ = HitReason::Environment;
                 why = "an environmental weapon (fall, fire, ...) cannot hurt anyone else";
                 return HitVerdict::Reject;
             }
             bool bound = false, wait = false;
             std::string first; // the first reason a path failed
-            const auto note = [&](const std::string& r) {
-                if (first.empty()) first = r;
+            HitReason firstWhy = HitReason::NoShot;
+            const auto note = [&](const std::string& r, HitReason why2) {
+                if (first.empty())
+                {
+                    first = r;
+                    firstWhy = why2;
+                }
             };
             char wbuf[16];
             std::snprintf(wbuf, sizeof wbuf, "0x%08X", (unsigned)h.weapon);
@@ -1523,11 +1608,11 @@ namespace gage::server {
                 const VehicleStore::Seat occ = vehicles_.Occupancy(c.id);
                 const VehicleStore::Vehicle* dv = occ.veh != VehicleStore::kNone && occ.seat == 0 ? vehicles_.Get(occ.veh) : nullptr;
                 if (!dv)
-                    note("a run-over needs the shooter to drive a vehicle");
+                    note("a run-over needs the shooter to drive a vehicle", HitReason::RunOver);
                 else if (ac::Dist(dv->s.k, tpos) > ac::kRunOverRange)
-                    note("the shooter's vehicle is farther than " + std::to_string((int)ac::kRunOverRange) + " m from the target");
+                    note("the shooter's vehicle is farther than " + std::to_string((int)ac::kRunOverRange) + " m from the target", HitReason::RunOver);
                 else if (!vehicles_.MovedRecently(occ.veh, nowMs, ac::kRunOverMovedMs))
-                    note("the shooter's vehicle has not been moving");
+                    note("the shooter's vehicle has not been moving", HitReason::RunOver);
                 else
                 {
                     bound = true;
@@ -1544,15 +1629,15 @@ namespace gage::server {
                         bound = true; // shot binding switched off by the operator: the damage caps still apply
                         eff = kind;
                     }
-                    else if (ac::ShotLog::Slot* s = c.shots.Find(h.shotSeq, nowMs, cfg_.hitShotWindowMs))
+                    else if (ac::ShotLog::Slot* s = c.shots.Find(h.shotSeq, nowMs, ac::ShotWindowFor(kind, cfg_.hitShotWindowMs)))
                     {
                         if (!held)
                         {
-                            note(std::string("weapon ") + wbuf + " was not reported in the shooter's states lately");
+                            note(std::string("weapon ") + wbuf + " was not reported in the shooter's states lately", HitReason::WeaponNotHeld);
                             wait = true;
                         }
                         else if (s->hits >= ac::RuleOf(kind).hitsPerShot)
-                            note("that shot has hit " + std::to_string((int)s->hits) + " times already");
+                            note("that shot has hit " + std::to_string((int)s->hits) + " times already", HitReason::ShotUsed);
                         else
                         {
                             bound = true;
@@ -1563,7 +1648,7 @@ namespace gage::server {
                     else
                     {
                         note("no shot of the shooter's with shotSeq " + std::to_string((int)h.shotSeq) + " in the last " +
-                             std::to_string(cfg_.hitShotWindowMs) + " ms");
+                             std::to_string(ac::ShotWindowFor(kind, cfg_.hitShotWindowMs)) + " ms", HitReason::NoShot);
                         wait = c.shots.Ahead(h.shotSeq) || !held; // its state (or the weapon change) may still be coming
                     }
                 }
@@ -1573,7 +1658,7 @@ namespace gage::server {
                     // v5: a melee Hit needs a swing (the shot slot above) AND the target within reach.
                     bound = false;
                     credit = nullptr;
-                    note("a melee hit from " + std::to_string((int)ac::Dist(c.k, tpos)) + " m (reach " + std::to_string((int)reach) + " m)");
+                    note("a melee hit from " + std::to_string((int)ac::Dist(c.k, tpos)) + " m (reach " + std::to_string((int)reach) + " m)", HitReason::MeleeReach);
                 }
                 else if (!bound && kind != ac::WeaponKind::Melee && ac::NeedsShot(kind) && held && ac::Dist(c.k, tpos) <= reach)
                 {
@@ -1591,7 +1676,7 @@ namespace gage::server {
                     }
                     else if (kind == ac::WeaponKind::Explosive)
                     {
-                        note("no launch of an explosive weapon in the last " + std::to_string(ac::kExplosiveHeldMs / 1000) + " s");
+                        note("no launch of an explosive weapon in the last " + std::to_string(ac::kExplosiveHeldMs / 1000) + " s", HitReason::NoExplosive);
                         wait = true;
                     }
                 }
@@ -1600,6 +1685,7 @@ namespace gage::server {
             {
                 if (wait && !final) return HitVerdict::Defer;
                 stats_.hitsUnbound++;
+                hitReason_ = firstWhy;
                 why = first.empty() ? std::string("no matching shot") : first;
                 return HitVerdict::Reject;
             }
@@ -1617,6 +1703,7 @@ namespace gage::server {
         if (avail < 1.0)
         {
             stats_.hitsOverBudget++;
+            hitReason_ = HitReason::OverBudget;
             why = std::string("over the damage budget of ") + rule.label + " weapons (" + std::to_string(rule.maxPerSec) + " per second)";
             return HitVerdict::Reject;
         }
@@ -1630,10 +1717,17 @@ namespace gage::server {
         const bool boneCounts = !credit || credit->hits == 0;
         const HitScale scaled = ScaleHit(cfg_, eff, damage, boneCounts ? h.bone : (int16_t)-1,
                                          tp == &c ? 0.0f : ac::Dist(c.k, tpos));
+        if (credit && eff == ac::WeaponKind::Melee && nowMs - credit->atMs > cfg_.hitShotWindowMs) stats_.hitsMeleeLate++;   // only the melee window let it in
         if (credit) credit->hits++;
         stats_.hitsAccepted++;
+        if (eff == ac::WeaponKind::Melee)
+        {
+            stats_.hitsMelee++;
+            if (damage < h.damage) stats_.hitsMeleeClipped++;
+        }
+        if (scaled.floored) stats_.hitsFloored++;
         if (tp)
-            HurtPlayer(*tp, c.id, h.weapon, scaled.damage, h.bone, DamageFlags(scaled.headshot, eff, false));
+            stats_.hitsDamageApplied += HurtPlayer(*tp, c.id, h.weapon, scaled.damage, h.bone, DamageFlags(scaled.headshot, eff, false));
         else
             vehicles_.Damage(h.targetId, damage, tick_); // a vehicle's body health is not a player's: the clamped number, unscaled
         return HitVerdict::Accept;
@@ -1660,6 +1754,7 @@ namespace gage::server {
                 break;
             case HitVerdict::Reject:
                 stats_.hitsRejected++;
+                stats_.hitRefusals[(size_t)hitReason_]++;
                 LogDrop(c, kDropHit, "Hit refused: " + why);
                 break;
             }

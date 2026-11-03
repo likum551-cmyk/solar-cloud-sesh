@@ -33,6 +33,8 @@
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_w9.h"
 #include "protocol/protocol.h"
+#include "melee_sim.h"
+#include "../apps/server/anticheat.h"
 
 #include <cctype>
 #include <cmath>
@@ -2234,6 +2236,188 @@ static void Test0cMelee()
     }
 }
 
+
+// ---- 0.4.5 melee audit: the client's whole melee pipeline on scripted fights (tests/melee_sim.h) -------------------------
+// What the engine does per frame (TickLocalMelee + the melee part of ProbePeerHits + the Hit flush), fed a script of
+// presses, blows and pool drops on a simulated clock at 62.5 frames a second. Asserts what the owner's three complaints are
+// about: a legit blow is reported exactly ONCE (never zero, never two), within the nominal damage band, a swing that
+// missed is never reported, and the guns' path is the same as before.
+namespace {
+    struct FightBlow { double t; int pool; bool event; };
+    struct FightScript
+    {
+        std::vector<double> presses;     // the melee control pressed (the frame containing t)
+        std::vector<FightBlow> blows;    // a blow lands on the puppet at t: pool drop and whether GTA records the damage event
+        double actionMs = 350.0;         // IS_PED_PERFORMING_MELEE_ACTION stays true this long after a press (0 = never reads true)
+    };
+    void RunFight(meleesim::Client& c, const FightScript& s, double endMs)
+    {
+        std::size_t pi = 0, bi = 0;
+        for (double t = 0.0; t <= endMs; t += 16.0)
+        {
+            bool press = false, action = false;
+            while (pi < s.presses.size() && s.presses[pi] <= t)
+            {
+                press = true;
+                ++pi;
+            }
+            for (double p : s.presses)
+                if (s.actionMs > 0.0 && t >= p && t < p + s.actionMs)
+                    action = true;
+            while (bi < s.blows.size() && s.blows[bi].t <= t)
+            {
+                c.pup.Blow(s.blows[bi].pool, s.blows[bi].event);
+                ++bi;
+            }
+            c.Frame(t, press, action);
+        }
+    }
+    int SumClaimed(const meleesim::Client& c)
+    {
+        int n = 0;
+        for (const meleesim::Sent& x : c.sent) n += x.hit.damage;
+        return n;
+    }
+}
+
+static void Test05MeleeSim()
+{
+    // one punch; the AI melee modifier at 0 leaves the pool alone (the 0.4.3 live case), and with it live the pool drops too
+    {
+        meleesim::Client a, b;
+        FightScript s0;
+        s0.presses = { 200 };
+        s0.blows = { { 520, 0, true } };
+        RunFight(a, s0, 2000);
+        FightScript s1;
+        s1.presses = { 200 };
+        s1.blows = { { 520, 30, true } };
+        RunFight(b, s1, 2000);
+        Check("0.4.5 sim: one punch is ONE Hit of the nominal 40 (shotSeq 1, left within 100 ms of the blow), whether the pool did not move (modifier 0) or dropped 30 "
+              "(one report, not 70); the puppet's pool is back at 1000",
+              a.sent.size() == 1 && a.sent[0].hit.damage == 40 && a.sent[0].hit.shotSeq == 1 && a.sent[0].atMs - 520 <= 100 &&
+                  b.sent.size() == 1 && b.sent[0].hit.damage == 40 && b.pup.health == 1000 && a.hitsEvent == 1 && b.hitsEvent == 1 && b.hitsPool == 0,
+              F("modifier 0: %zu hits (%d), live: %zu hits (%d), pool %d", a.sent.size(), a.sent.empty() ? 0 : a.sent[0].hit.damage, b.sent.size(),
+                b.sent.empty() ? 0 : b.sent[0].hit.damage, b.pup.health));
+    }
+    // a combo: three punches 500 ms apart, each lands 300 ms after its press
+    {
+        meleesim::Client c;
+        FightScript s;
+        s.presses = { 100, 600, 1100 };
+        s.blows = { { 400, 0, true }, { 900, 0, true }, { 1400, 0, true } };
+        RunFight(c, s, 2500);
+        bool seqs = c.sent.size() == 3;
+        for (std::size_t i = 0; seqs && i < 3; ++i)
+            seqs = c.sent[i].hit.shotSeq == i + 1 && c.sent[i].hit.damage == 40 && c.sent[i].atMs - s.blows[i].t <= 100;
+        Check("0.4.5 sim: a combo of 3 punches 0.5 s apart is exactly 3 Hits of 40 on shotSeq 1, 2, 3, each within 100 ms of its blow (120 claimed, not 0, not 240)",
+              seqs && SumClaimed(c) == 120 && c.swings == 3, F("%zu hits, %d claimed, %u swings", c.sent.size(), SumClaimed(c), c.swings));
+    }
+    // a swing that misses, then one that hits
+    {
+        meleesim::Client c;
+        FightScript s;
+        s.presses = { 100, 900 };
+        s.blows = { { 1200, 0, true } };
+        RunFight(c, s, 2500);
+        Check("0.4.5 sim: a swing that misses (no blow) reports nothing; the next swing that hits is one Hit, on its own shotSeq (2)",
+              c.sent.size() == 1 && c.sent[0].hit.shotSeq == 2 && c.sent[0].hit.damage == 40, F("%zu hits", c.sent.size()));
+    }
+    // THE STALE EVENT: a blow lands outside every window (1.3 s after the press) and leaves its damage event standing; a later swing
+    // that misses must not be reported as a hit on its first frame
+    {
+        meleesim::Client c;
+        FightScript s;
+        s.presses = { 100, 3000 };
+        s.blows = { { 1400, 0, true } };               // 1.3 s after the press: outside the 900 ms window, the pool did not move
+        RunFight(c, s, 4500);
+        Check("0.4.5 sim: a blow outside every swing window leaves its damage event standing; the NEXT swing, a miss, is not reported as a hit (ghost hit on its first "
+              "frame); the stale event is cleared and counted",
+              c.sent.empty() && c.stale == 1 && !c.pup.event, F("%zu hits, %u stale cleared, event left %d", c.sent.size(), c.stale, (int)c.pup.event));
+    }
+    // the window edges: a blow 780 ms after the press (inside the 900 ms window) is a hit, one 950 ms after is not and leaves no ghost behind
+    {
+        meleesim::Client inside, outside;
+        FightScript a;
+        a.presses = { 100 };
+        a.blows = { { 880, 0, true } };
+        a.actionMs = 0;                                // the action native may read false: the window alone must carry it
+        RunFight(inside, a, 2500);
+        FightScript b;
+        b.presses = { 100, 3000 };
+        b.blows = { { 1050, 0, true } };
+        b.actionMs = 0;
+        RunFight(outside, b, 4500);
+        Check("0.4.5 sim: the swing window edge: a blow 780 ms after the press is one Hit, one 950 ms after is none and does not fire on the next swing's first frame either "
+              "(the action flag reading false does not matter)",
+              inside.sent.size() == 1 && outside.sent.empty(), F("inside %zu, outside %zu", inside.sent.size(), outside.sent.size()));
+    }
+    // the guns are not touched by any of it: the pool probe reports every shot once; the event is never read with a gun in hand
+    {
+        meleesim::Client c;
+        c.held = false;
+        c.weapon = meleesim::kPistolHash;
+        for (int i = 0; i < 5; ++i)                    // 5 shots 120 ms apart, each takes 30 off the pool
+        {
+            const double t = 100.0 + 120.0 * i;
+            for (double f = t - 8.0; f <= t + 140.0; f += 16.0)
+            {
+                if (f < t)
+                    continue;
+                if (f - t < 16.0)
+                {
+                    c.Shot();
+                    c.pup.Blow(30, true);
+                }
+                c.Frame(f, false, false);
+            }
+        }
+        for (double f = 900.0; f < 1500.0; f += 16.0) c.Frame(f, false, false);
+        bool all30 = c.sent.size() == 5;
+        for (const meleesim::Sent& x : c.sent) all30 = all30 && x.hit.damage == 30 && x.hit.weapon == meleesim::kPistolHash;
+        meleesim::Client burst;                        // 6 shots 30 ms apart: the batcher merges them, no damage is lost or doubled
+        burst.held = false;
+        burst.weapon = meleesim::kPistolHash;
+        double t = 100.0;
+        int shots = 0;
+        for (double f = 0.0; f < 1200.0; f += 16.0)
+        {
+            if (shots < 6 && f >= t)
+            {
+                burst.Shot();
+                burst.pup.Blow(30, true);
+                ++shots;
+                t += 32.0;
+            }
+            burst.Frame(f, false, false);
+        }
+        Check("0.4.5 sim: guns: 5 shots 120 ms apart are 5 Hits of exactly 30 each by the pool drop, the damage event is never read (no melee window); a 6-shot burst 32 ms "
+              "apart is merged by the batcher into Hits that add up to exactly 180",
+              all30 && c.eventReads == 0 && c.hitsEvent == 0 && SumClaimed(burst) == 180 && burst.eventReads == 0,
+              F("%zu hits, event reads %u, burst claimed %d in %zu hits", c.sent.size(), c.eventReads, SumClaimed(burst), burst.sent.size()));
+    }
+    // the event gate itself
+    {
+        MeleeEventGate g;
+        using S = MeleeEventGate::Step;
+        const S a = g.Tick(false), b = g.Tick(true), c = g.Tick(true), d = g.Tick(true), e = g.Tick(false), f = g.Tick(true);
+        Check("0.4.5 sim: MeleeEventGate: closed does nothing, the first open frame clears the stale event, later frames of that window read, a closed gap and a reopen clears again "
+              "(a combo whose window never closes keeps reading)",
+              a == S::Closed && b == S::ClearStale && c == S::Read && d == S::Read && e == S::Closed && f == S::ClearStale,
+              F("%d %d %d %d %d %d", (int)a, (int)b, (int)c, (int)d, (int)e, (int)f));
+    }
+    // client and server agree on how long a swing counts
+    {
+        const double need = kMeleeHitWindowMs + HitBatchConfig().holdMs + 33.0 /* one script tick of flush */ + 300.0 /* link and jitter */;
+        Check("0.4.5 sim: the server's melee swing window covers the client's swing window plus the batcher hold, a tick and 300 ms of link (the 500 ms shot window did not: "
+              "a blow later than ~450 ms after the press was refused)",
+              (double)gage::server::ac::kMeleeShotWindowMs >= need && gage::server::ac::ShotWindowFor(gage::server::ac::WeaponKind::Melee, 500) >= need &&
+                  gage::server::ac::ShotWindowFor(gage::server::ac::WeaponKind::Handgun, 500) == 500 && gage::server::ac::ShotWindowFor(gage::server::ac::WeaponKind::Melee, 0) == 0 &&
+                  gage::server::ac::ShotWindowFor(gage::server::ac::WeaponKind::Melee, 3000) == 3000,
+              F("need %.0f ms, window %u ms", need, (unsigned)gage::server::ac::kMeleeShotWindowMs));
+    }
+}
+
 // ---- W9 (docs/sync-specs/live-0.4.2-fixes.md section W9): passengers, seats, leaving a moving vehicle, impacts ----
 static void TestW9()
 {
@@ -2675,6 +2859,8 @@ int main()
     TestW8();
     std::printf("-- 0.4.4 item 0c: melee hit by the damage event, receiver swing trigger\n");
     Test0cMelee();
+    std::printf("-- 0.4.5 melee audit: scripted fights through the client's melee pipeline\n");
+    Test05MeleeSim();
     std::printf("-- W9: passenger enter, re-warp limiter, F press guard, passenger engine, bail-out, vehicle impact, bikes\n");
     TestW9();
     std::printf("-- W10: player name tags (fade, projection, occlusion cache, text, list)\n");
@@ -2686,7 +2872,8 @@ int main()
     // + 0d 6 (in TestW8 beside the climb window: pre-vault placement 1, climb accounting 1, cover window 4)
     // + W9 8 (enter warp 1, re-warp limiter 1, press guard 1, passenger engine 1, unseat 2, impact 1, bike class 1; EnterWarpDue's old W6 check stays)
     // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16;
+    // + 0.4.5 melee audit 8 (punch, combo, miss then hit, stale event, window edge, guns, event gate, client/server window)
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + 8;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {

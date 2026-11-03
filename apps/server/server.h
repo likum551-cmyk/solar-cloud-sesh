@@ -108,6 +108,34 @@ namespace gage::server {
 
     class AdminChannel;
 
+    // Why a Hit was refused (Stats::hitRefusals, the `combat:` log line). One per refusal, whichever path judged it.
+    enum class HitReason : uint8_t
+    {
+        None,
+        Rate,            // over hitsPerSecond
+        ShooterDead,
+        ShooterNoState,
+        ZeroDamage,
+        NoTarget,        // no such player / vehicle
+        TargetNoState,
+        TargetDead,
+        Untrusted,       // the shooter is inside the untrusted window
+        Range,           // beyond maxHitDistance
+        NotRelevant,     // the target is not in the shooter's view
+        Environment,     // an environmental weapon aimed at somebody else
+        NoShot,          // no shot (swing) of the shooter's with that shotSeq in the window
+        WeaponNotHeld,   // the claimed weapon was not in the shooter's states lately
+        ShotUsed,        // the shot already carried its hitsPerShot Hits
+        MeleeReach,      // a melee Hit beyond reach
+        RunOver,         // a run-over rule failed
+        NoExplosive,     // no launch of an explosive weapon
+        OverBudget,      // the class's damage budget is spent
+        DeferFull,       // too many Hits waiting for their shot
+        Count
+    };
+    constexpr size_t kHitReasons = (size_t)HitReason::Count;
+    const char* HitReasonName(HitReason r); // a short log key, e.g. "melee_reach"
+
     // Counters for the admin console and the tests.
     struct Stats
     {
@@ -159,6 +187,13 @@ namespace gage::server {
         uint64_t hitsClamped = 0;            // accepted with less damage than claimed (class cap or damage-rate budget)
         uint64_t hitsOverBudget = 0;         // refused: the weapon class's damage budget per second is spent
         uint64_t hitsUntrusted = 0;          // refused: the shooter is inside the untrusted window
+        // ---- 0.4.5 melee audit: why a Hit died (every refusal counts in exactly one slot) and what the accepted ones were worth ----
+        uint64_t hitRefusals[kHitReasons] = {};  // by HitReason
+        uint64_t hitsMelee = 0;              // accepted as the melee class (fists, blades, a gun used as a club)
+        uint64_t hitsMeleeClipped = 0;       // ... of which less than claimed: the class cap, the weapon ceiling or the budget
+        uint64_t hitsMeleeLate = 0;          // ... of which named a swing older than hitShotWindowMs (the melee window, kMeleeShotWindowMs)
+        uint64_t hitsFloored = 0;            // accepted and scaled below 1 point, applied as the 1-point floor
+        uint64_t hitsDamageApplied = 0;      // sum of the damage taken off players by accepted Hits (armour and health)
         uint64_t movesRejected = 0;          // positions beyond the displacement budget (each opens the untrusted window)
         uint64_t untrustedRefusals = 0;      // Enter / Register / Spawn refused inside the window
         uint64_t vehicleRepliesSuppressed = 0; // RateLimited VehicleResults not sent (at most 1 a second per player)
@@ -365,6 +400,10 @@ namespace gage::server {
         // (applied), Defer (the shot or weapon state it names may still be on its way: kept up to 300 ms) or
         // Reject (`why` says). `final` turns a Defer into a Reject.
         enum class HitVerdict { Accept, Defer, Reject };
+        HitReason hitReason_ = HitReason::None;   // set with `why` when ApplyHit (or OnHit) refuses: counted by whoever reports the refusal
+        Stats hitLogMark_;                        // stats_ as of the previous 10 s `combat:` line
+        uint64_t nextHitLogUs_ = 0;
+        void LogHitSummary(uint64_t nowUs);
         HitVerdict ApplyHit(Conn& c, const proto::Hit& h, uint64_t nowMs, bool final, std::string& why);
         void RetryDeferredHits(Conn& c, uint64_t nowMs);
         void CheckMove(Conn& c, const proto::PlayerState& s, uint64_t nowMs);
@@ -377,7 +416,7 @@ namespace gage::server {
         // Applies `damage` (already clamped and scaled, apps/server/damage.h) to `victim` from `attacker`, tells the
         // victim, the attacker and (v5) everyone for whom either is relevant, broadcasts a death. `bone` is the Hit's
         // bone (-1 unknown), `flags` the proto::kDmg* bits the hit earned (the armour bit is added here).
-        void HurtPlayer(Conn& victim, uint16_t attacker, uint32_t weapon, uint16_t damage, int16_t bone = -1, uint8_t flags = 0);
+        uint16_t HurtPlayer(Conn& victim, uint16_t attacker, uint32_t weapon, uint16_t damage, int16_t bone = -1, uint8_t flags = 0);
         void SendVitals(Conn& victim, uint16_t attacker, uint32_t weapon, uint16_t damage, bool killed, int16_t bone = -1,
                         uint8_t flags = 0);
         // Re-publishes the player's state to the replicator with the server's health / armour / death.
