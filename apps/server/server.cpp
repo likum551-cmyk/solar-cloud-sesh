@@ -290,6 +290,16 @@ namespace gage::server {
             line += first ? "none]" : "]";
             Log(line);
         }
+        {
+            // T1 seats: one line while intents flowed, so the next live log says what the seat protocol did. Key=value.
+            const uint64_t ok = n.seatIntents - o.seatIntents, ref = n.seatIntentsRefused - o.seatIntentsRefused;
+            const uint64_t seated = n.seatSeated - o.seatSeated, canc = n.seatCancelled - o.seatCancelled;
+            const uint64_t exits = n.seatExits - o.seatExits;
+            if (ok + ref + seated + canc + exits != 0)
+                Log("seats: last 10 s: intents reserved " + std::to_string(ok) + " refused " + std::to_string(ref) + ", seated from a reservation " +
+                    std::to_string(seated) + ", cancelled " + std::to_string(canc) + " (expired " + std::to_string(n.seatExpired - o.seatExpired) +
+                    "), announced exits " + std::to_string(exits) + ", notices sent " + std::to_string(n.seatNoticesSent - o.seatNoticesSent));
+        }
         hitLogMark_ = stats_;
     }
 
@@ -1186,6 +1196,7 @@ namespace gage::server {
         std::vector<uint16_t> gone;
         vehicles_.Tick(nowMs, tick_, &gone);
         for (uint16_t id : gone) VehicleDestroyed(id);
+        FlushSeatNotices(); // T1: reservations that expired, vehicles that went, players that died or left since the last tick
         // v5: who controls each vehicle (the driver, else the nearest trusted player who has it in view), decided
         // once per tick before the frames are built, so every receiver is told the same ctrl.
         controlCandidates_.clear();
@@ -1322,6 +1333,36 @@ namespace gage::server {
         res.code = code;
         res.vehId = vehId;
         SendTo(c, proto::kChanReliable, proto::Encode(res), true);
+        FlushSeatNotices(); // T1: after the actor's answer, before anything else this tick
+    }
+
+    // T1 seats: delivers the SeatNotices the store queued to every client that has the vehicle in range, and to the actor
+    // (who learns of an Expired / Replaced / VehicleGone cancel of its own walk this way). Reliable, in order.
+    void Server::FlushSeatNotices()
+    {
+        if (vehicles_.PendingNotices() == 0) return;
+        std::vector<std::vector<uint16_t>> audiences;
+        const std::vector<proto::SeatNotice> notices = vehicles_.TakeNotices(&audiences);
+        for (size_t i = 0; i < notices.size(); i++)
+        {
+            const proto::SeatNotice& n = notices[i];
+            const proto::Bytes bytes = proto::Encode(n);
+            if (bytes.empty()) continue; // cannot happen with the store's own data
+            switch (n.kind)
+            {
+            case proto::SeatNoticeKind::Seated:    stats_.seatSeated++; break;
+            case proto::SeatNoticeKind::Cancelled: stats_.seatCancelled++; if (n.detail == (uint8_t)proto::SeatCancelReason::Expired) stats_.seatExpired++; break;
+            case proto::SeatNoticeKind::Exited:    stats_.seatExits++; break;
+            case proto::SeatNoticeKind::Reserved:  break;
+            }
+            for (const uint16_t to : audiences[i])
+            {
+                const auto it = players_.find(to);
+                if (it == players_.end()) continue; // left since (the departing player's own cancel)
+                SendTo(*it->second, proto::kChanReliable, bytes, true);
+                stats_.seatNoticesSent++;
+            }
+        }
     }
 
     proto::VehicleResultCode Server::RunVehicleCmd(Conn& c, const proto::VehicleCmd& m, uint16_t& vehId)
@@ -1422,7 +1463,25 @@ namespace gage::server {
             }
             return vehicles_.Enter(c.id, m.vehId, m.arg, c.k, nowMs, tick_);
         case proto::VehicleOp::Exit:
-            return vehicles_.Exit(c.id, m.vehId, nowMs, tick_);
+            return vehicles_.Exit(c.id, m.vehId, nowMs, tick_, true); // T1: announced (SeatNotice::Exited), or a pending reservation cancelled
+        case proto::VehicleOp::EnterIntent:
+        {
+            // T1 seats: the same gates as Enter (a dead or position-less player, the untrusted window) before the store's own.
+            if (c.dead) return Code::Dead;
+            if (!c.hasState) return Code::NoState;
+            if (Untrusted(c, nowMs))
+            {
+                stats_.untrustedRefusals++;
+                return Code::RateLimited;
+            }
+            if (m.arg & ~proto::kIntentArgMask) return Code::BadArg; // reserved bits
+            const Code r = vehicles_.Reserve(c.id, m.vehId, m.arg & 0xFF, (m.arg & proto::kIntentRun) != 0, c.k, nowMs, tick_);
+            if (r == Code::Ok) stats_.seatIntents++;
+            else stats_.seatIntentsRefused++;
+            return r;
+        }
+        case proto::VehicleOp::CancelIntent:
+            return vehicles_.CancelIntent(c.id, m.vehId);
         case proto::VehicleOp::Release:
             return vehicles_.Release(c.id, m.vehId, tick_); // v5: the owner gives the driver's seat to anybody
         case proto::VehicleOp::SetLocked:
@@ -1483,6 +1542,7 @@ namespace gage::server {
             // that was still waiting for its shot dies with it).
             const VehicleStore::Seat seat = vehicles_.Occupancy(victim.id);
             if (seat.veh != VehicleStore::kNone) vehicles_.Exit(victim.id, seat.veh, victim.deathMs, tick_);
+            vehicles_.CancelIntentOf(victim.id, proto::SeatCancelReason::PlayerGone); // T1: a dead player walks nowhere
             ClearAnim(victim, true);
             victim.deferred.clear();
         }
@@ -1823,6 +1883,7 @@ namespace gage::server {
         c.armor = (uint8_t)cfg_.respawnArmour; // v5: Config::respawnArmour (0 by default)
         const VehicleStore::Seat seat = vehicles_.Occupancy(c.id);
         if (seat.veh != VehicleStore::kNone) vehicles_.Exit(c.id, seat.veh, nowMs, tick_);
+        vehicles_.CancelIntentOf(c.id, proto::SeatCancelReason::PlayerGone); // T1
         ClearAnim(c, true);
         c.k = proto::Kinematics();
         c.k.x = sp.x;

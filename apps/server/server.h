@@ -198,6 +198,7 @@ namespace gage::server {
         uint64_t untrustedRefusals = 0;      // Enter / Register / Spawn refused inside the window
         uint64_t vehicleRepliesSuppressed = 0; // RateLimited VehicleResults not sent (at most 1 a second per player)
         uint64_t vehicleFloodKicks = 0;      // players cut off for a sustained VehicleCmd flood
+        uint64_t seatIntents = 0, seatIntentsRefused = 0, seatSeated = 0, seatCancelled = 0, seatExpired = 0, seatExits = 0, seatNoticesSent = 0; // T1 seats (wire v6)
         uint64_t registersRefused = 0;       // Register: too soon after the last one, or too close to a networked vehicle
         uint64_t modelsDenied = 0;           // Spawn / Register of a model outside the allow / deny lists
         uint64_t vehiclesOrphaned = 0;       // occupied vehicles whose spawner left
@@ -395,6 +396,7 @@ namespace gage::server {
         void OnVehicleUpdate(Conn& c, const uint8_t* data, size_t len);
         void OnVehicleCmd(Conn& c, const uint8_t* data, size_t len);
         proto::VehicleResultCode RunVehicleCmd(Conn& c, const proto::VehicleCmd& m, uint16_t& vehId);
+        void FlushSeatNotices();   // T1 seats: delivers VehicleStore's queued SeatNotices
         void OnHit(Conn& c, const uint8_t* data, size_t len);
         // The authority rules of anticheat.h. ApplyHit judges a Hit and, when it passes, applies it: Accept
         // (applied), Defer (the shot or weapon state it names may still be on its way: kept up to 300 ms) or

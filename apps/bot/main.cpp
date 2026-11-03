@@ -347,6 +347,10 @@ int main(int argc, char** argv)
             case net::Event::Type::PeerAnimStop:
                 Log("anim stop: " + std::to_string(e.animStop.id));
                 break;
+            case net::Event::Type::SeatNotice:
+                Log(std::string("seat notice: ") + proto::ToString(e.seatNotice.kind) + " player " + std::to_string(e.seatNotice.player) + " vehicle " +
+                    std::to_string(e.seatNotice.vehId) + " seat " + std::to_string((int)e.seatNotice.seat));
+                break;
             }
         }
 

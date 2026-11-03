@@ -962,3 +962,65 @@ Client and server ship together: a v4 client gets `Refuse(VersionMismatch)` from
 | `RespawnOk` (24) | health 100, armour 0 | health `playerHealth` (200), armour `respawnArmour` (0) |
 | health | 100 by default (GTA ped health 200) | 200 by default (GTA ped health 300); a carbine kills in 9 hits instead of 4 |
 | `Hello`, `Refuse` | | unchanged |
+
+<!-- ===== T1 seats (desync overhaul round 2) ===== begin: append-only section, owned by the T1 task -->
+
+## T1 seats: enter / exit intents (wire v6, additive)
+
+Why: the seat list (`VehicleWorld.seats`) says who SITS where, but nothing said that a player is ON THE WAY to a seat, so every other
+screen could only warp the puppet into the seat the moment the list named it ("sometimes the player is teleported in, sometimes other
+players never see the enter animation at all"). v6 makes the intent authoritative on the server and replays it on every client with the
+game's own enter task; the seat warp stays only as a bounded fallback. `VehicleWorld`, `VehicleState`, `VehicleUpdate` and `PedState`
+are NOT touched by this section. Client and server must ship together, like every wire change (the orchestrator does the single
+`kVersion` bump; this section is written against v6).
+
+### New ops of `VehicleCmd` (15), new range `1..11` (`kVehicleOpLast = CancelIntent`)
+
+| op | value | `arg` | meaning |
+|---|---|---|---|
+| `EnterIntent` | 10 | bits 0..7 the wire seat (0..7), bit 8 `kIntentRun` (the player runs to the door; clear = walks); every other bit must be 0 (`BadArg`) | reserve seat `arg & 0xFF` of `vehId` for the sender. Same gates as `Enter` (dead, no state, untrusted window, `NoVehicle`, `BadArg` seat, `NotOwner` driver seat of an owned car, `SeatTaken` when the seat is occupied OR reserved by somebody else, `TooFar` over `vehicleEnterDistance`, `Locked`), plus `NotAllowed` when the sender already sits in a vehicle. Ok seats NOBODY: the reservation lives `kIntentTtlMs` (6000 ms) |
+| `CancelIntent` | 11 | 0 | drop the sender's reservation on `vehId`; Ok also when there is none (idempotent); `NoVehicle` when the car does not exist |
+
+A player has at most one reservation: a new `EnterIntent` for another seat cancels the old one (`Cancelled/Replaced`), the same seat
+renews it silently. `Exit` while only a reservation is held answers Ok and cancels it (`Cancelled/ByPlayer`). `Enter` by the holder
+turns it into occupancy; an `Enter` of another seat cancels it (`Cancelled/Replaced`). An `Enter` of a seat somebody else has reserved is
+`SeatTaken`. The answer to both ops is the usual `VehicleResult` (19) with `op` = 10 / 11 (the link of `libs/sync/vehicle_link.h` never
+sees these ops).
+
+### 31 `SeatNotice` (server to client, reliable): 8 bytes
+
+```
+u8 type=31 | u8 kind | u16 player | u16 vehId | u8 seat | u8 detail
+```
+
+Sent to every client that has the vehicle in its relevant set (`VehicleStore::RelevantTo`) and to the player concerned, in order with
+the other reliable traffic (a `VehicleResult` to the actor first). Never relayed back: a client that sends one is refused
+(`Refuse(Protocol)`).
+
+| kind | value | `detail` | meaning |
+|---|---|---|---|
+| `Reserved` | 1 | bit 0 `kSeatNoticeRun` | `player` reserved `seat` of `vehId`: replay the entry (the real enter task toward that seat) |
+| `Seated` | 2 | 0 | the reservation became occupancy: `player` holds `seat` (the next `VehicleWorld` lists it) |
+| `Cancelled` | 3 | `SeatCancelReason` 0 ByPlayer, 1 Expired, 2 Replaced, 3 VehicleGone, 4 PlayerGone | the reservation ended without a seating |
+| `Exited` | 4 | 0 | `player` left `seat` by its own `Exit`: play the normal exit animation now. NOT sent for a death, a respawn, a disconnect or a despawn (those only drop the seat from the list) |
+
+Strict decoding: unknown kind, `player >= kMaxPlayers` (1024), `vehId >= kMaxVehicles` (256), `seat >= 8`, or a `detail` the kind does
+not define (Reserved: only bit 0; Cancelled: 0..4; Seated / Exited: 0) refuse the message; `Encode` returns an empty packet for the same
+fields. Extra or missing bytes refuse it. Test: `tests/decode_fuzz_test.cpp` (four `SeatNotice` cases, two new `VehicleCmd` cases),
+`tests/gameplay_test.cpp` `TestWire`, `tests/netcode_test.cpp` (`VehicleCmd` ops 1..11, `PeekType` 1..31).
+
+### What the clients do with it (libs/sync/seat_intent.h, apps/engine/engine.cpp)
+
+* The player's own client, on F / G: `EnterIntent`, wait for the Ok, then GTA's `TASK_ENTER_VEHICLE` for exactly that seat (flags 1, no
+  jack flag); the link's `Enter` follows when the game has seated the ped. A refusal starts nothing; no answer within 2 s cancels. The
+  teleport-in (`SET_PED_INTO_VEHICLE`) only happens when the task never starts (1 s), stops without a seat (0.4 s after) or runs out of
+  time (4.5 s door, 3.5 s bike / cycle), or for a locked car (its owner's entry).
+* Every other client: `Reserved` starts the same task on the puppet ONCE; the seat warp waits `confirmGraceMs` (1.5 s) after `Seated` / the
+  list naming the player and is never allowed while the task still runs inside that grace; `Cancelled` clears the task; `Exited` runs the
+  normal exit animation at once and refuses a stale seat list for 0.7 s.
+* `HKCU\Software\GAGE-MP` value `seat_intent=0` restores the pre-v6 behaviour on the client for A/B testing (the server keeps sending).
+
+Server diagnostics: `seats: last 10 s: ...` in the server log while intents flow. Client: `engine: seats (T1), last 10 s: ...` and
+`engine: seats: ...` lines in `gage.log`.
+
+<!-- ===== T1 seats ===== end -->

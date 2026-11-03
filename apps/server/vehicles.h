@@ -26,6 +26,12 @@
 //    steering zeroed, horn off). PlayerGone (disconnect) frees the seat; the player's EMPTY vehicles are
 //    destroyed with it and the ones somebody else sits in become orphans (no spawner, but still counted
 //    against the address) that go Rules::orphanMs after they empty.
+//  * T1 seats (wire v6) INTENTS: Reserve (VehicleOp::EnterIntent) holds a seat for a player who is on the way to it
+//    (at most one reservation per player, kIntentTtlMs long, never in the seat list), so a second player's Enter or
+//    Reserve of the same seat is refused SeatTaken while the first walks in. Every change (Reserved, Seated when the
+//    player's Enter takes the reserved seat, Cancelled with a reason, Exited for an announced Exit) is queued as a
+//    proto::SeatNotice for the caller to deliver (TakeNotices); the store has no sockets. Occupancy is still only
+//    ever the seat list: a reservation seats nobody.
 //  * Motion: Update accepts a VehicleUpdate only from the vehicle's controller (v4: the player in seat 0), finite,
 //    in the world box, with a reported velocity under Rules::maxSpeed; it copies the motion, the driver flags
 //    and (v5) flags2 and doors; health only goes down. The sample time the caller passes (the sender's
@@ -122,6 +128,17 @@ namespace gage::server {
             uint32_t changedTick = 0;  // a server-owned field, the occupancy or a park changed at this tick
             double fuelAcc = 0;        // fractional permille drained so far
             double driveSec = 0;       // seconds driven with the engine on (by displacement) since the last Tick
+            uint16_t resBy[proto::kVehSeats] = {proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer,
+                                                proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer, proto::kNoPlayer}; // T1: who holds each seat's reservation
+        };
+
+        // T1 seats: one player's pending reservation (at most one each).
+        struct Intent
+        {
+            uint16_t veh = 0xFFFF;     // kNone = no reservation
+            uint8_t  seat = 0;
+            bool     run = false;
+            uint64_t sinceMs = 0;
         };
 
         struct Seat { uint16_t veh = kNone; uint8_t seat = 0; };
@@ -136,6 +153,9 @@ namespace gage::server {
                 if (*e < 1) *e = 1;
             v_.assign(proto::kMaxVehicles, Vehicle());
             occ_.assign(maxPlayers, Seat());
+            intent_.assign(maxPlayers, Intent());
+            notices_.clear();
+            audiences_.clear();
             rx_.assign(maxPlayers, Rx());
             removed_.clear();
             nextId_ = 0;
@@ -163,6 +183,30 @@ namespace gage::server {
         size_t Count() const { return count_; }
         const Vehicle* Get(uint16_t id) const { return id < v_.size() && v_[id].exists ? &v_[id] : nullptr; }
         Seat Occupancy(uint16_t player) const { return player < occ_.size() ? occ_[player] : Seat(); }
+        // T1: the player's pending reservation (veh == kNone: none).
+        Intent PendingIntent(uint16_t player) const { return player < intent_.size() ? intent_[player] : Intent(); }
+        // T1: who holds the reservation on (id, seat), kNoPlayer when nobody (a reservation older than kIntentTtlMs counts as gone).
+        uint16_t ReservedBy(uint16_t id, uint32_t seat, uint64_t nowMs) const
+        {
+            if (id >= v_.size() || !v_[id].exists || seat >= proto::kVehSeats) return proto::kNoPlayer;
+            const uint16_t p = v_[id].resBy[seat];
+            if (p == proto::kNoPlayer || p >= intent_.size()) return proto::kNoPlayer;
+            return nowMs >= intent_[p].sinceMs && nowMs - intent_[p].sinceMs >= proto::kIntentTtlMs ? proto::kNoPlayer : p;
+        }
+        // T1: the SeatNotices queued since the last call (oldest first); the caller delivers them. `audiences` (optional) gets, per notice, the
+        // players to tell: the actor plus every receiver that had the vehicle in its relevant set WHEN THE NOTICE WAS QUEUED (so the notice about a
+        // vehicle being destroyed still reaches the players who had it, though the destroy has cleared their relevance since).
+        std::vector<proto::SeatNotice> TakeNotices(std::vector<std::vector<uint16_t>>* audiences = nullptr)
+        {
+            std::vector<proto::SeatNotice> out;
+            out.swap(notices_);
+            if (audiences)
+                audiences->swap(audiences_);
+            else
+                audiences_.clear();
+            return out;
+        }
+        size_t PendingNotices() const { return notices_.size(); }
         // True when vehicle `id` is in `player`'s relevant set (what its client is told about).
         bool RelevantTo(uint16_t player, uint16_t id) const
         {
@@ -273,6 +317,9 @@ namespace gage::server {
                 if (p < occ_.size()) occ_[p] = Seat();
                 if (ejected) ejected->push_back(p);
             }
+            for (size_t s = 0; s < proto::kVehSeats; s++)   // T1: whoever was on the way in is not any more
+                if (V.resBy[s] != proto::kNoPlayer)
+                    DropIntent(V.resBy[s], proto::SeatCancelReason::VehicleGone);
             V = Vehicle();
             count_--;
             removed_.push_back(Removed{id, tick});
@@ -298,6 +345,11 @@ namespace gage::server {
             if (seat == 0 && V.owned && V.spawner != player) return Code::NotOwner;
             if (V.s.seats[seat] == player) return Code::Ok; // already there
             if (V.s.seats[seat] != proto::kNoPlayer) return Code::SeatTaken;
+            {
+                // T1: a seat somebody else is walking to is theirs until they sit, cancel or time out.
+                const uint16_t held = ReservedBy(id, seat, nowMs);
+                if (held != proto::kNoPlayer && held != player) return Code::SeatTaken;
+            }
             const Seat cur = occ_[player];
             if (cur.veh != id) // a seat shuffle inside the same vehicle skips the door checks
             {
@@ -306,6 +358,7 @@ namespace gage::server {
             }
             NoteTick(tick);
             if (cur.veh != kNone) Leave(player, nowMs, tick);
+            ConsumeIntent(player, id, (uint8_t)seat);   // T1: the walk ends here: Seated for the seat it was for, else Cancelled
             V.s.seats[seat] = player;
             occ_[player] = Seat{id, (uint8_t)seat};
             V.changedTick = tick;
@@ -326,14 +379,75 @@ namespace gage::server {
             return Code::Ok;
         }
 
-        // Leaves vehicle `id` (the one the player sits in).
-        Code Exit(uint16_t player, uint16_t id, uint64_t nowMs, uint32_t tick)
+        // Leaves vehicle `id` (the one the player sits in). T1: `announce` (a player's own Exit command, not a death or a
+        // respawn) queues SeatNotice::Exited so every screen plays the normal exit animation; an Exit while the player only
+        // holds a reservation on `id` cancels it (Ok).
+        Code Exit(uint16_t player, uint16_t id, uint64_t nowMs, uint32_t tick, bool announce = false)
         {
             if (player >= occ_.size()) return Code::NotAllowed;
             if (id >= v_.size() || !v_[id].exists) return Code::NoVehicle;
-            if (occ_[player].veh != id) return Code::NotInVehicle;
+            if (occ_[player].veh != id)
+            {
+                if (intent_[player].veh == id)
+                {
+                    DropIntent(player, proto::SeatCancelReason::ByPlayer);
+                    return Code::Ok;
+                }
+                return Code::NotInVehicle;
+            }
+            const uint8_t seat = occ_[player].seat;
             Leave(player, nowMs, tick);
+            if (announce) Notice(proto::SeatNoticeKind::Exited, player, id, seat, 0);
             return Code::Ok;
+        }
+
+        // T1 seats: `player` reserves `seat` of vehicle `id` (VehicleOp::EnterIntent). The checks are Enter's, plus: a player
+        // who sits somewhere already is NotAllowed (an intent is a walk from outside), and a seat somebody else holds (seated or
+        // reserved) is SeatTaken. Ok when the reservation stands (a repeat of the same one just renews it).
+        Code Reserve(uint16_t player, uint16_t id, uint32_t seat, bool run, const proto::Kinematics& playerPos, uint64_t nowMs, uint32_t tick)
+        {
+            if (player >= occ_.size()) return Code::NotAllowed;
+            if (id >= v_.size() || !v_[id].exists) return Code::NoVehicle;
+            if (seat >= proto::kVehSeats) return Code::BadArg;
+            Vehicle& V = v_[id];
+            if (seat == 0 && V.owned && V.spawner != player) return Code::NotOwner;
+            if (occ_[player].veh != kNone) return Code::NotAllowed;
+            if (V.s.seats[seat] != proto::kNoPlayer) return Code::SeatTaken;
+            const uint16_t held = ReservedBy(id, seat, nowMs);
+            if (held != proto::kNoPlayer && held != player) return Code::SeatTaken;
+            if (Dist2(playerPos, V.s.k) > rules_.enterDistance * rules_.enterDistance) return Code::TooFar;
+            if ((V.s.flags & proto::kVehLocked) && V.spawner != player) return Code::Locked;
+            NoteTick(tick);
+            Intent& I = intent_[player];
+            if (I.veh == id && I.seat == seat)
+            {
+                I.sinceMs = nowMs;            // the same walk, renewed: nobody needs telling again
+                I.run = run;
+                return Code::Ok;
+            }
+            if (I.veh != kNone) DropIntent(player, proto::SeatCancelReason::Replaced);
+            I.veh = id;
+            I.seat = (uint8_t)seat;
+            I.run = run;
+            I.sinceMs = nowMs;
+            V.resBy[seat] = player;
+            Notice(proto::SeatNoticeKind::Reserved, player, id, (uint8_t)seat, run ? proto::kSeatNoticeRun : 0);
+            return Code::Ok;
+        }
+
+        // T1 seats: drops `player`'s reservation on `id` (VehicleOp::CancelIntent). Ok also when there is none.
+        Code CancelIntent(uint16_t player, uint16_t id)
+        {
+            if (player >= occ_.size()) return Code::NotAllowed;
+            if (id >= v_.size() || !v_[id].exists) return Code::NoVehicle;
+            if (intent_[player].veh == id) DropIntent(player, proto::SeatCancelReason::ByPlayer);
+            return Code::Ok;
+        }
+
+        // T1 seats: the player died, respawned or was put elsewhere: whatever it was walking to is over.
+        void CancelIntentOf(uint16_t player, proto::SeatCancelReason why)
+        {
+            if (player < intent_.size() && intent_[player].veh != kNone) DropIntent(player, why);
         }
 
         // A player left the server: out of its seat. Its EMPTY vehicles are destroyed (ids to `destroyed`),
@@ -344,6 +458,7 @@ namespace gage::server {
                         size_t* orphaned = nullptr)
         {
             if (player >= occ_.size()) return;
+            if (intent_[player].veh != kNone) DropIntent(player, proto::SeatCancelReason::PlayerGone);
             if (occ_[player].veh != kNone) Leave(player, nowMs, tick);
             for (Vehicle& V : v_)
             {
@@ -536,6 +651,9 @@ namespace gage::server {
         void Tick(uint64_t nowMs, uint32_t tick, std::vector<uint16_t>* despawned)
         {
             NoteTick(tick);
+            for (uint16_t p = 0; p < intent_.size(); p++)   // T1: a walk that never ended
+                if (intent_[p].veh != kNone && nowMs >= intent_[p].sinceMs && nowMs - intent_[p].sinceMs >= proto::kIntentTtlMs)
+                    DropIntent(p, proto::SeatCancelReason::Expired);
             for (Vehicle& V : v_)
             {
                 if (!V.exists) continue;
@@ -801,6 +919,48 @@ namespace gage::server {
             }
             return best;
         }
+        // T1 seats helpers. Notice queues one SeatNotice; DropIntent ends a reservation with Cancelled(why);
+        // ConsumeIntent is Enter's: the reservation for exactly this seat becomes Seated, any other one is Cancelled(Replaced).
+        void Notice(proto::SeatNoticeKind kind, uint16_t player, uint16_t veh, uint8_t seat, uint8_t detail)
+        {
+            proto::SeatNotice n;
+            n.kind = kind;
+            n.player = player;
+            n.vehId = veh;
+            n.seat = seat;
+            n.detail = detail;
+            notices_.push_back(n);
+            std::vector<uint16_t> to;
+            for (uint16_t p = 0; p < rx_.size(); p++)
+                if (p == player || (rx_[p].active && veh < rx_[p].v.size() && rx_[p].v[veh].relevant)) to.push_back(p);
+            audiences_.push_back(std::move(to));
+        }
+        void ReleaseIntent(uint16_t player)
+        {
+            Intent& I = intent_[player];
+            if (I.veh < v_.size() && v_[I.veh].resBy[I.seat] == player) v_[I.veh].resBy[I.seat] = proto::kNoPlayer;
+            I = Intent();
+        }
+        void DropIntent(uint16_t player, proto::SeatCancelReason why)
+        {
+            const Intent I = intent_[player];
+            if (I.veh == kNone) return;
+            ReleaseIntent(player);
+            Notice(proto::SeatNoticeKind::Cancelled, player, I.veh, I.seat, (uint8_t)why);
+        }
+        void ConsumeIntent(uint16_t player, uint16_t id, uint8_t seat)
+        {
+            const Intent I = intent_[player];
+            if (I.veh == kNone) return;
+            if (I.veh == id && I.seat == seat)
+            {
+                ReleaseIntent(player);
+                Notice(proto::SeatNoticeKind::Seated, player, id, seat, 0);
+            }
+            else
+                DropIntent(player, proto::SeatCancelReason::Replaced);
+        }
+
         // Out of its seat; a driver's vehicle parks.
         void Leave(uint16_t player, uint64_t nowMs, uint32_t tick)
         {
@@ -831,6 +991,9 @@ namespace gage::server {
         Rules rules_;
         std::vector<Vehicle> v_;  // by id, kMaxVehicles slots
         std::vector<Seat> occ_;   // by player id
+        std::vector<Intent> intent_;           // T1: by player id
+        std::vector<proto::SeatNotice> notices_;   // T1: queued, oldest first
+        std::vector<std::vector<uint16_t>> audiences_;   // T1: the players to tell, per queued notice
         std::vector<Rx> rx_;      // by player id
         std::vector<Removed> removed_;
         std::vector<Cand> cands_;

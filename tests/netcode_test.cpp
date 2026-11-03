@@ -381,13 +381,13 @@ static void CodecTests()
     // PeekType.
     {
         proto::Msg m = proto::Msg::Hello;
-        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; 31 is the first unknown one.
-        const uint8_t zero = 0, firstUnknown = 31, ff = 255;
+        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; T1 (v6): 31 SeatNotice; 32 is the first unknown one.
+        const uint8_t zero = 0, firstUnknown = 32, ff = 255;
         bool allKnown = true;
-        for (uint8_t t = 1; t <= 30; t++)
+        for (uint8_t t = 1; t <= 31; t++)
             allKnown = allKnown && proto::PeekType(&t, 1, m) && (uint8_t)m == t;
-        Check("codec: PeekType accepts 1..30 and rejects empty, 0, 31, 255",
-              allKnown && proto::kMsgLast == 30 && !proto::PeekType(&zero, 0, m) && !proto::PeekType(nullptr, 0, m) &&
+        Check("codec: PeekType accepts 1..31 and rejects empty, 0, 32, 255",
+              allKnown && proto::kMsgLast == 31 && !proto::PeekType(&zero, 0, m) && !proto::PeekType(nullptr, 0, m) &&
                   !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
     }
 
@@ -2133,7 +2133,7 @@ static void VehicleCodecTests()
     // VehicleCmd ops and the Register tail.
     {
         int known = 0, accepted = 0;
-        for (int op = 1; op <= 9; op++)
+        for (int op = 1; op <= 11; op++)
         {
             proto::VehicleCmd c;
             c.vehId = 1;
@@ -2141,7 +2141,7 @@ static void VehicleCodecTests()
             const proto::Bytes b = proto::Encode(c);
             if (DecodeAs<proto::VehicleCmd>(b.data(), b.size())) known++;
         }
-        for (int op : {0, 10, 255})
+        for (int op : {0, 12, 255})
         {
             wire::Writer w;
             w.u8((uint8_t)proto::Msg::VehicleCmd);
@@ -2159,9 +2159,9 @@ static void VehicleCodecTests()
         const bool tails = !DecodeAs<proto::VehicleCmd>(regNoTail.data(), regNoTail.size()) &&
                            !DecodeAs<proto::VehicleCmd>(lockWithTail.data(), lockWithTail.size()) &&
                            !DecodeAs<proto::VehicleCmd>(regBadRot.data(), regBadRot.size());
-        Check("codec v5: VehicleCmd accepts ops 1..9 (Release new), rejects 0, 10 and 255, a Register without its tail, "
+        Check("codec v5/v6: VehicleCmd accepts ops 1..11 (Release v5, EnterIntent and CancelIntent v6), rejects 0, 12 and 255, a Register without its tail, "
               "a tail on another op and an invalid rotation",
-              known == 9 && accepted == 0 && tails, std::to_string(known) + " known, " + std::to_string(accepted) + " bad accepted");
+              known == 11 && accepted == 0 && tails, std::to_string(known) + " known, " + std::to_string(accepted) + " bad accepted");
     }
 
     // Combat and emote refusals, and the Valid* helpers.
@@ -2181,8 +2181,8 @@ static void VehicleCodecTests()
         if (!patched(7, 9, 0x00) || !patched(7, 9, 0x01)) bad += "[killed flags 0..3 are legal]";
         if (patched(4, 2, 13)) bad += "[result code 13]";
         if (!patched(4, 2, 12)) bad += "[result code 12 (NotOwner) refused]";
-        if (patched(4, 1, 10)) bad += "[result op 10]";
-        if (!patched(4, 1, 9)) bad += "[result op 9 (Release) refused]";
+        if (patched(4, 1, 12)) bad += "[result op 12]";
+        if (!patched(4, 1, 9) || !patched(4, 1, 10) || !patched(4, 1, 11)) bad += "[result op 9 (Release) / 10 (EnterIntent) / 11 (CancelIntent) refused]";
         {
             proto::RespawnOk r;
             r.x = std::numeric_limits<float>::quiet_NaN();
@@ -2223,7 +2223,7 @@ static void VehicleCodecTests()
         if (!proto::ValidVehicleUpdate(u) || proto::ValidVehicleUpdate(uBad) || !proto::Encode(uBad).empty() ||
             proto::ValidVehicleUpdate(uRot))
             bad += "[ValidVehicleUpdate]";
-        Check("codec v5: Hit kind, Damage killed / victim / flags, Killed flags, VehicleResult op (Release 9 legal, 10 not) / code (NotOwner 12 legal, 13 not) and non-finite RespawnOk are refused; anim names "
+        Check("codec v5: Hit kind, Damage killed / victim / flags, Killed flags, VehicleResult op (Release 9, EnterIntent 10 and CancelIntent 11 legal, 12 not) / code (NotOwner 12 legal, 13 not) and non-finite RespawnOk are refused; anim names "
               "are 1..63 of [A-Za-z0-9_@/.-], blends finite within +-1000, duration -1 or more; a 64-byte name never decodes; "
               "ValidVehicleUpdate refuses NaN and a zero rotation",
               bad.empty(), bad);
@@ -4303,6 +4303,7 @@ static void MeleeFightSimTests()
 
 #define T6_HEALTH_NETWORK
 #include "t6_health_tests.h"   // T6 health: the real server and session into the client's tracker and HUD (uses the helpers above)
+#include "t1_seats_net_tests.h"   // T1 seats (wire v6): the three-client scenario against the real server
 
 int main()
 {
@@ -4347,6 +4348,8 @@ int main()
     VehicleAbuseTests();
     AnimAuthorityTests();
     t6health::NetworkTests();   // T6 health: Welcome.playerHealth / Hit / Damage / heal / kill / Respawn into the tracker and the HUD
+    std::printf("-- T1 seats: enter / exit intents, three clients, the real server (wire v6)\n");
+    t1net::SeatNetworkTests();
     std::printf("-- metrics and budget\n");
     MetricsTests();
     ShutdownTests();
@@ -4355,7 +4358,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling at the shipped defaults; // (+2: the version refusal texts, player-facing) 105 core + 12 resource-codec + 7 v4-codec + 5 look-codec + 8 v3 network (+1 W7: the 30 Hz defaults) + 18 v4 network + 28 authority checks
+    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks + t1net::kNetChecks; // 0.4.5 melee audit: +12 scripted fights; // W8: +1 melee ceiling; // T6 health network checks; // T1 seats: the PeekType / VehicleCmd-op checks were reworded (not added); + the three-client scenario and the wire rules
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {
