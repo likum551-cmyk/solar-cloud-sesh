@@ -6,8 +6,9 @@ namespace gage::sync {
 
 EmoteArbiter::EmoteArbiter(const EmoteConfig& cfg) : cfg_(cfg) {}
 
-void EmoteArbiter::StartAnim(double nowMs, int32_t durationMs, uint32_t flags)
+bool EmoteArbiter::StartAnim(double nowMs, int32_t durationMs, uint32_t flags)
 {
+    const bool replaced = kind_ != EmoteKind::None;
     kind_ = EmoteKind::Anim;
     phase_ = Phase::WaitDict;
     durationMs_ = durationMs;
@@ -15,11 +16,17 @@ void EmoteArbiter::StartAnim(double nowMs, int32_t durationMs, uint32_t flags)
     sinceMs_ = nowMs;
     notPlayingSinceMs_ = -1;
     stopReq_ = false;
+    seen_ = false;
+    reissues_ = 0;
     ++stats_.started;
+    if (replaced)
+        ++stats_.restarted;
+    return replaced;
 }
 
-void EmoteArbiter::StartScenario(double nowMs)
+bool EmoteArbiter::StartScenario(double nowMs)
 {
+    const bool replaced = kind_ != EmoteKind::None;
     kind_ = EmoteKind::Scenario;
     phase_ = Phase::Issue;
     durationMs_ = -1;
@@ -27,7 +34,12 @@ void EmoteArbiter::StartScenario(double nowMs)
     sinceMs_ = nowMs;
     notPlayingSinceMs_ = -1;
     stopReq_ = false;
+    seen_ = false;
+    reissues_ = 0;
     ++stats_.started;
+    if (replaced)
+        ++stats_.restarted;
+    return replaced;
 }
 
 void EmoteArbiter::Stop()
@@ -49,6 +61,8 @@ void EmoteArbiter::OnNewPed(double nowMs)
     phase_ = kind_ == EmoteKind::Anim ? Phase::WaitDict : Phase::Issue;
     sinceMs_ = nowMs;
     notPlayingSinceMs_ = -1;
+    seen_ = false;
+    reissues_ = 0;
 }
 
 void EmoteArbiter::Clear()
@@ -57,12 +71,15 @@ void EmoteArbiter::Clear()
     phase_ = Phase::Idle;
     stopReq_ = false;
     issued_ = false;
+    seen_ = false;
+    reissues_ = 0;
     notPlayingSinceMs_ = -1;
 }
 
-void EmoteArbiter::End(EmoteOut& out)
+void EmoteArbiter::End(EmoteOut& out, EmoteEnd why)
 {
     out.ended = true;
+    out.endReason = why;
     Clear();
 }
 
@@ -75,13 +92,13 @@ EmoteOut EmoteArbiter::Tick(const EmoteIn& in)
     {
         out.clearTasks = issued_;
         ++stats_.stopped;
-        End(out);
+        End(out, EmoteEnd::Stop);
         return out;
     }
     if (in.dead || in.inVehicle)
     {
         ++stats_.cancelled;
-        End(out);
+        End(out, in.dead ? EmoteEnd::Dead : EmoteEnd::Vehicle);
         return out;
     }
     switch (phase_)
@@ -92,16 +109,26 @@ EmoteOut EmoteArbiter::Tick(const EmoteIn& in)
         if (in.dictLoaded)
         {
             out.issueAnim = true;
+            out.waitedMs = in.nowMs - sinceMs_;
+            // The ped's tasks are cleared first when the anim takes the legs (a gait task would fight it) or when an
+            // earlier emote's task may still be on the ped (a restart, a re-issue); an upper-body anim on a ped with
+            // no emote runs as a secondary task over the gait and leaves it alone. Clearing the gait while the
+            // controller keeps running (upper body) means the controller must issue it again.
+            out.replacedTask = issued_;
+            out.clearFirst = !KeepsLoco(flags_) || issued_;
+            out.resetLoco = KeepsLoco(flags_) && out.clearFirst;
             phase_ = Phase::Playing;
             issuedAtMs_ = in.nowMs;
             issued_ = true;
+            seen_ = false;
             ++stats_.issued;
         }
         else if (in.nowMs - sinceMs_ >= cfg_.dictTimeoutMs)
         {
             out.gaveUp = true;
+            out.clearTasks = issued_;          // a restart whose dictionary never loaded: the old emote's task is still there
             ++stats_.dictTimeouts;
-            End(out);
+            End(out, EmoteEnd::DictTimeout);
             return out;
         }
         else
@@ -109,18 +136,30 @@ EmoteOut EmoteArbiter::Tick(const EmoteIn& in)
         break;
     case Phase::Issue:
         out.issueScenario = true;
+        out.clearFirst = true;
         phase_ = Phase::Playing;
         issuedAtMs_ = in.nowMs;
         issued_ = true;
+        seen_ = false;
         ++stats_.issued;
         break;
     case Phase::Playing:
     {
         const double el = in.nowMs - issuedAtMs_;
+        if (in.playing == 1 && !seen_)
+        {
+            seen_ = true;
+            out.confirmed = true;
+            out.confirmMs = el;
+            ++stats_.confirmed;
+            stats_.confirmMsSum += el;
+            if (el > stats_.confirmMsMax)
+                stats_.confirmMsMax = el;
+        }
         if (kind_ == EmoteKind::Anim && durationMs_ > 0 && el >= (double)durationMs_)
         {
             ++stats_.finished;
-            End(out);
+            End(out, EmoteEnd::Duration);
             return out;
         }
         const double grace = kind_ == EmoteKind::Scenario ? cfg_.scenarioGraceMs : cfg_.startGraceMs;
@@ -130,8 +169,26 @@ EmoteOut EmoteArbiter::Tick(const EmoteIn& in)
                 notPlayingSinceMs_ = in.nowMs;
             else if (in.nowMs - notPlayingSinceMs_ >= cfg_.notPlayingEndMs)
             {
+                if (seen_ && Looping() && reissues_ < cfg_.reissueMax)
+                {
+                    // It played and the game dropped it under us (a knockdown, a replaced task) while the sender
+                    // still loops it: stream / issue it again instead of leaving the puppet standing.
+                    ++reissues_;
+                    ++stats_.reissued;
+                    out.reissued = true;
+                    phase_ = kind_ == EmoteKind::Anim ? Phase::WaitDict : Phase::Issue;
+                    sinceMs_ = in.nowMs;
+                    notPlayingSinceMs_ = -1;
+                    seen_ = false;
+                    break;
+                }
                 ++stats_.notPlaying;
-                End(out);
+                if (!seen_)
+                {
+                    out.neverPlayed = true;
+                    ++stats_.neverPlayed;
+                }
+                End(out, EmoteEnd::NotPlaying);
                 return out;
             }
         }
@@ -140,7 +197,7 @@ EmoteOut EmoteArbiter::Tick(const EmoteIn& in)
         if (kind_ == EmoteKind::Anim && durationMs_ == 0 && in.playing < 0 && el >= cfg_.oneShotCapMs)
         {
             ++stats_.finished;
-            End(out);
+            End(out, EmoteEnd::OneShotCap);
             return out;
         }
         break;

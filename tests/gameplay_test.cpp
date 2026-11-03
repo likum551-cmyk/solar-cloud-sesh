@@ -2647,6 +2647,8 @@ static void TestW10()
     }
 }
 
+#include "anim_audit_tests.h"   // 0e: the animation audit's simulations (after Check / F)
+
 int main()
 {
     std::printf("-- vitals\n");
@@ -2679,6 +2681,8 @@ int main()
     TestW9();
     std::printf("-- W10: player name tags (fade, projection, occlusion cache, text, list)\n");
     TestW10();
+    std::printf("-- 0e: animation audit (scripted emote / swing simulations, dictionary streaming, diagnostics)\n");
+    anim_audit::TestAnimAudit();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -2688,9 +2692,9 @@ int main()
     // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
     const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    if (g_run != expected)
+    if (g_run != expected + anim_audit::kAnimAuditChecks)   // + 0e: the animation audit (tests/anim_audit_tests.h)
     {
-        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
+        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks);
         return 1;
     }
     return g_failed ? 1 : 0;

@@ -28,6 +28,7 @@
 #include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
+#include "sync/swing.h"
 #include "sync/gtaids.h"
 #include "sync/hypertune.h"
 #include "sync/pausemenu.h"
@@ -218,7 +219,7 @@ namespace {
         std::string scenarioIn;       // the newest PeerScenario
         proto::Anim emoteAnim;        // what the arbiter plays (script tick)
         std::string emoteScenario;
-        sync::EmoteArbiter emote;
+        sync::EmoteArbiter emote = sync::EmoteArbiter(sync::PeerEmoteConfig());   // 0e: a loop the game cancelled comes back (twice)
         sync::EmoteDictHold emoteDict;   // the animation dictionary this peer's emote keeps loaded (g_animDicts)
 
         // ---- sync plan W6, on-foot Tier B (script tick) ----
@@ -239,6 +240,9 @@ namespace {
         // ---- sync plan W3, combat client (script tick unless marked "join worker") ----
         sync::ShotDebt shotDebt;         // shots owed to this ped (shotSeq stepped) and not fired yet: 3 a frame
         sync::MeleeSwingGate swingGate;  // 0c: a shotSeq step or a rising kPfMelee is ONE swing to show (300 ms dedupe)
+        sync::PendingSwing swingPending; // 0e: a swing that waited for its dictionary is still shown if it loads within 250 ms
+        sync::SwingProbe swingProbe;     // 0e: IS_ENTITY_PLAYING_ANIM after the swing task (did the clip really play?)
+        bool swingProbeArmed = false;    // ... and which candidate list it belongs to (false unarmed, true armed)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
         bool reactLifted = false;        // PCF 188 (DisableHurt) and the ragdoll block are lifted for the reaction
@@ -467,6 +471,8 @@ namespace {
     // dictionary is streamed out (RemoveAnimDict) only when the last emote using it has ended, been
     // given up or lost its ped. Script tick only.
     sync::AnimDictRefs g_animDicts;
+    sync::AnimDiag g_animDiag, g_animDiagLast;   // 0e: the 10 s per-kind animation line (script tick)
+    sync::FirstUse g_animFirstUse;               // 0e: one log line per animation the first time it is used
     sync::EmoteDictHold g_localEmoteDict;
     proto::Anim g_localAnim;
     std::string g_localScenario;
@@ -2144,12 +2150,16 @@ namespace {
                     break;
                 }
                 if (g_world->AnimDictExists(a.dict.c_str()) == 0) {
+                    ++g_animDiag.Of(sync::AnimKind::LocalEmote).requested;
+                    ++g_animDiag.Of(sync::AnimKind::LocalEmote).dictMissing;
                     game::Overlay::PushSystemLine("No such animation dictionary.");
                     GLOGI("engine: /e %s %s refused: the dictionary does not exist", a.dict.c_str(), a.name.c_str());
                     break;
                 }
                 g_localAnim = a;
-                g_localEmote.StartAnim(NowMs(), a.durationMs, a.flags);
+                ++g_animDiag.Of(sync::AnimKind::LocalEmote).requested;
+                if (g_localEmote.StartAnim(NowMs(), a.durationMs, a.flags))
+                    ++g_animDiag.Of(sync::AnimKind::LocalEmote).restarted;
                 SyncLocalEmoteDict();                  // counted at once: a dictionary an ending emote frees stays
                 ++g_v4.emotesStarted;
                 GLOGI("engine: /e %s %s%s%s (streaming)", a.dict.c_str(), a.name.c_str(), c.loop ? " loop" : "",
@@ -2162,7 +2172,9 @@ namespace {
                     break;
                 }
                 g_localScenario = c.arg;
-                g_localEmote.StartScenario(NowMs());
+                ++g_animDiag.Of(sync::AnimKind::LocalEmote).requested;
+                if (g_localEmote.StartScenario(NowMs()))
+                    ++g_animDiag.Of(sync::AnimKind::LocalEmote).restarted;
                 ++g_v4.emotesStarted;
                 GLOGI("engine: /scenario %s", c.arg.c_str());
                 break;
@@ -2809,6 +2821,8 @@ namespace {
         pe.enterVeh = -1;
         pe.enterTaskMs = 0;
         pe.emote.OnNewPed(NowMs());
+        pe.swingProbe.Cancel();                        // 0e: a swing issued on the old ped is nobody's to judge
+        pe.swingPending.Clear();
         pe.water.Reset();                              // W8: a fresh ped has no water edge and no climb in progress
         pe.climb.Reset();
         pe.seatLimiter.Reset();                        // W9: a fresh ped has no warp history, no bail-out velocity, no impact
@@ -2892,85 +2906,156 @@ namespace {
 
     // The swing a remote ped plays when its shotSeq steps with a melee-class weapon in hand. Every dictionary and
     // clip name is INFERRED (not checked against the game files): each dictionary is asked with
-    // DOES_ANIM_DICT_EXIST once and the answer logged, the first that exists is used, and a ped is never touched
-    // when none does. Flags 16|32 (upper body + secondary) leave the legs and the gait task alone.
+    // DOES_ANIM_DICT_EXIST once and the answer logged, the first usable candidate is used, and a ped is never touched
+    // when none exists. Flags 16|32 (upper body + secondary) leave the legs and the gait task alone.
+    // 0e: the dictionary request is REPEATED until HAS_ANIM_DICT_LOADED (sync::DictStream; it used to be sent once and
+    // counted sent even when the call failed), a swing that finds the dictionary still streaming is kept for 250 ms
+    // (sync::PendingSwing), and after the task IS_ENTITY_PLAYING_ANIM says whether the ped really plays the clip
+    // (sync::SwingProbe): a clip never seen playing twice is demoted for the next candidate (sync::SwingBook).
     struct SwingClip
     {
         const char* dict;
         const char* clip;
         int exists = -2;       // DOES_ANIM_DICT_EXIST: -2 not asked yet, 1 yes, 0 no, -1 cannot call (asked again)
-        bool held = false;     // g_animDicts holds a reference (REQUEST_ANIM_DICT was sent)
+        bool held = false;     // g_animDicts holds a reference (the dictionary is wanted until the session ends)
+        sync::DictStream stream;
     };
     SwingClip g_swingUnarmed[] = { { "melee@unarmed@streamed_core", "heavy_punch_a" },
                                    { "melee@unarmed@streamed_variations", "heavy_punch_a" } };
     SwingClip g_swingArmed[] = { { "melee@large_wpn@streamed_core", "ground_attack_on_spot" },
                                  { "melee@knife@streamed_core", "ground_attack_on_spot" } };
+    struct SwingSet
+    {
+        SwingClip* list;
+        size_t n;
+        sync::SwingBook book;
+        bool init = false;
+    };
+    SwingSet g_swingSetUnarmed{ g_swingUnarmed, sizeof(g_swingUnarmed) / sizeof(g_swingUnarmed[0]) };
+    SwingSet g_swingSetArmed{ g_swingArmed, sizeof(g_swingArmed) / sizeof(g_swingArmed[0]) };
     constexpr int kSwingMs = 400;                      // INFERRED: about one punch
     constexpr int kSwingFlags = 16 | 32;               // AF_UPPERBODY | AF_SECONDARY
 
     // A session ended: the swing dictionaries are handed back (script tick).
     void ReleaseSwingDicts()
     {
-        auto release = [](SwingClip* list, size_t n) {
-            for (size_t i = 0; i < n; ++i)
-                if (list[i].held)
+        for (SwingSet* set : { &g_swingSetUnarmed, &g_swingSetArmed })
+            for (size_t i = 0; i < set->n; ++i)
+            {
+                SwingClip& c = set->list[i];
+                if (c.held)
                 {
-                    list[i].held = false;
-                    if (g_animDicts.Release(list[i].dict))
-                        g_world->RemoveAnimDict(list[i].dict);
+                    c.held = false;
+                    if (g_animDicts.Release(c.dict))
+                        g_world->RemoveAnimDict(c.dict);
                 }
-        };
-        release(g_swingUnarmed, sizeof(g_swingUnarmed) / sizeof(g_swingUnarmed[0]));
-        release(g_swingArmed, sizeof(g_swingArmed) / sizeof(g_swingArmed[0]));
+                c.stream.Reset();
+            }
     }
 
-    // The first candidate clip of a swing whose dictionary exists, requested (a reference held until the session ends).
-    // nullptr = none exists in this game (or not checkable yet). Logs once per dictionary what DOES_ANIM_DICT_EXIST said.
-    SwingClip* SwingClipFor(uint32_t weapon)
+    void NoteDictReady(sync::AnimKind kind, double ms)
     {
-        const bool unarmed = weapon == UnarmedHash();
-        SwingClip* list = unarmed ? g_swingUnarmed : g_swingArmed;
-        const size_t n = unarmed ? sizeof(g_swingUnarmed) / sizeof(g_swingUnarmed[0])
-                                 : sizeof(g_swingArmed) / sizeof(g_swingArmed[0]);
-        for (size_t i = 0; i < n; ++i)
+        sync::AnimKindStats& k = g_animDiag.Of(kind);
+        ++k.dictReady;
+        k.dictReadyMsSum += ms;
+        if (ms > k.dictReadyMsMax)
+            k.dictReadyMsMax = ms;
+    }
+
+    // The candidate clip of a swing to use, its dictionary kept requested until it has loaded (and again if the game
+    // streams it out). nullptr = none exists in this game (or not checkable yet). Logs once per dictionary what
+    // DOES_ANIM_DICT_EXIST said, and once per dictionary how long it took to load.
+    SwingClip* SwingClipFor(uint32_t weapon, double nowMs, SwingSet** setOut = nullptr, size_t* idxOut = nullptr)
+    {
+        SwingSet& set = weapon == UnarmedHash() ? g_swingSetUnarmed : g_swingSetArmed;
+        if (!set.init)
         {
-            SwingClip& c = list[i];
-            if (c.exists < 0)
-            {
-                const int was = c.exists;
-                c.exists = g_world->AnimDictExists(c.dict);
-                if (c.exists != was && c.exists != -2)
-                    PeerLog(c.exists != 1, "engine: melee swing: dictionary %s (clip %s, INFERRED names) %s in this game",
-                            c.dict, c.clip, c.exists == 1 ? "exists" : c.exists == 0 ? "does NOT exist" : "cannot be checked");
-            }
-            if (c.exists != 1)
-                continue;
-            if (!c.held)
-            {
-                g_animDicts.Acquire(c.dict);
-                g_world->RequestAnimDict(c.dict);
-                c.held = true;
-            }
-            return &c;
+            set.init = true;
+            set.book.Reset(set.n);
         }
-        return nullptr;
+        for (size_t i = 0; i < set.n; ++i)
+        {
+            SwingClip& c = set.list[i];
+            if (c.exists >= 0)
+                continue;
+            const int was = c.exists;
+            c.exists = g_world->AnimDictExists(c.dict);
+            set.book.SetExists(i, c.exists);
+            if (c.exists != was && c.exists != -2)
+                PeerLog(c.exists != 1, "engine: melee swing: dictionary %s (clip %s, INFERRED names) %s in this game",
+                        c.dict, c.clip, c.exists == 1 ? "exists" : c.exists == 0 ? "does NOT exist" : "cannot be checked");
+        }
+        const int pick = set.book.Pick();
+        if (pick < 0)
+            return nullptr;
+        SwingClip& c = set.list[(size_t)pick];
+        if (!c.held)
+        {
+            g_animDicts.Acquire(c.dict);
+            c.held = true;
+        }
+        if (c.stream.Due(nowMs))
+        {
+            const uint32_t loadsBefore = c.stream.Loads();
+            if (c.stream.Tick(nowMs, g_world->HasAnimDictLoaded(c.dict)) && !g_world->RequestAnimDict(c.dict))
+                c.stream.NoteRequestFailed();
+            if (c.stream.Loads() != loadsBefore)
+            {
+                NoteDictReady(sync::AnimKind::PeerSwing, c.stream.LastLoadMs());
+                if (g_animFirstUse.Note(std::string("load:") + c.dict))
+                    PeerLog(false, "engine: anim first use: swing dictionary %s loaded %.0f ms after the first request (%u requests "
+                            "sent, %u calls failed)", c.dict, c.stream.LastLoadMs(), c.stream.Requests(), c.stream.FailedRequests());
+            }
+        }
+        if (setOut)
+            *setOut = &set;
+        if (idxOut)
+            *idxOut = (size_t)pick;
+        return &c;
+    }
+
+    // TASK_PLAY_ANIM of the swing; the probe follows it (PeerSwingService).
+    void IssuePeerSwing(Peer& pe, SwingSet& set, size_t idx, double nowMs, bool late)
+    {
+        SwingClip& c = set.list[idx];
+        sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
+        if (g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
+        {
+            ++g_v4.peerSwings;
+            ++dk.issued;
+            if (late)
+                ++dk.late;
+            pe.swingProbe.Begin(nowMs, idx);
+            pe.swingProbeArmed = &set == &g_swingSetArmed;
+        }
+        else
+        {
+            ++g_v4.peerSwingFailed;
+            ++dk.failed;
+        }
     }
 
     // A remote ped swings: a shotSeq step or a rising kPfMelee with a melee-class weapon in hand (combat 4, receiver;
     // the pair is one swing, see PlayPeerShots). Every way a swing is not shown is counted (0c: the live test showed
     // "0 peer swings shown" with no hint why).
-    void PlayPeerSwing(Peer& pe, int id, uint32_t weapon)
+    void PlayPeerSwing(Peer& pe, int id, uint32_t weapon, double nowMs)
     {
         ++g_v4.peerSwingSteps;
+        sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
+        ++dk.requested;
         if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
         {
             ++g_v4.peerSwingOwned;                     // an emote, a seat, a climb or a reaction owns the ped
+            ++dk.owned;
             return;
         }
-        SwingClip* c = SwingClipFor(weapon);
+        SwingSet* set = nullptr;
+        size_t idx = 0;
+        SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
         if (!c)
         {
             ++g_v4.peerSwingNoDict;
+            ++dk.dictMissing;
             static bool logged = false;
             if (!logged)
             {
@@ -2982,13 +3067,61 @@ namespace {
         }
         if (!g_world->HasAnimDictLoaded(c->dict))
         {
-            ++g_v4.peerSwingNoDict;                    // still streaming: this swing is missed (WarmPeerSwing loads it early)
+            ++g_v4.peerSwingNoDict;                    // still streaming: kept for 250 ms (PeerSwingService plays it when it loads)
+            pe.swingPending.Arm(nowMs);
             return;
         }
-        if (g_world->TaskPlayAnim(pe.ped, c->dict, c->clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
-            ++g_v4.peerSwings;
-        else
-            ++g_v4.peerSwingFailed;
+        IssuePeerSwing(pe, *set, idx, nowMs, false);
+    }
+
+    // Once per frame per remote ped, after the swing trigger: the swing that waited for its dictionary, and the
+    // IS_ENTITY_PLAYING_ANIM probe of the last issued one. Probe results are logged once per clip: "never seen playing" is
+    // the decisive line of the next live test (the clip name is wrong, or the native cannot see a secondary anim).
+    void PeerSwingService(Peer& pe, int id, uint32_t weapon, bool meleeWeapon, double nowMs)
+    {
+        sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
+        if (pe.swingPending.Armed())
+        {
+            if (!meleeWeapon || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active() || pe.emote.Active())
+                pe.swingPending.Clear();
+            else
+            {
+                SwingSet* set = nullptr;
+                size_t idx = 0;
+                SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
+                if (c && pe.swingPending.Take(nowMs, g_world->HasAnimDictLoaded(c->dict)))
+                    IssuePeerSwing(pe, *set, idx, nowMs, true);
+            }
+        }
+        if (!pe.swingProbe.Active())
+            return;
+        SwingSet& set = pe.swingProbeArmed ? g_swingSetArmed : g_swingSetUnarmed;
+        const size_t ci = pe.swingProbe.Candidate();
+        SwingClip& c = set.list[ci];
+        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip));
+        if (r == sync::SwingProbe::Result::Pending || r == sync::SwingProbe::Result::Idle)
+            return;
+        if (r == sync::SwingProbe::Result::Shown)
+        {
+            ++dk.shown;
+            if (g_animFirstUse.Note(std::string("swing-shown:") + c.dict + "/" + c.clip))
+                PeerLog(false, "engine: anim first use: swing clip %s / %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) on peer id=%d: the "
+                        "names are right", c.dict, c.clip, id);
+        }
+        else if (r == sync::SwingProbe::Result::NotShown)
+        {
+            ++dk.unseen;
+            const bool demoted = set.book.OnProbe(ci, r);
+            if (g_animFirstUse.Note(std::string("swing-unseen:") + c.dict + "/" + c.clip))
+                PeerLog(true, "engine: anim first use: swing clip %s / %s was issued (TASK_PLAY_ANIM) on peer id=%d but IS_ENTITY_PLAYING_ANIM "
+                        "never saw it play in 250 ms: the clip name is probably WRONG (names are INFERRED; /e <dict> <clip> tests one by "
+                        "hand), or that native cannot see an upper-body secondary task", id, c.dict, c.clip);
+            if (demoted)
+                PeerLog(true, "engine: melee swing: clip %s / %s demoted after two swings never seen playing: the next candidate is used",
+                        c.dict, c.clip);
+            return;
+        }
+        set.book.OnProbe(ci, r);
     }
 
     // A muzzle flash for a remote shot: the "core" particle asset's per-class effect (sync::MuzzleFlashEffect,
@@ -3082,9 +3215,10 @@ namespace {
         // receiver ignored it, so a swing whose counter step was missed was never shown); one swing within 300 ms.
         const bool meleeWeapon = IsMeleeClassWeapon(ps.weapon);
         if (sync::PeerSwingDue(pe.swingGate, nowMs, n, meleeWeapon, (ps.flags & proto::kPfMelee) != 0))
-            PlayPeerSwing(pe, id, ps.weapon);
+            PlayPeerSwing(pe, id, ps.weapon, nowMs);
         else if (meleeWeapon)
-            SwingClipFor(ps.weapon);                   // load the swing dictionary before the first swing, not during it
+            SwingClipFor(ps.weapon, nowMs);            // load the swing dictionary before the first swing, not during it
+        PeerSwingService(pe, id, ps.weapon, meleeWeapon, nowMs);   // 0e: a swing that waited, the IS_ENTITY_PLAYING_ANIM probe
         if (meleeWeapon)
         {
             pe.shotDebt.Clear();                       // fists and clubs owe no bullets
@@ -3684,20 +3818,26 @@ namespace {
                 else if (g_world->AnimDictExists(a.dict.c_str()) == 0)
                 {
                     ++g_v4.emoteMissingDict;
+                    ++g_animDiag.Of(sync::AnimKind::PeerEmote).requested;
+                    ++g_animDiag.Of(sync::AnimKind::PeerEmote).dictMissing;
                     PeerLog(true, "engine: remote peer id=%d anim %s/%s: no such dictionary in this game", id,
                             a.dict.c_str(), a.name.c_str());
                 }
                 else
                 {
                     pe.emoteAnim = a;
-                    pe.emote.StartAnim(nowMs, a.durationMs, a.flags);
+                    ++g_animDiag.Of(sync::AnimKind::PeerEmote).requested;
+                    if (pe.emote.StartAnim(nowMs, a.durationMs, a.flags))
+                        ++g_animDiag.Of(sync::AnimKind::PeerEmote).restarted;
                     SyncPeerEmoteDict(pe);             // counted before any ending emote can free the dictionary
                 }
             }
             else if (pe.emoteKind == 2)
             {
                 pe.emoteScenario = pe.scenarioIn;
-                pe.emote.StartScenario(nowMs);
+                ++g_animDiag.Of(sync::AnimKind::PeerEmote).requested;
+                if (pe.emote.StartScenario(nowMs))
+                    ++g_animDiag.Of(sync::AnimKind::PeerEmote).restarted;
             }
             else
                 pe.emote.Stop();
@@ -3728,15 +3868,29 @@ namespace {
         const sync::EmoteOut o = pe.emote.Tick(in);
         if (o.requestDict)
             g_world->RequestAnimDict(pe.emoteAnim.dict.c_str());
+        sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerEmote);
         if (o.issueAnim)
         {
             const proto::Anim& a = pe.emoteAnim;
-            ClearPedTasksNow(pe.ped);                  // drop the gait task first: the anim owns the ped
-            g_world->TaskPlayAnim(pe.ped, a.dict.c_str(), a.name.c_str(), a.blendIn, a.blendOut,
-                                  sync::EmoteArbiter::GtaDuration(a.durationMs),
-                                  (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
+            // 0e: the legs are taken (gait cleared) for a full-body anim or when an earlier emote's task may still be on
+            // the ped; an upper-body / secondary anim runs over the gait task and leaves it alone.
+            if (o.clearFirst)
+                ClearPedTasksNow(pe.ped);
+            const bool called = g_world->TaskPlayAnim(pe.ped, a.dict.c_str(), a.name.c_str(), a.blendIn, a.blendOut,
+                                                      sync::EmoteArbiter::GtaDuration(a.durationMs),
+                                                      (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
+            if (o.resetLoco)
+                LocoReset(pe, kSiteEmoteEnd);          // the gait was cleared under an upper-body anim: the controller re-issues it
             pe.aimTask = false;
             ++g_v4.emotesStarted;
+            ++(called ? dk.issued : dk.failed);
+            NoteDictReady(sync::AnimKind::PeerEmote, o.waitedMs);
+            if (g_animFirstUse.Note("emote:" + a.dict + "/" + a.name))
+                PeerLog(!called, "engine: anim first use: remote peer id=%d emote %s / %s: DOES_ANIM_DICT_EXIST yes, HAS_ANIM_DICT_LOADED after %.0f ms, "
+                        "TASK_PLAY_ANIM %s (flags %u, duration %d ms); IS_ENTITY_PLAYING_ANIM is checked from the next frame", id,
+                        a.dict.c_str(), a.name.c_str(), o.waitedMs, called ? "called" : "could NOT be called",
+                        (unsigned)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags),
+                        (int)sync::EmoteArbiter::GtaDuration(a.durationMs));
         }
         if (o.issueScenario)
         {
@@ -3744,12 +3898,31 @@ namespace {
             g_world->TaskStartScenarioInPlace(pe.ped, pe.emoteScenario.c_str());
             pe.aimTask = false;
             ++g_v4.emotesStarted;
+            ++dk.issued;
         }
         if (o.clearTasks)
             g_world->ClearPedTasks(pe.ped);
+        if (o.confirmed)
+        {
+            ++dk.shown;
+            if (g_animFirstUse.Note("emote-seen:" + pe.emoteAnim.dict + "/" + pe.emoteAnim.name))
+                PeerLog(false, "engine: anim first use: remote peer id=%d emote %s / %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) %.0f ms after "
+                        "the task", id, pe.emoteAnim.dict.c_str(), pe.emoteAnim.name.c_str(), o.confirmMs);
+        }
+        if (o.reissued)
+            ++dk.reissued;
+        if (o.neverPlayed)
+        {
+            ++dk.unseen;
+            if (g_animFirstUse.Note("emote-unseen:" + pe.emoteAnim.dict + "/" + pe.emoteAnim.name))
+                PeerLog(true, "engine: anim first use: remote peer id=%d emote %s / %s was issued but the ped never played it "
+                        "(IS_ENTITY_PLAYING_ANIM stayed false): the clip name is probably wrong, or the ped could not play it", id,
+                        pe.emoteAnim.dict.c_str(), pe.emoteAnim.name.c_str());
+        }
         if (o.gaveUp)
         {
             ++g_v4.emoteDictTimeouts;
+            ++dk.dictTimeout;
             PeerLog(true, "engine: remote peer id=%d anim %s/%s: dictionary did not load in 3 s", id,
                     pe.emoteAnim.dict.c_str(), pe.emoteAnim.name.c_str());
         }
@@ -3757,6 +3930,9 @@ namespace {
             ++g_v4.emoteNotPlaying;
         if (o.ended)
         {
+            ++dk.ended[(size_t)o.endReason];
+            if (o.endReason == sync::EmoteEnd::Dead || o.endReason == sync::EmoteEnd::Vehicle)
+                ++dk.cancelled;
             SyncPeerEmoteDict(pe);                     // ended, given up (3 s) or cut short: free the dictionary
             LocoReset(pe, kSiteEmoteEnd);              // the controller re-issues its gait (no snap)
             pe.aimTask = false;
@@ -6700,30 +6876,64 @@ namespace {
         in.dead = dead;
         in.inVehicle = inVehicle;
         const sync::EmoteOut o = g_localEmote.Tick(in);
+        sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::LocalEmote);
         if (o.requestDict)
             g_world->RequestAnimDict(g_localAnim.dict.c_str());
         if (o.issueAnim)
         {
             const proto::Anim& a = g_localAnim;
-            g_world->TaskPlayAnim(lp, a.dict.c_str(), a.name.c_str(), a.blendIn, a.blendOut,
-                                  sync::EmoteArbiter::GtaDuration(a.durationMs),
-                                  (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
+            if (o.replacedTask)
+                g_world->ClearPedTasks(lp);            // 0e: an earlier emote of ours is still on the ped (a restart): blended out first
+            const bool called = g_world->TaskPlayAnim(lp, a.dict.c_str(), a.name.c_str(), a.blendIn, a.blendOut,
+                                                      sync::EmoteArbiter::GtaDuration(a.durationMs),
+                                                      (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
             const bool sent = join::SendAnim(a);
-            GLOGI("engine: anims: playing %s/%s%s", a.dict.c_str(), a.name.c_str(), sent ? ", sent" : " (not sent: offline)");
+            ++(called ? dk.issued : dk.failed);
+            NoteDictReady(sync::AnimKind::LocalEmote, o.waitedMs);
+            GLOGI("engine: anims: playing %s/%s%s; DOES_ANIM_DICT_EXIST yes, HAS_ANIM_DICT_LOADED after %.0f ms, TASK_PLAY_ANIM %s "
+                  "(flags %u, duration %d ms); IS_ENTITY_PLAYING_ANIM is checked from the next frame", a.dict.c_str(), a.name.c_str(),
+                  sent ? ", sent" : " (not sent: offline)", o.waitedMs, called ? "called" : "could NOT be called",
+                  (unsigned)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), (int)sync::EmoteArbiter::GtaDuration(a.durationMs));
         }
         if (o.issueScenario)
         {
             g_world->TaskStartScenarioInPlace(lp, g_localScenario.c_str());
             const bool sent = join::SendScenario(g_localScenario);
+            ++dk.issued;
             GLOGI("engine: anims: scenario %s%s", g_localScenario.c_str(), sent ? ", sent" : " (not sent: offline)");
         }
         if (o.clearTasks)
             g_world->ClearPedTasks(lp);
+        if (o.confirmed)
+        {
+            ++dk.shown;
+            GLOGI("engine: anims: our emote %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) %.0f ms after the task",
+                  anim ? (g_localAnim.dict + "/" + g_localAnim.name).c_str() : g_localScenario.c_str(), o.confirmMs);
+        }
+        if (o.reissued)
+            ++dk.reissued;
+        if (o.neverPlayed)
+        {
+            // 0e: the clip never played on our own ped: a wrong clip name (TASK_PLAY_ANIM reports nothing) or a task the game dropped.
+            ++dk.unseen;
+            game::Overlay::PushSystemLine(anim ? "That animation did not play: check the clip name (/e <dict> <clip>)."
+                                               : "That scenario did not start.");
+            GLOGW("engine: anims: %s was issued but IS_ENTITY_PLAYING_ANIM never saw it play: the %s is probably wrong",
+                  anim ? (g_localAnim.dict + "/" + g_localAnim.name).c_str() : g_localScenario.c_str(),
+                  anim ? "clip name" : "scenario name");
+        }
         if (o.gaveUp)
         {
             ++g_v4.emoteDictTimeouts;
+            ++dk.dictTimeout;
             game::Overlay::PushSystemLine("That animation did not load.");
             GLOGW("engine: anims: %s did not load in 3 s", g_localAnim.dict.c_str());
+        }
+        if (o.ended)
+        {
+            ++dk.ended[(size_t)o.endReason];
+            if (o.endReason == sync::EmoteEnd::Dead || o.endReason == sync::EmoteEnd::Vehicle)
+                ++dk.cancelled;
         }
         if (o.ended && wasIssued)
         {
@@ -6877,6 +7087,13 @@ namespace {
                   !g_localEmote.Active() ? "none" : g_localEmote.Kind() == sync::EmoteKind::Anim ? g_localAnim.dict.c_str()
                                                                                                   : g_localScenario.c_str());
         }
+        if (join::IsConnected())
+        {
+            // 0e: per animation kind, what the last 10 s asked for, loaded, issued and actually SAW playing; "unseen" is a clip
+            // IS_ENTITY_PLAYING_ANIM never saw (wrong name), "ended(...)" says what ended the emotes.
+            GLOGI("engine: anims (0e), last 10 s: %s", sync::AnimDiagLine(g_animDiag, g_animDiagLast).c_str());
+        }
+        g_animDiagLast = g_animDiag;
         last = c;
         lastWorlds = worlds;
         lastEmotes = emotes;
