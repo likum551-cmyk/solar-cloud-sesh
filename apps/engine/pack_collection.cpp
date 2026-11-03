@@ -47,7 +47,9 @@ bool BuildImage(const std::vector<FileSpec>& files, BuiltImage& out, std::string
     }
 
     // Data blob: each file's bytes start on a 512-byte sector boundary; the gaps are zero padding. The
-    // file entry stores the start sector index (not the byte offset).
+    // file entry stores the start sector index (not the byte offset). After the last file the blob is padded
+    // to a whole number of sectors, so the blob a collection exposes is `blobSectors * 512` bytes and a
+    // sector-granular read of the final file's last (partial) sector never runs past the end.
     std::vector<uint8_t> blob;
     std::vector<uint32_t> startSectors(fileCount);
     for (uint32_t i = 0; i < fileCount; ++i) {
@@ -58,6 +60,8 @@ bool BuildImage(const std::vector<FileSpec>& files, BuiltImage& out, std::string
         startSectors[i] = static_cast<uint32_t>(startSector);
         if (files[i].size != 0) blob.insert(blob.end(), files[i].data, files[i].data + files[i].size);
     }
+    blob.insert(blob.end(), (kSectorSize - (blob.size() % kSectorSize)) % kSectorSize, 0u);
+    if (blob.size() / kSectorSize > kSectorMask) { err = "blob exceeds the 23-bit sector-offset field"; return false; }
 
     // Entries: [0] = root directory (children 1..N), then one entry per file.
     std::vector<TocEntry> entries;
@@ -76,11 +80,80 @@ bool BuildImage(const std::vector<FileSpec>& files, BuiltImage& out, std::string
         }
     }
 
+    // Placement view: where each file's bytes sit in the blob, derived from the layout above.
+    out.placements.reserve(fileCount);
+    for (uint32_t i = 0; i < fileCount; ++i) {
+        FilePlacement p;
+        p.entryIndex = i + 1;
+        p.sector = startSectors[i];
+        p.sectorCount = static_cast<uint32_t>(SectorsFor(files[i].size));
+        p.byteOffset = static_cast<uint64_t>(startSectors[i]) << kSectorShift;
+        p.size = static_cast<uint32_t>(files[i].size);
+        out.placements.push_back(p);
+    }
+
+    out.entryTable = SerializeEntryTable(entries);
     out.entries = std::move(entries);
     out.nameHeap = std::move(heap);
+    out.blobSectors = static_cast<uint32_t>(blob.size() / kSectorSize);
     out.blob = std::move(blob);
     out.fileCount = fileCount;
     return true;
+}
+
+static void PutLE64(std::vector<uint8_t>& v, uint64_t x) {
+    for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xffu));
+}
+
+static uint64_t ReadLE64(const uint8_t* p) {
+    uint64_t x = 0;
+    for (int i = 7; i >= 0; --i) x = (x << 8) | p[i];
+    return x;
+}
+
+std::vector<uint8_t> SerializeEntryTable(const std::vector<TocEntry>& entries) {
+    std::vector<uint8_t> t;
+    t.reserve(entries.size() * 16);
+    for (const TocEntry& e : entries) { PutLE64(t, e.q0); PutLE64(t, e.q1); }
+    return t;
+}
+
+TocEntry ReadTocEntry(const uint8_t* p) {
+    TocEntry e;
+    e.q0 = ReadLE64(p);
+    e.q1 = ReadLE64(p + 8);
+    return e;
+}
+
+// ---- RSC7 page-flag decode (spec: docs/content-streaming/r3-plan.md; see the header for the caveats) ----
+namespace {
+struct PageField { uint32_t lowBit; uint32_t width; uint32_t sizeShift; };
+// Lowest bit first. The last four single-bit fields (bits 24..27 -> shifts 3..0) are the plan's
+// "bits24-27 (<<3..<<0)" read as ascending bit / descending shift; that mapping is an interpretation.
+constexpr PageField kPageFields[] = {
+    {4, 1, 8}, {5, 2, 7}, {7, 4, 6}, {11, 6, 5}, {17, 7, 4}, {24, 1, 3}, {25, 1, 2}, {26, 1, 1}, {27, 1, 0},
+};
+static_assert(sizeof(kPageFields) / sizeof(kPageFields[0]) == kRsc7SizeClasses, "one field per size class");
+}  // namespace
+
+Rsc7Pages DecodeRsc7Pages(uint32_t flags) {
+    Rsc7Pages r;
+    r.baseShift = flags & 0xfu;
+    r.basePageSize = 0x200u << r.baseShift;
+    for (const PageField& f : kPageFields) {
+        const uint32_t count = (flags >> f.lowBit) & ((1u << f.width) - 1u);
+        r.counts[f.sizeShift] = count;
+        r.pageCount += count;
+        r.totalSize += static_cast<uint64_t>(count) * (static_cast<uint64_t>(r.basePageSize) << f.sizeShift);
+    }
+    return r;
+}
+
+Rsc7PageFlags DecodeRsc7PageFlags(uint32_t sysFlags, uint32_t gfxFlags) {
+    Rsc7PageFlags r;
+    r.sys = DecodeRsc7Pages(sysFlags);
+    r.gfx = DecodeRsc7Pages(gfxFlags);
+    return r;
 }
 
 }  // namespace gage::game::content
