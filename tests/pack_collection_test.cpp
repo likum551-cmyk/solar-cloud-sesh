@@ -158,11 +158,218 @@ static void TestBuildImage() {
     CHECK(!BuildImage({{"", f2.data(), f2.size()}}, bad, e), "empty name rejected");
 }
 
+// ---- 5. in-RAM image layout: sector offsets land exactly on the bytes ---------------------------------
+// These are real assertions about the layout rules this builder implements (entry sector field -> byte
+// offset in the blob, file extents, padding, entry-table serialisation). They are proven offline against the
+// entry format pinned above; they do NOT prove the game's own reader accepts the image (that needs a live run).
+static std::vector<uint8_t> PatternFile(size_t n, uint8_t salt) {
+    std::vector<uint8_t> v(n);
+    for (size_t i = 0; i < n; ++i) v[i] = uint8_t((i * 131u + salt * 17u + 1u) & 0xffu);  // never all-zero, differs per file
+    return v;
+}
+static size_t CeilSectors(size_t bytes) { return (bytes + 511) / 512; }  // independent of SectorsFor on purpose
+
+static void TestImageLayout() {
+    // Sizes straddle every sector boundary case: 1 byte, just under / exactly / just over a sector, several
+    // sectors, an RSC7 resource (header kept) that is not a sector multiple, and a larger multi-sector file.
+    const size_t sizes[] = {1, 511, 512, 513, 1024, 700, 40, 5000, 2049};
+    std::vector<std::vector<uint8_t>> src;
+    std::vector<FileSpec> files;
+    std::vector<std::string> names;
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); ++k) {
+        src.push_back(PatternFile(sizes[k], uint8_t(k + 1)));
+        names.push_back("file" + std::to_string(k) + (k == 5 ? ".yft" : ".bin"));
+    }
+    // file 5 (700 B) becomes an RSC7 resource: overwrite its first 16 bytes with a real header.
+    {
+        std::vector<uint8_t> hdr;
+        AppendLE32(hdr, kRsc7Magic); AppendLE32(hdr, 0xA2u); AppendLE32(hdr, 0xa3022403u); AppendLE32(hdr, 0x20000000u);
+        std::memcpy(src[5].data(), hdr.data(), 16);
+    }
+    for (size_t k = 0; k < src.size(); ++k) files.push_back({names[k], src[k].data(), src[k].size()});
+
+    BuiltImage img; std::string err;
+    CHECK(BuildImage(files, img, err), "layout: BuildImage ok: %s", err.c_str());
+    const size_t N = files.size();
+    CHECK(img.entries.size() == N + 1 && img.placements.size() == N, "layout: root + N entries, N placements");
+
+    bool allSectorsLand = true, allExtentsOk = true, allCountsOk = true, allPadZero = true, allNames = true;
+    for (size_t k = 0; k < N; ++k) {
+        const TocEntry& e = img.entries[k + 1];
+        const FilePlacement& p = img.placements[k];
+        // byteOffset recomputed straight from the documented formula, NOT via EntryByteOffset.
+        const uint64_t byteOffset = (uint64_t)(EntryC(e) & 0x7fffffu) << 9;
+        if (p.entryIndex != k + 1 || p.byteOffset != byteOffset || p.sector != (EntryC(e) & 0x7fffffu)) allSectorsLand = false;
+        if (byteOffset % 512 != 0) allSectorsLand = false;
+        // the file's bytes sit exactly there in the blob
+        if (byteOffset + src[k].size() > img.blob.size() ||
+            std::memcmp(img.blob.data() + byteOffset, src[k].data(), src[k].size()) != 0) allExtentsOk = false;
+        if (EntryFileSize(e) != src[k].size() || p.size != src[k].size()) allExtentsOk = false;
+        // sectorCount is ceil(size/512), and the next entry starts exactly that many sectors later
+        if (p.sectorCount != CeilSectors(src[k].size())) allCountsOk = false;
+        if (k + 1 < N) {
+            const uint32_t thisSec = EntrySector(img.entries[k + 1]), nextSec = EntrySector(img.entries[k + 2]);
+            if (nextSec - thisSec != CeilSectors(src[k].size())) allCountsOk = false;
+            // the padding between the end of this file and the start of the next is all zero
+            const size_t padStart = (size_t)byteOffset + src[k].size(), padEnd = (size_t)nextSec * 512;
+            for (size_t b = padStart; b < padEnd; ++b) if (img.blob[b] != 0) allPadZero = false;
+        }
+        if (std::string(&img.nameHeap[EntryNameOffset(e)]) != names[k]) allNames = false;
+    }
+    CHECK(allSectorsLand, "layout: every entry's (C & 0x7fffff) << 9 is its placement byte offset, sector-aligned");
+    CHECK(allExtentsOk, "layout: every file's bytes are at blob[byteOffset .. +size) and the entry sizes match");
+    CHECK(allCountsOk, "layout: next.sector - this.sector == ceil(size/512) for every consecutive pair");
+    CHECK(allPadZero, "layout: the padding between files is zero");
+    CHECK(allNames, "layout: every NameOffset resolves to the file's name in the heap");
+
+    // first file at sector 0; the blob is a whole number of sectors ending exactly after the last file
+    CHECK(EntrySector(img.entries[1]) == 0, "layout: first file at sector 0");
+    const FilePlacement& last = img.placements[N - 1];
+    CHECK(img.blobSectors == last.sector + CeilSectors(src[N - 1].size()), "layout: blobSectors == last.sector + ceil(lastSize/512)");
+    CHECK(img.blob.size() == (size_t)img.blobSectors * 512, "layout: blob is blobSectors * 512 bytes (final tail padded)");
+    bool tailZero = true;
+    for (size_t b = (size_t)last.byteOffset + last.size; b < img.blob.size(); ++b) if (img.blob[b] != 0) tailZero = false;
+    CHECK(tailZero, "layout: the final file's tail padding is zero");
+    // concrete expectation for this size set, worked out by hand: sectors 0,1,2,4,5,7,9,10,..
+    // sizes 1,511,512,513,1024,700,40,5000,2049 -> counts 1,1,1,2,2,2,1,10,5 -> starts 0,1,2,3,5,7,9,10,20 -> total 25
+    const uint32_t wantStart[] = {0, 1, 2, 3, 5, 7, 9, 10, 20};
+    bool startsOk = true;
+    for (size_t k = 0; k < N; ++k) if (EntrySector(img.entries[k + 1]) != wantStart[k]) startsOk = false;
+    CHECK(startsOk, "layout: hand-computed start sectors 0,1,2,3,5,7,9,10,20");
+    CHECK(img.blobSectors == 25, "layout: hand-computed total 25 sectors (got %u)", img.blobSectors);
+    CHECK(EntryIsResource(img.entries[6]) && ResSystemFlags(img.entries[6]) == 0xa3022403u &&
+          ResGraphicsFlags(img.entries[6]) == 0x20000000u, "layout: the RSC7 file is a resource entry with its header flags");
+    CHECK(!EntryIsResource(img.entries[1]) && !EntryIsDir(img.entries[1]), "layout: a plain file is a binary entry");
+
+    // entry table: 16 bytes per entry, stride 0x10, q0 at +0 and q1 at +8, little-endian
+    CHECK(img.entryTable.size() == img.entries.size() * 0x10, "table: 16 bytes per entry");
+    bool tableRoundTrips = true;
+    for (size_t i = 0; i < img.entries.size(); ++i) {
+        const TocEntry r = ReadTocEntry(img.entryTable.data() + i * 0x10);
+        if (r.q0 != img.entries[i].q0 || r.q1 != img.entries[i].q1) tableRoundTrips = false;
+    }
+    CHECK(tableRoundTrips, "table: entry i at byte i*0x10 reads back as entries[i]");
+    {
+        // root dir q0 = 0x7fffff0000000000 -> LE bytes 00 00 00 00 00 ff ff 7f ; q1 = (N<<32)|1
+        const uint8_t* t = img.entryTable.data();
+        const uint8_t wantQ0[8] = {0, 0, 0, 0, 0, 0xff, 0xff, 0x7f};
+        CHECK(std::memcmp(t, wantQ0, 8) == 0, "table: root dir q0 bytes are little-endian");
+        CHECK(t[8] == 1 && t[9] == 0 && t[12] == uint8_t(N) && t[13] == 0, "table: root dir q1 = (childCount << 32) | firstChild");
+    }
+    {
+        // a live golden word serialises to the byte order a little-endian qword read would see
+        TocEntry g = MakeResourceEntry(0x2a08, 16567, 0x06fa6, 0xa0100000u, 0x20000000u);  // q0 = 0x806fa60040b72a08
+        std::vector<uint8_t> t = SerializeEntryTable({g});
+        const uint8_t want[16] = {0x08, 0x2a, 0xb7, 0x40, 0x00, 0xa6, 0x6f, 0x80, 0x00, 0x00, 0x10, 0xa0, 0x00, 0x00, 0x00, 0x20};
+        CHECK(t.size() == 16 && std::memcmp(t.data(), want, 16) == 0, "table: golden res248 serialises to the expected 16 bytes");
+        CHECK(SerializeEntryTable({}).empty(), "table: an empty TOC serialises to nothing");
+    }
+
+    // deterministic: building the same files twice gives the same bytes
+    BuiltImage again; std::string e2;
+    CHECK(BuildImage(files, again, e2) && again.blob == img.blob && again.entryTable == img.entryTable &&
+          again.nameHeap == img.nameHeap && again.blobSectors == img.blobSectors, "layout: deterministic output");
+}
+
+static void TestImageLayoutEdges() {
+    // A zero-size file occupies zero sectors, so the next file starts at the same sector (next - this == ceil(0/512) == 0).
+    std::vector<uint8_t> a = PatternFile(513, 7), b = PatternFile(1, 9);
+    std::vector<FileSpec> files = {{"a.bin", a.data(), a.size()}, {"z.bin", nullptr, 0}, {"b.bin", b.data(), b.size()}};
+    BuiltImage img; std::string err;
+    CHECK(BuildImage(files, img, err), "edge: zero-size file accepted: %s", err.c_str());
+    CHECK(EntrySector(img.entries[1]) == 0 && EntrySector(img.entries[2]) == 2 && EntrySector(img.entries[3]) == 2,
+          "edge: a(513 B) at 0, zero-size z at 2, b at 2");
+    CHECK(img.placements[1].sectorCount == 0 && img.placements[2].sectorCount == 1, "edge: sectorCount 0 for the empty file");
+    CHECK(img.blobSectors == 3 && img.blob.size() == 3 * 512, "edge: 3 sectors total");
+
+    // a single exact-sector file: blob is exactly one sector, no extra padding sector
+    std::vector<uint8_t> one = PatternFile(512, 3);
+    std::vector<FileSpec> f1 = {{"one.bin", one.data(), one.size()}};
+    BuiltImage i1;
+    CHECK(BuildImage(f1, i1, err) && i1.blobSectors == 1 && i1.blob.size() == 512 &&
+          std::memcmp(i1.blob.data(), one.data(), 512) == 0, "edge: a 512-byte file fills exactly one sector");
+
+    // a 24-bit size overflow is rejected before the data is read
+    uint8_t dummy = 0;
+    BuiltImage bad;
+    CHECK(!BuildImage({{"big.bin", &dummy, (size_t)kMaxFileSize24 + 1}}, bad, err), "edge: size over the 24-bit field rejected");
+    CHECK(SectorsFor(0) == 0 && SectorsFor(1) == 1 && SectorsFor(512) == 1 && SectorsFor(513) == 2, "SectorsFor is ceil(n/512)");
+}
+
+// ---- 6. RSC7 page-flag decode: SPEC-CONSISTENCY tests, NOT game-validated --------------------------------
+// IMPORTANT: DecodeRsc7PageFlags implements the formula as WRITTEN in docs/content-streaming/r3-plan.md
+// (game fn 0x1370140). The tests below prove only that the code matches that document: the expected
+// decompositions were derived by hand / by an independent script from the same text. They do NOT show that the
+// game computes the same totals. The real sizes must be confirmed by a live run on the owner's machine, and two
+// readings are unconfirmed until then: (1) bits 24..27 -> size shifts 3..0 (ascending bit, descending shift),
+// (2) bits 28..31 are ignored. If either is wrong the jesko totals below change.
+static void CheckPages(const char* what, const Rsc7Pages& got, uint32_t baseShift, uint32_t baseSize,
+                       const uint32_t (&counts)[kRsc7SizeClasses], uint32_t pageCount, uint64_t total) {
+    bool ok = got.baseShift == baseShift && got.basePageSize == baseSize && got.pageCount == pageCount && got.totalSize == total;
+    for (int s = 0; s < kRsc7SizeClasses; ++s) if (got.counts[s] != counts[s]) ok = false;
+    CHECK(ok, "%s: baseShift %u base 0x%x pages %u total 0x%llx", what, got.baseShift, got.basePageSize, got.pageCount,
+          (unsigned long long)got.totalSize);
+    // the decomposition is self-consistent with the documented formula
+    uint64_t sum = 0; uint32_t n = 0;
+    for (int s = 0; s < kRsc7SizeClasses; ++s) { n += got.counts[s]; sum += (uint64_t)got.counts[s] * ((uint64_t)got.basePageSize << s); }
+    CHECK(n == got.pageCount && sum == got.totalSize && got.basePageSize == (0x200u << got.baseShift),
+          "%s: totals equal the sum of count * (base << shift)", what);
+}
+
+static void TestRsc7PageFlags() {
+    // counts[] is indexed by size shift 0..8 (pages of base << shift).
+    {   // jesko.yft: sys 0xa3022403 -> shift 3 (base 0x1000); bits 7..10 = 8 (<<6), bits 11..16 = 4 (<<5), bit 24 (<<3) and bit 25 (<<2) set
+        const uint32_t c[kRsc7SizeClasses] = {0, 0, 1, 1, 1, 4, 8, 0, 0};
+        Rsc7PageFlags d = DecodeRsc7PageFlags(0xa3022403u, 0x20000000u);
+        CheckPages("jesko.yft sys", d.sys, 3, 0x1000, c, 15, 0x29c000);
+        const uint32_t z[kRsc7SizeClasses] = {};
+        CheckPages("jesko.yft gfx", d.gfx, 0, 0x200, z, 0, 0);   // 0x20000000 sets only bit 29, which the plan does not map
+    }
+    {   // jesko.ytd: sys 0x00060000 -> shift 0 (base 0x200), bits 17..23 = 3 (<<4) ; gfx 0xdb100008 -> shift 8 (base 0x20000)
+        const uint32_t cs[kRsc7SizeClasses] = {0, 0, 0, 0, 3, 0, 0, 0, 0};
+        const uint32_t cg[kRsc7SizeClasses] = {1, 0, 1, 1, 8, 0, 0, 0, 0};
+        Rsc7PageFlags d = DecodeRsc7PageFlags(0x00060000u, 0xdb100008u);
+        CheckPages("jesko.ytd sys", d.sys, 0, 0x200, cs, 3, 0x6000);
+        CheckPages("jesko.ytd gfx", d.gfx, 8, 0x20000, cg, 11, 0x11a0000);
+    }
+    {   // jesko_hi.yft: sys 0xa101f004 -> shift 4 (base 0x2000); bits 11..16 = 62 (<<5), bit 24 (<<3) set
+        const uint32_t cs[kRsc7SizeClasses] = {0, 0, 0, 1, 0, 62, 0, 0, 0};
+        Rsc7PageFlags d = DecodeRsc7PageFlags(0xa101f004u, 0x20000000u);
+        CheckPages("jesko_hi.yft sys", d.sys, 4, 0x2000, cs, 63, 0xf90000);
+        const uint32_t z[kRsc7SizeClasses] = {};
+        CheckPages("jesko_hi.yft gfx", d.gfx, 0, 0x200, z, 0, 0);
+    }
+    // each field alone, so a shifted or mis-widthed field cannot hide behind the jesko values
+    {
+        const uint32_t b4[kRsc7SizeClasses] = {0, 0, 0, 0, 0, 0, 0, 0, 1};
+        CheckPages("bit4 only", DecodeRsc7Pages(0x10u), 0, 0x200, b4, 1, 0x20000);
+        const uint32_t b27[kRsc7SizeClasses] = {1, 0, 0, 0, 0, 0, 0, 0, 0};
+        CheckPages("bit27 only", DecodeRsc7Pages(1u << 27), 0, 0x200, b27, 1, 0x200);
+        const uint32_t b24[kRsc7SizeClasses] = {0, 0, 0, 1, 0, 0, 0, 0, 0};
+        CheckPages("bit24, shift 2", DecodeRsc7Pages((1u << 24) | 2u), 2, 0x800, b24, 1, 0x4000);
+        const uint32_t z[kRsc7SizeClasses] = {};
+        CheckPages("flags 0", DecodeRsc7Pages(0), 0, 0x200, z, 0, 0);
+        // widths: a field holds its maximum and does not leak into its neighbour
+        const uint32_t mx[kRsc7SizeClasses] = {1, 1, 1, 1, 127, 63, 15, 3, 1};
+        CheckPages("all count bits set, shift 15", DecodeRsc7Pages(0x0fffffffu), 15, 0x1000000, mx, 213, 0x161f000000ULL);
+        const uint32_t w5[kRsc7SizeClasses] = {0, 0, 0, 0, 0, 0, 0, 3, 0};
+        CheckPages("bits 5..6 = 3", DecodeRsc7Pages(0x60u), 0, 0x200, w5, 3, 0x30000);   // 3 * (0x200 << 7)
+    }
+    // the plan is silent on bits 28..31; this pins what the code does with them today (ignored), nothing more.
+    CHECK(DecodeRsc7Pages(0xf0000000u).pageCount == 0 && DecodeRsc7Pages(0xf0000000u).totalSize == 0,
+          "bits 28..31 ignored (spec silent: unconfirmed)");
+    // the total exceeds 32 bits for the largest classes: it must not wrap
+    CHECK(DecodeRsc7Pages(0x0fffffffu).totalSize > 0xffffffffULL, "total is 64-bit (no wrap above 4 GiB)");
+}
+
 int main() {
     TestGoldenVectors();
     TestRoundTrip();
     TestRsc7Parse();
     TestBuildImage();
+    TestImageLayout();
+    TestImageLayoutEdges();
+    TestRsc7PageFlags();
     std::printf("pack_collection: %d/%d passed\n", g_pass, g_pass + g_fail);
     return g_fail ? 1 : 0;
 }

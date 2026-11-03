@@ -110,20 +110,90 @@ struct FileSpec {
     size_t size = 0;
 };
 
-// The assembled pack: a name heap, one TOC entry per node (entry[0] = root dir, then one per file in
-// `files` order), and a sector-aligned data blob holding the file bytes back-to-back. Offsets in the
-// file entries are sector indices into `blob`. This is consumed by the (separate) game-side registrar.
-struct BuiltImage {
-    std::vector<TocEntry> entries;      // [0] root dir, [1..N] files, in input order
-    std::vector<char>     nameHeap;     // "\0"-terminated names; root name "" first, then each file name
-    std::vector<uint8_t>  blob;         // file bytes, each starting on a 512-byte sector boundary
-    uint32_t              fileCount = 0;
+// Whole 512-byte sectors needed to hold `bytes` bytes: ceil(bytes / 512). 0 bytes -> 0 sectors.
+inline constexpr uint64_t SectorsFor(uint64_t bytes) { return (bytes + kSectorSize - 1) / kSectorSize; }
+
+// Where one file landed in the image. Everything here is derived from the entry + the layout rules above;
+// it is a convenience view for the game-side registrar and for the offline layout tests.
+struct FilePlacement {
+    uint32_t entryIndex = 0;    // index into BuiltImage::entries (>= 1; entry 0 is the root directory)
+    uint32_t sector = 0;        // first sector of the file inside `blob` (== EntrySector of its entry)
+    uint32_t sectorCount = 0;   // SectorsFor(size): whole sectors the file occupies (the next file starts after these)
+    uint64_t byteOffset = 0;    // sector << 9: where its first byte sits in `blob` (== EntryByteOffset)
+    uint32_t size = 0;          // on-disk size in bytes (== EntryFileSize)
 };
+
+// The assembled pack: the in-RAM image a custom collection will expose, as three byte arrays plus a
+// placement view. `entries` is the TOC (entry[0] = root dir, then one per file in `files` order);
+// `entryTable` is the same TOC serialised exactly as it would sit in memory (16 bytes per entry, stride
+// 0x10, q0 at +0 then q1 at +8, both little-endian); `nameHeap` is the name string heap that every
+// entry's NameOffset indexes; `blob` is the sector-aligned data holding the file bytes. Offsets in the file
+// entries are sector indices into `blob`. This is consumed by the (separate) game-side registrar.
+//
+// Layout invariants (asserted by the offline selftest; they are properties of THIS builder, not yet proven
+// against the game's own reader):
+//   * placements[k].sector == 0 for k == 0, and placements[k+1].sector - placements[k].sector ==
+//     placements[k].sectorCount (== ceil(size/512)): files are back-to-back, each starting on a sector.
+//   * blob.size() == blobSectors * 512, and blobSectors == last.sector + last.sectorCount: the blob is a
+//     whole number of sectors (the final file's tail is zero-padded to the sector boundary).
+//   * the bytes of file k are exactly blob[placements[k].byteOffset .. + size); padding bytes are zero.
+struct BuiltImage {
+    std::vector<TocEntry>      entries;      // [0] root dir, [1..N] files, in input order
+    std::vector<uint8_t>       entryTable;   // SerializeEntryTable(entries): 16 bytes per entry
+    std::vector<char>          nameHeap;     // "\0"-terminated names; root name "" first, then each file name
+    std::vector<uint8_t>       blob;         // file bytes, each starting on a 512-byte sector boundary
+    std::vector<FilePlacement> placements;   // one per file, in input order (entryIndex == k + 1)
+    uint32_t                   blobSectors = 0;  // blob.size() / 512
+    uint32_t                   fileCount = 0;
+};
+
+// Serialises a TOC to its in-memory form: for each entry, q0 then q1, each as 8 little-endian bytes (so entry
+// i starts at byte i * 0x10). Total, pure. ReadTocEntry is the inverse for one entry; `p` must have 16 bytes.
+std::vector<uint8_t> SerializeEntryTable(const std::vector<TocEntry>& entries);
+TocEntry ReadTocEntry(const uint8_t* p);
 
 // Builds a BuiltImage from `files`. Each file becomes a resource entry when it carries a valid RSC7
 // header, otherwise a binary entry (q1 uncompressed-size = its own size, since we pack stored/uncompressed).
 // Fails (returns false, sets err) on: no files, empty name, a file whose size exceeds the 24-bit field,
 // or a blob that would need a sector offset past the 23-bit field. The output is deterministic.
 bool BuildImage(const std::vector<FileSpec>& files, BuiltImage& out, std::string& err);
+
+// ---- RSC7 page flags (spec decode of game fn 0x1370140; NOT game-validated) ------------------------------
+// A resource's system (virtual) flags and graphics (physical) flags each describe a set of memory pages. This
+// is the decode exactly as documented in docs/content-streaming/r3-plan.md ("RSC7 page-flag decoder"):
+//   baseShift = flags bits 0..3;  base page size = 0x200 << baseShift.
+//   Page-count bit-fields, lowest bit first, each counting pages of (base page size << sizeShift):
+//     bit  4      (1 bit )  sizeShift 8
+//     bits 5..6   (2 bits)  sizeShift 7
+//     bits 7..10  (4 bits)  sizeShift 6
+//     bits 11..16 (6 bits)  sizeShift 5
+//     bits 17..23 (7 bits)  sizeShift 4
+//     bit  24     (1 bit )  sizeShift 3
+//     bit  25     (1 bit )  sizeShift 2
+//     bit  26     (1 bit )  sizeShift 1
+//     bit  27     (1 bit )  sizeShift 0
+//   total size = sum over the fields of count * (base page size << sizeShift); page count = sum of counts.
+// The plan writes the last four fields as "bits24-27 (<<3..<<0)"; mapping them bit 24 -> <<3 ... bit 27 -> <<0
+// (ascending bit, descending shift) follows the same pattern as the earlier fields but is an INTERPRETATION of
+// that one line. Bits 28..31 are not mentioned by the plan and are ignored here. Both points, and the meaning
+// of the two outputs of 0x1370140, must be confirmed against the game before any total is trusted.
+inline constexpr int kRsc7SizeClasses = 9;   // sizeShift 0..8
+
+struct Rsc7Pages {
+    uint32_t baseShift = 0;                      // flags bits 0..3
+    uint32_t basePageSize = 0;                   // 0x200 << baseShift
+    uint32_t counts[kRsc7SizeClasses] = {};      // counts[s] = pages of (basePageSize << s), s = sizeShift 0..8
+    uint32_t pageCount = 0;                      // sum of counts
+    uint64_t totalSize = 0;                      // sum of counts[s] * (basePageSize << s)
+};
+
+struct Rsc7PageFlags {
+    Rsc7Pages sys;   // decoded from the system (virtual) flags
+    Rsc7Pages gfx;   // decoded from the graphics (physical) flags
+};
+
+// Decodes one flags dword / both flags of a resource. Pure, total (every input decodes).
+Rsc7Pages DecodeRsc7Pages(uint32_t flags);
+Rsc7PageFlags DecodeRsc7PageFlags(uint32_t sysFlags, uint32_t gfxFlags);
 
 }  // namespace gage::game::content
