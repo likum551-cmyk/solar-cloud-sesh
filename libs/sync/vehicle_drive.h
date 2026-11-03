@@ -75,8 +75,13 @@
 //     grip turns its velocity with it), or a straight line when |w| > arcMaxRadS (2,
 //     a spin: the velocity does not follow the body) or arcExtrapolation is off.
 //     Beyond the cap: Holding at the capped pose with zero velocity.
-//  4. Before the oldest snapshot (just after a teleport / a reset): Buffering, the
-//     oldest snapshot as it is (with its velocity, so a moving car is not braked).
+//  4. Before the oldest snapshot (just after a teleport / a reset / a first sight): Buffering. Sync D: the car is
+//     shown where it was `oldest.tMs - t` before that snapshot, walked BACK along its velocity and angular velocity
+//     (the same arc as 3, run in reverse), for at most bufferBackMaxMs (300 ms; further back it holds at that pose).
+//     Until Sync D it was pinned at the oldest snapshot as it is, so a moving car's target stood still at the
+//     snapshot's position for the whole render delay (~110 ms) and then moved on: at 25 m/s a hand-over, a first
+//     sight or a bridge reset popped the car 2.7 m ahead of where it was shown and braked it there; at 139 m/s
+//     (the hyper car) 15 m. Its velocity is still the snapshot's (a moving car is not braked).
 //
 // HOW IT WORKS: VehicleDriveController (constants are VehicleDriveConfig defaults)
 //  1. Snap (SET_ENTITY_COORDS + QUATERNION, then velocity and angular velocity as the
@@ -198,6 +203,7 @@ namespace gage::sync {
         double maxBridgeMs = 500.0;       // smoother.h maxBridgeMs
         float teleportMinM = 10.0f;       // RAGECOOP DisplayVehicle snaps at 10 m
         float teleportPerSpeedS = 0.5f;   // ours: half a second of travel at speed
+        double bufferBackMaxMs = 300.0;   // Sync D: Buffering walks the oldest snapshot back along its motion at most this long (0 = pinned, as before)
         bool arcExtrapolation = true;     // ours: velocity turns with the body
         float arcMaxRadS = 2.0f;          // ours: above this |w| (a spin) extrapolate straight
     };

@@ -300,11 +300,25 @@ bool VehicleInterpolator::Sample(double t, VehicleSample& out)
     if (t < oldest.tMs)
     {
         out.mode = VehMode::Buffering;
-        out.pos = oldest.pos;
-        out.vel = oldest.vel;
-        out.rot = oldest.rot;
-        out.angVel = OmegaOf(0);
         out.steering = oldest.steering;
+        const DriveVec w = OmegaOf(0);
+        // Sync D: walk back along the snapshot's own motion (see vehicle_drive.h, 4.), not a pin at its position.
+        const double back = std::fmin(oldest.tMs - t, cfg_.bufferBackMaxMs > 0.0 ? cfg_.bufferBackMaxMs : 0.0);
+        if (back > 0.0)
+        {
+            Extrapolate(oldest, w, -back, out.pos, out.rot);
+            const double wl = Len(ToD(w));
+            out.vel = (cfg_.arcExtrapolation && wl > 1e-6 && wl <= cfg_.arcMaxRadS)
+                          ? ToF(SafeV(RotateD(ExpD(Scale(ToD(w), -back / 1000.0)), ToD(oldest.vel))))
+                          : oldest.vel;
+        }
+        else
+        {
+            out.pos = oldest.pos;
+            out.rot = oldest.rot;
+            out.vel = oldest.vel;
+        }
+        out.angVel = w;
         return true;
     }
     if (t >= newest.tMs)

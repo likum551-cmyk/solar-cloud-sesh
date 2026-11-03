@@ -26,6 +26,7 @@
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
+#include "sync/vehicle_syncd.h"
 #include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
@@ -342,6 +343,7 @@ namespace {
         sync::VehicleInterpolator interp;
         sync::ClassDelay extra;       // this car's class extra on the shared render clock (the tick, under the lock)
         uint32_t ctrlSeq = 0;         // counts hand-overs (and session starts); the tick resets the drive controller on a change
+        uint32_t driveResetSeq = 0;   // Sync D: counts the hand-overs / session starts that must snap the drive controller (sync::DecideHandover)
     };
     std::map<uint16_t, VehNet> g_vehNet;          // g_peersMtx
     uint32_t g_vehSession = 0;                    // g_peersMtx: numbers the server sessions (each Welcome) for the interpolators
@@ -354,6 +356,9 @@ namespace {
         proto::VehicleState st;       // the newest full state (copied when stVersion changed)
         uint32_t stVersion = 0, appliedVersion = 0;
         uint32_t ctrlSeq = 0, appliedCtrlSeq = 0;   // VehNet::ctrlSeq (copied by SyncNet) and the one the tick has handled
+        uint32_t driveResetSeq = 0, appliedDriveResetSeq = 0;   // Sync D: VehNet::driveResetSeq and the one the tick has handled
+        uint32_t syncDPersistentSeen = 0, syncDUnderFloorSeen = 0, syncDBlendsSeen = 0, syncDGracesSeen = 0;   // drive stats at the last "(D)" line
+        sync::DriveErrWindow errWin;  // Sync D: this copy's drive error against the sender's, per 10 s (the "vehicle drive (D)" line)
         int32_t handle = 0;           // the local entity (0 = not spawned)
         uint32_t spawnedModel = 0;
         bool adopted = false;         // `handle` is our own car, bound by a Register answer
@@ -564,6 +569,21 @@ namespace {
         bool rpmLogged = false;          // the one-time line about the missing throttle / RPM native
     };
     PassengerEngineView g_pax;
+    // Sync D (libs/sync/vehicle_syncd.h): what the offline audit changed or could not decide, for the 10 s "(D)" lines.
+    // Script tick, except the hand-over counters (the join worker bumps them): [0] a hand-over that kept the buffer and the
+    // drive controller (between two other controllers), [1] one that cleared / snapped (to or from us, or a new session).
+    struct SyncDStats
+    {
+        uint32_t enterFollowed = 0, enterTasked = 0;                                     // door walks shown by following the pose / by TASK_ENTER_VEHICLE
+        uint32_t displacedOtherSeat = 0, displacedOtherVeh = 0, displacedOutside = 0, displacedUnknown = 0;   // a warped puppet found out of its seat
+        uint32_t unseatLeave = 0, unseatBail = 0, unseatClear = 0, bailFallback = 0;    // exits by TASK_LEAVE_VEHICLE flag 0 / 4160 / the pop / the flag-16 fallback
+        uint32_t carryExits = 0;
+    };
+    SyncDStats g_syncD;
+    std::atomic<uint32_t> g_syncDHandovers[2] = { 0, 0 };
+    // puppet_enter=task (HKCU, read at Welcome) restores the W6 door walk (TASK_ENTER_VEHICLE on the puppet); the default
+    // follows the sender's pose and warps into the seat when the seat list names the player (sync::EnterWalkMode).
+    std::atomic<bool> g_peerEnterTask{false};
     std::atomic<uint32_t> g_vehWorldsIn{0}, g_emotesIn{0};
 
     // A single "companion" ped that mirrors the local player at a fixed offset:
@@ -1142,6 +1162,7 @@ namespace {
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
+        g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         {
             // Sync plan W3: hit_react off|bullet|ragdoll|both (anything else, the default: both),
             // peer_muzzle=0, peer_shoot=script (real fire is the default since the 0.4.3 fixes).
@@ -1193,6 +1214,7 @@ namespace {
                 kv.second.extra.Reset();
                 kv.second.haveState = false;
                 ++kv.second.ctrlSeq;
+                ++kv.second.driveResetSeq;             // a new source of motion: the drive controller snaps onto its first sample
             }
             g_playerHealth.store(playerHealth ? playerHealth : proto::kDefaultHealth);
         }
@@ -1410,7 +1432,16 @@ namespace {
             // resets the drive controller (the new controller starts from where its car is: nobody snaps it).
             if (v.haveState && v.st.ctrl != st.ctrl)
             {
-                v.interp.Clear();
+                // Sync D: only a hand-over to or from US empties the buffer and snaps the drive controller; between two other
+                // controllers the car is the same car on the same road (sync::DecideHandover): the buffer stays, the
+                // controller's own snap rules judge the new samples, and the car is pulled over the small step instead of
+                // being popped a whole render delay ahead.
+                const sync::HandoverAction ha = sync::DecideHandover(v.st.ctrl, st.ctrl, me);
+                if (ha.clearInterp)
+                    v.interp.Clear();
+                if (ha.resetDrive)
+                    ++v.driveResetSeq;
+                g_syncDHandovers[ha.resetDrive ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
                 ++v.ctrlSeq;
             }
             v.st = st;
@@ -4052,7 +4083,14 @@ namespace {
             if (vit != g_vehs.end() && vit->second.handle)
                 UnseatPeer(pe, vit->second.handle);
         }
-        if (e.enterStart && pe.seatedVeh < 0 && !g_world->IsPedInVehicle(ped))
+        // Sync D: the sender's F / G entry is a run to the door and a warp into the seat (never a door animation), so by default the
+        // puppet keeps FOLLOWING the sender's pose with the ordinary locomotion and is warped into the seat when the seat list names
+        // the player (a few tens of cm); its own TASK_ENTER_VEHICLE walk (blend 1.0, its own path, a door animation) fell behind a
+        // running sender and was warped from half the door distance away. puppet_enter=task restores it (sync::EnterWalkMode).
+        const bool enterTask = sync::PuppetUsesEnterTask(g_peerEnterTask.load() ? sync::EnterWalkMode::Task : sync::EnterWalkMode::Follow);
+        if (e.enterStart && !enterTask)
+            ++g_syncD.enterFollowed;
+        if (e.enterStart && enterTask && pe.seatedVeh < 0 && !g_world->IsPedInVehicle(ped))
         {
             const auto vit = g_vehs.find((uint16_t)e.enterVeh);
             if (vit != g_vehs.end() && vit->second.handle && !vit->second.removed)
@@ -4067,6 +4105,7 @@ namespace {
                 ClearPedTasksNow(ped);
                 if (g_world->TaskEnterVehicle(ped, vit->second.handle, 5000, seat, 1.0f, 1))
                 {
+                    ++g_syncD.enterTasked;
                     pe.enterVeh = e.enterVeh;
                     pe.enterTaskMs = nowMs > 0.0 ? nowMs : 1.0;
                     pe.aimTask = false;
@@ -4625,6 +4664,7 @@ namespace {
             v.removed = n.removed;
             v.haveState = n.haveState;
             v.ctrlSeq = n.ctrlSeq;
+            v.driveResetSeq = n.driveResetSeq;
             if (v.stVersion != n.stVersion)
             {
                 v.st = n.st;
@@ -4985,11 +5025,20 @@ namespace {
             {
                 left = g_world->TaskLeaveVehicle(pe.ped, leaveVeh, plan.leaveFlags);
                 if (!left && plan.fallbackFlags >= 0)
+                {
                     left = g_world->TaskLeaveVehicle(pe.ped, leaveVeh, plan.fallbackFlags);
+                    if (left)
+                        ++g_syncD.bailFallback;
+                }
             }
             if (left)
             {
                 const double now = NowMs();
+                // Sync D: which exit was used (counted per 10 s: normal climb-out / bail-out, and a bail-out that had to fall back to the warp)
+                if (plan.mode == sync::UnseatMode::Bail)
+                    ++g_syncD.unseatBail;
+                else
+                    ++g_syncD.unseatLeave;
                 if (plan.pauseMs > 0.0)
                     pe.loco.Pause(plan.pauseMs);
                 pe.leaveUntilMs = now + (plan.pauseMs > 0.0 ? plan.pauseMs : sync::kBailPauseMs);
@@ -5016,6 +5065,7 @@ namespace {
             }
             else
             {
+                ++g_syncD.unseatClear;
                 ClearPedTasksNow(pe.ped);
                 pe.leaveUntilMs = 0;
             }
@@ -5325,8 +5375,12 @@ namespace {
                     // controller snaps onto its first sample (a new source of motion); if we are the new controller
                     // nobody snaps anything: the car stays where it is and our updates start from that pose.
                     v.appliedCtrlSeq = v.ctrlSeq;
-                    v.drive.Reset();
-                    v.lastDriveMs = 0;
+                    if (v.driveResetSeq != v.appliedDriveResetSeq)
+                    {
+                        v.appliedDriveResetSeq = v.driveResetSeq;
+                        v.drive.Reset();
+                        v.lastDriveMs = 0;
+                    }
                     v.bodyShown = sync::BodyShown();   // the new controller's lights and doors are shown afresh
                     v.appliedEngine = v.appliedSiren = v.appliedLights = -1;   // ... and so are the server's engine / siren / health
                     v.appliedBody = v.appliedEngineHp = 0xFFFF;
@@ -5417,6 +5471,7 @@ namespace {
                             else
                                 v.lastContactFlag = false;
                             const sync::VehicleDriveOutput o = v.drive.Update(in);
+                            v.errWin.Add(o.posErrorM, o.rotErrorDeg, sync::LateralErrorM(s.pos, s.rot, in.localPos), s.mode, o.snap);   // Sync D
                             if (o.contactOpened)
                             {
                                 if (o.contactOpened == 1)
@@ -5530,6 +5585,35 @@ namespace {
                     if (pe.seatedVeh == (int)id && pe.seatedSeat == (int)s &&
                         g_world->GetPedInVehicleSeat(h, gtaSeat) == pe.ped)
                         continue;                      // already there
+                    if (pe.seatedVeh == (int)id && pe.seatedSeat == (int)s)
+                    {
+                        // Sync D diagnosis: we warped this ped into this seat and it is no longer in it. Where is it? (the W9 re-warp
+                        // counters say how often, not why: GTA's shuffle to another seat, another car, or out of every car)
+                        const int32_t nowIn = g_world->GetVehiclePedIsIn(pe.ped);
+                        const sync::SeatDisplacement dsp = sync::ClassifyDisplacement(true, true, nowIn == h && nowIn != 0,
+                                                                                    g_world->IsPedInVehicle(pe.ped));
+                        switch (dsp)
+                        {
+                        case sync::SeatDisplacement::OtherSeat: ++g_syncD.displacedOtherSeat; break;
+                        case sync::SeatDisplacement::OtherVehicle: ++g_syncD.displacedOtherVeh; break;
+                        case sync::SeatDisplacement::Outside: ++g_syncD.displacedOutside; break;
+                        default: ++g_syncD.displacedUnknown; break;
+                        }
+                        static int dispLogged = 0;
+                        if (dispLogged < 10)
+                        {
+                            ++dispLogged;
+                            int seatNow = -9;
+                            if (dsp == sync::SeatDisplacement::OtherSeat)
+                                for (int q = -1; q < (int)proto::kVehSeats - 1 && seatNow == -9; ++q)
+                                    if (g_world->GetPedInVehicleSeat(h, q) == pe.ped)
+                                        seatNow = q + 1;
+                            PeerLog(true, "engine: vehicle id=%u: player %u was warped into seat %u and is %s (%s)", id, (unsigned)pid, (unsigned)s,
+                                    dsp == sync::SeatDisplacement::OtherSeat ? "now in another seat of the same car" :
+                                    dsp == sync::SeatDisplacement::OtherVehicle ? "now in another vehicle" : "no longer in any vehicle",
+                                    dsp == sync::SeatDisplacement::OtherSeat ? (std::string("wire seat ") + std::to_string(seatNow)).c_str() : "a re-warp follows");
+                        }
+                    }
                     // W6: a ped walking to this car with TASK_ENTER_VEHICLE (TickPeerTierB) is left to the walk; the
                     // old seat warp takes over once it has had sync::kEnterTaskMaxMs (or the ped is already inside).
                     // W9 item 1: ... and no longer once the sender's move says it is not entering (it was put into the seat).
@@ -6849,6 +6933,72 @@ namespace {
             SyncLocalEmoteDict();                      // ended, given up or cut short: free the dictionary
     }
 
+    // Sync D, every 10 s with the vehicles lines: what the remote cars' drive did (position / heading / sideways error against the
+    // sender's sample AT THE INSTANT IT CLAIMS, so latency is not in it; snaps; which interpolator mode the frames were in) and the
+    // occupant counters the W9 line cannot give (door walks followed vs tasked, a warped puppet found out of its seat and where,
+    // exits by flag, controller hand-overs kept vs snapped). Script tick. `last` is the previous window's counters.
+    void ReportSyncD(const SyncDStats& last, const uint32_t lastHand[2])
+    {
+        const SyncDStats& c = g_syncD;
+        sync::DriveErrWindow::Window agg;
+        double posSum = 0, rotSum = 0, latSum = 0;
+        uint16_t worstId = 0xFFFF;
+        float worstPos = -1.0f;
+        uint32_t cars = 0, snapsTotal = 0, persistent = 0, underFloor = 0, blends = 0, graces = 0;
+        for (auto& kv : g_vehs)
+        {
+            NetVeh& v = kv.second;
+            const sync::VehicleDriveStats& ds = v.drive.Stats();
+            const sync::DriveErrWindow::Window w = v.errWin.Take();
+            persistent += ds.persistentSnaps - v.syncDPersistentSeen;
+            underFloor += ds.underFloorSnaps - v.syncDUnderFloorSeen;
+            blends += ds.blends - v.syncDBlendsSeen;
+            graces += ds.contacts - v.syncDGracesSeen;
+            v.syncDPersistentSeen = ds.persistentSnaps;
+            v.syncDUnderFloorSeen = ds.underFloorSnaps;
+            v.syncDBlendsSeen = ds.blends;
+            v.syncDGracesSeen = ds.contacts;
+            if (!w.frames)
+                continue;
+            ++cars;
+            agg.frames += w.frames;
+            agg.buffering += w.buffering;
+            agg.interpolating += w.interpolating;
+            agg.extrapolating += w.extrapolating;
+            agg.holding += w.holding;
+            agg.snaps += w.snaps;
+            posSum += (double)w.posMeanM * w.frames;
+            rotSum += (double)w.rotMeanDeg * w.frames;
+            latSum += (double)w.latMeanM * w.frames;
+            agg.posMaxM = std::max(agg.posMaxM, w.posMaxM);
+            agg.rotMaxDeg = std::max(agg.rotMaxDeg, w.rotMaxDeg);
+            agg.latMaxM = std::max(agg.latMaxM, w.latMaxM);
+            snapsTotal += w.snaps;
+            if (w.posMaxM > worstPos)
+            {
+                worstPos = w.posMaxM;
+                worstId = kv.first;
+            }
+        }
+        if (agg.frames)
+            GLOGI("engine: vehicle drive (D), last 10 s: %u remote cars, %u drive frames (%u interpolating, %u extrapolating, %u holding, %u "
+                  "buffering); error against the sender's sample at the instant it claims: position mean %.3f / max %.2f m, heading mean %.2f / "
+                  "max %.1f deg, sideways mean %.3f / max %.2f m (worst car id=%u); %u snaps (%u persistent-error, %u under-floor in the window), "
+                  "%u quaternion blends, %u contact graces",
+                  cars, agg.frames, agg.interpolating, agg.extrapolating, agg.holding, agg.buffering, posSum / agg.frames, (double)agg.posMaxM,
+                  rotSum / agg.frames, (double)agg.rotMaxDeg, latSum / agg.frames, (double)agg.latMaxM, (unsigned)worstId, snapsTotal, persistent,
+                  underFloor, blends, graces);
+        const uint32_t hand0 = g_syncDHandovers[0].load(), hand1 = g_syncDHandovers[1].load();
+        GLOGI("engine: occupants (D), last 10 s: door walks followed on the pose %u / TASK_ENTER_VEHICLE %u (puppet_enter=%s); a warped puppet "
+              "found out of its seat (one count per retry): in another seat %u, in another car %u, in no car %u, unknown %u; exits: %u climb-out "
+              "(flag 0), %u bail-out (4160, %u of them by the flag-16 fallback), %u pops; controller hand-overs kept %u / snapped %u",
+              c.enterFollowed - last.enterFollowed, c.enterTasked - last.enterTasked, g_peerEnterTask.load() ? "task" : "follow",
+              c.displacedOtherSeat - last.displacedOtherSeat, c.displacedOtherVeh - last.displacedOtherVeh,
+              c.displacedOutside - last.displacedOutside, c.displacedUnknown - last.displacedUnknown, c.unseatLeave - last.unseatLeave,
+              c.unseatBail - last.unseatBail, c.bailFallback - last.bailFallback, c.unseatClear - last.unseatClear, hand0 - lastHand[0],
+              hand1 - lastHand[1]);
+    }
+
     // Every 10 s: one line each for vehicles, combat and anims (only while connected).
     void ReportV4(double nowMs)
     {
@@ -6984,6 +7134,14 @@ namespace {
                               tot.edges, tot.flagTrueHard, tot.opened[1], tot.opened[2], tot.opened[3], mutes, tot.graceFrames, tot.devOver1,
                               tot.devOver3, (double)worstDev, tot.localUnder3m, tot.localUnder1_5m, tot.puppetUnder3m, printed, interesting);
                 }
+            }
+            {
+                static SyncDStats lastD;
+                static uint32_t lastHand[2] = { 0, 0 };
+                ReportSyncD(lastD, lastHand);
+                lastD = g_syncD;
+                lastHand[0] = g_syncDHandovers[0].load();
+                lastHand[1] = g_syncDHandovers[1].load();
             }
             const sync::VitalsStats& vs = g_vitals.Stats();
             const sync::HitBatchStats& hs = g_hits.Stats();

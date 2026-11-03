@@ -10,8 +10,10 @@
 //   Leaving X:                Exit(id), also when the player goes straight into another car (/car,
 //                             SET_PED_INTO_VEHICLE: no frame on foot between): Exit(old id) goes out on
 //                             one Tick and the new car's command on the next. Left while the answer is
-//                             still out: the command becomes an "orphan" and its Ok, when it comes, is
-//                             answered with an Exit (a Register's Ok also binds that car to the new id).
+//                             still out: the command becomes an "orphan". An Enter's Exit is owed AT ONCE (Sync D: the
+//                             server may seat us on it, or keep us in the seat a refused change leaves, and a late Ok must
+//                             not Exit a newer seating in the same car); a Register has no vehicle id yet, so its Ok is
+//                             answered with an Exit (and also binds that car to the new id).
 //   Answers:                  matched on op AND vehicle id (a Register has no id yet: on op alone, the
 //                             oldest orphan first, the server answers in order). Ok -> linked (seat 0 =
 //                             the server's driver: send VehicleUpdate). An Ok that matches nothing we

@@ -105,7 +105,22 @@ int LocalVehicleLink::FindOrphan(uint8_t op, uint16_t vehId) const
 void LocalVehicleLink::LeaveCurrent(double nowMs)
 {
     if (awaiting_)
+    {
         Orphan(pendingOp_, netId_, veh_, nowMs);
+        // Sync D (occupant fuzz, two defects of one root): the server may already seat us on this unanswered Enter, or keep us
+        // in the seat we had (a refused SEAT CHANGE leaves the player where he was), and an orphan's answer was the only thing
+        // that could owe the Exit:
+        //   * a refusal owed nothing, so the player stood outside while the server kept listing him in the old seat and every
+        //     other client warped his puppet back into the car until he sat in it again (the "passenger re-seated" ghost);
+        //   * an Ok owed an Exit for the VEHICLE when it arrived, which also removed a NEW seating in the same car made in
+        //     between (leave and get back in within a round trip: F, exit, F), leaving the client linked in a car the
+        //     server had emptied of him.
+        // So the Exit is owed NOW, at the moment we leave: it follows the Enter on the same ordered channel (an Ok is undone,
+        // a refusal leaves nothing to undo but the old seat) and precedes any new Enter (OnFoot flushes owed Exits first).
+        // The orphan's later answer owes nothing more (Apply). A Register has no vehicle id yet: its Ok still owes the Exit.
+        if (netId_ >= 0 && pendingOp_ == kOpEnter)
+            Owe(netId_, veh_);
+    }
     else if (state_ == State::Linked && netId_ >= 0)
         Owe(netId_, veh_);
     awaiting_ = false;
@@ -180,8 +195,9 @@ void LocalVehicleLink::Apply(const Res& r, const VehLinkIn& in, VehLinkOut& out)
             {
                 out.bindVeh = o.veh;            // that car now IS server vehicle r.vehId
                 out.bindNetId = r.vehId;
+                Owe(r.vehId, o.veh);            // a Register had no vehicle id when we left: only its Ok can owe the Exit
             }
-            Owe(r.vehId, o.veh);
+            // an Enter's Exit was owed when we left (LeaveCurrent): owing it again here could remove a newer seating
         }
         return;
     }
