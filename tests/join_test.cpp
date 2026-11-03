@@ -251,6 +251,17 @@ int main() {
     Check("SanitizeName: nothing left -> player", join::SanitizeName(L"") == "player" && join::SanitizeName(L"   ") == "player");
     Check("SanitizeName: every result passes ValidName",
           proto::ValidName(join::SanitizeName(L"a b\t\"c\" é --..")));
+    {
+        using R = proto::RefuseReason;
+        bool finalOk = true, retryOk = true;
+        for (R r : {R::VersionMismatch, R::BadName, R::Protocol, R::Banned})
+            finalOk = finalOk && join::RefusalIsFinal(r);
+        for (R r : {R::NameTaken, R::ServerFull, R::HelloTimeout, R::TooManyConnections})
+            retryOk = retryOk && !join::RefusalIsFinal(r);
+        Check("RefusalIsFinal: a version mismatch, a bad name, a protocol error and a ban end the engine's connecting; a taken name (our own "
+              "dropped session's ghost), a full server, a missed Hello and the connect rate are retried",
+              finalOk && retryOk && join::kRefusedRetryMs >= 1000, std::string(finalOk ? "" : "final ") + (retryOk ? "" : "retry "));
+    }
     Check("JsonEscape: quote, backslash, newline and control characters",
           join::JsonEscape(std::string("a\"b\\c\n\x01")) == "a\\\"b\\\\c\\n\\u0001", join::JsonEscape(std::string("a\"b\\c\n\x01")));
     Check("JsonEscape: UTF-8 passes through", join::JsonEscape("\xE1\x83\x92") == "\xE1\x83\x92");
@@ -549,7 +560,7 @@ int main() {
     }
 
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    const int expected = 49 + 2 + 1 + 2 + 1;   // + vehicle mailbox 2 + playerHealth 1 + sample time 2 (sync plan W6) + refusal reason/text 1
+    const int expected = 49 + 2 + 1 + 2 + 1 + 1;   // + vehicle mailbox 2 + playerHealth 1 + sample time 2 (sync plan W6) + refusal reason/text 1 + RefusalIsFinal 1
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
         return 1;

@@ -1989,7 +1989,11 @@ namespace gage::server {
     {
         if (AllDigits(target))
         {
-            auto it = players_.find((uint16_t)std::strtoul(target.c_str(), nullptr, 10));
+            // An id wider than the wire's u16 names nobody: `(uint16_t)` used to wrap 65536 onto player 0 (a kick or a
+            // ban of the wrong player). strtoul saturates on overflow, so the range test is exact on every platform.
+            const unsigned long id = std::strtoul(target.c_str(), nullptr, 10);
+            if (id >= proto::kMaxPlayers) return nullptr;
+            auto it = players_.find((uint16_t)id);
             return it == players_.end() ? nullptr : it->second;
         }
         auto it = nameKeys_.find(proto::NameKey(target));

@@ -26,11 +26,26 @@ namespace gage::join {
         std::wstring player = L"player";
     };
 
+    // Whether a Refuse is the end of the engine's connecting (the player has to act: update the game, change the name, ask an
+    // admin, report a protocol bug) or something the server lifts by itself, so the engine keeps trying. NameTaken is the
+    // ghost of our own dropped connection (the server holds it for its peer timeout, 5..30 s, and a reconnect inside that
+    // window is refused as a duplicate name), ServerFull and TooManyConnections clear as slots free and the per-address
+    // connect bucket refills, HelloTimeout is a lost packet. Giving up on those left a player whose Wi-Fi blinked
+    // staring at a dead loading screen until the game was restarted.
+    constexpr bool RefusalIsFinal(proto::RefuseReason r)
+    {
+        return !(r == proto::RefuseReason::NameTaken || r == proto::RefuseReason::ServerFull ||
+                 r == proto::RefuseReason::HelloTimeout || r == proto::RefuseReason::TooManyConnections);
+    }
+    // How long the engine waits before the next attempt after a refusal it does not treat as final (one attempt costs the
+    // server a connection and counts against its per-address connect rate, whose default is well above one per 5 s).
+    constexpr unsigned kRefusedRetryMs = 5000;
+
     // The result of one Connect().
     struct Session
     {
         bool           connected = false;
-        bool           refused = false;   // the server refused us (version, name, full): retrying cannot help
+        bool           refused = false;   // the server refused us (version, name, full); RefusalIsFinal(refuseReason) says whether retrying can help
         uint16_t       myId = 0;
         uint16_t       tickHz = 0;
         std::string    serverName;

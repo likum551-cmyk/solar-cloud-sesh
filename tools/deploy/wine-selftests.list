@@ -28,6 +28,7 @@
 
 # ---- pure computation: a failure is a real regression or a compiler/ABI difference -----------------------------
 quant_test            | gate   |  300 |        | protocol quantisation: exhaustive round trips and float error bounds; no OS calls, so a failure is a codegen or logic difference
+decode_fuzz_test      | soft   |  120 |        | every protocol Decode and the UDP query datagrams against truncation, trailing bytes, bit flips and random packets (deterministic, about 1 s, no OS calls); new in 0.4.5-sync, soft until it has passed twice on the VPS (then gate)
 interest_test         | gate   |  300 |        | Replicator (interest management, delta frames) driven directly, simulated time; no sockets
 sync_test             | gate   |  300 |        | remote-player smoother under loss and jitter; pure
 locomotion_test       | gate   |  300 |        | remote-ped locomotion controller against scripted poses; seeded, pure
