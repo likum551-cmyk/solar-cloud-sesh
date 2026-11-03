@@ -1877,6 +1877,35 @@ static server::Config AdminConfig()
     return cfg;
 }
 
+// An admin target is an id (decimal) or a name. An id wider than the wire's u16 must NOT wrap onto a real player
+// (`kick 65536` used to kick player 0, `ban 65537` banned player 1). AllDigits caps an id at 5 digits, so 65536..99999
+// are the wrapping range; a longer digit string is a name.
+static void AdminIdTests()
+{
+    Rig rig;
+    if (!rig.Start()) { Check("admin ids: server starts", false); return; }
+    Probe alice(rig), bob(rig);
+    const bool joined = alice.Join("Alice") && bob.Join("Bob");
+    const uint16_t aId = alice.s.myId(), bId = bob.s.myId();
+    std::string o;
+    bool wrapped = true;
+    std::string what;
+    for (const unsigned long long off : {65536ull, 70000ull, 99000ull}) // AllDigits caps an id at 5 digits; longer digit strings are names
+    {
+        const std::string aWide = std::to_string(aId + off), bWide = std::to_string(bId + off);
+        for (const char* verb : {"kick ", "heal ", "kill ", "ban "})
+        {
+            if (rig.srv.Execute(std::string(verb) + aWide, o) != server::CommandResult::Error) { wrapped = false; what += std::string(verb) + aWide + " "; }
+            if (rig.srv.Execute(std::string(verb) + bWide, o) != server::CommandResult::Error) { wrapped = false; what += std::string(verb) + bWide + " "; }
+        }
+        if (rig.srv.Execute("armor " + aWide + " 5", o) != server::CommandResult::Error) { wrapped = false; what += "armor " + aWide + " "; }
+    }
+    rig.Pump(100);
+    Check("admin ids: a decimal id wider than 16 bits (65536 + id ... 99999) never reaches player `id`: kick / heal / kill / ban / armor refuse it, "
+          "nobody is kicked, killed or banned",
+          joined && wrapped && rig.srv.Players().size() == 2 && rig.srv.bans().entries().empty(), what + " players=" + std::to_string(rig.srv.Players().size()));
+}
+
 static void AdminTests()
 {
     {
@@ -2963,6 +2992,7 @@ int main()
     std::printf("-- bans\n");
     BanTests();
     std::printf("-- admin channel\n");
+    AdminIdTests();
     AdminTests();
     std::printf("-- authority rules (anticheat.h, vehicles.h)\n");
     AuthorityUnitTests();
@@ -2978,7 +3008,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 106; // W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run
+    const int expected = 107; // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

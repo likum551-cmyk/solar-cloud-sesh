@@ -90,6 +90,13 @@ add_executable(quant_test ${GAGE_ROOT}/tests/quant_test.cpp)
 target_link_libraries(quant_test PRIVATE gage_protocol)
 set_target_properties(quant_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
+# decode_fuzz_test: every protocol Decode and the UDP query datagrams against truncation, trailing bytes, every
+# single-bit flip and random / mutated packets (deterministic): refused or canonical, never a crash, refusals leave
+# `out` alone. Needs only the protocol library.
+add_executable(decode_fuzz_test ${GAGE_ROOT}/tests/decode_fuzz_test.cpp)
+target_link_libraries(decode_fuzz_test PRIVATE gage_protocol)
+set_target_properties(decode_fuzz_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
 # interest_test: the Replicator driven directly (no sockets): relevance radii and hysteresis, the
 # always-relevant override, send rates, the bandwidth budget, the coarse channel, a 600-player crowd.
 add_executable(interest_test ${GAGE_ROOT}/tests/interest_test.cpp)

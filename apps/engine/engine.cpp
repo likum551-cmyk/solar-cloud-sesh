@@ -59,7 +59,9 @@ namespace {
     join::Config g_cfg;
     std::atomic<bool> g_active{false};
     std::atomic<bool> g_connecting{false};
-    std::atomic<bool> g_giveUp{false}; // the server refused us: retrying cannot help
+    std::atomic<bool> g_giveUp{false}; // the server refused us for a reason retrying cannot fix (join::RefusalIsFinal)
+    std::atomic<ULONGLONG> g_refusedRetryAt{0}; // GetTickCount64: after a refusal the server may lift (a taken name, a full server), no attempt before
+    std::atomic<ULONGLONG> g_refusedNoticeAt{0}; // the last chat line about such a refusal (rate limit)
     std::thread g_connectThread;
 
     // The server's own sentence for a refusal the player can act on: today only Refuse(VersionMismatch)
@@ -1048,7 +1050,22 @@ namespace {
             game::Overlay::PushSystemLine(sess.refuseText.c_str());
             g_refuseSaidAt.store(GetTickCount64());
         }
-        g_giveUp.store(true);       // after the text is stored: the loader never shows the generic line for it
+        if (join::RefusalIsFinal(sess.refuseReason))
+        {
+            g_giveUp.store(true);   // after the text is stored: the loader never shows the generic line for it
+            return;
+        }
+        // A refusal the server lifts by itself (our own dropped session's ghost holding the name, a full server, the
+        // per-address connect rate): wait and try again instead of giving up for the rest of the run.
+        const ULONGLONG now = GetTickCount64();
+        g_refusedRetryAt.store(now + join::kRefusedRetryMs);
+        if (now - g_refusedNoticeAt.load() >= 30000)
+        {
+            g_refusedNoticeAt.store(now);
+            const std::string line = "The server refused the connection (" + (sess.refuseText.empty() ? std::string(proto::ToString(sess.refuseReason)) : sess.refuseText) +
+                                     "). Trying again every few seconds.";
+            game::Overlay::PushSystemLine(line.c_str());
+        }
     }
 
     // Render thread, once per Present while the world is shown: repeat the refusal text in chat.
@@ -1076,6 +1093,8 @@ namespace {
             return;
         if (g_connecting.load())
             return;
+        if (GetTickCount64() < g_refusedRetryAt.load())
+            return;                                    // a refusal the server may lift: not before the pause is over
         ULONG now = GetTickCount();
         if (now - g_lastConnectAttempt.load() < 1000)
             return;                                   // retry at most ~1/s
@@ -1090,7 +1109,10 @@ namespace {
                         sess.serverName.c_str(), (unsigned)sess.myId);
                 else if (sess.refused)
                 {
-                    GLOGE("engine: join refused (%ls); not retrying", sess.error.c_str());
+                    if (join::RefusalIsFinal(sess.refuseReason))
+                        GLOGE("engine: join refused (%ls); not retrying", sess.error.c_str());
+                    else
+                        GLOGW("engine: join refused (%ls); trying again in %u s", sess.error.c_str(), join::kRefusedRetryMs / 1000);
                     OnJoinRefused(sess);
                 }
                 else
