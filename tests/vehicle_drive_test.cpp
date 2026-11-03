@@ -45,6 +45,13 @@
 //      blended back beyond 45 m, slewed), and a bike's lean (RollDeg conventions; the roll survives the
 //      controller on a banked circle).
 //
+//  11. Sync D (remote vehicle motion and occupants, offline audit): tests/vehsim.h runs the REAL interpolator, controller,
+//      PresentLead, NetClock and ClassDelay behind a simulated relay (30 Hz sender, 30/15/10 Hz tiers, 20-80 ms jitter, 3-5 %
+//      loss, the wire quantisation) against a simplified physical car, on scripted paths. Checks: Buffering walks the oldest
+//      snapshot back along its motion (no pin: the 2.5 m / 14 m pop of a hand-over), DecideHandover (no snap between two other
+//      controllers), the whole pipeline's error bounds per scenario and tier, stalls, DriveErrWindow, LateralErrorM,
+//      ClassifyDisplacement, EnterWalkMode.
+//
 // Every loop-shaped check also asserts how many frames it measured; the run asserts
 // the total number of checks.
 
@@ -52,6 +59,8 @@
 #include "sync/vehicle_drive.h"
 #include "sync/hypertune.h"
 #include "sync/vehicle_w9.h"
+#include "sync/vehicle_syncd.h"
+#include "vehsim.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1098,6 +1107,163 @@ static void TestW9() {
     }
 }
 
+
+// ---- 11. Sync D: the receive pipeline against a simulated relay and car (tests/vehsim.h) ---------------------------
+
+constexpr int kSyncDChecks = 11;
+
+static void TestSyncD() {
+    // Buffering: the oldest snapshot walked BACK along its velocity, not pinned (the pop after a hand-over / reset / teleport)
+    {
+        auto make = [](double bufferBackMs) {
+            VehicleInterpConfig cfg;
+            cfg.bufferBackMaxMs = bufferBackMs;
+            VehicleInterpolator ip(cfg);
+            VehicleSnapshot s;
+            s.tMs = 1000; s.pos = V(5, 100, 2); s.vel = V(0, 25, 0); s.rot = vq::FromHeadingDeg(0);
+            ip.Push(s);
+            return ip;
+        };
+        VehicleInterpolator a = make(300), pinned = make(0);
+        VehicleSample s100, s500, s0, sp;
+        const bool ok = a.Sample(900, s100) && a.Sample(500, s500) && a.Sample(1000, s0) && pinned.Sample(900, sp);
+        Check("Buffering: 100 ms before the only snapshot a 25 m/s car is 2.5 m behind it (not pinned on it), capped at 300 ms (7.5 m back at 500 ms); at its own time exactly there; the velocity is kept; bufferBackMaxMs 0 is the old pin",
+              ok && s100.mode == VehMode::Buffering && std::fabs(s100.pos.y - 97.5f) < 0.01 && std::fabs(s500.pos.y - 92.5f) < 0.01 &&
+                  s0.mode != VehMode::Buffering && std::fabs(s0.pos.y - 100.0f) < 1e-3 && std::fabs(s100.vel.y - 25.0f) < 1e-3 &&
+                  std::fabs(sp.pos.y - 100.0f) < 1e-3,
+              F("100 ms: %.3f, 500 ms: %.3f, own time: %.3f, vel %.2f, pinned %.3f", s100.pos.y, s500.pos.y, s0.pos.y, s100.vel.y, sp.pos.y));
+    }
+    // DecideHandover
+    {
+        const uint16_t me = 3, none = 0xFFFF;
+        const HandoverAction third = DecideHandover(1, 2, me), toMe = DecideHandover(1, me, me), fromMe = DecideHandover(me, 2, me),
+                             toNone = DecideHandover(1, none, me), fromNone = DecideHandover(none, 2, me), same = DecideHandover(2, 2, me),
+                             meNone = DecideHandover(me, none, me);
+        Check("DecideHandover: between two other controllers (or from / to nobody) nothing is cleared or snapped; to or from us both are; no change is none",
+              !third.clearInterp && !third.resetDrive && !toNone.clearInterp && !toNone.resetDrive && !fromNone.clearInterp &&
+                  !fromNone.resetDrive && toMe.clearInterp && toMe.resetDrive && fromMe.clearInterp && fromMe.resetDrive &&
+                  meNone.clearInterp && meNone.resetDrive && !same.clearInterp && !same.resetDrive);
+    }
+    // A controller hand-over at 25 m/s and at 139 m/s (the hyper car): the old behaviour (buffer pinned, cleared and snapped)
+    // against the new (walk-back Buffering, nothing cleared between two other controllers)
+    {
+        struct R { vehsim::Metrics oldM, bufM, newM; };
+        auto run = [](double v) {
+            R r;
+            vehsim::Truth t(vehsim::scn::Straight(v));
+            vehsim::RunCfg oldc; oldc.handoverMs = 6000; oldc.interp.bufferBackMaxMs = 0.0;               // the old Buffering + Clear + Reset
+            vehsim::RunCfg bufc; bufc.handoverMs = 6000;                                                  // walk-back Buffering, still cleared + snapped (a hand-over to / from us, a bridge reset)
+            vehsim::RunCfg newc; newc.handoverMs = 6000;
+            const HandoverAction ha = DecideHandover(1, 2, 3);
+            newc.handoverKeep = !ha.clearInterp && !ha.resetDrive;                                       // between two other controllers: nothing cleared
+            r.oldM = vehsim::Run(t, oldc);
+            r.bufM = vehsim::Run(t, bufc);
+            r.newM = vehsim::Run(t, newc);
+            return r;
+        };
+        const R a = run(25.0), b = run(139.0);
+        Check("hand-over at 25 m/s: the old pin-clear-snap pops the car 2.5 m and snaps twice; the walk-back Buffering alone (a clear + snap still) stays under 0.3 m; with the buffer and controller kept it also snaps only at the spawn",
+              a.oldM.posMax > 2.0 && a.oldM.snaps == 2 && a.bufM.posMax < 0.3 && a.bufM.snaps == 2 && a.newM.posMax < 0.3 && a.newM.snaps == 1 && a.newM.pops == 0 &&
+                  a.oldM.frames > 900 && a.newM.frames > 900,
+              F("old %.2f m (snaps %u, pop %.2f), buffering fix %.3f m (snaps %u), kept %.3f m (snaps %u, pop %.2f)", a.oldM.posMax, a.oldM.snaps, a.oldM.popMax,
+                a.bufM.posMax, a.bufM.snaps, a.newM.posMax, a.newM.snaps, a.newM.popMax));
+        Check("hand-over at 139 m/s (500 km/h): the old one pops it 14 m; walk-back Buffering and the kept buffer both stay under 1 m",
+              b.oldM.posMax > 10.0 && b.bufM.posMax < 1.0 && b.newM.posMax < 1.0 && b.newM.snaps == 1,
+              F("old %.2f m, buffering fix %.3f m, kept %.3f m (snaps %u)", b.oldM.posMax, b.bufM.posMax, b.newM.posMax, b.newM.snaps));
+    }
+    // The whole pipeline, per scenario and relay tier: error against the sender at the instant the sample claims
+    {
+        struct Sc { const char* name; vehsim::Script s; };
+        const Sc scs[] = {{"straight", vehsim::scn::Straight(25)}, {"lane change", vehsim::scn::LaneChange()}, {"hard brake", vehsim::scn::HardBrake()},
+                          {"brake in a bend", vehsim::scn::BrakeInBend()}, {"reverse", vehsim::scn::Reverse()}, {"hairpin", vehsim::scn::Hairpin()},
+                          {"jump", vehsim::scn::Jump()}, {"parked", vehsim::scn::Parked()}};
+        bool ok = true;
+        std::string got;
+        int frames = 0;
+        for (int tier = 1; tier <= 3; ++tier)
+            for (const Sc& sc : scs) {
+                vehsim::Truth t(sc.s);
+                vehsim::RunCfg rc;
+                rc.net.relayEvery = tier;
+                rc.net.upJitterMs = 30; rc.net.downJitterMs = 60; rc.net.loss = 0.05;                   // 20-80 ms jitter, 5 % loss
+                rc.net.seed = 11 + tier;
+                const vehsim::Metrics m = vehsim::Run(t, rc);
+                frames += m.frames;
+                const bool good = m.frames > 400 && m.posMax < 0.4 && m.posMean < 0.12 && m.angMax < 15.0 && m.snaps == 1 && m.pops == 0 &&
+                                  m.latMax < 0.5 && m.zBounceMax < 0.3 && m.zFloatMax < 0.4 && m.posStillMax < 0.2;
+                if (!good) {
+                    ok = false;
+                    got += F("[%s t%d: %.2f m / mean %.3f, %.1f deg, lat %.2f, snaps %u, pops %d, z %.2f/%.2f, still %.2f] ", sc.name, tier, m.posMax, m.posMean,
+                             m.angMax, m.latMax, m.snaps, m.pops, m.zBounceMax, m.zFloatMax, m.posStillMax);
+                }
+            }
+        Check("pipeline at 30/15/10 Hz relay with 20-80 ms jitter and 5 % loss: straight, lane change, hard brake, brake in a bend, reverse, hairpin, jump, parked all stay within 0.4 m / 15 deg of the instant the sample claims, one snap (the spawn), no pops",
+              ok && frames > 10000, ok ? F("%d frames", frames) : got);
+    }
+    // 500 km/h: the error is the timing noise times 139 m/s (1 ms = 14 cm), so the bound is wider; speed caps and quantisation hold
+    {
+        bool ok = true;
+        std::string got;
+        double worst = 0;
+        for (int tier = 1; tier <= 3; ++tier)
+            for (int curve = 0; curve < 2; ++curve) {
+                vehsim::Truth t(curve ? vehsim::scn::HyperCurve() : vehsim::scn::HyperStraight());
+                vehsim::RunCfg rc;
+                rc.net.relayEvery = tier;
+                rc.net.seed = 21 + tier;
+                const vehsim::Metrics m = vehsim::Run(t, rc);
+                worst = std::max(worst, m.posMax);
+                if (!(m.frames > 800 && m.posMax < 3.0 && m.angMax < 8.0 && m.snaps == 1 && m.pops <= 3)) {
+                    ok = false;
+                    got += F("[t%d %s: %.2f m, %.1f deg, snaps %u, pops %d] ", tier, curve ? "curve" : "straight", m.posMax, m.angMax, m.snaps, m.pops);
+                }
+            }
+        Check("hyper car at 139 m/s (straight and a gentle curve, three tiers): within 3 m / 8 deg, one snap (1 ms of render-clock noise is 14 cm there: the 10 Hz tier's delay change costs 2.5 m)", ok, ok ? F("worst %.2f m", worst) : got);
+    }
+    // a network hole: 300 ms is bridged without a snap; 1.2 s snaps once (persistent error) and the car is back within 0.2 m two seconds later
+    {
+        vehsim::Truth t(vehsim::scn::Straight(25));
+        vehsim::RunCfg a; a.net.stallFromMs = 7000; a.net.stallToMs = 7300;
+        vehsim::RunCfg b; b.net.stallFromMs = 7000; b.net.stallToMs = 8200;
+        const vehsim::Metrics ma = vehsim::Run(t, a), mb = vehsim::Run(t, b);
+        Check("a 300 ms network hole is bridged with no snap and no pop; a 1.2 s hole costs at most one more snap and the car is back on the path (< 0.2 m) at the end",
+              ma.snaps == 1 && ma.pops == 0 && ma.posMax < 0.5 && mb.snaps <= 2 && mb.endPosErr < 0.2,
+              F("300 ms: snaps %u, pops %d, %.2f m; 1.2 s: snaps %u, end %.3f m", ma.snaps, ma.pops, ma.posMax, mb.snaps, mb.endPosErr));
+    }
+    // present-time lead on a hairpin: the car is drawn near the present (an estimate), within 1 m / 20 degrees of where it will be
+    {
+        vehsim::Truth t(vehsim::scn::Hairpin());
+        vehsim::RunCfg rc; rc.lead = true;
+        const vehsim::Metrics m = vehsim::Run(t, rc);
+        Check("present lead on a hairpin at 12 m/s: within 1.2 m / 20 degrees of the present, one snap",
+              m.frames > 700 && m.posMax < 1.2 && m.angMax < 20.0 && m.snaps == 1, F("%.2f m, %.1f deg, snaps %u", m.posMax, m.angMax, m.snaps));
+    }
+    // the diagnostics
+    {
+        DriveErrWindow w;
+        w.Add(0.5, 4.0, 0.2, VehMode::Interpolating, false);
+        w.Add(1.5, 2.0, 0.4, VehMode::Extrapolating, true);
+        w.Add(std::nan(""), 1.0, 1.0, VehMode::Holding, false);          // refused
+        const DriveErrWindow::Window a = w.Take(), b = w.Take();
+        const DriveQuat east = vq::FromHeadingDeg(-90.0);               // forward is +x
+        Check("DriveErrWindow: frames, mean and max, snaps and modes of a window, a non-finite sample refused, Take clears",
+              a.frames == 2 && std::fabs(a.posMeanM - 1.0f) < 1e-6 && a.posMaxM == 1.5f && std::fabs(a.rotMeanDeg - 3.0f) < 1e-6 && a.rotMaxDeg == 4.0f &&
+                  std::fabs(a.latMeanM - 0.3f) < 1e-6 && a.latMaxM == 0.4f && a.snaps == 1 && a.interpolating == 1 && a.extrapolating == 1 && a.holding == 0 &&
+                  b.frames == 0 && b.posMaxM == 0.0f);
+        Check("LateralErrorM: the sideways part only (2 m ahead = 0, 1 m to the left or right = 1), at any heading; a target pointing straight up has none",
+              std::fabs(LateralErrorM(V(0, 0, 0), vq::FromHeadingDeg(0), V(0, 2, 0))) < 1e-6 && std::fabs(LateralErrorM(V(0, 0, 0), vq::FromHeadingDeg(0), V(1, 0, 0)) - 1.0) < 1e-6 &&
+                  std::fabs(LateralErrorM(V(0, 0, 0), vq::FromHeadingDeg(0), V(-1, 5, 0)) - 1.0) < 1e-6 &&
+                  std::fabs(LateralErrorM(V(10, 10, 0), east, V(13, 10, 0))) < 1e-5 && std::fabs(LateralErrorM(V(10, 10, 0), east, V(13, 11, 0)) - 1.0) < 1e-5 &&
+                  LateralErrorM(V(0, 0, 0), vq::Exp(V(-kPi / 2, 0, 0)), V(1, 1, 0)) == 0.0);
+    }
+    {
+        Check("ClassifyDisplacement: never warped here is not a displacement; then another seat of the same car, another car, outside, unreadable",
+              ClassifyDisplacement(false, true, true, true) == SeatDisplacement::NotSeatedBefore && ClassifyDisplacement(true, true, true, true) == SeatDisplacement::OtherSeat &&
+                  ClassifyDisplacement(true, true, false, true) == SeatDisplacement::OtherVehicle && ClassifyDisplacement(true, true, false, false) == SeatDisplacement::Outside &&
+                  ClassifyDisplacement(true, false, true, true) == SeatDisplacement::Unknown);
+    }
+}
+
 int main() {
     std::printf("-- quaternion math\n");
     TestQuatMath();
@@ -1119,10 +1285,12 @@ int main() {
     TestHyperTune();
     std::printf("-- W9: contact grace, present-time lead, bike lean\n");
     TestW9();
+    std::printf("-- Sync D: the receive pipeline against a simulated relay and car, hand-over, diagnostics\n");
+    TestSyncD();
 
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
-    // + hyper tune 4 + W9 11 (RollDeg 1, contact grace 3, no false grace 1, lead weight 1, lead slew 1, lead accuracy 2, bike roll 1, bike log 1)
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11;
+    // + Sync D 11 (kSyncDChecks) + hyper tune 4 + W9 11 (RollDeg 1, contact grace 3, no false grace 1, lead weight 1, lead slew 1, lead accuracy 2, bike roll 1, bike log 1)
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11 + kSyncDChecks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

@@ -32,6 +32,7 @@
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_w9.h"
+#include "sync/vehicle_syncd.h"
 #include "protocol/protocol.h"
 
 #include <cctype>
@@ -2647,6 +2648,220 @@ static void TestW10()
     }
 }
 
+
+// ---- Sync D: occupant flows (event-sequence fuzz of the local link against a server model) and the door walk -------------
+
+namespace {
+
+struct FuzzRng {
+    uint64_t s;
+    explicit FuzzRng(uint64_t seed) : s(seed * 0x9E3779B97F4A7C15ull + 1) {}
+    uint32_t Next() {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        return (uint32_t)(s >> 11);
+    }
+    int Range(int n) { return (int)(Next() % (uint32_t)n); }
+    bool Chance(int percent) { return Range(100) < percent; }
+};
+
+// Three server cars with four seats each, the local player (id 0) and two other players (1, 2). The client side is the engine's: a
+// ped in a car (handle 10 + car), a seat the game reads, the LocalVehicleLink ticked every 100 ms, and what the engine does with its
+// output (an eject takes the ped out, a revert puts it back, an Enter / Exit goes to the server after 100-400 ms and the answer comes
+// back after 100-400 ms).
+struct OccupantFuzz {
+    static constexpr int kCars = 3, kSeats = 4;
+    uint16_t seat[kCars][kSeats];
+    int32_t veh = 0;        // the local ped's vehicle handle (10 + car), 0 = on foot
+    int mySeat = -1;        // the seat the game reads for the local ped
+    LocalVehicleLink link;
+    struct Up { int due; uint8_t op; int car; int seatNo; };
+    struct Dn { int due; uint8_t op, code; int car; };
+    std::vector<Up> up;
+    std::vector<Dn> dn;
+    FuzzRng rng;
+    int tick = 0, lastUpDue = 0, lastDnDue = 0, noActionUntil = 0;   // the commands and answers travel on one reliable ordered channel each: never reordered
+    int enterCmds = 0, exitCmds = 0, ejects = 0, reverts = 0, doubleSeat = 0, localEnters = 0, cmdsThisTick = 0, maxCmdsPerTick = 0;
+    explicit OccupantFuzz(uint64_t seed) : rng(seed) {
+        for (auto& c : seat) for (auto& x : c) x = 0xFFFF;
+    }
+    int MeSeats() const {
+        int n = 0;
+        for (auto& c : seat) for (auto x : c) n += (x == 0);
+        return n;
+    }
+    void Server() {
+        for (size_t i = 0; i < up.size();) {
+            if (up[i].due > tick) { ++i; continue; }
+            const Up m = up[i];
+            up.erase(up.begin() + (long)i);
+            uint8_t code = 0;
+            if (m.op == 3) {                                   // Enter
+                if (seat[m.car][m.seatNo] != 0xFFFF && seat[m.car][m.seatNo] != 0) code = 2;   // SeatTaken
+                else {
+                    for (auto& c : seat) for (auto& x : c) if (x == 0) x = 0xFFFF;            // one seat at a time
+                    seat[m.car][m.seatNo] = 0;
+                }
+            } else if (m.op == 4) {                            // Exit
+                for (auto& x : seat[m.car]) if (x == 0) x = 0xFFFF;
+            }
+            lastDnDue = std::max(lastDnDue, tick + 1 + rng.Range(4));
+            dn.push_back({lastDnDue, m.op, code, m.car});
+        }
+        if (MeSeats() > 1) ++doubleSeat;
+    }
+    void Others() {
+        if (!rng.Chance(8)) return;
+        const int c = rng.Range(kCars), q = rng.Range(kSeats);
+        const uint16_t who = (uint16_t)(1 + rng.Range(2));
+        if (seat[c][q] == 0xFFFF) seat[c][q] = who;
+        else if (seat[c][q] == who) seat[c][q] = 0xFFFF;
+    }
+    void Actions() {
+        if (tick < noActionUntil || !rng.Chance(7)) return;           // an eject / revert needs a frame to take effect before the player can act again
+        switch (rng.Range(5)) {
+        case 0: case 1: {                                      // F / G: warp into some seat of some car (the server's list may be stale)
+            const int c = rng.Range(kCars), q = rng.Range(kSeats);
+            veh = 10 + c; mySeat = q; ++localEnters;
+            break;
+        }
+        case 2:                                                // GTA's own shuffle inside the car
+            if (veh) mySeat = rng.Range(kSeats);
+            break;
+        case 3:                                                // out
+            veh = 0; mySeat = -1;
+            break;
+        case 4:                                                // the car vanished under us / straight into another car
+            if (veh) { veh = 10 + rng.Range(kCars); mySeat = rng.Range(kSeats); ++localEnters; }
+            break;
+        }
+    }
+    void Client() {
+        for (size_t i = 0; i < dn.size();) {
+            if (dn[i].due > tick) { ++i; continue; }
+            link.OnResult(dn[i].op, dn[i].code, (uint16_t)dn[i].car);
+            dn.erase(dn.begin() + (long)i);
+        }
+        VehLinkIn in;
+        in.nowMs = tick * 100.0;
+        in.veh = veh;
+        in.seat = veh ? mySeat : -1;
+        in.netId = veh ? veh - 10 : -1;
+        const VehLinkOut o = link.Tick(in);
+        cmdsThisTick = 0;
+        if (o.cmd == VehLinkCmd::Enter || o.cmd == VehLinkCmd::Exit) {
+            lastUpDue = std::max(lastUpDue, tick + 1 + rng.Range(4));
+            up.push_back({lastUpDue, (uint8_t)(o.cmd == VehLinkCmd::Enter ? 3 : 4), o.netId, o.seat});
+            if (o.cmd == VehLinkCmd::Enter) ++enterCmds; else ++exitCmds;
+            ++cmdsThisTick;
+        }
+        maxCmdsPerTick = std::max(maxCmdsPerTick, cmdsThisTick);
+        if (o.eject) { veh = 0; mySeat = -1; ++ejects; noActionUntil = tick + 2; }
+        if (o.revertSeat >= 0 && veh) { mySeat = o.revertSeat; ++reverts; noActionUntil = tick + 2; }
+    }
+    void Step(bool act) {
+        ++tick;
+        if (act) { Actions(); Others(); }
+        Client();
+        Server();
+    }
+};
+
+}   // namespace
+
+constexpr int kSyncDGameplayChecks = 4;
+
+static void TestSyncD()
+{
+    // Two focused cases the fuzz found (the first 641 of 20000 random sequences ended with a ghost seat or a lost one before the fix):
+    {
+        // 1. A seat change still unanswered when we get out: the server keeps us in the old seat if it refuses the change, and nothing owed
+        //    the Exit, so we stood outside while every other client kept our puppet in the car.
+        LocalVehicleLink l;
+        l.Tick(VIn(0, 777, 1, 9));                    // Enter(9, seat 1)
+        l.OnResult(3, 0, 9);
+        l.Tick(VIn(16, 777, 1, 9));                   // linked in seat 1
+        VehLinkOut o = l.Tick(VIn(32, 777, 0, 9));    // the game shuffled us to seat 0: Enter(9, 0) is out
+        const bool sent = o.cmd == VehLinkCmd::Enter && o.seat == 0;
+        o = l.Tick(VIn(48, 0));                       // out of the car before the answer
+        const bool exitAtOnce = o.cmd == VehLinkCmd::Exit && o.netId == 9;
+        l.OnResult(3, 2, 9);                          // SeatTaken: the server kept us in seat 1
+        int moreExits = 0;
+        for (int t = 1; t <= 6; ++t)
+            moreExits += l.Tick(VIn(48 + 16 * t, 0)).cmd == VehLinkCmd::Exit;
+        Check("link: a seat change still unanswered when we get out owes the old seat an Exit at once (the server keeps us there if it refuses); the refusal then owes nothing more",
+              sent && exitAtOnce && moreExits == 0 && !l.Linked(), F("sent %d, exit at once %d, further exits %d", (int)sent, (int)exitAtOnce, moreExits));
+    }
+    {
+        // 2. Out and back into the same car within a round trip: the first Enter's Ok must not Exit the car again (it would remove the new seating)
+        LocalVehicleLink l;
+        VehLinkOut o = l.Tick(VIn(0, 777, 1, 9));     // Enter(9, seat 1)
+        const bool e1 = o.cmd == VehLinkCmd::Enter;
+        o = l.Tick(VIn(16, 0));                       // out before the answer
+        const bool x1 = o.cmd == VehLinkCmd::Exit && o.netId == 9;
+        o = l.Tick(VIn(32, 777, 1, 9));               // and back into the same car
+        const bool e2 = o.cmd == VehLinkCmd::Enter && o.netId == 9;
+        int exits = 0;
+        l.OnResult(3, 0, 9);                          // the answer to the first Enter (the older command: the orphan)
+        exits += l.Tick(VIn(48, 777, 1, 9)).cmd == VehLinkCmd::Exit;
+        l.OnResult(3, 0, 9);                          // the answer to the second
+        exits += l.Tick(VIn(64, 777, 1, 9)).cmd == VehLinkCmd::Exit;
+        for (int t = 1; t <= 4; ++t)
+            exits += l.Tick(VIn(64 + 16 * t, 777, 1, 9)).cmd == VehLinkCmd::Exit;
+        Check("link: out and back into the same car within a round trip: one Exit (owed when we left), none from the first Enter's late Ok, and the second Enter links",
+              e1 && x1 && e2 && exits == 0 && l.Linked() && l.NetId() == 9 && l.Seat() == 1,
+              F("enter %d exit %d enter %d, later exits %d, linked %d", (int)e1, (int)x1, (int)e2, exits, (int)l.Linked()));
+    }
+    // The occupant flows: random but legal sequences of F / G warps, shuffles, exits, straight car changes, other players taking and
+    // leaving seats, answers 100-400 ms late. After 10 s of quiet the server and the local ped agree (the local ped sits where the server
+    // has it, or is on foot and the server has nobody), the server never had the local player in two seats, and the link never sent
+    // more than one command per tick.
+    {
+        int fails = 0, doubleSeat = 0, perTick = 0, withEject = 0, withRevert = 0, withEnter = 0, firstBad = -1;
+        std::string bad;
+        constexpr int kSeeds = 4000;
+        for (int seed = 1; seed <= kSeeds; ++seed) {
+            OccupantFuzz f((uint64_t)seed);
+            for (int t = 0; t < 300; ++t) f.Step(true);
+            for (int t = 0; t < 120; ++t) f.Step(false);
+            const int meSeats = f.MeSeats();
+            bool ok = true;
+            if (f.veh == 0) ok = meSeats == 0;                                       // on foot: the server has nobody of ours
+            else ok = meSeats == 1 && f.seat[f.veh - 10][f.mySeat] == 0;             // in a car: the server has us there, in that seat
+            doubleSeat += f.doubleSeat;
+            perTick = std::max(perTick, f.maxCmdsPerTick);
+            withEject += f.ejects > 0;
+            withRevert += f.reverts > 0;
+            withEnter += f.enterCmds > 0;
+            if (!ok) {
+                ++fails;
+                if (firstBad < 0) {
+                    firstBad = seed;
+                    bad = F("seed %d: ped %s seat %d, server seats of ours %d, link %s seat %d id %d, enters %d exits %d ejects %d reverts %d", seed,
+                            f.veh ? "in a car" : "on foot", f.mySeat, meSeats, f.link.StateName(), f.link.Seat(), f.link.NetId(), f.enterCmds, f.exitCmds,
+                            f.ejects, f.reverts);
+                }
+            }
+        }
+        Check("occupant fuzz: 4000 random legal event sequences, then 10 s of quiet: the server and the local ped agree, never two seats at once, one command per tick",
+              fails == 0 && doubleSeat == 0 && perTick <= 1 && withEject > 1000 && withRevert > 200 && withEnter >= kSeeds * 99 / 100,
+              F("%d disagreements (%s), %d double-seat ticks, %d cmds/tick max, %d runs with an eject, %d with a revert", fails, bad.c_str(), doubleSeat, perTick,
+                withEject, withRevert));
+    }
+    // The puppet's door walk. The sender RUNS to the door (TASK_GO_STRAIGHT_TO_COORD at blend 2.0, about 3.5 m/s) and is warped into
+    // the seat there; a puppet that walks to the door with its own TASK_ENTER_VEHICLE (blend 1.0, about 1.5 m/s, started one render
+    // delay late, INFERRED GTA speeds) is warped from where it has got to when the seat list names the player: the teleport. Following
+    // the sender's pose it is within the pose lag of the door.
+    {
+        const double senderMps = 3.5, taskMps = 1.5, delayS = 0.11, doorM = 4.0;
+        const double walkS = doorM / senderMps;                                      // the sender arrives, warps, the seat list follows
+        const double taskTeleportM = doorM - taskMps * std::max(0.0, walkS - delayS);   // the task puppet started `delay` late
+        const double followLagM = senderMps * 0.03;                                  // the seat list leads the pose timeline by about 30 ms
+        const bool taskDefault = PuppetUsesEnterTask(EnterWalkMode::Task), followDefault = PuppetUsesEnterTask(EnterWalkMode::Follow);
+        Check("door walk: the default (Follow) shows the sender's own run to the door (no TASK_ENTER_VEHICLE), so the seat warp moves the puppet about 0.1 m instead of about 2.6 m (INFERRED speeds: blend 2.0 run 3.5 m/s, blend 1.0 walk 1.5 m/s)",
+              taskDefault && !followDefault && taskTeleportM > 2.0 && followLagM < 0.2, F("task %.2f m, follow %.2f m", taskTeleportM, followLagM));
+    }
+}
+
 int main()
 {
     std::printf("-- vitals\n");
@@ -2679,6 +2894,8 @@ int main()
     TestW9();
     std::printf("-- W10: player name tags (fade, projection, occlusion cache, text, list)\n");
     TestW10();
+    std::printf("-- Sync D: occupant event fuzz, the puppet's door walk\n");
+    TestSyncD();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -2686,7 +2903,7 @@ int main()
     // + 0d 6 (in TestW8 beside the climb window: pre-vault placement 1, climb accounting 1, cover window 4)
     // + W9 8 (enter warp 1, re-warp limiter 1, press guard 1, passenger engine 1, unseat 2, impact 1, bike class 1; EnterWarpDue's old W6 check stays)
     // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16;
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected)
     {

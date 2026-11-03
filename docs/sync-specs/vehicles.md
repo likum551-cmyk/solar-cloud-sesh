@@ -75,3 +75,19 @@ Test: gameplay_test: seated+aiming+gun -> Issue; not aiming with task active -> 
 | VehicleOp | Release = 9 (kVehicleOpLast = 9) |
 
 Docs: docs/api/protocol.md section 14.
+
+## Sync D: offline audit of remote vehicle motion and occupants (2026-11-03)
+
+Method: `tests/vehsim.h` runs the real `VehicleInterpolator`, `VehicleDriveController`, `PresentLead`, `NetClock` and `ClassDelay` behind a simulated relay (30 Hz sender, 30/15/10 Hz tiers, 20-80 ms jitter, 3-5 % loss, the wire quantisation of `protocol/quant.h`) against a simplified physical car (tyre grip that turns a hard corner into a drift, drag, ramp and ballistic flight, gravity, ground). It is NOT the game: the puppet obeys SET_ENTITY_VELOCITY / ANGULAR_VELOCITY at once and the physics are guesses. Numbers below are simulation, not live.
+
+What the simulation found fine: straight, lane change, hard brake, brake in a bend, reverse, hairpin, jump, parked, crawl (0.15..3 m/s), at 20..240 fps and all three tiers stay within about 0.1-0.4 m / 6-15 degrees of the instant the sample claims, one snap (the spawn), no pops. A 500 km/h car is limited by timing: 1 ms of render-clock noise is 14 cm (the 10 Hz tier's delay change costs up to 2.5 m; that is the shared clock's, not the controller's).
+
+What it found wrong, and the change:
+1. Buffering pinned the car at its oldest snapshot while the snapshot's velocity said "moving": the target stood still for a whole render delay and then moved on. After any hand-over, first sight, teleport or bridge reset (a hole over 500 ms) the car popped 2.5 m ahead at 25 m/s (14 m at 139 m/s) and was snapped there. `VehicleInterpolator::Sample` now walks the oldest snapshot BACK along its velocity / angular velocity (`VehicleInterpConfig::bufferBackMaxMs`, 300 ms; 0 restores the pin): 0.11 m / 0.59 m.
+2. A controller hand-over emptied the snapshot buffer and snapped the drive controller even between two OTHER controllers (the driver left a moving car, someone else is nearest). `sync::DecideHandover` (vehicle_syncd.h): only a hand-over to or from US clears and snaps; otherwise the buffer and the controller stay.
+3. Door walk (INFERRED, not provable offline): the sender's F / G entry is a run to the door and a warp into the seat; the W6 puppet walked to the door with its own TASK_ENTER_VEHICLE (blend 1.0, own path) and was warped from wherever that had got to. The default is now to keep following the sender's pose and warp when the seat list names the player (`puppet_enter=task` in HKCU restores the W6 walk, read at Welcome).
+4. `LocalVehicleLink` (occupant fuzz, 20000 random legal sequences: 641 ended with a ghost or a lost seat, now 0): (a) leaving while a SEAT CHANGE was unanswered left the old seat on the server if the change was refused (the ghost occupant: every other client warped the puppet back into the car); (b) leaving and re-entering the same car within a round trip: the first Enter's late Ok owed an Exit for the whole vehicle and removed the new seating. The Exit for an unanswered Enter is now owed at the moment we leave; the late answer owes nothing.
+
+Diagnostics added (10 s, `engine: vehicle drive (D)` and `engine: occupants (D)`): position / heading / sideways error mean and max against the sender's sample at the instant it claims, drive frames by interpolator mode (interpolating / extrapolating / holding / buffering), snaps, persistent and under-floor snaps, blends, graces; door walks followed vs tasked, a warped puppet found out of its seat (another seat / another car / outside / unknown), exits by flag (0 / 4160 / the flag-16 fallback / pops), controller hand-overs kept vs snapped.
+
+Not changed, reported: the present-time lead (W9) trades a constant 110 ms lag for a prediction error that peaks at the onset of a manoeuvre (hairpin: up to 1 m / 17 degrees, versus 0.2 m / 6 degrees without it, but then about 1.3 m behind the sender at 12 m/s).
