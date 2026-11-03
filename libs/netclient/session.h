@@ -206,6 +206,19 @@ namespace gage::net {
         uint32_t rttMs() const;
         uint32_t lastSentSeq() const { return seq_; }
 
+        // ENet's own view of the link (diagnostics, sync pipeline review 2026-11-03). ENet silently drops a share of
+        // UNRELIABLE packets (our state channel) when `throttle` is below `throttleScale`: it lowers the throttle each
+        // time a round trip is much slower than the last 5 s's quietest, and a deceleration of 0 (what the server
+        // configures for every peer since that review) holds it at the scale. lossPercent is ENet's smoothed loss of
+        // RELIABLE packets (a retransmission), rttVarMs its smoothed round-trip deviation.
+        struct LinkInfo
+        {
+            uint32_t rttMs = 0, rttVarMs = 0;
+            uint32_t throttle = 0, throttleScale = 32, throttleDeceleration = 0;
+            double lossPercent = 0;
+        };
+        LinkInfo link() const;
+
         // Counters for diagnostics and tests.
         // WorldState packets that arrived, including those the dropWorldPercent knob discarded.
         uint64_t worldReceived() const { return worldReceived_; }

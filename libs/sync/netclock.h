@@ -48,6 +48,47 @@
 
 namespace gage::sync {
 
+    // A windowed picture of how irregularly something arrives (pipeline diagnostics, sync pipeline review 2026-11-03):
+    // the gaps (ms) between consecutive arrivals, kept as a count, a sum, a maximum and a 4 ms histogram (the last
+    // bin is "252 ms or more"), so a mean, a p95 and a maximum over a window come out without storing the gaps.
+    // The owner takes the window (Take) every few seconds and the numbers restart. Pure, no clock.
+    struct ArrivalWindow
+    {
+        static constexpr int kBins = 64;
+        static constexpr double kBinMs = 4.0;
+        uint32_t n = 0;
+        double sumMs = 0, maxMs = 0;
+        uint32_t bins[kBins] = {};
+
+        void Add(double gapMs)
+        {
+            if (!(gapMs >= 0.0) || gapMs > 1e7) return;
+            ++n;
+            sumMs += gapMs;
+            if (gapMs > maxMs) maxMs = gapMs;
+            int b = static_cast<int>(gapMs / kBinMs);
+            if (b >= kBins) b = kBins - 1;
+            ++bins[b];
+        }
+        double MeanMs() const { return n ? sumMs / static_cast<double>(n) : 0.0; }
+        // The p-th percentile (0..1), to the bin: the upper edge of the bin holding that rank (the true maximum for the
+        // overflow bin). 0 for an empty window.
+        double PercentileMs(double p) const
+        {
+            if (n == 0) return 0.0;
+            const double rank = p * static_cast<double>(n - 1);
+            uint32_t seen = 0;
+            for (int b = 0; b < kBins; ++b)
+            {
+                seen += bins[b];
+                if (static_cast<double>(seen) > rank)
+                    return b == kBins - 1 ? maxMs : (b + 1) * kBinMs;
+            }
+            return maxMs;
+        }
+        void Reset() { *this = ArrivalWindow(); }
+    };
+
     struct NetClockConfig
     {
         double tickHz = 20.0;            // Welcome::tickHz
@@ -75,6 +116,9 @@ namespace gage::sync {
         uint32_t frames = 0;    // frames observed
         uint32_t ignored = 0;   // refused: non-finite, or too far from the newest tick
         uint32_t resyncs = 0;   // hard render clock resyncs
+        uint32_t baselineSteps = 0;   // frames after which the baseline (the clock offset estimate) moved by more than 5 ms
+        uint32_t delayRises = 0;      // times the delay rose at once (a jitter burst the estimate had not covered)
+        uint32_t reorderedFrames = 0; // frames whose tick was older than the newest seen (jitter, counted as such)
     };
 
     class NetClock
@@ -118,6 +162,21 @@ namespace gage::sync {
         const NetClockStats& Stats() const { return stats_; }
         const NetClockConfig& Config() const { return cfg_; }
 
+        // Pipeline diagnostics, taken by the engine's 10 s report. TakeFrameGaps: the arrival gaps (local receive time)
+        // of the frames this clock heard since the last take (WorldStates and VehicleWorlds together: the link's own
+        // rhythm). TakeBaselineDriftMs: how far the baseline (recv - tick * tickMs, the clock offset estimate) is from
+        // where it was at the last take, and TakeBaselineStepMaxMs the largest single step it made since.
+        ArrivalWindow TakeFrameGaps() { ArrivalWindow w = frameGaps_; frameGaps_.Reset(); return w; }
+        double TakeBaselineDriftMs()
+        {
+            const double now = BaselineMs();
+            const double d = haveBaseMark_ ? now - baseMark_ : 0.0;
+            baseMark_ = now;
+            haveBaseMark_ = true;
+            return d;
+        }
+        double TakeBaselineStepMaxMs() { const double m = stepMaxMs_; stepMaxMs_ = 0.0; return m; }
+
         // Forget everything: a new session (its ticks restart, its timeline has nothing to do with the old one).
         void Reset();
 
@@ -146,6 +205,9 @@ namespace gage::sync {
         bool haveRender_ = false;
         double renderT_ = 0, lastNowMs_ = 0;
         NetClockStats stats_;
+        ArrivalWindow frameGaps_;
+        double lastFrameRecvMs_ = 0, lastBase_ = 0, stepMaxMs_ = 0, baseMark_ = 0;
+        bool haveFrameRecv_ = false, haveBase_ = false, haveBaseMark_ = false;
     };
 
     // ---- the per-class extra delay -------------------------------------------------------------------------

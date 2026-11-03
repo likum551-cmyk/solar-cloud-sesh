@@ -109,12 +109,26 @@ bool NetClock::OnFrame(uint32_t tick, double recvMs)
     lastRecvMs_ = recvMs;
     haveLast_ = true;
     ++stats_.frames;
+    if (haveFrameRecv_ && recvMs >= lastFrameRecvMs_) frameGaps_.Add(recvMs - lastFrameRecvMs_);
+    lastFrameRecvMs_ = recvMs;
+    haveFrameRecv_ = true;
+    if (u < static_cast<int64_t>(newestU_)) ++stats_.reorderedFrames;
 
     const double offset = recvMs - static_cast<double>(u) * tickMs_;
     while (!baseline_.empty() && baseline_.back().v >= offset) baseline_.pop_back();
     baseline_.push_back({recvMs, offset});
     while (baseline_.size() > 1 && baseline_.front().t + cfg_.baselineWindowMs < recvMs) baseline_.pop_front();
 
+    {
+        const double base = baseline_.front().v;
+        if (haveBase_ && std::fabs(base - lastBase_) > 5.0)
+        {
+            ++stats_.baselineSteps;
+            stepMaxMs_ = std::max(stepMaxMs_, std::fabs(base - lastBase_));
+        }
+        lastBase_ = base;
+        haveBase_ = true;
+    }
     excess_.push_back({recvMs, offset - baseline_.front().v});
     while (!excess_.empty() && (excess_.size() > kMaxExcessSamples || excess_.front().t + cfg_.statWindowMs < recvMs))
         excess_.pop_front();
@@ -145,7 +159,10 @@ void NetClock::Retarget(double nowMs)
     if (stats_.frames < kMinFrames)
         return; // the first frames only measure: the delay stays at its initial value
     if (targetMs_ > delayMs_)
+    {
         delayMs_ = targetMs_; // rises at once
+        ++stats_.delayRises;
+    }
     else
         delayMs_ += (targetMs_ - delayMs_) * (1.0 - std::exp(-dt / cfg_.fallTauMs)); // falls with wall time
 }

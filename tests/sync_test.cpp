@@ -44,22 +44,35 @@
 //      offset with a fixed 120 ms delay) is measured in the same harness and does not.
 //  13. Sender pipeline (onfoot spec item 8): a 100 fps frame-quantised 45 Hz sender, worker wait U[0,2] ms, uplink
 //      jitter, a 30 Hz server placing samples with SampleClock, downlink jitter, 2% loss; truth = sample time.
+//  14. Sync pipeline review (2026-11-03): (a) the velocity-aided position denoise (smoother.h item 13): the wire's 1 cm
+//      position grid was a 6% speed ripple at walking speed; real motion (stop, turn, start) is not smeared; (b) the
+//      diagnostics counters (arrival windows, repeats split, baseline steps); (c) END TO END with the real
+//      server Replicator and WorldDecoder: sender, uplink, SampleClock, tiers 30/15/10 Hz, idle gate, delta frames,
+//      downlink, RemoteSync, 60 fps render, against ground truth, in the profiles of the review (jitter 20..80 ms,
+//      loss 2..10%, clock drift, stop/start, tier change, sender hitch, bursts).
 //
 
 // Every error check also asserts how many frames it measured, so an empty loop
 // cannot pass; the run asserts the total number of checks.
 
 #include "protocol/quant.h"
+#include "protocol/worldcodec.h"
 #include "sync/netclock.h"
 #include "sync/sampleclock.h"
 #include "sync/smoother.h"
 #include "sync/vehicle_drive.h"
+
+// The REAL server replication (tiers, idle gate, delta codec, quantiser) drives the end-to-end pipeline tests (section 14):
+// compiled into this test as it is, no copy of its rules.
+#include "../apps/server/replication.cpp"
+#include "../apps/server/vehicles.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1859,11 +1872,11 @@ static void TestSenderPipeline() {
     Check("sender pipeline: p95 placement error <= 2 ms on every one of 12 seeds (v4 placement at receipt: more than twice that)",
           framesOk && a.placeP95 <= 2.0 && worstPlace <= 2.0 && receipt.placeP95 > 2.0 * a.placeP95,
           F("primary %.2f ms, worst %.2f ms, at receipt %.2f ms", a.placeP95, worstPlace, receipt.placeP95));
-    // The ripple is a measured floor, not a margin: the same run with unquantised samples gives 2.0% (the u16 ms stamp and
-    // the whole-ms age cost ~0.4 ms of placement noise = 2 mm at 6 m/s per snapshot), the 1 cm position and 1/32 m/s velocity
-    // grid of the wire adds ~1 point. 3 of 12 seeds land at 3.03..3.10%: the target is met on the primary run only narrowly.
-    Check("sender pipeline: speed ripple <= 3% on the primary run (measured floor ~2.9..3.1% over 12 seeds, guard 3.5%; 10.8% with v4 placement)",
-          framesOk && a.ripple <= 0.03 && worstRipple <= 0.035 && receipt.ripple > 3.0 * a.ripple,
+    // The ripple was a measured floor of 2.9..3.1% (the 1 cm position grid of the wire: +-0.3 m/s of chord noise per 33 ms tick); the velocity-aided
+    // denoise (smoother.h item 13, sync pipeline review 2026-11-03) takes it to 0.66..0.71% over the 12 seeds. The bound is now 1.2% (guard 1.5%), so the
+    // old reconstruction (3.0%) fails it; the v4 placement at receipt (3.9%) is still several times worse.
+    Check("sender pipeline: speed ripple <= 1.2% on the primary run (0.66..0.71% over 12 seeds with the denoise, 2.9..3.1% before it; 3.9% with v4 placement at receipt)",
+          framesOk && a.ripple <= 0.012 && worstRipple <= 0.015 && receipt.ripple > 3.0 * a.ripple,
           F("primary %.2f%%, seeds %.2f..%.2f%%, at receipt %.2f%%", a.ripple * 100.0, minRipple * 100.0, worstRipple * 100.0, receipt.ripple * 100.0));
     Check("sender pipeline: p95 position error <= 0.10 m on the primary run and every seed",
           framesOk && a.posP95 <= 0.10 && worstPos <= 0.10, F("primary %.4f m, worst %.4f m", a.posP95, worstPos));
@@ -1872,6 +1885,865 @@ static void TestSenderPipeline() {
     Check("sender pipeline loss stress: 10% loss with +-15 ms downlink jitter freezes a ped for <= 150 ms, 30% loss for <= 300 ms",
           l10.frames > 3000 && l30.frames > 3000 && l10.frozenMs <= 150.0 && l30.frozenMs <= 300.0,
           F("10%%: %.0f ms, 30%%: %.0f ms", l10.frozenMs, l30.frozenMs));
+}
+
+// ---- 14a: the velocity-aided position denoise (smoother.h item 13) ---------------------------------------------------
+
+// A server-side stream through the wire's quantiser into a RemoteSync (the engine's configuration; `gain` overrides
+// SmootherConfig::denoiseGain, 0 = the old behaviour): a path `truth(tMs)` is sampled at every `every`-th tick of a 30 Hz
+// server, quantised (1 cm, 1/32 m/s), placed at its exact time (age 16 ms at the tick) and read at 60 fps. Measured from
+// `fromMs`: the pose speed error against the path's speed, the speed ripple (sd of the per-frame step over its mean: only
+// meaningful on a constant-speed path) and the position error against the path at the time the pose claims to show.
+struct DenoiseRun {
+    double velP95 = 0, ripple = 0, posMax = 0, posP95 = 0;
+    size_t frames = 0;
+    SmootherStats stats;
+};
+
+template <class Truth>
+static DenoiseRun RunDenoise(Truth truth, double gain, int every, double durMs, double fromMs = 6000) {
+    const double tickMs = kTick30, frame = 1000.0 / 60.0;
+    SmootherConfig sc = SmootherConfig::ForTickHz(30);
+    sc.denoiseGain = float(gain);
+    RemoteSync rs(sc);
+    std::vector<double> ve, steps, pe;
+    Pose prev;
+    bool have = false;
+    uint32_t tick = 1000;
+    double nextTick = 0;
+    DenoiseRun r;
+    for (long f = 0; double(f) * frame < durMs; ++f) {
+        const double now = double(f) * frame;
+        while (nextTick <= now) {
+            if (tick % uint32_t(every) == 0) {
+                const double age = 16.0, ts = nextTick - age; // the sample time on the server's timeline
+                const proto::Kinematics k = proto::Dequantize(proto::Quantize(truth(ts)));
+                rs.OnPlayerState(1, tick, k, nextTick + 25.0, age);
+            }
+            ++tick;
+            nextTick += tickMs;
+        }
+        Pose p;
+        if (!rs.Sample(1, now, p)) continue;
+        if (now >= fromMs) {
+            const proto::Kinematics t = truth((p.renderTick - 1000.0) * tickMs);
+            pe.push_back(Dist(p.k, t));
+            ve.push_back(std::fabs(std::sqrt(double(p.k.vx) * p.k.vx + double(p.k.vy) * p.k.vy) - std::sqrt(double(t.vx) * t.vx + double(t.vy) * t.vy)));
+            if (have) steps.push_back(Dist(p.k, prev.k));
+            ++r.frames;
+        }
+        prev = p;
+        have = true;
+    }
+    if (!steps.empty()) {
+        double mean = 0, var = 0;
+        for (double s : steps) mean += s;
+        mean /= double(steps.size());
+        for (double s : steps) var += (s - mean) * (s - mean);
+        r.ripple = mean > 0 ? std::sqrt(var / double(steps.size())) / mean : 0;
+    }
+    r.velP95 = Percentile(ve, 0.95);
+    r.posP95 = Percentile(pe, 0.95);
+    r.posMax = Percentile(pe, 1.0);
+    if (const PlayerSmoother* ps = rs.Find(1)) r.stats = ps->Stats();
+    return r;
+}
+
+static void TestDenoise() {
+    const double kDur = 30000;
+    const auto walk = [](double speed) { Walk w; w.speed = speed; return [w](double t) { return w.At(t); }; };
+    const DenoiseRun w18on = RunDenoise(walk(1.8), 0.3, 1, kDur), w18off = RunDenoise(walk(1.8), 0.0, 1, kDur);
+    const DenoiseRun w60on = RunDenoise(walk(6.0), 0.3, 1, kDur), w60off = RunDenoise(walk(6.0), 0.0, 1, kDur);
+    const DenoiseRun mid18on = RunDenoise(walk(1.8), 0.3, 2, kDur), mid18off = RunDenoise(walk(1.8), 0.0, 2, kDur);
+    std::printf("  [denoise, wire-quantised stream, 30 Hz near tier] walking 1.8 m/s: speed ripple %.2f%% -> %.2f%%, pose speed error p95 %.3f -> %.3f m/s, "
+                "position p95 %.4f -> %.4f m  |  6 m/s: ripple %.2f%% -> %.2f%%, speed error p95 %.3f -> %.3f  |  mid tier (15 Hz) 1.8 m/s: ripple %.2f%% -> %.2f%%, "
+                "speed error p95 %.3f -> %.3f (denoised %u of %u stored)\n",
+                w18off.ripple * 100, w18on.ripple * 100, w18off.velP95, w18on.velP95, w18off.posP95, w18on.posP95, w60off.ripple * 100, w60on.ripple * 100,
+                w60off.velP95, w60on.velP95, mid18off.ripple * 100, mid18on.ripple * 100, mid18off.velP95, mid18on.velP95, mid18on.stats.denoised, mid18on.stats.accepted);
+    Check("denoise: a ped walking at 1.8 m/s into the 30 Hz near tier moves at a steady pose speed (ripple <= 2.5%, p95 speed error <= 0.08 m/s); without it the 1 cm "
+          "position grid showed as a > 5% ripple and 0.2 m/s errors",
+          w18on.frames > 1000 && w18on.ripple <= 0.025 && w18on.velP95 <= 0.08 && w18off.ripple >= 0.05 && w18off.velP95 >= 0.20,
+          F("on %.2f%% / %.3f, off %.2f%% / %.3f", w18on.ripple * 100, w18on.velP95, w18off.ripple * 100, w18off.velP95));
+    Check("denoise: the same at 6 m/s (circle) and in the mid tier (every 2nd tick): the pose speed error p95 drops to under half of the raw wire's",
+          w60on.velP95 <= 0.5 * w60off.velP95 && w60on.ripple <= 0.01 && mid18on.velP95 <= 0.5 * mid18off.velP95 && mid18on.ripple <= 0.5 * mid18off.ripple &&
+              w60on.frames > 1000 && mid18on.frames > 1000,
+          F("6 m/s %.3f vs %.3f m/s, ripple %.2f%%; mid %.3f vs %.3f", w60on.velP95, w60off.velP95, w60on.ripple * 100, mid18on.velP95, mid18off.velP95));
+
+    // Real motion is not smeared. Paths (m, seconds): a 4.5 m/s run that stops dead, a 90 degree turn at 4.5 m/s, a start from
+    // standing to 4.5 m/s over 0.3 s, repeated every 4 s. The pose error against the path must not exceed the raw wire's by
+    // more than 1.5 cm, and stay within 5 cm of the path (the interpolation's own error at the corners is in both).
+    const auto cycle = [](double t) {
+        const double cyc = std::floor(t / 8000.0), c = std::fmod(t / 1000.0, 8.0); // 0..2 run +x, 2..4 stand, 4..6 accelerate +y over 0.3 s then run, 6..8 stand
+        proto::Kinematics k;
+        double x = 0, y = 0, vx = 0, vy = 0;
+        if (c < 2) { x = 4.5 * c; vx = 4.5; }
+        else if (c < 4) { x = 9.0; }
+        else if (c < 6) {
+            const double a = c - 4, ramp = std::min(a, 0.3);
+            x = 9.0;
+            y = a < 0.3 ? 4.5 * a * a / (2 * 0.3) : 4.5 * (a - 0.15);
+            vy = 4.5 * ramp / 0.3;
+        }
+        else { x = 9.0; y = 4.5 * (2 - 0.15); }
+        k.x = float(x + cyc * 9.0); k.y = float(y + cyc * 4.5 * 1.85); k.z = 30; k.vx = float(vx); k.vy = float(vy); k.vz = 0; // each cycle ends where the next one starts
+        k.heading = float(vx != 0 ? -90.0 : 0.0);
+        return k;
+    };
+    const DenoiseRun cyOn = RunDenoise(cycle, 0.3, 1, 40000), cyOff = RunDenoise(cycle, 0.0, 1, 40000);
+    std::printf("  [denoise, stop / turn / start every 8 s] position error max %.4f m (raw wire %.4f), p95 %.4f (raw %.4f), speed error p95 %.3f (raw %.3f)\n",
+                cyOn.posMax, cyOff.posMax, cyOn.posP95, cyOff.posP95, cyOn.velP95, cyOff.velP95);
+    Check("denoise: real motion is not smeared: a run that stops dead, a start from standing and a 90 degree turn (every 8 s) show a pose error within 1.5 cm of the raw wire's and under 5 cm",
+          cyOn.frames > 1500 && cyOn.posMax <= cyOff.posMax + 0.015 && cyOn.posMax <= 0.05 && cyOn.velP95 <= cyOff.velP95 + 0.02,
+          F("max %.4f vs raw %.4f, speed p95 %.3f vs %.3f", cyOn.posMax, cyOff.posMax, cyOn.velP95, cyOff.velP95));
+
+    // A sender whose velocity says 0 while it moves at 0.4 m/s (a velocity native that fails or lags): the prediction is 1.3 cm per
+    // sample off, which is inside the noise band, so the filter is on but its pull is bounded by the band: the position stays within
+    // 3 cm of the path (the raw wire: under 1 cm).
+    const auto blind = [](double t) {
+        proto::Kinematics k;
+        k.x = float(0.4 * t / 1000.0); k.y = 0; k.z = 30; k.vx = 0; k.vy = 0; k.vz = 0; k.heading = -90;
+        return k;
+    };
+    const DenoiseRun blOn = RunDenoise(blind, 0.3, 1, 20000), blOff = RunDenoise(blind, 0.0, 1, 20000);
+    Check("denoise: a sender that reports velocity 0 while walking at 0.4 m/s is not pulled back more than 3 cm (the noise band bounds the filter), a faster one (1.8 m/s, 6 cm per sample) not at all",
+          blOn.frames > 800 && blOn.posMax <= 0.03 && blOff.posMax <= 0.015 &&
+              RunDenoise([](double t) { proto::Kinematics k; k.x = float(1.8 * t / 1000.0); k.z = 30; return k; }, 0.3, 1, 20000).posMax <= 0.02,
+          F("0.4 m/s: on %.4f m, off %.4f m", blOn.posMax, blOff.posMax));
+
+    // The repeat test compares the RAW samples. A ped that runs and then stands: the standing samples are bit-identical, so after the
+    // first of them every further one is a Repeat (not stored), whatever the filter did to the stored copy of the last moving one.
+    {
+        SmootherConfig sc = SmootherConfig::ForTickHz(30);
+        PlayerSmoother sm(sc);
+        double now = 0;
+        uint32_t tick = 1000;
+        for (int i = 0; i < 60; ++i, ++tick, now += kTick30) {
+            const proto::Kinematics k = proto::Dequantize(proto::Quantize(K(1.0 + 0.15 * i, 0, 30, -90, 4.5)));
+            sm.Push(tick, k, now + 25, 16.0);
+        }
+        const proto::Kinematics stand = proto::Dequantize(proto::Quantize(K(1.0 + 0.15 * 59 + 0.05, 0, 30, -90, 0)));
+        const uint32_t acc0 = sm.Stats().accepted, rep0 = sm.Stats().repeats;
+        for (int i = 0; i < 90; ++i, ++tick, now += kTick30) sm.Push(tick, stand, now + 25, 16.0 + i * 33.3 > 254 ? 254.0 : 16.0 + i * 33.3);
+        const uint32_t acc = sm.Stats().accepted - acc0, rep = sm.Stats().repeats - rep0;
+        Check("denoise: the repeat detection compares the raw samples: 90 identical standing samples after a run store 1 and repeat 89 (comparing with the denoised stored copy kept re-storing them)",
+              acc == 1 && rep == 89 && sm.Stats().denoised > 0, F("accepted %u repeats %u (denoised %u)", acc, rep, sm.Stats().denoised));
+    }
+
+    {
+        SmootherConfig base;
+        const SmootherConfig tuned = SmootherConfig::ForTickHz(30);
+        SmootherConfig wild;
+        wild.denoiseGain = 7.0f;
+        wild.denoiseBandM = -1.0f;
+        wild.denoiseMaxGapMs = std::nanf("");
+        PlayerSmoother a(wild), b(base);
+        Check("denoise config: off in the struct default (every older standalone smoother), 0.3 in ForTickHz (the engine); a wild gain / band / gap is sanitised and never crashes",
+              base.denoiseGain == 0.0f && tuned.denoiseGain > 0.29f && tuned.denoiseGain < 0.31f &&
+                  a.Push(1, K(0, 0, 0), 0, 0) == PushResult::Accepted && a.Push(2, K(0.01, 0, 0), 33, 0) == PushResult::Accepted &&
+                  b.Push(1, K(0, 0, 0), 0, 0) == PushResult::Accepted && b.Stats().denoised == 0,
+              F("base %.2f tuned %.2f", base.denoiseGain, tuned.denoiseGain));
+    }
+}
+
+// ---- 14b: the pipeline diagnostics counters -----------------------------------------------------------------------------
+
+static void TestPipelineDiagnostics() {
+    // ArrivalWindow: mean / p95 / max of arrival gaps, restarting on Take.
+    {
+        ArrivalWindow w;
+        for (double g : {33.0, 34.0, 33.0, 33.0, 66.0, 33.0, 34.0, 33.0, 33.0, 300.0}) w.Add(g);
+        w.Add(-1.0); // refused
+        w.Add(std::nan(""));
+        const double p50 = w.PercentileMs(0.5), p95 = w.PercentileMs(0.95);
+        ArrivalWindow cleared = w;
+        cleared.Reset();
+        Check("pipeline counters: ArrivalWindow keeps count, mean, max and a 4 ms histogram (p50 / p95 to the bin), refuses negative and NaN gaps, and Reset empties it",
+              w.n == 10 && std::fabs(w.MeanMs() - 63.2) < 0.01 && w.maxMs == 300.0 && p50 >= 33.0 && p50 <= 40.0 && p95 >= 66.0 && p95 <= 300.0 && cleared.n == 0 &&
+                  cleared.PercentileMs(0.95) == 0.0,
+              F("n %u mean %.1f max %.0f p50 %.0f p95 %.0f", w.n, w.MeanMs(), w.maxMs, p50, p95));
+    }
+    // PlayerSmoother: the arrival window of STORED snapshots, the repeat split, the longest extrapolation, taken per window.
+    {
+        SmootherConfig sc = SmootherConfig::ForTickHz(30);
+        RemoteSync rs(sc);
+        double now = 0;
+        uint32_t tick = 100;
+        for (int i = 0; i < 40; ++i, ++tick, now += 30 + (i % 3) * 3) { // arrivals 30, 33, 36 ms apart
+            rs.OnFrame(tick, now);
+            rs.OnPlayerState(2, tick, K(0.15 * i, 0, 30, 0, 4.5), now, 10.0);
+        }
+        // identical state again (idle refresh): Repeat, identical
+        rs.OnFrame(tick, now);
+        const PushResult same = rs.OnPlayerState(2, tick++, K(0.15 * 39, 0, 30, 0, 4.5), now, 10.0);
+        // a different state whose placed time is earlier than the newest stored: Repeat, earlier (the sender's timeline went back)
+        rs.OnFrame(tick, now += 33);
+        const PushResult back = rs.OnPlayerState(2, tick++, K(0.15 * 40, 0, 30, 0, 4.5), now, 120.0);
+        // a late duplicate tick: Stale
+        const PushResult stale = rs.OnPlayerState(2, tick - 3, K(1, 0, 30), now, 10.0);
+        ArrivalWindow w;
+        double longest = 0;
+        const bool have = rs.TakeDiagnostics(2, w, longest);
+        const SmootherStats st = rs.Find(2)->Stats();
+        ArrivalWindow w2;
+        double longest2 = 0;
+        rs.TakeDiagnostics(2, w2, longest2);
+        Check("pipeline counters: a player's stored snapshots arrive as an arrival window (39 gaps of 30..36 ms), the repeats split into identical / earlier-placed, stale ones are counted, "
+              "and taking the window restarts it",
+              have && w.n == 39 && w.MeanMs() > 31.0 && w.MeanMs() < 34.0 && w.maxMs <= 36.5 && same == PushResult::Repeat && back == PushResult::Repeat &&
+                  stale == PushResult::Stale && st.repeatsIdentical == 1 && st.repeatsEarlier == 1 && st.repeats == 2 && st.stale == 1 && w2.n == 0,
+              F("n %u mean %.1f max %.1f; identical %u earlier %u stale %u; second window %u", w.n, w.MeanMs(), w.maxMs, st.repeatsIdentical, st.repeatsEarlier, st.stale, w2.n));
+        (void)longest; (void)longest2;
+    }
+    // Longest extrapolation run: a stream that stops for 200 ms is extrapolated for about that long and the number is reported once.
+    {
+        RemoteSync rs(SmootherConfig::ForTickHz(30));
+        double now = 0;
+        uint32_t tick = 100;
+        for (int i = 0; i < 90; ++i, ++tick, now += kTick30) {
+            rs.OnFrame(tick, now);
+            rs.OnPlayerState(2, tick, K(0.15 * i, 0, 30, 0, 4.5), now, 10.0);
+            Pose p;
+            rs.Sample(2, now, p);
+        }
+        // the stream stops: sample at 60 fps for 220 ms
+        for (double t = now; t < now + 220; t += 1000.0 / 60) {
+            Pose p;
+            rs.Sample(2, t, p);
+        }
+        ArrivalWindow w;
+        double longest = 0;
+        rs.TakeDiagnostics(2, w, longest);
+        ArrivalWindow w2;
+        double longest2 = -1;
+        rs.TakeDiagnostics(2, w2, longest2);
+        Check("pipeline counters: the longest run of extrapolating frames is measured (a stream that stops for 220 ms: 60..230 ms) and the window restarts",
+              longest > 60.0 && longest <= 230.0 && longest2 == 0.0, F("longest %.0f ms, after the take %.0f", longest, longest2));
+    }
+    // NetClock: baseline steps, delay rises, reordered frames, the frame arrival window and the baseline drift.
+    {
+        NetClock clk(NetClockConfig::ForTickHz(30));
+        double base = 5000;
+        uint32_t tick = 1;
+        auto feed = [&](int n, double extra) {
+            for (int i = 0; i < n; ++i, ++tick) clk.OnFrame(tick, base + double(tick) * kTick30 + extra);
+        };
+        feed(300, 0);                  // 10 s calm
+        const double d0 = clk.TakeBaselineDriftMs();
+        ArrivalWindow calmWin = clk.TakeFrameGaps();
+        const uint32_t stepsCalm = clk.Stats().baselineSteps, risesCalm = clk.Stats().delayRises;
+        feed(90, 70.0);                // the link gets 70 ms slower: the frames are late, the delay rises at once; the baseline only follows after 5 s
+        const uint32_t risesBurst = clk.Stats().delayRises;
+        feed(210, 70.0);               // 7 s more: the old baseline leaves the 5 s window, a step of 70 ms
+        const double drift = clk.TakeBaselineDriftMs();
+        const double stepMax = clk.TakeBaselineStepMaxMs();
+        const uint32_t steps = clk.Stats().baselineSteps;
+        const uint32_t re0 = clk.Stats().reorderedFrames;
+        clk.OnFrame(tick - 5, base + double(tick) * kTick30 + 70.0); // an old frame arrives late
+        Check("pipeline counters: NetClock counts delay rises (a link that gets 70 ms slower), baseline steps over 5 ms (one of 70 ms once the old baseline leaves its 5 s window) with the "
+              "drift since the last take, the frame arrival window (30 Hz: mean 33.3 ms) and reordered frames",
+              stepsCalm == 0 && risesCalm == 0 && risesBurst >= 1 && steps >= 1 && stepMax > 60.0 && stepMax < 80.0 && std::fabs(drift - 70.0) < 5.0 && d0 == 0.0 &&
+                  std::fabs(calmWin.MeanMs() - kTick30) < 0.5 && calmWin.n >= 298 && clk.Stats().reorderedFrames == re0 + 1,
+              F("steps %u (calm %u) rises %u (calm %u) step max %.1f drift %.1f frames mean %.1f reordered %u", steps, stepsCalm, risesBurst, risesCalm, stepMax, drift,
+                calmWin.MeanMs(), clk.Stats().reorderedFrames));
+    }
+}
+
+// ---- 14c: end to end through the real server replication ---------------------------------------------------------------
+
+// Ground-truth paths on the SENDER's timeline (ms): an interface so each scenario brings its own motion.
+struct E2ePath {
+    virtual ~E2ePath() {}
+    virtual proto::Kinematics At(double tMs) const = 0;
+};
+struct E2eCircle : E2ePath { // the 6 m/s walk circle of the other tests, its centre `cx` metres from the receiver
+    Walk w;
+    explicit E2eCircle(double cx, double speed = 6.0) { w.cx = cx; w.speed = speed; }
+    proto::Kinematics At(double t) const override { return w.At(t); }
+};
+struct E2eShuttle : E2ePath { // out and back along +x between x0 and x1
+    double x0, x1, speed;
+    E2eShuttle(double a, double b, double s) : x0(a), x1(b), speed(s) {}
+    proto::Kinematics At(double t) const override {
+        const double len = x1 - x0, period = 2 * len / speed * 1000.0;
+        double ph = std::fmod(t, period);
+        if (ph < 0) ph += period;
+        const bool fwd = ph < period / 2;
+        proto::Kinematics k;
+        k.x = float(x0 + (fwd ? ph : period - ph) / 1000.0 * speed); k.y = 0; k.z = 30;
+        k.vx = float(fwd ? speed : -speed); k.vy = 0; k.vz = 0; k.heading = fwd ? -90.0f : 90.0f;
+        return k;
+    }
+};
+struct E2eStopGo : E2ePath { // walk 1.8 m/s 3 s, stand 3 s, run 4.5 m/s 4 s, stand 3 s, sprint 7 m/s 4 s, stand 3 s (20 s cycle), 0.4 s ramps, folded into 55 m
+    double cx;
+    std::vector<double> X;
+    double L = 55.0; // the path folds here (one cycle's distance: the direction reverses while standing, never at speed)
+    explicit E2eStopGo(double c) : cx(c) {
+        X.assign(100001, 0.0);
+        for (size_t i = 1; i < X.size(); ++i) X[i] = X[i - 1] + Speed(double(i - 1) * 0.001) * 0.001;
+        L = X[20000];
+    }
+    static double Speed(double ts) {
+        const double c = std::fmod(ts, 20.0);
+        auto ramp = [](double t, double t0, double t1, double v) {
+            if (t < t0 || t >= t1 + 0.4) return 0.0;
+            if (t < t0 + 0.4) return v * (t - t0) / 0.4;
+            if (t < t1) return v;
+            return v * (1 - (t - t1) / 0.4);
+        };
+        return ramp(c, 0, 3, 1.8) + ramp(c, 6, 10, 4.5) + ramp(c, 13, 17, 7.0);
+    }
+    proto::Kinematics At(double t) const override {
+        if (t < 0) t = 0;
+        size_t i = size_t(t);
+        if (i + 1 >= X.size()) i = X.size() - 2;
+        const double x = X[i] + (X[i + 1] - X[i]) * (t - double(i)), m = std::fmod(x, 2 * L);
+        const bool back = m > L;
+        proto::Kinematics k;
+        k.x = float(cx + (back ? 2 * L - m : m)); k.y = 0; k.z = 30;
+        const double sp = Speed(t / 1000.0);
+        k.vx = float(back ? -sp : sp); k.vy = 0; k.vz = 0; k.heading = back ? 90.0f : -90.0f;
+        return k;
+    }
+};
+
+static proto::PedState E2ePedFor(const proto::Kinematics& k) {
+    proto::PedState p;
+    const double s = std::sqrt(double(k.vx) * k.vx + double(k.vy) * k.vy);
+    p.move = s < 0.3 ? proto::kMoveIdle : s < 3.0 ? proto::kMoveWalk : s < 6.0 ? proto::kMoveRun : proto::kMoveSprint;
+    return p;
+}
+
+struct E2eProfile {
+    double tickHz = 30, senderFps = 60;
+    double upLatMs = 25, upJitMs = 8, upLoss = 0;
+    double downLatMs = 25, downJitMs = 10, downLoss = 0.02;
+    double tickLateMs = 0.6;               // the server loop starts a tick U[0, this] ms late
+    double clientDriftPpm = 0;             // the client's clock runs fast by this
+    double durMs = 40000;
+    uint64_t seed = 11;
+    double hitchAtMs = -1, hitchLenMs = 0; // the sender produces no frames for hitchLenMs from hitchAtMs
+    double burstEveryMs = 0, burstMs = 0, burstExtraMs = 0; // downlink delay bursts (a bad Wi-Fi)
+    double senderOffsetMs = 1234.5;        // the sender's clock = the global one + this (its u16 stamp wraps every 65.536 s)
+    float denoiseGain = -1.0f;             // >= 0: override SmootherConfig::denoiseGain (0 = the pre-review behaviour)
+};
+
+struct E2eResult {
+    size_t frames = 0, extrap = 0, hold = 0, buffering = 0, stalls = 0, entries = 0;
+    double errP50 = 0, errP95 = 0, errMax = 0, velP95 = 0, latMed = 0, latSd = 0, latP95 = 0, delayMed = 0, delayMax = 0;
+    double gapMean = 0, gapP95 = 0, gapMax = 0, longestExtrapMs = 0, stepMaxRel = 0, entriesPerS = 0;
+    uint32_t snaps = 0, resyncs = 0, bridges = 0, repeats = 0, stale = 0, denoised = 0;
+    uint64_t tierSent[4] = {0, 0, 0, 0};
+};
+
+// Sender (a game loop of `senderFps` sending at 1.5 x the tick as engine.cpp does) -> uplink (worker wait, latency, jitter,
+// loss) -> server (SampleClock placement, the real Replicator: tiers by distance, idle gate, quantiser, delta frames and acks)
+// -> downlink (latency, jitter, loss, bursts) -> WorldDecoder -> RemoteSync -> 60 fps render. Scored from 6 s: the pose against the
+// path at a constant latency (the median over the run: the pipeline's fixed latency), the sd of that latency over the run (the time
+// base's steadiness), the pose speed error, modes, the largest step, stalls (steps under 15% of the path's while it moves) and the
+// arrival rhythm of the stored entries.
+static E2eResult RunE2e(const E2ePath& path, const E2eProfile& P) {
+    Rng rng(P.seed);
+    const double tickMs = 1000.0 / P.tickHz;
+    const uint64_t tickUs = 1000000ull / uint64_t(P.tickHz);
+    const double vOff = 54321.7, cOff = 777.3; // the server's and the client's clocks against the global one
+    struct E { double t; uint64_t ord; int kind; std::vector<uint8_t> bytes; proto::Kinematics k; proto::PedState ped; uint16_t stamp; double sT; };
+    auto cmp = [](const E& a, const E& b) { return a.t != b.t ? a.t > b.t : a.ord > b.ord; };
+    std::priority_queue<E, std::vector<E>, decltype(cmp)> q(cmp);
+    uint64_t ord = 0;
+    auto push = [&](E e) { e.ord = ord++; q.push(std::move(e)); };
+    {
+        double nextSend = 0;
+        const double fr = 1000.0 / P.senderFps, interval = tickMs / 1.5;
+        for (long f = 0; double(f) * fr <= P.durMs; ++f) {
+            const double t = 3.7 + double(f) * fr + (rng.Uniform() - 0.5) * 2.0;
+            if (P.hitchAtMs >= 0 && t >= P.hitchAtMs && t < P.hitchAtMs + P.hitchLenMs) continue;
+            if (t < nextSend) continue;
+            const double due = nextSend + interval;
+            nextSend = due > t ? due : t + interval;
+            E e{};
+            e.kind = 0;
+            e.sT = t; e.k = path.At(t); e.ped = E2ePedFor(e.k);
+            e.stamp = uint16_t(uint64_t(t + P.senderOffsetMs) & 0xFFFFu);
+            if (P.upLoss > 0 && rng.Uniform() < P.upLoss) continue;
+            e.t = t + rng.Uniform() * 2.0 + P.upLatMs + rng.Uniform() * P.upJitMs;
+            push(e);
+        }
+    }
+    for (uint64_t i = uint64_t(std::ceil(vOff * 1000.0 / double(tickUs))) + 2;; ++i) {
+        const double T = double(i * tickUs) / 1000.0 - vOff;
+        if (T > P.durMs + 500) break;
+        if (T < 0) continue;
+        E e{};
+        e.kind = 1; e.t = T + rng.Uniform() * P.tickLateMs; e.sT = double(i);
+        push(e);
+    }
+    const double rf = 1000.0 / 60.0;
+    for (long f = 0; double(f) * rf <= P.durMs; ++f) { E e{}; e.kind = 3; e.t = 2.3 + double(f) * rf; push(e); }
+
+    server::Replicator rep;
+    server::ReplConfig cfg;
+    cfg.maxPlayers = 8;
+    cfg.tickHz = uint16_t(P.tickHz);
+    rep.Configure(cfg);
+    rep.AddPlayer(0);
+    rep.AddPlayer(1); // the receiver, at the origin
+    rep.SetState(1, proto::Kinematics(), 0);
+    server::Metrics metrics;
+    SampleClock sc;
+    proto::WorldDecoder dec;
+    SmootherConfig smc = SmootherConfig::ForTickHz(P.tickHz);
+    if (P.denoiseGain >= 0.0f) smc.denoiseGain = P.denoiseGain;
+    RemoteSync rs(smc);
+    rs.SetLocalId(1);
+
+    struct AckRec { double t; proto::WorldAck a; };
+    std::vector<AckRec> ackHist;
+    struct Fr { double T; Pose p; double delay; };
+    std::vector<Fr> frames;
+    std::vector<double> gaps;
+    E2eResult R;
+    double lastStoredAt = -1;
+    auto clientNow = [&](double T) { return T * (1.0 + P.clientDriftPpm * 1e-6) + cOff; };
+    while (!q.empty()) {
+        E e = q.top();
+        q.pop();
+        const double T = e.t;
+        if (e.kind == 0) {
+            const uint64_t recvUs = uint64_t((T + vOff) * 1000.0);
+            rep.SetState(0, e.k, e.ped, sc.Place(e.stamp, recvUs));
+            const double want = T - P.upLatMs - 11.0; // the receiver's own 45 Hz PlayerState carries its newest receipt
+            proto::WorldAck a;
+            for (size_t i = ackHist.size(); i-- > 0;)
+                if (ackHist[i].t <= want) { a = ackHist[i].a; break; }
+            rep.SetAck(1, a);
+        } else if (e.kind == 1) {
+            const uint32_t tick = uint32_t(e.sT);
+            std::vector<std::vector<uint8_t>> out;
+            rep.Tick(tick, uint64_t(tick) * tickUs, [&](uint16_t r, bool coarse, const proto::Bytes& pk) { if (r == 1 && !coarse) out.push_back(pk); }, metrics);
+            for (auto& pk : out) {
+                if (rng.Uniform() < P.downLoss) continue;
+                double extra = 0;
+                if (P.burstEveryMs > 0 && std::fmod(T, P.burstEveryMs) < P.burstMs) extra = P.burstExtraMs * rng.Uniform();
+                E d{};
+                d.kind = 2; d.t = T + P.downLatMs + rng.Uniform() * P.downJitMs + extra; d.bytes = pk;
+                push(d);
+            }
+        } else if (e.kind == 2) {
+            const double now = clientNow(T);
+            proto::WorldState ws;
+            if (!dec.Decode(e.bytes.data(), e.bytes.size(), ws)) continue; // stale or reordered: ENet's sequenced channel drops these too
+            ackHist.push_back({T, dec.ack()});
+            rs.OnFrame(ws.tick, now);
+            for (const proto::WorldEntry& we : ws.players) {
+                if (we.id == 1) continue;
+                const PushResult r = rs.OnPlayerState(we.id, ws.tick, we.k, now, double(we.ageMs), we.ped);
+                R.entries++;
+                if (r == PushResult::Accepted || r == PushResult::Teleported) {
+                    if (lastStoredAt >= 0) gaps.push_back(now - lastStoredAt);
+                    lastStoredAt = now;
+                }
+            }
+        } else {
+            const double now = clientNow(T);
+            Pose p;
+            if (!rs.Sample(0, now, p)) continue;
+            const PlayerSmoother* ps = rs.Find(0);
+            frames.push_back({T, p, ps ? ps->DelayMs() : 0.0});
+        }
+    }
+
+    const double warm = 6000;
+    std::vector<double> taus, errs, vels, delayV;
+    size_t nf = 0;
+    for (const Fr& f : frames) {
+        if (f.T < warm) continue;
+        if ((nf++ & 3) != 0) continue; // every 4th frame is enough for the latency estimate
+        const double sp = std::sqrt(double(f.p.k.vx) * f.p.k.vx + double(f.p.k.vy) * f.p.k.vy);
+        double best = 1e9, bt = -1;
+        for (double tau = 20; tau <= 600; tau += 2.0) {
+            const double d = Dist(f.p.k, path.At(f.T - tau));
+            if (d < best) { best = d; bt = tau; }
+        }
+        const proto::Kinematics tn = path.At(f.T - bt);
+        if (std::sqrt(double(tn.vx) * tn.vx + double(tn.vy) * tn.vy) > 1.0 && sp > 1.0) taus.push_back(bt);
+    }
+    R.latMed = Percentile(taus, 0.5);
+    R.latP95 = Percentile(taus, 0.95);
+    {
+        double m = 0, v = 0;
+        for (double t : taus) m += t;
+        m /= double(std::max<size_t>(1, taus.size()));
+        for (double t : taus) v += (t - m) * (t - m);
+        R.latSd = std::sqrt(v / double(std::max<size_t>(1, taus.size())));
+    }
+    Pose pp;
+    bool have = false;
+    double extrapRun = 0;
+    for (const Fr& f : frames) {
+        if (f.T < warm) continue;
+        ++R.frames;
+        if (f.p.mode == PoseMode::Extrapolating) { ++R.extrap; extrapRun += rf; R.longestExtrapMs = std::max(R.longestExtrapMs, extrapRun); } else extrapRun = 0;
+        if (f.p.mode == PoseMode::Holding) ++R.hold;
+        if (f.p.mode == PoseMode::Buffering) ++R.buffering;
+        const proto::Kinematics t = path.At(f.T - R.latMed);
+        errs.push_back(Dist(f.p.k, t));
+        vels.push_back(std::hypot(double(f.p.k.vx) - t.vx, double(f.p.k.vy) - t.vy));
+        delayV.push_back(f.delay);
+        const double tsp = std::sqrt(double(t.vx) * t.vx + double(t.vy) * t.vy);
+        if (have && tsp > 1.5) {
+            const double step = Dist(f.p.k, pp.k), expect = tsp * rf / 1000.0;
+            if (step < 0.15 * expect) ++R.stalls;
+            R.stepMaxRel = std::max(R.stepMaxRel, step / expect);
+        }
+        pp = f.p;
+        have = true;
+    }
+    R.errP50 = Percentile(errs, 0.5); R.errP95 = Percentile(errs, 0.95); R.errMax = Percentile(errs, 1.0); R.velP95 = Percentile(vels, 0.95);
+    R.delayMed = Percentile(delayV, 0.5); R.delayMax = Percentile(delayV, 1.0);
+    double gm = 0;
+    for (double g : gaps) gm += g;
+    R.gapMean = gm / double(std::max<size_t>(1, gaps.size()));
+    R.gapP95 = Percentile(gaps, 0.95); R.gapMax = Percentile(gaps, 1.0);
+    if (const PlayerSmoother* ps = rs.Find(0)) {
+        const SmootherStats& st = ps->Stats();
+        R.snaps = st.teleports; R.resyncs = st.resyncs; R.bridges = st.bridgeResets; R.repeats = st.repeats; R.stale = st.stale; R.denoised = st.denoised;
+    }
+    R.entriesPerS = double(R.entries) / (P.durMs / 1000.0);
+    for (int i = 0; i < 4; ++i) R.tierSent[i] = metrics.pairSentTier[i];
+    return R;
+}
+
+static void PrintE2e(const char* name, const E2eResult& r) {
+    std::printf("  [pipeline %-34s] err p50 %.3f p95 %.3f max %.2f m, speed err p95 %.2f m/s | latency %.0f ms (sd %.1f, p95 %.0f), delay %.0f..%.0f | stored gap mean %.0f p95 %.0f max %.0f ms | "
+                "extrap %.1f%% (longest %.0f ms) hold %.1f%% | stalls %zu, step max %.2fx | snaps %u resyncs %u bridges %u repeats %u stale %u, %.1f entries/s\n",
+                name, r.errP50, r.errP95, r.errMax, r.velP95, r.latMed, r.latSd, r.latP95, r.delayMed, r.delayMax, r.gapMean, r.gapP95, r.gapMax,
+                100.0 * double(r.extrap) / double(std::max<size_t>(1, r.frames)), r.longestExtrapMs, 100.0 * double(r.hold) / double(std::max<size_t>(1, r.frames)), r.stalls,
+                r.stepMaxRel, r.snaps, r.resyncs, r.bridges, r.repeats, r.stale, r.entriesPerS);
+}
+
+static void TestEndToEnd() {
+    const E2eProfile base;
+    // Tiers by distance from the receiver at the origin: near < 120 m (30 Hz), mid < 250 m (15 Hz), far (10 Hz).
+    const E2eCircle nearC(50), midC(180), farC(350);
+    const E2eResult n0 = RunE2e(nearC, base), m0 = RunE2e(midC, base), f0 = RunE2e(farC, base);
+    PrintE2e("near 6 m/s circle, 2% loss", n0);
+    PrintE2e("mid", m0);
+    PrintE2e("far", f0);
+    Check("e2e steady (25 ms links, 8 / 10 ms jitter, 2% loss): the near, mid and far tier each track the path within 3 cm p95 at a steady latency (sd <= 2 ms; 127 / 160 / 193 ms behind), "
+          "no snap, no stall, and the stored entries arrive at the tier's rate (about 30 / 15 / 10 per second)",
+          n0.frames > 1800 && m0.frames > 1800 && f0.frames > 1800 && n0.errP95 <= 0.03 && m0.errP95 <= 0.03 && f0.errP95 <= 0.03 && n0.latSd <= 2.0 && m0.latSd <= 2.0 && f0.latSd <= 2.0 &&
+              n0.snaps + m0.snaps + f0.snaps == 0 && n0.stalls + m0.stalls + f0.stalls == 0 && n0.entriesPerS > 27.0 && n0.entriesPerS < 31.0 && m0.entriesPerS > 13.5 && m0.entriesPerS < 15.5 &&
+              f0.entriesPerS > 9.0 && f0.entriesPerS < 10.5 && n0.latMed > 110 && n0.latMed < 145 && f0.latMed > n0.latMed + 40,
+          F("err p95 %.3f/%.3f/%.3f, latency %.0f/%.0f/%.0f sd %.1f/%.1f/%.1f, entries/s %.1f/%.1f/%.1f", n0.errP95, m0.errP95, f0.errP95, n0.latMed, m0.latMed, f0.latMed, n0.latSd, m0.latSd, f0.latSd,
+            n0.entriesPerS, m0.entriesPerS, f0.entriesPerS));
+    {
+        // The server's per-tier counts (Metrics::pairSentTier): near : mid : far = 30 : 15 : 10 entries per second over the run, idle 0 (the sender never stands).
+        const double perS[3] = {double(n0.tierSent[0]) / 40.0, double(m0.tierSent[1]) / 40.0, double(f0.tierSent[2]) / 40.0};
+        Check("e2e server counters: Metrics::pairSentTier counts the entries by the rate that applied: 30 / 15 / 10 per second for a near, mid and far subject (within 8%), nothing in the other distance classes, and only the 1 Hz idle refresh of the standing receiver (the sender's own view of it) in the idle class",
+              std::fabs(perS[0] - 30.0) < 2.4 && std::fabs(perS[1] - 15.0) < 1.2 && std::fabs(perS[2] - 10.0) < 0.8 && n0.tierSent[1] + n0.tierSent[2] == 0 &&
+                  m0.tierSent[0] + m0.tierSent[2] == 0 && f0.tierSent[0] + f0.tierSent[1] == 0 && n0.tierSent[3] <= 45,
+              F("near %.1f mid %.1f far %.1f /s; stray near-run %llu mid-run %llu far-run %llu", perS[0], perS[1], perS[2],
+                (unsigned long long)(n0.tierSent[1] + n0.tierSent[2]), (unsigned long long)(m0.tierSent[0] + m0.tierSent[2]),
+                (unsigned long long)(f0.tierSent[0] + f0.tierSent[1])));
+    }
+
+    // The same with and without the denoise: the speed ripple of a walking ped, end to end.
+    {
+        E2eProfile p = base;
+        p.downLoss = 0.0; // a clean link isolates the reconstruction
+        const E2eCircle walkC(50, 1.8);
+        const E2eResult on = RunE2e(walkC, p);
+        p.denoiseGain = 0.0f;
+        const E2eResult off = RunE2e(walkC, p);
+        PrintE2e("near walking 1.8 m/s, denoise on", on);
+        PrintE2e("near walking 1.8 m/s, denoise OFF (old)", off);
+        Check("e2e walking pace: through the real server (1 cm wire, 45 Hz sender into the 30 Hz tick) a ped walking at 1.8 m/s is shown with a pose speed error p95 <= 0.10 m/s "
+              "(the old reconstruction: >= 0.25) and no position error beyond 1.5 cm p95",
+              on.frames > 1800 && on.velP95 <= 0.10 && off.velP95 >= 0.25 && on.errP95 <= 0.015, F("on %.3f m/s, off %.3f m/s, position p95 %.4f", on.velP95, off.velP95, on.errP95));
+    }
+
+    // Hostile links: 80 ms downlink jitter with 5% loss, 5% uplink loss, 10% downlink loss.
+    {
+        E2eProfile j = base;
+        j.downJitMs = 80; j.upJitMs = 20; j.downLoss = 0.05;
+        const E2eResult nj = RunE2e(nearC, j), mj = RunE2e(midC, j), fj = RunE2e(farC, j);
+        PrintE2e("near, 80 ms down jitter, 5% loss", nj);
+        PrintE2e("mid", mj);
+        PrintE2e("far", fj);
+        E2eProfile l = base;
+        l.downLoss = 0.10;
+        const E2eResult nl = RunE2e(nearC, l), ml = RunE2e(midC, l);
+        E2eProfile u = base;
+        u.upLoss = 0.05;
+        const E2eResult nu = RunE2e(nearC, u), mu = RunE2e(midC, u);
+        PrintE2e("near, 10% down loss", nl);
+        PrintE2e("mid, 10% down loss", ml);
+        PrintE2e("near, 5% up loss", nu);
+        PrintE2e("mid, 5% up loss", mu);
+        Check("e2e hostile (80 ms downlink jitter + 5% loss): no snap, no stall, p95 position error <= 12 cm in every tier (the delay adapts: median delay 150..250 ms), nothing frozen",
+              nj.frames > 1800 && mj.frames > 1800 && fj.frames > 1800 && nj.snaps + mj.snaps + fj.snaps == 0 && nj.stalls + mj.stalls + fj.stalls == 0 && nj.errP95 <= 0.12 && mj.errP95 <= 0.12 &&
+                  fj.errP95 <= 0.12 && nj.longestExtrapMs <= 250.0 && nj.latMed > 150 && nj.latMed < 260,
+              F("err p95 %.3f/%.3f/%.3f, latency %.0f/%.0f/%.0f, longest extrapolation %.0f ms", nj.errP95, mj.errP95, fj.errP95, nj.latMed, mj.latMed, fj.latMed, nj.longestExtrapMs));
+        Check("e2e loss: 10% downlink loss and 5% uplink loss: p95 position error <= 6 cm, no snap, no stall, the longest extrapolation within the 250 ms cap",
+              nl.snaps + ml.snaps + nu.snaps + mu.snaps == 0 && nl.stalls + ml.stalls + nu.stalls + mu.stalls == 0 && nl.errP95 <= 0.06 && ml.errP95 <= 0.06 && nu.errP95 <= 0.06 && mu.errP95 <= 0.08 &&
+                  nl.longestExtrapMs <= 250.0 && ml.longestExtrapMs <= 250.0,
+              F("down10 near %.3f mid %.3f; up5 near %.3f mid %.3f; longest %.0f/%.0f ms", nl.errP95, ml.errP95, nu.errP95, mu.errP95, nl.longestExtrapMs, ml.longestExtrapMs));
+    }
+
+    // Stop and start (walk, stand, run, stand, sprint, stand; the idle gate takes the standing sender to 1 Hz and wakes it for the start).
+    {
+        E2eProfile p = base;
+        p.downJitMs = 20;
+        const E2eStopGo sn(30), sm(150), sf(300);
+        const E2eResult a = RunE2e(sn, p), b = RunE2e(sm, p), c = RunE2e(sf, p);
+        PrintE2e("near stop/go", a);
+        PrintE2e("mid stop/go", b);
+        PrintE2e("far stop/go", c);
+        Check("e2e stop / start: standing for 3 s (1 Hz idle refresh) and starting again (walk, run, sprint) at every tier: p95 position error <= 2 cm, the latency does not move (sd <= 2 ms: "
+              "the idle gate, the bridge reset and the class extra do not shift the time base), no snap, at most one stalled frame",
+              a.frames > 1800 && a.errP95 <= 0.02 && b.errP95 <= 0.02 && c.errP95 <= 0.02 && a.latSd <= 2.0 && b.latSd <= 2.0 && c.latSd <= 2.5 && a.snaps + b.snaps + c.snaps == 0 &&
+                  a.stalls <= 1 && b.stalls <= 1 && c.stalls <= 1 && a.bridges >= 3,
+              F("err p95 %.3f/%.3f/%.3f, latency sd %.1f/%.1f/%.1f, stalls %zu/%zu/%zu, bridges %u", a.errP95, b.errP95, c.errP95, a.latSd, b.latSd, c.latSd, a.stalls, b.stalls, c.stalls, a.bridges));
+    }
+
+    // Tier changes: a ped shuttling across the near/mid boundary (95..150 m) and the mid/far one (220..280 m) at 5 m/s. Today the class extra
+    // moves the render time by one tick (33 ms) each time the tier changes (up after 1.5 s, down after 8 s, then slewed at 10%): the latency
+    // of the near/mid shuttle swings by 33 ms. That is the design (a mid ped must be drawn one tick later than a near one), so the bound
+    // here is what it costs (p95 position error 20 cm at 5 m/s = 33 ms), not zero: it must not snap, stall or freeze.
+    {
+        const E2eShuttle s1(95, 150, 5), s2(220, 280, 5);
+        const E2eResult a = RunE2e(s1, base), b = RunE2e(s2, base);
+        PrintE2e("tier crossing near<->mid, 5 m/s", a);
+        PrintE2e("tier crossing mid<->far, 5 m/s", b);
+        Check("e2e tier change: crossing the near/mid and the mid/far boundary back and forth shifts the latency by one class extra (<= 40 ms, p95 position error <= 22 cm) without a snap, a resync, a stall or a frozen ped",
+              a.frames > 1800 && b.frames > 1800 && a.snaps + b.snaps == 0 && a.resyncs + b.resyncs == 0 && a.stalls <= 3 && b.stalls <= 3 && a.errP95 <= 0.22 && b.errP95 <= 0.22 && a.latSd <= 40.0 &&
+                  b.latSd <= 40.0 && a.longestExtrapMs <= 250.0,
+              F("near/mid: err p95 %.3f latency sd %.1f stalls %zu; mid/far: err p95 %.3f sd %.1f stalls %zu", a.errP95, a.latSd, a.stalls, b.errP95, b.latSd, b.stalls));
+    }
+
+    // Time-base robustness: the client's clock 300 ppm fast / slow, the sender's u16 stamp wrapping inside the run, a server loop that starts
+    // its ticks up to 8 ms late, a 30 fps sender and a 144 fps sender.
+    {
+        E2eProfile pf = base, ps = base, pw = base, pl = base, p30 = base, p144 = base;
+        pf.clientDriftPpm = 300; ps.clientDriftPpm = -300; pw.senderOffsetMs = 62000; pl.tickLateMs = 8; p30.senderFps = 30; p144.senderFps = 144;
+        const E2eResult a = RunE2e(nearC, pf), b = RunE2e(nearC, ps), c = RunE2e(nearC, pw), d = RunE2e(nearC, pl), e = RunE2e(nearC, p30), g = RunE2e(nearC, p144);
+        PrintE2e("near, client clock +300 ppm", a);
+        PrintE2e("near, client clock -300 ppm", b);
+        PrintE2e("near, sender stamp wraps (u16) in the run", c);
+        PrintE2e("near, server ticks 0..8 ms late", d);
+        PrintE2e("near, sender at 30 fps", e);
+        PrintE2e("near, sender at 144 fps", g);
+        Check("e2e time base: client clock drift of +-300 ppm, the sender's 16-bit stamp wrapping inside the run, a server loop up to 8 ms late and 30 / 144 fps senders all keep the p95 "
+              "position error <= 3 cm at a steady latency (sd <= 2 ms), no snap, no resync",
+              a.errP95 <= 0.03 && b.errP95 <= 0.03 && c.errP95 <= 0.03 && d.errP95 <= 0.03 && e.errP95 <= 0.03 && g.errP95 <= 0.03 && std::max({a.latSd, b.latSd, c.latSd, d.latSd, e.latSd, g.latSd}) <= 2.0 &&
+                  a.snaps + b.snaps + c.snaps + d.snaps + e.snaps + g.snaps == 0 && a.resyncs + b.resyncs + c.resyncs + d.resyncs + e.resyncs + g.resyncs == 0 && a.frames > 1800,
+              F("err p95 %.3f/%.3f/%.3f/%.3f/%.3f/%.3f latency sd %.1f/%.1f/%.1f/%.1f/%.1f/%.1f", a.errP95, b.errP95, c.errP95, d.errP95, e.errP95, g.errP95, a.latSd, b.latSd, c.latSd, d.latSd, e.latSd, g.latSd));
+    }
+
+    // A sender that freezes (a game hitch, an alt-tab) for 400 ms and Wi-Fi style downlink bursts of up to 150 ms every 4 s.
+    {
+        E2eProfile h = base;
+        h.hitchAtMs = 15000; h.hitchLenMs = 400;
+        E2eProfile w = base;
+        w.burstEveryMs = 4000; w.burstMs = 300; w.burstExtraMs = 150;
+        const E2eResult a = RunE2e(nearC, h), b = RunE2e(nearC, w), c = RunE2e(midC, w);
+        PrintE2e("near, sender hitch 400 ms at 15 s", a);
+        PrintE2e("near, 150 ms bursts every 4 s", b);
+        PrintE2e("mid, 150 ms bursts every 4 s", c);
+        Check("e2e hitch and bursts: a 400 ms sender hitch is bridged without a snap (extrapolation <= 250 ms, the ped catches up: p95 error <= 2 cm over the run), 150 ms downlink bursts keep the p95 "
+              "position error <= 25 cm with no snap, no stall and no frozen ped",
+              a.snaps == 0 && a.longestExtrapMs <= 250.0 && a.errP95 <= 0.02 && b.snaps + c.snaps == 0 && b.stalls + c.stalls == 0 && b.errP95 <= 0.25 && c.errP95 <= 0.25 && b.longestExtrapMs <= 250.0,
+              F("hitch: err p95 %.3f max %.2f; bursts near %.3f mid %.3f, longest %.0f ms", a.errP95, a.errMax, b.errP95, c.errP95, b.longestExtrapMs));
+    }
+}
+
+// A car on a circle (radius 60 m, `speed` m/s) through the real VehicleStore (controller's VehicleUpdate at 45 Hz with SampleClock placement,
+// BuildFrame's tiers and ageMs, the VehicleWorld codec) into the engine's receive path (SnapshotStampMs on the shared NetClock, the interpolator,
+// the car's class extra), drawn at 60 fps: the vehicle half of the end-to-end pipeline. Same scoring as RunE2e: the car against the path at a
+// constant latency, the sd of that latency, the largest per-frame step against the expected one.
+struct E2eCarResult { size_t frames = 0; double errP95 = 0, errMax = 0, latMed = 0, latSd = 0, stepMin = 1e9, stepMax = 0, gapMean = 0; uint32_t stale = 0, repeats = 0; };
+
+static E2eCarResult RunCarE2e(double cx, double speed, double downJitMs, double downLoss, double upJitMs, double upLoss, uint64_t seed) {
+    Rng rng(seed);
+    const double tickMs = kTick30, durMs = 40000, vOff = 54321.7, cOff = 777.3, rf = 1000.0 / 60.0, r = 60.0, sOff = 1234.5;
+    const uint64_t tickUs = 1000000ull / 30;
+    struct E { double t; uint64_t o; int kind; double sT; uint16_t stamp; proto::VehicleUpdate u; std::vector<uint8_t> b; };
+    auto cmp = [](const E& a, const E& b) { return a.t != b.t ? a.t > b.t : a.o > b.o; };
+    std::priority_queue<E, std::vector<E>, decltype(cmp)> q(cmp);
+    uint64_t ord = 0;
+    auto push = [&](E e) { e.o = ord++; q.push(std::move(e)); };
+    auto at = [&](double t, proto::Kinematics& k, proto::Quat& qu, double& w) {
+        const double om = speed / r, th = om * t / 1000.0;
+        k.x = float(cx + r * std::cos(th)); k.y = float(r * std::sin(th)); k.z = 30;
+        k.vx = float(-speed * std::sin(th)); k.vy = float(speed * std::cos(th)); k.vz = 0;
+        qu.x = 0; qu.y = 0; qu.z = float(std::sin(th / 2)); qu.w = float(std::cos(th / 2));
+        w = om;
+    };
+    {
+        double nextSend = 0;
+        uint32_t seq = 0;
+        for (long f = 0; double(f) * (1000.0 / 60) <= durMs; ++f) {
+            const double t = 3.7 + double(f) * (1000.0 / 60) + (rng.Uniform() - 0.5) * 2.0;
+            if (t < nextSend) continue;
+            const double due = nextSend + tickMs / 1.5;
+            nextSend = due > t ? due : t + tickMs / 1.5;
+            E e{};
+            e.kind = 0; e.sT = t; e.stamp = uint16_t(uint64_t(t + sOff) & 0xFFFFu);
+            double w;
+            at(t, e.u.k, e.u.rot, w);
+            e.u.avz = float(w); e.u.vehId = 0; e.u.seq = ++seq; e.u.flags = proto::kVehEngine;
+            if (upLoss > 0 && rng.Uniform() < upLoss) continue;
+            e.t = t + rng.Uniform() * 2.0 + 25.0 + rng.Uniform() * upJitMs;
+            push(e);
+        }
+    }
+    for (uint64_t i = uint64_t(std::ceil(vOff * 1000.0 / double(tickUs))) + 2;; ++i) {
+        const double T = double(i * tickUs) / 1000.0 - vOff;
+        if (T > durMs + 500) break;
+        if (T < 0) continue;
+        E e{};
+        e.kind = 1; e.t = T + rng.Uniform() * 0.6; e.sT = double(i);
+        push(e);
+    }
+    for (long f = 0; double(f) * rf <= durMs; ++f) { E e{}; e.kind = 3; e.t = 2.3 + double(f) * rf; push(e); }
+
+    server::VehicleStore vs;
+    server::VehicleStore::Rules rules;
+    rules.nearEvery = 1; rules.midEvery = 2; rules.farEvery = 3; rules.refreshTicks = 30;
+    vs.Configure(rules, 8);
+    vs.AddReceiver(0);
+    vs.AddReceiver(1);
+    uint16_t vid = 0;
+    proto::Kinematics pos0;
+    pos0.x = float(cx + r); pos0.z = 30;
+    vs.Create(0x1234, pos0, proto::Quat(), 0, 0, 0, 0, false, 0, 1, &vid);
+    vs.Enter(0, vid, 0, pos0, 0, 1);
+    SampleClock sc;
+    NetClock clock(NetClockConfig::ForTickHz(30));
+    VehicleInterpolator interp;
+    ClassDelay extra;
+    const proto::Kinematics rpos; // the receiver stands at the origin
+    struct Fr { double T, x, y; };
+    std::vector<Fr> frames;
+    std::vector<double> gaps;
+    double lastStored = -1;
+    E2eCarResult R;
+    while (!q.empty()) {
+        E e = q.top();
+        q.pop();
+        const double T = e.t;
+        if (e.kind == 0) {
+            const uint64_t recvUs = uint64_t((T + vOff) * 1000.0);
+            bool jumped = false;
+            vs.Update(0, e.u, recvUs / 1000, &jumped, sc.Place(e.stamp, recvUs) / 1000);
+        } else if (e.kind == 1) {
+            const uint32_t tick = uint32_t(e.sT);
+            const uint64_t nowMs = uint64_t(tick) * tickUs / 1000;
+            std::vector<uint16_t> gone;
+            vs.Tick(nowMs, tick, &gone);
+            std::vector<server::VehicleStore::ControlCandidate> cc(2);
+            cc[0].id = 0; cc[0].pos = pos0; cc[0].hasState = true; cc[0].trusted = true;
+            cc[1].id = 1; cc[1].pos = rpos; cc[1].hasState = true; cc[1].trusted = true;
+            vs.AssignControllers(nowMs, tick, cc);
+            proto::VehicleWorld fr;
+            if (vs.BuildFrame(1, true, rpos, tick, nowMs, fr)) {
+                const proto::Bytes b = proto::Encode(fr);
+                if (!b.empty() && rng.Uniform() >= downLoss) {
+                    E d{};
+                    d.kind = 2; d.t = T + 25.0 + rng.Uniform() * downJitMs; d.b = b;
+                    push(d);
+                }
+            }
+        } else if (e.kind == 2) {
+            proto::VehicleWorld vw;
+            if (!proto::Decode(e.b.data(), e.b.size(), vw)) continue;
+            const double now = T + cOff;
+            clock.OnFrame(vw.tick, now);
+            const int64_t ft = clock.Unwrap(vw.tick);
+            for (const proto::VehicleState& st : vw.vehicles) {
+                if (st.ctrl == 1) continue;
+                VehicleSnapshot s;
+                s.tMs = SnapshotStampMs(ft, clock.TickMs(), st.ageMs);
+                s.pos = {st.k.x, st.k.y, st.k.z}; s.vel = {st.k.vx, st.k.vy, st.k.vz};
+                s.rot = {st.rot.x, st.rot.y, st.rot.z, st.rot.w}; s.angVel = {st.avx, st.avy, st.avz};
+                s.hasAngVel = true; s.steering = st.steer;
+                const VehPush pr = interp.Push(s);
+                if (pr == VehPush::Accepted || pr == VehPush::Teleported) {
+                    clock.NoteAge(st.ageMs);
+                    if (lastStored >= 0) gaps.push_back(now - lastStored);
+                    lastStored = now;
+                }
+            }
+        } else {
+            const double now = T + cOff;
+            if (!clock.Ready()) continue;
+            const double ex = extra.UpdateGap(interp.TypicalGapMs(), clock.TickMs(), now, clock.Config().maxSlew);
+            VehicleSample out;
+            if (interp.Sample(clock.RenderT(now) - ex, out)) frames.push_back({T, out.pos.x, out.pos.y});
+        }
+    }
+    std::vector<double> taus, errs, steps;
+    size_t nf = 0;
+    for (const Fr& f : frames) {
+        if (f.T < 6000 || (nf++ & 3) != 0) continue;
+        double best = 1e9, bt = 0;
+        for (double tau = 20; tau <= 600; tau += 2.0) {
+            proto::Kinematics k; proto::Quat qq; double w;
+            at(f.T - tau, k, qq, w);
+            const double d = std::hypot(f.x - k.x, f.y - k.y);
+            if (d < best) { best = d; bt = tau; }
+        }
+        taus.push_back(bt);
+    }
+    R.latMed = Percentile(taus, 0.5);
+    {
+        double m = 0, v = 0;
+        for (double t : taus) m += t;
+        m /= double(std::max<size_t>(1, taus.size()));
+        for (double t : taus) v += (t - m) * (t - m);
+        R.latSd = std::sqrt(v / double(std::max<size_t>(1, taus.size())));
+    }
+    const Fr* pv = nullptr;
+    for (const Fr& f : frames) {
+        if (f.T < 6000) continue;
+        proto::Kinematics k; proto::Quat qq; double w;
+        at(f.T - R.latMed, k, qq, w);
+        errs.push_back(std::hypot(f.x - k.x, f.y - k.y));
+        if (pv) steps.push_back(std::hypot(f.x - pv->x, f.y - pv->y) / (speed * rf / 1000.0));
+        pv = &f;
+        ++R.frames;
+    }
+    R.errP95 = Percentile(errs, 0.95); R.errMax = Percentile(errs, 1.0);
+    R.stepMin = Percentile(steps, 0.0); R.stepMax = Percentile(steps, 1.0);
+    double gm = 0;
+    for (double g : gaps) gm += g;
+    R.gapMean = gm / double(std::max<size_t>(1, gaps.size()));
+    R.stale = interp.Stats().stale; R.repeats = interp.Stats().repeats;
+    return R;
+}
+
+static void TestEndToEndVehicles() {
+    // Receiver at the origin, the car on a circle of 60 m around (cx, 0): near < 120 m, mid < 250 m, far beyond.
+    const E2eCarResult n = RunCarE2e(50, 20, 10, 0.02, 8, 0, 3), m = RunCarE2e(180, 20, 10, 0.02, 8, 0, 3), f = RunCarE2e(350, 20, 10, 0.02, 8, 0, 3);
+    const E2eCarResult fast = RunCarE2e(50, 35, 10, 0.02, 8, 0, 3), hostile = RunCarE2e(50, 20, 60, 0.05, 20, 0, 3), hostileMid = RunCarE2e(180, 20, 60, 0.05, 20, 0, 3);
+    const E2eCarResult up = RunCarE2e(50, 20, 10, 0.02, 8, 0.05, 3);
+    auto line = [](const char* name, const E2eCarResult& r) {
+        std::printf("  [car pipeline %-30s] err p95 %.3f max %.2f m | latency %.0f ms (sd %.1f) | step %.2f..%.2fx | stored gap mean %.0f ms | stale %u repeats %u\n", name, r.errP95, r.errMax, r.latMed,
+                    r.latSd, r.stepMin, r.stepMax, r.gapMean, r.stale, r.repeats);
+    };
+    line("near 20 m/s circle", n); line("mid", m); line("far", f); line("near 35 m/s", fast); line("near, 80 ms-ish jitter, 5% loss", hostile); line("mid, same", hostileMid); line("near, 5% uplink loss", up);
+    Check("e2e vehicles: a car at 20 m/s through the real VehicleStore (45 Hz controller, SampleClock, tiers 30 / 15 / 10 Hz, ageMs, the VehicleWorld codec) is shown within 6 cm (p95: about 2.5 ms of time-base noise at 20 m/s) of its path at a steady latency "
+          "(sd <= 2 ms: 127 / 160 / 193 ms behind), every frame within 0.9..1.1 of the expected step; 35 m/s within 10 cm",
+          n.frames > 1800 && m.frames > 1800 && f.frames > 1800 && n.errP95 <= 0.06 && m.errP95 <= 0.06 && f.errP95 <= 0.06 && std::max({n.latSd, m.latSd, f.latSd}) <= 2.0 &&
+              std::min({n.stepMin, m.stepMin, f.stepMin}) >= 0.9 && std::max({n.stepMax, m.stepMax, f.stepMax}) <= 1.1 && fast.errP95 <= 0.10 && n.latMed > 110 && n.latMed < 145 && f.latMed > n.latMed + 40,
+          F("err p95 %.3f/%.3f/%.3f fast %.3f, latency %.0f/%.0f/%.0f sd %.1f/%.1f/%.1f, step %.2f..%.2f", n.errP95, m.errP95, f.errP95, fast.errP95, n.latMed, m.latMed, f.latMed, n.latSd, m.latSd, f.latSd,
+            std::min({n.stepMin, m.stepMin, f.stepMin}), std::max({n.stepMax, m.stepMax, f.stepMax})));
+    Check("e2e vehicles hostile: 60 ms downlink jitter with 5% loss and 20 ms uplink jitter (near and mid), and 5% uplink loss: p95 position error <= 25 cm (a 20 m/s car, delay adapting), steps within 0.7..1.3, no frozen car",
+          hostile.frames > 1800 && hostile.errP95 <= 0.25 && hostileMid.errP95 <= 0.25 && up.errP95 <= 0.25 && std::min({hostile.stepMin, hostileMid.stepMin, up.stepMin}) >= 0.7 &&
+              std::max({hostile.stepMax, hostileMid.stepMax, up.stepMax}) <= 1.3,
+          F("err p95 %.3f/%.3f/%.3f, steps %.2f..%.2f", hostile.errP95, hostileMid.errP95, up.errP95, std::min({hostile.stepMin, hostileMid.stepMin, up.stepMin}),
+            std::max({hostile.stepMax, hostileMid.stepMax, up.stepMax})));
 }
 
 int main() {
@@ -1915,12 +2787,18 @@ int main() {
     TestClassHold();
     TestClassHysteresis();
     TestStillSettle();
+    std::printf("-- sync pipeline review: position denoise, diagnostics, end to end through the real replication\n");
+    TestDenoise();
+    TestPipelineDiagnostics();
+    TestEndToEnd();
+    TestEndToEndVehicles();
 
     // steady 4x3 + loss/jitter 10 + slow client 3 + continuity 2 + ordering 8 +
     // heading 3 + extrapolation 3 + teleport 5 + RemoteSync 2 + forget 4 +
     // sample age 2 + idle/left 3 + ped state 5 + sample clock 3 (v5) + NetClock 6 + one clock 3 + sender pipeline 5 (W7) + config 4
     // + W8: class hold 1 + class extra hysteresis 1 + standing-still settle 1
-    const int expected = 12 + 10 + 3 + 2 + 8 + 3 + 3 + 5 + 2 + 4 + 2 + 3 + 5 + 3 + 6 + 3 + 5 + 4 + 3;
+    // + sync pipeline review: denoise 6, diagnostics 4, end to end 9, vehicles end to end 2
+    const int expected = 12 + 10 + 3 + 2 + 8 + 3 + 3 + 5 + 2 + 4 + 2 + 3 + 5 + 3 + 6 + 3 + 5 + 4 + 3 + 6 + 4 + 9 + 2;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

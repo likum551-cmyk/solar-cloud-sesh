@@ -67,6 +67,10 @@ namespace gage::server {
             put("pairs_budget_deferred_per_s", d(n.pairBudgetDeferred, s.pairBudgetDeferred) / secs);
             put("pairs_packet_cap_deferred_per_s", d(n.pairPacketCapDeferred, s.pairPacketCapDeferred) / secs);
             put("pairs_no_state_per_s", d(n.pairNoState, s.pairNoState) / secs);
+            put("pairs_sent_near_per_s", d(n.pairSentTier[0], s.pairSentTier[0]) / secs);
+            put("pairs_sent_mid_per_s", d(n.pairSentTier[1], s.pairSentTier[1]) / secs);
+            put("pairs_sent_far_per_s", d(n.pairSentTier[2], s.pairSentTier[2]) / secs);
+            put("pairs_sent_idle_per_s", d(n.pairSentTier[3], s.pairSentTier[3]) / secs);
             put("wakes_per_s", d(n.wakes, s.wakes) / secs);
             put("noise_wakes_held_per_s", d(n.noiseWakesHeld, s.noiseWakesHeld) / secs);
             put("samples_received_per_s", d(n.samplesReceived, s.samplesReceived) / secs);
@@ -74,6 +78,12 @@ namespace gage::server {
             put("samples_forwarded_twice_per_s", d(n.samplesForwardedTwice, s.samplesForwardedTwice) / secs);
             const double recvd = d(n.samplesReceived, s.samplesReceived), fwd = d(n.samplesForwarded, s.samplesForwarded);
             put("samples_never_forwarded_per_s", (recvd > fwd ? recvd - fwd : 0.0) / secs);
+            put("enet_peers", (double)n.enetPeers);
+            put("enet_throttle_min", (double)n.enetThrottleMin);
+            put("enet_loss_permille_max", (double)n.enetLossPermilleMax);
+            put("enet_rtt_ms_avg", (double)n.enetRttMsAvg);
+            put("enet_rtt_ms_max", (double)n.enetRttMsMax);
+            put("enet_rttvar_ms_max", (double)n.enetRttVarMsMax);
             return kv;
         }
 
@@ -97,6 +107,28 @@ namespace gage::server {
         for (const auto& p : kv)
             out += "\n  " + p.first + " " + Num(p.second);
         return out;
+    }
+
+    std::string FormatSyncLine(const Metrics& n, const Metrics& s, double secs, uint32_t tickHz, size_t players)
+    {
+        if (secs <= 0.0) secs = 1e-9;
+        auto d = [](uint64_t a, uint64_t b) { return (double)(a - b); };
+        const double recvd = d(n.samplesReceived, s.samplesReceived), fwd = d(n.samplesForwarded, s.samplesForwarded);
+        char buf[900];
+        std::snprintf(buf, sizeof(buf),
+                      "sync %.0f s: %zu players, %.1f ticks/s of %u (%.0f missed, late p95 %.0f us); world %.1f pkts/s "
+                      "%.1f entries/s (near %.1f mid %.1f far %.1f idle %.1f /s, budget deferred %.1f /s); samples in %.1f /s, "
+                      "forwarded %.1f twice %.1f never %.1f /s; enet %.0f peers throttle min %.0f/32 loss max %.1f%% rtt avg %.0f "
+                      "max %.0f ms var max %.0f ms",
+                      secs, players, d(n.ticks, s.ticks) / secs, (unsigned)tickHz, d(n.ticksMissed, s.ticksMissed),
+                      n.tickLateUs.Quantile(0.95, &s.tickLateUs), d(n.worldPackets, s.worldPackets) / secs,
+                      d(n.worldEntries, s.worldEntries) / secs, d(n.pairSentTier[0], s.pairSentTier[0]) / secs,
+                      d(n.pairSentTier[1], s.pairSentTier[1]) / secs, d(n.pairSentTier[2], s.pairSentTier[2]) / secs,
+                      d(n.pairSentTier[3], s.pairSentTier[3]) / secs, d(n.pairBudgetDeferred, s.pairBudgetDeferred) / secs,
+                      recvd / secs, fwd / secs, d(n.samplesForwardedTwice, s.samplesForwardedTwice) / secs,
+                      (recvd > fwd ? recvd - fwd : 0.0) / secs, (double)n.enetPeers, (double)n.enetThrottleMin,
+                      (double)n.enetLossPermilleMax / 10.0, (double)n.enetRttMsAvg, (double)n.enetRttMsMax, (double)n.enetRttVarMsMax);
+        return buf;
     }
 
     std::string FormatMetricsJson(const Metrics& now, const Metrics& since, double windowSeconds, uint32_t tickHz,

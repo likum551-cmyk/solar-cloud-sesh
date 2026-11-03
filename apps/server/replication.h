@@ -158,6 +158,7 @@ namespace gage::server {
             proto::EntryPlan plan;
             size_t bytes;
             uint32_t lastSent;
+            uint8_t tier = 0; // 0 near, 1 mid, 2 far, 3 idle (the rate that applied: Metrics::pairSentTier)
         };
 
         void ProcessReceiver(uint16_t r, uint32_t tick, const Sink& sink, Metrics& m);

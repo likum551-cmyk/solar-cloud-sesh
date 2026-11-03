@@ -645,4 +645,17 @@ namespace gage::net {
         return peer_ ? peer_->roundTripTime : 0;
     }
 
+    ClientSession::LinkInfo ClientSession::link() const
+    {
+        LinkInfo l;
+        if (!peer_) return l;
+        l.rttMs = peer_->roundTripTime;
+        l.rttVarMs = peer_->roundTripTimeVariance;
+        l.throttle = peer_->packetThrottle;
+        l.throttleScale = ENET_PEER_PACKET_THROTTLE_SCALE;
+        l.throttleDeceleration = peer_->packetThrottleDeceleration;
+        l.lossPercent = 100.0 * (double)peer_->packetLoss / (double)ENET_PEER_PACKET_LOSS_SCALE;
+        return l;
+    }
+
 }

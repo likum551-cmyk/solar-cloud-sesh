@@ -167,12 +167,19 @@ namespace {
                 // Datagrams both ways tell a dead path (in == 0) from a socket that cannot send.
                 const net::ClientSession::Counters c = session.counters();
                 const std::string note = peers.beatNote ? peers.beatNote() : std::string();
+                // Sync pipeline review: ENet's packet throttle deletes unreliable packets (our state channel) when it is below its scale; the
+                // server configures deceleration 0 so it must read full. loss is ENet's smoothed loss of RELIABLE packets, stale / rejected the
+                // world frames the decoder dropped (reordered or late / unresolvable) over the whole session.
+                const net::ClientSession::LinkInfo li = session.link();
                 GLOGI("join: network thread alive, %u states sent (%u of them keep-alives) and %u world updates in the last 10 s; "
-                      "udp %llu in / %llu out, rtt %u ms, socket errors %llu, loop gap max %lld ms%s%s",
+                      "udp %llu in / %llu out, rtt %u ms, socket errors %llu, loop gap max %lld ms%s%s; "
+                      "enet throttle %u/%u (deceleration %u), reliable loss %.1f%%, rtt deviation %u ms, world frames dropped by the decoder: %llu stale %llu rejected",
                       (unsigned)beatStates, (unsigned)beatKeepAlives, (unsigned)beatWorlds,
                       (unsigned long long)(c.wireDatagramsIn - beatIn), (unsigned long long)(c.wireDatagramsOut - beatOut),
                       (unsigned)session.rttMs(), (unsigned long long)c.socketErrors, beatLoopGapMaxMs,
-                      note.empty() ? "" : "; ", note.c_str());
+                      note.empty() ? "" : "; ", note.c_str(),
+                      (unsigned)li.throttle, (unsigned)li.throttleScale, (unsigned)li.throttleDeceleration, li.lossPercent, (unsigned)li.rttVarMs,
+                      (unsigned long long)c.worldStale, (unsigned long long)c.worldRejected);
                 beatIn = c.wireDatagramsIn;
                 beatOut = c.wireDatagramsOut;
                 beatAt = Clock::now();
