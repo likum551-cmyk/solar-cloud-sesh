@@ -245,6 +245,12 @@ set_target_properties(crash_filter_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CM
 add_executable(script_suppress_test tests/script_suppress_test.cpp)
 set_target_properties(script_suppress_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
+# ambient_test.exe: T5, no ambient NPCs / traffic: the pure logic of apps/engine/ambient.h (scheduler, exemption list, sweep
+# planner, circuit breaker, counters, the `engine: ambient` line) and a source-order guard on apps/engine/engine.cpp. Never shipped.
+add_executable(ambient_test tests/ambient_test.cpp)
+target_compile_definitions(ambient_test PRIVATE T5_REPO_DIR="${CMAKE_SOURCE_DIR}")
+set_target_properties(ambient_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
 # serverquery_test.exe: the launcher's UDP server-query client (libs/net/serverquery.cpp)
 # against an in-process UDP responder on loopback -- proves a real round trip reads the live
 # player counts, that a wrong nonce is ignored, and that a dead port times out. Never shipped.

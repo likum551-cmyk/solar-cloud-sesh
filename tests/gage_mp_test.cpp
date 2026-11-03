@@ -5,6 +5,8 @@
 #include "../apps/engine/gage_mp.cpp"  // the TU itself, so its internals are reachable
 
 #include "../apps/engine/quit_gate.h"
+#define T5_WITH_WORLD
+#include "t5_ambient_tests.h"   // T5 ambient: the World wrappers' counters and the hash-0 sentinels
 
 #include <atomic>
 #include <cstdio>
@@ -139,7 +141,13 @@ int main() {
               lightsOn && highbeamsOn && ratio == 1.5f && roof == 7);
     }
 
-    const int expected = 18;
+    // T5 ambient: the World wrappers on a test exe with no native table (tests/t5_ambient_tests.h).
+    {
+        const int ran = t5::RunWorld([](const char* name, bool ok, const std::string& got) { Check(name, ok, got.c_str()); });
+        Check("T5: the world checks ran", ran == t5::kWorldChecks, std::to_string(ran).c_str());
+    }
+
+    const int expected = 18 + t5::kWorldChecks + 1;   // + T5 ambient (RunWorld and its own count check)
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
