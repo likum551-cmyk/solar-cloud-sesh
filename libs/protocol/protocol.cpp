@@ -574,6 +574,37 @@ namespace gage::proto {
         return w.take();
     }
 
+    namespace {
+        // The one place that says which SeatNotice fields are valid (Encode refuses, Decode refuses).
+        bool SeatNoticeValid(const SeatNotice& m)
+        {
+            const uint8_t kind = (uint8_t)m.kind;
+            if (kind < (uint8_t)SeatNoticeKind::Reserved || kind > (uint8_t)SeatNoticeKind::Exited) return false;
+            if (m.player >= kMaxPlayers || m.vehId >= kMaxVehicles || m.seat >= kVehSeats) return false;
+            switch (m.kind)
+            {
+            case SeatNoticeKind::Reserved:  return (m.detail & ~kSeatNoticeRun) == 0;
+            case SeatNoticeKind::Cancelled: return m.detail <= kSeatCancelLast;
+            case SeatNoticeKind::Seated:
+            case SeatNoticeKind::Exited:    return m.detail == 0;
+            }
+            return false;
+        }
+    }
+
+    Bytes Encode(const SeatNotice& m)
+    {
+        if (!SeatNoticeValid(m)) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::SeatNotice);
+        w.u8((uint8_t)m.kind);
+        w.u16(m.player);
+        w.u16(m.vehId);
+        w.u8(m.seat);
+        w.u8(m.detail);
+        return w.take();
+    }
+
     Bytes Encode(const PlayerLook& m)
     {
         wire::Writer w;
@@ -1002,6 +1033,21 @@ namespace gage::proto {
         return true;
     }
 
+    bool Decode(const uint8_t* p, size_t n, SeatNotice& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::SeatNotice)) return false;
+        SeatNotice m;
+        m.kind = (SeatNoticeKind)r.u8();
+        m.player = r.u16();
+        m.vehId = r.u16();
+        m.seat = r.u8();
+        m.detail = r.u8();
+        if (!r.done() || !SeatNoticeValid(m)) return false;
+        out = m;
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, PlayerLook& out)
     {
         wire::Reader r(p, n);
@@ -1223,6 +1269,7 @@ namespace gage::proto {
         case Msg::PeerAnim:         return "PeerAnim";
         case Msg::PeerScenario:     return "PeerScenario";
         case Msg::PeerAnimStop:     return "PeerAnimStop";
+        case Msg::SeatNotice:       return "SeatNotice";
         }
         return "?";
     }
@@ -1267,6 +1314,33 @@ namespace gage::proto {
         case VehicleOp::SetColours: return "SetColours";
         case VehicleOp::Register:   return "Register";
         case VehicleOp::Release:    return "Release";
+        case VehicleOp::EnterIntent:  return "EnterIntent";
+        case VehicleOp::CancelIntent: return "CancelIntent";
+        }
+        return "?";
+    }
+
+    const char* ToString(SeatNoticeKind k)
+    {
+        switch (k)
+        {
+        case SeatNoticeKind::Reserved:  return "Reserved";
+        case SeatNoticeKind::Seated:    return "Seated";
+        case SeatNoticeKind::Cancelled: return "Cancelled";
+        case SeatNoticeKind::Exited:    return "Exited";
+        }
+        return "?";
+    }
+
+    const char* ToString(SeatCancelReason r)
+    {
+        switch (r)
+        {
+        case SeatCancelReason::ByPlayer:    return "ByPlayer";
+        case SeatCancelReason::Expired:     return "Expired";
+        case SeatCancelReason::Replaced:    return "Replaced";
+        case SeatCancelReason::VehicleGone: return "VehicleGone";
+        case SeatCancelReason::PlayerGone:  return "PlayerGone";
         }
         return "?";
     }

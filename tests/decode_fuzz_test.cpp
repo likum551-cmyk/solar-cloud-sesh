@@ -309,6 +309,14 @@ static std::vector<Case> Corpus()
     { PeerAnim m; m.id = 4; m.anim = SampleAnim(); v.push_back(Make("PeerAnim", m)); }
     { PeerScenario m; m.id = 4; m.name = "WORLD_HUMAN_SMOKING"; v.push_back(Make("PeerScenario", m)); }
     { PeerAnimStop m; m.id = 4; v.push_back(Make("PeerAnimStop", m)); }
+    // T1 seats (wire v6): one case per SeatNotice kind (each kind has its own detail rule: Reserved bit 0 only, Cancelled a reason, the
+    // others 0), and the two new VehicleCmd ops (their arg is validated by the server, not the codec).
+    { SeatNotice m; m.kind = SeatNoticeKind::Reserved; m.player = 7; m.vehId = 12; m.seat = 3; m.detail = kSeatNoticeRun; v.push_back(Make("SeatNotice reserved", m)); }
+    { SeatNotice m; m.kind = SeatNoticeKind::Seated; m.player = 7; m.vehId = 12; m.seat = 3; v.push_back(Make("SeatNotice seated", m)); }
+    { SeatNotice m; m.kind = SeatNoticeKind::Cancelled; m.player = 7; m.vehId = 12; m.seat = 3; m.detail = (uint8_t)SeatCancelReason::Expired; v.push_back(Make("SeatNotice cancelled", m)); }
+    { SeatNotice m; m.kind = SeatNoticeKind::Exited; m.player = 7; m.vehId = 12; m.seat = 3; v.push_back(Make("SeatNotice exited", m)); }
+    { VehicleCmd m; m.vehId = 12; m.op = VehicleOp::EnterIntent; m.arg = 3u | kIntentRun; v.push_back(Make("VehicleCmd enter intent", m)); }
+    { VehicleCmd m; m.vehId = 12; m.op = VehicleOp::CancelIntent; v.push_back(Make("VehicleCmd cancel intent", m)); }
     for (Case& c : v)
         if (c.name == "VehicleWorld" || c.name == "VehicleUpdate" || c.name == "VehicleCmd register") c.lossy = true;
     return v;

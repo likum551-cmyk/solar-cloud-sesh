@@ -172,8 +172,9 @@ namespace gage::proto {
         PeerAnim         = 28, // S->C reliable (v4): another player plays an animation
         PeerScenario     = 29, // S->C reliable (v4): another player starts a scenario
         PeerAnimStop     = 30, // S->C reliable (v4): another player stopped its animation / scenario
+        SeatNotice       = 31, // S->C reliable (T1 seats, wire v6): a player's enter / exit INTENT on a vehicle seat (see SeatNotice)
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::PeerAnimStop;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::SeatNotice;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -426,8 +427,20 @@ namespace gage::proto {
         Register   = 8, // v4: adopt a local (ambient) car: arg = model hash, the tail carries where it is; the server
                         // creates a networked vehicle there and seats the requester in `seat`
         Release    = 9, // v5: give up ownership of vehId (its owner only): anybody may drive it from then on
+        EnterIntent  = 10, // T1 seats (wire v6): "I am about to get into seat N of vehId" (arg = seat | kIntentRun): the server RESERVES the
+                           // seat (same checks as Enter: range, NotOwner, taken or reserved by someone else, distance, lock, dead, not
+                           // already seated), answers Ok or the refusal, and tells every relevant client with a SeatNotice::Reserved.
+                           // The reservation ends with the player's Enter (SeatNotice::Seated), CancelIntent, Exit, a new intent, death,
+                           // disconnect, the vehicle's despawn or kIntentTtlMs (SeatNotice::Cancelled). It never seats anybody.
+        CancelIntent = 11, // T1 seats (wire v6): drop my reservation on vehId (Ok also when there is none); Exit while a reservation is
+                           // pending is the same
     };
-    constexpr uint8_t kVehicleOpLast = (uint8_t)VehicleOp::Release;
+    constexpr uint8_t kVehicleOpLast = (uint8_t)VehicleOp::CancelIntent;
+    // EnterIntent.arg: bits 0..7 the wire seat (0..kVehSeats-1), bit 8 kIntentRun (the player ran to the door; the replay walks
+    // when clear), every other bit reserved and refused (BadArg).
+    constexpr uint32_t kIntentRun = 0x100u;
+    constexpr uint32_t kIntentArgMask = 0x1FFu;
+    constexpr uint32_t kIntentTtlMs = 6000;  // a reservation the player never completes or cancels is dropped by the server after this
 
     // One networked vehicle as a client sees it in a VehicleWorld full entry.
     //   id            0..kMaxVehicles-1
@@ -561,6 +574,38 @@ namespace gage::proto {
         uint16_t          vehId = 0;
     };
 
+    // T1 seats (wire v6): the server's account of a player's enter / exit INTENT, to every client that has the vehicle in range
+    // (and to the actor), reliable and in order with the server's other reliable traffic. VehicleWorld.seats stays the only
+    // truth about OCCUPANCY; this carries what the seat list cannot: that somebody is ON THE WAY into a seat (so every screen
+    // can play the real enter task instead of a warp), which seat, and when an intent died without a seating.
+    //   Reserved   `player` reserved `seat` of `vehId` (detail bit 0 kSeatNoticeRun: it ran to the door). Replaces that player's
+    //              older reservation (a Cancelled/Replaced for the old one precedes it).
+    //   Seated     the reservation became occupancy: `player` now holds `seat` (the VehicleWorld names it from the same tick on).
+    //   Cancelled  the reservation ended without a seating; detail = SeatCancelReason.
+    //   Exited     `player` left `seat` by its own Exit (the normal exit animation is due; a death, disconnect or despawn is NOT
+    //              announced this way, those only drop the seat from the list).
+    // Decode refuses an unknown kind, a player at or above kMaxPlayers, a vehicle at or above kMaxVehicles, a seat at or above
+    // kVehSeats, and a detail that is not defined for the kind (Reserved: only bit 0; Cancelled: a SeatCancelReason; others 0).
+    enum class SeatNoticeKind : uint8_t { Reserved = 1, Seated = 2, Cancelled = 3, Exited = 4 };
+    enum class SeatCancelReason : uint8_t
+    {
+        ByPlayer    = 0, // CancelIntent / Exit while pending
+        Expired     = 1, // kIntentTtlMs passed
+        Replaced    = 2, // the same player reserved another seat (or entered another seat / vehicle)
+        VehicleGone = 3, // the vehicle was despawned
+        PlayerGone  = 4, // the player disconnected, died or was put elsewhere
+    };
+    constexpr uint8_t kSeatCancelLast = (uint8_t)SeatCancelReason::PlayerGone;
+    constexpr uint8_t kSeatNoticeRun = 1;
+    struct SeatNotice
+    {
+        SeatNoticeKind kind = SeatNoticeKind::Reserved;
+        uint16_t       player = kNoPlayer;
+        uint16_t       vehId = 0;
+        uint8_t        seat = 0;
+        uint8_t        detail = 0;
+    };
+
     // ---- combat (v4): server-owned health -------------------------------------
     // A shooter's client reports each hit its game registered (Hit); the server validates it
     // (shooter and target alive, target relevant to the shooter, within Config::maxHitDistance, at
@@ -691,6 +736,7 @@ namespace gage::proto {
     Bytes Encode(const PeerAnim& m);
     Bytes Encode(const PeerScenario& m);
     Bytes Encode(const PeerAnimStop& m);
+    Bytes Encode(const SeatNotice& m);   // T1 seats: empty (refused) for a field Decode would refuse
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -721,6 +767,7 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, VehicleCmd& out);
     // PlayerLook / PeerLook decode any wire value (a PeerLook id must be below kMaxPlayers);
     // ValidLook is the range policy.
+    bool Decode(const uint8_t* p, size_t n, SeatNotice& out);   // T1 seats
     bool Decode(const uint8_t* p, size_t n, PlayerLook& out);
     bool Decode(const uint8_t* p, size_t n, PeerLook& out);
     bool Decode(const uint8_t* p, size_t n, VehicleUpdate& out);
@@ -789,5 +836,7 @@ namespace gage::proto {
     const char* ToString(LeaveReason r);
     const char* ToString(VehicleOp op);
     const char* ToString(VehicleResultCode c);
+    const char* ToString(SeatNoticeKind k);
+    const char* ToString(SeatCancelReason r);
 
 }

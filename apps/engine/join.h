@@ -125,6 +125,8 @@ namespace gage::join {
         std::function<void(const proto::PeerAnim&)> onPeerAnim;
         std::function<void(const proto::PeerScenario&)> onPeerScenario;
         std::function<void(const proto::PeerAnimStop&)> onPeerAnimStop;
+        // T1 seats (wire v6): somebody's enter / exit intent on a vehicle seat (reliable, in order with the server's other traffic).
+        std::function<void(const proto::SeatNotice&)> onSeatNotice;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;

@@ -395,6 +395,10 @@ namespace {
                     if (peers.onPeerScenario)
                         timed("peerScenario", [&] { peers.onPeerScenario(e.scenario); });
                     break;
+                case net::Event::Type::SeatNotice:
+                    if (peers.onSeatNotice)
+                        timed("seatNotice", [&] { peers.onSeatNotice(e.seatNotice); });
+                    break;
                 case net::Event::Type::PeerAnimStop:
                     if (peers.onPeerAnimStop)
                         timed("peerAnimStop", [&] { peers.onPeerAnimStop(e.animStop); });

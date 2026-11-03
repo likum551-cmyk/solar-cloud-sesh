@@ -27,6 +27,7 @@
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
 #include "sync/vehicle_syncd.h"
+#include "sync/seat_intent.h"
 #include "sync/nametag.h"
 #include "sync/combat.h"
 #include "sync/emote.h"
@@ -475,9 +476,10 @@ namespace {
     // the bounded queue, where an answer evicts a feed line when it is full and a feed line is refused.
     struct NetEvent
     {
-        enum Kind { Killed, VehResult } kind = Killed;
+        enum Kind { Killed, VehResult, SeatNote } kind = Killed;
         proto::Killed killed;
         proto::VehicleResult veh;
+        proto::SeatNotice seat;       // T1 seats (wire v6)
     };
     std::mutex g_evMtx;
     constexpr size_t kMaxEvents = 256;
@@ -531,6 +533,21 @@ namespace {
         sync::EntryVec target;     // its last target
     };
     EntryWalk g_entryWalk;
+    // T1 seats (wire v6, libs/sync/seat_intent.h): the server's enter / exit intents. g_seats holds the reservation book and one replay per
+    // remote player; g_localEnter is OUR entry (intent -> the game's TASK_ENTER_VEHICLE -> bounded fallback warp). HKCU seat_intent=0
+    // (read at Welcome) restores the pre-v6 behaviour: walk + teleport-in locally, follow + seat warp on the other screens.
+    // Script tick only (the net sinks queue their events).
+    sync::SeatClientModel g_seats;
+    sync::LocalEnterFlow g_localEnter;
+    std::atomic<bool> g_seatIntentOn{true};
+    struct T1Stats
+    {
+        uint32_t intentsSent = 0, intentsOk = 0, intentsRefused = 0, cancelsSent = 0, noticesIn = 0, noticesAboutUs = 0, exitsReplayed = 0, exitsNoPed = 0;
+        uint32_t refusedBy[16] = {};                 // by VehicleResultCode
+        uint32_t localIssueFailed = 0;
+        uint32_t evictLog = 0;
+    };
+    T1Stats g_t1;
     // W9 item 3: INPUT_ENTER (23) stays disabled from our handled F / G press until 500 ms after the ped sat down, and a
     // quick exit after an entry is counted (the 0.4.2 log: enter, exit 1.4 s later, enter, exit). Script tick only.
     sync::EntryPressGuard g_entryGuard;
@@ -1212,6 +1229,7 @@ namespace {
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
+        g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
             // Sync plan W3: hit_react off|bullet|ragdoll|both (anything else, the default: both),
             // peer_muzzle=0, peer_shoot=script (real fire is the default since the 0.4.3 fixes).
@@ -1513,6 +1531,14 @@ namespace {
             if (pushed == sync::VehPush::Accepted || pushed == sync::VehPush::Teleported)
                 clock.NoteAge((double)st.ageMs);
         }
+    }
+
+    void OnSeatNotice(const proto::SeatNotice& n)
+    {
+        NetEvent e;
+        e.kind = NetEvent::SeatNote;
+        e.seat = n;
+        PushEvent(std::move(e), true);                 // reliable and ordered with the VehicleResults: never the one dropped
     }
 
     void OnVehicleResult(const proto::VehicleResult& r)
@@ -4321,6 +4347,86 @@ namespace {
     // the way out on the exiting move. INFERRED live checks: that the native seat -2 takes any free seat, that
     // SET_PED_STEALTH_MOVEMENT's second argument true means "on", and that cover finds a point. Returns true while
     // the enter walk or the cover owns the ped (DrivePeer then issues no gait task over it).
+    // T1 seats (wire v6): the replay of one remote player's enter intent (libs/sync/seat_intent.h PuppetSeatReplay), once per DrivePeer from
+    // TickPeerTierB. SeatNotice::Reserved started it (HandleSeatNotice); this issues GTA's own TASK_ENTER_VEHICLE for the reserved seat ONCE,
+    // watches it (is the car named by GET_VEHICLE_PED_IS_TRYING_TO_ENTER, is the ped in the seat), clears it when the server cancels the
+    // intent, and tells the seat loop (TickVehicles, AllowsSeatWarp) when the BOUNDED fallback warp is allowed. Returns true while the
+    // task owns the ped (no gait task over it, also when it is seated by the task and the server's list has not named it yet).
+    // Natives: GET_VEHICLE_PED_IS_TRYING_TO_ENTER naming a puppet's scripted TASK_ENTER_VEHICLE, GET_VEHICLE_CLASS 8 / 13 for bikes and
+    // cycles, TASK_ENTER_VEHICLE's seat / speed arguments on a puppet: all INFERRED, live-unverified (the counters tell: issued / started /
+    // finished / neverStarted / warps in the "engine: seats (T1)" line). Script tick, no lock.
+    bool TickPeerSeatReplay(Peer& pe, int id, double nowMs)
+    {
+        sync::PuppetSeatReplay* rp = g_seats.Find((uint16_t)id);
+        if (!rp || !rp->NeedsReadings())
+            return false;
+        sync::SeatReplayIn in;
+        in.nowMs = nowMs;
+        in.pedReady = pe.ped != 0;
+        int32_t h = 0;
+        const int veh = rp->Veh();
+        if (veh >= 0)
+        {
+            const auto vit = g_vehs.find((uint16_t)veh);
+            if (vit != g_vehs.end() && vit->second.handle && !vit->second.removed)
+            {
+                h = vit->second.handle;
+                in.vehReady = true;
+                for (size_t s = 0; s < proto::kVehSeats; ++s)
+                    in.listedSomewhere = in.listedSomewhere || vit->second.st.seats[s] == (uint16_t)id;
+            }
+        }
+        if (h && pe.ped)
+        {
+            in.inSeat = g_world->GetPedInVehicleSeat(h, rp->Seat() - 1) == pe.ped;
+            // "running" = the game says this ped is entering that car by either native (TRYING_TO_ENTER, or USING = in or entering; a ped that is
+            // in the seat is already caught by inSeat above): one native that does not answer for a scripted task must not read as a task that never ran.
+            in.tryingToEnter = g_world->GetVehiclePedIsTryingToEnter(pe.ped) == h || g_world->GetVehiclePedIsUsing(pe.ped) == h;
+            const int cls = g_world->GetVehicleClass(h);
+            in.mount = cls == 8 || cls == 13;          // motorcycles, cycles (hook.h)
+        }
+        const sync::SeatReplayOut o = rp->Tick(in);
+        switch (o.act)
+        {
+        case sync::SeatAct::IssueEnter:
+        {
+            ClearPedTasksNow(pe.ped);                  // the gait task goes; the enter task replaces it
+            const bool ok = g_world->TaskEnterVehicle(pe.ped, h, o.timeoutMs, o.seat - 1, o.run ? 2.0f : 1.0f, 1);
+            pe.aimTask = false;
+            LocoReset(pe, kSiteEnterWalk);
+            if (!ok)
+                rp->NoteIssueFailed();                 // TASK_ENTER_VEHICLE not callable: behave as a task that never ran (the bounded warp)
+            static int logged = 0;
+            if (logged < 12)
+            {
+                ++logged;
+                PeerLog(!ok, "engine: seats: replaying player %d's entry: TASK_ENTER_VEHICLE vehicle id=%d seat %d (%s, %s, limit %d ms): %s", id,
+                        o.veh, o.seat, o.run ? "run" : "walk", in.mount ? "bike/cycle" : "door", o.timeoutMs, ok ? "issued" : "NOT callable");
+            }
+            break;
+        }
+        case sync::SeatAct::ClearTask:
+            ClearPedTasksNow(pe.ped);                  // cancelled or over without a seat: the controller re-issues its gait
+            pe.aimTask = false;
+            LocoReset(pe, kSiteEnterTimeout);
+            break;
+        case sync::SeatAct::Evict:
+        {
+            // Seated by the task, and the server's list never named the player: the screens disagree. Out of the car.
+            const auto vit = g_vehs.find((uint16_t)veh);
+            ++g_t1.evictLog;
+            if (g_t1.evictLog <= 8)
+                PeerLog(true, "engine: seats: DIVERGENCE player %d sits in vehicle id=%d seat %d here but the server's seat list never named it: put out", id,
+                        veh, rp->Seat());
+            UnseatPeer(pe, vit != g_vehs.end() && !vit->second.removed ? vit->second.handle : 0);
+            break;
+        }
+        case sync::SeatAct::None:
+            break;
+        }
+        return o.holdsPed;
+    }
+
     bool TickPeerTierB(Peer& pe, int id, const sync::Pose& pose, double nowMs)
     {
         const proto::PedState& ps = pose.ped;
@@ -4347,8 +4453,11 @@ namespace {
         // puppet keeps FOLLOWING the sender's pose with the ordinary locomotion and is warped into the seat when the seat list names
         // the player (a few tens of cm); its own TASK_ENTER_VEHICLE walk (blend 1.0, its own path, a door animation) fell behind a
         // running sender and was warped from half the door distance away. puppet_enter=task restores it (sync::EnterWalkMode).
-        const bool enterTask = sync::PuppetUsesEnterTask(g_peerEnterTask.load() ? sync::EnterWalkMode::Task : sync::EnterWalkMode::Follow);
-        if (e.enterStart && !enterTask)
+        // T1 seats: with the server's intent (default) the walk to the door is the real TASK_ENTER_VEHICLE, started by SeatNotice::Reserved and
+        // replayed by TickPeerSeatReplay; the two older modes below only run with HKCU seat_intent=0.
+        const bool seatIntent = g_seatIntentOn.load();
+        const bool enterTask = !seatIntent && sync::PuppetUsesEnterTask(g_peerEnterTask.load() ? sync::EnterWalkMode::Task : sync::EnterWalkMode::Follow);
+        if (e.enterStart && !enterTask && !seatIntent)
             ++g_syncD.enterFollowed;
         if (e.enterStart && enterTask && pe.seatedVeh < 0 && !g_world->IsPedInVehicle(ped))
         {
@@ -4411,7 +4520,8 @@ namespace {
                 LocoReset(pe, kSiteEnterGaveUp);
             }
         }
-        return coverHolds;
+        const bool seatHolds = seatIntent && TickPeerSeatReplay(pe, id, nowMs);
+        return coverHolds || seatHolds;
     }
 
     void DrivePeer(Peer& pe, int id, const sync::Pose& pose, double dtMs, double nowMs)
@@ -5064,6 +5174,7 @@ namespace {
                     SyncEmoteDict(pe.emoteDict, false, std::string());   // its ped is gone: free the dictionary
                     ReleaseRequest(pe);
                     removedPeers.push_back(it->first);
+                    g_seats.DropPlayer(it->first);          // T1: whatever it was walking to is moot
                     it = g_peers.erase(it);
                     continue;
                 }
@@ -5288,7 +5399,8 @@ namespace {
         {
         case 1: return "Spawn";     case 2: return "Despawn";   case 3: return "Enter";
         case 4: return "Exit";      case 5: return "SetLocked"; case 6: return "SetLights";
-        case 7: return "SetColours"; case 8: return "Register";
+        case 7: return "SetColours"; case 8: return "Register";   case 9: return "Release";
+        case 10: return "EnterIntent"; case 11: return "CancelIntent";
         }
         return "?";
     }
@@ -5637,6 +5749,7 @@ namespace {
                     if (v.requestedModel)
                         g_world->ModelNoLongerNeeded(v.requestedModel);
                     removedVehs.push_back(id);
+                    g_seats.OnVehicleGone((int)id);         // T1: nobody is walking to a car that is gone
                     it = g_vehs.erase(it);
                     continue;
                 }
@@ -5922,10 +6035,33 @@ namespace {
                                     dsp == sync::SeatDisplacement::OtherSeat ? (std::string("wire seat ") + std::to_string(seatNow)).c_str() : "a re-warp follows");
                         }
                     }
+                    // T1 seats: the seat warp is the BOUNDED FALLBACK of the server's enter intent. A ped the real TASK_ENTER_VEHICLE already
+                    // put into this seat is only recorded; a ped whose task is still running is left to it until sync::PuppetSeatReplay
+                    // allows the warp (confirmGraceMs after the server's Seated, or the task ended / timed out); right after an Exited notice a
+                    // stale list may not seat it again. With HKCU seat_intent=0 the W6 / W9 rule below stands.
+                    sync::WarpWhy warpWhy = sync::WarpWhy::None;
+                    const bool seatIntent = g_seatIntentOn.load();
+                    if (seatIntent)
+                    {
+                        if (g_world->IsPedInVehicle(pe.ped) && g_world->GetPedInVehicleSeat(h, gtaSeat) == pe.ped)
+                        {
+                            pe.seatedVeh = (int)id;    // seated by the game's own task: nothing to warp
+                            pe.seatedSeat = (int)s;
+                            pe.aimTask = false;
+                            pe.emote.Clear();
+                            SyncPeerEmoteDict(pe);
+                            g_world->SetPedConfigFlag(pe.ped, 184, true);
+                            continue;
+                        }
+                        const sync::WarpDecision wd = g_seats.Puppet(pid).AllowsSeatWarp((int)id, (int)s, nowMs);
+                        if (!wd.allow)
+                            continue;
+                        warpWhy = wd.why;
+                    }
                     // W6: a ped walking to this car with TASK_ENTER_VEHICLE (TickPeerTierB) is left to the walk; the
                     // old seat warp takes over once it has had sync::kEnterTaskMaxMs (or the ped is already inside).
                     // W9 item 1: ... and no longer once the sender's move says it is not entering (it was put into the seat).
-                    if (pe.enterTaskMs > 0.0 && pe.seatedVeh < 0 && pe.enterVeh == (int)id &&
+                    if (!seatIntent && pe.enterTaskMs > 0.0 && pe.seatedVeh < 0 && pe.enterVeh == (int)id &&
                         !g_world->IsPedInVehicle(pe.ped) &&
                         !sync::EnterWarpDue(true, false, nowMs - pe.enterTaskMs, pe.lastPed.move == proto::kMoveEnteringVehicle))
                         continue;
@@ -5963,6 +6099,8 @@ namespace {
                         }
                     }
                     g_world->SetPedIntoVehicle(pe.ped, h, gtaSeat);
+                    if (seatIntent)
+                        g_seats.Puppet(pid).NoteWarp(warpWhy);   // T1: counted by reason (the 10 s "seats (T1)" line)
                     pe.enterTaskMs = 0.0;              // the walk (if any) is over: the ped is seated
                     pe.enterVeh = -1;
                     pe.seatedVeh = id;
@@ -6040,6 +6178,7 @@ namespace {
     constexpr float kEntryReachM = 8.0f;        // a networked car this close (to its origin) takes the keys over
     constexpr float kEntryWalkMaxM = 5.0f;      // the farthest door the ped is walked to
     constexpr float kEntryWarpM = 1.6f;         // this close to the door (seat bone): put into the seat
+    constexpr float kEntryRunM = 3.0f;          // T1: farther than this from the door the entry task is issued at a run (the wire's run flag)
     constexpr double kEntryWalkMaxMs = 4000.0;  // give up a walk that has not arrived by then
     constexpr double kEntryReissueMs = 1500.0;  // the go-to task is re-issued at least this often (it has a 3 s timeout)
     // Seat bones by wire seat (driver, front passenger, rear left, rear right, then the third and fourth
@@ -6133,8 +6272,19 @@ namespace {
             if (dx * dx + dy * dy + dz * dz > kEntryReachM * kEntryReachM)
                 continue;
             car.c.netId = (int)kv.first;
+            const double bookNow = NowMs();
             for (size_t s = 0; s < proto::kVehSeats; ++s)
+            {
                 car.c.seats[s] = v.st.seats[s];
+                // T1 seats: a seat somebody else is walking to counts as taken (the server's reservation), so F never picks a seat that is
+                // about to be refused; our own reservation stays ours.
+                if (car.c.seats[s] == sync::kEntryNobody && g_seatIntentOn.load(std::memory_order_relaxed))
+                {
+                    const uint16_t holder = g_seats.Book().Holder((int)kv.first, (int)s, bookNow);
+                    if (holder != sync::kSeatNobody && holder != join::MyId())
+                        car.c.seats[s] = holder;
+                }
+            }
             car.c.locked = (v.st.flags & proto::kVehLocked) != 0;
             // VehicleState.ownerId (v5): the pick avoids the driver's seat of a car somebody else owns (PickEntry),
             // and the server's NotOwner (12) is the authority if a stale view picked it anyway.
@@ -6143,9 +6293,24 @@ namespace {
         }
     }
 
-    // Ends a walk in progress: the go-to task, if one was issued, is blended out.
+    void ApplyLocalEnterOut(const sync::LocalEnterOut& o, int32_t lp, double nowMs);   // below, with EntryNotice
+
+    // T1 seats: our own entry is given up (the player moved off, ragdolled, died, pressed F again, the car went away): the flow clears the
+    // task and tells the server (CancelIntent) when it had got that far. No effect when no entry is under way.
+    void AbortLocalEnter(int32_t lp)
+    {
+        if (!g_localEnter.Active())
+            return;
+        sync::LocalEnterIn in;
+        in.nowMs = NowMs();
+        in.abort = true;
+        ApplyLocalEnterOut(g_localEnter.Tick(in), lp, in.nowMs);
+    }
+
+    // Ends a walk in progress: the go-to task, if one was issued, is blended out; an entry by the server's intent is aborted.
     void CancelEntryWalk(int32_t lp)
     {
+        AbortLocalEnter(lp);
         if (g_entryWalk.active && g_entryWalk.tasked && lp)
             g_world->ClearPedTasks(lp);
         g_entryWalk = EntryWalk();
@@ -6162,9 +6327,103 @@ namespace {
         ++g_v4.entryRefused;
     }
 
+    // T1 seats: applies what LocalEnterFlow::Tick returned (the natives and the wire; the decisions are the flow's). Script tick.
+    //   SendIntent / SendCancel  VehicleCmd EnterIntent / CancelIntent (answered by HandleIntentResult / the Cancelled notice)
+    //   IssueEnter               GTA's own TASK_ENTER_VEHICLE for the reserved seat (flags 1: no jack flag, never takes a held seat)
+    //   FallbackWarp             the task never started / stopped without a seat / ran out of time: the BOUNDED teleport-in
+    void ApplyLocalEnterOut(const sync::LocalEnterOut& o, int32_t lp, double nowMs)
+    {
+        const int netId = g_localEnter.NetId(), seat = g_localEnter.Seat();
+        int32_t h = 0;
+        if (netId >= 0)
+        {
+            const auto it = g_vehs.find((uint16_t)netId);
+            if (it != g_vehs.end() && !it->second.removed)
+                h = it->second.handle;
+        }
+        bool fellBack = false;
+        for (const sync::LocalAct a : { o.act, o.also })
+        {
+            switch (a)
+            {
+            case sync::LocalAct::None:
+                break;
+            case sync::LocalAct::SendIntent:
+            case sync::LocalAct::SendCancel:
+            {
+                proto::VehicleCmd c;
+                c.op = a == sync::LocalAct::SendIntent ? proto::VehicleOp::EnterIntent : proto::VehicleOp::CancelIntent;
+                c.vehId = (uint16_t)netId;
+                c.arg = a == sync::LocalAct::SendIntent ? sync::PackIntentArg(seat, g_localEnter.Run()) : 0u;
+                const bool sent = join::SendVehicleCmd(c);
+                ++g_v4.vehCmds;
+                if (a == sync::LocalAct::SendIntent) ++g_t1.intentsSent; else ++g_t1.cancelsSent;
+                GLOGI("engine: seats: %s vehicle id=%d seat %d (%s) %s", a == sync::LocalAct::SendIntent ? "EnterIntent" : "CancelIntent", netId, seat,
+                      g_localEnter.Run() ? "run" : "walk", sent ? "sent" : "NOT sent (no session)");
+                break;
+            }
+            case sync::LocalAct::IssueEnter:
+            {
+                const bool ok = lp && h && g_world->TaskEnterVehicle(lp, h, o.timeoutMs, seat - 1, g_localEnter.Run() ? 2.0f : 1.0f, 1);
+                if (!ok) ++g_t1.localIssueFailed;
+                GLOGI("engine: seats: the server reserved seat %d of vehicle id=%d: TASK_ENTER_VEHICLE %s (%s, limit %d ms)", seat, netId,
+                      ok ? "issued" : "NOT issued (native not callable or the car is not here): the fallback warp follows", g_localEnter.Run() ? "run" : "walk",
+                      o.timeoutMs);
+                break;
+            }
+            case sync::LocalAct::ClearTask:
+                if (lp) g_world->ClearPedTasks(lp);
+                break;
+            case sync::LocalAct::FallbackWarp:
+            {
+                fellBack = true;
+                if (!lp || !h)
+                    break;
+                g_world->ClearPedTasks(lp);
+                const int32_t holder = g_world->GetPedInVehicleSeat(h, seat - 1);
+                const bool ok = (!holder || holder == lp) && g_world->SetPedIntoVehicle(lp, h, seat - 1);
+                g_localSeatAtMs = 0;                   // read the real seat next tick; the link then sends Enter
+                ++g_v4.entryPicks;
+                g_entryGuard.OnSeated(nowMs);
+                GLOGW("engine: seats: FALLBACK WARP into seat %d of vehicle id=%d (%s): the enter task %s: %s", seat, netId,
+                      o.why == sync::LocalWhy::NeverStarted ? "never started" : o.why == sync::LocalWhy::EndedNoSeat ? "stopped without a seat" : "ran out of time",
+                      o.why == sync::LocalWhy::TimedOut ? "(limit reached)" : "", ok ? "SET_PED_INTO_VEHICLE called" : "SET_PED_INTO_VEHICLE FAILED or the seat is held");
+                break;
+            }
+            }
+        }
+        if (o.why == sync::LocalWhy::Refused)
+        {
+            const char* text = sync::LocalVehicleLink::RefusalText(o.refusal);
+            EntryNotice(*text ? text : "The server refused that vehicle seat.", nowMs);
+            GLOGI("engine: seats: entry refused by the server (%s)", VehResultName(o.refusal));
+        }
+        else if (o.why == sync::LocalWhy::NoAnswer)
+            GLOGW("engine: seats: no answer to our EnterIntent within %.0f ms: entry dropped", sync::LocalEnterCfg().answerWaitMs);
+        else if (o.why == sync::LocalWhy::ServerCancelled)
+            GLOGI("engine: seats: the server cancelled our reservation (expired, replaced or the car went): entry dropped");
+        if (!g_localEnter.Active())
+        {
+            g_entryWalk = EntryWalk();                 // the entry is over, one way or the other
+            if (!fellBack)
+                g_entryGuard.OnCancel();
+        }
+    }
+
     // Runs every script tick on the connected, entered player, BEFORE TickLocalVehicle.
     void TickVehicleEntry(int32_t lp, int32_t lpVeh, bool dead, double nowMs)
     {
+        if (lp && lpVeh && !dead && g_localEnter.Active())
+        {
+            // T1 seats: the game's own TASK_ENTER_VEHICLE seated us (GET_VEHICLE_PED_IS_IN names the car): done, no warp. The link's Enter follows.
+            sync::LocalEnterIn in;
+            in.nowMs = nowMs;
+            in.seatedNow = true;
+            ApplyLocalEnterOut(g_localEnter.Tick(in), lp, nowMs);
+            g_entryGuard.OnSeated(nowMs);
+            g_entryWalk = EntryWalk();
+            GLOGI("engine: seats: seated by the game's own enter task (no warp)");
+        }
         if (!lp || lpVeh || dead)
         {
             // W9 item 3: just seated by our press: GTA's own INPUT_ENTER must not consume the same press (or the next
@@ -6218,7 +6477,7 @@ namespace {
         // Safety net: GTA started entering a networked car anyway (a path the disabled keys do not cover).
         // Take the ped out of that task at once and treat it as F for that car.
         bool net = false;
-        if (!pressF && !pressG)
+        if (!pressF && !pressG && !g_localEnter.Active())      // T1: the enter task running now is OURS, not GTA's own
         {
             const int32_t trying = g_world->GetVehiclePedIsTryingToEnter(lp);
             for (size_t i = 0; trying && i < cars.size(); ++i)
@@ -6262,9 +6521,22 @@ namespace {
                 if (car.c.netId == g_entryWalk.netId)
                     only.push_back(car);
             cars.swap(only);
-            if (cars.empty() || nowMs - g_entryWalk.startMs > kEntryWalkMaxMs || g_world->IsPedRagdoll(lp))
+            const bool inFlow = g_localEnter.Active();         // T1: the flow has its own limits (the answer wait, the task limit)
+            if (cars.empty() || (!inFlow && nowMs - g_entryWalk.startMs > kEntryWalkMaxMs) || g_world->IsPedRagdoll(lp))
             {
                 CancelEntryWalk(lp);
+                return;
+            }
+            if (inFlow)
+            {
+                sync::LocalEnterIn in;
+                in.nowMs = nowMs;
+                // either native counts (see TickPeerSeatReplay): the fallback warp must not fire on a task that runs but is not named by one of them
+                in.tryingToEnter = g_world->GetVehiclePedIsTryingToEnter(lp) == cars[0].handle || g_world->GetVehiclePedIsUsing(lp) == cars[0].handle;
+                const int cls = g_world->GetVehicleClass(cars[0].handle);
+                in.mount = cls == 8 || cls == 13;
+                in.abort = g_world->IsPedFalling(lp) || g_world->IsPedJumping(lp);
+                ApplyLocalEnterOut(g_localEnter.Tick(in), lp, nowMs);
                 return;
             }
         }
@@ -6300,6 +6572,27 @@ namespace {
             if (begin)
                 EntryNotice(sync::LocalVehicleLink::RefusalText(3 /* TooFar */), nowMs);
             CancelEntryWalk(lp);
+            return;
+        }
+        if (begin && g_seatIntentOn.load() && !car->c.locked)
+        {
+            // T1 seats (wire v6): the real entry. The seat is RESERVED on the server first (EnterIntent); only its Ok starts GTA's own
+            // TASK_ENTER_VEHICLE for exactly that seat (no jack flag), on every screen. A locked car (its owner's entry) and HKCU seat_intent=0 keep
+            // the walk + teleport-in below.
+            const int32_t holder = g_world->GetPedInVehicleSeat(car->handle, pick.seat - 1);
+            if (holder && holder != lp)
+            {
+                CancelEntryWalk(lp);                   // the server's list can run ahead of a remote occupant's ped: not now
+                return;
+            }
+            g_entryWalk.tasked = false;
+            g_localEnter.Begin(pick.netId, pick.seat, pick.doorDistM > kEntryRunM, nowMs);
+            ++g_v4.entryPicks;
+            GLOGI("engine: seats: %s -> seat %d of vehicle id=%d (door %.2f m): asking the server", wantDriver ? "F" : "G", pick.seat, pick.netId,
+                  pick.doorDistM);
+            sync::LocalEnterIn in;
+            in.nowMs = nowMs;
+            ApplyLocalEnterOut(g_localEnter.Tick(in), lp, nowMs);   // SendIntent
             return;
         }
         if (pick.doorDistM <= kEntryWarpM)
@@ -6679,6 +6972,65 @@ namespace {
 
     // ---- protocol v4: health, hits, respawn (script tick) ------------------------------------------
 
+    // T1 seats: one SeatNotice, in the order the server sent it (DrainEvents). Script tick.
+    //   Reserved / Seated / Cancelled go to the book and to the replay of the player concerned (TickPeerSeatReplay acts on them);
+    //   a Cancelled about US also voids our own walk (LocalEnterFlow); Exited about someone else runs the normal exit animation at once.
+    void HandleSeatNotice(const proto::SeatNotice& n, double nowMs)
+    {
+        ++g_t1.noticesIn;
+        if (!g_seatIntentOn.load())
+            return;
+        const uint16_t me = join::MyId();
+        const sync::NoticeEffect fx = g_seats.OnNotice(n, me, nowMs);
+        static int logged = 0;
+        if (logged < 40)
+        {
+            ++logged;
+            GLOGI("engine: seats: notice %s player %u vehicle id=%u seat %u detail %u%s", proto::ToString(n.kind), (unsigned)n.player, (unsigned)n.vehId,
+                  (unsigned)n.seat, (unsigned)n.detail, fx.aboutMe ? " (about us)" : "");
+        }
+        if (fx.aboutMe)
+        {
+            ++g_t1.noticesAboutUs;
+            if (n.kind == proto::SeatNoticeKind::Cancelled)
+                g_localEnter.OnServerCancel(n.vehId, n.seat);
+            return;
+        }
+        if (fx.unseatPuppet)
+        {
+            const auto pit = g_peers.find(fx.player);
+            if (pit == g_peers.end() || !pit->second.ped || pit->second.deadShown)
+            {
+                ++g_t1.exitsNoPed;
+                return;
+            }
+            Peer& pe = pit->second;
+            const auto vit = g_vehs.find((uint16_t)fx.veh);
+            if (pe.seatedVeh == fx.veh || g_world->IsPedInVehicle(pe.ped))
+            {
+                UnseatPeer(pe, vit != g_vehs.end() && !vit->second.removed ? vit->second.handle : 0);
+                ++g_t1.exitsReplayed;
+            }
+        }
+    }
+
+    // T1 seats: the server's answer to our EnterIntent / CancelIntent (not the link's: it must never see these ops). Script tick.
+    void HandleIntentResult(const proto::VehicleResult& r)
+    {
+        if (r.op == proto::VehicleOp::CancelIntent)
+            return;                                    // Ok whether or not there was a reservation: nothing to learn
+        const uint8_t code = (uint8_t)r.code;
+        if (r.code == proto::VehicleResultCode::Ok)
+            ++g_t1.intentsOk;
+        else
+        {
+            ++g_t1.intentsRefused;
+            ++g_t1.refusedBy[code < 16 ? code : 15];
+            GLOGW("engine: seats: the server REFUSED our entry intent on vehicle id=%u: %s", (unsigned)r.vehId, VehResultName(code));
+        }
+        g_localEnter.OnResult((int)r.vehId, code);
+    }
+
     // Damage about us / RespawnOk / Killed / VehicleResult from the join worker. Runs before TickLife,
     // so a RespawnOk is seen the frame it is taken. The first two never pass through the bounded queue
     // (g_inbox and g_respawnSlot), so a flood of kill-feed lines cannot lose them.
@@ -6756,9 +7108,17 @@ namespace {
                       (unsigned)k.victimId, (unsigned)k.killerId, (unsigned)k.weapon, (unsigned)k.flags);
                 break;
             }
+            case NetEvent::SeatNote:
+                HandleSeatNotice(e.seat, nowMs);
+                break;
             case NetEvent::VehResult:
             {
                 const proto::VehicleResult& r = e.veh;
+                if (r.op == proto::VehicleOp::EnterIntent || r.op == proto::VehicleOp::CancelIntent)
+                {
+                    HandleIntentResult(r);             // T1: ours, not the link's
+                    break;
+                }
                 g_link.OnResult((uint8_t)r.op, (uint8_t)r.code, r.vehId);
                 if (r.code == proto::VehicleResultCode::Ok)
                 {
@@ -7051,6 +7411,8 @@ namespace {
         g_lastMarkedVeh = 0;
         g_noShuffleVeh = 0;
         g_entryWalk = EntryWalk();
+        g_localEnter.Reset();
+        g_seats.Reset();
         g_entryGuard.Reset();
         g_vitalsPrevTotal = -1;
         g_serverDeadNoticed = false;
@@ -7341,6 +7703,53 @@ namespace {
               hand1 - lastHand[1]);
     }
 
+    // T1 seats (wire v6), every 10 s with the vehicle lines: what the server's enter / exit intents did on THIS machine. One line, only when
+    // something happened in the window. Grep "engine: seats (T1)". Script tick.
+    //   our entries: begun, EnterIntent sent / Ok / refused (by code), the game's task issued / seen running / finished with us seated /
+    //                never started / stopped without a seat / timed out, the BOUNDED fallback warps, entries aborted / cancelled by the server
+    //   other players' entries (replays): Reserved notices, TASK_ENTER_VEHICLE issued (must equal the Reserved count minus the cancelled
+    //                before the car was here) / started / finished by the game / never started / stopped / timed out / not callable, cancelled
+    //                by the server, exit animations replayed, stale lists refused after an exit, the seat WARPS by reason (the fallback), puppets put
+    //                out because the server never named them
+    //   divergences: puppets put out + warped puppets found out of their seat (SyncD displaced counters, last window)
+    void ReportSeats()
+    {
+        static T1Stats last;
+        static uint32_t lastDisplaced = 0;
+        const T1Stats& c = g_t1;
+        const sync::SeatReplayStats p = g_seats.TakeStats();
+        const sync::LocalEnterStats l = g_localEnter.TakeStats();
+        const uint32_t displaced = g_syncD.displacedOtherSeat + g_syncD.displacedOtherVeh + g_syncD.displacedOutside + g_syncD.displacedUnknown;
+        const uint32_t sent = c.intentsSent - last.intentsSent, ok = c.intentsOk - last.intentsOk, refused = c.intentsRefused - last.intentsRefused,
+                       notices = c.noticesIn - last.noticesIn, exitsRep = c.exitsReplayed - last.exitsReplayed;
+        const bool active = sent || ok || refused || notices || p.issued || p.warpNoIntent || p.Warps() || p.exits || l.begun || exitsRep || p.evicted;
+        if (active)
+        {
+            std::string by;
+            for (int i = 1; i < 16; ++i)
+                if (c.refusedBy[i] != last.refusedBy[i])
+                {
+                    char b[40];
+                    std::snprintf(b, sizeof(b), "%s%s=%u", by.empty() ? "" : " ", VehResultName((uint8_t)i), c.refusedBy[i] - last.refusedBy[i]);
+                    by += b;
+                }
+            GLOGI("engine: seats (T1), last 10 s: OUR entries: %u begun, intents sent %u / Ok %u / refused %u [%s]; the game's task issued %u (not callable %u) / "
+                  "running %u / finished with us seated %u / never started %u / stopped without a seat %u / timed out %u; FALLBACK WARPS %u; aborted %u, "
+                  "cancelled by the server %u, no answer %u, cancels sent %u. OTHERS: %u notices in (%u about us), replays: Reserved %u -> task issued %u "
+                  "(bike/cycle %u, not callable %u) / running %u / finished by the game %u / never started %u / stopped %u / timed out %u / cancelled %u / "
+                  "dropped (car never came) %u / gave up unconfirmed %u; exit animations replayed %u (no ped %u), stale-list denials after an exit %u (per check); "
+                  "seat WARPS %u (no intent %u, confirmed before the task %u, grace over %u, task ended %u, task timed out %u); DIVERGENCES: puppets put out "
+                  "(seated here, never in the server's list) %u, warped puppets found out of their seat %u",
+                  l.begun, l.sent, l.accepted, l.refused, by.empty() ? "none" : by.c_str(), l.issued, c.localIssueFailed - last.localIssueFailed, l.started,
+                  l.finished, l.neverStarted, l.endedNoSeat, l.timedOut, l.fallbackWarps, l.aborted, l.serverCancelled, l.noAnswer, c.cancelsSent - last.cancelsSent,
+                  notices, c.noticesAboutUs - last.noticesAboutUs, p.intents, p.issued, p.mounts, p.issueFailed, p.started, p.finished, p.neverStarted,
+                  p.endedNoSeat, p.timeouts, p.cancelled, p.droppedNotReady, p.gaveUp, exitsRep, c.exitsNoPed - last.exitsNoPed, p.latchDenied, p.Warps(),
+                  p.warpNoIntent, p.warpConfirmed, p.warpGraceOver, p.warpTaskEnded, p.warpTaskTimeout, p.evicted, displaced - lastDisplaced);
+        }
+        last = c;
+        lastDisplaced = displaced;
+    }
+
     // Every 10 s: one line each for vehicles, combat and anims (only while connected).
     void ReportV4(double nowMs)
     {
@@ -7485,6 +7894,7 @@ namespace {
                 lastD = g_syncD;
                 lastHand[0] = g_syncDHandovers[0].load();
                 lastHand[1] = g_syncDHandovers[1].load();
+                ReportSeats();                             // T1 seats
             }
             const sync::VitalsStats& vs = g_vitals.Stats();
             const sync::HitBatchStats& hs = g_hits.Stats();
@@ -8224,6 +8634,7 @@ namespace gage::engine {
         sinks.onEnded = OnEnded;
         sinks.onVehicles = OnVehicles;                 // protocol v4
         sinks.onVehicleResult = OnVehicleResult;
+        sinks.onSeatNotice = OnSeatNotice;
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;
