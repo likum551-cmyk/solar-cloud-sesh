@@ -45,7 +45,16 @@ constexpr uint32_t kOffCount     = 0x30;         // mgr -> WORD entry count
 constexpr uint32_t kOffGen       = 0x178;        // mgr -> DWORD generation counter (edx to Setup2/MountGate)
 constexpr uint32_t kEntryStride  = 0xf0;
 constexpr uint32_t kOffEntryHash = 0x60;         // DlcEntry -> DWORD name hash (the RunPackGroup key)
+constexpr uint32_t kOffEntryPath = 0xb8;         // DlcEntry -> const char* path (Mount loads it as a QWORD ptr)
+constexpr uint32_t kOffEntryFlag = 0xc0;         // DlcEntry -> WORD; must be nonzero or Mount ignores +0xb8
+constexpr uint32_t kOffEntryType = 0xc8;         // DlcEntry -> DWORD device type: 2 = packfile, 1 = relative/folder
 constexpr uint32_t kOffEntryState= 0xd0;         // DlcEntry -> DWORD setup state (0 fresh, 1 parsed, 2 mounted)
+constexpr uint32_t kTypePackfile = 2;            // Mount 0x94307c: +0xc8==2 -> fiPackfile::Open (the crypto path)
+constexpr uint32_t kTypeRelative = 1;            // Mount 0x94307c: +0xc8==1 -> fiDeviceRelative over +0xb8 (loose folder)
+
+// Diagnostic probe (pack_probe=1): the fiAssetManager global and its mount/file-exists calls, used to mount
+// the pack under "extra:/" WITHOUT DlcSetup2's teardown and ask the game which pack files are visible.
+constexpr uint32_t kAssetGlobalRva = 0x1e2ee90u; // &ASSET; DlcSetup2 lea's it before PushFolder/Exists/PopFolder
 
 // 3889 hash of IS_MODEL_IN_CDIMAGE; World::CallNative maps public hashes and falls back to the hash as given.
 constexpr uint64_t kNativeIsModelInCdimage = 0x35B9E0803292B641ULL;
@@ -75,6 +84,30 @@ const Sig kSigs[kSigCount] = {
       "48 89 5C 24 08 57 48 83 EC 20 48 8B F9 48 8B 0D ?? ?? ?? ?? 41 8B D8 E8 ?? ?? ?? ?? 48 85 C0 74 14 4C 8D 44 24 48 48 8B",
       "recon-3889 2.5 / p2 section 4" },
 };
+
+// Diagnostic-only signatures, resolved lazily and independently of the four above (a probe-sig miss must
+// never disable the normal mount). Mount(entry, gen, mountPoint) opens+mounts the archive and returns 0 on
+// success; PushFolder/Exists/PopFolder are the fiAssetManager calls DlcSetup2 itself uses to test setup2.xml.
+enum ProbeSigId : int { kMount, kPushFolder, kExists, kPopFolder, kProbeSigCount };
+
+const Sig kProbeSigs[kProbeSigCount] = {
+    { "Mount",       // RVA 0x94307c: int(entry /*rcx*/, uint32 gen /*edx*/, const char* mountPoint /*r8*/); 0=ok
+      "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 45 33 FF 49 8B F0 48 8B D9 4C 39 39",
+      "recon-3889 2.3 / p2 section 3" },
+    { "PushFolder",  // RVA 0x1367bb8: void(asset /*rcx*/, const char* folder /*rdx*/)
+      "48 89 5C 24 18 48 89 54 24 10 57 48 81 EC 20 01 00 00 48 8B D9 48 8D 0D ?? ?? ?? ?? 48 8B FA E8 ?? ?? ?? ?? 80 3F 24 74",
+      "fiAssetManager::PushFolder (3889)" },
+    { "Exists",      // RVA 0x1362be8: uint8(asset /*rcx*/, const char* name /*rdx*/, uint64 flags /*r8=0*/)
+      "48 81 EC 38 01 00 00 4C 8B CA 4C 89 44 24 20 48 8D 54 24 30 41 B8 00 01 00 00 E8 ?? ?? ?? ?? 48 81 C4 38 01 00 00 C3",
+      "fiAssetManager::Exists (3889)" },
+    { "PopFolder",   // RVA 0x13679b4: void(asset /*rcx*/)
+      "FF 89 00 0C 00 00 48 8D 0D ?? ?? ?? ?? E9 ?? ?? ?? ??",
+      "fiAssetManager::PopFolder (3889)" },
+};
+
+uintptr_t g_probeAddr[kProbeSigCount] = {};
+bool      g_probeResolvedOnce = false;
+bool      g_probeReady        = false;
 
 // ---------------------------------------------------------------------------------------------
 // Image bounds, readable-page runs, pattern scan (self-contained; mirrors dlc_mount.cpp).
@@ -300,6 +333,10 @@ using AddDlcPackFn   = uint8_t (*)(void* mgr, const char* path);
 using Setup2Fn       = uint8_t (*)(void* entry, uint32_t gen);
 using MountGateFn    = uint8_t (*)(void* entry, uint32_t gen);
 using RunPackGroupFn = void    (*)(void* mgr, uint32_t packHash, uint32_t groupHash);
+using MountFn        = int     (*)(void* entry, uint32_t gen, const char* mountPoint);
+using PushFolderFn   = void    (*)(void* asset, const char* folder);
+using ExistsFn       = uint8_t (*)(void* asset, const char* name, uint64_t flags);
+using PopFolderFn    = void    (*)(void* asset);
 
 void*    Manager()          { return IsReadable((void*)g_singleton, 8) ? *reinterpret_cast<void**>(g_singleton) : nullptr; }
 bool     VtableOk(void* mgr) {
@@ -419,11 +456,100 @@ bool Preflight(const std::wstring& file) {
     return true;
 }
 
+// Folder-mode (strategy B) preflight: the pack is a LOOSE folder. dlc.rpf is only the file AddDlcPack's
+// Exists gate needs (we override the entry to a relative/folder device, so it is never opened or decrypted);
+// the real content is setup2.xml + content.xml + data/*.meta + nested x64/*.rpf read off disk through the
+// device. Confirm the gate file and setup2.xml are both present; encryption is irrelevant here.
+bool FolderPreflight(const Paths& paths) {
+    const DWORD gate = GetFileAttributesW(paths.file.c_str());
+    if (gate == INVALID_FILE_ATTRIBUTES || (gate & FILE_ATTRIBUTE_DIRECTORY)) {
+        Fail("folder-mode: AddDlcPack's gate file is missing: %s (drop a dlc.rpf there; it is not mounted)",
+             Narrow(paths.file).c_str());
+        return false;
+    }
+    // setup2.xml must sit at the folder root (what the relative device exposes as extra:/setup2.xml).
+    std::wstring folderW = paths.file;
+    const size_t slash = folderW.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) folderW.resize(slash + 1);
+    const std::wstring setup = folderW + L"setup2.xml";
+    if (GetFileAttributesW(setup.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        Fail("folder-mode: setup2.xml not found at the pack folder root (%s); the loose layout is incomplete",
+             Narrow(setup).c_str());
+        return false;
+    }
+    GLOGI("hook: [packstream] folder-mode preflight ok: gate dlc.rpf + setup2.xml present at \"%s\"",
+          paths.device.c_str());
+    return true;
+}
+
 bool ModelInCdimage(World& world, uint32_t modelHash) {
     const uint64_t a[] = { (uint64_t)modelHash };
     uint64_t ret[4] = {};
     if (!world.CallNative(kNativeIsModelInCdimage, a, 1, ret)) return false;
     return (ret[0] & 0xff) != 0;
+}
+
+// Resolve the diagnostic probe signatures once, over the same readable runs ResolveAll uses. Kept separate
+// so a probe-sig miss cannot fail the normal mount. Returns whether all four resolved uniquely.
+bool ResolveProbe() {
+    if (g_probeResolvedOnce) return g_probeReady;
+    g_probeResolvedOnce = true;
+    const Image im = GameImage();
+    if (!im.base || !im.size) return false;
+    const std::vector<Run> runs = ReadableRuns(im);
+    bool all = true;
+    for (int i = 0; i < kProbeSigCount; ++i) {
+        const uint8_t* first = nullptr;
+        const int c = CountPat(runs, kProbeSigs[i].pat, &first);
+        if (c == 1) {
+            g_probeAddr[i] = (uintptr_t)first;
+            GLOGI("hook: [packstream] probe-sig %-11s UNIQUE @ +0x%llx   (%s)", kProbeSigs[i].name,
+                  (unsigned long long)(uintptr_t)(first - im.base), kProbeSigs[i].source);
+        } else {
+            GLOGW("hook: [packstream] probe-sig %-11s %s", kProbeSigs[i].name,
+                  c < 0 ? "BAD PATTERN" : (c == 0 ? "missing" : "ambiguous"));
+            all = false;
+        }
+    }
+    g_probeReady = all;
+    return all;
+}
+
+// Mount the freshly-added pack under "extra:/" via Mount() directly (NOT DlcSetup2, which tears "extra:/"
+// back down on failure) and ask the game, through the same fiAssetManager calls DlcSetup2 uses, which pack
+// files are visible. This decides the state-5 blocker: if setup2.xml AND content.xml AND a data meta all
+// read absent, the mounted AES TOC is invisible in-process (an open/decrypt-route problem, not our seal,
+// which rage-cli and our own --check both read fine); if setup2.xml alone is absent, it is a pack
+// naming/layout issue. The entry must be fresh (device ptr 0) so Mount opens rather than short-circuits.
+void Probe(void* mgr, char* entry) {
+    if (!ResolveProbe()) { GLOGW("hook: [packstream] probe: not all probe signatures resolved; skipping"); return; }
+    const Image im = GameImage();
+    void* asset = reinterpret_cast<void*>((uintptr_t)im.base + kAssetGlobalRva);
+    const uint32_t gen = Gen(mgr);
+    void* dev0 = IsReadable(entry, 8) ? *reinterpret_cast<void**>(entry) : nullptr;
+    GLOGI("hook: [packstream] probe: ASSET @0x%llx; Mount(entry @0x%llx, gen %u, \"extra:/\"); entry.device was 0x%llx",
+          (unsigned long long)(uintptr_t)asset, (unsigned long long)(uintptr_t)entry, (unsigned)gen,
+          (unsigned long long)(uintptr_t)dev0);
+    const int mrc = reinterpret_cast<MountFn>(g_probeAddr[kMount])(entry, gen, "extra:/");
+    void* dev1 = IsReadable(entry, 8) ? *reinterpret_cast<void**>(entry) : nullptr;
+    GLOGI("hook: [packstream] probe: Mount returned %d (0=ok); entry.device now 0x%llx", mrc,
+          (unsigned long long)(uintptr_t)dev1);
+    if (mrc != 0) { GLOGW("hook: [packstream] probe: Mount did not open the archive; no file check possible"); return; }
+
+    static const char* const kProbeFiles[] = { "setup2.xml", "content.xml", "data/vehicles.meta", "data/handling.meta" };
+    reinterpret_cast<PushFolderFn>(g_probeAddr[kPushFolder])(asset, "extra:/");
+    int anyVisible = 0, setup2Visible = 0;
+    for (const char* f : kProbeFiles) {
+        const uint8_t ex = reinterpret_cast<ExistsFn>(g_probeAddr[kExists])(asset, f, 0);
+        if (ex) ++anyVisible;
+        if (ex && std::strcmp(f, "setup2.xml") == 0) setup2Visible = 1;
+        GLOGI("hook: [packstream] probe:   Exists(extra:/%s) = %u", f, (unsigned)ex);
+    }
+    reinterpret_cast<PopFolderFn>(g_probeAddr[kPopFolder])(asset);
+    GLOGI("hook: [packstream] probe: VERDICT -> %s",
+          anyVisible == 0 ? "TOC INVISIBLE in-process (AES TOC not decrypted/parsed via this open route)"
+          : (setup2Visible ? "setup2.xml IS visible -- the full chain should work; re-run with pack_probe=0"
+                           : "some files visible but setup2.xml absent -- pack naming/layout issue"));
 }
 
 // Run the whole chain once. Game thread. Sets g_status = Failed on any refusal; returns true when the
@@ -439,8 +565,14 @@ bool MountSequence(World& world) {
 
     Paths paths;
     if (!ResolvePaths(paths)) return false;              // Fail() already logged
-    if (!Preflight(paths.file)) return false;            // Fail() already logged
-    GLOGI("hook: [packstream] AddDlcPack path \"%s\"", paths.device.c_str());
+    const bool folderMode = reg::Get(L"pack_folder") == L"1";
+    if (folderMode) {
+        if (!FolderPreflight(paths)) return false;       // Fail() already logged
+    } else if (!Preflight(paths.file)) {
+        return false;                                     // Fail() already logged
+    }
+    GLOGI("hook: [packstream] AddDlcPack path \"%s\"%s", paths.device.c_str(),
+          folderMode ? "  (folder-mode: entry will be overridden to a relative device)" : "");
 
     const uint16_t n0 = Count(mgr);
     const uint8_t added = reinterpret_cast<AddDlcPackFn>(g_addr[kAddDlcPack])(mgr, paths.device.c_str());
@@ -455,11 +587,42 @@ bool MountSequence(World& world) {
     const int idx = (int)n1 - 1;
     char* e = Entry(mgr, idx);
     if (!e) { Fail("the new DLC entry at index %d is not readable", idx); return false; }
-    const uint32_t packHash = EntryHash(e);
+    uint32_t packHash = EntryHash(e);
     const uint32_t gen = Gen(mgr);
     GLOGI("hook: [packstream] entry @0x%llx idx %d: nameHash 0x%08x, state %u, gen %u",
           (unsigned long long)(uintptr_t)e, idx, (unsigned)packHash, (unsigned)EntryState(e), (unsigned)gen);
-    if (!packHash) { Fail("the new DLC entry has a zero name hash; AddDlcPack did not populate it"); return false; }
+
+    if (folderMode) {
+        // Override the packfile entry AddDlcPack built into a relative/folder device: Mount 0x94307c takes
+        // its folder branch (0x943144) only when +0xc8 == 1 (==2 is packfile = the crypto path), it loads
+        // +0xb8 as a const char* (the loose base folder) and ignores it unless the +0xc0 WORD is nonzero.
+        // The device ctor 0x13659c8 copies the path, so the static string need only outlive DlcSetup2.
+        static std::string s_folder;
+        s_folder = paths.device;                          // "<folder>/" forward-slash, trailing '/'
+        if (!IsReadable(e + kOffEntryType, 4) || !IsReadable(e + kOffEntryPath, 8) || !IsReadable(e + kOffEntryFlag, 2)) {
+            Fail("folder-mode: DLC entry device fields (+0xb8/+0xc0/+0xc8) are not writable"); return false;
+        }
+        const uint32_t oldType = *reinterpret_cast<uint32_t*>(e + kOffEntryType);
+        const uint16_t oldFlag = *reinterpret_cast<uint16_t*>(e + kOffEntryFlag);
+        const char* oldPath = *reinterpret_cast<const char* const*>(e + kOffEntryPath);
+        GLOGI("hook: [packstream] folder-mode: pre-override type(+0xc8)=%u flag(+0xc0)=%u path(+0xb8)=\"%s\"",
+              (unsigned)oldType, (unsigned)oldFlag, (oldPath && IsReadable(oldPath, 1)) ? oldPath : "<null>");
+        *reinterpret_cast<uint32_t*>(e + kOffEntryType) = kTypeRelative;
+        *reinterpret_cast<const char**>(e + kOffEntryPath) = s_folder.c_str();
+        if (oldFlag == 0) *reinterpret_cast<uint16_t*>(e + kOffEntryFlag) = 1;
+        GLOGI("hook: [packstream] folder-mode: overrode entry to relative device (type=1) over \"%s\" "
+              "(nameHash set from setup2.xml by DlcSetup2)", s_folder.c_str());
+    } else if (!packHash) {
+        Fail("the new DLC entry has a zero name hash; AddDlcPack did not populate it"); return false;
+    }
+
+    // Diagnostic branch (default off): mount the pack ourselves and ask the game which files it can see,
+    // instead of running DlcSetup2 (which, on a setup2.xml miss, writes state 5 and tears "extra:/" down).
+    if (reg::Get(L"pack_probe") == L"1") {
+        Probe(mgr, e);
+        Fail("pack_probe=1: diagnostic probe complete (see the [packstream] probe lines above); not completing the mount");
+        return false;
+    }
 
     if (!reinterpret_cast<Setup2Fn>(g_addr[kSetup2])(e, gen)) {
         Fail("DlcSetup2 returned false (setup2.xml not parsed; entry state %u). The pack needs a valid "
@@ -467,6 +630,16 @@ bool MountSequence(World& world) {
         return false;
     }
     GLOGI("hook: [packstream] DlcSetup2 ok (state %u)", (unsigned)EntryState(e));
+    {
+        // DlcSetup2 parses setup2.xml and sets the entry's nameHash from its <nameHash> (joaat); that is the
+        // key RunPackGroup runs the change-set under. Re-read it so folder-mode (AddDlcPack left it 0/wrong)
+        // and the packfile route both key on the pack's real identity.
+        const uint32_t h2 = EntryHash(e);
+        if (h2 && h2 != packHash)
+            GLOGI("hook: [packstream] nameHash set by DlcSetup2: 0x%08x -> 0x%08x", (unsigned)packHash, (unsigned)h2);
+        if (h2) packHash = h2;
+    }
+    if (!packHash) { Fail("entry nameHash is still zero after DlcSetup2; cannot run the change-set"); return false; }
 
     if (!reinterpret_cast<MountGateFn>(g_addr[kMountGate])(e, gen)) {
         Fail("MountGate returned false (dlc.rpf not mounted; entry state %u). This is where retail would "

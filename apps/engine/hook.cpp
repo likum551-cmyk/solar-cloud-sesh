@@ -5722,6 +5722,307 @@ static void logNewNativeResolution() {
             }
         }
     }
+    // [streamdiag] one-shot: log the image RVAs of model/streaming native handlers. The static dump has
+    // valid code but no runtime native table (it is populated on the heap at boot), so handler addresses
+    // can only be obtained live; with these RVAs their bodies disassemble offline to find the fragment/txd
+    // streaming stores for the CStreaming content route. Diagnostic only (not shipped behaviour).
+    {
+        struct DiagNative { const char* name; uint64_t hash; };
+        static const DiagNative kDiag[] = {
+            {"REQUEST_MODEL",                 0xEC9DAA34BBB4658Cull},
+            {"HAS_MODEL_LOADED",              0x6252BC0DD8A320DBull},
+            {"IS_MODEL_IN_CDIMAGE",           0xE7D342E0F16AAA8Full},
+            {"IS_MODEL_A_VEHICLE",            0xAD1840C2E6AF7D5Eull},
+            {"CREATE_VEHICLE",                0x5779387E956077A6ull},
+            {"GET_HASH_KEY",                  0x70E57E9927B6BA58ull},
+            {"SET_MODEL_AS_NO_LONGER_NEEDED", 0x55098D9E9AD58806ull},
+        };
+        for (const DiagNative& d : kDiag) {
+            NativeHandler h = findNativeHandler(d.hash);
+            if (h && g_imageBase)
+                GLOGI("hook: [streamdiag] %-28s handler @ +0x%llx", d.name,
+                      (unsigned long long)((const uint8_t*)(uintptr_t)h - g_imageBase));
+            else
+                GLOGW("hook: [streamdiag] %-28s UNRESOLVED", d.name);
+        }
+    }
+    // [storewalk] verify the CStreaming store globals found by static RE and dump their LIVE layout. The
+    // store objects are runtime-constructed (absent/zero in the image dump), so their slot pool ptr, counts
+    // and base stream index can only be read live; these drive the loose-model registration (Track 2).
+    // Reads are bounded to the mapped image (RVAs < image size) so a wrong offset logs MISMATCH, never faults.
+    if (g_imageBase && g_imageSize > 0x3000000) {
+        struct StoreRef { const char* name; uintptr_t objRva; uintptr_t vtRva; };
+        static const StoreRef kStores[] = {
+            {"FragmentStore", 0x2f5d690, 0x1bb4190},
+            {"TxdStore",      0x2f5da20, 0x1bb3bd0},
+        };
+        for (const StoreRef& s : kStores) {
+            const uint8_t* obj = g_imageBase + s.objRva;
+            const uint64_t vt = *reinterpret_cast<const uint64_t*>(obj);
+            const uint64_t wantVt = (uint64_t)(uintptr_t)g_imageBase + s.vtRva;
+            GLOGI("hook: [storewalk] %-13s @+0x%llx  vtable=0x%llx want 0x%llx -> %s",
+                  s.name, (unsigned long long)s.objRva, (unsigned long long)vt,
+                  (unsigned long long)wantVt, vt == wantVt ? "OK" : "MISMATCH");
+            const uint64_t* q = reinterpret_cast<const uint64_t*>(obj);
+            for (int off = 0; off < 0x200; off += 0x20)
+                GLOGI("hook: [storewalk]   +0x%03x: %016llx %016llx %016llx %016llx", off,
+                      (unsigned long long)q[off/8+0], (unsigned long long)q[off/8+1],
+                      (unsigned long long)q[off/8+2], (unsigned long long)q[off/8+3]);
+        }
+    }
+    // [vehdiag2] read-only: decode the streaming-handle encoding (image/collection index + offset) used
+    // by base-game vehicle fragment/txd slots, for the FiveM-style custom collection. v1 proved the slot
+    // name hash is NOT at +0x0/+0x8/+0xc, so: (a) raw-dump the first pool entries to see the slot shape;
+    // (b) one pass brute-forces the name-hash offset across the whole pool + collects occupancy stats;
+    // (c) window-dump the streaming-info manager across each store's global range to expose the handle
+    // bit layout even without a name anchor. Bounded, validated reads; NO game-function calls.
+    if (g_imageBase && g_imageSize > 0x3000000) {
+        auto joaat = [](const char* s) -> uint32_t {
+            uint32_t h = 0;
+            for (; *s; ++s) { char c = *s; if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+                h += (uint8_t)c; h += h << 10; h ^= h >> 6; }
+            h += h << 3; h ^= h >> 11; h += h << 15; return h;
+        };
+        const uint8_t* mgr    = g_imageBase + 0x2ea23d0;
+        const uint8_t* mgrArr = *reinterpret_cast<const uint8_t* const*>(mgr);
+        const uint32_t mgrCnt = *reinterpret_cast<const uint32_t*>(mgr + 8);
+        const char* names[3]  = { "adder", "police", "comet2" };
+        const uint32_t wants[3] = { joaat(names[0]), joaat(names[1]), joaat(names[2]) };
+        GLOGI("hook: [vehdiag2] mgrArr=%p mgrCnt=%u  wants adder=0x%08x police=0x%08x comet2=0x%08x",
+              (const void*)mgrArr, mgrCnt, wants[0], wants[1], wants[2]);
+        struct Store { const char* tag; uintptr_t objRva; };
+        static const Store kStores[] = { {"frag", 0x2f5d690}, {"txd", 0x2f5da20} };
+        for (const Store& st : kStores) {
+            const uint8_t* s       = g_imageBase + st.objRva;
+            const uint8_t* arrBase = *reinterpret_cast<const uint8_t* const*>(s + 0x38);
+            const uint32_t count   = *reinterpret_cast<const uint32_t*>(s + 0x48);
+            const uint32_t elem    = *reinterpret_cast<const uint32_t*>(s + 0x4c);
+            const int32_t  baseIdx = *reinterpret_cast<const int32_t*>(s + 0x8);
+            GLOGI("hook: [vehdiag2] %-4s arr=%p count=%u elem=0x%x baseIdx=%d",
+                  st.tag, (const void*)arrBase, count, elem, baseIdx);
+            if (!arrBase || elem != 0x18 || !count || count >= 0x40000) {
+                GLOGW("hook: [vehdiag2] %-4s layout unexpected - skip", st.tag);
+                continue;
+            }
+            // (a) raw dump first 8 entries (3 qwords each)
+            for (uint32_t i = 0; i < 8 && i < count; ++i) {
+                const uint64_t* q = reinterpret_cast<const uint64_t*>(arrBase + (size_t)i * elem);
+                GLOGI("hook: [vehdiag2] %-4s [%u] %016llx %016llx %016llx",
+                      st.tag, i, (unsigned long long)q[0], (unsigned long long)q[1],
+                      (unsigned long long)q[2]);
+            }
+            // (b) one pass: brute-force name-hash offset (0x0..0x14) + occupancy stats
+            uint32_t nonNullPtr = 0, plaus10 = 0, plaus14 = 0;
+            int hitIdx[3] = { -1, -1, -1 };
+            int hitOff[3] = { -1, -1, -1 };
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint8_t* n = arrBase + (size_t)i * elem;
+                if (*reinterpret_cast<const uint64_t*>(n) != 0) ++nonNullPtr;
+                if (*reinterpret_cast<const uint32_t*>(n + 0x10) < mgrCnt) ++plaus10;
+                if (*reinterpret_cast<const uint32_t*>(n + 0x14) < mgrCnt) ++plaus14;
+                for (int k = 0; k < 3; ++k) {
+                    if (hitIdx[k] >= 0) continue;
+                    for (int off = 0; off <= 0x14; off += 4)
+                        if (*reinterpret_cast<const uint32_t*>(n + off) == wants[k]) {
+                            hitIdx[k] = (int)i; hitOff[k] = off; break;
+                        }
+                }
+            }
+            GLOGI("hook: [vehdiag2] %-4s occupancy nonNullPtr=%u/%u  +0x10 in-range=%u  +0x14 in-range=%u",
+                  st.tag, nonNullPtr, count, plaus10, plaus14);
+            for (int k = 0; k < 3; ++k) {
+                if (hitIdx[k] < 0) { GLOGI("hook: [vehdiag2] %-4s %-8s not in pool", st.tag, names[k]); continue; }
+                const uint8_t* n = arrBase + (size_t)hitIdx[k] * elem;
+                const uint64_t* q = reinterpret_cast<const uint64_t*>(n);
+                const uint32_t f10 = *reinterpret_cast<const uint32_t*>(n + 0x10);
+                const uint32_t f14 = *reinterpret_cast<const uint32_t*>(n + 0x14);
+                const long long g  = (long long)baseIdx + hitIdx[k];
+                GLOGI("hook: [vehdiag2] %-4s %-8s FOUND idx=%d nameOff=0x%x entry %016llx %016llx %016llx",
+                      st.tag, names[k], hitIdx[k], hitOff[k],
+                      (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2]);
+                GLOGI("hook: [vehdiag2] %-4s   +0x10=0x%08x +0x14=0x%08x base+idx=%lld", st.tag, f10, f14, g);
+                if (mgrArr && g >= 0 && (uint64_t)g < mgrCnt) {
+                    const uint32_t* e = reinterpret_cast<const uint32_t*>(mgrArr + (size_t)g * 8);
+                    GLOGI("hook: [vehdiag2] %-4s   mgr[base+idx=%lld] handle=0x%08x flags=0x%08x", st.tag, g, e[0], e[1]);
+                }
+                if (mgrArr && f10 < mgrCnt) {
+                    const uint32_t* e = reinterpret_cast<const uint32_t*>(mgrArr + (size_t)f10 * 8);
+                    GLOGI("hook: [vehdiag2] %-4s   mgr[+0x10=%u] handle=0x%08x flags=0x%08x", st.tag, f10, e[0], e[1]);
+                }
+                if (mgrArr && f14 < mgrCnt) {
+                    const uint32_t* e = reinterpret_cast<const uint32_t*>(mgrArr + (size_t)f14 * 8);
+                    GLOGI("hook: [vehdiag2] %-4s   mgr[+0x14=%u] handle=0x%08x flags=0x%08x", st.tag, f14, e[0], e[1]);
+                }
+            }
+            // (c) window dump of mgr across this store's global range (handle encoding)
+            if (mgrArr && baseIdx >= 0 && (uint64_t)baseIdx < mgrCnt) {
+                for (int w = 0; w < 12; ++w) {
+                    const long long g = (long long)baseIdx + w;
+                    if ((uint64_t)g >= mgrCnt) break;
+                    const uint32_t* e = reinterpret_cast<const uint32_t*>(mgrArr + (size_t)g * 8);
+                    GLOGI("hook: [vehdiag2] %-4s mgr[%lld] handle=0x%08x flags=0x%08x", st.tag, g, e[0], e[1]);
+                }
+            }
+        }
+        // alternate global base (0x2f5d988) in case base+idx is wrong for the fragment store
+        const int32_t baseIdxG = *reinterpret_cast<const int32_t*>(g_imageBase + 0x2f5d988);
+        if (mgrArr && baseIdxG >= 0 && (uint64_t)baseIdxG < mgrCnt) {
+            GLOGI("hook: [vehdiag2] alt baseG=%d window:", baseIdxG);
+            for (int w = 0; w < 12; ++w) {
+                const long long g = (long long)baseIdxG + w;
+                if ((uint64_t)g >= mgrCnt) break;
+                const uint32_t* e = reinterpret_cast<const uint32_t*>(mgrArr + (size_t)g * 8);
+                GLOGI("hook: [vehdiag2]   mgrG[%lld] handle=0x%08x flags=0x%08x", g, e[0], e[1]);
+            }
+        }
+    }
+    // [fidiag] read-only: dump real registered fiCollection pointers from the image registry (0x2c67400)
+    // + their vtables (the fiPackfile/fiCollection interface our custom collection must clone) + object
+    // layout. Heap coll ptrs are low (<4GB); their vtable ptr is a high image VA -> RVA = vt - g_imageBase.
+    // Bounded (first 3 non-null, <=4096 scanned, 56 vtable slots). NO game-function calls -> no crash risk.
+    if (g_imageBase && g_imageSize > 0x3000000) {
+        const uint8_t* const* reg = reinterpret_cast<const uint8_t* const*>(g_imageBase + 0x2c67400);
+        const int32_t cap = *reinterpret_cast<const int32_t*>(g_imageBase + 0x1b81588);
+        GLOGI("hook: [fidiag] registry=%p cap=%d imageBase=%p imageSize=0x%llx",
+              (const void*)reg, cap, (const void*)g_imageBase, (unsigned long long)g_imageSize);
+        int shown = 0;
+        const int scanMax = (cap > 0 && cap < 4096) ? cap : 4096;
+        for (int i = 0; i < scanMax && shown < 3; ++i) {
+            const uint8_t* coll = reg[i];
+            if (!coll || (uintptr_t)coll < 0x10000) continue;
+            const uint8_t* vt = *reinterpret_cast<const uint8_t* const*>(coll);
+            const uintptr_t vtrva = (uintptr_t)(vt - g_imageBase);
+            if (vtrva >= (uintptr_t)g_imageSize) continue;  // vtable not in image -> not a code collection
+            GLOGI("hook: [fidiag] image[%d] coll=%p vtableRVA=0x%llx", i, (const void*)coll,
+                  (unsigned long long)vtrva);
+            const uint64_t* oq = reinterpret_cast<const uint64_t*>(coll);
+            for (int o = 0; o < 0x40; o += 0x20)
+                GLOGI("hook: [fidiag]   obj+0x%02x: %016llx %016llx %016llx %016llx",
+                      o, (unsigned long long)oq[o/8], (unsigned long long)oq[o/8+1],
+                      (unsigned long long)oq[o/8+2], (unsigned long long)oq[o/8+3]);
+            const uint64_t* vq = reinterpret_cast<const uint64_t*>(vt);
+            for (int s = 0; s < 56; s += 4) {
+                auto RV = [&](int k) -> unsigned long long {
+                    const uintptr_t r = (uintptr_t)((const uint8_t*)vq[s + k] - g_imageBase);
+                    return (r < (uintptr_t)g_imageSize) ? (unsigned long long)r : 0xffffffffULL; };
+                GLOGI("hook: [fidiag]   vt[%2d] +0x%03x: %08llx %08llx %08llx %08llx",
+                      s, s * 8, RV(0), RV(1), RV(2), RV(3));
+            }
+            // [entdiag] read-only: for a real fiPackfile (vtable 0x1b82890) dump its object streaming
+            // fields + a few concrete 0x10-byte entries so the exact entry bit-packing is observed, not
+            // guessed, before we build an in-memory packfile the game will read. idxs 0x248..0x24c are
+            // the known vehicle-fragment entries for imageIndex 2 (frag handle 0x00020249). Bounded by
+            // the collection's own entry count; heap reads only, no game calls.
+            if (vtrva == 0x1b82890) {
+                const uint8_t sh = coll[0xb8];
+                const uint32_t cnt28 = *reinterpret_cast<const uint32_t*>(coll + 0x28);
+                const uint32_t cnt30 = *reinterpret_cast<const uint32_t*>(coll + 0x30);
+                const uint64_t dataBase = *reinterpret_cast<const uint64_t*>(coll + 0x10);
+                const uint64_t dev = *reinterpret_cast<const uint64_t*>(coll + 0x50);
+                const uint32_t baseOff = *reinterpret_cast<const uint32_t*>(coll + 0x58);
+                const uint8_t* tbl = *reinterpret_cast<const uint8_t* const*>(coll + 0x20);
+                GLOGI("hook: [entdiag] packfile coll=%p shift=%u cnt28=%u cnt30=%u dataBase=%016llx dev=%016llx baseOff=%u tbl=%p",
+                      (const void*)coll, sh, cnt28, cnt30,
+                      (unsigned long long)dataBase, (unsigned long long)dev, baseOff, (const void*)tbl);
+                if (tbl && (uintptr_t)tbl >= 0x10000 && (uintptr_t)tbl < 0x100000000ULL) {
+                    static const int idxs[] = { 0, 1, 2, 0x248, 0x249, 0x24a, 0x24b, 0x24c };
+                    for (int k = 0; k < 8; ++k) {
+                        const uint32_t idx = static_cast<uint32_t>(idxs[k]);
+                        if (idx >= cnt28) continue;
+                        const uint64_t* e = reinterpret_cast<const uint64_t*>(tbl + static_cast<size_t>(idx) * 0x10);
+                        const uint64_t q0 = e[0], q1 = e[1];
+                        const uint64_t offBytes = static_cast<uint64_t>(static_cast<uint32_t>(q0 & 0xffff)) << sh;
+                        const uint32_t size24 = static_cast<uint32_t>((q0 >> 16) & 0xffffff);
+                        const uint32_t flags = static_cast<uint32_t>((q0 >> 40) & 0xffffff);
+                        const uint32_t altSize = static_cast<uint32_t>(q1 & 0xffffffff);
+                        GLOGI("hook: [entdiag]   ent[0x%x] q0=%016llx q1=%016llx -> off=%llu size24=%u flags=0x%06x alt=%u",
+                              idx, (unsigned long long)q0, (unsigned long long)q1,
+                              (unsigned long long)offBytes, size24, flags, altSize);
+                    }
+                }
+            }
+            ++shown;
+        }
+    }
+    // [cdiag] read-only: settle the fragType resource-construct ABI for Route B (manual load+Set). The
+    // place worker (FragmentStore vtable slot 42, RVA 0x16b7a0c) passes a TYPE DESCRIPTOR (RVA 0x1bb5478)
+    // + type 0xa2 to the generic constructor 0x1354d0c. We must know whether that construct consumes a
+    // datResourceMap of already-decompressed pages (-> hand-build pages + inflate) or a name/req-desc =
+    // a full device-backed named load (-> provide a device). Read-only evidence:
+    //  (a) descriptor 0x1bb5478: field0 (id/size) + each fn slot resolved to an RVA (so its construct fn
+    //      disassembles offline, and the live image is confirmed to match the dump);
+    //  (b) a RESIDENT FragmentStore slot (flagByte&0x80==0, obj!=0): the fragType* object head (its vtable
+    //      RVA proves a constructed object) + the slot name-hash [+0x08] and streaming handle [+0x10] =>
+    //      a live handle into the streaming mgr == device/handle-backed loads;
+    //  (c) the resource-manager context head 0x1e2ee90 + the '#'-replacement char [0x1e2d744] + the paging
+    //      sentinel [0x1e2ee00].
+    // Bounded reads inside the mapped image; NO game-function calls -> no crash risk (same contract as
+    // [fidiag]/[vehdiag2]). Remove with the other diagnostics before shipping.
+    if (g_imageBase && g_imageSize > 0x3000000) {
+        auto RVof = [&](const void* p) -> unsigned long long {
+            const uintptr_t r = (uintptr_t)((const uint8_t*)p - g_imageBase);
+            return (r < (uintptr_t)g_imageSize) ? (unsigned long long)r : 0xffffffffULL;
+        };
+        // (a) the fragType type descriptor (the arg slot 42 hands to the constructor)
+        const uint64_t* dq = reinterpret_cast<const uint64_t*>(g_imageBase + 0x1bb5478);
+        GLOGI("hook: [cdiag] descriptor @0x1bb5478 field0=%016llx (id/size), fn slots:",
+              (unsigned long long)dq[0]);
+        for (int s = 1; s < 8; ++s)
+            GLOGI("hook: [cdiag]   desc[%d] +0x%02x: ptr=%016llx rva=0x%llx", s, s * 8,
+                  (unsigned long long)dq[s], RVof((const void*)dq[s]));
+        // (b) a resident FragmentStore slot: proof of a constructed object + its streaming handle
+        {
+            const uint8_t* fs      = g_imageBase + 0x2f5d690;
+            const uint8_t* pool    = *reinterpret_cast<const uint8_t* const*>(fs + 0x38);
+            const uint8_t* flags   = *reinterpret_cast<const uint8_t* const*>(fs + 0x40);
+            const uint32_t count   = *reinterpret_cast<const uint32_t*>(fs + 0x48);
+            const uint32_t elem    = *reinterpret_cast<const uint32_t*>(fs + 0x4c);
+            const int32_t  baseIdx = *reinterpret_cast<const int32_t*>(fs + 0x8);
+            const uint8_t* mgr     = g_imageBase + 0x2ea23d0;
+            const uint8_t* mgrArr  = *reinterpret_cast<const uint8_t* const*>(mgr);
+            const uint32_t mgrCnt  = *reinterpret_cast<const uint32_t*>(mgr + 8);
+            GLOGI("hook: [cdiag] FragmentStore pool=%p flags=%p count=%u elem=0x%x baseIdx=%d",
+                  (const void*)pool, (const void*)flags, count, elem, baseIdx);
+            int shownR = 0;
+            if (pool && flags && elem == 0x18 && count && count < 0x40000) {
+                for (uint32_t i = 0; i < count && shownR < 3; ++i) {
+                    if (flags[i] & 0x80) continue;             // empty / not-loaded slot
+                    const uint8_t* e    = pool + (size_t)i * elem;
+                    const uint8_t* objp = (const uint8_t*)(*reinterpret_cast<const uint64_t*>(e));
+                    if (!objp || (uintptr_t)objp < 0x10000) continue;
+                    const uint8_t* objvt = *reinterpret_cast<const uint8_t* const*>(objp);
+                    const uint64_t nameHash = *reinterpret_cast<const uint64_t*>(e + 0x08);
+                    const uint32_t handle   = *reinterpret_cast<const uint32_t*>(e + 0x10);
+                    const uint32_t sflags   = *reinterpret_cast<const uint32_t*>(e + 0x14);
+                    GLOGI("hook: [cdiag] slot[%u] flag=0x%02x obj=%p objVtRVA=0x%llx nameHash+flags=%016llx handle=0x%08x sflags=0x%08x",
+                          i, flags[i], (const void*)objp, RVof(objvt),
+                          (unsigned long long)nameHash, handle, sflags);
+                    const uint64_t* oq = reinterpret_cast<const uint64_t*>(objp);
+                    for (int o = 0; o < 0x40; o += 0x20)
+                        GLOGI("hook: [cdiag]   obj+0x%02x: %016llx %016llx %016llx %016llx", o,
+                              (unsigned long long)oq[o/8], (unsigned long long)oq[o/8+1],
+                              (unsigned long long)oq[o/8+2], (unsigned long long)oq[o/8+3]);
+                    const long long g = (long long)baseIdx + i;
+                    if (mgrArr && g >= 0 && (uint64_t)g < mgrCnt) {
+                        const uint32_t* m = reinterpret_cast<const uint32_t*>(mgrArr + (size_t)g * 8);
+                        GLOGI("hook: [cdiag]   mgr[base+%u=%lld] handle=0x%08x flags=0x%08x", i, g, m[0], m[1]);
+                    }
+                    ++shownR;
+                }
+            }
+            if (!shownR) GLOGW("hook: [cdiag] no resident FragmentStore slot found");
+        }
+        // (c) resource-manager context head + the globals the name path reads
+        {
+            const uint64_t* rq = reinterpret_cast<const uint64_t*>(g_imageBase + 0x1e2ee90);
+            const uint8_t hashChar = *reinterpret_cast<const uint8_t*>(g_imageBase + 0x1e2d744);
+            const uint64_t pageSentinel = *reinterpret_cast<const uint64_t*>(g_imageBase + 0x1e2ee00);
+            GLOGI("hook: [cdiag] resmgr@0x1e2ee90: %016llx %016llx %016llx %016llx  '#'->0x%02x pageSentinel=%016llx",
+                  (unsigned long long)rq[0], (unsigned long long)rq[1],
+                  (unsigned long long)rq[2], (unsigned long long)rq[3],
+                  hashChar, (unsigned long long)pageSentinel);
+        }
+    }
     if (resolved == total) {
         GLOGI("hook: new natives: %d/%d resolved (world clean-up, join gate, blips, ped drive, look, "
               "vehicles, combat, camera, pause menu, sync-plan on-foot/vehicle/drive-by/particles)",

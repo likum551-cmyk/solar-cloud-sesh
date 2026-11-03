@@ -414,3 +414,8 @@ set_target_properties(vehicle_drive_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${C
 add_executable(gameplay_test tests/gameplay_test.cpp)
 target_link_libraries(gameplay_test PRIVATE gage_sync)
 set_target_properties(gameplay_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
+# pack_collection_test.exe: offline proofs for the streaming content-pack TOC builder
+# (apps/engine/pack_collection.{h,cpp}); entry bit-packing pinned to live golden vectors. Never shipped.
+add_executable(pack_collection_test tests/pack_collection_test.cpp apps/engine/pack_collection.cpp)
+set_target_properties(pack_collection_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)

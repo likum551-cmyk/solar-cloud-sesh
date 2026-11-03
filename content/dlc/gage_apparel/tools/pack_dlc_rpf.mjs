@@ -23,6 +23,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from "node:fs";
 import { createHash, createCipheriv, createDecipheriv } from "node:crypto";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -148,7 +149,7 @@ function buildArchive(root, encWord) {
 
 // ---- independent reader / checker -----------------------------------------------------------------
 // Does not share structures with the writer: it re-derives everything from the bytes, the way CodeWalker reads.
-function readArchive(buf, label = "root") {
+function readArchive(buf, label = "root", recurse = true) {
   const errs = [];
   const err = (m) => errs.push(`${label}: ${m}`);
   if (buf.length < 16) { err("shorter than the 16-byte header"); return { errs, files: [], enc: 0 }; }
@@ -194,8 +195,8 @@ function readArchive(buf, label = "root") {
       const data = buf.subarray(start, start + len);
       if (c.kind === "rsc" && (data.length < 16 || data.readUInt32LE(0) !== RSC7)) err(`${full}: resource entry without RSC7 magic`);
       if (c.kind === "rsc" && (data.readUInt32LE(8) !== c.sys || data.readUInt32LE(12) !== c.gfx)) err(`${full}: TOC flags differ from the RSC7 header`);
-      files.push({ path: full, kind: c.kind, len, data });
-      if (c.kind === "bin" && c.name.toLowerCase().endsWith(".rpf") && c.size === 0) {
+      files.push({ path: full, kind: c.kind, len, data, comp: c.kind === "bin" && c.size !== 0, usize: c.kind === "bin" ? c.usize : len });
+      if (recurse && c.kind === "bin" && c.name.toLowerCase().endsWith(".rpf") && c.size === 0) {
         const inner = readArchive(data, `${label}/${full}`);
         errs.push(...inner.errs);
         files.push(...inner.files.map((f) => ({ ...f, path: `${full}/${f.path}` })));
@@ -336,6 +337,78 @@ if (args.check) {
   printTree(r, buf);
   if (r.errs.length) { for (const e of r.errs) console.error("PROBLEM " + e); process.exit(1); }
   console.log("structure OK");
+  process.exit(0);
+}
+
+// --extract=<file.rpf> [--out=<dir>] [--aes-key-file=<key>]: unpack an archive's files to a loose folder,
+// recursing into nested .rpf so resources (jesko.yft/.ytd) land as real files. Nested-archive CONTAINERS
+// are skipped (their children are written instead), so no file-vs-directory clash. This is the clean
+// "get the loose assets for streaming" step: no game, no encryption gate -- it only READS the TOC.
+if (args.extract) {
+  const inPath = path.resolve(String(args.extract));
+  let buf = readFileSync(inPath);
+  const enc = buf.length >= 16 ? buf.readUInt32LE(12) : 0;
+  if (enc === ENC_AES) {
+    if (!args["aes-key-file"]) { console.error("archive is AES-encrypted; pass --aes-key-file=<32-byte key> to read its TOC"); process.exit(1); }
+    console.log("archive header says AES; decrypting the entries+names region with the supplied key to read it");
+    buf = unsealAes(buf, readKeyFile(args["aes-key-file"]));
+  } else if (enc === ENC_NG) { console.error("archive is NG-encrypted; NG is not supported by this tool"); process.exit(1); }
+  const outDir = path.resolve(String(args.out ?? path.join(path.dirname(inPath), "loose")));
+  // --keep-nested: do NOT recurse into nested .rpf; write each as an intact blob. This reproduces the exact
+  // on-disk layout a content.xml expects (loose data/*.meta + nested x64/*.rpf as real RPF files for the
+  // streaming side), so a folder-device DLC mount can hand them to the game's own content pipeline.
+  const recurse = !args["keep-nested"];
+  const r = readArchive(buf, "root", recurse);
+  const paths = r.files.map((f) => f.path);
+  const isContainer = (p) => paths.some((q) => q !== p && q.startsWith(p + "/"));   // a nested .rpf whose children we extracted
+  let n = 0, skipped = 0;
+  for (const f of r.files) {
+    if (isContainer(f.path)) { skipped++; continue; }
+    const dest = path.join(outDir, ...f.path.split("/"));
+    mkdirSync(path.dirname(dest), { recursive: true });
+    let out = f.data, note = "";
+    if (f.comp) {                                  // RPF7 deflate-compressed bin (FileSize != 0): inflate to the real file
+      try { out = zlib.inflateRawSync(f.data); note = ` (inflated ${f.len} -> ${out.length})`; }
+      catch (e) { note = ` (NOT inflated: ${e.message}; wrote raw)`; }
+    }
+    writeFileSync(dest, out);
+    console.log(`  ${f.kind.padEnd(3)} ${String(out.length).padStart(9)}  ${f.path}${note}`);
+    n++;
+  }
+  console.log(`extracted ${n} file(s) -> ${outDir}${skipped ? `  (${skipped} nested-archive container(s) skipped)` : ""}`);
+  if (r.errs.length) { console.error(`(${r.errs.length} TOC problem(s) reading nested archives; the top-level extraction above is still complete)`); for (const e of r.errs.slice(0, 2)) console.error("  PROBLEM " + e); }
+  process.exit(0);
+}
+
+// --seal=<in.rpf> --out=<out.rpf> --aes-key-file=<key>: reseal an already-built OPEN archive as AES,
+// in place of rebuilding one from source assets. For a pack that is already a finished dlc.rpf (e.g. an
+// OpenIV add-on), this is the whole job: validate its plaintext TOC, encrypt the entries+names region
+// with the operator's key, verify the round-trip, write the sealed copy.
+if (args.seal) {
+  if (!args["aes-key-file"]) { console.error("--seal needs --aes-key-file=<path to a 32-byte key>"); process.exit(2); }
+  if (!args.out) { console.error("--seal needs --out=<output .rpf path>"); process.exit(2); }
+  const inPath = path.resolve(String(args.seal));
+  const outPath = path.resolve(String(args.out));
+  if (inPath === outPath) { console.error("--seal will not overwrite the input in place; choose a different --out"); process.exit(2); }
+  const src = readFileSync(inPath);
+  if (src.length < 16 || src.readUInt32LE(0) !== RPF7) { console.error(`${inPath} is not an RPF7 archive`); process.exit(1); }
+  const enc = src.readUInt32LE(12);
+  if (enc === ENC_AES) { console.error("input is already AES-sealed; nothing to do"); process.exit(1); }
+  if (enc === ENC_NG) { console.error("input is NG-encrypted; this tool cannot reseal NG (needs CodeWalker's magic.dat, excluded)"); process.exit(1); }
+  if (enc !== ENC_OPEN && enc !== ENC_NONE) { console.error(`input encryption 0x${enc.toString(16).padStart(8, "0")} is neither OPEN nor NONE; refusing`); process.exit(1); }
+  // The outer TOC is plaintext for OPEN/NONE: confirm IT is well-formed. Do NOT recurse into nested
+  // .rpf entries (the lang text sub-archives need not parse here): they are opaque file data the game
+  // reads after mounting, and they are not part of the outer region this seal encrypts.
+  const r = readArchive(src, "root", false);
+  if (r.errs.length) { console.error("the outer archive's TOC is not structurally valid; refusing to seal it:"); for (const e of r.errs) console.error("  PROBLEM " + e); process.exit(1); }
+  if (!r.files.some((f) => f.path === "setup2.xml")) { console.error("the input archive has no setup2.xml at its root; the game's DlcSetup2 needs one"); process.exit(1); }
+  const key = readKeyFile(args["aes-key-file"]);
+  const sealed = sealAes(src, key);
+  if (!unsealAes(sealed, key).equals(src)) { console.error("internal error: unseal(seal(x)) != x; not writing a bad pack"); process.exit(1); }
+  mkdirSync(path.dirname(outPath), { recursive: true });
+  writeFileSync(outPath, sealed);
+  printTree(r, src);
+  console.log(`resealed OPEN -> AES (0x${ENC_AES.toString(16)}) with the supplied key; round-trip verified -> ${outPath}`);
   process.exit(0);
 }
 

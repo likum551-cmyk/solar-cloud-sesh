@@ -32,8 +32,17 @@
 //       are driveable from the registry (pack_device / pack_path) without a rebuild, and every step
 //       is logged so the first run says exactly where it stopped.
 //
+// STRATEGY B (pack_folder=1): mount a LOOSE folder, not an RPF. AddDlcPack still builds the entry (its
+// Exists gate only needs a dlc.rpf file present in the folder; it is never opened), then the entry is
+// overridden to a relative/folder device (Mount 0x94307c folder branch: +0xc8=1, +0xb8=the folder path),
+// so DlcSetup2 reads setup2.xml/content.xml off disk and RunPackGroup registers the data-files + nested
+// stream RPFs. This never calls fiPackfile::Open and never touches the encryption gate -- the clean route
+// for an OPEN add-on pack. Model files still live in a nested x64/vehicles.rpf (the stock pipeline has no
+// loose-model path); whether that nested OPEN RPF is accepted is what the first folder-mode run decides.
+//
 // Registry (all under HKCU\Software\GAGE-MP, strings):
 //   pack_mount  = "1"  to arm this at all (default off: Tick is a no-op).
+//   pack_folder = "1"  strategy B: loose-folder device instead of a packfile mount (default off = packfile).
 //   pack_name   logical pack name, default "gage_jesko" (names the %LOCALAPPDATA% folder).
 //   pack_path   absolute path to the pack's dlc.rpf; default
 //               %LOCALAPPDATA%\GAGE-MP\packs\<pack_name>\dlc.rpf (what the launcher will drop).
