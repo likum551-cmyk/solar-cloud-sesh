@@ -126,12 +126,12 @@ namespace {
     {
         kSiteHitReact, kSiteEmoteEnd, kSiteCoverExit, kSiteEnterWalk, kSiteEnterTimeout, kSiteEnterGaveUp, kSiteDriveMode,
         kSiteLeaveVeh, kSiteTierBDrift, kSiteBackFromVeh, kSiteAimEnd, kSiteCollisionBack, kSiteClimbEnd, kSiteUnseat,
-        kSiteWater, kSiteAnchorLost, kSiteCoverFail, kLocoSites
+        kSiteWater, kSiteAnchorLost, kSiteCoverFail, kSiteRepair, kLocoSites
     };
     const char* const kLocoSiteName[kLocoSites] = {
         "hit-react-end", "emote-end", "cover-exit", "enter-walk", "enter-timeout", "enter-gave-up", "drive-mode",
         "leave-vehicle", "tier-b-drift", "back-from-vehicle", "aim-end", "collision-back", "climb-end", "unseat", "water-edge",
-        "anchor-lost", "cover-fail"
+        "anchor-lost", "cover-fail", "repair"
     };
 
     // W11 (docs/CLOUD-HANDOFF.md item 0b): loco_mode = anchor (default) | straight, re-read at every Welcome like peer_drive. Anchor: each
@@ -147,6 +147,11 @@ namespace {
     // logged as "engine: loco level"). Both re-read at every Welcome like loco_mode.
     std::atomic<bool> g_locoPushNudge{true};
     std::atomic<bool> g_locoSelfCheck{true};
+    // R3 T2 (desync round 3): loco_r3 = 0 switches every round-3 rule off at once (the quiet window and write verdict, the lost task needing
+    // the ped's own speed, the re-issue spacing, the ladder hold and cap: sync::Round2Behaviour); loco_repair = 0 only the repairs of a
+    // puppet no task moves (ClearTasks, then the lean and the alt creation recipe). Re-read at every Welcome like loco_mode.
+    std::atomic<bool> g_locoR3{true};
+    std::atomic<bool> g_locoRepair{true};
     sync::LevelWitness g_locoDegrade;     // script tick only
     std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
@@ -155,6 +160,10 @@ namespace {
         if (!g_locoPushNudge.load())
             c.push = sync::PushMode::Velocity;
         c.selfCheck = g_locoSelfCheck.load();
+        if (!g_locoR3.load())
+            c = sync::Round2Behaviour(c);
+        if (!g_locoRepair.load())
+            c.maxRepairs = 0;
         return c;
     }
 
@@ -193,6 +202,13 @@ namespace {
         sync::ClimbWindow climb;
         sync::OneShotAudit audit;   // T2: did the game SHOW the jump / reload / stealth / swim / ragdoll we asked for (script tick)
         uint32_t levelLogged = 0;   // T2: "engine: loco level" lines written for this puppet (rate limit)
+        // R3 T2: the creation recipe of the puppet's ped (0 full, 1 lean, 2 alt: World::SpawnRemotePed), the repairs done on it
+        // (LocoInput::repairsDone), the gait diagnostic of the last 10 s ("engine: gait") and its log-line budgets. Script tick only.
+        int recipe = 0;
+        int repairsDone = 0;
+        sync::GaitDiag gaitDiag;
+        uint32_t verdictLogged = 0;
+        bool capLogged = false;
 
         // Stage 3 (protocol v3). Appearance: the newest PeerLook (PeerNet::look, copied by SyncNet, applied
         // by the script tick); lookDirty until it is on the ped. pedModel is the model the ped was spawned with.
@@ -1327,6 +1343,10 @@ namespace {
         // T2: the position-error push and the degradation ladder (see LocoCfg).
         g_locoPushNudge.store(reg::Get(L"loco_push") != L"velocity");
         g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
+        g_locoR3.store(reg::Get(L"loco_r3") != L"0");
+        g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
+        GLOGI("engine: remote on-foot round-3 rules %s (loco_r3): quiet window + write verdict, re-issue spacing, ladder hold / cap; repairs of a puppet "
+              "no task moves %s (loco_repair)", g_locoR3.load() ? "ON" : "OFF (round-2 controller)", g_locoRepair.load() ? "ON" : "OFF");
         GLOGI("engine: remote on-foot position error closed by %s (loco_push), self-checks / degradation ladder %s (loco_selfcheck)",
               g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
               g_locoSelfCheck.load() ? "ON (anchor -> straight -> blend-carried speed -> rigid follow, each step logged)" : "OFF");
@@ -4966,6 +4986,109 @@ namespace {
     // steer, heading and the rare snap; this applies them in the order its header gives.
     void UnseatPeer(Peer& pe, int32_t leaveVeh);   // defined below (its default argument is declared there)
 
+    // R3 T2: what the controller learned about coordinate writes on this puppet, the level cap, and the repairs it asks of the engine.
+    // All of them are rare, one-off events; the per-puppet budget keeps a broken session from flooding the log.
+    const char* WriteVerdictName(sync::WriteVerdict v)
+    {
+        return v == sync::WriteVerdict::Harm ? "HARM (every coordinate write cancels the walk)"
+             : v == sync::WriteVerdict::Harmless ? "harmless (the writes are not why the task shows nothing)" : "unknown";
+    }
+    void NoteLocoVerdict(Peer& pe, int id, const sync::LocoOutput& o)
+    {
+        if (pe.verdictLogged >= 6)
+            return;
+        ++pe.verdictLogged;
+        const sync::LocoStats& s = pe.loco.Stats();
+        PeerLog(true, "engine: loco write verdict id=%d (%s): %s (quiet windows %u: %u showed a gait with no coordinate write, %u did not). %s", id,
+                pe.name.c_str(), WriteVerdictName(o.writeVerdict), s.quietWindows, s.quietHarm, s.quietClear,
+                o.writeVerdict == sync::WriteVerdict::Harm
+                    ? "The position error is now closed by single pulses (one write per 1.5 s, beyond 0.9 m) instead of a write on every frame."
+                    : "The ladder and the repairs go on from the task, not the writes.");
+    }
+    // The engine's side of sync::LocoRepair: what to do to a puppet that no level of the ladder moved. ClearTasks keeps the ped; the
+    // respawns are done by TickPeers (pe.respawnPed) with the recipe set here. Script tick, ped valid.
+    void ApplyLocoRepair(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
+    {
+        (void)nowMs;
+        const float sp = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+        ++pe.repairsDone;
+        const char* what = "";
+        switch (o.repair)
+        {
+        case sync::LocoRepair::ClearTasks:
+            what = "CLEAR_PED_TASKS_IMMEDIATELY, freeze off, collision on, then the gait task again";
+            ClearPedTasksNow(pe.ped);
+            g_world->FreezeEntityPosition(pe.ped, false);
+            g_world->SetEntityCollision(pe.ped, true);
+            pe.aimTask = false;
+            LocoReset(pe, kSiteRepair);
+            break;
+        case sync::LocoRepair::RespawnLean:
+            what = "the ped is created again with the LEAN recipe (invincible + events blocked only)";
+            pe.recipe = 1;
+            pe.respawnPed = true;
+            break;
+        case sync::LocoRepair::RespawnAlt:
+            what = "the ped is created again with the ALT recipe (civilian ped type, no script-host flag, lean flags)";
+            pe.recipe = 2;
+            pe.respawnPed = true;
+            break;
+        case sync::LocoRepair::None:
+            return;
+        }
+        PeerLog(true, "engine: loco repair id=%d (%s): step %d of 3 because the gait task stalled twice and no coordinate write was to blame (pose speed "
+                "%.2f m/s, the ped's own speed %.2f m/s, write verdict %s): %s", id, pe.name.c_str(), pe.repairsDone, sp, pe.loco.SelfSpeed(),
+                WriteVerdictName(o.writeVerdict), what);
+    }
+    // R3 T2: the task types GET_IS_TASK_ACTIVE says are running on the ped (indices 0..kTaskScanMax, no name guessed): the list of a puppet
+    // that "runs" a go-to task shows whether the game really has one, and compares with the same list of the local player walking.
+    constexpr int kTaskScanMax = 600;
+    std::string ActiveTaskTypes(int32_t ped)
+    {
+        std::string s;
+        int n = 0;
+        for (int t = 0; t < kTaskScanMax; ++t)
+            if (g_world->GetIsTaskActive(ped, t))
+            {
+                if (n++)
+                    s += ",";
+                s += std::to_string(t);
+                if (n >= 24)
+                {
+                    s += ",...";
+                    break;
+                }
+            }
+        return n ? s : std::string("none");
+    }
+    // The per-puppet gait line (every 10 s while a moving gait was commanded): what the game says the ped does, next to what the pose
+    // asks. One log is enough to tell W (writes cancel the walk), D / F (no task moves it) and B (the gait natives lie) apart.
+    std::string GaitLine(int id, const Peer& pe)
+    {
+        const sync::GaitDiagSummary g = pe.gaitDiag.Summary();
+        const sync::LocoStats& s = pe.loco.Stats();
+        const float lat = pe.loco.MeanLatencyMs();
+        char latb[48];
+        if (lat >= 0.0f) std::snprintf(latb, sizeof(latb), "%.0f ms over %u", lat, s.latencyN);
+        else std::snprintf(latb, sizeof(latb), "none seen");
+        char buf[1100];
+        std::snprintf(buf, sizeof(buf),
+                      "engine: gait id=%d (%s): last 10 s a moving gait was commanded on %u of %u frames; the game READS still %.0f%% walking %.0f%% running %.0f%% "
+                      "sprinting %.0f%% (IS_PED_*), IS_PED_STILL true on %u of %u asks; speed: pose %.2f, ped from positions %.2f (our writes included), "
+                      "GET_ENTITY_SPEED %.2f, own displacement net of our writes %.2f m/s; move blend ratio set on %u frames (mean %.2f), coordinate writes on "
+                      "%u frames, %u task issues, task-to-first-gait %s issues; ragdoll %u frames; write verdict %s (quiet windows %u: %u gait / %u none, pulses %u); "
+                      "ladder level %d, %u changes this session%s; repairs %d, creation recipe %d",
+                      id, pe.name.c_str(), g.commandedFrames, g.frames, g.readShare(g.readStill) * 100.0, g.readShare(g.readWalk) * 100.0,
+                      g.readShare(g.readRun) * 100.0, g.readShare(g.readSprint) * 100.0, g.stillTrue, g.stillAsked, g.poseMs, g.posMs, g.entityMs, g.ownMs,
+                      g.blendFrames, g.blendMean, g.writeFrames, g.issues, latb, g.ragdollFrames, WriteVerdictName(pe.loco.Verdict()), s.quietWindows,
+                      s.quietHarm, s.quietClear, s.pulses, (int)pe.loco.Level(), (unsigned)pe.loco.LevelChangesTotal(),
+                      pe.loco.LadderFrozen() ? " (FROZEN by the cap)" : "", pe.repairsDone, pe.recipe);
+        std::string line = buf;
+        if (g.commandedFrames > 0)
+            line += "; active task types [" + ActiveTaskTypes(pe.ped) + "]";
+        return line;
+    }
+
     // T2: a puppet's controller moved to another level of the degradation ladder: say so (the numbers that decided it are in the
     // line), count it, and tell the witness (two puppets finding the same failure make it machine-wide).
     void NoteLocoLevel(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
@@ -5531,6 +5654,7 @@ namespace {
             const bool anchorWanted = g_locoAnchor.load() && !g_anchorBroken && !aiming;
             in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
         }
+        in.repairsDone = pe.repairsDone;                   // R3 T2
         // T2: a failure two puppets' controllers found is imposed on this one too (the game is one game), until its timer runs out.
         if (g_locoDegradeReset.exchange(false))
             g_locoDegrade.Reset();
@@ -5543,6 +5667,39 @@ namespace {
             return;                                    // leaving a vehicle: the exit animation owns the ped
         if (o.levelChanged)
             NoteLocoLevel(pe, id, o, in, nowMs);
+        if (o.verdictChanged)
+            NoteLocoVerdict(pe, id, o);                    // R3 T2
+        if (o.capHit && !pe.capLogged)
+        {
+            pe.capLogged = true;
+            PeerLog(true, "engine: loco level id=%d (%s): the cap of level changes per session was reached (%u): the ladder is FROZEN at level %d (%s) for the "
+                    "rest of the session (loco_r3=0 lifts the cap)", id, pe.name.c_str(), (unsigned)pe.loco.LevelChangesTotal(), (int)pe.loco.Level(),
+                    LocoLevelName(pe.loco.Level()));
+        }
+        {
+            // R3 T2: the gait diagnostic frame: what the game says the ped does next to what the pose asks
+            sync::GaitDiagFrame gf;
+            gf.dtMs = dtMs;
+            gf.nowMs = nowMs;
+            gf.commanded = aiming ? sync::Gait::Still : o.gait;      // (an aim task owns the animation: its gait read is not a signal)
+            gf.read = in.pedGait;
+            gf.poseSpeed = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+            gf.ownSpeed = pe.loco.SelfSpeed();
+            gf.pedPos = in.pedPos;
+            gf.wrote = o.snap || o.nudge;
+            gf.issued = o.task == sync::LocoTask::GoStraight || o.task == sync::LocoTask::GoToAnchor;
+            gf.blendSet = gf.issued || o.setBlend;
+            gf.moveBlend = o.moveBlendRatio;
+            gf.ragdoll = in.ragdoll;
+            if (gf.commanded != sync::Gait::Still)
+            {
+                gf.entitySpeed = g_world->GetEntitySpeed(pe.ped);
+                gf.pedStill = g_world->IsPedStill(pe.ped) ? 1 : 0;
+            }
+            pe.gaitDiag.Observe(gf);
+        }
+        if (o.repair != sync::LocoRepair::None)
+            ApplyLocoRepair(pe, id, o, in, nowMs);         // R3 T2 (after the diagnostic: the frame is judged on the ped it was read from)
         {
             // Sync A: the slide metric (libs/sync LocoDiag), from what this frame read and what the controller decided
             sync::LocoDiagFrame df;
@@ -6149,11 +6306,12 @@ namespace {
                     pe.requestedModel = model;         // SpawnRemotePed requests it every call
                     // Returns 0 until the model has streamed in: tried again next frame at the new pose.
                     pe.ped = g_world->SpawnRemotePed((int)model, pose.k.x, pose.k.y, pose.k.z,
-                                                     Heading360(pose.k.heading));
+                                                     Heading360(pose.k.heading), pe.recipe);
                     if (pe.ped)
                     {
-                        PeerLog(false, "engine: spawned remote peer id=%d (%s) as ped %d (model 0x%08x%s)", it->first,
-                                pe.name.c_str(), pe.ped, (unsigned)model, pe.hasLook ? ", own look" : ", no look yet");
+                        PeerLog(pe.recipe != 0, "engine: spawned remote peer id=%d (%s) as ped %d (model 0x%08x%s, creation recipe %d: %s)", it->first,
+                                pe.name.c_str(), pe.ped, (unsigned)model, pe.hasLook ? ", own look" : ", no look yet", pe.recipe,
+                                pe.recipe == 0 ? "full flags" : pe.recipe == 1 ? "LEAN: invincible + events blocked only" : "ALT: civilian ped type, no script-host flag, lean");
                         pe.requestedModel = 0;          // SpawnRemotePed released it after CREATE_PED
                         pe.pedModel = model;
                         pe.spawnSinceMs = 0;
@@ -6236,6 +6394,7 @@ namespace {
                         }
                         report.emplace_back(LocoLine(it->first, pe));   // W8: why the controller issued tasks, what was last applied
                         report.emplace_back(LocoSlideLine(it->first, pe));   // Sync A: the slide metric
+                        report.emplace_back(GaitLine(it->first, pe));        // R3 T2: what the game says the ped does next to the pose
                     }
                     {
                         // R3 T3: one cover line per puppet with cover activity in the last 10 s (the window is taken either way)
@@ -6246,6 +6405,7 @@ namespace {
                             report.emplace_back(cl);
                     }
                     pe.slide.Reset();
+                    pe.gaitDiag.Reset();
                     pe.shootingFrames = 0;
                     const sync::LocoStats& ls = pe.loco.Stats();
                     pe.locoGoSeen = ls.goStraight;
@@ -6258,6 +6418,19 @@ namespace {
                     pe.samples = pe.extrapolated = pe.held = pe.snaps = 0;
                 }
                 ++it;
+            }
+            if (reportNow && lp && withData > 0)
+            {
+                // R3 T2: the same readings on the LOCAL player while it walks, to set against the puppets' "engine: gait" lines (a puppet
+                // whose active task types never include what the walking player has is not running a locomotion task at all)
+                const int lg = g_world->PedGait(lp);
+                if (lg > 0)
+                {
+                    char lb[120];
+                    std::snprintf(lb, sizeof(lb), "engine: gait local player (for comparison): the game reads %s, GET_ENTITY_SPEED %.2f m/s, active task types [",
+                                  lg == 3 ? "sprinting" : lg == 2 ? "running" : "walking", g_world->GetEntitySpeed(lp));
+                    report.emplace_back(std::string(lb) + ActiveTaskTypes(lp) + "]");
+                }
             }
             if (withData > reported)
                 report.emplace_back("engine: sync: " + std::to_string(withData - reported) + " more peer(s) not listed");

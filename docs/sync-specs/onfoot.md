@@ -164,3 +164,38 @@ Decision numbers (per puppet, 10 s line): healthy = `level 0`, skate < 5%, nudge
 | **parachute** | IS_PED_IN_PARACHUTE_FREE_FALL | kPfParachute | placed, collision off, no parachute task | missing: needs natives |
 | enter / exit a vehicle | | move 5 / 6 | | T1 |
 No state found that needs a new wire field AND can be played with a native we have: a wire change would only carry what no puppet can show. `engine: anims onfoot (T2)` prints per 10 s, for jump / reload / stealth / swim / ragdoll: asked, SHOWN (the game's own readback said yes within the kind's window, average ms), NOT shown, unreadable. A kind that is asked but never shown is an animation the other players do not see.
+
+## R3 T2 (desync round 3, client 0.4.8 candidate): "the task ran, the puppet showed no gait, own speed 0.00"
+
+Live (0.4.7, GI's `gage.log`, puppet id=2): `TASK_GO_TO_ENTITY` on the anchor, then `TASK_GO_STRAIGHT_TO_COORD`, then a rigid follow: the ped read no gait and its own speed (net of our writes) was 0.00-0.48 m/s against a pose of 1.05-5.64 m/s; 13 go-tasks per 10 s, skate 90%, 7 level changes in 6.5 minutes. `TASK_CLIMB` did not start either.
+
+### What reading the code ruled out (evidence level: code only; nothing here was seen in a game)
+- `World::SpawnRemotePed` (hook.cpp, `SpawnRemotePed`) creates the puppet unfrozen (`FreezeEntityPosition(ped, false)`), collision on, invincible, events blocked, ragdoll off, keep-task, config flag 188. 188 is `PED_FLAG_DISABLE_HURT` (alt:V ped flag list); none of these is documented to stop scripted tasks. Only the anchor is frozen (`SpawnPed`), and the straight task, which has no anchor, failed the same way.
+- The per-frame coordinate write on the ped (`engine.cpp` DrivePeer `if (o.nudge && !o.snap)`) is the one thing applied to the puppet every frame in the 0.4.7 default. But 0.4.3-0.4.6 had no coordinate write (a velocity push) and GI already reported "players slide in an idle pose", and the first 0.4.7 event (03:39:51) is the puppet's first ladder event (no earlier one in the log), probably in the first seconds of a movement, where the start grace holds the nudge back. So it is a candidate (W), not the likeliest.
+- All natives run inside `run_script_threads` with the TLS script thread set to the `startup` thread when the stock scripts are off (hook.cpp `scriptTickBody`): the puppets and their tasks belong to a script handler that never ticks. Untestable offline; it is a candidate for the D / F family below.
+
+### The candidates, and what the 0.4.7 log can and cannot tell apart (`tests/r3_t2_tests.h`, `R3T2_TABLE=1`)
+| cause | model | 0.4.7 10 s numbers (60 s run, pose 4.5 m/s) |
+|---|---|---|
+| W | every coordinate write cancels the walk for 400 ms | gait read 0%, own speed 0.01 m/s, 3569 nudge frames |
+| D | no task moves the ped | the same, to the digit |
+| F | a ped flag/state blocks tasks until the ENGINE changes the ped | the same |
+| L | a task needs 1.2 s to show a gait, a re-issue restarts the wait | gait read 43%, own 1.8 m/s |
+| B | the IS_PED_* natives read Still, the ped moves fine | gait 0%, **own speed 4.5 m/s** |
+W, D and F cannot be told apart by anything round 2 logged. B can (own speed), and 0.4.7 mislabelled it "lost". The round-3 controller tells W from D / F by an experiment, and F from D by what the engine can do to the ped.
+
+### What the controller does now (libs/sync/locomotion.*, only with the ladder on; all of it rolls back with `loco_r3=0`)
+- **Quiet window / write verdict.** The puppet's FIRST moving task runs with no coordinate write for `quietInitialMs` (1.55 s). A failure (lost / stuck / snap storm) seen while writes were flowing opens a quiet window (no write at all, 0.7-1.3 s, as long as the error it may cost allows). The ped reading a gait (or moving on its own) for 350 ms in it = **Harm**: every write cancels the walk; from then on the position error is closed by single pulses (one write per 1.5 s beyond 0.9 m), the nudge-share / rate / stuck detectors ignore the pulses' effect. Nothing in it = **Harmless**, the ladder goes on at once. A working game proves Harmless silently (gait read and own speed agree while writes flow for 1.5 s).
+- **Lost needs the ped's own speed to agree** (B is not lost).
+- **Ladder converges.** Monotone down within one failure; a level change holds `levelHoldMs` (8 s) before an UP step; at most `maxLevelChanges` (12) per puppet and session, then the level is frozen and one line says so; the fallback timers keep doubling.
+- **Re-issue limits.** Rule-based re-issues (turn / drift / arrival / stall) at most once per second (`reissueMinMs`); only a turn of more than 70 degrees may come after 500 ms; a first gait gets `firstGaitWindowMs` (1.5 s; the live cadence was 0.77 s) before it is called lost; a forced re-issue (snap, Reset) waits `issueGapMs` (600 ms; the whole window while the previous issue still waits for its first gait). Still <-> moving is never held.
+- **Repairs.** A straight task that stalled twice with the writes cleared makes the controller ask the ENGINE (`LocoOutput::repair`): 1 `ClearTasks` (CLEAR_PED_TASKS_IMMEDIATELY, freeze off, collision on), 2 `RespawnLean` (creation recipe 1: invincible, heading, events blocked and nothing else), 3 `RespawnAlt` (recipe 2: CIVMALE ped type, no script-host flag). After each the straight task is tried first. After the third the rigid follow holds 120 s (then 240, ... 600 s) before a probation.
+
+### Live steps (GI)
+Default config first, 60 s with a friend walking / running. `grep gage.log`:
+- `engine: gait id=` (every 10 s per puppet, plus `engine: gait local player`): what the game READS (IS_PED_*), the speed three ways, blend ratio set, writes, issues, task-to-first-gait latency, write verdict, ladder level, **active task types**. Compare the puppet's list with the local player's.
+- `engine: loco write verdict id=`: Harm -> the per-frame nudge was the cause (fixed by pulses). Harmless -> not the writes.
+- `engine: loco repair id=` and `engine: spawned remote peer ... creation recipe N`: which repair (if any) made the puppet walk: the line after it says whether the gait came (`engine: gait` reads walking/running).
+- `engine: loco level id=`: now at most a handful per session; `the cap of level changes ... FROZEN` if the backstop was hit.
+Switches (HKCU\Software\GAGE-MP, read at every Welcome): `loco_r3=0` (all round-3 rules off = 0.4.7), `loco_repair=0` (no repairs), plus the older `loco_mode`, `loco_push`, `loco_selfcheck`.
+Decision: gait `READS still` ~0% AND own speed ~0 in every line, no verdict Harm, repairs 1-3 asked and the gait never comes -> tasks do not run on a puppet whatever its flags: next suspects are the dormant script host (the `startup` thread) and the call context; the active-task-type list says whether the game has any locomotion task on the ped. Gait reads > 0 but own speed ~0 -> the task runs and physics does not move the ped (collision around the puppet, `HAS_COLLISION_LOADED_AROUND_ENTITY`).
