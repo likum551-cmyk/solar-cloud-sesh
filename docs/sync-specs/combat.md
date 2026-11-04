@@ -89,3 +89,22 @@ Design (libs/sync/combat.h `HealthScale`, `RunHealthProbe`, `ChooseHealthScale`,
 - Registry (`HKCU\Software\GAGE-MP`, read at Welcome): `health_mode` = `direct` (the 0.4.7 behaviour: no scaling, the roll-back), `scaled` (always scaled; an unmeasurable ceiling is taken as 100), anything else / unset = `auto`.
 
 Diagnostics (`gage.log`): `engine: health: probe [session start|ped guard swap|respawn|ped handle not probed|reconciliation gave up] ped N, playerHealth P -> wish max W, health_mode=M: start: hp H max X; SET_ENTITY_MAX_HEALTH(W) ok -> hp H max X; SET_ENTITY_HEALTH(W) ok -> ...; SET_PED_MAX_HEALTH(W) ok -> ...; SET_ENTITY_HEALTH(W) ok -> ...; => <behaviour>; ceiling C; mode SCALED|DIRECT`, then `probe +1 frame: ...` and `probe +1 s: ...`; every 10 s `engine: health: mode SCALED|DIRECT (health_mode=...), measured ceiling C (behaviour), ped H / max M (GTA wants H' / M'), server health S of playerHealth P, bar B%; read-backs: probe hp .. max ..; probes N (+1 frame took back N, +1 s differed N); totals: ... reconciles N (gave up N, re-probes N) ...`. Tests: `tests/t6_health_tests.h` (SimPed with five switchable GTA models, every scenario under each) and `tests/r3_t1_health_tests.h`.
+
+## R3 T6 melee (desync round 3: "punch animations aint there and hits do no damage")
+
+Live (0.4.7, GI's log, evidence level "measured live"): about 25 swings counted, 4 Hits sent (self-hits included), 0 melee hits by the damage event, 1 by the pool
+drop, "Damage confirmed by the server on our Hits 0 (0 damage)" on every line; P2's swings on GI's screen: "peer swings shown 2, 1, 4" and no animation (that counter
+counted TASK_PLAY_ANIM calls). Server log not available.
+
+Where a melee Hit can die (from the code; none proven live): (1) client: the swing is counted (shotSeq step) but the hit is detected only by HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY on
+the puppet (PED_TYPE_MISSION, PCF 188 DisableHurt, no ragdoll, pool 1000) inside a 900 ms window, or by its pool dropping; neither fired for ~25 swings, and nothing in the log
+says how many swings had a puppet within reach (`meleeNearSwings` was not in the excerpt); (2) HitBatcher 50 ms hold, SendHit needs Joined; (3) server: Rate, shooter dead / no
+state, zero damage, target missing / no state / dead, untrusted shooter, range, relevance, a swing within 1500 ms with that shotSeq (`no_shot`), weapon held 500 ms
+(`weapon_not_held`), 2 Hits per swing (`shot_used`), 4 m reach (`melee_reach`), melee budget (`over_budget`), 4 deferred Hits (`defer_full`); a deferred Hit that died with its
+shooter was uncounted (now `defer_dropped`). After ScaleHit a fist is 40 x 50 % = 20 at the shipped defaults. Not provable offline which of these ate the 4 Hits.
+
+Fix: the server judges the swing itself (apps/server/melee.h, docs/api/server.md "Melee judgement"), no wire change; client-reported Hits stay as confirmations. Animation: the swing
+is read back (IS_ENTITY_PLAYING_ANIM; IS_PED_IN_MELEE_COMBAT for the melee-task rung) and counted as SEEN, with the reason when not (a locomotion task issued meanwhile, a busy ped,
+nothing explains it); a ladder (libs/sync/swing.h SwingLadder: upper-body 16|32, + not interruptable 8, full body 8, the melee task against the puppet's own invisible invincible
+anchor ped with the AI melee modifier at 0 and a harm breaker) climbs only on measured misses and pins the first variant seen playing. HKCU `melee_anim` = auto (default) | play |
+melee_task | off. Logs: `engine: melee swings (R3 T6)` (effect counters), `engine: melee server (R3 T6)` (server-confirmed melee damage), server `melee:`.

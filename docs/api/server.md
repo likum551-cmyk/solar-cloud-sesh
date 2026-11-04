@@ -194,6 +194,8 @@ The server owns vehicle occupancy and player health (`docs/api/protocol.md`, mes
 | `respawnDelaySeconds` | whole number | `5` | 0..300. A Respawn request sooner than this after death is ignored. |
 | `maxHitDistance` | whole number (m) | `1000` | 10..5000. A Hit with the target farther than this from the shooter is dropped. |
 | `hitsPerSecond` | whole number | `30` | 1..1000. Hits accepted per shooter per second. Damage per hit is clamped to 250 and further to the weapon class's cap (see [Anti-cheat rules](#anti-cheat-rules-protocol-v4)). |
+| `meleeAdjudicate` | `0` or `1` | `1` | R3 T6. `1`: the server decides a melee hit itself (see [Melee judgement](#melee-judgement-r3-t6)): a swing (`shotSeq` step or `kPfMelee` edge with a melee weapon) is judged at its blow time against the stored tracks. `0`: only client-reported Hits (0.4.7 behaviour). |
+| `meleeReachPercent` | whole number | `100` | 25..400. Scales the reach of every melee weapon class in the judgement (fists 1.4 m, light 1.7 m, heavy 2.1 m, plus a 0.5 m slack, centre to centre). |
 | `spawnPoints` | array | `[[195.2, -933.8, 30.7, 140]]` | 1..16 points `[x, y, z, heading]` inside the world box (x, y within ±16000, z -2000..3000, heading ±360). Respawns pick from these. |
 | `hitShotWindowMs` | whole number (ms) | `500` | `0` or 100..5000. A firearm Hit must name a shot, and a melee Hit a swing (`shotSeq` change), the server received within this long. A MELEE Hit may name a swing up to 1500 ms old whatever this is set to when it is smaller (0.4.5: a blow lands up to 900 ms after the button press on the client, so 500 refused late blows with no feedback); a larger value applies to melee too. `0` switches the shot requirement off (the damage caps and the melee reach stay). |
 | `hitDamageScalePercent` | whole number | `100` | 10..1000. Scales every per-class damage cap and damage budget (the shipped numbers are estimates: raise it if legitimate players are clamped, lower it to be stricter). |
@@ -227,6 +229,38 @@ v4 numbers back set `playerHealth` 100, every `*DamagePercent` 100 and `headshot
 `Damage` goes to the victim, the attacker and every other player for whom either of them is in the relevance set, with the
 bone and flags (headshot, melee, explosion, armour absorbed); `Killed` carries headshot and melee.
 
+### Melee judgement (R3 T6)
+
+Desync round 3, 0.4.7 live log: about 25 swings, 4 Hits sent, none from the game's damage event, 0 damage ever confirmed. A melee hit no longer
+depends on the client reading GTA's damage event off a puppet. The server decides it from what it already holds, with no wire change.
+
+* **A swing** is a state of a player on foot with a melee-class weapon (`WEAPON_UNARMED`, knife, bat, ...) whose `shotSeq` stepped, or whose
+  `kPfMelee` bit rose with no step in the last 400 ms. Swings closer than 250 ms to the previous judged one are not judged (the client's own gate
+  is 300 ms); at most 4 wait at a time.
+* **The blow lands** 220 ms after the swing's sample (the press), by the sender's sample clock; the swing is judged then (or 90 ms later on the
+  server's clock when the attacker's sample for that time never came).
+* **Who is hit.** Attacker pose at the blow; each other player's pose at the blow minus 100 ms (what the attacker's screen showed: lag
+  compensation) from a 48-sample track per player. The nearest living player **on foot**, in the attacker's relevance set, within the weapon
+  class's reach (centre to centre: fists and knuckles 1.4 m, light weapons 1.7 m, heavy ones 2.1 m, each + 0.5 m slack, scaled by
+  `meleeReachPercent`), less than 1.6 m above or below, and inside a 65 degree facing cone of the attacker's heading (inside 0.9 m facing is
+  not required). One target per swing. A dead or seated player is no target; an attacker that is dead, untrusted, ragdolling, falling,
+  climbing or in a vehicle at the blow throws no punch.
+* **The damage** is the weapon's melee ceiling (`MeleeNominalMax`: fists 40, light 60, heavy 80, scaled by `hitDamageScalePercent`) through
+  exactly the path a client-reported Hit takes: the melee damage budget (300 per second), `meleeDamagePercent`, `hitsPerSecond`, `HurtPlayer`
+  (Damage to victim, attacker and onlookers with the melee flag, Killed with the melee flag). A client-reported Hit stays an input and is never
+  counted twice: a Hit for the swing (`shotSeq`) and target the server already hit is a **confirmation** (no damage); one that arrives first
+  pays and the judgement skips that swing; one for another target is the swing's second target; one the judgement found a miss for is accepted on
+  the game's word and counted as **contradicting** (its distance and angle are logged).
+* **Switches.** `meleeAdjudicate` (0 = the 0.4.7 behaviour: only client-reported Hits) and `meleeReachPercent` (25..400).
+* **Cheating surface.** A client can only cause a hit that its own reported position, heading and swing counter could have caused, 1.4 to 2.6 m
+  from a player in front of it, at most four a second and within the melee budget. It cannot name a victim.
+* **The `melee:` line** (every 10 s while anything happened): `melee: last 10 s: swings seen N (too close to the previous swing N), judged N
+  [hit=N no_target=N behind=N target_dead=N target_in_vehicle=N attacker_out=N budget=N claimed_first=N], misses with a player on foot within
+  3 m N, damage applied by judged hits N; client-reported melee Hits: confirming a judged hit N, paid before the judgement N, on another target N,
+  contradicting the judgement N, for a swing the server holds no judgement of N; adjudication on, reach x100%`. The first 40 hits and near misses
+  are also logged one per line with the nearest player's distance and angle off the heading. `combat: last 10 s` gained `defer_dropped` (a Hit
+  that waited for its shot and died with its shooter was dropped uncounted before).
+
 ### Anti-cheat rules (protocol v4)
 
 A modified client controls everything it sends; the server decides what happens. These rules live in
@@ -250,6 +284,9 @@ last few weapons the state reported. A `Hit` against another player or a vehicle
   4 m (7 m to a vehicle's centre) of the shooter's last position (v4 needed no swing: anybody within 4 m could claim 300
   damage a second). A firearm Hit with no shot behind it still passes when the weapon is reported and the target is
   that close (a pistol-whip), at melee damage;
+  R3 T6: with `meleeAdjudicate` 1 (the default) the server does not wait for such a Hit at all, see
+  [Melee judgement](#melee-judgement-r3-t6); a Hit for a swing and target the server already hit is a confirmation (no
+  second count);
 * **explosives** (grenades, rockets, mines, molotovs, ...): the shooter launched one (a `shotSeq` change while the
   state reported an explosive weapon) within the last 15 s and fewer than 16 Hits were charged to it, because their
   damage lands seconds after the shot;

@@ -268,6 +268,13 @@ namespace {
         sync::PendingSwing swingPending; // 0e: a swing that waited for its dictionary is still shown if it loads within 250 ms
         sync::SwingProbe swingProbe;     // 0e: IS_ENTITY_PLAYING_ANIM after the swing task (did the clip really play?)
         bool swingProbeArmed = false;    // ... and which candidate list it belongs to (false unarmed, true armed)
+        // R3 T6: the swing in flight, for the read-back's reasons and the bounded retry (script tick)
+        sync::SwingVariant swingVariant = sync::SwingVariant::Upper;   // how it was issued (the ladder's rung at the time)
+        uint32_t swingLocoMark = 0;      // the locomotion controller's task count at the issue: more later = a task replaced the swing
+        double swingIssuedMs = 0;
+        bool swingRetried = false;       // the one bounded re-issue was spent
+        int swingLocalHp = 0;            // melee-task rung: the local player's health + armour at the issue (harm breaker)
+        double swingMeleeUntilMs = 0;    // melee-task rung: when the puppet's melee task is ended again (0 = none running)
         sync::MeleeEventGate meleeEvents; // 0.4.5: the damage event of THIS puppet is cleared on the first frame of a swing window (stale ones)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
@@ -510,6 +517,15 @@ namespace {
     // regression: swings counted, no hit ever seen). Registry read at Welcome; applied only after the tick set it.
     std::atomic<bool> g_aiMeleeMod{false};
     bool g_aiMeleeApplied = false;                     // script tick
+    // R3 T6: melee_anim = auto | play | melee_task | off (re-read at every Welcome like the other switches); the ladder and the
+    // counters are script-tick only. g_meleeConfirm* are written by the join worker: the server's own Damage with kDmgMelee on a
+    // player WE hit (adjudicated by the server or claimed by us, the client cannot tell which).
+    std::atomic<int> g_meleeAnimWanted{(int)sync::SwingMode::Auto};
+    sync::SwingLadder g_swingLadder;
+    sync::SwingDiag g_swingDiag, g_swingDiagLast;
+    double g_meleeTaskModUntilMs = 0;                  // the AI melee modifier is held at 0 until then (the melee-task rung), 0 = not held
+    bool g_meleeTaskModSet = false;
+    std::atomic<uint32_t> g_meleeConfirmCount{0}, g_meleeConfirmDamage{0}, g_meleeConfirmKills{0};
     // 0c, written by TickLocalMelee every script frame, read by ProbePeerHits (same thread): the melee state of OUR ped.
     bool   g_meleeHeld = false;                        // a melee-class weapon in hand, on foot, alive
     bool   g_meleeActionNow = false;                   // IS_PED_PERFORMING_MELEE_ACTION(local ped)
@@ -1337,6 +1353,13 @@ namespace {
             g_aiDamageWanted.store(true);
             // 0c: the AI MELEE modifier stays untouched unless ai_melee_mod=1 (see g_aiMeleeMod).
             g_aiMeleeMod.store(reg::Get(L"ai_melee_mod") == L"1");
+            {
+                // R3 T6: how a remote swing is shown (HKCU\Software\GAGE-MP melee_anim): auto climbs a ladder by measured effect,
+                // play = animations only, melee_task = the melee task only, off = no swing is shown.
+                const std::wstring ma = reg::Get(L"melee_anim");
+                g_meleeAnimWanted.store((int)(ma == L"play" ? sync::SwingMode::Play : ma == L"melee_task" ? sync::SwingMode::MeleeTask
+                                                                                  : ma == L"off" ? sync::SwingMode::Off : sync::SwingMode::Auto));
+            }
             GLOGI("engine: combat client: hit reactions %s (a melee blow: a short stagger), muzzle flash %s, remote shots via %s "
                   "(hit_react / peer_muzzle / peer_shoot); AI weapon damage modifier 0.0 once the tick sets it, AI melee modifier %s "
                   "(ai_melee_mod; off: puppets only play a swing animation, and the modifier zeroed our own fists on them)",
@@ -1673,6 +1696,13 @@ namespace {
             {
                 g_hitDamageConfirmed.fetch_add(d.damage, std::memory_order_relaxed);
                 g_hitConfirmCount.fetch_add(1, std::memory_order_relaxed);
+                if (d.flags & proto::kDmgMelee)         // R3 T6: a melee blow of ours the SERVER counted (it judges swings itself now)
+                {
+                    g_meleeConfirmCount.fetch_add(1, std::memory_order_relaxed);
+                    g_meleeConfirmDamage.fetch_add(d.damage, std::memory_order_relaxed);
+                    if (d.killed)
+                        g_meleeConfirmKills.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             // Sync plan W3 / W6: the server confirms a hit of ours on a puppet, and (protocol v5) tells every relevant
             // player about the damage between two others: the victim's puppet flinches / falls on our screen the same
@@ -3543,24 +3573,70 @@ namespace {
         return &c;
     }
 
-    // TASK_PLAY_ANIM of the swing; the probe follows it (PeerSwingService).
-    void IssuePeerSwing(Peer& pe, SwingSet& set, size_t idx, double nowMs, bool late)
+    // R3 T6. The locomotion controller's task count on a puppet (go-straight / go-to-anchor / stand-still issues): a rise between the
+    // swing's issue and its read-back means a locomotion task was issued on the ped meanwhile, the usual way a secondary clip is lost.
+    uint32_t LocoTaskCount(const Peer& pe)
+    {
+        const sync::LocoStats& ls = pe.loco.Stats();
+        return ls.goStraight + ls.standStill;
+    }
+
+    // The melee-task rung: TASK_PUT_PED_DIRECTLY_INTO_MELEE against the puppet's own invisible, invincible, collision-less anchor ped, so
+    // its blows can land on nobody that matters; the AI melee damage modifier is held at 0 for the window as well (the puppet's fists cannot
+    // hurt the local player even if its AI picks a new target), and PeerSwingService trips the breaker if our health moves meanwhile.
+    bool IssuePeerMeleeTask(Peer& pe, double nowMs)
+    {
+        if (!pe.anchor || !g_world->EntityExists(pe.anchor))
+        {
+            ++g_swingDiag.meleeTaskNoTarget;           // straight locomotion mode, or the anchor is not there yet: nothing safe to aim at
+            return false;
+        }
+        const int32_t lp = g_localPed.load();
+        pe.swingLocalHp = lp ? g_world->GetEntityHealth(lp) + g_world->GetPedArmour(lp) : 0;
+        if (!g_aiMeleeApplied)
+        {
+            g_meleeTaskModSet = g_world->SetAiMeleeWeaponDamageModifier(0.0f);
+            g_meleeTaskModUntilMs = nowMs + 1200.0;
+        }
+        if (!g_world->TaskPutPedDirectlyIntoMelee(pe.ped, pe.anchor, 0.2f, 0.6f, 0.0f, 0))
+            return false;
+        pe.swingMeleeUntilMs = nowMs + kSwingMs + 150.0;
+        return true;
+    }
+
+    // TASK_PLAY_ANIM of the swing (or the melee task); the probe follows it (PeerSwingService). `retry`: the one bounded re-issue after a
+    // locomotion task replaced it.
+    void IssuePeerSwing(Peer& pe, SwingSet& set, size_t idx, double nowMs, bool late, bool retry = false)
     {
         SwingClip& c = set.list[idx];
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
-        if (g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
+        const sync::SwingVariant var = g_swingLadder.Current();
+        const bool ok = var == sync::SwingVariant::MeleeTask
+                            ? IssuePeerMeleeTask(pe, nowMs)
+                            : g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, sync::SwingVariantFlags(var), 1.0f);
+        if (ok)
         {
             ++g_v4.peerSwings;
             ++dk.issued;
             if (late)
                 ++dk.late;
+            if (retry)
+                ++g_swingDiag.retried;
+            else
+                ++g_swingDiag.issued, ++g_swingDiag.variantIssued[(size_t)var];
             pe.swingProbe.Begin(nowMs, idx);
             pe.swingProbeArmed = &set == &g_swingSetArmed;
+            pe.swingVariant = var;
+            pe.swingLocoMark = LocoTaskCount(pe);
+            pe.swingIssuedMs = nowMs;
+            if (!retry)
+                pe.swingRetried = false;
         }
         else
         {
             ++g_v4.peerSwingFailed;
             ++dk.failed;
+            ++g_swingDiag.notIssuedFailed;
         }
     }
 
@@ -3570,21 +3646,55 @@ namespace {
     void PlayPeerSwing(Peer& pe, int id, uint32_t weapon, double nowMs)
     {
         ++g_v4.peerSwingSteps;
+        ++g_swingDiag.seen;
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
         ++dk.requested;
+        {
+            const sync::SwingMode want = (sync::SwingMode)g_meleeAnimWanted.load(std::memory_order_relaxed);
+            if (want != g_swingLadder.Mode() && !(want == sync::SwingMode::MeleeTask && g_swingLadder.Mode() == sync::SwingMode::Play && g_swingLadder.MeleeTripped()))
+            {
+                g_swingLadder.SetMode(want);
+                PeerLog(false, "engine: melee swing: melee_anim=%s (auto: upper-body clip, then not-interruptable, full body, the melee task, each rung only "
+                        "after the read-back says the swing was not seen playing)", sync::SwingModeName(want));
+            }
+        }
+        if (!g_swingLadder.Enabled())
+        {
+            ++g_swingDiag.notIssuedOff;
+            return;
+        }
         if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
         {
             ++g_v4.peerSwingOwned;                     // an emote, a seat, a climb or a reaction owns the ped
             ++dk.owned;
+            ++g_swingDiag.notIssuedOwned;
+            return;
+        }
+        if (g_world->IsPedRagdoll(pe.ped))
+        {
+            ++g_swingDiag.notIssuedRagdoll;            // a ragdolling ped plays no clip: not the swing's fault
             return;
         }
         SwingSet* set = nullptr;
         size_t idx = 0;
         SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
+        if (!c && g_swingLadder.OnNoClips())
+        {
+            ++g_swingDiag.escalations;
+            PeerLog(true, "engine: melee swing: none of the candidate clip dictionaries exists in this game: the ladder goes straight to the melee task "
+                    "(melee_anim=%s)", sync::SwingModeName(g_swingLadder.Mode()));
+        }
+        if (!c && g_swingLadder.Current() == sync::SwingVariant::MeleeTask)
+        {
+            set = weapon == UnarmedHash() ? &g_swingSetUnarmed : &g_swingSetArmed;   // the melee task needs no clip: the set only carries the read-back
+            IssuePeerSwing(pe, *set, 0, nowMs, false);
+            return;
+        }
         if (!c)
         {
             ++g_v4.peerSwingNoDict;
             ++dk.dictMissing;
+            ++g_swingDiag.notIssuedDictMissing;
             static bool logged = false;
             if (!logged)
             {
@@ -3594,7 +3704,7 @@ namespace {
             }
             return;
         }
-        if (!g_world->HasAnimDictLoaded(c->dict))
+        if (g_swingLadder.Current() != sync::SwingVariant::MeleeTask && !g_world->HasAnimDictLoaded(c->dict))
         {
             ++g_v4.peerSwingNoDict;                    // still streaming: kept for 250 ms (PeerSwingService plays it when it loads)
             pe.swingPending.Arm(nowMs);
@@ -3603,12 +3713,40 @@ namespace {
         IssuePeerSwing(pe, *set, idx, nowMs, false);
     }
 
-    // Once per frame per remote ped, after the swing trigger: the swing that waited for its dictionary, and the
-    // IS_ENTITY_PLAYING_ANIM probe of the last issued one. Probe results are logged once per clip: "never seen playing" is
-    // the decisive line of the next live test (the clip name is wrong, or the native cannot see a secondary anim).
+    // Once per frame per remote ped, after the swing trigger: the swing that waited for its dictionary, and the read-back of the last
+    // issued one (IS_ENTITY_PLAYING_ANIM, or IS_PED_IN_MELEE_COMBAT for the melee task). R3 T6: the read-back is the EFFECT counter, with
+    // the reason when it says no (a locomotion task issued meanwhile, a busy ped, nothing explains it), one bounded re-issue after a
+    // locomotion task replaced the swing, and the ladder (sync::SwingLadder) climbs on a streak of unexplained misses.
     void PeerSwingService(Peer& pe, int id, uint32_t weapon, bool meleeWeapon, double nowMs)
     {
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
+        // the melee-task rung's global modifier is handed back after its window (unless ai_melee_mod=1 holds it), and its puppet's task ends
+        if (g_meleeTaskModUntilMs > 0.0 && nowMs >= g_meleeTaskModUntilMs)
+        {
+            g_meleeTaskModUntilMs = 0.0;
+            if (g_meleeTaskModSet && !g_aiMeleeApplied)
+                g_world->ResetAiMeleeWeaponDamageModifier();
+            g_meleeTaskModSet = false;
+        }
+        if (pe.swingMeleeUntilMs > 0.0)
+        {
+            const int32_t lp = g_localPed.load();
+            if (lp && g_world->GetEntityHealth(lp) + g_world->GetPedArmour(lp) < pe.swingLocalHp)
+            {
+                // The local player lost health while a puppet was in melee: whatever else caused it, this rung does not run again.
+                ++g_swingDiag.meleeTaskHarm;
+                g_swingLadder.TripMeleeTask();
+                pe.swingLocalHp = 0;
+                PeerLog(true, "engine: melee swing: our health dropped while peer id=%d was in a melee task: the melee-task rung is DISABLED for this "
+                        "session (the ladder falls back to the animations)", id);
+            }
+            if (nowMs >= pe.swingMeleeUntilMs)
+            {
+                pe.swingMeleeUntilMs = 0.0;
+                g_world->ClearPedTasks(pe.ped);        // the puppet leaves the melee task ...
+                pe.loco.Reset();                       // ... and the locomotion controller issues its gait task again
+            }
+        }
         if (pe.swingPending.Armed())
         {
             if (!meleeWeapon || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active() || pe.emote.Active())
@@ -3620,6 +3758,8 @@ namespace {
                 SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
                 if (c && pe.swingPending.Take(nowMs, g_world->HasAnimDictLoaded(c->dict)))
                     IssuePeerSwing(pe, *set, idx, nowMs, true);
+                else if (!pe.swingPending.Armed())
+                    ++g_swingDiag.notIssuedDictLate;   // it waited 250 ms and the dictionary did not load
             }
         }
         if (!pe.swingProbe.Active())
@@ -3627,29 +3767,75 @@ namespace {
         SwingSet& set = pe.swingProbeArmed ? g_swingSetArmed : g_swingSetUnarmed;
         const size_t ci = pe.swingProbe.Candidate();
         SwingClip& c = set.list[ci];
-        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip));
-        if (r == sync::SwingProbe::Result::Pending || r == sync::SwingProbe::Result::Idle)
+        const bool viaMelee = pe.swingVariant == sync::SwingVariant::MeleeTask;
+        const int playing = viaMelee ? g_world->IsPedInMeleeCombat(pe.ped) : g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip);
+        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, playing);
+        if (r == sync::SwingProbe::Result::Pending)
+        {
+            // One bounded retry: a locomotion task was issued on the ped since the swing and the clip is not playing (yet): the task most
+            // likely replaced it, so it is issued once more, within the first 150 ms (a punch is shown late rather than not at all).
+            if (sync::SwingRetryDue(viaMelee, pe.swingRetried, playing, nowMs - pe.swingIssuedMs, LocoTaskCount(pe), pe.swingLocoMark))
+            {
+                pe.swingRetried = true;
+                IssuePeerSwing(pe, set, ci, nowMs, false, true);
+            }
+            return;
+        }
+        if (r == sync::SwingProbe::Result::Idle)
             return;
         if (r == sync::SwingProbe::Result::Shown)
         {
             ++dk.shown;
+            ++g_swingDiag.shown;
+            ++g_swingDiag.variantShown[(size_t)pe.swingVariant];
+            if (pe.swingRetried)
+                ++g_swingDiag.retriedShown;
+            if (g_swingLadder.Mode() != sync::SwingMode::Off && pe.swingVariant == g_swingLadder.Current() && !g_swingLadder.Pinned())
+                PeerLog(false, "engine: melee swing: variant '%s' is SEEN playing on peer id=%d (read-back): pinned", sync::SwingVariantName(pe.swingVariant), id);
+            g_swingLadder.OnResult(r, false);
+            if (!viaMelee)
+                set.book.OnProbe(ci, r);               // the clip is verified for good
             if (g_animFirstUse.Note(std::string("swing-shown:") + c.dict + "/" + c.clip))
                 PeerLog(false, "engine: anim first use: swing clip %s / %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) on peer id=%d: the "
                         "names are right", c.dict, c.clip, id);
+            return;
         }
-        else if (r == sync::SwingProbe::Result::NotShown)
+        if (r == sync::SwingProbe::Result::NotShown)
         {
             ++dk.unseen;
-            const bool demoted = set.book.OnProbe(ci, r);
-            if (g_animFirstUse.Note(std::string("swing-unseen:") + c.dict + "/" + c.clip))
-                PeerLog(true, "engine: anim first use: swing clip %s / %s was issued (TASK_PLAY_ANIM) on peer id=%d but IS_ENTITY_PLAYING_ANIM "
-                        "never saw it play in 250 ms: the clip name is probably WRONG (names are INFERRED; /e <dict> <clip> tests one by "
-                        "hand), or that native cannot see an upper-body secondary task", id, c.dict, c.clip);
+            ++g_swingDiag.unseen;
+            // Why: busy (ragdoll, a reaction, a seat: not the swing's fault) > a locomotion task issued meanwhile > nothing explains it.
+            const bool busy = pe.seatedVeh >= 0 || pe.hitReact.Active() || pe.emote.Active() || g_world->IsPedRagdoll(pe.ped);
+            const sync::SwingMiss why = sync::ClassifySwingMiss(busy, pe.swingRetried, LocoTaskCount(pe), pe.swingLocoMark);
+            const bool overwritten = why == sync::SwingMiss::Overwritten;
+            if (why == sync::SwingMiss::Busy)
+                ++g_swingDiag.unseenBusy;
+            else if (overwritten)
+                ++g_swingDiag.unseenOverwritten;
+            else
+                ++g_swingDiag.unseenPlain;
+            // The clip is blamed only for a miss nothing else explains: a busy ped or a locomotion task is not the name's fault.
+            const bool demoted = !viaMelee && why == sync::SwingMiss::Plain ? set.book.OnProbe(ci, r) : false;
+            // A clip demoted this swing gets its successor a fresh run before the ladder moves (the miss may be the name, not the variant).
+            const bool up = !demoted && g_swingLadder.OnResult(r, busy);
+            if (up)
+            {
+                ++g_swingDiag.escalations;
+                PeerLog(true, "engine: melee swing: the swing was not seen playing %s on peer id=%d: the ladder moves up to '%s' (melee_anim=%s)",
+                        busy ? "(ped busy)" : overwritten ? "(a locomotion task was issued meanwhile)" : "(nothing explains it)", id,
+                        sync::SwingVariantName(g_swingLadder.Current()), sync::SwingModeName(g_swingLadder.Mode()));
+            }
+            if (g_animFirstUse.Note(std::string("swing-unseen:") + c.dict + "/" + c.clip + "/" + std::to_string((int)pe.swingVariant)))
+                PeerLog(true, "engine: anim first use: swing %s %s / %s [%s] was issued on peer id=%d but the read-back never saw it in 250 ms (%s): "
+                        "the clip name is probably WRONG (names are INFERRED; /e <dict> <clip> tests one by hand), a task replaced it, or that native cannot "
+                        "see an upper-body secondary task", viaMelee ? "melee task" : "clip", c.dict, c.clip, sync::SwingVariantName(pe.swingVariant), id,
+                        busy ? "ped busy" : overwritten ? "a locomotion task was issued meanwhile" : "nothing else explains it");
             if (demoted)
                 PeerLog(true, "engine: melee swing: clip %s / %s demoted after two swings never seen playing: the next candidate is used",
                         c.dict, c.clip);
             return;
         }
+        ++g_swingDiag.unreadable;                      // Unknown: the read-back native never answered
         set.book.OnProbe(ci, r);
     }
 
@@ -8361,6 +8547,7 @@ namespace {
         SyncLocalEmoteDict();
         g_localReact.Clear();
         g_meleeGate.Reset();
+        g_swingLadder.SetMode((sync::SwingMode)g_meleeAnimWanted.load());   // R3 T6: a new session starts the ladder from the registry mode again
         ReleaseSwingDicts();
         g_haveRespawnOk = false;
         g_localSeat = -1;
@@ -9012,7 +9199,8 @@ namespace {
             GLOGI("engine: combat: guards (totals): %u losses a remote puppet caused (not self-reported, %u put back "
                   "after the grace), %u ticks skipped for an unreadable health/armour, event queue evicted %u refused %u",
                   vs.puppetLosses, vs.puppetRestores, vs.skippedReads, evEvicted, evRefused);
-            GLOGI("engine: combat client (W3), last 10 s: %u melee swings counted, %u peer swings shown, %u real peer shots, "
+            GLOGI("engine: combat client (W3), last 10 s: %u melee swings counted, %u peer swing tasks ISSUED (not proof anything was seen: see the "
+                  "'engine: melee swings (R3 T6)' line for the read-back), %u real peer shots, "
                   "%u muzzle flashes; reactions on us %u flinch / %u knockdown / %u melee stagger, on puppets %u flinch / %u "
                   "knockdown / %u melee stagger",
                   c.meleeSwings - last.meleeSwings, c.peerSwings - last.peerSwings, c.peerShotsReal - last.peerShotsReal,
@@ -9020,10 +9208,11 @@ namespace {
                   c.reactStagger - last.reactStagger, c.puppetFlinch - last.puppetFlinch, c.puppetKnock - last.puppetKnock,
                   c.puppetStagger - last.puppetStagger);
             GLOGI("engine: melee (0c), last 10 s: hits sent (all weapons) %u; melee hits detected by the damage EVENT %u / by the pool drop %u (event read "
-                  "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u shown, %u not shown (ped owned "
+                  "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u swing tasks issued (NOT proof they played), %u not issued (ped owned "
                   "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s; audit (0.4.5): swing windows "
                   "opened on a puppet %u (puppet within 3 m %u), stale damage events cleared %u, claimed %u by event / %u by pool, "
-                  "Damage confirmed by the server on our Hits %u (%u damage)",
+                  "Damage confirmed by the server on our Hits %u (%u damage; R3 T6: the server now judges our swings itself, see the 'melee:' "
+                  "server line and 'engine: melee server (R3 T6)')",
                   c.hitsSent - last.hitsSent, c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool,
                   c.meleeEventsRead - last.meleeEventsRead, c.meleeSwings - last.meleeSwings,
                   c.peerSwingSteps - last.peerSwingSteps, c.peerSwings - last.peerSwings,
@@ -9034,6 +9223,21 @@ namespace {
                   c.meleeWindows - last.meleeWindows, c.meleeNearSwings - last.meleeNearSwings,
                   c.meleeStaleEvents - last.meleeStaleEvents, c.meleeEventDamage - last.meleeEventDamage,
                   c.meleePoolDamage - last.meleePoolDamage, c.hitsConfirmed - last.hitsConfirmed, c.hitDamage - last.hitDamage);
+            {
+                // R3 T6: the EFFECT counters. Swings of OUR fists that the server counted as hits (its own judgement or our Hit, the Damage
+                // carries kDmgMelee either way), and the other player's swings as the read-back saw them on our screen.
+                const uint32_t mc = g_meleeConfirmCount.load(std::memory_order_relaxed), md = g_meleeConfirmDamage.load(std::memory_order_relaxed),
+                               mk = g_meleeConfirmKills.load(std::memory_order_relaxed);
+                static uint32_t lastMc = 0, lastMd = 0, lastMk = 0;
+                GLOGI("engine: melee server (R3 T6), last 10 s: our swings counted %u, melee blows the SERVER confirmed on others %u (%u damage, %u kills) "
+                      "[totals this session: %u / %u damage / %u kills]; Hits we sent %u; melee hits we detected locally (event %u, pool %u) are no longer "
+                      "needed for damage",
+                      c.meleeSwings - last.meleeSwings, mc - lastMc, md - lastMd, mk - lastMk, mc, md, mk, c.hitsSent - last.hitsSent,
+                      c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool);
+                lastMc = mc; lastMd = md; lastMk = mk;
+                GLOGI("engine: melee swings (R3 T6), last 10 s: %s", sync::SwingDiagLine(g_swingDiag, g_swingDiagLast, g_swingLadder).c_str());
+                g_swingDiagLast = g_swingDiag;
+            }
             GLOGI("engine: combat client (W8), last 10 s: local health changed by a puppet ped's gun or fists %u times (our "
                   "own cosmetic flinch bullets included); AI damage modifiers %s; dead-puppet melee reports capped %u, puppets "
                   "killed by a takedown %u; TASK_CLIMB issued %u, placement fallbacks %u; alt-tab fallback states sent %u",

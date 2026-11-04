@@ -46,6 +46,8 @@
   "respawnDelaySeconds": 5,
   "maxHitDistance": 1000,
   "hitsPerSecond": 30,
+  "meleeAdjudicate": 1,
+  "meleeReachPercent": 100,
   "spawnPoints": [[195.2, -933.8, 30.7, 140]],
   "hitShotWindowMs": 500,
   "hitDamageScalePercent": 100,

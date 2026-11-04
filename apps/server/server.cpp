@@ -148,6 +148,9 @@ namespace gage::server {
             uint64_t atMs = 0;
         };
         std::vector<DeferredHit> deferred;   // Hits waiting for the shot / weapon state they name
+        melee::Track track;                  // R3 T6: the player's recent positions, for the melee judgement (lag compensation)
+        melee::SwingBook swings;             // ... and its swings waiting for their blow time, and their judgements
+        bool prevMeleeFlag = false;          // kPfMelee in the previous state (the rising edge is a swing)
         uint64_t posMs = 0;                  // server time `k` was accepted (the displacement budget runs from it)
         uint64_t graceUntilMs = 0;           // no displacement judgement before this (join, respawn)
         uint64_t untrustedUntilMs = 0;       // inside the untrusted window until this
@@ -257,6 +260,7 @@ namespace gage::server {
         case HitReason::NoExplosive:    return "no_explosive";
         case HitReason::OverBudget:     return "over_budget";
         case HitReason::DeferFull:      return "defer_full";
+        case HitReason::DeferDropped:   return "defer_dropped";
         case HitReason::Count:          break;
         }
         return "?";
@@ -300,7 +304,37 @@ namespace gage::server {
                     std::to_string(seated) + ", cancelled " + std::to_string(canc) + " (expired " + std::to_string(n.seatExpired - o.seatExpired) +
                     "), announced exits " + std::to_string(exits) + ", notices sent " + std::to_string(n.seatNoticesSent - o.seatNoticesSent));
         }
+        LogMeleeSummary(n, o);
         hitLogMark_ = stats_;
+    }
+
+    // R3 T6: one line every 10 s while the server saw a swing or a melee Hit, so ONE log says where a punch went: swings seen, judged
+    // and why not hit (key=value), what the client-reported Hits did next to the judgement, the damage. Silent when nothing happened.
+    void Server::LogMeleeSummary(const Stats& n, const Stats& o)
+    {
+        const uint64_t seen = n.meleeSwingsSeen - o.meleeSwingsSeen, judged = n.meleeJudged - o.meleeJudged;
+        const uint64_t cf = n.meleeClaimConfirm - o.meleeClaimConfirm, fi = n.meleeClaimFirst - o.meleeClaimFirst,
+                       ot = n.meleeClaimOther - o.meleeClaimOther, co = n.meleeClaimContradict - o.meleeClaimContradict,
+                       un = n.meleeClaimUnknown - o.meleeClaimUnknown;
+        if (seen + judged + cf + fi + ot + co + un == 0) return;
+        std::string line = "melee: last 10 s: swings seen " + std::to_string(seen) + " (too close to the previous swing " +
+                           std::to_string(n.meleeSwingsTooClose - o.meleeSwingsTooClose) + "), judged " + std::to_string(judged) + " [";
+        bool first = true;
+        for (size_t i = 0; i < melee::kOutcomes; i++)
+        {
+            const uint64_t d = n.meleeOutcome[i] - o.meleeOutcome[i];
+            if (!d) continue;
+            line += std::string(first ? "" : " ") + melee::OutcomeName((melee::Outcome)i) + "=" + std::to_string(d);
+            first = false;
+        }
+        line += first ? "none]" : "]";
+        line += ", misses with a player on foot within 3 m " + std::to_string(n.meleeNearMiss - o.meleeNearMiss) +
+                ", damage applied by judged hits " + std::to_string(n.meleeAdjDamage - o.meleeAdjDamage) +
+                "; client-reported melee Hits: confirming a judged hit " + std::to_string(cf) + ", paid before the judgement " + std::to_string(fi) +
+                ", on another target " + std::to_string(ot) + ", contradicting the judgement (accepted on the game's word) " + std::to_string(co) +
+                ", for a swing the server holds no judgement of " + std::to_string(un) + "; adjudication " +
+                (cfg_.meleeAdjudicate ? "on, reach x" + std::to_string(cfg_.meleeReachPercent) + "%" : std::string("OFF (meleeAdjudicate 0)"));
+        Log(line);
     }
 
     uint16_t Server::adminPort() const { return admin_ && admin_->running() ? admin_->port() : 0; }
@@ -594,6 +628,7 @@ namespace gage::server {
             FlushPendingLooks();
             for (auto& kv : players_) // Hits waiting for a shot that never came are judged now
                 if (!kv.second->deferred.empty()) RetryDeferredHits(*kv.second, nowMs);
+            if (cfg_.meleeAdjudicate) JudgeMelee(nowMs);   // R3 T6: the swings whose blow time has come
             BroadcastWorld();
             BroadcastVehicles(nowMs);
             stats_.ticks++;
@@ -1004,6 +1039,8 @@ namespace gage::server {
             c.graceUntilMs = nowMs + cfg_.untrustedJoinGraceMs; // the first state is the baseline, the engine's own spawn teleport follows
         else
             CheckMove(c, s, nowMs);
+        const uint8_t prevSeq = c.shots.last;
+        const bool hadSeq = c.shots.have;
         c.shots.OnState(s.ped.shotSeq, s.ped.weapon, nowMs);
         c.weapons.Note(s.ped.weapon, nowMs);
         c.posMs = nowMs;
@@ -1013,6 +1050,26 @@ namespace gage::server {
         c.ped = s.ped;
         // v5: the sample time is the sender's own stamp placed on the server's clock, not the packet's arrival.
         c.stateRecvUs = c.stateClock.Place(s.sampleMs, NowUs());
+        {
+            // R3 T6: the track the melee judgement reads, and the swing this state shows (a counter step or the rising kPfMelee
+            // with a melee-class weapon in hand, on foot).
+            melee::Sample ms;
+            ms.ms = (double)c.stateRecvUs / 1000.0;
+            ms.x = s.k.x; ms.y = s.k.y; ms.z = s.k.z; ms.heading = s.k.heading;
+            ms.inVehicle = s.ped.move >= proto::kMoveInVehicle;
+            c.track.Push(ms);
+            const bool flagNow = (s.ped.flags & proto::kPfMelee) != 0;
+            if (cfg_.meleeAdjudicate)
+            {
+                const int steps = hadSeq ? (int)((uint8_t)((s.ped.shotSeq & 15) - prevSeq) & 15) : 0;
+                const bool meleeWeapon = ac::KindOf(s.ped.weapon) == ac::WeaponKind::Melee && s.ped.move < proto::kMoveInVehicle;
+                const melee::SwingBook::Observed o =
+                    c.swings.Observe(ms.ms, steps, flagNow && !c.prevMeleeFlag, meleeWeapon, (uint8_t)(s.ped.shotSeq & 15), s.ped.weapon);
+                stats_.meleeSwingsSeen += o.seen;
+                stats_.meleeSwingsTooClose += o.tooClose;
+            }
+            c.prevMeleeFlag = flagNow;
+        }
         repl_.SetState(c.id, s.k, Shown(c), c.stateRecvUs);
         repl_.SetAck(c.id, s.ack);
         stats_.statesAccepted++;
@@ -1621,6 +1678,11 @@ namespace gage::server {
             if (seat.veh != VehicleStore::kNone) vehicles_.Exit(victim.id, seat.veh, victim.deathMs, tick_);
             vehicles_.CancelIntentOf(victim.id, proto::SeatCancelReason::PlayerGone); // T1: a dead player walks nowhere
             ClearAnim(victim, true);
+            for (size_t i = 0; i < victim.deferred.size(); ++i)   // R3 T6: counted, not silently dropped
+            {
+                stats_.hitsRejected++;
+                stats_.hitRefusals[(size_t)HitReason::DeferDropped]++;
+            }
             victim.deferred.clear();
         }
         SendVitals(victim, attacker, weapon, applied, killed, bone, flags);
@@ -1737,6 +1799,7 @@ namespace gage::server {
 
         ac::WeaponKind eff = ac::WeaponKind::Environment; // the class whose caps apply
         ac::ShotLog::Slot* credit = nullptr;              // the shot or launch this Hit is charged to
+        melee::ClaimKind claim = melee::ClaimKind::Unknown; // R3 T6: what the melee book says about the swing this Hit names
         if (tp != &c) // a self-hit is environmental damage: no trust, range or weapon rules
         {
             if (Untrusted(c, nowMs))
@@ -1767,6 +1830,17 @@ namespace gage::server {
                 hitReason_ = HitReason::Environment;
                 why = "an environmental weapon (fall, fire, ...) cannot hurt anyone else";
                 return HitVerdict::Reject;
+            }
+            if (kind == ac::WeaponKind::Melee && cfg_.meleeAdjudicate && tp)
+            {
+                // R3 T6: the server judges the swing itself (melee.h). A claim for the swing and target it already hit is the same blow:
+                // confirmed, never a second count. The other cases are decided by the normal rules below and counted after.
+                claim = melee::ClassifyClaim(c.swings, h.shotSeq, h.targetId, (double)nowMs);
+                if (claim == melee::ClaimKind::Confirms)
+                {
+                    stats_.meleeClaimConfirm++;
+                    return HitVerdict::Accept;
+                }
             }
             bool bound = false, wait = false;
             std::string first; // the first reason a path failed
@@ -1868,6 +1942,40 @@ namespace gage::server {
             }
         }
 
+        const HitVerdict done = FinishHit(c, h, tp, eff, credit, nowMs, why, tp == &c ? 0.0f : ac::Dist(c.k, tpos));
+        if (done == HitVerdict::Accept && eff == ac::WeaponKind::Melee && cfg_.meleeAdjudicate && tp && tp != &c)
+        {
+            switch (claim)
+            {
+            case melee::ClaimKind::BeforeJudging:
+                stats_.meleeClaimFirst++;
+                if (melee::SwingBook::Result* r = c.swings.Find(h.shotSeq, (double)nowMs)) r->claimTarget = h.targetId;
+                break;
+            case melee::ClaimKind::OtherTarget:   stats_.meleeClaimOther++; break;
+            case melee::ClaimKind::Contradicts:
+            {
+                stats_.meleeClaimContradict++;
+                if (const melee::SwingBook::Result* r = c.swings.Find(h.shotSeq, (double)nowMs))
+                    if (meleeVerdictLogs_ < 40)
+                    {
+                        meleeVerdictLogs_++;
+                        Log("melee: client-reported Hit from " + c.name + " on id " + std::to_string(h.targetId) + " accepted although the server judged that swing " +
+                            melee::OutcomeName(r->outcome) + " (nearest living player on foot " + std::to_string(r->distM) + " m, " +
+                            std::to_string(r->angleDeg) + " degrees off the heading): reach or cone may be too tight");
+                    }
+                break;
+            }
+            default:                              stats_.meleeClaimUnknown++; break;
+            }
+        }
+        return done;
+    }
+
+    // The tail of ApplyHit (also the server's own melee judgement, JudgeSwing): the damage caps, the class budget, ScaleHit and the
+    // effect. `distM` is the shooter-to-target distance (a headshot's range falloff).
+    Server::HitVerdict Server::FinishHit(Conn& c, const proto::Hit& h, Conn* tp, ac::WeaponKind eff, ac::ShotLog::Slot* credit, uint64_t nowMs,
+                                         std::string& why, float distM)
+    {
         // Damage: the protocol cap, the class's per-hit cap, then what is left of the class's budget.
         const ac::WeaponRule rule = ac::RuleForKind(eff, cfg_.hitDamageScalePercent);
         const uint16_t claimed = std::min<uint16_t>(h.damage, proto::kMaxHitDamage);
@@ -1892,8 +2000,7 @@ namespace gage::server {
         // heads). A Hit with no shot slot to credit (binding switched off by hitShotWindowMs 0, a gun used as a
         // club, an explosion) is judged on its bone alone; the melee and explosive classes cannot headshot anyway.
         const bool boneCounts = !credit || credit->hits == 0;
-        const HitScale scaled = ScaleHit(cfg_, eff, damage, boneCounts ? h.bone : (int16_t)-1,
-                                         tp == &c ? 0.0f : ac::Dist(c.k, tpos));
+        const HitScale scaled = ScaleHit(cfg_, eff, damage, boneCounts ? h.bone : (int16_t)-1, distM);
         if (credit && eff == ac::WeaponKind::Melee && nowMs - credit->atMs > cfg_.hitShotWindowMs) stats_.hitsMeleeLate++;   // only the melee window let it in
         if (credit) credit->hits++;
         stats_.hitsAccepted++;
@@ -1918,6 +2025,106 @@ namespace gage::server {
         return HitVerdict::Accept;
     }
 
+    // ---- R3 T6: the server's own melee judgement (apps/server/melee.h) --------------------------------------------------
+
+    void Server::JudgeMelee(uint64_t nowMs)
+    {
+        for (auto& kv : players_)
+        {
+            Conn& c = *kv.second;
+            melee::SwingBook::Pending p;
+            while (c.swings.PendingCount() && c.swings.Take((double)nowMs, c.track.NewestMs(), p))
+                JudgeSwing(c, p, nowMs);
+        }
+    }
+
+    void Server::JudgeSwing(Conn& c, const melee::SwingBook::Pending& p, uint64_t nowMs)
+    {
+        using melee::Outcome;
+        stats_.meleeJudged++;
+        melee::Verdict v;
+        const auto finish = [&](const melee::Verdict& vv) {
+            stats_.meleeOutcome[(size_t)vv.outcome]++;
+            c.swings.Record(p, vv);
+            const bool miss = vv.outcome != Outcome::Hit && vv.outcome != Outcome::ClaimedFirst && vv.outcome != Outcome::AttackerOut;
+            const bool near3 = miss && vv.distM >= 0.0f && vv.distM <= 3.0f;
+            if (near3) stats_.meleeNearMiss++;
+            if ((vv.outcome == Outcome::Hit || near3) && meleeVerdictLogs_ < 40)
+            {
+                meleeVerdictLogs_++;
+                Log("melee: " + c.name + " swing (shotSeq " + std::to_string((int)p.seq) + ", weapon 0x" + [&] { char b[12]; std::snprintf(b, sizeof b, "%08X", (unsigned)p.weapon); return std::string(b); }() +
+                    ") judged " + melee::OutcomeName(vv.outcome) + (vv.target != proto::kNoPlayer && vv.outcome == Outcome::Hit ? " on id " + std::to_string(vv.target) : std::string()) +
+                    ": nearest living player on foot " + std::to_string(vv.distM) + " m (reach " + std::to_string(vv.reachM) + " m), " + std::to_string(vv.angleDeg) + " degrees off the heading");
+            }
+        };
+        if (c.swings.ClaimedBefore(p))
+        {
+            v.outcome = Outcome::ClaimedFirst;
+            finish(v);
+            return;
+        }
+        if (c.dead || !c.hasState || Untrusted(c, nowMs) ||
+            (c.ped.flags & (proto::kPfRagdoll | proto::kPfFalling | proto::kPfParachute | proto::kPfClimbing | proto::kPfVaulting)) != 0)
+        {
+            v.outcome = Outcome::AttackerOut;
+            finish(v);
+            return;
+        }
+        std::vector<melee::Candidate> cands;
+        for (const auto& kv : players_)
+        {
+            Conn& o = *kv.second;
+            if (&o == &c || !o.hasState || ac::Dist(c.k, o.k) > 8.0f) continue;
+            if (!repl_.Relevant(c.id, o.id)) continue;
+            melee::Candidate cd;
+            cd.id = o.id;
+            cd.track = &o.track;
+            cd.dead = o.dead;
+            cands.push_back(cd);
+        }
+        v = melee::Adjudicate(c.track, p.pressMs + melee::kStrikeDelayMs, p.weapon, cands.data(), cands.size(), cfg_.meleeReachPercent);
+        if (v.outcome != Outcome::Hit)
+        {
+            finish(v);
+            return;
+        }
+        const auto it = players_.find(v.target);
+        if (it == players_.end() || it->second->dead)
+        {
+            v.outcome = Outcome::TargetDead;   // died between the judgement's data and now
+            finish(v);
+            return;
+        }
+        Conn& victim = *it->second;
+        ac::ShotLog::Slot* credit = c.shots.Find(p.seq, nowMs, 3 * ac::kMeleeShotWindowMs);
+        if (credit && credit->hits >= ac::RuleOf(ac::WeaponKind::Melee).hitsPerShot)
+        {
+            v.outcome = Outcome::ClaimedFirst;   // the swing's hits were already paid by client-reported Hits
+            finish(v);
+            return;
+        }
+        if (!c.hitRate.Take(nowMs))
+        {
+            v.outcome = Outcome::Budget;
+            finish(v);
+            return;
+        }
+        proto::Hit h;
+        h.kind = proto::HitKind::Player;
+        h.targetId = v.target;
+        h.weapon = p.weapon;
+        h.damage = ac::MeleeNominalMax(p.weapon, cfg_.hitDamageScalePercent);   // the weapon's ceiling: the same number the client claims
+        h.bone = -1;
+        h.shotSeq = p.seq;
+        std::string why;
+        const uint64_t before = stats_.hitsDamageApplied;
+        if (FinishHit(c, h, &victim, ac::WeaponKind::Melee, credit, nowMs, why, v.distM) != HitVerdict::Accept)
+            v.outcome = Outcome::Budget;
+        else
+            stats_.meleeAdjDamage += stats_.hitsDamageApplied - before;
+        finish(v);
+    }
+
     // Re-judges the Hits that waited for a state: every accepted state of the shooter, and every world tick
     // (a Hit that has waited ac::kShotDeferMs is judged for the last time).
     void Server::RetryDeferredHits(Conn& c, uint64_t nowMs)
@@ -1927,7 +2134,12 @@ namespace gage::server {
         list.swap(c.deferred);
         for (const Conn::DeferredHit& d : list)
         {
-            if (c.dead) continue; // died while waiting: nothing to apply
+            if (c.dead) // died while waiting: nothing to apply (R3 T6: but counted, it used to vanish)
+            {
+                stats_.hitsRejected++;
+                stats_.hitRefusals[(size_t)HitReason::DeferDropped]++;
+                continue;
+            }
             std::string why;
             const bool final = nowMs - d.atMs >= ac::kShotDeferMs;
             switch (ApplyHit(c, d.h, nowMs, final, why))
@@ -1979,6 +2191,7 @@ namespace gage::server {
         // the one at the spawn point is expected. Neither is a jump.
         c.posMs = nowMs;
         c.graceUntilMs = nowMs + ac::kRespawnGraceMs;
+        c.track.Clear();                      // R3 T6: the old place is no history to judge a punch against
         PushShown(c);
         proto::RespawnOk ok;
         ok.x = sp.x;

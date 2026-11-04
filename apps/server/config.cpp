@@ -215,6 +215,8 @@ namespace gage::server {
         if (cfg.respawnDelayMs > 300000) return fail("respawnDelaySeconds must be 0..300");
         if (cfg.maxHitDistance < 10 || cfg.maxHitDistance > 5000) return fail("maxHitDistance must be 10..5000");
         if (cfg.hitsPerSecond < 1 || cfg.hitsPerSecond > 1000) return fail("hitsPerSecond must be 1..1000");
+        if (cfg.meleeAdjudicate > 1) return fail("meleeAdjudicate must be 0 or 1");
+        if (cfg.meleeReachPercent < 25 || cfg.meleeReachPercent > 400) return fail("meleeReachPercent must be 25..400");
         if (cfg.spawnPoints.empty() || cfg.spawnPoints.size() > 16) return fail("spawnPoints must hold 1..16 points");
         for (const SpawnPoint& sp : cfg.spawnPoints)
         {
@@ -503,6 +505,16 @@ namespace gage::server {
                 if (!WholeNumber(v, 1, 1000, n)) return fail("\"hitsPerSecond\" must be a whole number 1..1000");
                 out.hitsPerSecond = n;
             }
+            else if (key == "meleeAdjudicate")
+            {
+                if (!WholeNumber(v, 0, 1, n)) return fail("\"meleeAdjudicate\" must be 0 or 1");
+                out.meleeAdjudicate = n;
+            }
+            else if (key == "meleeReachPercent")
+            {
+                if (!WholeNumber(v, 25, 400, n)) return fail("\"meleeReachPercent\" must be a whole number 25..400");
+                out.meleeReachPercent = n;
+            }
             else if (key == "spawnPoints")
             {
                 if (!ParseSpawnPoints(v, out.spawnPoints))
@@ -582,7 +594,7 @@ namespace gage::server {
                                     "vehicleMaxSpeed, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "
                                     "respawnArmour, respawnDelaySeconds, maxHitDistance, "
-                                    "hitsPerSecond, spawnPoints, hitShotWindowMs, hitDamageScalePercent, onFootMaxSpeed, "
+                                    "hitsPerSecond, meleeAdjudicate, meleeReachPercent, spawnPoints, hitShotWindowMs, hitDamageScalePercent, onFootMaxSpeed, "
                                     "untrustedWindowMs, untrustedJoinGraceMs, connectsPerIpPerMinute, vehiclesPerIp, "
                                     "vehicleOrphanSeconds, registerCooldownMs, registerSeparationMeters, vehicleModelDeny, "
                                     "vehicleModelAllow";
@@ -651,7 +663,8 @@ namespace gage::server {
                std::to_string(cfg.hitDamageScalePercent) + "%, melee per-hit ceiling fists " +
                std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_UNARMED"), cfg.hitDamageScalePercent)) + " / light " +
                std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_KNIFE"), cfg.hitDamageScalePercent)) + " / heavy " +
-               std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_BAT"), cfg.hitDamageScalePercent)) + " (before the melee percent)";
+               std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_BAT"), cfg.hitDamageScalePercent)) + " (before the melee percent), server melee judgement " +
+               (cfg.meleeAdjudicate ? "on (reach x" + std::to_string(cfg.meleeReachPercent) + "%)" : std::string("off"));
     }
 
 }
