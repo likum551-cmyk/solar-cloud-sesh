@@ -141,12 +141,19 @@ namespace {
     // TASK_GO_STRAIGHT_TO_COORD, re-issued on turn / drift / arrival. The controller falls back to straight by itself for a
     // frame without an anchor entity, while aiming, and for 20 s after a lost task.
     // Read by the join worker's OnWelcome and by the game thread's SyncNet (Peer construction): atomic.
-    std::atomic<bool> g_locoAnchor{true};
+    //
+    // The walking-variant test series (client 0.4.8 -> 0.4.11): the build's DEFAULT variant is baked here, one flip per release, so every
+    // player on a version runs the same one with nothing in the registry. A registry value (loco_mode / loco_push) still overrides it and
+    // the Welcome log line says which side decided. 0.4.8 = anchor + nudge, 0.4.9 = straight + velocity, 0.4.10 = anchor + velocity,
+    // 0.4.11 = straight + nudge.
+    constexpr bool kBakedLocoAnchor = false;     // true = anchor, false = straight
+    constexpr bool kBakedLocoNudge = false;      // true = nudge,  false = velocity
+    std::atomic<bool> g_locoAnchor{kBakedLocoAnchor};
     // T2 (desync round 2): loco_push = nudge (default) | velocity: how a walking puppet's position error is closed. Nudge = a few mm of
     // SET_ENTITY_COORDS_NO_OFFSET per frame (exact whatever SET_ENTITY_VELOCITY does to a ped under a task); velocity = the 0.4.6 push.
     // loco_selfcheck = 0 turns the degradation ladder off (anchor -> straight -> blend-carried speed -> rigid follow, each step
     // logged as "engine: loco level"). Both re-read at every Welcome like loco_mode.
-    std::atomic<bool> g_locoPushNudge{true};
+    std::atomic<bool> g_locoPushNudge{kBakedLocoNudge};
     std::atomic<bool> g_locoSelfCheck{true};
     // R3 T2 (desync round 3): loco_r3 = 0 switches every round-3 rule off at once (the quiet window and write verdict, the lost task needing
     // the ped's own speed, the re-issue spacing, the ladder hold and cap: sync::Round2Behaviour); loco_repair = 0 only the repairs of a
@@ -1356,20 +1363,26 @@ namespace {
               g_peerDrive.load() == kDrivePlace ? "PLACEMENT (stage 1: set onto the pose, no animation)"
                                                 : "TASKS (locomotion controller)",
               drive.empty() ? L"<unset>" : drive.c_str());
-        // W11: loco_mode = straight keeps the old far-point go-straight path; anything else is the anchor (default).
-        g_locoAnchor.store(reg::Get(L"loco_mode") != L"straight");
-        GLOGI("engine: remote on-foot walking via %s (loco_mode)",
+        // W11: loco_mode = anchor | straight; unset or anything else = this build's baked variant (kBakedLocoAnchor).
+        const std::wstring locoModeReg = reg::Get(L"loco_mode");
+        const bool locoModeFromReg = locoModeReg == L"anchor" || locoModeReg == L"straight";
+        g_locoAnchor.store(locoModeFromReg ? locoModeReg == L"anchor" : kBakedLocoAnchor);
+        GLOGI("engine: remote on-foot walking via %s (loco_mode, %s)",
               g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
-                                  : "TASK_GO_STRAIGHT_TO_COORD at a far point");
-        // T2: the position-error push and the degradation ladder (see LocoCfg).
-        g_locoPushNudge.store(reg::Get(L"loco_push") != L"velocity");
+                                  : "TASK_GO_STRAIGHT_TO_COORD at a far point",
+              locoModeFromReg ? "REGISTRY override" : "build default");
+        // T2: the position-error push and the degradation ladder (see LocoCfg). loco_push = nudge | velocity; unset = the baked variant.
+        const std::wstring locoPushReg = reg::Get(L"loco_push");
+        const bool locoPushFromReg = locoPushReg == L"nudge" || locoPushReg == L"velocity";
+        g_locoPushNudge.store(locoPushFromReg ? locoPushReg == L"nudge" : kBakedLocoNudge);
         g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
         g_locoR3.store(reg::Get(L"loco_r3") != L"0");
         g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
         GLOGI("engine: remote on-foot round-3 rules %s (loco_r3): quiet window + write verdict, re-issue spacing, ladder hold / cap; repairs of a puppet "
               "no task moves %s (loco_repair)", g_locoR3.load() ? "ON" : "OFF (round-2 controller)", g_locoRepair.load() ? "ON" : "OFF");
-        GLOGI("engine: remote on-foot position error closed by %s (loco_push), self-checks / degradation ladder %s (loco_selfcheck)",
+        GLOGI("engine: remote on-foot position error closed by %s (loco_push, %s), self-checks / degradation ladder %s (loco_selfcheck)",
               g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
+              locoPushFromReg ? "REGISTRY override" : "build default",
               g_locoSelfCheck.load() ? "ON (anchor -> straight -> blend-carried speed -> rigid follow, each step logged)" : "OFF");
         g_locoDegradeReset.store(true);
         // W10: name tags on by default; nametags=0 turns them off, nametags_los=<int> the LOS trace flags.
