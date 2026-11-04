@@ -136,6 +136,7 @@
 // in game (roll a car on its side, compare) before relying on pitch/roll.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace gage::sync {
@@ -235,6 +236,10 @@ namespace gage::sync {
         //   controller's own stream has caught up, whatever its latency and whenever its own contact came.
         void ReplaceFrom(const VehicleSnapshot& s, double guardMs, const DriveVec* preVel = nullptr, float confirmFraction = 0.5f);
         bool Sample(double renderTMs, VehicleSample& out); // false: nothing stored (or bad time)
+        // R3 T5: the extrapolation cap (VehicleInterpConfig::extrapolateMaxMs) for the next Samples. A near copy is drawn `lead` ms past the delayed clock,
+        // i.e. that much further past its newest snapshot: the cap then has to grow by the lead or a network hole of (cap - lead) ms freezes it. Clamped to
+        // [100, 2000]; a non-finite value is ignored. Not part of the buffer: Clear() keeps it.
+        void SetExtrapolateMaxMs(double ms) { if (std::isfinite(ms)) cfg_.extrapolateMaxMs = ms < 100.0 ? 100.0 : (ms > 2000.0 ? 2000.0 : ms); }
         void Clear();
         int Count() const { return count_; }
         const VehicleInterpStats& Stats() const { return stats_; }
@@ -325,6 +330,10 @@ namespace gage::sync {
         DriveQuat localRot;       // GET_ENTITY_QUATERNION
         double dtMs = 0;          // since the previous Update (clamped to [0, 1000])
         bool contact = false;     // W9: HAS_ENTITY_COLLIDED_WITH_ANYTHING of the local copy this frame (INFERRED to ignore the ground)
+        // R3 T5: the copy's drawn pose is about to overlap the local player's vehicle (sync::impact::PredictOverlap on the machine where the contact is
+        // seen). Opens the grace like a contact (contactOpened 4) when none is open, so the copy yields to the hit instead of being a wall; the first
+        // real evidence (flag, speed loss, kick) during that grace is reported as a contact (contactOpened 1..3) so the response can be adopted.
+        bool proximity = false;
     };
 
     struct VehicleDriveOutput
@@ -353,7 +362,7 @@ namespace gage::sync {
         // Sync B: diagnostics. devMs = |the velocity commanded last frame - the car's own now| (3D, m/s; 0 when there was no
         // previous command or the frame gap was a hitch): how much physics did not honour. contactOpened = what opened a grace THIS frame.
         float devMs = 0;
-        uint8_t contactOpened = 0; // 0 none, 1 collision flag, 2 speed loss along the travel direction, 3 kick (any-direction deviation)
+        uint8_t contactOpened = 0; // 0 none, 1 collision flag, 2 speed loss along the travel direction, 3 kick (any-direction deviation), 4 proximity (R3 T5)
     };
 
     struct VehicleDriveStats
@@ -361,6 +370,7 @@ namespace gage::sync {
         uint32_t frames = 0, snaps = 0, persistentSnaps = 0, underFloorSnaps = 0, blends = 0, refused = 0;
         uint32_t contacts = 0, contactsByFlag = 0, contactsByDecel = 0;   // W9: graces opened, and what opened them
         uint32_t contactsByKick = 0, kickMutes = 0;                       // Sync B: ... by a velocity deviation in any direction; kick budget exhausted
+        uint32_t contactsByProximity = 0, proximityUpgrades = 0;          // R3 T5: ... by the predicted overlap; proximity graces that a real contact upgraded
     };
 
     // ---- sender steering ----
@@ -425,7 +435,7 @@ namespace gage::sync {
         double underFloorMs_ = 0;
         VehicleDriveStats stats_;
         // contact grace (W9 item 6)
-        bool graceOn_ = false;
+        bool graceOn_ = false, proxGrace_ = false;
         double graceAgeMs_ = 0, cooldownMs_ = 0;
         double clockMs_ = 0, kickAtMs_[8] = {}, kickMuteMs_ = 0;   // Sync B: the kick budget (sum of dt, the last kick times, the mute left)
         int kickN_ = 0;
@@ -443,6 +453,40 @@ namespace gage::sync {
         double slewMsPerMs = 0.5;      // the lead changes at most this fast (a car crossing the band does not jump)
     };
 
+    // R3 T5 (docs/sync-specs/vehicle-position.md): the NEAR-car clock. A car close to the local player is where a collision happens, and there the
+    // round-2 lead (the shared delay + the class extra, to get back to "now on the server's timeline") left two errors: (1) it follows every
+    // delay rise and class change (the render clock takes 500 ms to follow, the lead 40 ms: the car is pushed ahead by the difference for half
+    // a second per rise), (2) it stops at "now on the server's timeline", but the sender's stamp is its sample time + the fastest uplink (the
+    // SampleClock absorbs the constant), and the frame arrives the fastest downlink after its tick: the car is still half the owner's plus half
+    // our round trip behind the owner's real position, 2-3 m at 25 m/s on a 100 ms path. The near-car lead aims at NearT (the timeline time of
+    // the frame arriving now, smoothed) + linkLagMs and takes the difference to the delayed clock, so neither the delay nor the class extra
+    // appear in where the car is drawn.
+    //   nearT     NetClock::NearT(now), renderT NetClock::RenderT(now), extraMs the car's class extra (the car is otherwise drawn at renderT - extra)
+    inline double NearLeadWantMs(double nearT, double linkLagMs, double renderT, double extraMs)
+    {
+        const double lag = (std::isfinite(linkLagMs) && linkLagMs > 0.0) ? linkLagMs : 0.0;
+        const double w = nearT + lag - (renderT - extraMs);
+        return (std::isfinite(w) && w > 0.0) ? w : 0.0;
+    }
+    // The link lag (ms) of a copy: half our round trip to the server plus half the owner's (the server's measure of it), each at most
+    // maxHalfMs, the owner's taken to be like ours when the server did not say (ownerRttMs 0). 0 for a non-finite input.
+    inline double LinkLagMs(double ownRttMs, double ownerRttMs, double maxHalfMs = 150.0)
+    {
+        auto half = [&](double r) { return (std::isfinite(r) && r > 0.0) ? (r * 0.5 < maxHalfMs ? r * 0.5 : maxHalfMs) : 0.0; };
+        const double own = half(ownRttMs);
+        const double owner = ownerRttMs > 0.0 ? half(ownerRttMs) : own;
+        return own + owner;
+    }
+    // The near-car clock's lead ranges: full within 40 m, none beyond 70 m, up to 450 ms (the delay + the extra + the link lag).
+    inline PresentLeadConfig NearLeadConfig()
+    {
+        PresentLeadConfig c;
+        c.fullWithinM = 40.0f;
+        c.zeroBeyondM = 70.0f;
+        c.maxLeadMs = 450.0;
+        return c;
+    }
+
     // How far past the interpolation time a remote car is drawn. The interpolation time is the render clock minus
     // the car's class extra (about 110 ms behind the present); the lead moves it forward by `wantMs` (that delay,
     // so the car is drawn where it is NOW on the sender's side, extrapolated from its newest snapshots), weighted by
@@ -452,6 +496,8 @@ namespace gage::sync {
     {
     public:
         explicit PresentLead(const PresentLeadConfig& cfg = PresentLeadConfig()) : cfg_(cfg) {}
+        // R3 T5: the ranges and the cap can change between frames (the near-car clock widens them); the lead itself carries on.
+        void SetConfig(const PresentLeadConfig& cfg) { cfg_ = cfg; }
         // 1 within fullWithinM, 0 beyond zeroBeyondM, linear between; a non-finite distance is 0.
         static double Weight(const PresentLeadConfig& cfg, double distM);
         // The lead (ms) to add to the interpolation time this frame. The first call (and the first after Reset)

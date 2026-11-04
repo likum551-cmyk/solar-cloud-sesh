@@ -60,6 +60,9 @@ namespace gage::server {
         uint32_t vehicleEnterDistance = 10;      // m, 1..100: Enter / Register range from the player
         uint32_t vehicleMaxSpeed = 150;          // m/s, 10..600: a VehicleUpdate above it is clamped to it up to twice it (T4: a hyper car's overshoot), refused above that
         uint32_t fuelDrainPerMinute = 10;        // permille per minute while driven with the engine on, 0..1000
+        // R3 T5: the contact arbiter places a controller's samples at their TRUE time, not the SampleClock's (sample time + the fastest uplink): each
+        // sample is moved back by half the controller's round trip, at most this many ms (0..500, 0 = off; server.json contactLagCapMs).
+        uint32_t contactLagCapMs = 150;
 
         // ---- server.json keys: combat (protocol v4; damage scaling v5, apps/server/damage.h) ----
         // playerHealth: the maximum a player has at join, after `heal` and after a respawn, announced in
@@ -79,6 +82,12 @@ namespace gage::server {
         uint32_t respawnDelayMs = 5000;          // server.json respawnDelaySeconds 0..300
         uint32_t maxHitDistance = 1000;          // m, 10..5000: shooter to target
         uint32_t hitsPerSecond = 30;             // per shooter, 1..1000 (a token bucket, burst the same)
+        // R3 T6 (apps/server/melee.h): the server decides a melee hit itself from the swing (PedState.shotSeq / kPfMelee) and the two
+        // players' tracks, instead of waiting for the client to read GTA's damage event (0.4.7 live: 0 of about 25 swings ever hit).
+        // meleeAdjudicate 1 = on, 0 = only client-reported Hits (the 0.4.7 behaviour). meleeReachPercent scales the reach of
+        // every weapon class (fists 1.4 m, light 1.7 m, heavy 2.1 m, plus a 0.5 m slack, centre to centre).
+        uint32_t meleeAdjudicate = 1;            // 0 or 1
+        uint32_t meleeReachPercent = 100;        // 25..400
         // server.json spawnPoints: [[x, y, z, heading], ...], 1..16 points inside the world box, used in
         // turn. The default is the engine's own spawn, Legion Square.
         std::vector<SpawnPoint> spawnPoints{SpawnPoint{195.2f, -933.8f, 30.7f, 140.0f}};

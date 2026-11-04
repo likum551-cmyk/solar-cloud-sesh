@@ -846,6 +846,71 @@ namespace gage::sync::impact {
         return DecideImpactApply(trk, dvAuth, dwAuth, tContactMs, nowMs, localNear, depthM, ApplyCfg());
     }
 
+    // ---- R3 T5: the arbiter's time base ----
+    // A controller's sample is placed by the SampleClock at its sample time + the controller's FASTEST uplink, which differs per controller, so two cars
+    // that touch at one instant sit at two different times on the arbiter's base: 30 ms apart is 1.2 m at 40 m/s closing, more than the arbiter's whole
+    // margin. The server moves each controller's samples back by half its round trip (capped); this is the correction's slew: it follows ENet's smoothed
+    // round trip at no more than 0.25 ms per ms, so successive samples of one controller keep increasing (Note() refuses a sample that is not newer). The
+    // first call (dtMs >= 1e8) takes the target at once.
+    inline double SlewArbCorrMs(double curMs, double targetMs, double dtMs)
+    {
+        if (!(std::isfinite(targetMs) && targetMs >= 0.0)) targetMs = 0.0;
+        if (!(std::isfinite(curMs) && curMs >= 0.0)) curMs = 0.0;
+        const double step = 0.25 * (dtMs > 0.0 ? dtMs : 0.0);
+        const double d = targetMs - curMs;
+        return curMs + (d > step ? step : (d < -step ? -step : d));
+    }
+
+    // ---- R3 T5: proximity contact (the machine where the contact is SEEN) ----
+    // The copy's grace, adoption and the server's arbiter all start from a contact: the game's collision flag, a speed loss, a velocity kick, or the
+    // server's boxes touching. On GI's machine the copy of P2's car was drawn 2-3 m from where P2's screen had it (R3 T5), so nothing touched there.
+    // With the position error closed (the near-car clock) a contact still happens a few cm or one frame off, and the game's own flag comes one
+    // physics step AFTER the impulse. PredictOverlap looks ahead instead: the copy's drawn pose and velocity against OUR vehicle, both as the same
+    // oriented boxes the server's arbiter uses (ShapeOf by mass class), stepped forward at constant velocity and yaw rate.
+    struct ProximityCfg
+    {
+        double horizonMs = 120.0;      // looks this far ahead (a few frames; the copy is commanded its target velocity meanwhile)
+        double stepMs = 30.0;          // sampling step along the horizon (a 50 m/s closing speed moves 1.5 m per step: boxes are 2+ m deep)
+        double marginM = 0.35;         // each box is grown by this (the measured position error left after the near-car clock)
+        double minClosingMs = 1.5;     // the pair must close faster than this along the contact normal
+        double maxRangeM = 14.0;       // copies farther than this (origins) are not examined
+        bool requireApart = true;      // the boxes must be apart NOW (a pair already touching is a contact the flag / speed loss / kick triggers have)
+    };
+    struct ProximityOut { bool hit = false; double tHitMs = 0; double closing = 0; double depth = 0; };
+    inline Pose Advance(const Pose& p, double ms)
+    {
+        const double s = ms / 1000.0;
+        Pose q = p;
+        q.p = p.p + p.v * s;
+        q.h = p.h + p.w * s;
+        return q;
+    }
+    inline ProximityOut PredictOverlap(const Pose& own, MassClass ownMc, const Pose& copy, MassClass copyMc, const ProximityCfg& cfg)
+    {
+        ProximityOut out;
+        if (!Finite(own.p) || !Finite(own.v) || !Finite(copy.p) || !Finite(copy.v)) return out;
+        const V2 d = copy.p - own.p;
+        const double range = cfg.maxRangeM + 0.5 * (Len(own.v) + Len(copy.v)) * cfg.horizonMs / 1000.0;
+        if (Dot(d, d) > range * range) return out;
+        Shape sa = ShapeOf(ownMc), sb = ShapeOf(copyMc);
+        sa.hl += cfg.marginM; sa.hw += cfg.marginM; sb.hl += cfg.marginM; sb.hw += cfg.marginM;
+        const double step = cfg.stepMs > 1.0 ? cfg.stepMs : 1.0;
+        for (double t = 0.0; t <= cfg.horizonMs + 1e-9; t += step)
+        {
+            const Manifold m = Collide(Advance(own, t), sa, Advance(copy, t), sb);
+            if (!m.hit) continue;
+            if (t <= 0.0 && cfg.requireApart) return out;
+            const double closing = -Dot(copy.v - own.v, m.n);
+            if (closing < cfg.minClosingMs) return out;      // touching or overlapping but not closing: a pass, or already in contact (the flag has it)
+            out.hit = true;
+            out.tHitMs = t;
+            out.closing = closing;
+            out.depth = m.depth;
+            return out;
+        }
+        return out;
+    }
+
     // Mass class from a GET_VEHICLE_CLASS value (the engine knows it; the server has to guess from the model).
     inline MassClass MassClassOfVehicleClass(int cls)
     {

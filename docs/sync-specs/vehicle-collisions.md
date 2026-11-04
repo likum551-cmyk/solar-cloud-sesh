@@ -3,6 +3,12 @@
 GI, live: "Huge desync in car-to-car collisions ('not even close')". Code and simulation only: nothing here was run in the game. Everything the engine does with the
 game's physics is INFERRED and labelled live-unverified at the end.
 
+> **R3 T5 (2026-11-04) correction.** The simulation numbers below stamp every sample at its TRUE time, but the server's `SampleClock` stamps it at its sample time PLUS the controller's
+> fastest uplink (and the receiver's clock is the fastest downlink behind the server's tick). With the real stamp round 2's present-time lead leaves a copy half the controller's and
+> half our round trip behind its owner (2.05 m at 25 m/s on 40 ms each way), the two screens' contacts land up to 370 ms apart, and the arbiter's two tracks sit at two times (it
+> missed a T-bone whose controllers had 15 ms and 60 ms uplinks 4 times out of 4). See docs/sync-specs/vehicle-position.md for the measurement and the fix (near-car clock + link lag,
+> `LinkInfo`, the arbiter's half-round-trip correction, the proximity contact).
+
 ## Why two cars hitting each other look nothing alike (first-hand, from the code and the two-machine simulation)
 
 Every vehicle is simulated by exactly one client (its controller; `VehicleState.ctrl`). On every other machine it is a copy: a solid body whose velocity, angular velocity and pose

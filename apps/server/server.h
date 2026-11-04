@@ -85,6 +85,7 @@
 #include "config.h"
 #include "metrics.h"
 #include "protocol/protocol.h"
+#include "melee.h"
 #include "replication.h"
 #include "sync/vehicle_impact.h"
 #include "tickclock.h"
@@ -132,6 +133,7 @@ namespace gage::server {
         NoExplosive,     // no launch of an explosive weapon
         OverBudget,      // the class's damage budget is spent
         DeferFull,       // too many Hits waiting for their shot
+        DeferDropped,    // R3 T6: a Hit that waited for its shot was dropped with its shooter's death (it used to vanish uncounted)
         Count
     };
     constexpr size_t kHitReasons = (size_t)HitReason::Count;
@@ -173,8 +175,10 @@ namespace gage::server {
         uint64_t vehicleUpdatesStale = 0;    // seq not newer than the last accepted
         uint64_t vehicleFrames = 0;          // VehicleWorld packets sent
         uint64_t vehiclePartHits = 0;        // v6: vehicle Hits that set a tyre / window bit (VehicleStore::HitPart)
+        uint64_t vehicleWindowRejects = 0, vehicleDamageRejects = 0;   // R3 T4: controller reports that added a window / damage-block rise on a car with full health (refused)
         uint64_t vehicleImpacts = 0;         // T4: contacts between two controllers' vehicles the arbiter resolved
         uint64_t vehicleImpactsSent = 0;     // ... VehicleImpact messages sent (one per controller)
+        uint64_t linkInfoSent = 0;           // R3 T5: LinkInfo messages sent (one per client per second)
         uint64_t hitsAccepted = 0;
         uint64_t hitsRejected = 0;           // failed validation (dead, unknown, range, relevance, rate, 0 damage)
         uint64_t kills = 0;
@@ -198,6 +202,18 @@ namespace gage::server {
         uint64_t hitsMeleeLate = 0;          // ... of which named a swing older than hitShotWindowMs (the melee window, kMeleeShotWindowMs)
         uint64_t hitsFloored = 0;            // accepted and scaled below 1 point, applied as the 1-point floor
         uint64_t hitsDamageApplied = 0;      // sum of the damage taken off players by accepted Hits (armour and health)
+        // ---- R3 T6 melee adjudication (apps/server/melee.h): the server decides a melee hit from its own tracks ----
+        uint64_t meleeSwingsSeen = 0;        // swings the states showed (a counter step or a kPfMelee edge with a melee weapon)
+        uint64_t meleeSwingsTooClose = 0;    // ... dropped: closer than the minimum swing gap (or more than the queue holds)
+        uint64_t meleeJudged = 0;            // swings judged (a blow time that came)
+        uint64_t meleeOutcome[melee::kOutcomes] = {};   // ... by melee::Outcome
+        uint64_t meleeNearMiss = 0;          // judged misses with a living player on foot within 3 m (reach or cone too tight?)
+        uint64_t meleeAdjDamage = 0;         // damage taken off players by adjudicated hits (scaled, armour and health)
+        uint64_t meleeClaimConfirm = 0;      // client-reported melee Hits for a swing and target the server already hit (no damage)
+        uint64_t meleeClaimFirst = 0;        // ... that came before the judgement and paid (the judgement then skips the swing)
+        uint64_t meleeClaimOther = 0;        // ... on another target than the server's (a second target of the swing)
+        uint64_t meleeClaimContradict = 0;   // ... for a swing the server judged a miss
+        uint64_t meleeClaimUnknown = 0;      // ... naming no swing the book holds (an old one, or adjudication off)
         uint64_t movesRejected = 0;          // positions beyond the displacement budget (each opens the untrusted window)
         uint64_t untrustedRefusals = 0;      // Enter / Register / Spawn refused inside the window
         uint64_t vehicleRepliesSuppressed = 0; // RateLimited VehicleResults not sent (at most 1 a second per player)
@@ -414,6 +430,15 @@ namespace gage::server {
         uint64_t nextHitLogUs_ = 0;
         void LogHitSummary(uint64_t nowUs);
         HitVerdict ApplyHit(Conn& c, const proto::Hit& h, uint64_t nowMs, bool final, std::string& why);
+        // The tail of ApplyHit, shared with the server's own melee judgement: the damage caps, the class budget, ScaleHit, the effect
+        // (HurtPlayer / vehicle damage). `eff` is the class whose rules the Hit passed, `credit` the shot it is charged to.
+        HitVerdict FinishHit(Conn& c, const proto::Hit& h, Conn* tp, ac::WeaponKind eff, ac::ShotLog::Slot* credit, uint64_t nowMs,
+                             std::string& why, float distM);
+        // R3 T6 (apps/server/melee.h): the swings whose blow time has come are judged from the stored tracks; the 10 s `melee:` line.
+        void JudgeMelee(uint64_t nowMs);
+        void JudgeSwing(Conn& c, const melee::SwingBook::Pending& p, uint64_t nowMs);
+        void LogMeleeSummary(const Stats& n, const Stats& o);
+        uint32_t meleeVerdictLogs_ = 0;   // judgement lines written (capped: the first ones are the tuning data)
         void RetryDeferredHits(Conn& c, uint64_t nowMs);
         void CheckMove(Conn& c, const proto::PlayerState& s, uint64_t nowMs);
         void MarkUntrusted(Conn& c, uint64_t nowMs, const std::string& why);
@@ -433,6 +458,8 @@ namespace gage::server {
         proto::PedState Shown(const Conn& c) const;
         void BroadcastVehicles(uint64_t nowMs);
         void BroadcastImpacts(uint64_t nowMs);   // T4
+        uint32_t LinkRttMs(const Conn& c) const;
+        void BroadcastLinkInfo(uint64_t nowMs);  // R3 T5: ~1 Hz, each client gets the round trip of the players that control a vehicle
         void VehicleDestroyed(uint16_t id);
         void Accept(Conn& c, const std::string& name);
         void Refuse(Conn& c, proto::RefuseReason reason, const std::string& text);
@@ -469,6 +496,7 @@ namespace gage::server {
         std::vector<sync::impact::ContactArbiter::Live> contactLive_;    // scratch
         std::vector<sync::impact::ImpactOut> contactOut_;                // scratch
         uint32_t impactSeq_ = 0;
+        uint64_t linkInfoMs_ = 0;                                        // R3 T5: when LinkInfo last went out
         uint64_t impactLogMs_ = 0, impactLogCount_ = 0, impactLogClaims_ = 0;
         uint32_t nextSpawnPoint_ = 0;
         Metrics metrics_;

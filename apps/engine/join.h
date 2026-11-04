@@ -129,6 +129,8 @@ namespace gage::join {
         std::function<void(const proto::SeatNotice&)> onSeatNotice;
         // T4: the server's resolution of a contact of a vehicle we control (a copy elsewhere, a real car here); once per contact, reliable.
         std::function<void(const proto::VehicleImpact&)> onVehicleImpact;
+        // R3 T5: the round trip (ms) the server measures to each vehicle controller (about 1 Hz, unreliable).
+        std::function<void(const proto::LinkInfo&)> onLinkInfo;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;
@@ -201,5 +203,8 @@ namespace gage::join {
 
     // Our player id from the last Welcome (0 before the first).
     uint16_t MyId();
+
+    // R3 T5: our round trip to the server in ms (the quietest of ENet's last interval, or its smoothed value when lower), 0 when not connected.
+    uint32_t RttMs();
 
 }

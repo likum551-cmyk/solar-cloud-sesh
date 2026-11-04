@@ -887,6 +887,30 @@ const HashMapping kCrossmap3889[] = {
     {native::DELETE_ALL_TRAINS,                           0x47931C69C0D75B43},
     {native::GET_PED_NEARBY_PEDS,                         0xAA3F0A9E20917995},
     {native::GET_PED_NEARBY_VEHICLES,                     0xD65B4E942A960E26},
+    // Desync round 3: public hashes from the alloc8or native DB; 3889 hashes from the YimMenu crossmap, each confirmed by a second independent crossmap.
+    {native::SET_PED_MAX_HEALTH,                                  0x36A20106D0B42723},
+    {native::SET_PLAYER_MAX_ARMOUR,                               0x776D5F57819A1E41},
+    {native::GET_VEHICLE_PETROL_TANK_HEALTH,                      0x31B58D7972181BFA},
+    {native::SET_VEHICLE_PETROL_TANK_HEALTH,                      0xDF9DC0584881B7AF},
+    {native::SET_VEHICLE_DAMAGE,                                  0x2BDD547718FF1F1A},
+    {native::GET_VEHICLE_DEFORMATION_AT_POS,                      0x05A904F31991BA49},
+    {native::IS_VEHICLE_DOOR_DAMAGED,                             0xAD830DCD82C63F31},
+    {native::SET_VEHICLE_DOOR_BROKEN,                             0x89E9F387C190061F},
+    {native::SET_VEHICLE_DOOR_CONTROL,                            0x3E13A302AA0F06BF},
+    {native::IS_VEHICLE_DOOR_FULLY_OPEN,                          0x6B0915C0DDD2954F},
+    {native::GET_IS_DOOR_VALID,                                   0xB3E28598CA656061},
+    {native::GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED,               0xB4A09397270CB974},
+    {native::GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED,              0x08046513BC06BFBC},
+    {native::SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED,                  0x6BFFBDE3C98A828E},
+    {native::SET_VEHICLE_ENGINE_CAN_DEGRADE,                      0xF9DF73BCBDB93008},
+    {native::SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE,              0x8DB4917AFAD347BC},
+    {native::IS_PED_GOING_INTO_COVER,                             0x3F055D2CBA242A5D},
+    {native::TASK_STAY_IN_COVER,                                  0x115CA3B4F950226D},
+    {native::IS_PED_AIMING_FROM_COVER,                            0xF5327658CA9AF463},
+    {native::TASK_COMBAT_PED,                                     0x62A5310368A20EFA},
+    {native::IS_PED_IN_MELEE_COMBAT,                              0xFFAC548682B3D56E},
+    {native::TASK_PUT_PED_DIRECTLY_INTO_MELEE,                    0x849ABF0CBD8EE0D6},
+    {native::SET_PED_COMBAT_ATTRIBUTES,                           0xBE8796DB2B90A437},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -4167,7 +4191,7 @@ static int nearbyCall(World& w, gage::ambient::Id id, const char* name, uint64_t
     uint64_t args[] = { (uint64_t)(uint32_t)around, (uint64_t)(uintptr_t)buf, (uint64_t)(uint32_t)(int32_t)-1 };
     if (!ambCall(w, id, name, hash, args, withIgnore ? 3 : 2))
         return -1;
-    return gage::ambient::ParseNearby(buf, cap, out);
+    return gage::ambient::ParseNearby(buf, cap, out, &gage::ambient::g_lastNearbyEcho);   // R3 T5: slot 0 may still hold the capacity
 }
 
 int World::NearbyPeds(int32_t around, int32_t* out, int cap) {
@@ -4293,7 +4317,7 @@ bool callPedToggle(World& w, uint64_t hash, int32_t ped, bool on) {
 }
 }  // namespace
 
-int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float heading) {
+int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float heading, int recipe) {
     static bool loggedModelWait = false, loggedCreateFail = false, loggedSetupFail = false;
     const uint64_t model = (uint64_t)(uint32_t)modelHash;
     uint64_t reqArgs[] = { model };
@@ -4308,8 +4332,9 @@ int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float he
     }
 
     // CREATE_PED(pedType, model, x, y, z, heading, isNetwork, bScriptHostPed)
-    uint64_t args[] = { 26 /* PED_TYPE_MISSION */, model, FloatArg(x), FloatArg(y), FloatArg(z),
-                        FloatArg(heading), 0 /* isNetwork */, 1 /* bScriptHostPed */ };
+    // R3 T2 recipe 2 (ALT): PED_TYPE_CIVMALE (4) and no script-host flag; 0 and 1: PED_TYPE_MISSION, script host.
+    uint64_t args[] = { recipe >= 2 ? 4ull : 26ull /* PED_TYPE_MISSION */, model, FloatArg(x), FloatArg(y), FloatArg(z),
+                        FloatArg(heading), 0 /* isNetwork */, recipe >= 2 ? 0ull : 1ull /* bScriptHostPed */ };
     uint64_t ret[4] = {};
     if (!CallNative(native::CREATE_PED, args, 8, ret))
         return 0;
@@ -4330,15 +4355,19 @@ int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float he
     // behaves (it flinches, dives, ragdolls or wanders), so the count is logged once.
     int failed = 0;
     failed += !SetEntityInvincible(ped, true);
-    failed += !FreezeEntityPosition(ped, false);
-    failed += !SetEntityCollision(ped, true);
+    if (recipe <= 0) {
+        failed += !FreezeEntityPosition(ped, false);
+        failed += !SetEntityCollision(ped, true);
+    }
     failed += !SetEntityHeading(ped, heading);
     failed += !callPedToggle(*this, native::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, ped, true);
-    failed += !SetPedCanRagdoll(ped, false);
-    failed += !callPedToggle(*this, native::SET_PED_CAN_EVASIVE_DIVE, ped, false);
-    failed += !callPedToggle(*this, native::SET_PED_CAN_PLAY_AMBIENT_ANIMS, ped, false);
-    failed += !callPedToggle(*this, native::SET_PED_KEEP_TASK, ped, true);
-    failed += !SetPedConfigFlag(ped, 188 /* PCF_DisableHurt */, true);
+    if (recipe <= 0) {
+        failed += !SetPedCanRagdoll(ped, false);
+        failed += !callPedToggle(*this, native::SET_PED_CAN_EVASIVE_DIVE, ped, false);
+        failed += !callPedToggle(*this, native::SET_PED_CAN_PLAY_AMBIENT_ANIMS, ped, false);
+        failed += !callPedToggle(*this, native::SET_PED_KEEP_TASK, ped, true);
+        failed += !SetPedConfigFlag(ped, 188 /* PCF_DisableHurt */, true);
+    }
     if (failed && !loggedSetupFail) {
         loggedSetupFail = true;
         GLOGW("hook: SpawnRemotePed: %d of 10 setup natives could not be called (see 'new natives' line)",
@@ -4347,6 +4376,8 @@ int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float he
     CallNative(native::SET_MODEL_AS_NO_LONGER_NEEDED, reqArgs, 1, nullptr);
     return ped;
 }
+
+bool World::IsPedStill(int32_t ped) { return callPedBool(*this, native::IS_PED_STILL, ped); }
 
 bool World::SetEntityCoordsNoOffset(int32_t handle, float x, float y, float z) {
     if (!handle) return false;
@@ -5226,6 +5257,17 @@ bool World::SetEntityMaxHealth(int32_t entity, int value) {
     return callHandleInt(*this, native::SET_ENTITY_MAX_HEALTH, entity, value);
 }
 
+bool World::SetPedMaxHealth(int32_t ped, int value) {
+    return callHandleInt(*this, native::SET_PED_MAX_HEALTH, ped, value);
+}
+
+bool World::SetPlayerMaxArmour(int value) {
+    uint64_t player[4] = {};
+    if (!CallNative(native::PLAYER_ID, nullptr, 0, player)) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)player[0], (uint64_t)(uint32_t)value };
+    return CallNative(native::SET_PLAYER_MAX_ARMOUR, args, 2, nullptr);
+}
+
 int World::EntityExists(int32_t entity) {
     if (!entity) return 0;
     uint64_t arg[] = { entArg(entity) };
@@ -5332,8 +5374,38 @@ bool World::TaskPutPedDirectlyIntoCover(int32_t ped, float x, float y, float z, 
     return CallNative(native::TASK_PUT_PED_DIRECTLY_INTO_COVER, args, 11, nullptr);
 }
 
+// R3 T3 (cover).
+bool World::IsPedGoingIntoCover(int32_t ped) {
+    return callPedBool(*this, native::IS_PED_GOING_INTO_COVER, ped);
+}
+
+bool World::IsPedAimingFromCover(int32_t ped) {
+    return callPedBool(*this, native::IS_PED_AIMING_FROM_COVER, ped);
+}
+
+bool World::TaskStayInCover(int32_t ped) {
+    if (!ped) return false;
+    uint64_t args[] = { entArg(ped) };
+    return CallNative(native::TASK_STAY_IN_COVER, args, 1, nullptr);
+}
+
 bool World::IsPedPerformingMeleeAction(int32_t ped) {
     return callPedBool(*this, native::IS_PED_PERFORMING_MELEE_ACTION, ped);
+}
+
+int World::IsPedInMeleeCombat(int32_t ped) {
+    if (!ped) return 0;
+    uint64_t arg[] = { (uint64_t)(uint32_t)ped };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_PED_IN_MELEE_COMBAT, arg, 1, r)) return -1;
+    return (uint32_t)r[0] ? 1 : 0;
+}
+
+bool World::TaskPutPedDirectlyIntoMelee(int32_t ped, int32_t target, float blendIn, float timeInMelee, float strafePhaseSync, int aiCombatFlags) {
+    if (!ped || !target) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)target, FloatArg(blendIn), FloatArg(timeInMelee),
+                        FloatArg(strafePhaseSync), (uint64_t)(uint32_t)aiCombatFlags };
+    return CallNative(native::TASK_PUT_PED_DIRECTLY_INTO_MELEE, args, 6, nullptr);
 }
 
 bool World::SetPedMoveRateOverride(int32_t ped, float value) {
@@ -5526,6 +5598,78 @@ bool World::SetVehicleBrakeLights(int32_t veh, bool on) {
     return CallNative(native::SET_VEHICLE_BRAKE_LIGHTS, args, 2, nullptr);
 }
 #undef GAGE_T3_NEEDS_HASH
+
+// ---- R3 T4 vehicle damage state (protocol v7). All hashes are resolved ones (hook.h, "Desync round 3"); a call that cannot be made
+// returns false, which every caller reads as "no information" (a read) or "not done" (a write).
+bool World::GetVehiclePetrolTankHealth(int32_t veh, float& health) {
+    return callHandleGetFloat(*this, native::GET_VEHICLE_PETROL_TANK_HEALTH, veh, health);
+}
+
+bool World::SetVehiclePetrolTankHealth(int32_t veh, float health) {
+    return callHandleFloat(*this, native::SET_VEHICLE_PETROL_TANK_HEALTH, veh, health);
+}
+
+bool World::SetVehicleDamage(int32_t veh, float x, float y, float z, float damage, float radius, bool focusOnModel) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), FloatArg(x), FloatArg(y), FloatArg(z), FloatArg(damage), FloatArg(radius), boolArg(focusOnModel) };
+    return CallNative(native::SET_VEHICLE_DAMAGE, args, 7, nullptr);
+}
+
+bool World::GetVehicleDeformationAtPos(int32_t veh, float x, float y, float z, float& dx, float& dy, float& dz) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), FloatArg(x), FloatArg(y), FloatArg(z) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_DEFORMATION_AT_POS, args, 4, r)) return false;
+    memcpy(&dx, &r[0], 4);       // a Vector3 return: three padded slots, as GET_ENTITY_COORDS
+    memcpy(&dy, &r[1], 4);
+    memcpy(&dz, &r[2], 4);
+    return true;
+}
+
+bool World::IsVehicleDoorDamaged(int32_t veh, int door, bool& damaged) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)door };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_VEHICLE_DOOR_DAMAGED, args, 2, r)) return false;
+    damaged = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::GetIsDoorValid(int32_t veh, int door, bool& valid) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)door };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_IS_DOOR_VALID, args, 2, r)) return false;
+    valid = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetVehicleDoorBroken(int32_t veh, int door, bool deleteDoor) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)door, boolArg(deleteDoor) };
+    return CallNative(native::SET_VEHICLE_DOOR_BROKEN, args, 3, nullptr);
+}
+
+bool World::IsVehicleHeadlightDamaged(int32_t veh, bool left, bool& damaged) {
+    if (!veh) return false;
+    uint64_t arg[] = { entArg(veh) };
+    uint64_t r[4] = {};
+    if (!CallNative(left ? native::GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED : native::GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED, arg, 1, r)) return false;
+    damaged = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetVehicleCanBeVisiblyDamaged(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED, veh, on);
+}
+
+bool World::SetVehicleEngineCanDegrade(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_ENGINE_CAN_DEGRADE, veh, on);
+}
+
+bool World::SetDisableVehiclePetrolTankDamage(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE, veh, on);
+}
 
 bool World::GetConvertibleRoofState(int32_t veh, int& state) {
     if (!veh) return false;
@@ -5762,6 +5906,30 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(DELETE_ALL_TRAINS),
         GAGE_NEW_NATIVE(GET_PED_NEARBY_PEDS),
         GAGE_NEW_NATIVE(GET_PED_NEARBY_VEHICLES),
+        // Desync round 3
+        GAGE_NEW_NATIVE(SET_PED_MAX_HEALTH),
+        GAGE_NEW_NATIVE(SET_PLAYER_MAX_ARMOUR),
+        GAGE_NEW_NATIVE(GET_VEHICLE_PETROL_TANK_HEALTH),
+        GAGE_NEW_NATIVE(SET_VEHICLE_PETROL_TANK_HEALTH),
+        GAGE_NEW_NATIVE(SET_VEHICLE_DAMAGE),
+        GAGE_NEW_NATIVE(GET_VEHICLE_DEFORMATION_AT_POS),
+        GAGE_NEW_NATIVE(IS_VEHICLE_DOOR_DAMAGED),
+        GAGE_NEW_NATIVE(SET_VEHICLE_DOOR_BROKEN),
+        GAGE_NEW_NATIVE(SET_VEHICLE_DOOR_CONTROL),
+        GAGE_NEW_NATIVE(IS_VEHICLE_DOOR_FULLY_OPEN),
+        GAGE_NEW_NATIVE(GET_IS_DOOR_VALID),
+        GAGE_NEW_NATIVE(GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED),
+        GAGE_NEW_NATIVE(GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED),
+        GAGE_NEW_NATIVE(SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED),
+        GAGE_NEW_NATIVE(SET_VEHICLE_ENGINE_CAN_DEGRADE),
+        GAGE_NEW_NATIVE(SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE),
+        GAGE_NEW_NATIVE(IS_PED_GOING_INTO_COVER),
+        GAGE_NEW_NATIVE(TASK_STAY_IN_COVER),
+        GAGE_NEW_NATIVE(IS_PED_AIMING_FROM_COVER),
+        GAGE_NEW_NATIVE(TASK_COMBAT_PED),
+        GAGE_NEW_NATIVE(IS_PED_IN_MELEE_COMBAT),
+        GAGE_NEW_NATIVE(TASK_PUT_PED_DIRECTLY_INTO_MELEE),
+        GAGE_NEW_NATIVE(SET_PED_COMBAT_ATTRIBUTES),
         GAGE_NEW_NATIVE(GET_IS_LOADING_SCREEN_ACTIVE),
         GAGE_NEW_NATIVE(IS_SCREEN_FADED_IN),
         GAGE_NEW_NATIVE(IS_PLAYER_SWITCH_IN_PROGRESS),

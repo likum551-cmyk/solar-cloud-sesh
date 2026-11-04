@@ -20,7 +20,7 @@ namespace gage::net {
         uint8_t ChannelFor(proto::Msg t)
         {
             return t == proto::Msg::WorldState || t == proto::Msg::WorldCoarse || t == proto::Msg::VehicleWorld ||
-                           t == proto::Msg::PlayerState || t == proto::Msg::VehicleUpdate
+                           t == proto::Msg::PlayerState || t == proto::Msg::VehicleUpdate || t == proto::Msg::LinkInfo   // R3 T5: LinkInfo rides the state channel
                        ? proto::kChanState
                        : proto::kChanReliable;
         }
@@ -443,6 +443,11 @@ namespace gage::net {
             if (!proto::Decode(data, len, e.impact)) { malformed_++; return; }
             e.type = Event::Type::VehicleImpact;
             break;
+        case proto::Msg::LinkInfo:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.linkInfo)) { malformed_++; return; }
+            e.type = Event::Type::LinkInfo;
+            break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:
             return; // server-to-client types this session does not surface yet: ignored, not an error
@@ -653,6 +658,14 @@ namespace gage::net {
     uint32_t ClientSession::rttMs() const
     {
         return peer_ ? peer_->roundTripTime : 0;
+    }
+
+    uint32_t ClientSession::lowRttMs() const
+    {
+        if (!peer_) return 0;
+        uint32_t r = peer_->roundTripTime;
+        if (peer_->lastRoundTripTime > 0 && peer_->lastRoundTripTime < r) r = peer_->lastRoundTripTime;
+        return r;
     }
 
     ClientSession::LinkInfo ClientSession::link() const

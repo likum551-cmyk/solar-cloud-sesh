@@ -215,6 +215,7 @@ static server::VehicleStore::Rules StoreRules()
     r.perPlayer = 3;
     r.perIp = 6;
     r.emptyDespawnMs = 600000;
+    r.damageNeedsHealthLoss = false;       // round 2 trusted the controller's report; the R3 T4 rule (a clean car cannot gain a window) has its own tests (tests/r3_t4_tests.h)
     return r;
 }
 
@@ -393,8 +394,8 @@ static void TestStore()
         one.present = w.present;
         one.vehicles = w.vehicles;
         const size_t entry = proto::Encode(one).size() - (1 + 4 + 1 + 2) - 2;       // minus the frame header and the id + header byte
-        Check("store: FullBytes (the packet-cap accounting) equals the encoded size of a full entry with one occupant (v6: 46 + 2)",
-              server::VehicleStore::FullBytes(w.vehicles[0]) == entry && entry == 48, F("%zu vs %zu", server::VehicleStore::FullBytes(w.vehicles[0]), entry));
+        Check("store: FullBytes (the packet-cap accounting) equals the encoded size of a full entry with one occupant (v6: 46 + 2; v7 adds the 3-byte damage block of a clean car: 49 + 2)",
+              server::VehicleStore::FullBytes(w.vehicles[0]) == entry && entry == 51, F("%zu vs %zu", server::VehicleStore::FullBytes(w.vehicles[0]), entry));
     }
 }
 
@@ -980,6 +981,8 @@ static void TestRealServer()
 
 // ===========================================================================
 
+#include "r3_t4_tests.h"   // R3 T4: vehicle damage state, the sanity layer, the v7 wire (one include, one call below)
+
 int main()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -989,8 +992,12 @@ int main()
     TestVisualSync();
     TestSteerAndBrake();
     TestRealServer();
-    // A skipped section (an early return) must fail, not pass vacuously: 7 wire + 8 store + 13 visual + 6 steer / brake + 8 real-server.
-    const int expected = 7 + 8 + 13 + 6 + 8;
+    const int r2Checks = g_run;
+    RunR3T4Tests();
+    // A skipped section (an early return) must fail, not pass vacuously: 7 wire + 8 store + 13 visual + 6 steer / brake + 8 real-server
+    // (round 2), then the R3 T4 checks (kR3T4Checks, tests/r3_t4_tests.h).
+    const int expected = 7 + 8 + 13 + 6 + 8 + kR3T4Checks;
+    (void)r2Checks;
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

@@ -242,6 +242,18 @@ namespace gage::sync {
         Shared,           // another puppet's controller found the same failure (LevelWitness): imposed here without waiting to see it
     };
 
+    // R3 T2 (desync round 3): what the controller has learned about a coordinate write on this puppet. The live log (0.4.7) showed
+    // "the task ran, the ped's own speed 0.00 m/s" under TWO different task types: either every coordinate write cancels the walk
+    // (Harm), or the task does not move the ped at all (Harmless: the writes are not the cause). Unknown until a failure is seen with
+    // writes flowing: a QUIET window (no coordinate write for quietWindowMs) then tells which.
+    enum class WriteVerdict : uint8_t { Unknown, Harmless, Harm };
+    // R3 T2: something the ENGINE has to do to the ped because no level of the ladder moved it (LocoOutput::repair). One per request,
+    // the engine reports the number done back in LocoInput::repairsDone.
+    //   ClearTasks   CLEAR_PED_TASKS_IMMEDIATELY and the flags that could pin a ped (freeze, collision, ragdoll, keep-task) put to defaults
+    //   RespawnLean  the puppet is deleted and created again with the LEAN recipe (only invincible + heading + non-temporary events blocked)
+    //   RespawnAlt   ... with the ALT recipe (a civilian ped type, no script-host flag, lean flags)
+    enum class LocoRepair : uint8_t { None, ClearTasks, RespawnLean, RespawnAlt };
+
     struct LocoVec { float x = 0, y = 0, z = 0; };
 
     struct LocoConfig
@@ -345,6 +357,35 @@ namespace gage::sync {
 
         float fastDownFrac = 0.0f, fastDownMs = 100.0f;   // T2: a pose under this fraction of the gait's down edge drops the gait after fastDownMs (0 = off)
 
+        // R3 T2 (desync round 3), all of it only with selfCheck. Why: the 0.4.7 live log had a puppet whose tasks never gave a gait,
+        // a ladder that changed level 7 times in 6.5 minutes, and 13 task issues per 10 s.
+        //  - quiet window: a failure (lost / stuck / snap storm) seen while coordinate writes were flowing may be the WRITES cancelling the
+        //    walk. Before a level is given up, the writes stop for quietWindowMs; if the ped then shows a gait (or moves on its own for
+        //    quietNeedGoodMs) the writes are the cause: WriteVerdict::Harm, and the position error is then closed by single PULSES
+        //    (one write per pulseMs, only beyond pulseMinErrM) instead of a write every frame. If it still shows nothing the writes are
+        //    cleared (Harmless) and the ladder goes on. A working game proves the writes harmless silently: harmlessEvidMs of gait read
+        //    and own speed >= stuckRatio of the pose's while writes flow.
+        //  - the lost-task trigger needs the ped's own speed to agree (a ped that moves with its gait natives reading Still is not lost).
+        //  - ladder: a level change holds levelHoldMs before the next change that is not a deeper step of the same failure; at most
+        //    maxLevelChanges per puppet and session (then the level is frozen and a line says so).
+        //  - re-issues: rule-based re-issues (turn / drift / arrive / stall) are spaced reissueMinMs, a big turn (turnBigDeg) only
+        //    turnBigMinMs, none inside firstGaitWindowMs of an issue (the previous task has not had its chance to show a gait yet), and a
+        //    forced one (snap, Reset) at least issueGapMs after the last of the same kind. Still <-> moving is never delayed.
+        //  - repairs: a straight task that stalled twice with the writes cleared is asked of the ENGINE to repair (LocoRepair), up to
+        //    maxRepairs per puppet; then the final Placed holds deadPlacedMs before a probation.
+        bool  quietTrial = true;
+        float quietRecentMs = 600.0f, quietWindowMs = 1300.0f, quietNeedGoodMs = 350.0f, quietAbortErrM = 3.0f;
+        float harmlessEvidMs = 1500.0f;
+        float quietInitialMs = 1550.0f;   // the puppet's FIRST moving task runs without a coordinate write this long (firstGaitWindowMs + a frame)
+        float harmSettleMs = 1200.0f;     // with the verdict Harm a write's effect on the walk is given this long before the ped is judged
+        float pulseMs = 1500.0f, pulseMinErrM = 0.9f, pulseMaxM = 1.5f;
+        bool  lostNeedsLowSpeed = true;
+        float levelHoldMs = 8000.0f;
+        int   maxLevelChanges = 12;
+        float reissueMinMs = 1000.0f, turnBigDeg = 70.0f, turnBigMinMs = 500.0f, firstGaitWindowMs = 1500.0f, issueGapMs = 600.0f;
+        int   maxRepairs = 3;
+        float deadPlacedMs = 120000.0f, deadPlacedMaxMs = 600000.0f;
+
         float velTauMs = 120.0f;       // one-pole low-pass of the pose velocity (W1 item 4)
         float steerDeadbandM = 0.08f;  // no steering under this horizontal error
         float ragdollMaxMs = 8.0f;     // cap of the whole velocity while ragdolling
@@ -360,6 +401,10 @@ namespace gage::sync {
     // self-checks and the degradation ladder on. `anchor` picks the first level (Anchor or Straight). One definition, so the
     // numbers measured are the numbers shipped.
     LocoConfig ShippedLocoConfig(bool anchor);
+    // R3 T2: `c` with every round-3 rule off = the round-2 (0.4.7) controller: no quiet window / write verdict, the lost task trusted on the
+    // gait natives alone, 500 ms re-issue spacing, no first-gait window or forced-issue gap, no hold or cap on the ladder, no repair, the
+    // short dead timers. The registry switch loco_r3=0 (engine) and the before / after tables of the tests use this one definition.
+    LocoConfig Round2Behaviour(LocoConfig c);
 
     struct LocoInput
     {
@@ -402,6 +447,8 @@ namespace gage::sync {
         // W11 item 2: no anchor entity this frame (not created yet, lost, or an aim task owns the walk): the controller
         // acts as LocoMode::Straight for it. A switch between the modes re-issues the task once.
         bool noAnchor = false;
+        // R3 T2: LocoRepair steps the engine has already done on this puppet (the next one is asked for after this many).
+        int repairsDone = 0;
     };
 
     // Why a GoStraight was issued (LocoOutput::why; the per-trigger counters of LocoStats). W8 item 3: the live test
@@ -468,6 +515,14 @@ namespace gage::sync {
         bool levelChanged = false;
         LocoLevelWhy levelWhy = LocoLevelWhy::None;
         bool rateClamped = false;   // with setMoveRate: the rate sits at moveRateMin / moveRateMax
+        // R3 T2. repair: do this to the ped now (see LocoRepair). quiet: a quiet window is open (no coordinate write this frame).
+        // writeVerdict / verdictChanged: what the controller knows about coordinate writes on this puppet. capHit: the per-puppet cap
+        // of level changes was reached on this frame (the ladder is frozen from now on).
+        LocoRepair repair = LocoRepair::None;
+        bool quiet = false;
+        WriteVerdict writeVerdict = WriteVerdict::Unknown;
+        bool verdictChanged = false;
+        bool capHit = false;
     };
 
     struct LocoStats
@@ -486,6 +541,13 @@ namespace gage::sync {
         // T2: nudge frames, level changes (and by LocoLevelWhy)
         uint32_t nudgeFrames = 0, levelChanges = 0, levelWhy[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         double nudgedM = 0, travelledM = 0;   // metres written by nudges / metres the ped moved while a moving gait was shown (cumulative)
+        // R3 T2: quiet windows opened / ended with the ped showing a gait (writes harm) / ended without one; pulses written; repairs
+        // asked; re-issues the spacing rules held back (or deferred); level changes the hold or the cap refused; frames the engine
+        // read a gait (any) while a moving gait was commanded / the commanded moving frames (the gait read rate); task-to-first-gait
+        // latency (sum of ms, count) of the issues that did get a gait
+        uint32_t quietWindows = 0, quietHarm = 0, quietClear = 0, pulses = 0, repairs = 0, issuesHeld = 0, changesRefused = 0;
+        uint32_t gaitReadFrames = 0, commandedFrames = 0, latencyN = 0;
+        double latencySumMs = 0;
     };
 
     class LocomotionController
@@ -532,6 +594,13 @@ namespace gage::sync {
         float LastMoveRate() const { return lastRate_; }
         // T2: the level now, and the ped's own speed (m/s, from its position differences net of our nudges; -1 until measured)
         LocoLevel Level() const { return level_; }
+        // R3 T2: what is known about coordinate writes on this puppet, whether a quiet window is open, level changes so far (the cap),
+        // the ladder frozen by the cap, and the mean time from a task issue to the first gait the ped showed (-1 = none measured)
+        WriteVerdict Verdict() const { return writeVerdict_; }
+        bool QuietOpen() const { return quietLeftMs_ > 0.0; }
+        int LevelChangesTotal() const { return levelChangesTotal_; }
+        bool LadderFrozen() const { return ladderFrozen_; }
+        float MeanLatencyMs() const { return stats_.latencyN ? static_cast<float>(stats_.latencySumMs / stats_.latencyN) : -1.0f; }
         float SelfSpeed() const { return haveSelf_ ? static_cast<float>(std::sqrt(double(selfV_.x) * selfV_.x + double(selfV_.y) * selfV_.y)) : -1.0f; }
 
         // Gait inference with hysteresis: the gait after `current` sees `speed` (m/s).
@@ -607,6 +676,25 @@ namespace gage::sync {
         double rateIneffMs_ = 0;
         LocoVec vfPrev_; bool haveVfPrev_ = false; double accLp_ = 0;   // the pose's low-passed acceleration (m/s^2)
         int stallEvents_ = 0; double sinceStallEventMs_ = 1e9;           // straight-task stalls in a row (Placed from the second)
+
+        // R3 T2
+        WriteVerdict writeVerdict_ = WriteVerdict::Unknown;
+        double sinceWriteMs_ = 1e9;          // time since the last coordinate write this controller asked for (nudge / snap / pulse)
+        double quietLeftMs_ = 0, quietElapsedMs_ = 0, quietGoodMs_ = 0;
+        bool quietActive_ = false, quietInitial_ = false, quietInitialDone_ = false, repairRespawn_ = false;
+        double quietAbortErr_ = 0, quietInitialLeftMs_ = 0;
+        int quietTries_ = 0;
+        double harmlessEvidMs_ = 0;
+        double pulseSinceMs_ = 1e9;
+        double levelHoldLeftMs_ = 0;
+        int levelChangesTotal_ = 0;
+        bool ladderFrozen_ = false, capHitPending_ = false, verdictChangedPending_ = false;
+        LocoRepair repairPending_ = LocoRepair::None;
+        double sinceIssueGaitMs_ = -1;       // < 0: no issue waiting for its first gait; else ms since that issue
+        double sinceForcedIssueMs_ = 1e9;
+        LocoVec lastIssueDir_;               // the pose velocity direction of the last issue (a big turn is the one thing that may not wait)
+        bool haveIssueDir_ = false;
+        bool LadderMayChange(bool deeper);   // the hold and the cap (counts a refusal)
         int failSnaps_ = 0; double sinceFailSnapMs_ = 1e9; bool snapStorm_ = false;
 
         bool ragdollActive_ = false;
@@ -688,6 +776,55 @@ namespace gage::sync {
         double prevNowMs_ = 0;
         double stuckMs_ = 0;
         bool stuckCounted_ = false;
+    };
+
+    // R3 T2 (desync round 3): the gait DIAGNOSTIC. "The task ran but the ped showed no gait" was all the 0.4.7 log could say; this puts
+    // what the game reports about the puppet next to the pose, per puppet, per 10 s: which gait the IS_PED_* natives read while a moving
+    // one is commanded, the ped's speed three ways (from its positions including our writes, GET_ENTITY_SPEED, own displacement net of
+    // our writes), the move blend ratio set, the coordinate writes, the task issues. Pure: the engine feeds one frame per DrivePeer and
+    // prints the summary; the same code runs in tests/r3_t2_tests.h.
+    struct GaitDiagFrame
+    {
+        double dtMs = 0, nowMs = 0;
+        Gait commanded = Gait::Still;   // LocoOutput::gait (what the controller shows)
+        Gait read = Gait::Still;        // World::PedGait (IS_PED_SPRINTING / RUNNING / WALKING)
+        float poseSpeed = 0;            // horizontal m/s
+        float ownSpeed = -1;            // LocomotionController::SelfSpeed() (net of our writes), < 0 = none yet
+        float entitySpeed = -1;         // GET_ENTITY_SPEED, < 0 = unreadable
+        LocoVec pedPos;                 // GET_ENTITY_COORDS this frame (speed from positions, between two frames)
+        bool wrote = false;             // a coordinate write went out on the ped this frame (nudge, snap, pulse)
+        bool issued = false;            // a gait task was issued this frame
+        bool blendSet = false;          // SET_PED_DESIRED_MOVE_BLEND_RATIO this frame
+        float moveBlend = 0;
+        int pedStill = -1;              // IS_PED_STILL: 1 / 0, -1 = not asked
+        bool ragdoll = false;           // IS_PED_RAGDOLL
+    };
+
+    struct GaitDiagSummary
+    {
+        uint32_t frames = 0, commandedFrames = 0;            // frames observed / frames a moving gait was commanded
+        uint32_t readStill = 0, readWalk = 0, readRun = 0, readSprint = 0;   // the IS_PED_* gait on the commanded frames
+        uint32_t stillTrue = 0, stillAsked = 0, ragdollFrames = 0, writeFrames = 0, issues = 0, blendFrames = 0;
+        double poseMs = 0, ownMs = 0, entityMs = 0, posMs = 0;   // means over the commanded frames that have the value
+        uint32_t ownN = 0, entityN = 0, posN = 0;
+        double blendMean = 0;
+        double commandedShare() const { return frames ? double(commandedFrames) / frames : 0.0; }
+        double readShare(uint32_t n) const { return commandedFrames ? double(n) / commandedFrames : 0.0; }
+    };
+
+    class GaitDiag
+    {
+    public:
+        void Observe(const GaitDiagFrame& f);
+        GaitDiagSummary Summary() const;
+        void Reset() { *this = GaitDiag(); }
+
+    private:
+        GaitDiagSummary s_;
+        double poseSum_ = 0, ownSum_ = 0, entitySum_ = 0, posSum_ = 0, blendSum_ = 0;
+        bool havePrev_ = false;
+        LocoVec prevPos_;
+        double prevNowMs_ = 0;
     };
 
     // T2: the game is one game for every puppet. A failure two DIFFERENT puppets' controllers report within witnessMs (the anchor

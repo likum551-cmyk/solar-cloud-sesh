@@ -160,11 +160,47 @@ void NetClock::Retarget(double nowMs)
         return; // the first frames only measure: the delay stays at its initial value
     if (targetMs_ > delayMs_)
     {
+        const double rise = targetMs_ - delayMs_;
+        stats_.delayRiseSumMs += rise;
+        stats_.delayRiseMaxMs = std::max(stats_.delayRiseMaxMs, rise);
+        riseMaxWinMs_ = std::max(riseMaxWinMs_, rise);
+        if (rise > 5.0) ++stats_.delayRisesBig;
         delayMs_ = targetMs_; // rises at once
         ++stats_.delayRises;
     }
     else
         delayMs_ += (targetMs_ - delayMs_) * (1.0 - std::exp(-dt / cfg_.fallTauMs)); // falls with wall time
+}
+
+double NetClock::NearT(double nowMs)
+{
+    if (!started_ || !std::isfinite(nowMs)) return nearT_;
+    const double target = nowMs - BaselineMs();
+    if (!haveNear_)
+    {
+        haveNear_ = true;
+        nearT_ = target;
+        lastNearNowMs_ = nowMs;
+        return nearT_;
+    }
+    if (!(nowMs > lastNearNowMs_))
+        return nearT_;
+    const double dt = nowMs - lastNearNowMs_;
+    lastNearNowMs_ = nowMs;
+    nearT_ += dt;
+    const double err = target - nearT_;
+    if (std::fabs(err) > cfg_.resyncMs)
+    {
+        nearT_ = target;
+        ++stats_.nearResyncs;
+    }
+    else
+    {
+        double corr = Clamp(err / cfg_.slewTauMs, -cfg_.maxSlew, cfg_.maxSlew) * dt;
+        if (std::fabs(corr) > std::fabs(err)) corr = err;
+        nearT_ += corr;
+    }
+    return nearT_;
 }
 
 double NetClock::RenderT(double nowMs)

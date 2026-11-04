@@ -204,6 +204,7 @@ namespace gage::server {
         if (cfg.vehicleEnterDistance < 1 || cfg.vehicleEnterDistance > 100) return fail("vehicleEnterDistance must be 1..100");
         if (cfg.vehicleMaxSpeed < 10 || cfg.vehicleMaxSpeed > 600) return fail("vehicleMaxSpeed must be 10..600");
         if (cfg.fuelDrainPerMinute > 1000) return fail("fuelDrainPerMinute must be 0..1000");
+        if (cfg.contactLagCapMs > 500) return fail("contactLagCapMs must be 0..500");
         if (cfg.playerHealth < 1 || cfg.playerHealth > 255) return fail("playerHealth must be 1..255");
         for (const std::pair<const char*, uint32_t> p : {std::make_pair("firearmDamagePercent", cfg.firearmDamagePercent),
                                                          std::make_pair("meleeDamagePercent", cfg.meleeDamagePercent),
@@ -215,6 +216,8 @@ namespace gage::server {
         if (cfg.respawnDelayMs > 300000) return fail("respawnDelaySeconds must be 0..300");
         if (cfg.maxHitDistance < 10 || cfg.maxHitDistance > 5000) return fail("maxHitDistance must be 10..5000");
         if (cfg.hitsPerSecond < 1 || cfg.hitsPerSecond > 1000) return fail("hitsPerSecond must be 1..1000");
+        if (cfg.meleeAdjudicate > 1) return fail("meleeAdjudicate must be 0 or 1");
+        if (cfg.meleeReachPercent < 25 || cfg.meleeReachPercent > 400) return fail("meleeReachPercent must be 25..400");
         if (cfg.spawnPoints.empty() || cfg.spawnPoints.size() > 16) return fail("spawnPoints must hold 1..16 points");
         for (const SpawnPoint& sp : cfg.spawnPoints)
         {
@@ -459,6 +462,11 @@ namespace gage::server {
                 if (!WholeNumber(v, 10, 600, n)) return fail("\"vehicleMaxSpeed\" must be a whole number 10..600");
                 out.vehicleMaxSpeed = n;
             }
+            else if (key == "contactLagCapMs")
+            {
+                if (!WholeNumber(v, 0, 500, n)) return fail("\"contactLagCapMs\" must be a whole number 0..500");
+                out.contactLagCapMs = n;
+            }
             else if (key == "fuelDrainPerMinute")
             {
                 if (!WholeNumber(v, 0, 1000, n)) return fail("\"fuelDrainPerMinute\" must be a whole number 0..1000");
@@ -502,6 +510,16 @@ namespace gage::server {
             {
                 if (!WholeNumber(v, 1, 1000, n)) return fail("\"hitsPerSecond\" must be a whole number 1..1000");
                 out.hitsPerSecond = n;
+            }
+            else if (key == "meleeAdjudicate")
+            {
+                if (!WholeNumber(v, 0, 1, n)) return fail("\"meleeAdjudicate\" must be 0 or 1");
+                out.meleeAdjudicate = n;
+            }
+            else if (key == "meleeReachPercent")
+            {
+                if (!WholeNumber(v, 25, 400, n)) return fail("\"meleeReachPercent\" must be a whole number 25..400");
+                out.meleeReachPercent = n;
             }
             else if (key == "spawnPoints")
             {
@@ -579,10 +597,10 @@ namespace gage::server {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
                                     "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, adminPort, adminToken, "
                                     "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
-                                    "vehicleMaxSpeed, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
+                                    "vehicleMaxSpeed, contactLagCapMs, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "
                                     "respawnArmour, respawnDelaySeconds, maxHitDistance, "
-                                    "hitsPerSecond, spawnPoints, hitShotWindowMs, hitDamageScalePercent, onFootMaxSpeed, "
+                                    "hitsPerSecond, meleeAdjudicate, meleeReachPercent, spawnPoints, hitShotWindowMs, hitDamageScalePercent, onFootMaxSpeed, "
                                     "untrustedWindowMs, untrustedJoinGraceMs, connectsPerIpPerMinute, vehiclesPerIp, "
                                     "vehicleOrphanSeconds, registerCooldownMs, registerSeparationMeters, vehicleModelDeny, "
                                     "vehicleModelAllow";
@@ -651,7 +669,8 @@ namespace gage::server {
                std::to_string(cfg.hitDamageScalePercent) + "%, melee per-hit ceiling fists " +
                std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_UNARMED"), cfg.hitDamageScalePercent)) + " / light " +
                std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_KNIFE"), cfg.hitDamageScalePercent)) + " / heavy " +
-               std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_BAT"), cfg.hitDamageScalePercent)) + " (before the melee percent)";
+               std::to_string(ac::MeleeNominalMax(ac::Joaat("WEAPON_BAT"), cfg.hitDamageScalePercent)) + " (before the melee percent), server melee judgement " +
+               (cfg.meleeAdjudicate ? "on (reach x" + std::to_string(cfg.meleeReachPercent) + "%)" : std::string("off"));
     }
 
 }

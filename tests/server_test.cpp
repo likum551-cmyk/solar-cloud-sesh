@@ -945,8 +945,8 @@ static void QueryLiveTests()
         int size = 0;
         const query::Nonce n1 = MakeNonce(0xA1);
         const bool got = AskQuery(rig, udp, n1, rep, &size);
-        Check("query live: a request is answered with exactly 24 bytes carrying protocol 6 (kVersion), players 2, maxPlayers 8 and the nonce",
-              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 6 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
+        Check("query live: a request is answered with exactly 24 bytes carrying protocol 7 (kVersion), players 2, maxPlayers 8 and the nonce",
+              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 7 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
               got ? "players " + std::to_string(rep.players) : "no reply");
         query::Reply rep2;
         const query::Nonce n2 = MakeNonce(0x5C);
@@ -1337,7 +1337,7 @@ static void AnnounceTests()
                   NumField(p.v, "port") == rig.srv.port() && StrField(p.v, "name") == cfg.name &&
                   StrField(p.v, "gamemode") == "race" && StrField(p.v, "lang") == "pt-BR" &&
                   StrField(p.v, "url") == "https://example.org/x" && NumField(p.v, "players") == 0 &&
-                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 6, // v6: the master list shows protocol 6
+                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 7, // v6: the master list shows protocol 6
               first ? r0.head + "\n" + r0.body : "no request");
 
         Probe a(rig);
@@ -2656,10 +2656,11 @@ static void VehicleV5UnitTests()
             proto::VehicleWorld mine;
             if (vs.BuildFrame(0, true, At(0, 0), tick, now, mine) && !mine.vehicles.empty()) driverFulls++;
         }
-        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 46 + 2 per occupant when full (v6: tyres, rim, windows; one occupant: 50).
+        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 46 + 2 per occupant when full (v6: tyres, rim, windows; one occupant: 50);
+        // R3 T4 (v7): + the 3-byte damage block of an undamaged car (53).
         Check("vehicles v5: for a receiver of a driven car the entries are full for the first 3 frames and then about once a second (20 ticks) and motion-only "
               "(a 34-byte frame, entry 26 bytes) in between, every one with its age; the driver itself gets full states only at the parked rate",
-              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 46 + 2 &&
+              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 46 + 3 + 2 &&
                   driverFulls <= 5,
               std::to_string(fulls) + " full, " + std::to_string(motion) + " motion-only, " + std::to_string(motionBytes) + "/" + std::to_string(fullBytes) +
                   " bytes, driver " + std::to_string(driverFulls));
@@ -3107,6 +3108,8 @@ static void PipelineHealthTests()
 }
 
 #include "t4_server_tests.h"
+#define R3T6_SERVER
+#include "r3_t6_tests.h"   // R3 T6 melee: the server-side judgement (apps/server/melee.h) as pure units + the config keys
 
 int main()
 {
@@ -3138,6 +3141,8 @@ int main()
     VehicleV5UnitTests();
     std::printf("-- T4: vehicle collisions (claim of a driverless vehicle, speed cap clamp)\n");
     t4srv::T4ServerTests();
+    std::printf("-- R3 T6: melee judgement (melee.h), swing book, claims, config\n");
+    r3t6::ServerTests();
     std::printf("-- damage scaling (damage.h)\n");
     DamageScaleUnitTests();
     std::printf("-- tick clock and sample ages (N6c)\n");
@@ -3150,7 +3155,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 111 + t4srv::kT4ServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 111 + t4srv::kT4ServerChecks + r3t6::kServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

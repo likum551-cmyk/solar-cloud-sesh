@@ -454,6 +454,53 @@ namespace gage::game {
         constexpr uint64_t GET_CONTROL_NORMAL                          = 0xEC3C9B8D5327B563;
         constexpr uint64_t SET_VEHICLE_HANDBRAKE                       = 0x684785568EF26A22;
         constexpr uint64_t SET_VEHICLE_BRAKE_LIGHTS                    = 0x92B35082E0B42F66;
+        // Desync round 3 (0.4.8 work): natives confirmed by two independent crossmaps (public hash here, 3889 hash in kCrossmap3889).
+        //   SET_PED_MAX_HEALTH  PED void(Ped, int)
+        //   SET_PLAYER_MAX_ARMOUR  PLAYER void(Player, int)
+        //   GET_VEHICLE_PETROL_TANK_HEALTH  VEHICLE float(Vehicle)
+        //   SET_VEHICLE_PETROL_TANK_HEALTH  VEHICLE void(Vehicle, float)
+        //   SET_VEHICLE_DAMAGE  VEHICLE void(Vehicle, float x, float y, float z, float damage, float radius, BOOL focusOnModel)
+        //   GET_VEHICLE_DEFORMATION_AT_POS  VEHICLE Vector3(Vehicle, float x, float y, float z)
+        //   IS_VEHICLE_DOOR_DAMAGED  VEHICLE BOOL(Vehicle, int door)
+        //   SET_VEHICLE_DOOR_BROKEN  VEHICLE void(Vehicle, int door, BOOL deleteDoor)
+        //   SET_VEHICLE_DOOR_CONTROL  VEHICLE void(Vehicle, int door, int speed, float angle)
+        //   IS_VEHICLE_DOOR_FULLY_OPEN  VEHICLE BOOL(Vehicle, int door)
+        //   GET_IS_DOOR_VALID  VEHICLE BOOL(Vehicle, int door)
+        //   GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED  VEHICLE BOOL(Vehicle)
+        //   GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED  VEHICLE BOOL(Vehicle)
+        //   SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED  VEHICLE void(Vehicle, BOOL)
+        //   SET_VEHICLE_ENGINE_CAN_DEGRADE  VEHICLE void(Vehicle, BOOL)
+        //   SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE  VEHICLE void(Vehicle, BOOL)
+        //   IS_PED_GOING_INTO_COVER  PED BOOL(Ped)
+        //   TASK_STAY_IN_COVER  TASK void(Ped)
+        //   IS_PED_AIMING_FROM_COVER  PED BOOL(Ped)
+        //   TASK_COMBAT_PED  TASK void(Ped, Ped target, int combatFlags, int threatResponseFlags)
+        //   IS_PED_IN_MELEE_COMBAT  PED BOOL(Ped)
+        //   TASK_PUT_PED_DIRECTLY_INTO_MELEE  TASK void(Ped, Ped target, float blendIn, float timeInMelee, float strafePhaseSync, int aiCombatFlags)
+        //   SET_PED_COMBAT_ATTRIBUTES  PED void(Ped, int attributeId, BOOL enabled)
+        constexpr uint64_t SET_PED_MAX_HEALTH                           = 0xF5F6378C4F3419D3;
+        constexpr uint64_t SET_PLAYER_MAX_ARMOUR                        = 0x77DFCCF5948B8C71;
+        constexpr uint64_t GET_VEHICLE_PETROL_TANK_HEALTH               = 0x7D5DABE888D2D074;
+        constexpr uint64_t SET_VEHICLE_PETROL_TANK_HEALTH               = 0x70DB57649FA8D0D8;
+        constexpr uint64_t SET_VEHICLE_DAMAGE                           = 0xA1DD317EA8FD4F29;
+        constexpr uint64_t GET_VEHICLE_DEFORMATION_AT_POS               = 0x4EC6CFBC7B2E9536;
+        constexpr uint64_t IS_VEHICLE_DOOR_DAMAGED                      = 0xB8E181E559464527;
+        constexpr uint64_t SET_VEHICLE_DOOR_BROKEN                      = 0xD4D4F6A4AB575A33;
+        constexpr uint64_t SET_VEHICLE_DOOR_CONTROL                     = 0xF2BFA0430F0A0FCB;
+        constexpr uint64_t IS_VEHICLE_DOOR_FULLY_OPEN                   = 0x3E933CFF7B111C22;
+        constexpr uint64_t GET_IS_DOOR_VALID                            = 0x645F4B6E8499F632;
+        constexpr uint64_t GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED        = 0x5EF77C9ADD3B11A3;
+        constexpr uint64_t GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED       = 0xA7ECB73355EB2F20;
+        constexpr uint64_t SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED           = 0x4C7028F78FFD3681;
+        constexpr uint64_t SET_VEHICLE_ENGINE_CAN_DEGRADE               = 0x983765856F2564F9;
+        constexpr uint64_t SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE       = 0x37C8252A7C92D017;
+        constexpr uint64_t IS_PED_GOING_INTO_COVER                      = 0x9F65DBC537E59AD5;
+        constexpr uint64_t TASK_STAY_IN_COVER                           = 0xE5DA8615A6180789;
+        constexpr uint64_t IS_PED_AIMING_FROM_COVER                     = 0x3998B1276A3300E5;
+        constexpr uint64_t TASK_COMBAT_PED                              = 0xF166E48407BAC484;
+        constexpr uint64_t IS_PED_IN_MELEE_COMBAT                       = 0x4E209B2C1EAD5159;
+        constexpr uint64_t TASK_PUT_PED_DIRECTLY_INTO_MELEE             = 0x1C6CD14A876FFE39;
+        constexpr uint64_t SET_PED_COMBAT_ATTRIBUTES                    = 0x9F7794730795E019;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -770,7 +817,12 @@ namespace gage::game {
         // events blocked (it ignores threats and shoves), no ragdoll, no evasive dive, no ambient
         // anims, keeps its task, config flag 188 (DisableHurt) on, invincible. Default components
         // until ApplyPedLook. SpawnPed stays the companion's.
-        int32_t  SpawnRemotePed(int modelHash, float x, float y, float z, float heading);
+        // R3 T2 `recipe` (the repairs of libs/sync LocoRepair): 0 = all of the above; 1 = LEAN (invincible, heading, non-temporary
+        // events blocked and nothing else: no ragdoll block, no keep-task, no ambient / dive flags, no config flag 188, no freeze or
+        // collision call); 2 = ALT (lean, a CIVMALE ped type and no script-host flag). A puppet that never gets a gait from any task
+        // is created again with the next recipe; gage.log says which one it is ("engine: spawned remote peer ... recipe").
+        int32_t  SpawnRemotePed(int modelHash, float x, float y, float z, float heading, int recipe = 0);
+        bool     IsPedStill(int32_t ped);                            // IS_PED_STILL (R3 T2 diagnostic)
         bool     SetEntityCoordsNoOffset(int32_t handle, float x, float y, float z);  // hard snap, no axis offset
         bool     SetEntityVelocity(int32_t handle, float vx, float vy, float vz);    // m/s, world axes
         bool     GetEntityVelocity(int32_t handle, float& vx, float& vy, float& vz); // m/s, world axes
@@ -959,6 +1011,10 @@ namespace gage::game {
         int      IsEntityPlayingAnim(int32_t entity, const char* dict, const char* name);  // taskFlag 3
         int      IsPedUsingAnyScenario(int32_t ped);
         bool     SetEntityMaxHealth(int32_t entity, int value);
+        // R3 T1: SET_PED_MAX_HEALTH(ped, value): the PED maximum (the entity one is not what bounds a player ped's health in the live
+        // 0.4.7 log); false when it cannot be called. SET_PLAYER_MAX_ARMOUR(PLAYER_ID(), value) likewise.
+        bool     SetPedMaxHealth(int32_t ped, int value);
+        bool     SetPlayerMaxArmour(int value);
         int      EntityExists(int32_t entity);              // DOES_ENTITY_EXIST
         bool     IsHornActive(int32_t veh);                  // false also when uncallable
         // SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(PLAYER_ID(), m): 0 stops GTA's own regeneration.
@@ -996,7 +1052,17 @@ namespace gage::game {
                                              bool allowPeekingAndFiring, float blendInDuration,
                                              bool forceInitialFacingDirection, bool forceFaceLeft,
                                              int identifier, bool doEntry);
+        // R3 T3 (cover): IS_PED_GOING_INTO_COVER (the transition into cover), IS_PED_AIMING_FROM_COVER, TASK_STAY_IN_COVER (hold the cover
+        // the ped is in). All three false / false / false when the native cannot be called.
+        bool     IsPedGoingIntoCover(int32_t ped);
+        bool     IsPedAimingFromCover(int32_t ped);
+        bool     TaskStayInCover(int32_t ped);
         bool     IsPedPerformingMeleeAction(int32_t ped);            // IS_PED_PERFORMING_MELEE_ACTION
+        // R3 T6. IS_PED_IN_MELEE_COMBAT: 1 yes, 0 no, -1 the native could not be called (the swing read-back of the melee-task rung).
+        int      IsPedInMeleeCombat(int32_t ped);
+        // R3 T6. TASK_PUT_PED_DIRECTLY_INTO_MELEE(ped, target, blendIn, timeInMelee, strafePhaseSync, aiCombatFlags): false when a handle is 0 or
+        // the native is unavailable. The caller guarantees `target` can be hurt by nobody that matters (the puppet's own invincible anchor).
+        bool     TaskPutPedDirectlyIntoMelee(int32_t ped, int32_t target, float blendIn, float timeInMelee, float strafePhaseSync, int aiCombatFlags);
         // 0..10 (alloc8or); the native has to be called again every frame to hold.
         bool     SetPedMoveRateOverride(int32_t ped, float value);
         // 0.4.3 fixes (W8). IS_PED_VAULTING: a vault or slide over an obstacle (IS_PED_CLIMBING is the climb).
@@ -1055,6 +1121,21 @@ namespace gage::game {
         bool     GetControlNormal(int inputGroup, int control, float& value);                // -1..1 axis / 0..1 button
         bool     SetVehicleHandbrake(int32_t veh, bool on);
         bool     SetVehicleBrakeLights(int32_t veh, bool on);
+        // ---- R3 T4 vehicle damage state (protocol v7). Each returns false when the native could not be called. ----
+        bool     GetVehiclePetrolTankHealth(int32_t veh, float& health);                     // 1000 full .. 0 (and below: burning)
+        bool     SetVehiclePetrolTankHealth(int32_t veh, float health);
+        // SET_VEHICLE_DAMAGE: (x, y, z) is an offset in the car's own frame (focusOnModel = relative to the model); damage ~ a collision's
+        // strength (a few hundred = a real dent), radius in metres. It deforms the hull and lowers the body health.
+        bool     SetVehicleDamage(int32_t veh, float x, float y, float z, float damage, float radius, bool focusOnModel);
+        // GET_VEHICLE_DEFORMATION_AT_POS: the dent at a point in the car's frame, as a vector in metres (zero = undented).
+        bool     GetVehicleDeformationAtPos(int32_t veh, float x, float y, float z, float& dx, float& dy, float& dz);
+        bool     IsVehicleDoorDamaged(int32_t veh, int door, bool& damaged);                 // broken off / missing
+        bool     GetIsDoorValid(int32_t veh, int door, bool& valid);                         // the model has this door
+        bool     SetVehicleDoorBroken(int32_t veh, int door, bool deleteDoor);
+        bool     IsVehicleHeadlightDamaged(int32_t veh, bool left, bool& damaged);           // GET_IS_LEFT / RIGHT_VEHICLE_HEADLIGHT_DAMAGED
+        bool     SetVehicleCanBeVisiblyDamaged(int32_t veh, bool on);                        // false: collisions do not deform the car
+        bool     SetVehicleEngineCanDegrade(int32_t veh, bool on);
+        bool     SetDisableVehiclePetrolTankDamage(int32_t veh, bool on);
         // Particle fx: request the asset, wait for HasNamedPtfxAssetLoaded, UseParticleFxAsset, then
         // start (the alloc8or example order). Null / empty names return false without calling.
         bool     RequestNamedPtfxAsset(const char* fxName);

@@ -25,11 +25,14 @@
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_visual.h"
+#include "sync/vehicle_damage.h"
 #include "sync/pedstate.h"
+#include "sync/cover.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
 #include "sync/vehicle_impact.h"
+#include "sync/vehicle_position.h"
 #include "sync/vehicle_syncd.h"
 #include "sync/seat_intent.h"
 #include "sync/nametag.h"
@@ -124,12 +127,12 @@ namespace {
     {
         kSiteHitReact, kSiteEmoteEnd, kSiteCoverExit, kSiteEnterWalk, kSiteEnterTimeout, kSiteEnterGaveUp, kSiteDriveMode,
         kSiteLeaveVeh, kSiteTierBDrift, kSiteBackFromVeh, kSiteAimEnd, kSiteCollisionBack, kSiteClimbEnd, kSiteUnseat,
-        kSiteWater, kSiteAnchorLost, kSiteCoverFail, kLocoSites
+        kSiteWater, kSiteAnchorLost, kSiteCoverFail, kSiteRepair, kLocoSites
     };
     const char* const kLocoSiteName[kLocoSites] = {
         "hit-react-end", "emote-end", "cover-exit", "enter-walk", "enter-timeout", "enter-gave-up", "drive-mode",
         "leave-vehicle", "tier-b-drift", "back-from-vehicle", "aim-end", "collision-back", "climb-end", "unseat", "water-edge",
-        "anchor-lost", "cover-fail"
+        "anchor-lost", "cover-fail", "repair"
     };
 
     // W11 (docs/CLOUD-HANDOFF.md item 0b): loco_mode = anchor (default) | straight, re-read at every Welcome like peer_drive. Anchor: each
@@ -145,6 +148,11 @@ namespace {
     // logged as "engine: loco level"). Both re-read at every Welcome like loco_mode.
     std::atomic<bool> g_locoPushNudge{true};
     std::atomic<bool> g_locoSelfCheck{true};
+    // R3 T2 (desync round 3): loco_r3 = 0 switches every round-3 rule off at once (the quiet window and write verdict, the lost task needing
+    // the ped's own speed, the re-issue spacing, the ladder hold and cap: sync::Round2Behaviour); loco_repair = 0 only the repairs of a
+    // puppet no task moves (ClearTasks, then the lean and the alt creation recipe). Re-read at every Welcome like loco_mode.
+    std::atomic<bool> g_locoR3{true};
+    std::atomic<bool> g_locoRepair{true};
     sync::LevelWitness g_locoDegrade;     // script tick only
     std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
@@ -153,6 +161,10 @@ namespace {
         if (!g_locoPushNudge.load())
             c.push = sync::PushMode::Velocity;
         c.selfCheck = g_locoSelfCheck.load();
+        if (!g_locoR3.load())
+            c = sync::Round2Behaviour(c);
+        if (!g_locoRepair.load())
+            c.maxRepairs = 0;
         return c;
     }
 
@@ -191,6 +203,13 @@ namespace {
         sync::ClimbWindow climb;
         sync::OneShotAudit audit;   // T2: did the game SHOW the jump / reload / stealth / swim / ragdoll we asked for (script tick)
         uint32_t levelLogged = 0;   // T2: "engine: loco level" lines written for this puppet (rate limit)
+        // R3 T2: the creation recipe of the puppet's ped (0 full, 1 lean, 2 alt: World::SpawnRemotePed), the repairs done on it
+        // (LocoInput::repairsDone), the gait diagnostic of the last 10 s ("engine: gait") and its log-line budgets. Script tick only.
+        int recipe = 0;
+        int repairsDone = 0;
+        sync::GaitDiag gaitDiag;
+        uint32_t verdictLogged = 0;
+        bool capLogged = false;
 
         // Stage 3 (protocol v3). Appearance: the newest PeerLook (PeerNet::look, copied by SyncNet, applied
         // by the script tick); lookDirty until it is on the ped. pedModel is the model the ped was spawned with.
@@ -249,7 +268,9 @@ namespace {
         bool stealthOn = false;          // SET_PED_STEALTH_MOVEMENT is on for this ped
         double stealthAtMs = 0;          // ... when it was last (re)asserted
         sync::NameTagTrack nameTag;      // W10: this peer's tag across frames (eased alpha, last position, LOS cache)
-        sync::CoverWindow cover;         // 0d: TASK_PUT_PED_DIRECTLY_INTO_COVER as a window (issued, started, fallback, ended)
+        sync::CoverPuppet cover;         // R3 T3: the verified cover window (Wait / Pending / Held / crouch-pose fallback), libs/sync/cover.h
+        float coverIssuePos[3] = {0, 0, 0};   // ... where the puppet stood when the cover task went out (how far the game moved it)
+        double coverIssueMs = 0;              // ... and when
         int enterVeh = -1;               // the server vehicle id a TASK_ENTER_VEHICLE walks this ped to (-1 = none)
         double enterTaskMs = 0;          // ... when it was issued (> 0 while it runs); EnterWarpDue's clock
         // ---- W9 (vehicles, passengers, collision; script tick) ----
@@ -265,6 +286,13 @@ namespace {
         sync::PendingSwing swingPending; // 0e: a swing that waited for its dictionary is still shown if it loads within 250 ms
         sync::SwingProbe swingProbe;     // 0e: IS_ENTITY_PLAYING_ANIM after the swing task (did the clip really play?)
         bool swingProbeArmed = false;    // ... and which candidate list it belongs to (false unarmed, true armed)
+        // R3 T6: the swing in flight, for the read-back's reasons and the bounded retry (script tick)
+        sync::SwingVariant swingVariant = sync::SwingVariant::Upper;   // how it was issued (the ladder's rung at the time)
+        uint32_t swingLocoMark = 0;      // the locomotion controller's task count at the issue: more later = a task replaced the swing
+        double swingIssuedMs = 0;
+        bool swingRetried = false;       // the one bounded re-issue was spent
+        int swingLocalHp = 0;            // melee-task rung: the local player's health + armour at the issue (harm breaker)
+        double swingMeleeUntilMs = 0;    // melee-task rung: when the puppet's melee task is ended again (0 = none running)
         sync::MeleeEventGate meleeEvents; // 0.4.5: the damage event of THIS puppet is cleared on the first frame of a swing window (stale ones)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
@@ -341,7 +369,7 @@ namespace {
     {
         bool have = false;
         sync::ArrivalWindow frameGaps;
-        double baselineDriftMs = 0, stepMaxMs = 0, delayMs = 0, targetMs = 0, excessP95Ms = 0, ageP95Ms = 0;
+        double baselineDriftMs = 0, stepMaxMs = 0, delayMs = 0, targetMs = 0, excessP95Ms = 0, ageP95Ms = 0, riseMaxMs = 0;
         sync::NetClockStats stats, seen;   // seen: as of the previous report
     };
     PipeClockReport s_pipeClock;
@@ -427,6 +455,22 @@ namespace {
         sync::VisualMask sentVis;
         double visReadMs = -1e9;
         float sentSteer = 0.0f;       // the steering that went out last (a change of it is sent at once)
+        // ---- R3 T4 (vehicle damage state, protocol v7; libs/sync/vehicle_damage.h) ----
+        sync::VisualGuard visGuard;   // the per-slot baselines of the tyre / window reads (a slot that is "smashed" at the first sample is not a window)
+        sync::PedalGuard pedalGuard;  // a stuck handbrake read is not sent
+        sync::DamageReporter dmgRep;  // controller: petrol / doors / lamps / dents read off the car, through the baselines
+        sync::DamageApplier dmgApply; // copy: the server's block brought to the entity (closed loop for the dents)
+        sync::HandbrakeLimiter handLimit;   // copy: a handbrake claim that outlives a moving car is released
+        proto::VehicleDamage dmgReport;            // controller: the report (the block)
+        sync::DamageSendPolicy dmgSend;            // controller: when the block rides an update (a change, repeats, a 3 s refresh)
+        sync::DamageRaw dmgRaw;       // the last read of the entity (controller or copy), for the 10 s line
+        double dmgReadMs = -1e9;
+        float lastBodyHp = -1.0f;
+        double bodyFellMs = -1e9;     // when the controller's body health last fell (corroborates damage)
+        int appliedDmgGuard = -1;     // -1 unknown, 1 = copy guards on (cannot damage itself), 0 = a controlled car's defaults
+        int handEff = -1;             // the handbrake state the limiter last applied to this copy (-1 = nothing yet: the next check applies it)
+        bool dmgHullKnown = false;
+        sync::DentHull dmgHull;
         // ---- W9 (script tick) ----
         sync::PresentLead lead;       // item 6: how far past the interpolation time this copy is drawn (near the local player)
         double leadMs = 0;            // ... the lead of this frame (for the 10 s line)
@@ -443,6 +487,7 @@ namespace {
         sync::impact::ImpactTracker impactTracker;   // a car we control: the velocity jumps the game's physics gave it (a contact with a copy)
         uint32_t lastImpactSeq = 0;                  // the newest server VehicleImpact applied / judged for this car
         double divCheckAtMs = 0;                     // a copy whose response we adopted: when to compare it with its controller's stream (0 = none)
+        uint32_t proxUpgradesSeen = 0;               // R3 T5: drive stats at the last frame (proximity graces that a real contact upgraded)
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -458,6 +503,10 @@ namespace {
     // default 0 derives it from successive rotations (the frame of that native is unverified,
     // vehicle_drive.h RISK). veh_angframe=body applies the controller's body-frame output instead.
     std::atomic<bool> g_vehUseAngVel{false}, g_vehAngBody{false};
+    // R3 T4: veh_damage_sync=0 in HKCU\Software\GAGE-MP switches the vehicle damage state off (no damage block sent or applied, copies keep
+    // their own local damage rules: the v6 behaviour); veh_visual_guard=0 switches the sanity layer off (tyre / window / handbrake reads reach the
+    // wire as in v6). Both default on and are re-read at every Welcome.
+    std::atomic<bool> g_vehDamageSync{true}, g_vehVisualGuard{true};
     // veh_driveby=aim shows a seated remote player's raised gun with the plain aim task (never fires by
     // itself) instead of TASK_DRIVE_BY (which may fire real bullets on its own: INFERRED, unchecked live).
     std::atomic<bool> g_vehDriveByAimOnly{false};
@@ -466,6 +515,25 @@ namespace {
     // T4 (vehicle collisions): impact_sync=0 in HKCU\Software\GAGE-MP keeps the contact grace (W9 / Sync B) as the only contact handling and
     // ignores the server's VehicleImpact messages. Default on; re-read at every Welcome.
     std::atomic<bool> g_impactSync{true};
+    // R3 T5 (vehicle position, docs/sync-specs/vehicle-position.md). veh_near_clock=0 draws near copies as round 2 did (the lead = the shared delay + the class
+    // extra, 30 / 45 m, 250 ms cap, no link lag); veh_prox_contact=0 switches the proximity contact path off. Default on; re-read at every Welcome.
+    std::atomic<bool> g_nearClock{true}, g_proxContact{true};
+    // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
+    std::mutex g_linkMtx;
+    std::map<uint16_t, uint32_t> g_linkRtt;   // g_linkMtx
+    // R3 T5 counters / windows (script tick).
+    struct T5Stats
+    {
+        sync::PositionDiag pos;                  // drawn vs the owner's report now, per speed / distance band
+        uint32_t proxOpened = 0, proxUpgraded = 0, proxFrames = 0;   // proximity graces opened / turned into a real contact / copies predicted to overlap
+        uint32_t linkInfoIn = 0;                 // LinkInfo messages received (join worker: atomic in effect, read for the log only)
+        double lagSum = 0; uint32_t lagN = 0; double lagMax = 0;     // the link lag used (ms) over the driven frames
+        uint32_t ownerRttUnknown = 0;            // driven frames whose controller's round trip the server had not told us (ours stood in)
+        uint32_t sentFrames[4] = {};             // as controller: updates sent per speed band (the other machine's line is its view of these)
+        double sentSpeedSum = 0; uint32_t sentN = 0;
+    };
+    T5Stats g_t5;
+    std::atomic<uint32_t> g_linkInfoIn{0};
     // The server's VehicleImpact messages (join worker -> script tick), newest last, at most kMaxImpactQueue waiting.
     std::mutex g_impactMtx;
     std::vector<proto::VehicleImpact> g_impactQueue;   // g_impactMtx
@@ -507,6 +575,15 @@ namespace {
     // regression: swings counted, no hit ever seen). Registry read at Welcome; applied only after the tick set it.
     std::atomic<bool> g_aiMeleeMod{false};
     bool g_aiMeleeApplied = false;                     // script tick
+    // R3 T6: melee_anim = auto | play | melee_task | off (re-read at every Welcome like the other switches); the ladder and the
+    // counters are script-tick only. g_meleeConfirm* are written by the join worker: the server's own Damage with kDmgMelee on a
+    // player WE hit (adjudicated by the server or claimed by us, the client cannot tell which).
+    std::atomic<int> g_meleeAnimWanted{(int)sync::SwingMode::Auto};
+    sync::SwingLadder g_swingLadder;
+    sync::SwingDiag g_swingDiag, g_swingDiagLast;
+    double g_meleeTaskModUntilMs = 0;                  // the AI melee modifier is held at 0 until then (the melee-task rung), 0 = not held
+    bool g_meleeTaskModSet = false;
+    std::atomic<uint32_t> g_meleeConfirmCount{0}, g_meleeConfirmDamage{0}, g_meleeConfirmKills{0};
     // 0c, written by TickLocalMelee every script frame, read by ProbePeerHits (same thread): the melee state of OUR ped.
     bool   g_meleeHeld = false;                        // a melee-class weapon in hand, on foot, alive
     bool   g_meleeActionNow = false;                   // IS_PED_PERFORMING_MELEE_ACTION(local ped)
@@ -537,10 +614,14 @@ namespace {
     std::atomic<uint32_t> g_hitDamageConfirmed{0};     // Damage the server credited to our Hits (join worker)
     std::atomic<uint32_t> g_hitConfirmCount{0};        // ... and how many Damage messages that was (0.4.5 melee audit)
     std::atomic<bool> g_v4Reset{true};            // a session ended or began: the tick resets the units below
+    std::atomic<bool> g_v4ResetEnded{false};      // R3 T1: the pending g_v4Reset is a session END (no probe, no health written to the offline ped)
+    std::atomic<uint8_t> g_healthWish{0};         // R3 T1: HKCU health_mode: 0 auto, 1 direct, 2 scaled (read at Welcome)
 
     // Script tick only.
     sync::LocalVehicleLink g_link;
     sync::VitalsTracker g_vitals;
+    sync::HealthController g_health;              // R3 T1: measures what GTA holds (DIRECT / SCALED), keeps the read-backs
+    uint32_t g_healthTick = 0;                    // R3 T1: TickVitals runs once per script tick; numbers the probe's "one frame later"
     sync::RespawnGate g_respawnGate;
     sync::HitBatcher g_hits;
     sync::EmoteArbiter g_localEmote;
@@ -678,6 +759,13 @@ namespace {
     // follows the sender's pose and warps into the seat when the seat list names the player (sync::EnterWalkMode).
     std::atomic<bool> g_peerEnterTask{false};
     std::atomic<uint32_t> g_vehWorldsIn{0}, g_emotesIn{0};
+    // R3 T3 (libs/sync/cover.h): cover_sync=task|pose|off (HKCU, read at Welcome; default task with the verified window and the crouch-pose
+    // fallback), the breaker that sends every hold to the pose fallback after consecutive refused tasks, and the SENDER's cover classifier
+    // (ReadLocalPedState, script tick) with its 10 s counters.
+    std::atomic<int> g_coverSyncMode{(int)sync::CoverSyncMode::Task};
+    sync::CoverBreaker g_coverBreaker;
+    sync::CoverSense g_coverSense;
+    uint32_t g_coverSenderLogged = 0;
 
     // A single "companion" ped that mirrors the local player at a fixed offset:
     // proves the SpawnPed/EntityPos pipeline end-to-end before any live peer.
@@ -1250,8 +1338,17 @@ namespace {
         // T6: the server's maximum health BEFORE g_v4Reset is raised below (and before the g_peersMtx wait further down): the script tick
         // that handles the reset sizes the ped and the tracker from it, and used to be able to read the previous session's value.
         g_playerHealth.store(playerHealth ? playerHealth : proto::kDefaultHealth);
-        GLOGI("engine: health: Welcome.playerHealth %u -> the ped's maximum will be %d (100 + it)", (unsigned)playerHealth,
-              sync::PedMaxHealth(playerHealth));
+        {
+            // R3 T1: health_mode=direct|scaled|auto (default auto): direct is the 0.4.7 behaviour, the roll-back.
+            const std::wstring hm = reg::Get(L"health_mode");
+            std::string narrow;
+            for (wchar_t ch : hm)
+                narrow.push_back(ch < 128 ? (char)ch : '?');
+            g_healthWish.store((uint8_t)sync::ParseHealthMode(narrow));
+        }
+        GLOGI("engine: health: Welcome.playerHealth %u -> the ped's maximum will be %d (100 + it); health_mode=%s (the probe at session "
+              "start measures what GTA really holds)",
+              (unsigned)playerHealth, sync::PedMaxHealth(playerHealth), sync::HealthModeName((sync::HealthMode)g_healthWish.load()));
         // peer_drive: anything but "place" (absent, empty, a typo) is the default "tasks".
         const std::wstring drive = reg::Get(L"peer_drive");
         g_peerDrive.store(drive == L"place" ? kDrivePlace : kDriveTasks);
@@ -1267,6 +1364,10 @@ namespace {
         // T2: the position-error push and the degradation ladder (see LocoCfg).
         g_locoPushNudge.store(reg::Get(L"loco_push") != L"velocity");
         g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
+        g_locoR3.store(reg::Get(L"loco_r3") != L"0");
+        g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
+        GLOGI("engine: remote on-foot round-3 rules %s (loco_r3): quiet window + write verdict, re-issue spacing, ladder hold / cap; repairs of a puppet "
+              "no task moves %s (loco_repair)", g_locoR3.load() ? "ON" : "OFF (round-2 controller)", g_locoRepair.load() ? "ON" : "OFF");
         GLOGI("engine: remote on-foot position error closed by %s (loco_push), self-checks / degradation ladder %s (loco_selfcheck)",
               g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
               g_locoSelfCheck.load() ? "ON (anchor -> straight -> blend-carried speed -> rigid follow, each step logged)" : "OFF");
@@ -1287,9 +1388,24 @@ namespace {
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
+        g_vehDamageSync.store(reg::Get(L"veh_damage_sync") != L"0");     // R3 T4: the vehicle damage state (default on; 0 = the v6 behaviour)
+        g_vehVisualGuard.store(reg::Get(L"veh_visual_guard") != L"0");   // R3 T4: the sanity layer of the tyre / window / handbrake reads (default on)
         g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
+        g_nearClock.store(reg::Get(L"veh_near_clock") != L"0");     // R3 T5: the near-car clock + link lag (0 = round 2's lead)
+        g_proxContact.store(reg::Get(L"veh_prox_contact") != L"0"); // R3 T5: the proximity contact path (0 = the flag / speed loss / kick triggers only)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
+        {
+            // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
+            const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
+            g_coverSyncMode.store((int)cm);
+            g_coverBreaker.Reset();
+            GLOGI("engine: cover (R3 T3): cover_sync=%s (%s)", sync::CoverSyncName(cm),
+                  cm == sync::CoverSyncMode::Task ? "a puppet is put into cover only when it is within 0.30 m of the sender's pose and the game confirms it with "
+                                                    "IS_PED_IN_COVER; otherwise it stands / crouches on the sender's position"
+                  : cm == sync::CoverSyncMode::Pose ? "no cover task, the crouch pose on the sender's position"
+                                                     : "the cover flag is ignored");
+        }
         {
             // Sync plan W3: hit_react off|bullet|ragdoll|both (anything else, the default: both),
             // peer_muzzle=0, peer_shoot=script (real fire is the default since the 0.4.3 fixes).
@@ -1303,6 +1419,13 @@ namespace {
             g_aiDamageWanted.store(true);
             // 0c: the AI MELEE modifier stays untouched unless ai_melee_mod=1 (see g_aiMeleeMod).
             g_aiMeleeMod.store(reg::Get(L"ai_melee_mod") == L"1");
+            {
+                // R3 T6: how a remote swing is shown (HKCU\Software\GAGE-MP melee_anim): auto climbs a ladder by measured effect,
+                // play = animations only, melee_task = the melee task only, off = no swing is shown.
+                const std::wstring ma = reg::Get(L"melee_anim");
+                g_meleeAnimWanted.store((int)(ma == L"play" ? sync::SwingMode::Play : ma == L"melee_task" ? sync::SwingMode::MeleeTask
+                                                                                  : ma == L"off" ? sync::SwingMode::Off : sync::SwingMode::Auto));
+            }
             GLOGI("engine: combat client: hit reactions %s (a melee blow: a short stagger), muzzle flash %s, remote shots via %s "
                   "(hit_react / peer_muzzle / peer_shoot); AI weapon damage modifier 0.0 once the tick sets it, AI melee modifier %s "
                   "(ai_melee_mod; off: puppets only play a swing animation, and the modifier zeroed our own fists on them)",
@@ -1314,6 +1437,7 @@ namespace {
                                         : "the zero-damage script bullet (peer_shoot=script)",
                   g_aiMeleeMod.load() ? "0.0 (ai_melee_mod=1)" : "left alone");
         }
+        g_v4ResetEnded.store(false);
         g_v4Reset.store(true);
         GLOGI("engine: v4: remote vehicles take angular velocity %s, applied in the %s frame; local hit detection "
               "on remote peds %s (veh_angvel / veh_angframe / peer_hits); seated drive-by via %s (veh_driveby)",
@@ -1402,6 +1526,7 @@ namespace {
         g_entryReadyAt.store(0);
         g_loaderArmed.store(0);
         g_loaderPedAt.store(0);
+        g_v4ResetEnded.store(true);                    // R3 T1: this reset is a session end
         g_v4Reset.store(true);                         // link, vitals, hits, emotes start over
         g_aiDamageWanted.store(false);                 // the script tick resets the AI damage modifiers
         {
@@ -1600,6 +1725,16 @@ namespace {
         PushEvent(std::move(e), true);                 // reliable and ordered with the VehicleResults: never the one dropped
     }
 
+    // R3 T5: the round trip the server measures to each vehicle controller (join worker); the near-car lead reads it under g_linkMtx.
+    void OnLinkInfo(const proto::LinkInfo& m)
+    {
+        std::lock_guard<std::mutex> lk(g_linkMtx);
+        g_linkRtt.clear();
+        for (const proto::LinkEntry& e : m.e)
+            g_linkRtt[e.id] = e.rttMs;
+        g_linkInfoIn.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // T4: the server's resolution of a contact of a vehicle we control; queued for the script tick (TickVehicles applies it).
     void OnVehicleImpact(const proto::VehicleImpact& m)
     {
@@ -1637,6 +1772,13 @@ namespace {
             {
                 g_hitDamageConfirmed.fetch_add(d.damage, std::memory_order_relaxed);
                 g_hitConfirmCount.fetch_add(1, std::memory_order_relaxed);
+                if (d.flags & proto::kDmgMelee)         // R3 T6: a melee blow of ours the SERVER counted (it judges swings itself now)
+                {
+                    g_meleeConfirmCount.fetch_add(1, std::memory_order_relaxed);
+                    g_meleeConfirmDamage.fetch_add(d.damage, std::memory_order_relaxed);
+                    if (d.killed)
+                        g_meleeConfirmKills.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             // Sync plan W3 / W6: the server confirms a hit of ours on a puppet, and (protocol v5) tells every relevant
             // player about the damage between two others: the victim's puppet flinches / falls on our screen the same
@@ -1781,39 +1923,41 @@ namespace {
     // is 100, so a ped left at the game default of 200 would hold a server value of 150+ only after the vitals tracker
     // clamped it to 100. Set at the entry, on every respawn, after a model swap and whenever the vitals units start
     // over. Script tick.
-    // T6: the native's result and the value GTA kept are read back and counted (VitalsStats), the first calls of a session
-    // and every disagreement are logged. `why` names the caller.
-    void ApplyServerMaxHealth(int32_t ped, const char* why = "?")
+    // R3 T1: live 0.4.7 showed SET_ENTITY_MAX_HEALTH reading back 300 while the player ped's HEALTH never rose above 200, so this
+    // is now a PROBE: HealthController writes SET_ENTITY_MAX_HEALTH, SET_ENTITY_HEALTH, SET_PED_MAX_HEALTH, SET_ENTITY_HEALTH,
+    // reads the real health after each, measures the ceiling, chooses DIRECT or SCALED and tells the tracker; one line names every
+    // step, and the +1 frame / +1 s read-backs follow from TickVitals (HealthController::Pre). `why` names the caller; `beforeVitals`
+    // is true from ResetV4Units, which runs ahead of this tick's TickVitals.
+    struct HealthPort
+    {
+        int32_t ped;
+        bool SetEntityMax(int m) { return g_world->SetEntityMaxHealth(ped, m); }
+        bool SetPedMax(int m) { return g_world->SetPedMaxHealth(ped, m); }
+        bool SetHealth(int h) { return g_world->SetEntityHealth(ped, h); }
+        int  GetHealth() { return g_world->GetEntityHealth(ped); }
+        int  GetMax() { return g_world->GetEntityMaxHealth(ped); }
+    };
+
+    void DrainHealthLog()
+    {
+        sync::HealthController::Line l;
+        while (g_health.TakeLine(l))
+        {
+            if (l.warn)
+                GLOGW("%s", l.text.c_str());
+            else
+                GLOGI("%s", l.text.c_str());
+        }
+    }
+
+    void ApplyServerMaxHealth(int32_t ped, const char* why = "?", bool beforeVitals = false)
     {
         if (!ped)
             return;
-        struct Port
-        {
-            int32_t ped;
-            bool SetMax(int m) { return g_world->SetEntityMaxHealth(ped, m); }
-            int  GetMax() { return g_world->GetEntityMaxHealth(ped); }
-        } port{ped};
-        const int back = sync::ApplyMaxHealth(port, g_playerHealth.load(), g_vitals);
-        const sync::VitalsStats& st = g_vitals.Stats();
-        static uint32_t logged = 0;
-        static ULONG offAt = 0;
-        const bool off = back != st.lastMaxWanted;
-        const ULONG nowT = GetTickCount();
-        if (logged < 16 || (off && (!offAt || nowT - offAt >= 10000)))
-        {
-            ++logged;
-            if (off)
-                offAt = nowT;
-            const char* const fmt = "engine: health: SET_ENTITY_MAX_HEALTH(ped %d, %d) [%s] read back %d%s; ped health %d, "
-                                    "playerHealth %u (calls %u, failed %u, read-back differs %u)";
-            const char* const note = off ? "  <-- GTA did not keep the wish" : "";
-            if (off)
-                GLOGW(fmt, (int)ped, st.lastMaxWanted, why, back, note, g_world->GetEntityHealth(ped),
-                      (unsigned)g_playerHealth.load(), st.maxWrites, st.maxWriteFails, st.maxReadBackOff);
-            else
-                GLOGI(fmt, (int)ped, st.lastMaxWanted, why, back, note, g_world->GetEntityHealth(ped),
-                      (unsigned)g_playerHealth.load(), st.maxWrites, st.maxWriteFails, st.maxReadBackOff);
-        }
+        g_health.wish = (sync::HealthMode)g_healthWish.load();
+        HealthPort port{ped};
+        g_health.Begin(port, ped, g_playerHealth.load(), g_vitals, g_healthTick + (beforeVitals ? 1u : 0u), NowMs(), why);
+        DrainHealthLog();
     }
 
     // Dress the freemode ped GTA just gave the player (script tick only). Called right after every
@@ -1960,13 +2104,21 @@ namespace {
         int budget = ambient::kSweepMaxDeletes;
         for (int pass = 0; pass < 2; ++pass)           // 0: peds, 1: vehicles
         {
+            ambient::g_lastNearbyEcho = false;
             const int n = pass == 0 ? g_world->NearbyPeds(lp, found, ambient::kNearbyCap)
                                     : g_world->NearbyVehicles(lp, found, ambient::kNearbyCap);
             (pass == 0 ? g_ambRep.nearPeds : g_ambRep.nearVehs) = n;
+            if (ambient::g_lastNearbyEcho)
+                ++g_ambRep.enumCapEcho[pass];
             if (n <= 0)
                 continue;
             const ambient::SweepStats st = ambient::PlanSweep(found, n, g_ambExempt, budget, plan);
             g_ambRep.protectedSeen += (uint32_t)st.exempt;
+            g_ambRep.enumSeen[pass] += (uint32_t)st.seen;       // R3 T5: what each enumeration was made of (the live `near[peds=64 vehs=64]` was the capacity)
+            g_ambRep.enumExempt[pass] += (uint32_t)st.exempt;
+            g_ambRep.enumUnproven[pass] += (uint32_t)st.unproven;
+            g_ambRep.enumInvalid[pass] += (uint32_t)st.invalid;
+            g_ambRep.enumPlanned[pass] += (uint32_t)st.planned;
             for (const int32_t h : plan)
                 if (g_world->EntityExists(h) == 1 && g_world->DeleteAmbientEntity(h))
                 {
@@ -2205,6 +2357,7 @@ namespace {
         g_life = Life::Loading;
         g_lifePhaseAt = now;
         std::memcpy(g_lifeSpawn, kSpawn, sizeof(g_lifeSpawn));
+        g_v4ResetEnded.store(false);
         g_v4Reset.store(true);            // server-owned health starts from the server's defaults
         g_satiety = 100.0f;               // reset the placeholder hunger stat on entry
         g_satietyAt = 0;
@@ -2431,7 +2584,7 @@ namespace {
             if (ped && !g_vitals.ServerDead())
             {
                 ApplyServerMaxHealth(ped, "respawn");  // before the health: a value above the old maximum would be cut
-                g_world->SetEntityHealth(ped, 100 + (int)g_vitals.Health());
+                g_world->SetEntityHealth(ped, 100 + g_vitals.Scale().ToGta((int)g_vitals.Health()));   // R3 T1: in the units the ped runs in
                 g_world->SetPedArmour(ped, (int)g_vitals.Armour());
             }
             GLOGI("engine: respawned at %.1f, %.1f, %.1f heading %.0f with health %u armour %u", g_lifeSpawn[0],
@@ -2688,7 +2841,10 @@ namespace {
         const int hp = g_world->GetEntityHealth(lp);
         const int maxHp = g_world->GetEntityMaxHealth(lp);
         // T6: a frame whose max reads 0 (native failure) draws the last good / the server's maximum, not an empty bar.
-        const float hpFrac = sync::HudHealthFraction(hp, maxHp, g_playerHealth.load(), g_vitals.LastGoodMax());
+        float hpFrac = sync::HudHealthFraction(hp, maxHp, g_playerHealth.load(), g_vitals.LastGoodMax());
+        // R3 T1: SCALED (GTA cannot hold 100 + playerHealth): the server's number draws the bar, less the self-damage in flight.
+        if (ServerMode() && g_vitals.Scale().Scaled() && !g_vitals.ServerDead())
+            hpFrac = sync::ServerBarFraction((int)g_vitals.Health(), g_vitals.Pending(), (int)g_playerHealth.load());
         float satFrac = g_satiety / 100.0f;
         satFrac = satFrac < 0 ? 0 : (satFrac > 1 ? 1 : satFrac);
 
@@ -3501,24 +3657,70 @@ namespace {
         return &c;
     }
 
-    // TASK_PLAY_ANIM of the swing; the probe follows it (PeerSwingService).
-    void IssuePeerSwing(Peer& pe, SwingSet& set, size_t idx, double nowMs, bool late)
+    // R3 T6. The locomotion controller's task count on a puppet (go-straight / go-to-anchor / stand-still issues): a rise between the
+    // swing's issue and its read-back means a locomotion task was issued on the ped meanwhile, the usual way a secondary clip is lost.
+    uint32_t LocoTaskCount(const Peer& pe)
+    {
+        const sync::LocoStats& ls = pe.loco.Stats();
+        return ls.goStraight + ls.standStill;
+    }
+
+    // The melee-task rung: TASK_PUT_PED_DIRECTLY_INTO_MELEE against the puppet's own invisible, invincible, collision-less anchor ped, so
+    // its blows can land on nobody that matters; the AI melee damage modifier is held at 0 for the window as well (the puppet's fists cannot
+    // hurt the local player even if its AI picks a new target), and PeerSwingService trips the breaker if our health moves meanwhile.
+    bool IssuePeerMeleeTask(Peer& pe, double nowMs)
+    {
+        if (!pe.anchor || !g_world->EntityExists(pe.anchor))
+        {
+            ++g_swingDiag.meleeTaskNoTarget;           // straight locomotion mode, or the anchor is not there yet: nothing safe to aim at
+            return false;
+        }
+        const int32_t lp = g_localPed.load();
+        pe.swingLocalHp = lp ? g_world->GetEntityHealth(lp) + g_world->GetPedArmour(lp) : 0;
+        if (!g_aiMeleeApplied)
+        {
+            g_meleeTaskModSet = g_world->SetAiMeleeWeaponDamageModifier(0.0f);
+            g_meleeTaskModUntilMs = nowMs + 1200.0;
+        }
+        if (!g_world->TaskPutPedDirectlyIntoMelee(pe.ped, pe.anchor, 0.2f, 0.6f, 0.0f, 0))
+            return false;
+        pe.swingMeleeUntilMs = nowMs + kSwingMs + 150.0;
+        return true;
+    }
+
+    // TASK_PLAY_ANIM of the swing (or the melee task); the probe follows it (PeerSwingService). `retry`: the one bounded re-issue after a
+    // locomotion task replaced it.
+    void IssuePeerSwing(Peer& pe, SwingSet& set, size_t idx, double nowMs, bool late, bool retry = false)
     {
         SwingClip& c = set.list[idx];
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
-        if (g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, kSwingFlags, 1.0f))
+        const sync::SwingVariant var = g_swingLadder.Current();
+        const bool ok = var == sync::SwingVariant::MeleeTask
+                            ? IssuePeerMeleeTask(pe, nowMs)
+                            : g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, sync::SwingVariantFlags(var), 1.0f);
+        if (ok)
         {
             ++g_v4.peerSwings;
             ++dk.issued;
             if (late)
                 ++dk.late;
+            if (retry)
+                ++g_swingDiag.retried;
+            else
+                ++g_swingDiag.issued, ++g_swingDiag.variantIssued[(size_t)var];
             pe.swingProbe.Begin(nowMs, idx);
             pe.swingProbeArmed = &set == &g_swingSetArmed;
+            pe.swingVariant = var;
+            pe.swingLocoMark = LocoTaskCount(pe);
+            pe.swingIssuedMs = nowMs;
+            if (!retry)
+                pe.swingRetried = false;
         }
         else
         {
             ++g_v4.peerSwingFailed;
             ++dk.failed;
+            ++g_swingDiag.notIssuedFailed;
         }
     }
 
@@ -3528,21 +3730,55 @@ namespace {
     void PlayPeerSwing(Peer& pe, int id, uint32_t weapon, double nowMs)
     {
         ++g_v4.peerSwingSteps;
+        ++g_swingDiag.seen;
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
         ++dk.requested;
+        {
+            const sync::SwingMode want = (sync::SwingMode)g_meleeAnimWanted.load(std::memory_order_relaxed);
+            if (want != g_swingLadder.Mode() && !(want == sync::SwingMode::MeleeTask && g_swingLadder.Mode() == sync::SwingMode::Play && g_swingLadder.MeleeTripped()))
+            {
+                g_swingLadder.SetMode(want);
+                PeerLog(false, "engine: melee swing: melee_anim=%s (auto: upper-body clip, then not-interruptable, full body, the melee task, each rung only "
+                        "after the read-back says the swing was not seen playing)", sync::SwingModeName(want));
+            }
+        }
+        if (!g_swingLadder.Enabled())
+        {
+            ++g_swingDiag.notIssuedOff;
+            return;
+        }
         if (pe.emote.Active() || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active())
         {
             ++g_v4.peerSwingOwned;                     // an emote, a seat, a climb or a reaction owns the ped
             ++dk.owned;
+            ++g_swingDiag.notIssuedOwned;
+            return;
+        }
+        if (g_world->IsPedRagdoll(pe.ped))
+        {
+            ++g_swingDiag.notIssuedRagdoll;            // a ragdolling ped plays no clip: not the swing's fault
             return;
         }
         SwingSet* set = nullptr;
         size_t idx = 0;
         SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
+        if (!c && g_swingLadder.OnNoClips())
+        {
+            ++g_swingDiag.escalations;
+            PeerLog(true, "engine: melee swing: none of the candidate clip dictionaries exists in this game: the ladder goes straight to the melee task "
+                    "(melee_anim=%s)", sync::SwingModeName(g_swingLadder.Mode()));
+        }
+        if (!c && g_swingLadder.Current() == sync::SwingVariant::MeleeTask)
+        {
+            set = weapon == UnarmedHash() ? &g_swingSetUnarmed : &g_swingSetArmed;   // the melee task needs no clip: the set only carries the read-back
+            IssuePeerSwing(pe, *set, 0, nowMs, false);
+            return;
+        }
         if (!c)
         {
             ++g_v4.peerSwingNoDict;
             ++dk.dictMissing;
+            ++g_swingDiag.notIssuedDictMissing;
             static bool logged = false;
             if (!logged)
             {
@@ -3552,7 +3788,7 @@ namespace {
             }
             return;
         }
-        if (!g_world->HasAnimDictLoaded(c->dict))
+        if (g_swingLadder.Current() != sync::SwingVariant::MeleeTask && !g_world->HasAnimDictLoaded(c->dict))
         {
             ++g_v4.peerSwingNoDict;                    // still streaming: kept for 250 ms (PeerSwingService plays it when it loads)
             pe.swingPending.Arm(nowMs);
@@ -3561,12 +3797,40 @@ namespace {
         IssuePeerSwing(pe, *set, idx, nowMs, false);
     }
 
-    // Once per frame per remote ped, after the swing trigger: the swing that waited for its dictionary, and the
-    // IS_ENTITY_PLAYING_ANIM probe of the last issued one. Probe results are logged once per clip: "never seen playing" is
-    // the decisive line of the next live test (the clip name is wrong, or the native cannot see a secondary anim).
+    // Once per frame per remote ped, after the swing trigger: the swing that waited for its dictionary, and the read-back of the last
+    // issued one (IS_ENTITY_PLAYING_ANIM, or IS_PED_IN_MELEE_COMBAT for the melee task). R3 T6: the read-back is the EFFECT counter, with
+    // the reason when it says no (a locomotion task issued meanwhile, a busy ped, nothing explains it), one bounded re-issue after a
+    // locomotion task replaced the swing, and the ladder (sync::SwingLadder) climbs on a streak of unexplained misses.
     void PeerSwingService(Peer& pe, int id, uint32_t weapon, bool meleeWeapon, double nowMs)
     {
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
+        // the melee-task rung's global modifier is handed back after its window (unless ai_melee_mod=1 holds it), and its puppet's task ends
+        if (g_meleeTaskModUntilMs > 0.0 && nowMs >= g_meleeTaskModUntilMs)
+        {
+            g_meleeTaskModUntilMs = 0.0;
+            if (g_meleeTaskModSet && !g_aiMeleeApplied)
+                g_world->ResetAiMeleeWeaponDamageModifier();
+            g_meleeTaskModSet = false;
+        }
+        if (pe.swingMeleeUntilMs > 0.0)
+        {
+            const int32_t lp = g_localPed.load();
+            if (lp && g_world->GetEntityHealth(lp) + g_world->GetPedArmour(lp) < pe.swingLocalHp)
+            {
+                // The local player lost health while a puppet was in melee: whatever else caused it, this rung does not run again.
+                ++g_swingDiag.meleeTaskHarm;
+                g_swingLadder.TripMeleeTask();
+                pe.swingLocalHp = 0;
+                PeerLog(true, "engine: melee swing: our health dropped while peer id=%d was in a melee task: the melee-task rung is DISABLED for this "
+                        "session (the ladder falls back to the animations)", id);
+            }
+            if (nowMs >= pe.swingMeleeUntilMs)
+            {
+                pe.swingMeleeUntilMs = 0.0;
+                g_world->ClearPedTasks(pe.ped);        // the puppet leaves the melee task ...
+                pe.loco.Reset();                       // ... and the locomotion controller issues its gait task again
+            }
+        }
         if (pe.swingPending.Armed())
         {
             if (!meleeWeapon || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active() || pe.emote.Active())
@@ -3578,6 +3842,8 @@ namespace {
                 SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
                 if (c && pe.swingPending.Take(nowMs, g_world->HasAnimDictLoaded(c->dict)))
                     IssuePeerSwing(pe, *set, idx, nowMs, true);
+                else if (!pe.swingPending.Armed())
+                    ++g_swingDiag.notIssuedDictLate;   // it waited 250 ms and the dictionary did not load
             }
         }
         if (!pe.swingProbe.Active())
@@ -3585,29 +3851,75 @@ namespace {
         SwingSet& set = pe.swingProbeArmed ? g_swingSetArmed : g_swingSetUnarmed;
         const size_t ci = pe.swingProbe.Candidate();
         SwingClip& c = set.list[ci];
-        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip));
-        if (r == sync::SwingProbe::Result::Pending || r == sync::SwingProbe::Result::Idle)
+        const bool viaMelee = pe.swingVariant == sync::SwingVariant::MeleeTask;
+        const int playing = viaMelee ? g_world->IsPedInMeleeCombat(pe.ped) : g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip);
+        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, playing);
+        if (r == sync::SwingProbe::Result::Pending)
+        {
+            // One bounded retry: a locomotion task was issued on the ped since the swing and the clip is not playing (yet): the task most
+            // likely replaced it, so it is issued once more, within the first 150 ms (a punch is shown late rather than not at all).
+            if (sync::SwingRetryDue(viaMelee, pe.swingRetried, playing, nowMs - pe.swingIssuedMs, LocoTaskCount(pe), pe.swingLocoMark))
+            {
+                pe.swingRetried = true;
+                IssuePeerSwing(pe, set, ci, nowMs, false, true);
+            }
+            return;
+        }
+        if (r == sync::SwingProbe::Result::Idle)
             return;
         if (r == sync::SwingProbe::Result::Shown)
         {
             ++dk.shown;
+            ++g_swingDiag.shown;
+            ++g_swingDiag.variantShown[(size_t)pe.swingVariant];
+            if (pe.swingRetried)
+                ++g_swingDiag.retriedShown;
+            if (g_swingLadder.Mode() != sync::SwingMode::Off && pe.swingVariant == g_swingLadder.Current() && !g_swingLadder.Pinned())
+                PeerLog(false, "engine: melee swing: variant '%s' is SEEN playing on peer id=%d (read-back): pinned", sync::SwingVariantName(pe.swingVariant), id);
+            g_swingLadder.OnResult(r, false);
+            if (!viaMelee)
+                set.book.OnProbe(ci, r);               // the clip is verified for good
             if (g_animFirstUse.Note(std::string("swing-shown:") + c.dict + "/" + c.clip))
                 PeerLog(false, "engine: anim first use: swing clip %s / %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) on peer id=%d: the "
                         "names are right", c.dict, c.clip, id);
+            return;
         }
-        else if (r == sync::SwingProbe::Result::NotShown)
+        if (r == sync::SwingProbe::Result::NotShown)
         {
             ++dk.unseen;
-            const bool demoted = set.book.OnProbe(ci, r);
-            if (g_animFirstUse.Note(std::string("swing-unseen:") + c.dict + "/" + c.clip))
-                PeerLog(true, "engine: anim first use: swing clip %s / %s was issued (TASK_PLAY_ANIM) on peer id=%d but IS_ENTITY_PLAYING_ANIM "
-                        "never saw it play in 250 ms: the clip name is probably WRONG (names are INFERRED; /e <dict> <clip> tests one by "
-                        "hand), or that native cannot see an upper-body secondary task", id, c.dict, c.clip);
+            ++g_swingDiag.unseen;
+            // Why: busy (ragdoll, a reaction, a seat: not the swing's fault) > a locomotion task issued meanwhile > nothing explains it.
+            const bool busy = pe.seatedVeh >= 0 || pe.hitReact.Active() || pe.emote.Active() || g_world->IsPedRagdoll(pe.ped);
+            const sync::SwingMiss why = sync::ClassifySwingMiss(busy, pe.swingRetried, LocoTaskCount(pe), pe.swingLocoMark);
+            const bool overwritten = why == sync::SwingMiss::Overwritten;
+            if (why == sync::SwingMiss::Busy)
+                ++g_swingDiag.unseenBusy;
+            else if (overwritten)
+                ++g_swingDiag.unseenOverwritten;
+            else
+                ++g_swingDiag.unseenPlain;
+            // The clip is blamed only for a miss nothing else explains: a busy ped or a locomotion task is not the name's fault.
+            const bool demoted = !viaMelee && why == sync::SwingMiss::Plain ? set.book.OnProbe(ci, r) : false;
+            // A clip demoted this swing gets its successor a fresh run before the ladder moves (the miss may be the name, not the variant).
+            const bool up = !demoted && g_swingLadder.OnResult(r, busy);
+            if (up)
+            {
+                ++g_swingDiag.escalations;
+                PeerLog(true, "engine: melee swing: the swing was not seen playing %s on peer id=%d: the ladder moves up to '%s' (melee_anim=%s)",
+                        busy ? "(ped busy)" : overwritten ? "(a locomotion task was issued meanwhile)" : "(nothing explains it)", id,
+                        sync::SwingVariantName(g_swingLadder.Current()), sync::SwingModeName(g_swingLadder.Mode()));
+            }
+            if (g_animFirstUse.Note(std::string("swing-unseen:") + c.dict + "/" + c.clip + "/" + std::to_string((int)pe.swingVariant)))
+                PeerLog(true, "engine: anim first use: swing %s %s / %s [%s] was issued on peer id=%d but the read-back never saw it in 250 ms (%s): "
+                        "the clip name is probably WRONG (names are INFERRED; /e <dict> <clip> tests one by hand), a task replaced it, or that native cannot "
+                        "see an upper-body secondary task", viaMelee ? "melee task" : "clip", c.dict, c.clip, sync::SwingVariantName(pe.swingVariant), id,
+                        busy ? "ped busy" : overwritten ? "a locomotion task was issued meanwhile" : "nothing else explains it");
             if (demoted)
                 PeerLog(true, "engine: melee swing: clip %s / %s demoted after two swings never seen playing: the next candidate is used",
                         c.dict, c.clip);
             return;
         }
+        ++g_swingDiag.unreadable;                      // Unknown: the read-back native never answered
         set.book.OnProbe(ci, r);
     }
 
@@ -4697,6 +5009,109 @@ namespace {
     // steer, heading and the rare snap; this applies them in the order its header gives.
     void UnseatPeer(Peer& pe, int32_t leaveVeh);   // defined below (its default argument is declared there)
 
+    // R3 T2: what the controller learned about coordinate writes on this puppet, the level cap, and the repairs it asks of the engine.
+    // All of them are rare, one-off events; the per-puppet budget keeps a broken session from flooding the log.
+    const char* WriteVerdictName(sync::WriteVerdict v)
+    {
+        return v == sync::WriteVerdict::Harm ? "HARM (every coordinate write cancels the walk)"
+             : v == sync::WriteVerdict::Harmless ? "harmless (the writes are not why the task shows nothing)" : "unknown";
+    }
+    void NoteLocoVerdict(Peer& pe, int id, const sync::LocoOutput& o)
+    {
+        if (pe.verdictLogged >= 6)
+            return;
+        ++pe.verdictLogged;
+        const sync::LocoStats& s = pe.loco.Stats();
+        PeerLog(true, "engine: loco write verdict id=%d (%s): %s (quiet windows %u: %u showed a gait with no coordinate write, %u did not). %s", id,
+                pe.name.c_str(), WriteVerdictName(o.writeVerdict), s.quietWindows, s.quietHarm, s.quietClear,
+                o.writeVerdict == sync::WriteVerdict::Harm
+                    ? "The position error is now closed by single pulses (one write per 1.5 s, beyond 0.9 m) instead of a write on every frame."
+                    : "The ladder and the repairs go on from the task, not the writes.");
+    }
+    // The engine's side of sync::LocoRepair: what to do to a puppet that no level of the ladder moved. ClearTasks keeps the ped; the
+    // respawns are done by TickPeers (pe.respawnPed) with the recipe set here. Script tick, ped valid.
+    void ApplyLocoRepair(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
+    {
+        (void)nowMs;
+        const float sp = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+        ++pe.repairsDone;
+        const char* what = "";
+        switch (o.repair)
+        {
+        case sync::LocoRepair::ClearTasks:
+            what = "CLEAR_PED_TASKS_IMMEDIATELY, freeze off, collision on, then the gait task again";
+            ClearPedTasksNow(pe.ped);
+            g_world->FreezeEntityPosition(pe.ped, false);
+            g_world->SetEntityCollision(pe.ped, true);
+            pe.aimTask = false;
+            LocoReset(pe, kSiteRepair);
+            break;
+        case sync::LocoRepair::RespawnLean:
+            what = "the ped is created again with the LEAN recipe (invincible + events blocked only)";
+            pe.recipe = 1;
+            pe.respawnPed = true;
+            break;
+        case sync::LocoRepair::RespawnAlt:
+            what = "the ped is created again with the ALT recipe (civilian ped type, no script-host flag, lean flags)";
+            pe.recipe = 2;
+            pe.respawnPed = true;
+            break;
+        case sync::LocoRepair::None:
+            return;
+        }
+        PeerLog(true, "engine: loco repair id=%d (%s): step %d of 3 because the gait task stalled twice and no coordinate write was to blame (pose speed "
+                "%.2f m/s, the ped's own speed %.2f m/s, write verdict %s): %s", id, pe.name.c_str(), pe.repairsDone, sp, pe.loco.SelfSpeed(),
+                WriteVerdictName(o.writeVerdict), what);
+    }
+    // R3 T2: the task types GET_IS_TASK_ACTIVE says are running on the ped (indices 0..kTaskScanMax, no name guessed): the list of a puppet
+    // that "runs" a go-to task shows whether the game really has one, and compares with the same list of the local player walking.
+    constexpr int kTaskScanMax = 600;
+    std::string ActiveTaskTypes(int32_t ped)
+    {
+        std::string s;
+        int n = 0;
+        for (int t = 0; t < kTaskScanMax; ++t)
+            if (g_world->GetIsTaskActive(ped, t))
+            {
+                if (n++)
+                    s += ",";
+                s += std::to_string(t);
+                if (n >= 24)
+                {
+                    s += ",...";
+                    break;
+                }
+            }
+        return n ? s : std::string("none");
+    }
+    // The per-puppet gait line (every 10 s while a moving gait was commanded): what the game says the ped does, next to what the pose
+    // asks. One log is enough to tell W (writes cancel the walk), D / F (no task moves it) and B (the gait natives lie) apart.
+    std::string GaitLine(int id, const Peer& pe)
+    {
+        const sync::GaitDiagSummary g = pe.gaitDiag.Summary();
+        const sync::LocoStats& s = pe.loco.Stats();
+        const float lat = pe.loco.MeanLatencyMs();
+        char latb[48];
+        if (lat >= 0.0f) std::snprintf(latb, sizeof(latb), "%.0f ms over %u", lat, s.latencyN);
+        else std::snprintf(latb, sizeof(latb), "none seen");
+        char buf[1100];
+        std::snprintf(buf, sizeof(buf),
+                      "engine: gait id=%d (%s): last 10 s a moving gait was commanded on %u of %u frames; the game READS still %.0f%% walking %.0f%% running %.0f%% "
+                      "sprinting %.0f%% (IS_PED_*), IS_PED_STILL true on %u of %u asks; speed: pose %.2f, ped from positions %.2f (our writes included), "
+                      "GET_ENTITY_SPEED %.2f, own displacement net of our writes %.2f m/s; move blend ratio set on %u frames (mean %.2f), coordinate writes on "
+                      "%u frames, %u task issues, task-to-first-gait %s issues; ragdoll %u frames; write verdict %s (quiet windows %u: %u gait / %u none, pulses %u); "
+                      "ladder level %d, %u changes this session%s; repairs %d, creation recipe %d",
+                      id, pe.name.c_str(), g.commandedFrames, g.frames, g.readShare(g.readStill) * 100.0, g.readShare(g.readWalk) * 100.0,
+                      g.readShare(g.readRun) * 100.0, g.readShare(g.readSprint) * 100.0, g.stillTrue, g.stillAsked, g.poseMs, g.posMs, g.entityMs, g.ownMs,
+                      g.blendFrames, g.blendMean, g.writeFrames, g.issues, latb, g.ragdollFrames, WriteVerdictName(pe.loco.Verdict()), s.quietWindows,
+                      s.quietHarm, s.quietClear, s.pulses, (int)pe.loco.Level(), (unsigned)pe.loco.LevelChangesTotal(),
+                      pe.loco.LadderFrozen() ? " (FROZEN by the cap)" : "", pe.repairsDone, pe.recipe);
+        std::string line = buf;
+        if (g.commandedFrames > 0)
+            line += "; active task types [" + ActiveTaskTypes(pe.ped) + "]";
+        return line;
+    }
+
     // T2: a puppet's controller moved to another level of the degradation ladder: say so (the numbers that decided it are in the
     // line), count it, and tell the witness (two puppets finding the same failure make it machine-wide).
     void NoteLocoLevel(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
@@ -4715,76 +5130,114 @@ namespace {
         }
     }
 
-    // 0d: cover as a window (sync::CoverWindow), once per DrivePeer from TickPeerTierB. The puppet is put on the sender's pose of the
-    // edge first (the native looks for a cover point at the coordinates it is given), then TASK_PUT_PED_DIRECTLY_INTO_COVER(ped, pose,
-    // timeout -1, allowPeekingAndFiring false, blendIn 0, forceInitialFacingDirection false, forceFaceLeft false, identifier -1,
-    // doEntry false). Returns true while the cover task owns the ped: DrivePeer then runs no gait task, no velocity push and no
-    // anchor move (LocoController::Update is not called). INFERRED, not verifiable without a game: that these parameters find a
-    // cover point at a car; the log line "engine: vault / cover (0d)" counts issued / started / fallback / ended per 10 s.
+    // R3 T3: cover as a VERIFIED window (libs/sync/cover.h CoverPuppet), once per DrivePeer from TickPeerTierB. The 0d version put the puppet on
+    // the sender's pose (a SET at 1 m or more: a teleport), issued TASK_PUT_PED_DIRECTLY_INTO_COVER at coordinates where a car is no cover
+    // point and froze the puppet for 700 ms; it then stood upright on the pose while the sender crouched, or was snapped onto a cover point
+    // the game found a few decimetres away. Now: nothing is forced. The puppet stays under the locomotion pipeline until it is within 0.30 m
+    // of the pose and the pose is nearly still; the task goes out ONCE (parameters as in 0d: time -1, no peek / fire, blend 0, doEntry false)
+    // and counts only when IS_PED_IN_COVER reads true within the window, the puppet is still near the pose and faces the sender's way. A puppet
+    // the game moved (a snap), a task that is not accepted (no cover point, or a puppet that ignores tasks), a sender that slides along the
+    // cover or aims all end in ONE ClearPedTasksNow and the pose fallback: the pipeline keeps the puppet on the sender's position and the
+    // crouch hint (kPfStealth, set by the sender) crouches it. Returns true while the cover task owns the ped (DrivePeer then runs no gait
+    // task, no velocity push and no anchor move). Every step is counted per puppet ("engine: cover puppet (R3 T3) id=..." every 10 s).
     bool TickPeerCover(Peer& pe, int id, const sync::Pose& pose, double nowMs)
     {
         const proto::PedState& ps = pose.ped;
-        const bool flag = (ps.flags & proto::kPfCover) != 0 && (ps.flags & proto::kPfRagdoll) == 0 && pe.seatedVeh < 0;
-        bool inCover = false;
-        float drift = 0.0f;
+        const sync::CoverSyncMode mode = (sync::CoverSyncMode)g_coverSyncMode.load(std::memory_order_relaxed);
+        pe.cover.SetMode(mode);
+        sync::CoverIn in;
+        in.flag = (ps.flags & proto::kPfCover) != 0 && (ps.flags & proto::kPfRagdoll) == 0 && (ps.flags & proto::kPfDead) == 0 && pe.seatedVeh < 0;
+        in.aiming = sync::AimWanted(ps.flags, ps.weapon);
+        in.poseSpeed = std::sqrt(pose.k.vx * pose.k.vx + pose.k.vy * pose.k.vy);
+        in.nowMs = nowMs;
+        float cx = 0, cy = 0, cz = 0;
+        if (pe.cover.NeedsPed(in.flag) && g_world->GetEntityCoords(pe.ped, cx, cy, cz))
+        {
+            in.pedReadable = true;
+            const float dx = cx - pose.k.x, dy = cy - pose.k.y, dz = cz - pose.k.z;
+            in.distM = std::sqrt(dx * dx + dy * dy + dz * dz);
+            in.headingErrDeg = sync::CoverHeadingErrDeg(g_world->GetEntityHeading(pe.ped), Heading360(pose.k.heading));
+            const float mx = cx - pe.coverIssuePos[0], my = cy - pe.coverIssuePos[1], mz = cz - pe.coverIssuePos[2];
+            in.movedM = std::sqrt(mx * mx + my * my + mz * mz);
+        }
         if (pe.cover.Busy())
         {
-            inCover = g_world->IsPedInCover(pe.ped, false);
-            float cx = 0, cy = 0, cz = 0;
-            if (g_world->GetEntityCoords(pe.ped, cx, cy, cz))
-                drift = std::sqrt((cx - pose.k.x) * (cx - pose.k.x) + (cy - pose.k.y) * (cy - pose.k.y));
+            in.pedInCover = g_world->IsPedInCover(pe.ped, false);
+            in.pedGoingInto = g_world->IsPedGoingIntoCover(pe.ped);
         }
-        const sync::CoverWindow::Phase before = pe.cover.CurrentPhase();
-        const sync::CoverWindow::Out cv = pe.cover.Update(flag, inCover, drift, nowMs);
-        if (before == sync::CoverWindow::Phase::Pending && pe.cover.CurrentPhase() == sync::CoverWindow::Phase::Held)
+        const sync::CoverStats before = pe.cover.Stats();
+        sync::CoverOut cv = pe.cover.Update(in, &g_coverBreaker);
+        static int coverLogged = 0;
+        if (cv.accepted)
         {
             ++g_v4.coverStarted;
-            PeerLog(false, "engine: remote peer id=%d (%s) is in cover (IS_PED_IN_COVER)", id, pe.name.c_str());
+            if (coverLogged < 24)
+            {
+                ++coverLogged;
+                PeerLog(false, "engine: cover id=%d (%s): IS_PED_IN_COVER confirmed %.0f ms after the task (puppet %.2f m from the sender's pose, moved %.2f m "
+                        "by the game, heading off %.0f deg)", id, pe.name.c_str(), nowMs - pe.coverIssueMs, in.distM, in.movedM, in.headingErrDeg);
+            }
         }
-        bool failed = cv.failed;
         if (cv.issue)
         {
             ++g_v4.coverIssued;
-            PrePlacePeer(pe, pose);
             pe.aimTask = false;
-            const bool called = g_world->TaskPutPedDirectlyIntoCover(pe.ped, pose.k.x, pose.k.y, pose.k.z, -1, false, 0.0f, false,
-                                                                     false, -1, false);
+            if (cv.nudge)
+            {
+                // At most 0.30 m (the window gates on it): the puppet is put exactly on the pose so the cover point is searched where the sender is.
+                g_world->SetEntityCoordsNoOffset(pe.ped, pose.k.x, pose.k.y, pose.k.z);
+                if (in.headingErrDeg > sync::kPrePlaceHeadingDeg)
+                    g_world->SetEntityHeading(pe.ped, Heading360(pose.k.heading));
+                cx = pose.k.x; cy = pose.k.y; cz = pose.k.z;
+            }
+            pe.coverIssuePos[0] = cx; pe.coverIssuePos[1] = cy; pe.coverIssuePos[2] = cz;
+            pe.coverIssueMs = nowMs;
+            const bool called = g_world->TaskPutPedDirectlyIntoCover(pe.ped, pose.k.x, pose.k.y, pose.k.z, -1, false, 0.0f, false, false, -1, false);
             if (!called)
             {
-                pe.cover.NoteIssueFailed();
-                failed = true;
+                const sync::CoverOut f = pe.cover.NoteIssueFailed(nowMs, &g_coverBreaker);
+                cv.why = f.why;
+                cv.suspend = false;
             }
-            static int coverLogged = 0;
-            if (coverLogged < 8)
+            if (coverLogged < 24)
             {
                 ++coverLogged;
-                PeerLog(!called, "engine: remote peer id=%d (%s) takes cover (flags 0x%x): TASK_PUT_PED_DIRECTLY_INTO_COVER at "
-                        "%.2f %.2f %.2f %s", id, pe.name.c_str(), (unsigned)ps.flags, pose.k.x, pose.k.y, pose.k.z,
-                        called ? "issued; the puppet is checked with IS_PED_IN_COVER" : "could not be called");
+                PeerLog(!called, "engine: cover id=%d (%s): sender in cover (flags 0x%x, pose speed %.2f m/s), puppet %.2f m from the pose%s: "
+                        "TASK_PUT_PED_DIRECTLY_INTO_COVER at %.2f %.2f %.2f %s", id, pe.name.c_str(), (unsigned)ps.flags, (double)in.poseSpeed, in.distM,
+                        cv.nudge ? " (put exactly on it first)" : "", pose.k.x, pose.k.y, pose.k.z,
+                        called ? "issued once; checked with IS_PED_IN_COVER within 400 ms" : "could not be called");
             }
         }
-        if (failed)
+        if (cv.stay)
+        {
+            g_world->TaskStayInCover(pe.ped);
+            if (coverLogged < 24)
+            {
+                ++coverLogged;
+                PeerLog(true, "engine: cover id=%d (%s): out of cover while the sender is in it for 350 ms: TASK_STAY_IN_COVER once", id, pe.name.c_str());
+            }
+        }
+        if (cv.why != sync::CoverWhy::None)
         {
             ++g_v4.coverFailed;
-            ClearPedTasksNow(pe.ped);                  // no half-run task: the controller keeps the ped on the sender's pose
-            pe.aimTask = false;
-            LocoReset(pe, kSiteCoverFail);
-            static int failLogged = 0;
-            if (failLogged < 8)
+            if (coverLogged < 24)
             {
-                ++failLogged;
-                PeerLog(true, "engine: remote peer id=%d (%s): not in cover 700 ms after TASK_PUT_PED_DIRECTLY_INTO_COVER (no cover "
-                        "point at the pose?): the puppet stands on the pose until the flag falls", id, pe.name.c_str());
+                ++coverLogged;
+                PeerLog(true, "engine: cover id=%d (%s): FALLBACK to the crouch pose on the sender's position (%s): puppet %.2f m from the pose, moved %.2f m "
+                        "by the game, heading off %.0f deg, IS_PED_IN_COVER %d IS_PED_GOING_INTO_COVER %d, %s", id, pe.name.c_str(), sync::CoverWhyName(cv.why),
+                        in.distM, in.movedM, in.headingErrDeg, (int)in.pedInCover, (int)in.pedGoingInto, cv.clear ? "task cleared once" : "no task was on the ped");
             }
         }
-        if (cv.ended)
+        if (cv.clear)
         {
-            ++g_v4.coverEnded;
+            if (cv.ended)
+                ++g_v4.coverEnded;
             if (pe.seatedVeh < 0)
-                ClearPedTasksNow(pe.ped);              // out of cover: the controller re-issues its gait
+                ClearPedTasksNow(pe.ped);              // once: the controller re-issues its gait and keeps the ped on the pose
             pe.aimTask = false;
-            LocoReset(pe, kSiteCoverExit);
+            LocoReset(pe, cv.why != sync::CoverWhy::None ? kSiteCoverFail : kSiteCoverExit);
         }
+        (void)before;
         return cv.suspend;
     }
 
@@ -4877,7 +5330,13 @@ namespace {
     bool TickPeerTierB(Peer& pe, int id, const sync::Pose& pose, double nowMs)
     {
         const proto::PedState& ps = pose.ped;
-        const sync::PedEdges e = pe.edges.Update({ ps.flags, ps.move, ps.vehId });
+        // R3 T3: the sender's crouch hint in cover (kPfStealth set with kPfCover) is the POSE fallback's crouch; while the cover task path owns the
+        // hold (not the fallback) the stealth edge is not applied over a cover task. It is applied the moment the window falls back to the pose.
+        uint16_t edgeFlags = ps.flags;
+        if ((ps.flags & proto::kPfCover) && (sync::CoverSyncMode)g_coverSyncMode.load(std::memory_order_relaxed) == sync::CoverSyncMode::Task &&
+            pe.cover.CurrentPhase() != sync::CoverPhase::Pose)
+            edgeFlags = (uint16_t)(edgeFlags & ~proto::kPfStealth);
+        const sync::PedEdges e = pe.edges.Update({ edgeFlags, ps.move, ps.vehId });
         const int32_t ped = pe.ped;
         if (e.reloadStart && pe.seatedVeh < 0)
         {
@@ -5218,6 +5677,7 @@ namespace {
             const bool anchorWanted = g_locoAnchor.load() && !g_anchorBroken && !aiming;
             in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
         }
+        in.repairsDone = pe.repairsDone;                   // R3 T2
         // T2: a failure two puppets' controllers found is imposed on this one too (the game is one game), until its timer runs out.
         if (g_locoDegradeReset.exchange(false))
             g_locoDegrade.Reset();
@@ -5230,6 +5690,39 @@ namespace {
             return;                                    // leaving a vehicle: the exit animation owns the ped
         if (o.levelChanged)
             NoteLocoLevel(pe, id, o, in, nowMs);
+        if (o.verdictChanged)
+            NoteLocoVerdict(pe, id, o);                    // R3 T2
+        if (o.capHit && !pe.capLogged)
+        {
+            pe.capLogged = true;
+            PeerLog(true, "engine: loco level id=%d (%s): the cap of level changes per session was reached (%u): the ladder is FROZEN at level %d (%s) for the "
+                    "rest of the session (loco_r3=0 lifts the cap)", id, pe.name.c_str(), (unsigned)pe.loco.LevelChangesTotal(), (int)pe.loco.Level(),
+                    LocoLevelName(pe.loco.Level()));
+        }
+        {
+            // R3 T2: the gait diagnostic frame: what the game says the ped does next to what the pose asks
+            sync::GaitDiagFrame gf;
+            gf.dtMs = dtMs;
+            gf.nowMs = nowMs;
+            gf.commanded = aiming ? sync::Gait::Still : o.gait;      // (an aim task owns the animation: its gait read is not a signal)
+            gf.read = in.pedGait;
+            gf.poseSpeed = std::sqrt(in.vel.x * in.vel.x + in.vel.y * in.vel.y);
+            gf.ownSpeed = pe.loco.SelfSpeed();
+            gf.pedPos = in.pedPos;
+            gf.wrote = o.snap || o.nudge;
+            gf.issued = o.task == sync::LocoTask::GoStraight || o.task == sync::LocoTask::GoToAnchor;
+            gf.blendSet = gf.issued || o.setBlend;
+            gf.moveBlend = o.moveBlendRatio;
+            gf.ragdoll = in.ragdoll;
+            if (gf.commanded != sync::Gait::Still)
+            {
+                gf.entitySpeed = g_world->GetEntitySpeed(pe.ped);
+                gf.pedStill = g_world->IsPedStill(pe.ped) ? 1 : 0;
+            }
+            pe.gaitDiag.Observe(gf);
+        }
+        if (o.repair != sync::LocoRepair::None)
+            ApplyLocoRepair(pe, id, o, in, nowMs);         // R3 T2 (after the diagnostic: the frame is judged on the ped it was read from)
         {
             // Sync A: the slide metric (libs/sync LocoDiag), from what this frame read and what the controller decided
             sync::LocoDiagFrame df;
@@ -5426,6 +5919,7 @@ namespace {
             s_pipeClock.frameGaps = clk.TakeFrameGaps();
             s_pipeClock.baselineDriftMs = clk.TakeBaselineDriftMs();
             s_pipeClock.stepMaxMs = clk.TakeBaselineStepMaxMs();
+            s_pipeClock.riseMaxMs = clk.TakeDelayRiseMaxMs();
             s_pipeClock.delayMs = clk.DelayMs();
             s_pipeClock.targetMs = clk.TargetDelayMs();
             s_pipeClock.excessP95Ms = clk.ExcessP95Ms();
@@ -5576,8 +6070,15 @@ namespace {
     // on that timeline, up to the present: the delay and the class extra it is otherwise behind by, weighted 1 within
     // 30 m of the local player and 0 beyond 45 m (`distM`), the interpolator extrapolating past its newest snapshot
     // by the velocity (arc, capped at 500 ms). `leadMs` returns what was added. dtMs is the frame gap for the slew.
+    //
+    // R3 T5 (docs/sync-specs/vehicle-position.md): with veh_near_clock (default) a near copy is drawn at NetClock::NearT + the link lag instead
+    // (sync::NearLeadWantMs): the lead takes the difference to the delayed clock, so neither the shared delay (it rises and falls) nor the class
+    // extra moves it, and the stamp's missing half round trips (the owner's uplink, our downlink) are added. `ctrl` is the controller's player id
+    // (its round trip comes from the server's LinkInfo; ours from the session). `ideal` (optional) is the owner's report sampled at the same
+    // instant plus the lag: the diagnostic's reference; `lagOut` the link lag, `unledOut` how far the interpolation time is behind it.
     bool SampleVehInterp(uint16_t id, double nowMs, sync::VehicleSample& out, sync::PresentLead* lead = nullptr,
-                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr, double* dispOut = nullptr)
+                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr, double* dispOut = nullptr,
+                         uint16_t ctrl = proto::kNoPlayer, sync::VehicleSample* ideal = nullptr, double* lagOut = nullptr, double* unledOut = nullptr)
     {
         PeersLock lk(g_peersMtx, true);
         if (!g_syncLive || !g_sync.Clock().Ready())
@@ -5588,12 +6089,40 @@ namespace {
         VehNet& v = it->second;
         sync::NetClock& clock = g_sync.Clock();
         const double extra = v.extra.UpdateGap(v.interp.TypicalGapMs(), clock.TickMs(), nowMs, clock.Config().maxSlew);
-        const double add = lead ? lead->Update(distM, clock.DelayMs() + extra, dtMs) : 0.0;
+        const double renderT = clock.RenderT(nowMs);
+        const double nearT = clock.NearT(nowMs);
+        const bool nearOn = g_nearClock.load(std::memory_order_relaxed);
+        double lagMs = 0.0;
+        {
+            // the lag the stamp does not carry: half our round trip (the fastest downlink) + half the controller's (the fastest uplink SampleClock absorbs)
+            double ownerRtt = 0.0;
+            {
+                std::lock_guard<std::mutex> llk(g_linkMtx);
+                const auto rt = g_linkRtt.find(ctrl);
+                if (rt != g_linkRtt.end()) ownerRtt = (double)rt->second;
+            }
+            if (ownerRtt <= 0.0 && ctrl != proto::kNoPlayer && lagOut) ++g_t5.ownerRttUnknown;
+            lagMs = sync::LinkLagMs((double)join::RttMs(), ownerRtt);
+        }
+        double add = 0.0;
+        if (lead)
+        {
+            lead->SetConfig(nearOn ? sync::NearLeadConfig() : sync::PresentLeadConfig());
+            const double want = nearOn ? sync::NearLeadWantMs(nearT, lagMs, renderT, extra) : clock.DelayMs() + extra;
+            add = lead->Update(distM, want, dtMs);
+        }
         if (leadMs)
             *leadMs = add;
-        const double disp = clock.RenderT(nowMs) - extra + add;
+        v.interp.SetExtrapolateMaxMs(sync::VehicleInterpConfig().extrapolateMaxMs + (nearOn ? add : 0.0));   // R3 T5: the cap grows with the lead
+        const double disp = renderT - extra + add;
         if (dispOut)
             *dispOut = disp;
+        if (lagOut)
+            *lagOut = lagMs;
+        if (unledOut)
+            *unledOut = nearT + lagMs - disp;
+        if (ideal)
+            v.interp.Sample(nearT + lagMs, *ideal);
         return v.interp.Sample(disp, out);
     }
     // T4: the copy's own response to a hit becomes its trajectory from `snap.tMs` on (VehicleInterpolator::ReplaceFrom); the stream's pushes are
@@ -5610,6 +6139,21 @@ namespace {
         PeersLock lk(g_peersMtx, true);
         const auto it = g_vehNet.find(id);
         return it != g_vehNet.end() ? it->second.interp.Stats().guarded : 0u;
+    }
+    // R3 T5: the vehicles' interpolator totals over every copy (session totals; the position line prints the 10 s deltas): snapshots stored, identical or
+    // earlier-placed resends dropped, stale ones, teleports.
+    void VehInterpTotals(uint32_t& accepted, uint32_t& repeats, uint32_t& stale, uint32_t& teleports)
+    {
+        accepted = repeats = stale = teleports = 0;
+        PeersLock lk(g_peersMtx, true);
+        for (const auto& kv : g_vehNet)
+        {
+            const sync::VehicleInterpStats& s = kv.second.interp.Stats();
+            accepted += s.accepted;
+            repeats += s.repeats;
+            stale += s.stale;
+            teleports += s.teleports;
+        }
     }
     void ClearVehInterp(uint16_t id)
     {
@@ -5653,13 +6197,16 @@ namespace {
             if (reportNow && s_pipeClock.have && !g_peers.empty())
             {
                 const PipeClockReport& pc = s_pipeClock;
-                char line[420];
+                char line[600];
                 std::snprintf(line, sizeof(line),
                               "engine: pipe clock: %u world/vehicle frames in the last 10 s (arrival gap ms mean %.0f p95 %.0f max %.0f), clock offset moved %+.1f ms, "
-                              "%u steps over 5 ms (largest %.0f ms), %u delay rises, %u reordered frames, %u resyncs; shared delay %.0f ms (target %.0f), lateness p95 "
+                              "%u steps over 5 ms (largest %.0f ms), %u delay rises (%u over 5 ms, mean %.1f ms, largest %.1f ms), %u reordered frames, %u resyncs; shared delay %.0f ms (target %.0f), lateness p95 "
                               "excess %.0f + age %.0f ms",
                               pc.frameGaps.n + 1, pc.frameGaps.MeanMs(), pc.frameGaps.PercentileMs(0.95), pc.frameGaps.maxMs, pc.baselineDriftMs,
                               pc.stats.baselineSteps - pc.seen.baselineSteps, pc.stepMaxMs, pc.stats.delayRises - pc.seen.delayRises,
+                              pc.stats.delayRisesBig - pc.seen.delayRisesBig,
+                              pc.stats.delayRises > pc.seen.delayRises ? (pc.stats.delayRiseSumMs - pc.seen.delayRiseSumMs) / (pc.stats.delayRises - pc.seen.delayRises) : 0.0,
+                              pc.riseMaxMs,
                               pc.stats.reorderedFrames - pc.seen.reorderedFrames, pc.stats.resyncs - pc.seen.resyncs, pc.delayMs, pc.targetMs,
                               pc.excessP95Ms, pc.ageP95Ms);
                 report.emplace_back(line);
@@ -5782,11 +6329,12 @@ namespace {
                     pe.requestedModel = model;         // SpawnRemotePed requests it every call
                     // Returns 0 until the model has streamed in: tried again next frame at the new pose.
                     pe.ped = g_world->SpawnRemotePed((int)model, pose.k.x, pose.k.y, pose.k.z,
-                                                     Heading360(pose.k.heading));
+                                                     Heading360(pose.k.heading), pe.recipe);
                     if (pe.ped)
                     {
-                        PeerLog(false, "engine: spawned remote peer id=%d (%s) as ped %d (model 0x%08x%s)", it->first,
-                                pe.name.c_str(), pe.ped, (unsigned)model, pe.hasLook ? ", own look" : ", no look yet");
+                        PeerLog(pe.recipe != 0, "engine: spawned remote peer id=%d (%s) as ped %d (model 0x%08x%s, creation recipe %d: %s)", it->first,
+                                pe.name.c_str(), pe.ped, (unsigned)model, pe.hasLook ? ", own look" : ", no look yet", pe.recipe,
+                                pe.recipe == 0 ? "full flags" : pe.recipe == 1 ? "LEAN: invincible + events blocked only" : "ALT: civilian ped type, no script-host flag, lean");
                         pe.requestedModel = 0;          // SpawnRemotePed released it after CREATE_PED
                         pe.pedModel = model;
                         pe.spawnSinceMs = 0;
@@ -5869,8 +6417,18 @@ namespace {
                         }
                         report.emplace_back(LocoLine(it->first, pe));   // W8: why the controller issued tasks, what was last applied
                         report.emplace_back(LocoSlideLine(it->first, pe));   // Sync A: the slide metric
+                        report.emplace_back(GaitLine(it->first, pe));        // R3 T2: what the game says the ped does next to the pose
+                    }
+                    {
+                        // R3 T3: one cover line per puppet with cover activity in the last 10 s (the window is taken either way)
+                        const sync::CoverStats cw = pe.cover.TakeWindow();
+                        const std::string cl = sync::CoverPuppetLine(it->first, pe.name, pe.cover.Mode(), pe.cover.CurrentPhase(), pe.cover.LastWhy(), cw,
+                                                                     pe.cover.Stats());
+                        if (!cl.empty())
+                            report.emplace_back(cl);
                     }
                     pe.slide.Reset();
+                    pe.gaitDiag.Reset();
                     pe.shootingFrames = 0;
                     const sync::LocoStats& ls = pe.loco.Stats();
                     pe.locoGoSeen = ls.goStraight;
@@ -5883,6 +6441,19 @@ namespace {
                     pe.samples = pe.extrapolated = pe.held = pe.snaps = 0;
                 }
                 ++it;
+            }
+            if (reportNow && lp && withData > 0)
+            {
+                // R3 T2: the same readings on the LOCAL player while it walks, to set against the puppets' "engine: gait" lines (a puppet
+                // whose active task types never include what the walking player has is not running a locomotion task at all)
+                const int lg = g_world->PedGait(lp);
+                if (lg > 0)
+                {
+                    char lb[120];
+                    std::snprintf(lb, sizeof(lb), "engine: gait local player (for comparison): the game reads %s, GET_ENTITY_SPEED %.2f m/s, active task types [",
+                                  lg == 3 ? "sprinting" : lg == 2 ? "running" : "walking", g_world->GetEntitySpeed(lp));
+                    report.emplace_back(std::string(lb) + ActiveTaskTypes(lp) + "]");
+                }
             }
             if (withData > reported)
                 report.emplace_back("engine: sync: " + std::to_string(withData - reported) + " more peer(s) not listed");
@@ -6006,6 +6577,9 @@ namespace {
                 UnseatPeer(kv.second);
     }
 
+    void ResetVehicleDamage(NetVeh& v);    // R3 T4, below with the rest of the damage code
+    void NoteUnreliableVisual(uint16_t id, const sync::VisualMask& f);
+
     void ForgetVehicleHandle(NetVeh& v)
     {
         v.handle = 0;
@@ -6019,6 +6593,7 @@ namespace {
         v.vis.Reset();                 // T3: a new entity shows nothing of the server's visual state yet
         v.visReadMs = -1e9;
         v.steerPrevRotMs = -1e9;
+        ResetVehicleDamage(v);         // R3 T4: ... nor of the damage state, and every baseline starts over
     }
 
     // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
@@ -6081,7 +6656,19 @@ namespace {
         const bool shotRecent = nowMs - g_lastShotMs < 1500.0;
         VehVisualGame game{ v.handle };
         bool ran = false;
-        const sync::VisualOut o = sync::StepVisual(v.vis, game, server, iControl, nearUs, shotRecent, nowMs, &ran);
+        sync::VisualOut o;
+        if (g_vehVisualGuard.load(std::memory_order_relaxed) && !iControl)
+        {
+            // R3 T4: a copy compares and reports its OWN readback, so that readback goes through the per-slot baselines first (a window slot that
+            // reads smashed on every car would otherwise be fixed, smashed, or reported as a vehicle Hit). The local player's recent shot
+            // corroborates a pop at once; without it a new bit must hold on a second read.
+            sync::VisualMask flagged;
+            o = sync::StepVisualGuarded(v.vis, v.visGuard, game, server, false, nearUs, shotRecent, nowMs, shotRecent, &ran, &flagged);
+            if (flagged.Any())
+                NoteUnreliableVisual(id, flagged);
+        }
+        else
+            o = sync::StepVisual(v.vis, game, server, iControl, nearUs, shotRecent, nowMs, &ran);
         if (!ran)
             return;
         ++g_vis.reads;
@@ -6120,6 +6707,237 @@ namespace {
         }
     }
 
+    // ---- R3 T4: vehicle damage state (Desync Overhaul round 3, protocol v7) -----------------------------------------------------
+    // Petrol tank health, broken doors / headlights and a coarse dent map for the OTHER clients, and the sanity layer that keeps a wrong
+    // read off the wire (libs/sync/vehicle_damage.h has the rules, tests/r3_t4_tests.h the proofs). Switches (HKCU\Software\GAGE-MP):
+    // veh_damage_sync=0, veh_visual_guard=0. The 10 s line is "engine: vehicle damage (R3 T4)" (ReportVehDamage).
+    struct DmgStats
+    {
+        uint32_t ctlReads = 0, blocksSent = 0, adopted = 0, guardsSet = 0, copyRuns = 0, copyReplays = 0;
+        uint32_t flaggedTyres = 0, flaggedWindows = 0, flaggedParts = 0, flaggedDents = 0, flaggedPetrol = 0;
+        uint32_t handLogged = 0;
+    };
+    DmgStats g_dmg;
+
+    void ResetVehicleDamage(NetVeh& v)
+    {
+        v.visGuard.Reset();
+        v.pedalGuard.Reset();
+        v.dmgRep.Reset();
+        v.dmgApply.Reset();
+        v.handLimit.Reset();
+        v.dmgReport = proto::VehicleDamage();
+        v.dmgSend.Reset();
+        v.dmgRaw = sync::DamageRaw();
+        v.dmgReadMs = -1e9;
+        v.lastBodyHp = -1.0f;
+        v.bodyFellMs = -1e9;
+        v.appliedDmgGuard = -1;
+        v.handEff = -1;
+        v.dmgHullKnown = false;
+    }
+
+    // The probe frame of a car: half width, nose and tail from the wheel bones (cached per model), else a mid-size car's. Script tick.
+    sync::DentHull VehicleHullOf(int32_t veh)
+    {
+        static std::map<uint32_t, sync::DentHull> cache;
+        const uint32_t model = g_world->GetEntityModel(veh);
+        if (!model)
+            return sync::DentHull();
+        const auto it = cache.find(model);
+        if (it != cache.end())
+            return it->second;
+        sync::DentHull h;
+        bool measured = false;
+        float px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
+        if (g_world->GetEntityCoords(veh, px, py, pz) && g_world->GetEntityQuaternion(veh, qx, qy, qz, qw))
+        {
+            const sync::DriveQuat inv = sync::vq::Conj(sync::vq::Normalize({ qx, qy, qz, qw }));
+            auto local = [&](const char* bone, sync::DriveVec& out) {
+                const int bi = g_world->GetEntityBoneIndexByName(veh, bone);
+                float wx = 0, wy = 0, wz = 0;
+                if (bi < 0 || !g_world->GetWorldPositionOfEntityBone(veh, bi, wx, wy, wz))
+                    return false;
+                out = sync::vq::Rotate(inv, { wx - px, wy - py, wz - pz });
+                return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
+            };
+            sync::DriveVec lf, lr;
+            if (local("wheel_lf", lf) && local("wheel_lr", lr) && lf.y - lr.y >= 0.8f && lf.y - lr.y <= 12.0f && std::fabs(lf.x) >= 0.2f &&
+                std::fabs(lf.x) <= 2.5f)
+            {
+                h.halfWidth = std::max(0.6f, std::min(1.8f, std::fabs(lf.x) + 0.25f));
+                h.front = std::max(1.2f, std::min(5.0f, lf.y + 0.9f));
+                h.rear = std::min(-1.2f, std::max(-6.0f, lr.y - 0.9f));
+                measured = true;
+            }
+        }
+        cache[model] = h;
+        GLOGI("engine: vehicle: model 0x%08x dent probe frame half width %.2f nose %.2f tail %.2f (%s)", (unsigned)model, (double)h.halfWidth, (double)h.front,
+              (double)h.rear, measured ? "from the wheel bones" : "fallback: the wheel bones did not read");
+        return h;
+    }
+
+    // One entity as vehicle_damage.h's templates see it.
+    struct VehDamageGame
+    {
+        int32_t h;
+        sync::DentHull hull;
+        bool BodyHealth(float& f) { return g_world->GetVehicleBodyHealth(h, f); }
+        bool PetrolHealth(float& f) { return g_world->GetVehiclePetrolTankHealth(h, f); }
+        bool DoorValid(int d, bool& v) { return g_world->GetIsDoorValid(h, d, v); }
+        bool DoorBroken(int d, bool& b) { return g_world->IsVehicleDoorDamaged(h, d, b); }
+        bool LampBroken(int l, bool& b) { return g_world->IsVehicleHeadlightDamaged(h, l == 0, b); }
+        bool Dent(int probe, float& metres)
+        {
+            const sync::DentPoint pt = sync::DentProbePoint(probe, hull);
+            float dx = 0, dy = 0, dz = 0;
+            if (!g_world->GetVehicleDeformationAtPos(h, pt.x, pt.y, pt.z, dx, dy, dz))
+                return false;
+            const float m = std::sqrt(dx * dx + dy * dy + dz * dz);
+            metres = (std::isfinite(m) && m < 2.0f) ? m : 0.0f;          // a non-finite or absurd vector is "no dent", never a huge one
+            return true;
+        }
+        bool BreakDoor(int d) { return g_world->SetVehicleDoorBroken(h, d, true); }
+        bool SetPetrol(float f) { return g_world->SetVehiclePetrolTankHealth(h, f); }
+        bool ReplayLamp(int l, float damage)
+        {
+            const sync::DentPoint pt = sync::LampPoint(l, hull);
+            return g_world->SetVehicleDamage(h, pt.x, pt.y, pt.z, damage, 0.35f, true);
+        }
+        bool ReplayDent(int probe, float damage)
+        {
+            const sync::DentPoint pt = sync::DentProbePoint(probe, hull);
+            return g_world->SetVehicleDamage(h, pt.x, pt.y, pt.z, damage, 1.0f, true);
+        }
+        void BeginReplay() { g_world->SetVehicleCanBeVisiblyDamaged(h, true); }    // a copy cannot be damaged by the game, but the replay must
+        void EndReplay() { g_world->SetVehicleCanBeVisiblyDamaged(h, false); }
+    };
+
+    void EnsureVehicleHull(NetVeh& v)
+    {
+        if (v.dmgHullKnown)
+            return;
+        v.dmgHull = VehicleHullOf(v.handle);
+        v.dmgHullKnown = true;
+    }
+
+    // The controller: its body health fell since the last look (corroborates a tyre / window / dent that appears now).
+    void NoteVehicleBody(NetVeh& v, double nowMs)
+    {
+        float hp = 0.0f;
+        if (!g_world->GetVehicleBodyHealth(v.handle, hp) || !std::isfinite(hp))
+            return;
+        if (v.lastBodyHp >= 0.0f && hp < v.lastBodyHp - 0.5f)
+            v.bodyFellMs = nowMs;
+        v.lastBodyHp = hp;
+    }
+
+    // One line per car and slot (capped): a read that was damaged at the first sample while the server shows nothing. Script tick.
+    void NoteUnreliableVisual(uint16_t id, const sync::VisualMask& f)
+    {
+        g_dmg.flaggedTyres += (uint32_t)sync::PopCount8(f.tyres | f.rim);
+        g_dmg.flaggedWindows += (uint32_t)sync::PopCount8(f.windows);
+        static int logged = 0;
+        if (logged < 40)
+        {
+            ++logged;
+            PeerLog(true, "engine: vehicle id=%u sanity: tyre slot(s) %02x (off rim %02x) and window slot(s) %02x read as DAMAGED at the first sample while the server shows "
+                    "none: unreliable slot(s), not sent and not compared (a slot the model does not have, or a read that never clears)", id, f.tyres, f.rim, f.windows);
+        }
+    }
+
+    // Per script frame and car: the self-damage guards, the copy's handbrake limit and the copy's damage apply. Script tick.
+    void TickVehicleDamage(NetVeh& v, uint16_t id, bool iControl, double nowMs, bool nearUs)
+    {
+        const proto::VehicleState& st = v.st;
+        const int32_t h = v.handle;
+        if (!iControl && g_vehVisualGuard.load(std::memory_order_relaxed))
+        {
+            // The handbrake bit of the controller's state, limited: held on a standing car, released after 4 s of rolling with it.
+            const float sp = std::sqrt(st.k.vx * st.k.vx + st.k.vy * st.k.vy + st.k.vz * st.k.vz);
+            const int eff = v.handLimit.Effective((st.flags2 & proto::kVeh2Handbrake) != 0, sp, nowMs) ? 1 : 0;
+            if (eff != v.handEff)
+            {
+                ++(g_world->SetVehicleHandbrake(h, eff != 0) ? g_vis.handSet : g_vis.handFail);
+                v.handEff = eff;
+            }
+        }
+        if (!g_vehDamageSync.load(std::memory_order_relaxed))
+            return;
+        // A copy is kinematic and only follows its controller: the game must not damage it on its own (a local collision with a puppet, an
+        // engine that degrades, a tank that leaks), because that damage would exist on this machine only. A car we control has the defaults.
+        const int want = iControl ? 0 : 1;
+        if (v.appliedDmgGuard != want)
+        {
+            const bool a = g_world->SetVehicleCanBeVisiblyDamaged(h, iControl);
+            const bool b = g_world->SetVehicleEngineCanDegrade(h, iControl);
+            const bool c = g_world->SetDisableVehiclePetrolTankDamage(h, !iControl);
+            v.appliedDmgGuard = want;
+            ++g_dmg.guardsSet;
+            static int logged = 0;
+            if (logged < 6)
+            {
+                ++logged;
+                PeerLog(false, "engine: vehicle id=%u damage guards for a %s: visibly damaged %s (%s), engine degrades %s (%s), tank damage %s (%s)", id,
+                        iControl ? "car we control" : "copy", iControl ? "on" : "OFF", a ? "ok" : "FAILED", iControl ? "on" : "OFF", b ? "ok" : "FAILED",
+                        iControl ? "on" : "OFF", c ? "ok" : "FAILED");
+            }
+        }
+        if (iControl || !st.dmg.Any())
+            return;                                    // a clean server block costs nothing: not even the probe frame is measured
+        EnsureVehicleHull(v);
+        VehDamageGame game{ h, v.dmgHull };
+        bool ran = false;
+        const sync::DamageCmd cmd = sync::StepDamageCopy(v.dmgApply, game, st.dmg, nearUs, nowMs, &ran, &v.dmgRaw);
+        if (!ran)
+            return;
+        ++g_dmg.copyRuns;
+        if (!cmd.Any())
+            return;
+        ++g_dmg.copyReplays;
+        if (cmd.Replays())
+        {
+            // SET_VEHICLE_DAMAGE lowers the health too: put the server's values back.
+            g_world->SetVehicleBodyHealth(h, (float)st.bodyHealth);
+            g_world->SetVehicleEngineHealth(h, (float)st.engineHealth);
+        }
+        static int logged = 0;
+        if (logged < 24)
+        {
+            ++logged;
+            PeerLog(false, "engine: vehicle id=%u damage (copy): server petrol %u parts %02x dents [%u %u %u %u %u %u %u %u]; local read petrol %.0f doors %02x lamps %x "
+                    "dents [%u %u %u %u %u %u %u %u]; commands: doors %02x lamps %x dents %02x petrol %d (gain %.0f damage per metre)", id, (unsigned)st.dmg.petrol,
+                    (unsigned)st.dmg.parts, st.dmg.dent[0], st.dmg.dent[1], st.dmg.dent[2], st.dmg.dent[3], st.dmg.dent[4], st.dmg.dent[5], st.dmg.dent[6], st.dmg.dent[7],
+                    (double)v.dmgRaw.petrol, v.dmgRaw.doors, v.dmgRaw.lamps, v.dmgRaw.dent[0], v.dmgRaw.dent[1], v.dmgRaw.dent[2], v.dmgRaw.dent[3], v.dmgRaw.dent[4],
+                    v.dmgRaw.dent[5], v.dmgRaw.dent[6], v.dmgRaw.dent[7], cmd.breakDoors, cmd.lamps, cmd.dents, cmd.petrol ? 1 : 0, (double)v.dmgApply.Gain());
+        }
+    }
+
+    // The controller adopts the server's LOWER health: a vehicle Hit lowers the server's body / engine health, but our own car took no bullet
+    // (the shooter's game hit its copy), so without this it would show no smoke while every copy does. Script tick.
+    void AdoptServerHealth(NetVeh& v, uint16_t id)
+    {
+        if (!g_vehDamageSync.load(std::memory_order_relaxed))
+            return;
+        float body = 0.0f, engine = 0.0f;
+        const proto::VehicleState& st = v.st;
+        bool did = false;
+        if (g_world->GetVehicleBodyHealth(v.handle, body) && sync::ShouldAdoptServerHealth((float)st.bodyHealth, body))
+            did = g_world->SetVehicleBodyHealth(v.handle, (float)st.bodyHealth) || did;
+        if (g_world->GetVehicleEngineHealth(v.handle, engine) && sync::ShouldAdoptServerHealth((float)st.engineHealth, engine))
+            did = g_world->SetVehicleEngineHealth(v.handle, (float)st.engineHealth) || did;
+        if (!did)
+            return;
+        ++g_dmg.adopted;
+        static int logged = 0;
+        if (logged < 8)
+        {
+            ++logged;
+            PeerLog(false, "engine: vehicle id=%u (ours): adopted the server's lower health (a vehicle Hit): body %.0f -> %u, engine %.0f -> %u", id, (double)body,
+                    (unsigned)st.bodyHealth, (double)engine, (unsigned)st.engineHealth);
+        }
+    }
+
     // The server's own fields of a vehicle state onto its entity, when a new full state came in.
     // Driver-owned fields (engine, siren, horn) only when someone else drives it.
     // The controller's high beam, interior light, indicators, doors and roof on our copy, only the bits that differ
@@ -6145,7 +6963,9 @@ namespace {
             g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0);
         if (d.flags2 & proto::kVeh2Brake)
             ++(g_world->SetVehicleBrakeLights(h, (st.flags2 & proto::kVeh2Brake) != 0) ? g_vis.brakeSet : g_vis.brakeFail);
-        if (d.flags2 & proto::kVeh2Handbrake)   // the first sight applies "released" too: a copy must not keep a handbrake of its own
+        // The first sight applies "released" too: a copy must not keep a handbrake of its own. With the sanity layer on (R3 T4) the handbrake is
+        // applied per frame by TickVehicleDamage (HandbrakeLimiter) instead, so a claim that outlives a moving car is released.
+        if ((d.flags2 & proto::kVeh2Handbrake) && !g_vehVisualGuard.load(std::memory_order_relaxed))
             ++(g_world->SetVehicleHandbrake(h, (st.flags2 & proto::kVeh2Handbrake) != 0) ? g_vis.handSet : g_vis.handFail);
         if (d.flags2 & proto::kVeh2RoofDown)
         {
@@ -6157,6 +6977,9 @@ namespace {
         for (int door = 0; door < sync::kBodyDoors; ++door)
         {
             if (!(d.doors & (1u << door)))
+                continue;
+            // R3 T4: a door that is broken off is neither open nor shut (its angle ratio reads as open for ever): do not fight the damage replay.
+            if (g_vehDamageSync.load(std::memory_order_relaxed) && (st.dmg.parts & (1u << door)))
                 continue;
             if (st.doors & (1u << door))
                 g_world->SetVehicleDoorOpen(h, door, false, instantly);
@@ -6199,7 +7022,10 @@ namespace {
             v.appliedLights = lights;
         }
         if (iControl)
+        {
+            AdoptServerHealth(v, st.id);       // R3 T4
             return;
+        }
         ApplyVehicleBody(v);
         if (st.flags2 & proto::kVeh2Brake)
             g_world->SetVehicleBrakeLights(h, true);       // renewed by every full state while they are on (INFERRED: the native may not hold)
@@ -6426,6 +7252,10 @@ namespace {
             const bool haveLc = lpVeh && g_world->GetEntityCoords(lpVeh, lcx, lcy, lcz);
             for (auto& kv : g_vehs)
                 kv.second.contactPosValid = false;
+            // R3 T5 (proximity contact): OUR vehicle as the oriented box the server's arbiter uses, read once per frame and only when a copy is close enough to ask.
+            sync::impact::Pose t5OwnPose;
+            sync::impact::MassClass t5OwnMc = sync::impact::MassClass::Car;
+            bool t5OwnTried = false, t5OwnOk = false;
             size_t spawned = 0;
             for (const auto& kv : g_vehs)
                 if (kv.second.handle)
@@ -6541,6 +7371,7 @@ namespace {
                     v.visReadMs = -1e9;
                     v.sentVis = sync::VisualMask();
                     v.steerPrevRotMs = -1e9;
+                    ResetVehicleDamage(v);             // R3 T4: new role, new baselines
                 }
                 if (v.appliedVersion != v.stVersion)
                 {
@@ -6553,6 +7384,7 @@ namespace {
                     const float vdx = st.k.x - lpx, vdy = st.k.y - lpy, vdz = st.k.z - lpz;
                     const bool visNear = mine || (haveLp && vdx * vdx + vdy * vdy + vdz * vdz <= kVisNearM * kVisNearM);
                     TickVehicleVisual(v, id, iControl, nowMs, visNear, lp);
+                    TickVehicleDamage(v, id, iControl, nowMs, visNear);    // R3 T4
                 }
                 // W9 item 4 (passenger engine sound): the engine flag above is applied only when the server's flag CHANGES, and the
                 // server clears it at 0 fuel, so a car the local ped rides in as a passenger could sit with its engine stopped on
@@ -6602,7 +7434,11 @@ namespace {
                                                                (double)(st.k.z - lpz) * (st.k.z - lpz))
                                                    : 1e9;
                     double dispT = 0.0;   // T4: the interpolation time of this frame (an adopted response is stored at it)
-                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT))
+                    sync::VehicleSample t5Ideal;   // R3 T5: the owner's report sampled at (now + link lag): the diagnostic's reference
+                    double t5Lag = 0.0, t5Unled = 0.0;
+                    const bool t5Diag = leadDist < 120.0;
+                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT, st.ctrl,
+                                        t5Diag ? &t5Ideal : nullptr, &t5Lag, &t5Unled))
                     {
                         if (v.leadMs > 1.0)
                             ++g_v4.leadFrames;
@@ -6630,7 +7466,66 @@ namespace {
                             }
                             else
                                 v.lastContactFlag = false;
+                            // R3 T5 (proximity contact): this copy's drawn pose against OUR vehicle, both as the arbiter's boxes, 120 ms ahead.
+                            in.proximity = false;
+                            if (g_proxContact.load(std::memory_order_relaxed) && haveLc && !mine && leadDist < 40.0)
+                            {
+                                if (!t5OwnTried)
+                                {
+                                    t5OwnTried = true;
+                                    float ovx = 0, ovy = 0, ovz = 0, oqx, oqy, oqz, oqw, owx = 0, owy = 0, owz = 0;
+                                    if (g_world->GetEntityVelocity(lpVeh, ovx, ovy, ovz) && g_world->GetEntityQuaternion(lpVeh, oqx, oqy, oqz, oqw))
+                                    {
+                                        if (!g_world->GetEntityRotationVelocity(lpVeh, owx, owy, owz)) owz = 0;
+                                        t5OwnPose.p = { (double)lcx, (double)lcy };
+                                        t5OwnPose.v = { (double)ovx, (double)ovy };
+                                        t5OwnPose.h = sync::vq::HeadingDeg({ oqx, oqy, oqz, oqw }) * (3.14159265358979323846 / 180.0);
+                                        t5OwnPose.w = owz;
+                                        static int32_t clsHandle = 0;
+                                        static int cls = -1;
+                                        if (clsHandle != lpVeh) { clsHandle = lpVeh; cls = g_world->GetVehicleClass(lpVeh); }
+                                        t5OwnMc = cls >= 0 ? sync::impact::MassClassOfVehicleClass(cls) : sync::impact::MassClass::Car;
+                                        t5OwnOk = true;
+                                    }
+                                }
+                                if (t5OwnOk)
+                                {
+                                    const sync::impact::Pose pc{ { (double)in.localPos.x, (double)in.localPos.y }, { (double)s.vel.x, (double)s.vel.y },
+                                                                 sync::vq::HeadingDeg(in.localRot) * (3.14159265358979323846 / 180.0), (double)s.angVel.z };
+                                    const sync::impact::MassClass cmc = v.vehClass >= 0 ? sync::impact::MassClassOfVehicleClass(v.vehClass) : sync::impact::MassClass::Car;
+                                    if (sync::impact::PredictOverlap(t5OwnPose, t5OwnMc, pc, cmc, sync::impact::ProximityCfg()).hit)
+                                    {
+                                        in.proximity = true;
+                                        ++g_t5.proxFrames;
+                                    }
+                                }
+                            }
                             sync::VehicleDriveOutput o = v.drive.Update(in);
+                            if (t5Diag)
+                            {
+                                // R3 T5: drawn (the entity's position before this frame's commands) vs the owner's report at (now + link lag), the aim and the tracking.
+                                auto d3 = [](const sync::DriveVec& a, const sync::DriveVec& b) {
+                                    return std::sqrt((double)(a.x - b.x) * (a.x - b.x) + (double)(a.y - b.y) * (a.y - b.y) + (double)(a.z - b.z) * (a.z - b.z));
+                                };
+                                sync::PositionDiag::Frame pf;
+                                pf.speedMps = std::sqrt((double)s.vel.x * s.vel.x + (double)s.vel.y * s.vel.y + (double)s.vel.z * s.vel.z);
+                                pf.distM = leadDist;
+                                pf.totalM = d3(in.localPos, t5Ideal.pos);
+                                pf.targetM = d3(s.pos, t5Ideal.pos);
+                                pf.trackM = o.posErrorM;
+                                pf.unledMs = t5Unled;
+                                pf.leadMs = v.leadMs;
+                                pf.snapped = o.snap;
+                                g_t5.pos.Add(pf);
+                                g_t5.lagSum += t5Lag;
+                                ++g_t5.lagN;
+                                g_t5.lagMax = std::max(g_t5.lagMax, t5Lag);
+                            }
+                            {
+                                const uint32_t pu = v.drive.Stats().proximityUpgrades;
+                                g_t5.proxUpgraded += pu - v.proxUpgradesSeen;
+                                v.proxUpgradesSeen = pu;
+                            }
                             // T4 (vehicle collisions): when this copy took an impulse inside the last frame (the contact the controller just
                             // detected), that is the OTHER car's response to the hit from the game's own physics. The controller's next command
                             // would pull it back to the stream, which still carries the pre-impact motion for the whole network latency: the copy
@@ -6686,6 +7581,8 @@ namespace {
                                     ++g_v4.contactsFlag;
                                 else if (o.contactOpened == 2)
                                     ++g_v4.contactsDecel;
+                                else if (o.contactOpened == 4)
+                                    ++g_t5.proxOpened;                  // R3 T5: the proximity trigger (the copy was about to overlap our car)
                                 else
                                     ++g_v4.contactsKick;
                                 static int graceLogged = 0;
@@ -6694,7 +7591,7 @@ namespace {
                                     ++graceLogged;
                                     PeerLog(false, "engine: vehicle id=%u: contact on the remote copy (%s): soft correction for %.0f ms "
                                             "(speed %.1f m/s, error %.2f m, deviation from the last command %.1f m/s)", id,
-                                            o.contactOpened == 1 ? "collision flag" : (o.contactOpened == 2 ? "speed loss" : "velocity kick"),
+                                            o.contactOpened == 1 ? "collision flag" : (o.contactOpened == 2 ? "speed loss" : (o.contactOpened == 4 ? "proximity: about to overlap our car" : "velocity kick")),
                                             sync::VehicleDriveConfig().contactGraceMs, std::sqrt((double)in.localVel.x * in.localVel.x + (double)in.localVel.y * in.localVel.y +
                                                                                         (double)in.localVel.z * in.localVel.z), (double)o.posErrorM,
                                             (double)o.devMs);
@@ -7764,24 +8661,85 @@ namespace {
                                       g_world->GetControlNormal(0, kCtlVehHandbrake, hand);
                 if (!pedalsOk)
                     ++g_vis.pedalReadFail;
-                const sync::BrakeState bs = sync::ClassifyBrake(pedalsOk, accel, brake, hand, vFwd);
+                // R3 T4: a handbrake read that is held at the first sample of a rolling car, or that stays held while the car does not slow down, is
+                // a stuck read and is not sent (the brake lights then come from the foot brake alone). veh_visual_guard=0: the v6 classification.
+                const bool guardOn = g_vehVisualGuard.load(std::memory_order_relaxed);
+                const uint32_t stuckBefore = v.pedalGuard.Stats().stuckRuns;
+                const sync::BrakeState bs = guardOn ? v.pedalGuard.Classify(pedalsOk, accel, brake, hand, vFwd, nowMs)
+                                                    : sync::ClassifyBrake(pedalsOk, accel, brake, hand, vFwd);
+                if (guardOn && v.pedalGuard.Stats().stuckRuns != stuckBefore && g_dmg.handLogged < 12)
+                {
+                    ++g_dmg.handLogged;
+                    PeerLog(true, "engine: vehicle id=%u sanity: the handbrake control (id %d) reads %.2f at %.1f m/s and the car does not slow down: a stuck read, NOT sent as "
+                            "a handbrake until it reads released (pedals: accelerate %.2f, brake %.2f)", id, kCtlVehHandbrake, (double)hand, (double)vFwd, (double)accel, (double)brake);
+                }
                 brakeBit = bs.brakeLights;
                 handBit = bs.handbrake;
             }
             if (nowMs - v.visReadMs >= kVisReadMs)
             {
                 VehVisualGame game{ v.handle };
-                v.visReport = sync::ReadReport(v.vis, game);
+                if (g_vehVisualGuard.load(std::memory_order_relaxed))
+                {
+                    // R3 T4: what goes on the wire passes the per-slot baselines. The body health falling is the corroborating signal.
+                    NoteVehicleBody(v, nowMs);
+                    sync::VisualMask flagged;
+                    v.visReport = sync::ReadReportGuarded(v.vis, v.visGuard, game, sync::VisualMask{ v.st.tyres, v.st.tyresRim, v.st.windows },
+                                                          nowMs - v.bodyFellMs <= 3000.0, &flagged);
+                    if (flagged.Any())
+                        NoteUnreliableVisual(id, flagged);
+                }
+                else
+                    v.visReport = sync::ReadReport(v.vis, game);
                 v.visReadMs = nowMs;
             }
+            // R3 T4: the damage block. Read every 500 ms (250 ms while the body health is falling), through the baselines; it rides the next
+            // few updates after a change (the state channel may lose one) and is repeated every 3 s while the server does not show it.
+            const bool dmgOn = g_vehDamageSync.load(std::memory_order_relaxed);
+            if (dmgOn && nowMs - v.dmgReadMs >= (nowMs - v.bodyFellMs <= 3000.0 ? 250.0 : 500.0))
+            {
+                EnsureVehicleHull(v);
+                VehDamageGame dg{ v.handle, v.dmgHull };
+                sync::DamageReporter::Flagged fl;
+                v.dmgReport = sync::StepDamageController(v.dmgRep, dg, v.st.dmg, nowMs, &fl, true, &v.dmgRaw);
+                v.dmgReadMs = nowMs;
+                ++g_dmg.ctlReads;
+                if (v.dmgRaw.bodyOk && std::isfinite(v.dmgRaw.body))
+                {
+                    if (v.lastBodyHp >= 0.0f && v.dmgRaw.body < v.lastBodyHp - 0.5f)
+                        v.bodyFellMs = nowMs;
+                    v.lastBodyHp = v.dmgRaw.body;
+                }
+                v.dmgSend.Observe(v.dmgReport, v.st.dmg);
+                if (fl.parts || fl.dents || fl.petrol)
+                {
+                    g_dmg.flaggedParts += (uint32_t)sync::PopCount8(fl.parts);
+                    g_dmg.flaggedDents += (uint32_t)sync::PopCount8(fl.dents);
+                    g_dmg.flaggedPetrol += fl.petrol ? 1u : 0u;
+                    static int flagLogged = 0;
+                    if (flagLogged < 30)
+                    {
+                        ++flagLogged;
+                        PeerLog(true, "engine: vehicle id=%u sanity: door/lamp bits %02x, dent probe(s) %02x%s read as DAMAGED at the first sample while the server shows none: "
+                                "unreliable, not sent", id, fl.parts, fl.dents, fl.petrol ? " and the petrol tank (low)" : "");
+                    }
+                }
+            }
+            const bool sendDmg = dmgOn && v.dmgSend.Due(v.dmgReport, v.st.dmg, nowMs);
             u.flags2 = (uint8_t)((v.bodyFlags2 & ~(proto::kVeh2Brake | proto::kVeh2Handbrake)) | (brakeBit ? proto::kVeh2Brake : 0) |
                                  (handBit ? proto::kVeh2Handbrake : 0));
-            u.doors = v.bodyDoors;
+            // A door that is broken off reads as open for ever: it is not an open door (the copy would fight the damage replay).
+            u.doors = (uint8_t)(v.bodyDoors & ~(dmgOn ? (v.dmgReport.parts & proto::kVehDmgDoorsMask) : 0));
             u.tyres = v.visReport.tyres;
             u.tyresRim = v.visReport.rim;
             u.windows = v.visReport.windows;
+            if (sendDmg)
+            {
+                u.hasDmg = true;
+                u.dmg = v.dmgReport;
+            }
             const bool changed = !v.sentOnce || u.flags != v.sentFlags || u.flags2 != v.sentFlags2 || u.doors != v.sentDoors ||
-                                 v.visReport != v.sentVis || std::fabs(u.steer - v.sentSteer) > 0.04f;
+                                 v.visReport != v.sentVis || std::fabs(u.steer - v.sentSteer) > 0.04f || (sendDmg && v.dmgSend.Fresh());
             if (!v.sendGate.Due(nowMs, v.moving, changed))
                 return;
             auto clampHp = [](float hp) -> uint16_t {
@@ -7795,12 +8753,25 @@ namespace {
             if (join::SendVehicleState(u, sampleMs))
             {
                 ++g_v4.vehUpdates;
+                {
+                    // R3 T5, the controller's side of the position line: how fast the cars we send were going (the other machine's per-band numbers are its
+                    // view of exactly these frames).
+                    const double sp = std::sqrt((double)u.k.vx * u.k.vx + (double)u.k.vy * u.k.vy + (double)u.k.vz * u.k.vz);
+                    ++g_t5.sentFrames[sync::PositionDiag::SpeedBand(sp)];
+                    g_t5.sentSpeedSum += sp;
+                    ++g_t5.sentN;
+                }
                 v.sentOnce = true;
                 v.sentFlags = u.flags;
                 v.sentFlags2 = u.flags2;
                 v.sentDoors = u.doors;
                 v.sentVis = v.visReport;
                 v.sentSteer = u.steer;
+                if (u.hasDmg)
+                {
+                    v.dmgSend.Sent(nowMs);
+                    ++g_dmg.blocksSent;
+                }
                 ++g_vis.sentUpdates;
                 if (u.tyres) ++g_vis.sentWithTyres;
                 if (u.windows) ++g_vis.sentWithWindows;
@@ -8256,13 +9227,18 @@ namespace {
         }
         g_link.Reset();
         g_vitals.Reset(g_playerHealth.load(), 0);     // the server playerHealth, no armour (Welcome)
-        ApplyServerMaxHealth(g_world->LocalPlayer(), "session start");
+        g_health.Reset();
+        if (!g_v4ResetEnded.load())
+            ApplyServerMaxHealth(g_world->LocalPlayer(), "session start", true);
+        else
+            g_vitals.SetScale(sync::HealthScale());   // R3 T1: a session ended: no stale SCALED mode (and no health written to the offline ped)
         g_respawnGate.OnAlive();
         g_hits.Clear();
         g_localEmote.Clear();
         SyncLocalEmoteDict();
         g_localReact.Clear();
         g_meleeGate.Reset();
+        g_swingLadder.SetMode((sync::SwingMode)g_meleeAnimWanted.load());   // R3 T6: a new session starts the ladder from the registry mode again
         ReleaseSwingDicts();
         g_haveRespawnOk = false;
         g_localSeat = -1;
@@ -8301,9 +9277,18 @@ namespace {
             rechargeOff = server;
             rechargeAtMs = nowMs;
         }
+        // R3 T1: the probe's one-frame and one-second read-backs; the tracker waits the one tick the ped still holds the probe's value.
+        ++g_healthTick;
+        bool healthHold = false;
+        if (lp)
+        {
+            HealthPort hport{lp};
+            healthHold = g_health.Pre(hport, lp, g_vitals, g_healthTick, nowMs);
+            DrainHealthLog();
+        }
         // Alive, and Dying until the server has us dead: a lethal self-hit the server never answered is
         // re-sent after the tracker's ack timeout only if the tracker keeps ticking while we lie dead.
-        if (lp && sync::VitalsTickDue(server, g_life == Life::Alive, g_life == Life::Dying, g_vitals.ServerDead()))
+        if (lp && !healthHold && sync::VitalsTickDue(server, g_life == Life::Alive, g_life == Life::Dying, g_vitals.ServerDead()))
         {
             sync::VitalsObs ob;
             ob.nowMs = nowMs;
@@ -8356,7 +9341,13 @@ namespace {
                 g_vitalsPrevTotal = total;
             g_world->ClearLastDamage(lp);
             const sync::VitalsOut v = g_vitals.Tick(ob);
-            if (v.selfHitCount)
+            if (v.probe)
+            {
+                // R3 T1: measure this ped now (a handle nobody probed, or a mismatch GTA kept); the tracker said nothing else this tick.
+                g_vitalsPrevTotal = -1;
+                ApplyServerMaxHealth(lp, v.probeWhy);
+            }
+            else if (v.selfHitCount)
             {
                 static uint32_t fallHash = 0;
                 if (!fallHash)
@@ -8698,6 +9689,77 @@ namespace {
         g_vis.yawRatioN = 0;
     }
 
+    // R3 T4, every 10 s with the vehicles lines: the vehicle damage state, the controller's reads AND the copy's applied state per damaged car, so
+    // ONE log shows a divergence (the "ctl" line is what our game reads off a car we control and what we report; the "copy" line is the server's
+    // block next to what our game shows on a car somebody else controls), plus the sanity layer's counters and the pedal histogram that answers
+    // whether the handbrake / brake-light reads are plausible. Script tick.
+    void ReportVehDamage()
+    {
+        sync::PedalStats ped;
+        sync::DamageStats rep;
+        sync::ApplierStats app;
+        uint32_t handReleases = 0, tyreUnrel = 0, winUnrel = 0, partsUnrel = 0, dentUnrel = 0;
+        float gain = 0.0f;
+        for (auto& kv : g_vehs)
+        {
+            const NetVeh& n = kv.second;
+            const sync::PedalStats& ps = n.pedalGuard.Stats();
+            ped.samples += ps.samples; ped.moving += ps.moving; ped.accelHigh += ps.accelHigh; ped.brakeHigh += ps.brakeHigh; ped.handHigh += ps.handHigh;
+            ped.brakeRolling += ps.brakeRolling; ped.handDropped += ps.handDropped; ped.stuckRuns += ps.stuckRuns;
+            ped.maxAccel = std::max(ped.maxAccel, ps.maxAccel); ped.maxBrake = std::max(ped.maxBrake, ps.maxBrake); ped.maxHand = std::max(ped.maxHand, ps.maxHand);
+            handReleases += n.handLimit.Releases();
+            const sync::DamageStats& rs = n.dmgRep.Stats();
+            rep.reads += rs.reads; rep.sentRises += rs.sentRises;
+            const sync::ApplierStats& as = n.dmgApply.Stats();
+            app.reads += as.reads; app.divergent += as.divergent; app.doorsBroken += as.doorsBroken; app.lampsReplayed += as.lampsReplayed;
+            app.dentsReplayed += as.dentsReplayed; app.petrolSet += as.petrolSet; app.dentConverged += as.dentConverged; app.dentNoEffect += as.dentNoEffect;
+            app.dentGaveUp += as.dentGaveUp; app.cmdFailures += as.cmdFailures; app.suspends += as.suspends;
+            if (as.gainUpdates) { gain = n.dmgApply.Gain(); app.gainUpdates += as.gainUpdates; }
+            const sync::VisualMask u = n.visGuard.Unreliable();
+            tyreUnrel += (uint32_t)sync::PopCount8(u.tyres | u.rim);
+            winUnrel += (uint32_t)sync::PopCount8(u.windows);
+            partsUnrel += (uint32_t)sync::PopCount8(n.dmgRep.UnreliableParts());
+            dentUnrel += (uint32_t)sync::PopCount8(n.dmgRep.UnreliableDents());
+        }
+        const DmgStats& c = g_dmg;
+        const bool active = c.ctlReads || c.blocksSent || c.copyRuns || c.guardsSet || c.adopted || ped.samples || tyreUnrel || winUnrel;
+        if (join::IsConnected() && active)
+        {
+            GLOGI("engine: vehicle damage (R3 T4), last 10 s: veh_damage_sync %s, veh_visual_guard %s; as controller: %u damage reads, %u updates carried the block, "
+                  "%u adopted a lower server health (a vehicle Hit); SANITY: unreliable slots now: tyres %u, windows %u, doors/lamps %u, dents %u (flagged in the window: "
+                  "tyres %u windows %u doors/lamps %u dents %u petrol %u); PEDALS since the first sight of each car: %u samples (%u rolling), accelerator>0.1 %u, brake>0.1 %u, "
+                  "handbrake>0.5 %u, foot brake while rolling forward %u, max accel %.2f brake %.2f hand %.2f, handbrake withheld as stuck %u samples (%u runs); as copy: %u "
+                  "damage reads, doors broken %u, lamps replayed %u, dents replayed %u (converged %u, no effect %u, gave up %u, gain %.0f damage per metre after %u "
+                  "read-backs), petrol set %u, failed rounds %u (%u back-offs), handbrake releases after a long roll %u, self-damage guards set %u",
+                  g_vehDamageSync.load() ? "on" : "OFF", g_vehVisualGuard.load() ? "on" : "OFF", c.ctlReads, c.blocksSent, c.adopted, tyreUnrel, winUnrel, partsUnrel,
+                  dentUnrel, c.flaggedTyres, c.flaggedWindows, c.flaggedParts, c.flaggedDents, c.flaggedPetrol, ped.samples, ped.moving, ped.accelHigh, ped.brakeHigh,
+                  ped.handHigh, ped.brakeRolling, (double)ped.maxAccel, (double)ped.maxBrake, (double)ped.maxHand, ped.handDropped, ped.stuckRuns, c.copyRuns,
+                  app.doorsBroken, app.lampsReplayed, app.dentsReplayed, app.dentConverged, app.dentNoEffect, app.dentGaveUp, (double)gain, app.gainUpdates, app.petrolSet,
+                  app.cmdFailures, app.suspends, handReleases, c.guardsSet);
+            int lines = 0;
+            for (const auto& kv : g_vehs)
+            {
+                const NetVeh& n = kv.second;
+                if (!n.handle || !n.haveState || lines >= 4)
+                    continue;
+                const bool ours = n.st.ctrl == join::MyId();
+                const proto::VehicleDamage& d = ours ? n.dmgReport : n.st.dmg;
+                if (!n.st.dmg.Any() && !d.Any() && n.st.bodyHealth >= 990)
+                    continue;
+                ++lines;
+                GLOGI("engine: vehicle id=%u damage (%s): server body %u engine %u petrol %u parts %02x dents [%u %u %u %u %u %u %u %u]; %s read body %.0f petrol %.0f "
+                      "doors %02x lamps %x dents [%u %u %u %u %u %u %u %u]%s", (unsigned)kv.first, ours ? "ctl" : "copy", (unsigned)n.st.bodyHealth, (unsigned)n.st.engineHealth,
+                      (unsigned)n.st.dmg.petrol, (unsigned)n.st.dmg.parts, n.st.dmg.dent[0], n.st.dmg.dent[1], n.st.dmg.dent[2], n.st.dmg.dent[3], n.st.dmg.dent[4],
+                      n.st.dmg.dent[5], n.st.dmg.dent[6], n.st.dmg.dent[7], ours ? "controller's" : "copy's own", (double)n.dmgRaw.body, (double)n.dmgRaw.petrol,
+                      n.dmgRaw.doors, n.dmgRaw.lamps, n.dmgRaw.dent[0], n.dmgRaw.dent[1], n.dmgRaw.dent[2], n.dmgRaw.dent[3], n.dmgRaw.dent[4], n.dmgRaw.dent[5],
+                      n.dmgRaw.dent[6], n.dmgRaw.dent[7],
+                      ours ? "" : (n.dmgRaw.Any() ? "" : " (not read yet)"));
+            }
+        }
+        g_dmg.ctlReads = g_dmg.blocksSent = g_dmg.adopted = g_dmg.copyRuns = g_dmg.copyReplays = 0;
+        g_dmg.flaggedTyres = g_dmg.flaggedWindows = g_dmg.flaggedParts = g_dmg.flaggedDents = g_dmg.flaggedPetrol = 0;
+    }
+
     // Every 10 s: one line each for vehicles, combat and anims (only while connected).
     void ReportV4(double nowMs)
     {
@@ -8708,6 +9770,7 @@ namespace {
             return;
         lastMs = nowMs;
         ReportVehVisual();                             // T3
+        ReportVehDamage();                             // R3 T4
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
         g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;
@@ -8837,6 +9900,44 @@ namespace {
                 }
             }
             {
+                // R3 T5 (vehicle position): where a remote copy is DRAWN against where its owner's report puts it now (+ the link lag), per speed and distance band,
+                // with the terms behind it, and the controller's side (how fast the cars we send were going), so ONE log has both views. Read with
+                // docs/sync-specs/vehicle-position.md: a mean of metres at 15-30 m/s with "aim N ms behind" ~ 0 = the lag is the network (check the link lag line);
+                // "aim" large = the lead is not closing the render delay; "tracking" large = the drive controller / physics.
+                static uint32_t lastLinkIn = 0, lastAcc = 0, lastRep = 0, lastStale = 0, lastTele = 0;
+                uint32_t acc = 0, rep = 0, stl = 0, tel = 0;
+                VehInterpTotals(acc, rep, stl, tel);
+                const sync::PositionDiag::Window pw = g_t5.pos.Take();
+                const uint32_t linkIn = g_linkInfoIn.load(std::memory_order_relaxed);
+                if (pw.frames > 0 || g_t5.sentN > 0 || linkIn != lastLinkIn)
+                {
+                    std::string owners;
+                    {
+                        std::lock_guard<std::mutex> llk(g_linkMtx);
+                        for (const auto& rt : g_linkRtt)
+                            owners += (owners.empty() ? "" : ", ") + std::to_string(rt.first) + ":" + std::to_string(rt.second) + " ms";
+                    }
+                    const sync::NetClock& clk5 = g_sync.Clock();
+                    GLOGI("engine: vehicle position (R3 T5), last 10 s: near clock %s, proximity contact %s; our round trip %u ms, controllers' (server's view) [%s], %u LinkInfo in, "
+                          "owner's round trip unknown on %u frames; link lag used mean %.0f max %.0f ms; shared delay %.0f ms; copies: %s; proximity: %u frames predicted an overlap, "
+                          "%u graces opened, %u upgraded to a real contact; snapshots in 10 s: %u stored, %u resends dropped, %u stale, %u teleports; "
+                          "as controller: %u updates sent (mean speed %.1f m/s; speed bands 0-5/5-15/15-30/over 30: %u/%u/%u/%u)",
+                          g_nearClock.load() ? "on" : "OFF", g_proxContact.load() ? "on" : "OFF", (unsigned)join::RttMs(), owners.c_str(), linkIn - lastLinkIn,
+                          g_t5.ownerRttUnknown, g_t5.lagN ? g_t5.lagSum / g_t5.lagN : 0.0, g_t5.lagMax, clk5.DelayMs(), sync::PositionDiag::Format(pw).c_str(),
+                          g_t5.proxFrames, g_t5.proxOpened, g_t5.proxUpgraded, (acc >= lastAcc ? acc - lastAcc : 0u), (rep >= lastRep ? rep - lastRep : 0u), (stl >= lastStale ? stl - lastStale : 0u), (tel >= lastTele ? tel - lastTele : 0u),
+                          g_t5.sentN, g_t5.sentN ? g_t5.sentSpeedSum / g_t5.sentN : 0.0,
+                          g_t5.sentFrames[0], g_t5.sentFrames[1], g_t5.sentFrames[2], g_t5.sentFrames[3]);
+                }
+                lastLinkIn = linkIn;
+                lastAcc = acc; lastRep = rep; lastStale = stl; lastTele = tel;
+                g_t5.proxFrames = g_t5.proxOpened = g_t5.proxUpgraded = 0;
+                g_t5.lagSum = g_t5.lagMax = 0.0;
+                g_t5.lagN = g_t5.ownerRttUnknown = 0;
+                g_t5.sentN = 0;
+                g_t5.sentSpeedSum = 0.0;
+                for (uint32_t& sf : g_t5.sentFrames) sf = 0;
+            }
+            {
                 // T4 (vehicle collisions): the contacts our cars felt, the copies whose response was adopted, the server's impacts and what became of
                 // them, and the divergence estimate (a copy against its controller's stream 500 ms after the contact). Read with
                 // docs/sync-specs/vehicle-collisions.md: "adopted" > 0 with "refused" 0 = the copy path ran; "applied" > 0 = the server's resolution
@@ -8888,14 +9989,8 @@ namespace {
                   vs.clampsDown, vs.kills, hs.dropped, hs.rateHeld);
             // T6 health line: what the ped really holds against what the server says, and the counters that explain a
             // mismatch (see the T6 report for how to read it).
-            GLOGI("engine: health: ped %d / max %d, server health %u of playerHealth %u (ped max should be %d), bar %.0f%%; "
-                  "totals: max changes %u, gains undone %u, largest self-hit %u, ped swaps %u, reconciles %u (gave up %u), "
-                  "max reads unreadable %u, max writes %u (failed %u, read-back differs %u, last wish %d / read %d)",
-                  vs.obsHealth, vs.obsMax, (unsigned)g_vitals.Health(), (unsigned)g_playerHealth.load(),
-                  sync::PedMaxHealth(g_playerHealth.load()),
-                  sync::HudHealthFraction(vs.obsHealth, vs.obsMax, g_playerHealth.load(), g_vitals.LastGoodMax()) * 100.0f,
-                  vs.maxChanges, vs.clampsDown, vs.largestSelfHit, vs.pedSwaps, vs.reconciles, vs.reconcileGaveUp,
-                  vs.maxUnreadable, vs.maxWrites, vs.maxWriteFails, vs.maxReadBackOff, vs.lastMaxWanted, vs.lastMaxReadBack);
+            // R3 T1: ONE line that tells which GTA behaviour is true (mode, measured ceiling, ped against server, bar, read-backs, reconciler).
+            GLOGI("%s", g_health.StatusLine(g_vitals, (int)g_playerHealth.load(), ServerMode()).c_str());
             uint32_t evEvicted = 0, evRefused = 0;
             {
                 std::lock_guard<std::mutex> lk(g_evMtx);
@@ -8905,7 +10000,8 @@ namespace {
             GLOGI("engine: combat: guards (totals): %u losses a remote puppet caused (not self-reported, %u put back "
                   "after the grace), %u ticks skipped for an unreadable health/armour, event queue evicted %u refused %u",
                   vs.puppetLosses, vs.puppetRestores, vs.skippedReads, evEvicted, evRefused);
-            GLOGI("engine: combat client (W3), last 10 s: %u melee swings counted, %u peer swings shown, %u real peer shots, "
+            GLOGI("engine: combat client (W3), last 10 s: %u melee swings counted, %u peer swing tasks ISSUED (not proof anything was seen: see the "
+                  "'engine: melee swings (R3 T6)' line for the read-back), %u real peer shots, "
                   "%u muzzle flashes; reactions on us %u flinch / %u knockdown / %u melee stagger, on puppets %u flinch / %u "
                   "knockdown / %u melee stagger",
                   c.meleeSwings - last.meleeSwings, c.peerSwings - last.peerSwings, c.peerShotsReal - last.peerShotsReal,
@@ -8913,10 +10009,11 @@ namespace {
                   c.reactStagger - last.reactStagger, c.puppetFlinch - last.puppetFlinch, c.puppetKnock - last.puppetKnock,
                   c.puppetStagger - last.puppetStagger);
             GLOGI("engine: melee (0c), last 10 s: hits sent (all weapons) %u; melee hits detected by the damage EVENT %u / by the pool drop %u (event read "
-                  "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u shown, %u not shown (ped owned "
+                  "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u swing tasks issued (NOT proof they played), %u not issued (ped owned "
                   "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s; audit (0.4.5): swing windows "
                   "opened on a puppet %u (puppet within 3 m %u), stale damage events cleared %u, claimed %u by event / %u by pool, "
-                  "Damage confirmed by the server on our Hits %u (%u damage)",
+                  "Damage confirmed by the server on our Hits %u (%u damage; R3 T6: the server now judges our swings itself, see the 'melee:' "
+                  "server line and 'engine: melee server (R3 T6)')",
                   c.hitsSent - last.hitsSent, c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool,
                   c.meleeEventsRead - last.meleeEventsRead, c.meleeSwings - last.meleeSwings,
                   c.peerSwingSteps - last.peerSwingSteps, c.peerSwings - last.peerSwings,
@@ -8927,6 +10024,21 @@ namespace {
                   c.meleeWindows - last.meleeWindows, c.meleeNearSwings - last.meleeNearSwings,
                   c.meleeStaleEvents - last.meleeStaleEvents, c.meleeEventDamage - last.meleeEventDamage,
                   c.meleePoolDamage - last.meleePoolDamage, c.hitsConfirmed - last.hitsConfirmed, c.hitDamage - last.hitDamage);
+            {
+                // R3 T6: the EFFECT counters. Swings of OUR fists that the server counted as hits (its own judgement or our Hit, the Damage
+                // carries kDmgMelee either way), and the other player's swings as the read-back saw them on our screen.
+                const uint32_t mc = g_meleeConfirmCount.load(std::memory_order_relaxed), md = g_meleeConfirmDamage.load(std::memory_order_relaxed),
+                               mk = g_meleeConfirmKills.load(std::memory_order_relaxed);
+                static uint32_t lastMc = 0, lastMd = 0, lastMk = 0;
+                GLOGI("engine: melee server (R3 T6), last 10 s: our swings counted %u, melee blows the SERVER confirmed on others %u (%u damage, %u kills) "
+                      "[totals this session: %u / %u damage / %u kills]; Hits we sent %u; melee hits we detected locally (event %u, pool %u) are no longer "
+                      "needed for damage",
+                      c.meleeSwings - last.meleeSwings, mc - lastMc, md - lastMd, mk - lastMk, mc, md, mk, c.hitsSent - last.hitsSent,
+                      c.meleeHitsEvent - last.meleeHitsEvent, c.meleeHitsPool - last.meleeHitsPool);
+                lastMc = mc; lastMd = md; lastMk = mk;
+                GLOGI("engine: melee swings (R3 T6), last 10 s: %s", sync::SwingDiagLine(g_swingDiag, g_swingDiagLast, g_swingLadder).c_str());
+                g_swingDiagLast = g_swingDiag;
+            }
             GLOGI("engine: combat client (W8), last 10 s: local health changed by a puppet ped's gun or fists %u times (our "
                   "own cosmetic flinch bullets included); AI damage modifiers %s; dead-puppet melee reports capped %u, puppets "
                   "killed by a takedown %u; TASK_CLIMB issued %u, placement fallbacks %u; alt-tab fallback states sent %u",
@@ -8935,12 +10047,21 @@ namespace {
                   c.climbFallbacks - last.climbFallbacks,
                   g_fallbackStates.load(std::memory_order_relaxed) - lastFallbackStates);
             lastFallbackStates = g_fallbackStates.load(std::memory_order_relaxed);
+            // R3 T3: the sender's own cover reads of the last 10 s (always in the 0d line, in full when any read was true)
+            const sync::CoverSenderStats sndCover = g_coverSense.Take();
+            const std::string sndLine = sync::CoverSenderLine((int)join::MyId(), sndCover);
             GLOGI("engine: vault / cover (0d), last 10 s: TASK_CLIMB issued %u, started %u (the puppet really climbed / vaulted), "
                   "placement fallbacks %u; puppet put on the sender's pose before a task: nudged %u, set outright %u; cover: "
-                  "task issued %u, started %u (IS_PED_IN_COVER), never started (fallback: stands on the pose) %u, ended %u",
+                  "task issued %u, started %u (IS_PED_IN_COVER), fell back to the crouch pose on the sender's position %u, ended %u (R3 T3: cover_sync=%s; the "
+                  "SENDER side, ours: IS_PED_IN_COVER true %u, IS_PED_GOING_INTO_COVER true %u, IS_PED_AIMING_FROM_COVER true %u of %u reads, kPfCover sent on %u; "
+                  "the breaker opened %u times)",
                   c.climbTasks - last.climbTasks, c.climbStarted - last.climbStarted, c.climbFallbacks - last.climbFallbacks,
                   c.prePlaceNudged - last.prePlaceNudged, c.prePlaceSet - last.prePlaceSet, c.coverIssued - last.coverIssued,
-                  c.coverStarted - last.coverStarted, c.coverFailed - last.coverFailed, c.coverEnded - last.coverEnded);
+                  c.coverStarted - last.coverStarted, c.coverFailed - last.coverFailed, c.coverEnded - last.coverEnded,
+                  sync::CoverSyncName((sync::CoverSyncMode)g_coverSyncMode.load()), sndCover.inReads, sndCover.goingReads, sndCover.aimingReads, sndCover.samples,
+                  sndCover.sentCover, g_coverBreaker.Opens());
+            if (!sndLine.empty())
+                GLOGI("%s", sndLine.c_str());
             GLOGI("engine: anims: last 10 s: %u emote events in, %u started, %u dictionary timeouts, %u ended "
                   "not-playing, %u missing dictionaries; ours %s",
                   emotes - lastEmotes, c.emotesStarted - last.emotesStarted, c.emoteDictTimeouts - last.emoteDictTimeouts,
@@ -9055,8 +10176,26 @@ namespace {
             if (g_world->IsPedPerformingMeleeAction(lp))       s.flags |= proto::kPfMelee;
             if (g_world->IsPedReloading(lp))                   s.flags |= proto::kPfReloading;
             if (g_world->GetPedStealthMovement(lp))            s.flags |= proto::kPfStealth;
-            if (g_world->IsPedInCover(lp, false))              s.flags |= proto::kPfCover;
+            // R3 T3: cover, classified (libs/sync/cover.h CoverSense): IS_PED_IN_COVER / IS_PED_GOING_INTO_COVER / IS_PED_AIMING_FROM_COVER.
+            // kPfCover for in-cover and aiming-from-cover (and a 150 ms hold over a read gap); going-into sends nothing (the ped is still running
+            // to the cover: the others keep following its pose). A low head in cover is the crouch hint, sent as kPfStealth ("crouched").
+            sync::CoverReads cr;
+            cr.inCover = g_world->IsPedInCover(lp, false);
+            cr.goingInto = g_world->IsPedGoingIntoCover(lp);
+            cr.aimingFrom = g_world->IsPedAimingFromCover(lp);
+            cr.x = px; cr.y = py; cr.z = pz; cr.heading = heading;
+            if (cr.inCover || cr.aimingFrom)
+            {
+                float hx = 0, hy = 0, hz = 0;
+                if (g_world->GetPedBoneCoords(lp, 31086, 0.0f, 0.0f, 0.0f, hx, hy, hz) && std::isfinite(hz))   // SKEL_Head
+                    cr.headAboveM = hz - pz;
+            }
+            const sync::CoverSenderOut co = g_coverSense.Update(cr, nowMs);
+            if (co.sendCover)                                  s.flags |= proto::kPfCover;
+            if (co.sendCrouch)                                 s.flags |= proto::kPfStealth;
         }
+        else if (g_coverSense.Up())
+            g_coverSense.Update(sync::CoverReads(), nowMs);    // got into a vehicle: the hold ends
         // Entering (move 5) / exiting (move 6) a NETWORKED car, with its server id, so the others can play the
         // door walk instead of seeing the ped appear in the seat. Not while seated (move 4 stands).
         {
@@ -9625,6 +10764,7 @@ namespace gage::engine {
         sinks.onVehicleResult = OnVehicleResult;
         sinks.onSeatNotice = OnSeatNotice;
         sinks.onVehicleImpact = OnVehicleImpact;   // T4
+        sinks.onLinkInfo = OnLinkInfo;             // R3 T5
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

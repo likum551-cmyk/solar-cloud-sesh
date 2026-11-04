@@ -102,6 +102,11 @@ void LocomotionController::ResetHard()
     lagMs_ = 0.0;
     haveVfPrev_ = false;
     accLp_ = 0.0;
+    quietActive_ = false;      // R3 T2: a window of the old ped is nobody's to judge
+    quietInitial_ = false;
+    quietLeftMs_ = 0.0;
+    harmlessEvidMs_ = 0.0;
+    sinceIssueGaitMs_ = -1.0;
 }
 
 void LocomotionController::Pause(double ms) { pauseMs_ = ms > 0.0 ? ms : 0.0; }
@@ -117,6 +122,17 @@ Gait LocomotionController::ApplyAuthority(Gait inferred, int moveState)
 void LocomotionController::ResetForNewPed()
 {
     ResetHard();
+    // R3 T2: a NEW ped (also the one a repair created) starts at the top of the ladder; what is known about coordinate writes, the
+    // number of level changes and the cap stay with the puppet.
+    if (!repairRespawn_) anchorFallbackLeftMs_ = 0.0;   // (a repair's respawn keeps the straight start it asked for)
+    repairRespawn_ = false;
+    rateOffLeftMs_ = placedLeftMs_ = 0.0;
+    anchorFailStreak_ = rateFailStreak_ = placedFailStreak_ = 0;
+    stallEvents_ = 0;
+    lastIssueWasStall_ = false;
+    snapStorm_ = false;
+    failSnaps_ = 0;
+    mismatchMs_ = 0.0;
     ragdollActive_ = false;
     haveJumpSeq_ = false;
     lastJumpSeq_ = 0;
@@ -168,15 +184,51 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         ++stats_.levelChanges;
         ++stats_.levelWhy[static_cast<int>(o.levelWhy)];
         level_ = cur;
+        if (cfg_.selfCheck)
+        {
+            ++levelChangesTotal_;                     // R3 T2: the cap counts, the hold starts
+            levelHoldLeftMs_ = cfg_.levelHoldMs;
+            if (levelChangesTotal_ >= cfg_.maxLevelChanges && !ladderFrozen_)
+            {
+                ladderFrozen_ = true;                 // the cap: this level stays for the rest of the session (a line says so once)
+                capHitPending_ = true;
+            }
+        }
     }
     pendingWhy_ = LocoLevelWhy::None;
+    // R3 T2: coordinate writes this controller asked for (the quiet window and the verdict need to know how long ago), and the
+    // outputs the engine logs / acts on.
+    {
+        const double dtw = in.dtMs < 0.0 ? 0.0 : (in.dtMs > 1000.0 ? 1000.0 : in.dtMs);
+        if (o.nudge || o.snap) sinceWriteMs_ = 0.0;
+        else sinceWriteMs_ += dtw;
+        o.quiet = quietActive_;
+        o.writeVerdict = writeVerdict_;
+        o.verdictChanged = verdictChangedPending_;
+        o.capHit = capHitPending_;
+        o.repair = repairPending_;
+        verdictChangedPending_ = capHitPending_ = false;
+        repairPending_ = LocoRepair::None;
+    }
     return o;
+}
+
+bool LocomotionController::LadderMayChange(bool deeper)
+{
+    // R3 T2: the cap and the hold of the ladder. A deeper step of the failure being handled is allowed through the hold (the ladder
+    // is monotone downward within one failure); anything else waits for the hold; nothing passes the cap.
+    if (!cfg_.selfCheck) return true;
+    if (ladderFrozen_) { ++stats_.changesRefused; return false; }
+    if (!deeper && levelHoldLeftMs_ > 0.0) { ++stats_.changesRefused; return false; }
+    return true;
 }
 
 void LocomotionController::Degrade(LocoLevel to, LocoLevelWhy why, double ms)
 {
     // The engine passes on what another puppet learned (the game is the same game for all of them): a level, for a while.
     if (!cfg_.selfCheck || ms <= 0.0) return;
+    if (level_ != LocoLevel::Full ? static_cast<int>(to) <= static_cast<int>(level_) : false) return;   // R3: already at or below it
+    if (!LadderMayChange(true)) return;
     if (to == LocoLevel::Straight && cfg_.mode == LocoMode::Anchor)
     {
         if (anchorFallbackLeftMs_ < ms) anchorFallbackLeftMs_ = ms;
@@ -199,6 +251,22 @@ LocoConfig ShippedLocoConfig(bool anchor)
     return c;
 }
 
+LocoConfig Round2Behaviour(LocoConfig c)
+{
+    c.quietTrial = false;
+    c.lostNeedsLowSpeed = false;
+    c.reissueMinMs = 0.0f;
+    c.turnBigMinMs = 1e9f;
+    c.firstGaitWindowMs = 0.0f;
+    c.issueGapMs = 0.0f;
+    c.levelHoldMs = 0.0f;
+    c.maxLevelChanges = 1 << 20;
+    c.maxRepairs = 0;
+    c.deadPlacedMs = c.placedMs;
+    c.deadPlacedMaxMs = c.placedDurMaxMs;
+    return c;
+}
+
 LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
 {
     LocoOutput o;
@@ -216,13 +284,30 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     steadyMs_ += dt;
     sinceMoveStartMs_ += dt;
     sinceAnchorStallMs_ += dt;
-    if (anchorFallbackLeftMs_ > 0.0) anchorFallbackLeftMs_ = anchorFallbackLeftMs_ > dt ? anchorFallbackLeftMs_ - dt : 0.0;
+    // R3 T2: a fallback timer that runs out is a level change UP (Recovered): it waits for the hold after the last change and never
+    // happens once the cap froze the ladder (the timer then rests at 1 ms: the level stays).
+    const bool ladderHolds = cfg_.selfCheck && (ladderFrozen_ || levelHoldLeftMs_ > dt);
+    if (cfg_.selfCheck && levelHoldLeftMs_ > 0.0) levelHoldLeftMs_ = levelHoldLeftMs_ > dt ? levelHoldLeftMs_ - dt : 0.0;
+    sinceForcedIssueMs_ += dt;
+    pulseSinceMs_ += dt;
+    auto runDown = [&](double& timer) {
+        if (timer <= 0.0) return;
+        timer -= dt;
+        if (timer <= 0.0) timer = ladderHolds ? 1.0 : 0.0;
+    };
+    runDown(anchorFallbackLeftMs_);
     // T2: the fallback timers of the ladder run on, and the ped's own displacement is measured (position differences net of
     // what we wrote last frame): the one signal that needs no model of what SET_ENTITY_VELOCITY or a task really does.
     sinceRateFailMs_ += dt;
     sincePlacedMs_ += dt;
-    if (rateOffLeftMs_ > 0.0) rateOffLeftMs_ = rateOffLeftMs_ > dt ? rateOffLeftMs_ - dt : 0.0;
-    if (placedLeftMs_ > 0.0) placedLeftMs_ = placedLeftMs_ > dt ? placedLeftMs_ - dt : 0.0;
+    runDown(rateOffLeftMs_);
+    runDown(placedLeftMs_);
+    if (quietActive_) { quietLeftMs_ -= dt; quietElapsedMs_ += dt; }
+    if (quietInitial_)
+    {
+        quietInitialLeftMs_ -= dt;
+        if (quietInitialLeftMs_ <= 0.0 || writeVerdict_ != WriteVerdict::Unknown) quietInitial_ = false;
+    }
     if (havePrevPed_ && !in.teleported && dt >= 4.0 && dt <= 250.0)
     {
         const double ivx = (double(in.pedPos.x) - prevPedAfter_.x) / dtS, ivy = (double(in.pedPos.y) - prevPedAfter_.y) / dtS;
@@ -381,21 +466,40 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     const double dist = std::sqrt(ex * ex + ey * ey + ez * ez);
     const double speed3 = std::sqrt(double(in.vel.x) * in.vel.x + double(in.vel.y) * in.vel.y + double(in.vel.z) * in.vel.z);
     bool snap = !started_ || in.teleported || dist > cfg_.snapBaseM + cfg_.snapPerSpeedS * speed3;
+    bool persistentSnap = false;
     if (!snap)
     {
         offAcc_ += static_cast<float>((dist - cfg_.offToleranceM) * dtS);
         if (offAcc_ < 0.0f) offAcc_ = 0.0f;
-        if (offAcc_ >= cfg_.offLimitMs) { snap = true; ++stats_.persistentSnaps; }
+        if (offAcc_ >= cfg_.offLimitMs) { snap = true; persistentSnap = true; ++stats_.persistentSnaps; }
     }
     const bool wasStarted = started_;
     started_ = true;
+    if (snap && (quietActive_ || quietInitial_) && wasStarted && !in.teleported)
+    {
+        // R3 T2: a quiet window writes no coordinate at all, a snap included, unless the ped is so far off that the window itself is
+        // the damage (then it ends without a verdict and the snap goes out).
+        // (the window may let the error grow by what a ped that does not follow would lose in it: set when the window opened)
+        const double abortErr = std::fmax(double(cfg_.quietAbortErrM), quietAbortErr_);
+        if (dist <= abortErr)
+        {
+            snap = false;
+            if (persistentSnap) --stats_.persistentSnaps;
+        }
+        else
+        {
+            quietActive_ = false;
+            quietInitial_ = false;
+            quietLeftMs_ = 0.0;
+        }
+    }
     if (snap && wasStarted && !in.teleported && cfg_.selfCheck)
     {
         // a snap that is neither the first nor a teleport: the ped was not carried to the pose. Three within 6 s are a stall.
         if (sinceFailSnapMs_ > 6000.0) failSnaps_ = 0;
         ++failSnaps_;
         sinceFailSnapMs_ = 0.0;
-        if (failSnaps_ >= cfg_.snapStormN) { snapStorm_ = true; failSnaps_ = 0; }
+        if (failSnaps_ >= cfg_.snapStormN) { snapStorm_ = writeVerdict_ != WriteVerdict::Harm; failSnaps_ = 0; }   // (with Harm our own writes make the snaps)
     }
     if (snap)
     {
@@ -488,21 +592,45 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
                 if (he < dead) ++stats_.graceFrames;
             }
             double dx = 0, dy = 0, dzv = 0;
-            if (he > dead)
+            // R3 T2: a quiet window writes nothing; with the verdict Harm (every write cancels the walk) the error is closed by one
+            // PULSE per pulseMs beyond pulseMinErrM instead of a write every frame (the rigid Placed follow stays per frame: nothing
+            // else is left there).
+            const bool pulsed = cfg_.selfCheck && writeVerdict_ == WriteVerdict::Harm && !placed;
+            if (quietActive_ || quietInitial_)
             {
-                double mag = (he - dead) * (1.0 - std::exp(-dt / (tau > 1.0 ? tau : 1.0)));
-                const double maxStep = cap * dtS;
-                if (mag > maxStep) mag = maxStep;
-                dx = hx / he * mag;
-                dy = hy / he * mag;
+                // nothing
             }
-            const double dz = double(in.pos.z) - ped.z;
-            if (std::fabs(dz) > cfg_.nudgeZBandM)
+            else if (pulsed)
             {
-                double cz = cfg_.zGain * (dz > 0 ? dz - cfg_.nudgeZBandM : dz + cfg_.nudgeZBandM);
-                if (cz > cfg_.zCorrMaxMs) cz = cfg_.zCorrMaxMs;
-                if (cz < -cfg_.zCorrMaxMs) cz = -cfg_.zCorrMaxMs;
-                dzv = cz * dtS;
+                const double dzp = double(in.pos.z) - ped.z;
+                if ((he > cfg_.pulseMinErrM || std::fabs(dzp) > cfg_.nudgeZBandM) && pulseSinceMs_ >= cfg_.pulseMs)
+                {
+                    double mag = he - dead;
+                    if (mag > cfg_.pulseMaxM) mag = cfg_.pulseMaxM;
+                    if (mag > 0.0 && he > 0.0) { dx = hx / he * mag; dy = hy / he * mag; }
+                    if (std::fabs(dzp) > cfg_.nudgeZBandM) dzv = dzp > 0 ? dzp - cfg_.nudgeZBandM : dzp + cfg_.nudgeZBandM;
+                    pulseSinceMs_ = 0.0;
+                    ++stats_.pulses;
+                }
+            }
+            else
+            {
+                if (he > dead)
+                {
+                    double mag = (he - dead) * (1.0 - std::exp(-dt / (tau > 1.0 ? tau : 1.0)));
+                    const double maxStep = cap * dtS;
+                    if (mag > maxStep) mag = maxStep;
+                    dx = hx / he * mag;
+                    dy = hy / he * mag;
+                }
+                const double dz = double(in.pos.z) - ped.z;
+                if (std::fabs(dz) > cfg_.nudgeZBandM)
+                {
+                    double cz = cfg_.zGain * (dz > 0 ? dz - cfg_.nudgeZBandM : dz + cfg_.nudgeZBandM);
+                    if (cz > cfg_.zCorrMaxMs) cz = cfg_.zCorrMaxMs;
+                    if (cz < -cfg_.zCorrMaxMs) cz = -cfg_.zCorrMaxMs;
+                    dzv = cz * dtS;
+                }
             }
             const double nm = HLen(dx, dy);
             if (nm > 1e-5 || dzv != 0.0)
@@ -635,6 +763,21 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     }
     o.anchorMode = anchorMode;
 
+    // R3 T2: the gait the ped READS while a moving one is commanded (the share of frames, and the time from a task issue to the first
+    // gait read: the live number a re-issue spacing has to be measured against).
+    if (gait_ != Gait::Still && !jumping && !ragdollActive_ && !in.swimming && !settling)
+    {
+        ++stats_.commandedFrames;
+        const bool read = in.pedGait != Gait::Still;
+        if (read) ++stats_.gaitReadFrames;
+        if (sinceIssueGaitMs_ >= 0.0)
+        {
+            sinceIssueGaitMs_ += dt;
+            if (read) { stats_.latencySumMs += sinceIssueGaitMs_; ++stats_.latencyN; sinceIssueGaitMs_ = -1.0; }
+            else if (sinceIssueGaitMs_ > 6000.0) sinceIssueGaitMs_ = -1.0;
+        }
+    }
+
     // ---- gait task ----
     if (ragdollActive_ || jumping)
     {
@@ -721,7 +864,8 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         // T2 self-check: does the native scale the stride? Regress the ped's own speed (over the gait's nominal, net of our nudges) on
         // the applied rate (low-passed like the ped's lag). A working native gives a slope of about the learned scale (0.55 .. 1.6);
         // an ignored one ~0 however the loop moves the rate. Only a decision when the rate has actually varied.
-        if (cfg_.selfCheck && haveSelf_ && !settling && sp >= 1.0 && steadyMs_ >= 500.0 && !jumping && accLp_ < cfg_.rateProbeAccMs2)
+        if (cfg_.selfCheck && haveSelf_ && !settling && sp >= 1.0 && steadyMs_ >= 500.0 && !jumping && accLp_ < cfg_.rateProbeAccMs2 &&
+            writeVerdict_ != WriteVerdict::Harm)   // (with Harm each pulse restarts the walk: own speed against the rate is confounded)
         {
             const double x = rateEmaNum_, y = HLen(selfV_.x, selfV_.y) / Nominal(gait_, cfg_);
             const double wd = std::exp(-dt / static_cast<double>(cfg_.rateProbeTauMs > 1.0f ? cfg_.rateProbeTauMs : 1.0f));
@@ -740,7 +884,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
                     else rateIneffMs_ = 0.0;
                 }
             }
-            if (rateIneffMs_ >= cfg_.ratePinMs)
+            if (rateIneffMs_ >= cfg_.ratePinMs && LadderMayChange(true))
             {
                 if (sinceRateFailMs_ > 300000.0) rateFailStreak_ = 0;
                 double dur = cfg_.rateOffMs;
@@ -766,8 +910,9 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     bool stuckNow = false, draggingNow = false;
     if (cfg_.selfCheck)
     {
+        const bool harmSettling = writeVerdict_ == WriteVerdict::Harm && sinceWriteMs_ < cfg_.harmSettleMs;   // R3: a pulse's effect is running
         const bool eligible = gait_ != Gait::Still && !settling && !jumping && !ragdollActive_ && !in.swimming && haveSelf_ &&
-                              sp >= cfg_.stuckMinPoseMs && steadyMs_ >= cfg_.stuckSettleMs && sinceMoveStartMs_ >= cfg_.stuckSettleMs;
+                              sp >= cfg_.stuckMinPoseMs && steadyMs_ >= cfg_.stuckSettleMs && sinceMoveStartMs_ >= cfg_.stuckSettleMs && !harmSettling;
         if (eligible)
         {
             if (HLen(selfV_.x, selfV_.y) < cfg_.stuckRatio * sp) { lagMs_ += dt; healthyMs_ = 0.0; }
@@ -782,7 +927,8 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         else lagMs_ = 0.0;
         if (winMs_ >= cfg_.nudgeShareWindowMs)
         {
-            draggingNow = winTravelM_ >= 3.0 && winNudgedM_ > cfg_.nudgeShareMax * winTravelM_;
+            // (with the verdict Harm the writes are single pulses by design: their share of the distance says nothing about the task)
+            draggingNow = writeVerdict_ != WriteVerdict::Harm && winTravelM_ >= 3.0 && winNudgedM_ > cfg_.nudgeShareMax * winTravelM_;
             winNudgedM_ = winTravelM_ = winMs_ = 0.0;
         }
     }
@@ -790,7 +936,55 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
 
     // A stall: the ped shows no gait at all although a moving one is commanded (the task ended or was
     // cancelled by the game). The only gait-mismatch trigger left; the others were churn.
-    mismatchMs_ = (in.pedGait == Gait::Still && !in.swimming) ? mismatchMs_ + dt : 0.0;   // a swimmer shows no land gait
+    mismatchMs_ = (in.pedGait == Gait::Still && !in.swimming &&
+                   !(cfg_.selfCheck && writeVerdict_ == WriteVerdict::Harm && sinceWriteMs_ < cfg_.harmSettleMs)) ? mismatchMs_ + dt : 0.0;   // a swimmer shows no land gait
+    if (cfg_.selfCheck && cfg_.lostNeedsLowSpeed && mismatchMs_ > 0.0 && haveSelf_ && sp >= cfg_.stuckMinPoseMs &&
+        HLen(selfV_.x, selfV_.y) >= 0.6 * sp)
+        mismatchMs_ = 0.0;   // R3 T2: it moves with the pose (its own displacement agrees) although the gait natives read Still: not lost
+
+    // ---- R3 T2: coordinate writes: the passive proof, and the quiet window's verdict ----
+    if (cfg_.selfCheck && cfg_.quietTrial)
+    {
+        const bool movingEval = gait_ != Gait::Still && !settling && !jumping && !ragdollActive_ && !in.swimming;
+        const double own = haveSelf_ ? HLen(selfV_.x, selfV_.y) : 0.0;
+        if (writeVerdict_ == WriteVerdict::Unknown && !quietActive_)
+        {
+            // a working game proves the writes harmless for free: a gait read AND the ped's own speed agreeing with the pose while a
+            // write went out within the last 250 ms, for harmlessEvidMs of steady motion
+            if (movingEval && sp >= 1.5 && accLp_ < cfg_.steadyAccMs2 && sinceWriteMs_ < 250.0 && haveSelf_)
+            {
+                if (in.pedGait != Gait::Still && own >= cfg_.stuckRatio * sp) harmlessEvidMs_ += dt;
+                else harmlessEvidMs_ = 0.0;
+                if (harmlessEvidMs_ >= cfg_.harmlessEvidMs) { writeVerdict_ = WriteVerdict::Harmless; verdictChangedPending_ = true; }
+            }
+        }
+        if (quietActive_)
+        {
+            const bool good = movingEval && (in.pedGait != Gait::Still || (haveSelf_ && sp >= cfg_.stuckMinPoseMs && own >= cfg_.stuckRatio * sp));
+            if (good) quietGoodMs_ += dt;
+            if (quietGoodMs_ >= cfg_.quietNeedGoodMs)
+            {
+                // the ped showed a gait the moment the writes stopped: every write cancels the walk
+                writeVerdict_ = WriteVerdict::Harm;
+                verdictChangedPending_ = true;
+                quietActive_ = false;
+                quietLeftMs_ = 0.0;
+                ++stats_.quietHarm;
+                mismatchMs_ = 0.0;
+                lagMs_ = 0.0;
+                snapStorm_ = false;
+                failSnaps_ = 0;
+            }
+            else if (quietLeftMs_ <= 0.0)
+            {
+                // nothing, with no write for the whole window: the writes are not the cause, the ladder goes on at once
+                writeVerdict_ = WriteVerdict::Harmless;
+                verdictChangedPending_ = true;
+                quietActive_ = false;
+                ++stats_.quietClear;
+            }
+        }
+    }
 
     // Re-issue only when the task would otherwise be wrong: the commanded (debounced) gait changed, the
     // blend ratio moved a step (fallback only), or - at most every minReissueMs - the direction turned
@@ -812,10 +1006,40 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         issue = true;
         why = LocoWhy::Blend;
     }
+    // R3 T2: a forced re-issue (snap, Reset, a landing) goes out at least issueGapMs after a moving task's issue: the previous one has
+    // not had its chance to show a gait (live 0.4.7: 13 issues per 10 s = 0.77 s apart, no gait ever). Still <-> moving is never held.
+    // (while the previous issue is still waiting for its first gait the gap is the whole firstGaitWindowMs: a snap's re-issue must not
+    // restart a task that has not had its chance)
+    const double forcedGap = sinceIssueGaitMs_ >= 0.0 ? std::fmax(double(cfg_.issueGapMs), double(cfg_.firstGaitWindowMs)) : double(cfg_.issueGapMs);
+    if (issue && cfg_.selfCheck && lastTaskGait_ != Gait::Still && stats_.goStraight > 0 && sinceIssueMs_ < forcedGap)
+    {
+        issue = false;
+        why = LocoWhy::None;
+        ++stats_.issuesHeld;
+    }
     // A SoftReset() evaluates the rules now (no minReissueMs wait) but only the position rules: turn, drift, arrival.
     const bool soft = reevaluate_;
     reevaluate_ = false;
-    if (!issue && (soft || sinceIssueMs_ >= cfg_.minReissueMs))
+    // R3 T2: the rule-based re-issues are spaced reissueMinMs (not minReissueMs), and only a BIG turn may come earlier.
+    const double reissueMin = cfg_.selfCheck ? std::fmax(double(cfg_.minReissueMs), double(cfg_.reissueMinMs)) : double(cfg_.minReissueMs);
+    const bool windowOpen = soft || sinceIssueMs_ >= reissueMin;
+    bool bigTurn = false;
+    if (cfg_.selfCheck && !issue && !windowOpen && !anchorMode && sinceIssueMs_ >= cfg_.turnBigMinMs && forceIssue_ == false)
+    {
+        const double lastSp0 = HLen(lastTargetVel_.x, lastTargetVel_.y);
+        if (sp >= cfg_.idleUp && lastSp0 >= cfg_.idleUp)
+        {
+            const double cosA0 = (double(vf_.x) * lastTargetVel_.x + double(vf_.y) * lastTargetVel_.y) / (sp * lastSp0);
+            bigTurn = cosA0 < std::cos(double(cfg_.turnBigDeg) * kPi / 180.0);
+        }
+        else if (cfg_.turnBigMinMs > 0.0f) bigTurn = false;
+    }
+    if (bigTurn && !issue)
+    {
+        issue = true;
+        why = LocoWhy::Turn;
+    }
+    else if (!issue && windowOpen)
     {
         const double el = sinceIssueMs_ / 1000.0;
         // Drift is the anchor's (a long lead turns a few degrees into metres of target movement; the
@@ -845,9 +1069,40 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         // stall used to wait 2.5 s: a puppet whose go-to failed was dragged along in an idle pose for that long, at every start).
         const bool lostNow = mismatchMs_ >= cfg_.stallMs;
         const bool stormNow = snapStorm_;
-        const bool stallNow = !soft && (lostNow || stuckNow || stormNow || (draggingNow && anchorMode)) &&
-                              (stormNow || sinceIssueMs_ >= (lastIssueWasStall_ ? cfg_.stallRetryMs : cfg_.stallFirstMs));
-        issue = turn || driftNow || arriving || stallNow;
+        // R3 T2: the first stall waits firstGaitWindowMs while the issue is still waiting for its first gait (a task that has not had
+        // its chance is not lost), and a failure seen while coordinate writes were flowing first gets a QUIET window.
+        const double stallFirst = (cfg_.selfCheck && sinceIssueGaitMs_ >= 0.0)
+                                      ? std::fmax(double(cfg_.stallFirstMs), double(cfg_.firstGaitWindowMs)) : double(cfg_.stallFirstMs);
+        const bool fireNow = !soft && (lostNow || stuckNow || stormNow || (draggingNow && anchorMode)) &&
+                             (stormNow || sinceIssueMs_ >= (lastIssueWasStall_ ? cfg_.stallRetryMs : stallFirst));
+        bool quietHold = quietActive_;
+        if (fireNow && cfg_.selfCheck && cfg_.quietTrial && writeVerdict_ == WriteVerdict::Unknown && !quietActive_ && placedLeftMs_ <= 0.0 &&
+            (lostNow || stuckNow || stormNow))
+        {
+            if (sinceWriteMs_ < cfg_.quietRecentMs && quietTries_ < 3)
+            {
+                // the window is as long as the error it may cost allows: ~6 m of a ped that does not follow (a walk and a run get the full
+                // quietWindowMs, a sprint ~0.9 s; a gait read needs ~0.3-0.5 s after the last write's effect has run out)
+                const double winMs = Clamp(6000.0 / (sp > 0.5 ? sp : 0.5), 700.0, double(cfg_.quietWindowMs));
+                quietActive_ = true;
+                quietLeftMs_ = winMs;
+                quietAbortErr_ = pedErrH + 1.25 * sp * winMs / 1000.0 + 0.5;
+                quietElapsedMs_ = quietGoodMs_ = 0.0;
+                ++quietTries_;
+                ++stats_.quietWindows;
+                quietHold = true;
+            }
+            else if (sinceWriteMs_ >= cfg_.quietRecentMs)
+            {
+                // no coordinate write for the last quietRecentMs and still no gait: the writes are not what stops it
+                writeVerdict_ = WriteVerdict::Harmless;
+                verdictChangedPending_ = true;
+                ++stats_.quietClear;
+            }
+        }
+        o.quiet = quietHold;
+        const bool stallNow = fireNow && !quietHold;
+        issue = !quietHold && (turn || driftNow || arriving || stallNow);
         if (stallNow)
         {
             if (sinceStallEventMs_ < 15000.0) ++stallEvents_;
@@ -857,16 +1112,38 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         snapStorm_ = false;
         if (stallNow && !anchorMode && cfg_.selfCheck && stallEvents_ >= 2 && placedLeftMs_ <= 0.0)
         {
-            // The straight task was re-issued after a stall and stalled again: nothing the tasks do moves this ped. Follow the pose
-            // rigidly for a while (a slide in an idle pose, but never a drift); tried again after the timer, doubling per failure.
-            if (sincePlacedMs_ > 300000.0) placedFailStreak_ = 0;
-            double dur = cfg_.placedMs;
-            for (int i = 0; i < placedFailStreak_ && dur < cfg_.placedDurMaxMs; ++i) dur *= 2.0;
-            if (dur > cfg_.placedDurMaxMs) dur = cfg_.placedDurMaxMs;
-            ++placedFailStreak_;
-            sincePlacedMs_ = 0.0;
-            placedLeftMs_ = dur;
-            pendingWhy_ = LocoLevelWhy::StraightStuck;
+            // The straight task was re-issued after a stall and stalled again: nothing the tasks do moves this ped. R3 T2: before the
+            // rigid follow, the ENGINE is asked to repair the ped (clear its tasks and flags; then the lean and the alt creation
+            // recipe), one step per failure, up to maxRepairs; the ladder starts again from the top after each (a repair resets it).
+            // Only then the pose is followed rigidly (a slide in an idle pose, but never a drift); tried again after the timer, doubling
+            // per failure, with the long dead timers once the repairs are used up.
+            if (writeVerdict_ != WriteVerdict::Harm && in.repairsDone < cfg_.maxRepairs && LadderMayChange(true))
+            {
+                repairPending_ = in.repairsDone == 0 ? LocoRepair::ClearTasks : in.repairsDone == 1 ? LocoRepair::RespawnLean : LocoRepair::RespawnAlt;
+                repairRespawn_ = repairPending_ != LocoRepair::ClearTasks;
+                ++stats_.repairs;
+                stallEvents_ = 0;
+                lastIssueWasStall_ = false;
+                // the repaired ped starts on the straight task (the anchor task has already failed on this puppet: the next try of
+                // it is the ordinary recovery timer's); one stall pair later it is known whether the repair worked
+                anchorFallbackLeftMs_ = cfg_.anchorFallbackMs;
+                anchorFailStreak_ = 0;
+                sinceAnchorStallMs_ = 1e9;
+                forceIssue_ = true;
+            }
+            else if (LadderMayChange(true))
+            {
+                if (sincePlacedMs_ > 300000.0) placedFailStreak_ = 0;
+                const bool spent = in.repairsDone >= cfg_.maxRepairs;
+                double dur = spent ? cfg_.deadPlacedMs : cfg_.placedMs;
+                const double durMax = spent ? cfg_.deadPlacedMaxMs : cfg_.placedDurMaxMs;
+                for (int i = 0; i < placedFailStreak_ && dur < durMax; ++i) dur *= 2.0;
+                if (dur > durMax) dur = durMax;
+                ++placedFailStreak_;
+                sincePlacedMs_ = 0.0;
+                placedLeftMs_ = dur;
+                pendingWhy_ = LocoLevelWhy::StraightStuck;
+            }
         }
         if (stallNow)
         {
@@ -875,7 +1152,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
             rpW_ = rpX_ = rpY_ = rpXX_ = rpXY_ = 0.0;
             rateIneffMs_ = 0.0;
         }
-        if (stallNow && anchorMode)
+        if (stallNow && anchorMode && LadderMayChange(true))
         {
             pendingWhy_ = lostNow ? LocoLevelWhy::AnchorLost : (stuckNow || stormNow) ? LocoLevelWhy::AnchorStuck : LocoLevelWhy::AnchorDragging;
             // The anchor task is lost and re-issuing it may not cure it (no navmesh, an interior): the same stall as a
@@ -930,6 +1207,16 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         lastBlend_ = blend;
         blendSet_ = blend;
         sinceIssueMs_ = 0;
+        sinceIssueGaitMs_ = 0.0;     // R3 T2: the latency to the first gait read is measured from here
+        if (cfg_.selfCheck && cfg_.quietTrial && !quietInitialDone_ && writeVerdict_ == WriteVerdict::Unknown && gait_ != Gait::Still)
+        {
+            // the FIRST moving task of the puppet runs without a coordinate write for its first-gait window: if it shows nothing,
+            // the writes cannot be why (no quiet window to pay for), and if it does, the writes that follow are what is judged
+            quietInitialDone_ = true;
+            quietInitial_ = true;
+            quietInitialLeftMs_ = double(cfg_.quietInitialMs);
+            quietAbortErr_ = pedErrH + 1.25 * sp * double(cfg_.quietInitialMs) / 1000.0 + 0.5;
+        }
         mismatchMs_ = 0;
         forceIssue_ = false;
         resetForced_ = false;
@@ -1053,6 +1340,48 @@ LocoDiagSummary LocoDiag::Summary() const
     s.rateFrames = rateFrames_;
     if (rateFrames_) { s.rateMin = rateMin_; s.rateMax = rateMax_; s.rateMean = rateSum_ / rateFrames_; s.rateClampFrac = double(rateClamped_) / rateFrames_; }
     if (selfN_) s.selfSpeedMs = selfSum_ / selfN_;
+    return s;
+}
+
+void GaitDiag::Observe(const GaitDiagFrame& f)
+{
+    ++s_.frames;
+    // the ped's speed from its positions between two observations (our writes included), a gap over 250 ms is not bridged
+    double fromPos = -1.0;
+    const double gap = f.nowMs - prevNowMs_;
+    if (havePrev_ && gap > 0.0 && gap <= 250.0)
+        fromPos = HLen(double(f.pedPos.x) - prevPos_.x, double(f.pedPos.y) - prevPos_.y) / (gap / 1000.0);
+    prevPos_ = f.pedPos;
+    prevNowMs_ = f.nowMs;
+    havePrev_ = true;
+    if (f.wrote) ++s_.writeFrames;
+    if (f.issued) ++s_.issues;
+    if (f.ragdoll) ++s_.ragdollFrames;
+    if (f.commanded == Gait::Still) return;
+    ++s_.commandedFrames;
+    switch (f.read)
+    {
+    case Gait::Still:  ++s_.readStill;  break;
+    case Gait::Walk:   ++s_.readWalk;   break;
+    case Gait::Run:    ++s_.readRun;    break;
+    case Gait::Sprint: ++s_.readSprint; break;
+    }
+    if (f.pedStill >= 0) { ++s_.stillAsked; if (f.pedStill) ++s_.stillTrue; }
+    poseSum_ += f.poseSpeed;
+    if (f.ownSpeed >= 0.0f) { ownSum_ += f.ownSpeed; ++s_.ownN; }
+    if (f.entitySpeed >= 0.0f) { entitySum_ += f.entitySpeed; ++s_.entityN; }
+    if (fromPos >= 0.0) { posSum_ += fromPos; ++s_.posN; }
+    if (f.blendSet) { blendSum_ += f.moveBlend; ++s_.blendFrames; }
+}
+
+GaitDiagSummary GaitDiag::Summary() const
+{
+    GaitDiagSummary s = s_;
+    if (s.commandedFrames) s.poseMs = poseSum_ / s.commandedFrames;
+    if (s.ownN) s.ownMs = ownSum_ / s.ownN;
+    if (s.entityN) s.entityMs = entitySum_ / s.entityN;
+    if (s.posN) s.posMs = posSum_ / s.posN;
+    if (s.blendFrames) s.blendMean = blendSum_ / s.blendFrames;
     return s;
 }
 
