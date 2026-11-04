@@ -52,6 +52,10 @@
 //     6 / 7 are brake lights and handbrake; a vehicle Hit names a part in `bone` ((part << 8) | slot).
 //   * T4 collisions: Msg::VehicleImpact (40): the server's resolution of a contact between two controllers' vehicles.
 //
+// v7 against v6 (desync overhaul round 3; docs/api/protocol.md "R3 T4"):
+//   * R3 T4 vehicle damage state: the full VehicleWorld entry grows by a VehicleDamage block (petrol tank health, broken-off doors and
+//     headlights, a coarse dent map: 3..11 bytes); VehicleUpdate.flags bit 5 (kVehDamageBlock) announces the same block after `windows`.
+//
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
 //   * Sender-side sample time: PlayerState and VehicleUpdate carry a u16 sampleMs (the sender's own clock,
@@ -442,6 +446,56 @@ namespace gage::proto {
         return true;
     }
 
+    // ---- R3 T4: vehicle damage state (protocol v7, additive; docs/api/protocol.md "R3 T4") --------------------------------------
+    // What decides how a damaged car LOOKS beyond tyres and windows, at a low byte cost: the petrol tank's health (leak / fire stage),
+    // which doors were broken off and which headlights are broken, and a coarse dent map (kVehDentProbes fixed probe points around the
+    // hull, each the controller's GET_VEHICLE_DEFORMATION_AT_POS depth in 2 mm steps). Body and engine health are the existing
+    // VehicleState / VehicleUpdate fields. It is a STATIC block: the full VehicleWorld entry carries it (3 bytes for a clean car, at
+    // most 11), a VehicleUpdate carries it only when VehicleUpdate.flags has kVehDamageBlock (on a change, on a hand-over and as a
+    // slow refresh), a motion-only entry never.
+    //   petrol  petrol tank health / 4 (0..kPetrolFullWire = 250; 251..255 refused)
+    //   parts   bit i (0..5) = door i broken off (the kDoor* order); kVehDmgLampL / kVehDmgLampR = that headlight is broken
+    //   dent[i] probe i's dent depth, 0 = none, 1..255 = 2 mm steps (max 0.51 m)
+    // On the wire: u8 petrol, u8 parts, u8 dentMask (bit i = probe i has a dent), then one u8 (1..255) per set bit, ascending.
+    constexpr size_t  kVehDentProbes = 8;
+    constexpr uint8_t kPetrolFullWire = 250;
+    constexpr uint8_t kVehDmgDoorsMask = 0x3F;
+    constexpr uint8_t kVehDmgLampL = 1u << 6;
+    constexpr uint8_t kVehDmgLampR = 1u << 7;
+    constexpr float   kVehDentStepM = 0.002f;
+    constexpr uint8_t kVehDamageBlock = 1u << 5;   // VehicleUpdate.flags only (never a VehicleState flag): a damage block follows `windows`
+    struct VehicleDamage
+    {
+        uint8_t petrol = kPetrolFullWire;
+        uint8_t parts = 0;
+        uint8_t dent[kVehDentProbes] = {};
+        bool operator==(const VehicleDamage& o) const
+        {
+            if (petrol != o.petrol || parts != o.parts) return false;
+            for (size_t i = 0; i < kVehDentProbes; i++)
+                if (dent[i] != o.dent[i]) return false;
+            return true;
+        }
+        bool operator!=(const VehicleDamage& o) const { return !(*this == o); }
+        bool Any() const { return *this != VehicleDamage(); }
+        uint8_t DentMask() const
+        {
+            uint8_t m = 0;
+            for (size_t i = 0; i < kVehDentProbes; i++)
+                if (dent[i]) m = (uint8_t)(m | (1u << i));
+            return m;
+        }
+    };
+    // Encoded size of the block (3 + one byte per dented probe).
+    inline size_t VehicleDamageBytes(const VehicleDamage& d)
+    {
+        size_t n = 3;
+        for (size_t i = 0; i < kVehDentProbes; i++)
+            if (d.dent[i]) n++;
+        return n;
+    }
+    inline bool VehicleDamageValid(const VehicleDamage& d) { return d.petrol <= kPetrolFullWire; }
+
     // A rotation (unit quaternion, GTA's GET_ENTITY_QUATERNION order x, y, z, w). On the wire it is
     // a smallest-three u32 (quant.h): at most 0.28 degrees of rotation error.
     struct Quat { float x = 0, y = 0, z = 0, w = 1; };
@@ -502,6 +556,8 @@ namespace gage::proto {
     //                 Decode refuses a rim bit without its tyre bit), `windows` bit set = smashed. The server merges the
     //                 controller's report with the Hits that popped something of a car the shooter does not control
     //                 (VehicleStore::HitPart); full entries only, a change rides the usual 3 fresh frames
+    //   dmg           (v7) the VehicleDamage block (petrol tank health, broken doors / headlights, dent probes); full entries only,
+    //                 the server merges the controller's report monotonically (damage only goes up, as body / engine health)
     //   motionOnly    (v5) decode only: this entry was a motion-only entry (header 2) carrying id, ageMs, k, rot,
     //                 avx..avz, steer and flags; every other field above is NOT in it and holds a default, and the
     //                 receiver keeps what it already has. Encode writes the motion-only form for a state with this
@@ -527,6 +583,7 @@ namespace gage::proto {
         uint8_t    flags2 = 0;
         uint8_t    doors = 0;
         uint8_t    tyres = 0, tyresRim = 0, windows = 0;   // v6
+        VehicleDamage dmg;                                  // v7 (R3 T4): petrol tank, broken doors / headlights, dents (full entries only)
         bool       motionOnly = false;
     };
 
@@ -590,6 +647,8 @@ namespace gage::proto {
         uint8_t    flags2 = 0;
         uint8_t    doors = 0;
         uint8_t    tyres = 0, tyresRim = 0, windows = 0;   // v6
+        VehicleDamage dmg;                                  // v7 (R3 T4): meaningful only when hasDmg
+        bool       hasDmg = false;                          // v7: the update carries the damage block (flags bit kVehDamageBlock on the wire)
     };
 
     // The answer to every VehicleCmd, to its sender (reliable): `op` and `vehId` (the assigned id for

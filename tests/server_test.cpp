@@ -2656,10 +2656,11 @@ static void VehicleV5UnitTests()
             proto::VehicleWorld mine;
             if (vs.BuildFrame(0, true, At(0, 0), tick, now, mine) && !mine.vehicles.empty()) driverFulls++;
         }
-        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 46 + 2 per occupant when full (v6: tyres, rim, windows; one occupant: 50).
+        // A frame is 8 header bytes, then id + header byte + the entry: 26 motion-only; 46 + 2 per occupant when full (v6: tyres, rim, windows; one occupant: 50);
+        // R3 T4 (v7): + the 3-byte damage block of an undamaged car (53).
         Check("vehicles v5: for a receiver of a driven car the entries are full for the first 3 frames and then about once a second (20 ticks) and motion-only "
               "(a 34-byte frame, entry 26 bytes) in between, every one with its age; the driver itself gets full states only at the parked rate",
-              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 46 + 2 &&
+              frames == 40 && ageSet && fulls >= 4 && fulls <= 5 && motion == frames - fulls && motionBytes == 8 + 26 && fullBytes == 8 + 2 + 46 + 3 + 2 &&
                   driverFulls <= 5,
               std::to_string(fulls) + " full, " + std::to_string(motion) + " motion-only, " + std::to_string(motionBytes) + "/" + std::to_string(fullBytes) +
                   " bytes, driver " + std::to_string(driverFulls));

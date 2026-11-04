@@ -25,6 +25,7 @@
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_visual.h"
+#include "sync/vehicle_damage.h"
 #include "sync/pedstate.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
@@ -427,6 +428,22 @@ namespace {
         sync::VisualMask sentVis;
         double visReadMs = -1e9;
         float sentSteer = 0.0f;       // the steering that went out last (a change of it is sent at once)
+        // ---- R3 T4 (vehicle damage state, protocol v7; libs/sync/vehicle_damage.h) ----
+        sync::VisualGuard visGuard;   // the per-slot baselines of the tyre / window reads (a slot that is "smashed" at the first sample is not a window)
+        sync::PedalGuard pedalGuard;  // a stuck handbrake read is not sent
+        sync::DamageReporter dmgRep;  // controller: petrol / doors / lamps / dents read off the car, through the baselines
+        sync::DamageApplier dmgApply; // copy: the server's block brought to the entity (closed loop for the dents)
+        sync::HandbrakeLimiter handLimit;   // copy: a handbrake claim that outlives a moving car is released
+        proto::VehicleDamage dmgReport;            // controller: the report (the block)
+        sync::DamageSendPolicy dmgSend;            // controller: when the block rides an update (a change, repeats, a 3 s refresh)
+        sync::DamageRaw dmgRaw;       // the last read of the entity (controller or copy), for the 10 s line
+        double dmgReadMs = -1e9;
+        float lastBodyHp = -1.0f;
+        double bodyFellMs = -1e9;     // when the controller's body health last fell (corroborates damage)
+        int appliedDmgGuard = -1;     // -1 unknown, 1 = copy guards on (cannot damage itself), 0 = a controlled car's defaults
+        int handEff = -1;             // the handbrake state the limiter last applied to this copy (-1 = nothing yet: the next check applies it)
+        bool dmgHullKnown = false;
+        sync::DentHull dmgHull;
         // ---- W9 (script tick) ----
         sync::PresentLead lead;       // item 6: how far past the interpolation time this copy is drawn (near the local player)
         double leadMs = 0;            // ... the lead of this frame (for the 10 s line)
@@ -458,6 +475,10 @@ namespace {
     // default 0 derives it from successive rotations (the frame of that native is unverified,
     // vehicle_drive.h RISK). veh_angframe=body applies the controller's body-frame output instead.
     std::atomic<bool> g_vehUseAngVel{false}, g_vehAngBody{false};
+    // R3 T4: veh_damage_sync=0 in HKCU\Software\GAGE-MP switches the vehicle damage state off (no damage block sent or applied, copies keep
+    // their own local damage rules: the v6 behaviour); veh_visual_guard=0 switches the sanity layer off (tyre / window / handbrake reads reach the
+    // wire as in v6). Both default on and are re-read at every Welcome.
+    std::atomic<bool> g_vehDamageSync{true}, g_vehVisualGuard{true};
     // veh_driveby=aim shows a seated remote player's raised gun with the plain aim task (never fires by
     // itself) instead of TASK_DRIVE_BY (which may fire real bullets on its own: INFERRED, unchecked live).
     std::atomic<bool> g_vehDriveByAimOnly{false};
@@ -1287,6 +1308,8 @@ namespace {
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
+        g_vehDamageSync.store(reg::Get(L"veh_damage_sync") != L"0");     // R3 T4: the vehicle damage state (default on; 0 = the v6 behaviour)
+        g_vehVisualGuard.store(reg::Get(L"veh_visual_guard") != L"0");   // R3 T4: the sanity layer of the tyre / window / handbrake reads (default on)
         g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
@@ -6006,6 +6029,9 @@ namespace {
                 UnseatPeer(kv.second);
     }
 
+    void ResetVehicleDamage(NetVeh& v);    // R3 T4, below with the rest of the damage code
+    void NoteUnreliableVisual(uint16_t id, const sync::VisualMask& f);
+
     void ForgetVehicleHandle(NetVeh& v)
     {
         v.handle = 0;
@@ -6019,6 +6045,7 @@ namespace {
         v.vis.Reset();                 // T3: a new entity shows nothing of the server's visual state yet
         v.visReadMs = -1e9;
         v.steerPrevRotMs = -1e9;
+        ResetVehicleDamage(v);         // R3 T4: ... nor of the damage state, and every baseline starts over
     }
 
     // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
@@ -6081,7 +6108,19 @@ namespace {
         const bool shotRecent = nowMs - g_lastShotMs < 1500.0;
         VehVisualGame game{ v.handle };
         bool ran = false;
-        const sync::VisualOut o = sync::StepVisual(v.vis, game, server, iControl, nearUs, shotRecent, nowMs, &ran);
+        sync::VisualOut o;
+        if (g_vehVisualGuard.load(std::memory_order_relaxed) && !iControl)
+        {
+            // R3 T4: a copy compares and reports its OWN readback, so that readback goes through the per-slot baselines first (a window slot that
+            // reads smashed on every car would otherwise be fixed, smashed, or reported as a vehicle Hit). The local player's recent shot
+            // corroborates a pop at once; without it a new bit must hold on a second read.
+            sync::VisualMask flagged;
+            o = sync::StepVisualGuarded(v.vis, v.visGuard, game, server, false, nearUs, shotRecent, nowMs, shotRecent, &ran, &flagged);
+            if (flagged.Any())
+                NoteUnreliableVisual(id, flagged);
+        }
+        else
+            o = sync::StepVisual(v.vis, game, server, iControl, nearUs, shotRecent, nowMs, &ran);
         if (!ran)
             return;
         ++g_vis.reads;
@@ -6120,6 +6159,237 @@ namespace {
         }
     }
 
+    // ---- R3 T4: vehicle damage state (Desync Overhaul round 3, protocol v7) -----------------------------------------------------
+    // Petrol tank health, broken doors / headlights and a coarse dent map for the OTHER clients, and the sanity layer that keeps a wrong
+    // read off the wire (libs/sync/vehicle_damage.h has the rules, tests/r3_t4_tests.h the proofs). Switches (HKCU\Software\GAGE-MP):
+    // veh_damage_sync=0, veh_visual_guard=0. The 10 s line is "engine: vehicle damage (R3 T4)" (ReportVehDamage).
+    struct DmgStats
+    {
+        uint32_t ctlReads = 0, blocksSent = 0, adopted = 0, guardsSet = 0, copyRuns = 0, copyReplays = 0;
+        uint32_t flaggedTyres = 0, flaggedWindows = 0, flaggedParts = 0, flaggedDents = 0, flaggedPetrol = 0;
+        uint32_t handLogged = 0;
+    };
+    DmgStats g_dmg;
+
+    void ResetVehicleDamage(NetVeh& v)
+    {
+        v.visGuard.Reset();
+        v.pedalGuard.Reset();
+        v.dmgRep.Reset();
+        v.dmgApply.Reset();
+        v.handLimit.Reset();
+        v.dmgReport = proto::VehicleDamage();
+        v.dmgSend.Reset();
+        v.dmgRaw = sync::DamageRaw();
+        v.dmgReadMs = -1e9;
+        v.lastBodyHp = -1.0f;
+        v.bodyFellMs = -1e9;
+        v.appliedDmgGuard = -1;
+        v.handEff = -1;
+        v.dmgHullKnown = false;
+    }
+
+    // The probe frame of a car: half width, nose and tail from the wheel bones (cached per model), else a mid-size car's. Script tick.
+    sync::DentHull VehicleHullOf(int32_t veh)
+    {
+        static std::map<uint32_t, sync::DentHull> cache;
+        const uint32_t model = g_world->GetEntityModel(veh);
+        if (!model)
+            return sync::DentHull();
+        const auto it = cache.find(model);
+        if (it != cache.end())
+            return it->second;
+        sync::DentHull h;
+        bool measured = false;
+        float px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
+        if (g_world->GetEntityCoords(veh, px, py, pz) && g_world->GetEntityQuaternion(veh, qx, qy, qz, qw))
+        {
+            const sync::DriveQuat inv = sync::vq::Conj(sync::vq::Normalize({ qx, qy, qz, qw }));
+            auto local = [&](const char* bone, sync::DriveVec& out) {
+                const int bi = g_world->GetEntityBoneIndexByName(veh, bone);
+                float wx = 0, wy = 0, wz = 0;
+                if (bi < 0 || !g_world->GetWorldPositionOfEntityBone(veh, bi, wx, wy, wz))
+                    return false;
+                out = sync::vq::Rotate(inv, { wx - px, wy - py, wz - pz });
+                return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
+            };
+            sync::DriveVec lf, lr;
+            if (local("wheel_lf", lf) && local("wheel_lr", lr) && lf.y - lr.y >= 0.8f && lf.y - lr.y <= 12.0f && std::fabs(lf.x) >= 0.2f &&
+                std::fabs(lf.x) <= 2.5f)
+            {
+                h.halfWidth = std::max(0.6f, std::min(1.8f, std::fabs(lf.x) + 0.25f));
+                h.front = std::max(1.2f, std::min(5.0f, lf.y + 0.9f));
+                h.rear = std::min(-1.2f, std::max(-6.0f, lr.y - 0.9f));
+                measured = true;
+            }
+        }
+        cache[model] = h;
+        GLOGI("engine: vehicle: model 0x%08x dent probe frame half width %.2f nose %.2f tail %.2f (%s)", (unsigned)model, (double)h.halfWidth, (double)h.front,
+              (double)h.rear, measured ? "from the wheel bones" : "fallback: the wheel bones did not read");
+        return h;
+    }
+
+    // One entity as vehicle_damage.h's templates see it.
+    struct VehDamageGame
+    {
+        int32_t h;
+        sync::DentHull hull;
+        bool BodyHealth(float& f) { return g_world->GetVehicleBodyHealth(h, f); }
+        bool PetrolHealth(float& f) { return g_world->GetVehiclePetrolTankHealth(h, f); }
+        bool DoorValid(int d, bool& v) { return g_world->GetIsDoorValid(h, d, v); }
+        bool DoorBroken(int d, bool& b) { return g_world->IsVehicleDoorDamaged(h, d, b); }
+        bool LampBroken(int l, bool& b) { return g_world->IsVehicleHeadlightDamaged(h, l == 0, b); }
+        bool Dent(int probe, float& metres)
+        {
+            const sync::DentPoint pt = sync::DentProbePoint(probe, hull);
+            float dx = 0, dy = 0, dz = 0;
+            if (!g_world->GetVehicleDeformationAtPos(h, pt.x, pt.y, pt.z, dx, dy, dz))
+                return false;
+            const float m = std::sqrt(dx * dx + dy * dy + dz * dz);
+            metres = (std::isfinite(m) && m < 2.0f) ? m : 0.0f;          // a non-finite or absurd vector is "no dent", never a huge one
+            return true;
+        }
+        bool BreakDoor(int d) { return g_world->SetVehicleDoorBroken(h, d, true); }
+        bool SetPetrol(float f) { return g_world->SetVehiclePetrolTankHealth(h, f); }
+        bool ReplayLamp(int l, float damage)
+        {
+            const sync::DentPoint pt = sync::LampPoint(l, hull);
+            return g_world->SetVehicleDamage(h, pt.x, pt.y, pt.z, damage, 0.35f, true);
+        }
+        bool ReplayDent(int probe, float damage)
+        {
+            const sync::DentPoint pt = sync::DentProbePoint(probe, hull);
+            return g_world->SetVehicleDamage(h, pt.x, pt.y, pt.z, damage, 1.0f, true);
+        }
+        void BeginReplay() { g_world->SetVehicleCanBeVisiblyDamaged(h, true); }    // a copy cannot be damaged by the game, but the replay must
+        void EndReplay() { g_world->SetVehicleCanBeVisiblyDamaged(h, false); }
+    };
+
+    void EnsureVehicleHull(NetVeh& v)
+    {
+        if (v.dmgHullKnown)
+            return;
+        v.dmgHull = VehicleHullOf(v.handle);
+        v.dmgHullKnown = true;
+    }
+
+    // The controller: its body health fell since the last look (corroborates a tyre / window / dent that appears now).
+    void NoteVehicleBody(NetVeh& v, double nowMs)
+    {
+        float hp = 0.0f;
+        if (!g_world->GetVehicleBodyHealth(v.handle, hp) || !std::isfinite(hp))
+            return;
+        if (v.lastBodyHp >= 0.0f && hp < v.lastBodyHp - 0.5f)
+            v.bodyFellMs = nowMs;
+        v.lastBodyHp = hp;
+    }
+
+    // One line per car and slot (capped): a read that was damaged at the first sample while the server shows nothing. Script tick.
+    void NoteUnreliableVisual(uint16_t id, const sync::VisualMask& f)
+    {
+        g_dmg.flaggedTyres += (uint32_t)sync::PopCount8(f.tyres | f.rim);
+        g_dmg.flaggedWindows += (uint32_t)sync::PopCount8(f.windows);
+        static int logged = 0;
+        if (logged < 40)
+        {
+            ++logged;
+            PeerLog(true, "engine: vehicle id=%u sanity: tyre slot(s) %02x (off rim %02x) and window slot(s) %02x read as DAMAGED at the first sample while the server shows "
+                    "none: unreliable slot(s), not sent and not compared (a slot the model does not have, or a read that never clears)", id, f.tyres, f.rim, f.windows);
+        }
+    }
+
+    // Per script frame and car: the self-damage guards, the copy's handbrake limit and the copy's damage apply. Script tick.
+    void TickVehicleDamage(NetVeh& v, uint16_t id, bool iControl, double nowMs, bool nearUs)
+    {
+        const proto::VehicleState& st = v.st;
+        const int32_t h = v.handle;
+        if (!iControl && g_vehVisualGuard.load(std::memory_order_relaxed))
+        {
+            // The handbrake bit of the controller's state, limited: held on a standing car, released after 4 s of rolling with it.
+            const float sp = std::sqrt(st.k.vx * st.k.vx + st.k.vy * st.k.vy + st.k.vz * st.k.vz);
+            const int eff = v.handLimit.Effective((st.flags2 & proto::kVeh2Handbrake) != 0, sp, nowMs) ? 1 : 0;
+            if (eff != v.handEff)
+            {
+                ++(g_world->SetVehicleHandbrake(h, eff != 0) ? g_vis.handSet : g_vis.handFail);
+                v.handEff = eff;
+            }
+        }
+        if (!g_vehDamageSync.load(std::memory_order_relaxed))
+            return;
+        // A copy is kinematic and only follows its controller: the game must not damage it on its own (a local collision with a puppet, an
+        // engine that degrades, a tank that leaks), because that damage would exist on this machine only. A car we control has the defaults.
+        const int want = iControl ? 0 : 1;
+        if (v.appliedDmgGuard != want)
+        {
+            const bool a = g_world->SetVehicleCanBeVisiblyDamaged(h, iControl);
+            const bool b = g_world->SetVehicleEngineCanDegrade(h, iControl);
+            const bool c = g_world->SetDisableVehiclePetrolTankDamage(h, !iControl);
+            v.appliedDmgGuard = want;
+            ++g_dmg.guardsSet;
+            static int logged = 0;
+            if (logged < 6)
+            {
+                ++logged;
+                PeerLog(false, "engine: vehicle id=%u damage guards for a %s: visibly damaged %s (%s), engine degrades %s (%s), tank damage %s (%s)", id,
+                        iControl ? "car we control" : "copy", iControl ? "on" : "OFF", a ? "ok" : "FAILED", iControl ? "on" : "OFF", b ? "ok" : "FAILED",
+                        iControl ? "on" : "OFF", c ? "ok" : "FAILED");
+            }
+        }
+        if (iControl || !st.dmg.Any())
+            return;                                    // a clean server block costs nothing: not even the probe frame is measured
+        EnsureVehicleHull(v);
+        VehDamageGame game{ h, v.dmgHull };
+        bool ran = false;
+        const sync::DamageCmd cmd = sync::StepDamageCopy(v.dmgApply, game, st.dmg, nearUs, nowMs, &ran, &v.dmgRaw);
+        if (!ran)
+            return;
+        ++g_dmg.copyRuns;
+        if (!cmd.Any())
+            return;
+        ++g_dmg.copyReplays;
+        if (cmd.Replays())
+        {
+            // SET_VEHICLE_DAMAGE lowers the health too: put the server's values back.
+            g_world->SetVehicleBodyHealth(h, (float)st.bodyHealth);
+            g_world->SetVehicleEngineHealth(h, (float)st.engineHealth);
+        }
+        static int logged = 0;
+        if (logged < 24)
+        {
+            ++logged;
+            PeerLog(false, "engine: vehicle id=%u damage (copy): server petrol %u parts %02x dents [%u %u %u %u %u %u %u %u]; local read petrol %.0f doors %02x lamps %x "
+                    "dents [%u %u %u %u %u %u %u %u]; commands: doors %02x lamps %x dents %02x petrol %d (gain %.0f damage per metre)", id, (unsigned)st.dmg.petrol,
+                    (unsigned)st.dmg.parts, st.dmg.dent[0], st.dmg.dent[1], st.dmg.dent[2], st.dmg.dent[3], st.dmg.dent[4], st.dmg.dent[5], st.dmg.dent[6], st.dmg.dent[7],
+                    (double)v.dmgRaw.petrol, v.dmgRaw.doors, v.dmgRaw.lamps, v.dmgRaw.dent[0], v.dmgRaw.dent[1], v.dmgRaw.dent[2], v.dmgRaw.dent[3], v.dmgRaw.dent[4],
+                    v.dmgRaw.dent[5], v.dmgRaw.dent[6], v.dmgRaw.dent[7], cmd.breakDoors, cmd.lamps, cmd.dents, cmd.petrol ? 1 : 0, (double)v.dmgApply.Gain());
+        }
+    }
+
+    // The controller adopts the server's LOWER health: a vehicle Hit lowers the server's body / engine health, but our own car took no bullet
+    // (the shooter's game hit its copy), so without this it would show no smoke while every copy does. Script tick.
+    void AdoptServerHealth(NetVeh& v, uint16_t id)
+    {
+        if (!g_vehDamageSync.load(std::memory_order_relaxed))
+            return;
+        float body = 0.0f, engine = 0.0f;
+        const proto::VehicleState& st = v.st;
+        bool did = false;
+        if (g_world->GetVehicleBodyHealth(v.handle, body) && sync::ShouldAdoptServerHealth((float)st.bodyHealth, body))
+            did = g_world->SetVehicleBodyHealth(v.handle, (float)st.bodyHealth) || did;
+        if (g_world->GetVehicleEngineHealth(v.handle, engine) && sync::ShouldAdoptServerHealth((float)st.engineHealth, engine))
+            did = g_world->SetVehicleEngineHealth(v.handle, (float)st.engineHealth) || did;
+        if (!did)
+            return;
+        ++g_dmg.adopted;
+        static int logged = 0;
+        if (logged < 8)
+        {
+            ++logged;
+            PeerLog(false, "engine: vehicle id=%u (ours): adopted the server's lower health (a vehicle Hit): body %.0f -> %u, engine %.0f -> %u", id, (double)body,
+                    (unsigned)st.bodyHealth, (double)engine, (unsigned)st.engineHealth);
+        }
+    }
+
     // The server's own fields of a vehicle state onto its entity, when a new full state came in.
     // Driver-owned fields (engine, siren, horn) only when someone else drives it.
     // The controller's high beam, interior light, indicators, doors and roof on our copy, only the bits that differ
@@ -6145,7 +6415,9 @@ namespace {
             g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0);
         if (d.flags2 & proto::kVeh2Brake)
             ++(g_world->SetVehicleBrakeLights(h, (st.flags2 & proto::kVeh2Brake) != 0) ? g_vis.brakeSet : g_vis.brakeFail);
-        if (d.flags2 & proto::kVeh2Handbrake)   // the first sight applies "released" too: a copy must not keep a handbrake of its own
+        // The first sight applies "released" too: a copy must not keep a handbrake of its own. With the sanity layer on (R3 T4) the handbrake is
+        // applied per frame by TickVehicleDamage (HandbrakeLimiter) instead, so a claim that outlives a moving car is released.
+        if ((d.flags2 & proto::kVeh2Handbrake) && !g_vehVisualGuard.load(std::memory_order_relaxed))
             ++(g_world->SetVehicleHandbrake(h, (st.flags2 & proto::kVeh2Handbrake) != 0) ? g_vis.handSet : g_vis.handFail);
         if (d.flags2 & proto::kVeh2RoofDown)
         {
@@ -6157,6 +6429,9 @@ namespace {
         for (int door = 0; door < sync::kBodyDoors; ++door)
         {
             if (!(d.doors & (1u << door)))
+                continue;
+            // R3 T4: a door that is broken off is neither open nor shut (its angle ratio reads as open for ever): do not fight the damage replay.
+            if (g_vehDamageSync.load(std::memory_order_relaxed) && (st.dmg.parts & (1u << door)))
                 continue;
             if (st.doors & (1u << door))
                 g_world->SetVehicleDoorOpen(h, door, false, instantly);
@@ -6199,7 +6474,10 @@ namespace {
             v.appliedLights = lights;
         }
         if (iControl)
+        {
+            AdoptServerHealth(v, st.id);       // R3 T4
             return;
+        }
         ApplyVehicleBody(v);
         if (st.flags2 & proto::kVeh2Brake)
             g_world->SetVehicleBrakeLights(h, true);       // renewed by every full state while they are on (INFERRED: the native may not hold)
@@ -6541,6 +6819,7 @@ namespace {
                     v.visReadMs = -1e9;
                     v.sentVis = sync::VisualMask();
                     v.steerPrevRotMs = -1e9;
+                    ResetVehicleDamage(v);             // R3 T4: new role, new baselines
                 }
                 if (v.appliedVersion != v.stVersion)
                 {
@@ -6553,6 +6832,7 @@ namespace {
                     const float vdx = st.k.x - lpx, vdy = st.k.y - lpy, vdz = st.k.z - lpz;
                     const bool visNear = mine || (haveLp && vdx * vdx + vdy * vdy + vdz * vdz <= kVisNearM * kVisNearM);
                     TickVehicleVisual(v, id, iControl, nowMs, visNear, lp);
+                    TickVehicleDamage(v, id, iControl, nowMs, visNear);    // R3 T4
                 }
                 // W9 item 4 (passenger engine sound): the engine flag above is applied only when the server's flag CHANGES, and the
                 // server clears it at 0 fuel, so a car the local ped rides in as a passenger could sit with its engine stopped on
@@ -7764,24 +8044,85 @@ namespace {
                                       g_world->GetControlNormal(0, kCtlVehHandbrake, hand);
                 if (!pedalsOk)
                     ++g_vis.pedalReadFail;
-                const sync::BrakeState bs = sync::ClassifyBrake(pedalsOk, accel, brake, hand, vFwd);
+                // R3 T4: a handbrake read that is held at the first sample of a rolling car, or that stays held while the car does not slow down, is
+                // a stuck read and is not sent (the brake lights then come from the foot brake alone). veh_visual_guard=0: the v6 classification.
+                const bool guardOn = g_vehVisualGuard.load(std::memory_order_relaxed);
+                const uint32_t stuckBefore = v.pedalGuard.Stats().stuckRuns;
+                const sync::BrakeState bs = guardOn ? v.pedalGuard.Classify(pedalsOk, accel, brake, hand, vFwd, nowMs)
+                                                    : sync::ClassifyBrake(pedalsOk, accel, brake, hand, vFwd);
+                if (guardOn && v.pedalGuard.Stats().stuckRuns != stuckBefore && g_dmg.handLogged < 12)
+                {
+                    ++g_dmg.handLogged;
+                    PeerLog(true, "engine: vehicle id=%u sanity: the handbrake control (id %d) reads %.2f at %.1f m/s and the car does not slow down: a stuck read, NOT sent as "
+                            "a handbrake until it reads released (pedals: accelerate %.2f, brake %.2f)", id, kCtlVehHandbrake, (double)hand, (double)vFwd, (double)accel, (double)brake);
+                }
                 brakeBit = bs.brakeLights;
                 handBit = bs.handbrake;
             }
             if (nowMs - v.visReadMs >= kVisReadMs)
             {
                 VehVisualGame game{ v.handle };
-                v.visReport = sync::ReadReport(v.vis, game);
+                if (g_vehVisualGuard.load(std::memory_order_relaxed))
+                {
+                    // R3 T4: what goes on the wire passes the per-slot baselines. The body health falling is the corroborating signal.
+                    NoteVehicleBody(v, nowMs);
+                    sync::VisualMask flagged;
+                    v.visReport = sync::ReadReportGuarded(v.vis, v.visGuard, game, sync::VisualMask{ v.st.tyres, v.st.tyresRim, v.st.windows },
+                                                          nowMs - v.bodyFellMs <= 3000.0, &flagged);
+                    if (flagged.Any())
+                        NoteUnreliableVisual(id, flagged);
+                }
+                else
+                    v.visReport = sync::ReadReport(v.vis, game);
                 v.visReadMs = nowMs;
             }
+            // R3 T4: the damage block. Read every 500 ms (250 ms while the body health is falling), through the baselines; it rides the next
+            // few updates after a change (the state channel may lose one) and is repeated every 3 s while the server does not show it.
+            const bool dmgOn = g_vehDamageSync.load(std::memory_order_relaxed);
+            if (dmgOn && nowMs - v.dmgReadMs >= (nowMs - v.bodyFellMs <= 3000.0 ? 250.0 : 500.0))
+            {
+                EnsureVehicleHull(v);
+                VehDamageGame dg{ v.handle, v.dmgHull };
+                sync::DamageReporter::Flagged fl;
+                v.dmgReport = sync::StepDamageController(v.dmgRep, dg, v.st.dmg, nowMs, &fl, true, &v.dmgRaw);
+                v.dmgReadMs = nowMs;
+                ++g_dmg.ctlReads;
+                if (v.dmgRaw.bodyOk && std::isfinite(v.dmgRaw.body))
+                {
+                    if (v.lastBodyHp >= 0.0f && v.dmgRaw.body < v.lastBodyHp - 0.5f)
+                        v.bodyFellMs = nowMs;
+                    v.lastBodyHp = v.dmgRaw.body;
+                }
+                v.dmgSend.Observe(v.dmgReport, v.st.dmg);
+                if (fl.parts || fl.dents || fl.petrol)
+                {
+                    g_dmg.flaggedParts += (uint32_t)sync::PopCount8(fl.parts);
+                    g_dmg.flaggedDents += (uint32_t)sync::PopCount8(fl.dents);
+                    g_dmg.flaggedPetrol += fl.petrol ? 1u : 0u;
+                    static int flagLogged = 0;
+                    if (flagLogged < 30)
+                    {
+                        ++flagLogged;
+                        PeerLog(true, "engine: vehicle id=%u sanity: door/lamp bits %02x, dent probe(s) %02x%s read as DAMAGED at the first sample while the server shows none: "
+                                "unreliable, not sent", id, fl.parts, fl.dents, fl.petrol ? " and the petrol tank (low)" : "");
+                    }
+                }
+            }
+            const bool sendDmg = dmgOn && v.dmgSend.Due(v.dmgReport, v.st.dmg, nowMs);
             u.flags2 = (uint8_t)((v.bodyFlags2 & ~(proto::kVeh2Brake | proto::kVeh2Handbrake)) | (brakeBit ? proto::kVeh2Brake : 0) |
                                  (handBit ? proto::kVeh2Handbrake : 0));
-            u.doors = v.bodyDoors;
+            // A door that is broken off reads as open for ever: it is not an open door (the copy would fight the damage replay).
+            u.doors = (uint8_t)(v.bodyDoors & ~(dmgOn ? (v.dmgReport.parts & proto::kVehDmgDoorsMask) : 0));
             u.tyres = v.visReport.tyres;
             u.tyresRim = v.visReport.rim;
             u.windows = v.visReport.windows;
+            if (sendDmg)
+            {
+                u.hasDmg = true;
+                u.dmg = v.dmgReport;
+            }
             const bool changed = !v.sentOnce || u.flags != v.sentFlags || u.flags2 != v.sentFlags2 || u.doors != v.sentDoors ||
-                                 v.visReport != v.sentVis || std::fabs(u.steer - v.sentSteer) > 0.04f;
+                                 v.visReport != v.sentVis || std::fabs(u.steer - v.sentSteer) > 0.04f || (sendDmg && v.dmgSend.Fresh());
             if (!v.sendGate.Due(nowMs, v.moving, changed))
                 return;
             auto clampHp = [](float hp) -> uint16_t {
@@ -7801,6 +8142,11 @@ namespace {
                 v.sentDoors = u.doors;
                 v.sentVis = v.visReport;
                 v.sentSteer = u.steer;
+                if (u.hasDmg)
+                {
+                    v.dmgSend.Sent(nowMs);
+                    ++g_dmg.blocksSent;
+                }
                 ++g_vis.sentUpdates;
                 if (u.tyres) ++g_vis.sentWithTyres;
                 if (u.windows) ++g_vis.sentWithWindows;
@@ -8698,6 +9044,77 @@ namespace {
         g_vis.yawRatioN = 0;
     }
 
+    // R3 T4, every 10 s with the vehicles lines: the vehicle damage state, the controller's reads AND the copy's applied state per damaged car, so
+    // ONE log shows a divergence (the "ctl" line is what our game reads off a car we control and what we report; the "copy" line is the server's
+    // block next to what our game shows on a car somebody else controls), plus the sanity layer's counters and the pedal histogram that answers
+    // whether the handbrake / brake-light reads are plausible. Script tick.
+    void ReportVehDamage()
+    {
+        sync::PedalStats ped;
+        sync::DamageStats rep;
+        sync::ApplierStats app;
+        uint32_t handReleases = 0, tyreUnrel = 0, winUnrel = 0, partsUnrel = 0, dentUnrel = 0;
+        float gain = 0.0f;
+        for (auto& kv : g_vehs)
+        {
+            const NetVeh& n = kv.second;
+            const sync::PedalStats& ps = n.pedalGuard.Stats();
+            ped.samples += ps.samples; ped.moving += ps.moving; ped.accelHigh += ps.accelHigh; ped.brakeHigh += ps.brakeHigh; ped.handHigh += ps.handHigh;
+            ped.brakeRolling += ps.brakeRolling; ped.handDropped += ps.handDropped; ped.stuckRuns += ps.stuckRuns;
+            ped.maxAccel = std::max(ped.maxAccel, ps.maxAccel); ped.maxBrake = std::max(ped.maxBrake, ps.maxBrake); ped.maxHand = std::max(ped.maxHand, ps.maxHand);
+            handReleases += n.handLimit.Releases();
+            const sync::DamageStats& rs = n.dmgRep.Stats();
+            rep.reads += rs.reads; rep.sentRises += rs.sentRises;
+            const sync::ApplierStats& as = n.dmgApply.Stats();
+            app.reads += as.reads; app.divergent += as.divergent; app.doorsBroken += as.doorsBroken; app.lampsReplayed += as.lampsReplayed;
+            app.dentsReplayed += as.dentsReplayed; app.petrolSet += as.petrolSet; app.dentConverged += as.dentConverged; app.dentNoEffect += as.dentNoEffect;
+            app.dentGaveUp += as.dentGaveUp; app.cmdFailures += as.cmdFailures; app.suspends += as.suspends;
+            if (as.gainUpdates) { gain = n.dmgApply.Gain(); app.gainUpdates += as.gainUpdates; }
+            const sync::VisualMask u = n.visGuard.Unreliable();
+            tyreUnrel += (uint32_t)sync::PopCount8(u.tyres | u.rim);
+            winUnrel += (uint32_t)sync::PopCount8(u.windows);
+            partsUnrel += (uint32_t)sync::PopCount8(n.dmgRep.UnreliableParts());
+            dentUnrel += (uint32_t)sync::PopCount8(n.dmgRep.UnreliableDents());
+        }
+        const DmgStats& c = g_dmg;
+        const bool active = c.ctlReads || c.blocksSent || c.copyRuns || c.guardsSet || c.adopted || ped.samples || tyreUnrel || winUnrel;
+        if (join::IsConnected() && active)
+        {
+            GLOGI("engine: vehicle damage (R3 T4), last 10 s: veh_damage_sync %s, veh_visual_guard %s; as controller: %u damage reads, %u updates carried the block, "
+                  "%u adopted a lower server health (a vehicle Hit); SANITY: unreliable slots now: tyres %u, windows %u, doors/lamps %u, dents %u (flagged in the window: "
+                  "tyres %u windows %u doors/lamps %u dents %u petrol %u); PEDALS since the first sight of each car: %u samples (%u rolling), accelerator>0.1 %u, brake>0.1 %u, "
+                  "handbrake>0.5 %u, foot brake while rolling forward %u, max accel %.2f brake %.2f hand %.2f, handbrake withheld as stuck %u samples (%u runs); as copy: %u "
+                  "damage reads, doors broken %u, lamps replayed %u, dents replayed %u (converged %u, no effect %u, gave up %u, gain %.0f damage per metre after %u "
+                  "read-backs), petrol set %u, failed rounds %u (%u back-offs), handbrake releases after a long roll %u, self-damage guards set %u",
+                  g_vehDamageSync.load() ? "on" : "OFF", g_vehVisualGuard.load() ? "on" : "OFF", c.ctlReads, c.blocksSent, c.adopted, tyreUnrel, winUnrel, partsUnrel,
+                  dentUnrel, c.flaggedTyres, c.flaggedWindows, c.flaggedParts, c.flaggedDents, c.flaggedPetrol, ped.samples, ped.moving, ped.accelHigh, ped.brakeHigh,
+                  ped.handHigh, ped.brakeRolling, (double)ped.maxAccel, (double)ped.maxBrake, (double)ped.maxHand, ped.handDropped, ped.stuckRuns, c.copyRuns,
+                  app.doorsBroken, app.lampsReplayed, app.dentsReplayed, app.dentConverged, app.dentNoEffect, app.dentGaveUp, (double)gain, app.gainUpdates, app.petrolSet,
+                  app.cmdFailures, app.suspends, handReleases, c.guardsSet);
+            int lines = 0;
+            for (const auto& kv : g_vehs)
+            {
+                const NetVeh& n = kv.second;
+                if (!n.handle || !n.haveState || lines >= 4)
+                    continue;
+                const bool ours = n.st.ctrl == join::MyId();
+                const proto::VehicleDamage& d = ours ? n.dmgReport : n.st.dmg;
+                if (!n.st.dmg.Any() && !d.Any() && n.st.bodyHealth >= 990)
+                    continue;
+                ++lines;
+                GLOGI("engine: vehicle id=%u damage (%s): server body %u engine %u petrol %u parts %02x dents [%u %u %u %u %u %u %u %u]; %s read body %.0f petrol %.0f "
+                      "doors %02x lamps %x dents [%u %u %u %u %u %u %u %u]%s", (unsigned)kv.first, ours ? "ctl" : "copy", (unsigned)n.st.bodyHealth, (unsigned)n.st.engineHealth,
+                      (unsigned)n.st.dmg.petrol, (unsigned)n.st.dmg.parts, n.st.dmg.dent[0], n.st.dmg.dent[1], n.st.dmg.dent[2], n.st.dmg.dent[3], n.st.dmg.dent[4],
+                      n.st.dmg.dent[5], n.st.dmg.dent[6], n.st.dmg.dent[7], ours ? "controller's" : "copy's own", (double)n.dmgRaw.body, (double)n.dmgRaw.petrol,
+                      n.dmgRaw.doors, n.dmgRaw.lamps, n.dmgRaw.dent[0], n.dmgRaw.dent[1], n.dmgRaw.dent[2], n.dmgRaw.dent[3], n.dmgRaw.dent[4], n.dmgRaw.dent[5],
+                      n.dmgRaw.dent[6], n.dmgRaw.dent[7],
+                      ours ? "" : (n.dmgRaw.Any() ? "" : " (not read yet)"));
+            }
+        }
+        g_dmg.ctlReads = g_dmg.blocksSent = g_dmg.adopted = g_dmg.copyRuns = g_dmg.copyReplays = 0;
+        g_dmg.flaggedTyres = g_dmg.flaggedWindows = g_dmg.flaggedParts = g_dmg.flaggedDents = g_dmg.flaggedPetrol = 0;
+    }
+
     // Every 10 s: one line each for vehicles, combat and anims (only while connected).
     void ReportV4(double nowMs)
     {
@@ -8708,6 +9125,7 @@ namespace {
             return;
         lastMs = nowMs;
         ReportVehVisual();                             // T3
+        ReportVehDamage();                             // R3 T4
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
         g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;

@@ -35,7 +35,7 @@ build/win/selftest/legacy_handoff_test.exe  # the one-time RAGE-MP registry clea
 build/win/selftest/crash_diag_test.exe   # stack scan, minidump struct, MSVC throw decode, main-thread lookup
 build/win/selftest/join_test.exe         # the engine's session adapter against an in-process server, loopback
 build/win/selftest/netcode_test.exe      # protocol v1 + server over real ENet on loopback, about 12 s
-build/win/selftest/t3_vehvisual_test.exe  # vehicle visual state (v6 tyres / windows / brake lights / steering): wire, store merge, sync module, real server, about 8 s
+build/win/selftest/t3_vehvisual_test.exe  # vehicle visual state (v6 tyres / windows / brake lights / steering) + R3 T4 (v7 damage block, sanity layer): wire, store merge, sync modules, real server, about 9 s
 build/win/selftest/server_test.exe       # UDP query, master announce, bans, admin channel, about 16 s
 build/win/selftest/sync_test.exe         # the remote-player smoother (libs/sync) under loss, jitter and teleports
 build/win/selftest/locomotion_test.exe   # remote-ped gait controller against a simulated ped

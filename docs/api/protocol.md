@@ -391,6 +391,8 @@ A **full state** (v6: 46 bytes, plus 2 per occupant; v5: 43; v4: 36):
 | 45 | 1 | `u8` seat mask: bit i = seat i is occupied (seat 0 is the driver) |
 | 46 | 2 x n | `u16` player id per set bit, in seat order (each below 1024) |
 
+**v7 (R3 T4):** the full state grows by the `VehicleDamage` block (3..11 bytes, section "R3 T4") between `windows` and the seat mask: 49 bytes with a clean block (+2 per occupant).
+
 A **motion-only state** (v5, header 2): `u8` ageMs, the 22-byte motion, `u8` flags (the complete `kVeh*` set, as above):
 24 bytes after the id and header (26 with them; a full entry is 45 or more). It leaves out the model, health, fuel,
 colours, seats, ctrl, owner, flags2, doors and (v6) tyres, tyresRim and windows: the receiver keeps what it holds for them. The server sends a full entry
@@ -505,6 +507,9 @@ server copies position, velocity, rotation, angular velocity, steering and the d
 Hits (section 16); a health can only go down this way (a crash). Anything else is dropped and counted (`vehicleUpdatesRejected` / `Invalid` / `Stale`), never fatal. With fuel 0
 the engine stays off. The displacement check (`untrustedWindowMs`) runs on the server's receipt times, not on `sampleMs`, so a
 forged stamp cannot hide a jump.
+
+**v7 (R3 T4):** `flags` bit 5 (`kVehDamageBlock`) announces a `VehicleDamage` block (3..11 bytes) after `windows`; without it the message stays 40 bytes. The server merges it
+monotonically and refuses a rise on a car with full body health (section "R3 T4").
 
 ### 19 `VehicleResult` (server to client, reliable): 5 bytes
 
@@ -1155,3 +1160,111 @@ Server policy changes that need no wire change (T4):
 * `Rules::maxSpeedSoftFactor` (2.0): a `VehicleUpdate` whose velocity is over `vehicleMaxSpeed` (150) but under twice it is accepted with the velocity clamped to the cap (it used to be
   refused as `BadArg`, which froze a hyper car for everybody else); above twice the cap it is refused as before.
 <!-- T4-END -->
+
+<!-- R3-T4-BEGIN: vehicle damage state (desync overhaul round 3). Append-only section; the orchestrator does the single kVersion 6 -> 7 bump. -->
+## R3 T4: vehicle damage state and the sanity layer of the visual reads (protocol v7, additive)
+
+**Why.** GI's 0.4.7 log: "car damage state is not in sync". The wire carried tyres, rim, windows, brake lights and the handbrake (section 16), and body / engine
+health; it did not carry the petrol tank, broken-off doors, broken headlights or any deformation. The same log showed two reads that could not be right
+(`199 updates sent (0 with a burst tyre, 199 with a smashed window, 96 with brake lights, 96 with the handbrake)`, measured live): a smashed window in
+EVERY update of a car driven normally, and the other player's copy showing window damage on a car that had none. Client logic: `libs/sync/vehicle_damage.h`;
+tests: `tests/r3_t4_tests.h` (run by `t3_vehvisual_test`). Evidence level of everything below the wire: **simulated** (fake cars obeying the model written in the
+test); how the game's natives really behave is read back and logged live (the 10 s line), not assumed.
+
+### Wire (additive; `libs/protocol`)
+
+A new block, `VehicleDamage`, 3..11 bytes: `u8 petrol` (petrol tank health / 4, 0..250; 251..255 refused), `u8 parts` (bit i, i = 0..5: door i broken off, the
+`kDoor*` order; bit 6 `kVehDmgLampL`, bit 7 `kVehDmgLampR`: that headlight is broken), `u8 dentMask` (bit i = probe i has a dent), then one `u8` per set mask bit in
+ascending order (the dent depth in 2 mm steps, 1..255 = up to 0.51 m; a 0 under a set bit is refused).
+
+| Message | v6 | v7 |
+|---|---|---|
+| `VehicleUpdate` (18) | 40 bytes | 40 when `flags` bit 5 (`kVehDamageBlock`) is clear (an undamaged car costs nothing more); 43 with a clean block, 45 with two dents, 51 with eight (the block follows `windows`) |
+| `VehicleWorld` (14) full entry | 46 bytes + 2 per occupant | 49 with a clean block (+3), 51 with two dents, 57 with eight; the block sits between `windows` and the seat mask |
+| `VehicleWorld` motion-only entry | 24 | 24 (no block: the receiver keeps what it holds) |
+| `flags` of `VehicleUpdate` | bits 5..7 reserved (refused) | bit 5 = `kVehDamageBlock` (wire only: the decoded struct keeps the `kVeh*` bits and sets `hasDmg`); bits 6..7 still refused. `VehicleState.flags` is unchanged (bit 5 refused there) |
+
+Body health and engine health are the existing `u16` fields of both messages (smoke below ~400, a dead engine at 0). They stay as they are; a one-byte quantised form would
+save 2 bytes per update and entry but is a layout change for no new information.
+
+Strict decoding: petrol above 250, a dent byte of 0 under a set mask bit, a truncated or trailing block are refused; `Encode` refuses petrol above 250 and
+`ValidVehicleUpdate` checks it. Every truncation, one trailing byte and every single-bit flip of the block bytes are covered (`tests/r3_t4_tests.h` C3..C6,
+`decode_fuzz_test` cases "VehicleWorld damage", "VehicleUpdate damage", "VehicleUpdate clean block").
+
+**What the dent map is.** `kVehDentProbes` = 8 fixed probe points on the hull at bumper height, in the car's own frame (x right, y forward, z up; metres from the
+origin): 0 front left, 1 front right, 2 front middle, 3 rear left, 4 rear right, 5 rear middle, 6 left middle, 7 right middle. The half width, nose and tail come
+from the model's wheel bones (cached per model; a fallback frame when the bones do not read). A probe's value is the length of
+`GET_VEHICLE_DEFORMATION_AT_POS(vehicle, probe point)` in 2 mm steps. Cost is bounded: at most 8 bytes in a block, none for an undented car, the block is sent
+on change only. A finer grid (the per-vertex damage map) is not carried: dozens of samples per car per read and bytes in proportion, for a signal whose
+native semantics are unverified; 8 probes are the cheapest map that still shows WHERE a car is hurt.
+
+### Server rules (`apps/server/vehicles.h`, `VehicleStore::Update` / `MergeDamage`)
+
+1. *The controller's report is truth, and damage only goes up.* Like body and engine health (a crash cannot be undone by a client): the petrol tank takes the lower
+   value, broken parts are OR-ed, a dent takes the deeper value. A cleaner or milder report clears nothing. `VehicleStore::RepairDamage(id)` is the (future) repair path.
+2. *A clean car cannot gain damage.* `Rules::damageNeedsHealthLoss` (default true, `cleanHealth` 995): a report that ADDS a smashed window, a broken door or
+   headlight, a dent or a lower petrol tank is refused (and counted: `Stats::vehicleWindowRejects` / `vehicleDamageRejects`) while both the server's and the report's
+   body health are at least 995. A window bit that a validated Hit set (`HitPart`) is not "adding": it is acked by the controller as before. This is the server's
+   defence for a controller whose reads are wrong (an old client). Switching it off restores the v6 trust.
+3. *Stream-in, hand-over.* The block is a static field of the full entry: a newcomer gets it in its first full entry, a change is told for 3 frames, one entry a
+   second repeats it. A car with no controller keeps its block. `VehicleStore::FullBytes` counts it (46 + 3..11).
+
+### The sanity layer (`libs/sync/vehicle_damage.h`)
+
+Every read that feeds the wire is judged against a per-car BASELINE learned at the first sample (a clean car is the common case):
+
+* **`SlotGuard` / `VisualGuard`** (tyres, rim, windows, and the doors / headlights): a bit that is set at the very first read while the server does not show it is an
+  *unreliable slot*: counted, logged once per car (`engine: vehicle id=N sanity: ...`), never sent, and masked out of the copy's own readback (so a copy does not
+  fix, smash or report it as a vehicle Hit). A bit is damage only when it CHANGES from a baseline that read intact, after it held on a second read, or at once
+  with a corroborating signal (the controller's body health fell within 3 s; the local player shot lately). An unreliable slot is believed only while the server
+  itself shows the bit; once it has read clear it is an ordinary slot. A bit the server also shows at the first read (a hand-over of a damaged car) is a known fact.
+* **`PedalGuard`** (brake lights / handbrake): a handbrake that is held at the FIRST sample of a car rolling faster than 3 m/s, or stays held for 2 s while the car at
+  5+ m/s does not slow down (below 85 % of the speed the hold began at), is a stuck read: not sent until it reads released; the foot brake still lights the brake
+  lights. The same rule for a foot brake held 3 s at speed that does not slow the car. A parked car with the handbrake held is believed.
+* **`DamageReporter`** (petrol, doors, headlights, dents): starts from the server's block (so it reports nothing new on its own first read), flags first-read damage
+  as above, and believes a rise only when the server agrees, when the body health just fell, or when it held on a second read with the body health below its
+  first-sight value. A dent with no health loss anywhere is not a crash. A tank that reads low at the first sight of a clean car is unreliable.
+* **`HandbrakeLimiter`** (copy side): a held handbrake is honoured on a standing copy and for at most 4 s of continuous rolling; then it is released and ignored
+  until the controller clears the bit once. The copy's handbrake is now applied per frame by this limiter instead of once per full state.
+
+**The two live reads, explained from the code (evidence: the log lines above; the code path reproduced in `tests/r3_t4_tests.h` A1, A2):**
+* *199 of 199 smashed windows.* `ReadVisual` calls `IS_VEHICLE_WINDOW_INTACT` for slots 0..7 whatever glass the model has and set a bit for every "not intact"
+  result; the report took that mask from the very first sample, so a slot that reads "not intact" for any reason (a slot the model has no glass for, a window rolled down,
+  a read that never changes) was "smashed" in every update, and a copy applied it. The log does not say WHICH slots (the mask is not in it): the baseline rule handles
+  every case, and the new 10 s line prints the flagged slots. The same code path for tyres.
+* *96 brake-light updates and 96 handbrake updates.* `ClassifyBrake` sets the brake lights whenever the handbrake is held, so brake-light bits are a superset of
+  handbrake bits (proved for 20000 random pedal states); EQUAL counts only mean the foot brake never acted while the car rolled forward. 96 of 199 handbrake updates
+  (a still car is sent at 5 Hz, so a parked car held for ~19 s gives that) is consistent with a handbrake held while parked, which is real and harmless; it is not
+  evidence of a wrong control id. Control ids 59 / 71 / 72 / 76 are the standard `INPUT_VEH_MOVE_LR / ACCELERATE / BRAKE / HANDBRAKE`; the new 10 s line prints a pedal
+  histogram (samples, rolling, accelerator > 0.1, brake > 0.1, handbrake > 0.5, foot brake while rolling, maxima) that settles it from one log.
+
+### Client rules (engine glue in `apps/engine/engine.cpp`: `TickVehicleDamage`, `SendControlledVehicles`, `AdoptServerHealth`, `ReportVehDamage`)
+
+* *Controller.* Reads the damage every 500 ms (250 ms while the body health is falling) through the reporter; the block rides the next 6 `VehicleUpdate`s after a change
+  (the state channel may lose one) and is repeated every 3 s while the server's block lacks it (`DamageSendPolicy`); a report equal to the server's is never sent.
+  A door that is broken off is not reported as an open door. The controller also ADOPTS the server's lower body / engine health (more than 25 below its own): a vehicle
+  Hit lowers the server's health, but the controller's own car took no bullet.
+* *Copy.* Brought to the server's block (`DamageApplier`): doors with `SET_VEHICLE_DOOR_BROKEN(door, true)` (the door is deleted, not left as a loose physics object);
+  the petrol tank with `SET_VEHICLE_PETROL_TANK_HEALTH`; headlights, for which the game's script API has NO setter, with a small `SET_VEHICLE_DAMAGE` at the lamp
+  (120, 240, 480, 960 damage in successive rounds) checked by the headlight read-back; dents with `SET_VEHICLE_DAMAGE` at the probe, CLOSED LOOP: aim at 40 % of
+  the missing depth, read the probe back 450 ms later, learn the damage-per-metre gain from what the replay really did, aim at 90 % of what is still missing,
+  at most 4 rounds per probe per server value. A dent cannot be undone, so a game much stronger than the first guess overshoots once (documented; the 10 s line shows
+  the learned gain). A replay that does nothing stops after 4 tries, an unresolved write native after 3 rounds and 5 s of silence; unreadable depth means one blind replay.
+  A copy never reports damage. A car whose server block is clean costs no native call.
+* *Copies must not damage themselves.* While a car is somebody else's the engine sets `SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED(false)`,
+  `SET_VEHICLE_ENGINE_CAN_DEGRADE(false)` and `SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE(true)`; the visible-damage flag is lifted only for the length of a replay.
+  A car we control has the defaults back.
+* *Not carried.* Fire and explosion (engine / tank health below 0: the wire clamps at 0, and a copy driven into the burning range would burn and explode on its own
+  timeline, a desync of its own); loose door objects; windows' roll state; dirt; a repair (`RepairDamage` clears the server's block, but nothing sends it yet).
+* *Cause of the dent.* The server-arbitrated `VehicleImpact` (T4 of round 2) reaches only the two controllers; observers never see it, and walls, props and rollovers are
+  not in it. Reading the RESULT off the controller's hull covers every cause and survives packet loss, which is why the dents are state, not replayed events.
+
+### Switches and diagnostics
+
+* `HKCU\Software\GAGE-MP\veh_damage_sync=0`: no damage block is sent or applied, copies keep the game's own damage rules (v6 behaviour). `veh_visual_guard=0`: the
+  sanity layer is off (tyre / window / handbrake reads reach the wire as in v6, the copy's handbrake is applied once per full state). Both re-read at every Welcome.
+* Every 10 s: `engine: vehicle damage (R3 T4), last 10 s: ...` (switches, controller reads and blocks sent, adoptions, unreliable slots now and flagged in the window,
+  the pedal histogram, the copy's replays / convergence / no-effect / gave-up / learned gain / failed rounds) and, per damaged car (at most 4), `engine: vehicle id=N damage
+  (ctl|copy): server body / engine / petrol / parts / dents ...; <controller's|copy's own> read body / petrol / doors / lamps / dents ...` so one log shows the
+  controller's reads and the copy's applied state side by side. The first replays are logged in full (`damage (copy)`), the guards once (`damage guards for a ...`).
+<!-- R3-T4-END -->

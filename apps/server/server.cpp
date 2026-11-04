@@ -1343,6 +1343,8 @@ namespace gage::server {
         c.vehSeq = u.seq;
         c.hasVehSeq = true;
         stats_.vehicleUpdatesAccepted++;
+        stats_.vehicleWindowRejects = vehicles_.windowRejects();   // R3 T4 (cumulative counters of the store)
+        stats_.vehicleDamageRejects = vehicles_.damageRejects();
         {
             // T4: the arbiter keeps the controller's recent track (on the server's time base) to resolve contacts with other controllers' vehicles
             sync::impact::ArbSample as;

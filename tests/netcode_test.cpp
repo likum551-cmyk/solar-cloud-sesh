@@ -1988,6 +1988,7 @@ static void VehicleCodecTests()
             0x03, 0x00, 0x05, 0x00,                         // v5: ctrl player 3, ownerId player 5
             0x15, 0x21,                                     // v5: flags2 headlights | interior | indicator R, doors FL | trunk
             0x11, 0x10, 0x30,                               // v6: tyres slots 0 + 4 burst, rim slot 4, windows 4 + 5 smashed
+            0xFA, 0x00, 0x00,                               // v7 (R3 T4): damage block: petrol 250 (full tank), no broken parts, no dents
             0x05, 0x03, 0x00, 0x05, 0x00,                   // seat mask 0b101: seat 0 = player 3, seat 2 = player 5
             0x09, 0x00,                                     // id 9, header 0 = present, no full state
             0x0B, 0x02,                                     // v5: id 11, header 2 = motion-only entry follows
@@ -2014,7 +2015,7 @@ static void VehicleCodecTests()
         const proto::Bytes wantKilled = {0x16, 0x02, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
                                          0x03};     // v5: flags headshot | melee
         const proto::Bytes wantStop = {0x1E, 0x04, 0x00};
-        Check("codec v6: VehicleWorld (u8 ids, presence list, 46 + 2-per-occupant full entry, 24-byte motion-only entry), VehicleCmd (Register tail), "
+        Check("codec v7: VehicleWorld (u8 ids, presence list, 49 + 2-per-occupant full entry (the clean damage block included), 24-byte motion-only entry), VehicleCmd (Register tail), "
               "VehicleUpdate (40 bytes), Hit, Damage (17), Killed (10) and PeerAnimStop are laid out byte for byte",
               vs[0].bytes == wantWorld && vs[1].bytes == wantLock && vs[2].bytes == wantReg && vs[3].bytes == wantUp &&
                   vs[5].bytes == wantHit && vs[6].bytes == wantDmg && vs[7].bytes == wantKilled && wantUp.size() == 40 &&
@@ -2067,23 +2068,24 @@ static void VehicleCodecTests()
         };
         // Offsets: 9 id 5, 10 its header, 15..22 position, 29..32 rotation, 33..35 av, 36 steer, 37 flags,
         // 38/39 body, 42/43 fuel, 46 ageMs, 47/48 ctrl, 49/50 ownerId, 51 flags2, 52 doors, 53 tyres, 54 tyresRim (v6),
-        // 55 windows, 56 seat mask, 57/58 the first occupant, 61 the second entry's id, 62 its header, 63 the third entry's id,
-        // 64 its header (2: motion-only), 65 its ageMs, 66..87 its motion (87 steering), 88 its flags.
+        // 55 windows, 56..58 the v7 damage block (petrol, parts, dent mask: 3 bytes, no dents), 59 seat mask, 60/61 the first occupant,
+        // 64 the second entry's id, 65 its header, 66 the third entry's id, 67 its header (2: motion-only), 68 its ageMs,
+        // 69..90 its motion (90 steering), 91 its flags. (R3 T4 inserted the 3 damage bytes: everything from the seat mask on moved by 3.)
         std::string bad;
         if (worldWith(10, 0x03)) bad += "[reserved header bit]";
         if (worldWith(10, 0x04)) bad += "[header 4]";
-        if (worldWith(62, 0x04)) bad += "[reserved header bit, no state]";
-        if (worldWith(62, 0x03)) bad += "[header 3 on a presence-only entry]";
-        if (worldWith(64, 0x01)) bad += "[motion-only entry read as a full one]";
-        if (worldWith(64, 0x00)) bad += "[motion-only entry read as presence-only]";
+        if (worldWith(65, 0x04)) bad += "[reserved header bit, no state]";
+        if (worldWith(65, 0x03)) bad += "[header 3 on a presence-only entry]";
+        if (worldWith(67, 0x01)) bad += "[motion-only entry read as a full one]";
+        if (worldWith(67, 0x00)) bad += "[motion-only entry read as presence-only]";
         if (!worldWith(51, 0xFF)) bad += "[flags2 with bits 6 and 7 (brake lights, handbrake) is legal in v6]";
         if (worldWith(53, 0x00)) bad += "[rim bit without its tyre bit]";
         if (worldWith(52, 0x61)) bad += "[doors bit 6]";
         if (worldWith(48, 0x04)) bad += "[ctrl over kMaxPlayers]";
         if (worldWith(50, 0x04)) bad += "[ownerId over kMaxPlayers]";
-        if (worldWith(87, 0x80)) bad += "[motion-only steering -128]";
-        if (worldWith(88, 0x24)) bad += "[motion-only unknown flag 32]";
-        if (worldWith(61, 0x05)) bad += "[present not ascending]";
+        if (worldWith(90, 0x80)) bad += "[motion-only steering -128]";
+        if (worldWith(91, 0x24)) bad += "[motion-only unknown flag 32]";
+        if (worldWith(64, 0x05)) bad += "[present not ascending]";
         if (worldWith(9, 0x07)) bad += "[present and removed]";
         if (worldWith(6, 0x09)) bad += "[removed and present]";
         if (worldWith(32, 0xFF)) bad += "[rotation code 1023]"; // 0xFFF7FDFF: bits 20..29 = 1023
@@ -2092,8 +2094,10 @@ static void VehicleCodecTests()
         if (worldWith(37, 0x23)) bad += "[unknown flag 32]";
         if (worldWith(39, 0x04)) bad += "[body over 1000]";
         if (worldWith(43, 0x04)) bad += "[fuel over 1000]";
-        if (worldWith(58, 0x04)) bad += "[occupant id over kMaxPlayers]";
-        if (worldWith(56, 0x07)) bad += "[seat mask lies]";
+        if (worldWith(61, 0x04)) bad += "[occupant id over kMaxPlayers]";
+        if (worldWith(59, 0x07)) bad += "[seat mask lies]";
+        if (worldWith(56, 0xFB)) bad += "[petrol 251 (R3 T4)]";
+        if (worldWith(58, 0x01)) bad += "[dent mask names a dent that is not there (R3 T4)]";
         if (worldWith(8, 0x01) || worldWith(7, 0x04)) bad += "[present count lies]"; // 259 present; 4 present with 3 listed
         // Out of the box: z = -2^19 cm (-5243 m, the 20-bit field's minimum) fits the field but not the box.
         {

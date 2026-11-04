@@ -1102,6 +1102,21 @@ namespace gage::game {
         bool     GetControlNormal(int inputGroup, int control, float& value);                // -1..1 axis / 0..1 button
         bool     SetVehicleHandbrake(int32_t veh, bool on);
         bool     SetVehicleBrakeLights(int32_t veh, bool on);
+        // ---- R3 T4 vehicle damage state (protocol v7). Each returns false when the native could not be called. ----
+        bool     GetVehiclePetrolTankHealth(int32_t veh, float& health);                     // 1000 full .. 0 (and below: burning)
+        bool     SetVehiclePetrolTankHealth(int32_t veh, float health);
+        // SET_VEHICLE_DAMAGE: (x, y, z) is an offset in the car's own frame (focusOnModel = relative to the model); damage ~ a collision's
+        // strength (a few hundred = a real dent), radius in metres. It deforms the hull and lowers the body health.
+        bool     SetVehicleDamage(int32_t veh, float x, float y, float z, float damage, float radius, bool focusOnModel);
+        // GET_VEHICLE_DEFORMATION_AT_POS: the dent at a point in the car's frame, as a vector in metres (zero = undented).
+        bool     GetVehicleDeformationAtPos(int32_t veh, float x, float y, float z, float& dx, float& dy, float& dz);
+        bool     IsVehicleDoorDamaged(int32_t veh, int door, bool& damaged);                 // broken off / missing
+        bool     GetIsDoorValid(int32_t veh, int door, bool& valid);                         // the model has this door
+        bool     SetVehicleDoorBroken(int32_t veh, int door, bool deleteDoor);
+        bool     IsVehicleHeadlightDamaged(int32_t veh, bool left, bool& damaged);           // GET_IS_LEFT / RIGHT_VEHICLE_HEADLIGHT_DAMAGED
+        bool     SetVehicleCanBeVisiblyDamaged(int32_t veh, bool on);                        // false: collisions do not deform the car
+        bool     SetVehicleEngineCanDegrade(int32_t veh, bool on);
+        bool     SetDisableVehiclePetrolTankDamage(int32_t veh, bool on);
         // Particle fx: request the asset, wait for HasNamedPtfxAssetLoaded, UseParticleFxAsset, then
         // start (the alloc8or example order). Null / empty names return false without calling.
         bool     RequestNamedPtfxAsset(const char* fxName);

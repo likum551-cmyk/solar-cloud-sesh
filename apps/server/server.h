@@ -173,6 +173,7 @@ namespace gage::server {
         uint64_t vehicleUpdatesStale = 0;    // seq not newer than the last accepted
         uint64_t vehicleFrames = 0;          // VehicleWorld packets sent
         uint64_t vehiclePartHits = 0;        // v6: vehicle Hits that set a tyre / window bit (VehicleStore::HitPart)
+        uint64_t vehicleWindowRejects = 0, vehicleDamageRejects = 0;   // R3 T4: controller reports that added a window / damage-block rise on a car with full health (refused)
         uint64_t vehicleImpacts = 0;         // T4: contacts between two controllers' vehicles the arbiter resolved
         uint64_t vehicleImpactsSent = 0;     // ... VehicleImpact messages sent (one per controller)
         uint64_t hitsAccepted = 0;
