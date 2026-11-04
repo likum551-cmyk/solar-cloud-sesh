@@ -954,6 +954,13 @@ struct BuildProfile {
     size_t             scrProgNativeCount;        // rage::scrProgram::m_NativeCount
     size_t             scrProgNativeEntrypoints;  // rage::scrProgram::m_NativeEntrypoints
     size_t             threadScriptName;          // scrThread::m_ScriptName (char[64]); diagnostics + name fallback
+    // no_sp_scripts (GtaThread::Tick -> no-op). Enhanced: an ENTRY-anchored signature (match + gtaThreadTickFnOffset
+    // = the function). Legacy leaves gtaThreadTickSig null: its pattern sits INSIDE the function and stays in
+    // noSpInstall (fn = match - 0xB). threadStateOff is where the thread keeps its eThreadState, which is what Tick
+    // returns (0 = the Legacy rule threadId + 8).
+    const char*        gtaThreadTickSig;
+    int                gtaThreadTickFnOffset;
+    size_t             threadStateOff;
 };
 
 const BuildProfile kProfile3889 = {
@@ -967,6 +974,7 @@ const BuildProfile kProfile3889 = {
     0x2A48, 0x2A50, 0x08, 0x118, 0x128,
     "E8 ?? ?? ?? ?? 84 C0 8B 05 ?? ?? ?? ?? 74 ?? 83 C0",              // landingPageSig
     0, 0, 0, 0,                                                        // Enhanced-only fields: unused on Legacy (bucketed path)
+    nullptr, 0, 0,                                                     // gtaThreadTickSig / fn offset / state offset: Legacy uses its own pattern in noSpInstall
 };
 
 // Enhanced build 1158.13, DX12. Every value here was derived from the friend's
@@ -1000,6 +1008,18 @@ const BuildProfile kProfile1158 = {
     0x7A0, 0x7A8, 0x08, 0x198, 0x1A8,                                  // tls thread/active, thread id, scriptHandler, m_ScriptHash2
     "E8 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 83 C1 ?? 84 C0",                 // landingPageSig (Enhanced)
     -0x2A, 0x2C, 0x40, 0x154,                                          // InitNativeTables fn=match-0x2A; scrProgram m_NativeCount/m_NativeEntrypoints; m_ScriptName
+    // GtaThread::Tick (no_sp_scripts), derived 2026-11-04 from the friend's dump, all offline: run_script_threads
+    // (RVA 0x920a40) calls `call [rax+0x18]` = vtable slot 3 of every live thread with edx = the op budget and
+    // compares the result with 2 (KILLED); the GtaThread vtable (RVA 0x2679270) holds 0x13cfca0 in slot 3 (the base
+    // scrThread vtable 0x2610e80 holds 0x9209f0); slot 2 of both is the interpreter wrapper 0x91dc20, the only
+    // function in the image that stores the TLS thread slots +0x7A0 / +0x7A8. 0x13cfca0 =
+    //   56 57 53 | 48 83 EC 20 | 48 89 CE | 80 B9 CE 01 00 00 00 | 74 08 | 8B 7E 18 | E9 ...
+    //   push rsi/rdi/rbx; sub rsp,20; mov rsi,rcx; cmp byte [rcx+0x1ce],0; je +8; mov edi,[rsi+0x18]; jmp -> return edi
+    // i.e. the Legacy function's shape with `mov rsi,rcx` between the sub and the cmp (which is why the Legacy
+    // pattern found 0 hits), and the early-out returns the state at this+0x18. Unique in the dump (1 hit); the
+    // first 17 bytes are whole instructions with no CALL, so netJump takes it. The code is verified offline only;
+    // noSpVerifyTick cross-checks it live against the vtable.
+    "56 57 53 48 83 EC 20 48 89 CE 80 B9 ?? ?? 00 00 00 74 08 8B 7E 18 E9", 0, 0x18,
 };
 
 // Selected in Init() by main-module file name; defaults to Legacy so the live
@@ -2717,13 +2737,23 @@ int noScriptTick(uint8_t* thread, int) { return *(int*)(thread + g_threadStateOf
 
 // Poller thread. True once installed or definitively given up; false to keep retrying while the
 // script code is still encrypted.
+uint8_t* findAnyScriptThread();   // defined with the other thread finders below
+
+// The Tick function we hooked (null until noSpInstall succeeds) and whether noSpVerifyTick has finished.
+uint8_t* g_noSpTickFn = nullptr;
+bool g_noSpVerified = false;
+
 bool noSpInstall() {
-    if (g_build != &kProfile3889) {
-        GLOGW("hook: [nosp] no_sp_scripts ignored: build is %s, the Tick pattern is Legacy 3889 only",
-              g_build->label);
+    // Legacy 3889: the pattern sits inside the function (fn = match - 0xB). Enhanced: an entry-anchored
+    // signature from the build profile. Any other build has neither, so it stays inert.
+    const bool profileSig = g_build->gtaThreadTickSig != nullptr;
+    if (g_build != &kProfile3889 && !profileSig) {
+        GLOGW("hook: [nosp] no_sp_scripts ignored: no GtaThread::Tick pattern for build %s", g_build->label);
         return true;
     }
-    uint8_t* m = netFindUnique("gtaThreadTick", "48 83 EC 20 80 B9 ?? 01 00 00 00 8B FA");
+    const char* sig = profileSig ? g_build->gtaThreadTickSig : "48 83 EC 20 80 B9 ?? 01 00 00 00 8B FA";
+    const int fnOffset = profileSig ? g_build->gtaThreadTickFnOffset : -0xB;
+    uint8_t* m = netFindUnique("gtaThreadTick", sig);
     if (!m) {
         const ULONGLONG now = GetTickCount64();
         switch (codeWaitStep(g_noSpWait, now)) {
@@ -2739,19 +2769,63 @@ bool noSpInstall() {
         }
         return false;
     }
-    uint8_t* fn = m - 0xB;
-    g_threadStateOff = g_build->threadId + 8;
+    uint8_t* fn = m + fnOffset;
+    g_threadStateOff = g_build->threadStateOff ? g_build->threadStateOff : g_build->threadId + 8;
     char hex[16 * 3 + 1] = {};
     for (int i = 0; i < 16; ++i) snprintf(hex + i * 3, 4, "%02x ", fn[i]);
     GLOGI("hook: [nosp] GtaThread::Tick fn @ +0x%llx prologue: %s(state @ thread+0x%zx)",
           (unsigned long long)(uintptr_t)(fn - g_imageBase), hex, g_threadStateOff);
     if (netJump(fn, (void*)&noScriptTick)) {
         g_noSpActive = true;
+        g_noSpTickFn = fn;
         GLOGI("hook: [nosp] stock scripts OFF: GtaThread::Tick -> no-op (FiveM JustNoScript)");
     } else
         GLOGW("hook: [nosp] netJump refused the Tick prologue (undecodable or holds a CALL, or the write "
               "failed); stock scripts keep running");
     return true;
+}
+
+// Enhanced belt and braces. run_script_threads calls vtable slot 3 of every thread, so the function that really
+// ticks a stock script is the live vtable's, not whatever the signature matched. Once the ScriptThreads array is
+// known, read slot 3 of a live thread and say whether it is the function noSpInstall hooked; if it is not (a patch
+// that kept the signature's shape on another function), hook the vtable's function too, so the log line "stock
+// scripts OFF" is never a claim about the wrong function. Runs from the poller until it has looked once or 120 s
+// have passed; nothing here touches the game thread.
+void noSpVerifyTick() {
+    if (!g_noSpActive || g_noSpVerified || !g_build->gtaThreadTickSig) return;
+    static ULONGLONG firstTry = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!firstTry) firstTry = now;
+    uint8_t* t = findAnyScriptThread();
+    if (!t) {
+        if (now - firstTry > 120000) {
+            g_noSpVerified = true;
+            GLOGW("hook: [nosp] vtable cross-check: no live script thread within 120 s; Tick hook unverified");
+        }
+        return;
+    }
+    g_noSpVerified = true;
+    uint8_t** vt = nullptr;
+    if (!isReadable(t, sizeof(void*))) return;
+    memcpy(&vt, t, sizeof(vt));
+    if (!vt || !isReadable(vt, 4 * sizeof(void*))) {
+        GLOGW("hook: [nosp] vtable cross-check: the thread's vtable %p is unreadable; Tick hook unverified", (void*)vt);
+        return;
+    }
+    uint8_t* tick = vt[3];
+    const bool inImage = tick >= g_imageBase && tick < g_imageBase + g_imageSize;
+    GLOGI("hook: [nosp] vtable cross-check: a live thread's vtable is GTA5.exe+0x%llx, slot 3 (what run_script_threads "
+          "calls) = %s+0x%llx, hooked Tick = GTA5.exe+0x%llx: %s",
+          (unsigned long long)((uint8_t*)vt - g_imageBase), inImage ? "GTA5.exe" : "(outside the image) ",
+          (unsigned long long)(inImage ? (uint64_t)(tick - g_imageBase) : (uint64_t)(uintptr_t)tick),
+          (unsigned long long)(g_noSpTickFn - g_imageBase), tick == g_noSpTickFn ? "MATCH" : "MISMATCH");
+    if (tick == g_noSpTickFn) return;
+    if (!inImage) return;
+    if (netJump(tick, (void*)&noScriptTick))
+        GLOGW("hook: [nosp] the signature hooked the wrong function; the vtable's slot 3 is hooked as well");
+    else
+        GLOGW("hook: [nosp] the signature hooked the wrong function and netJump refused the vtable's slot 3; "
+              "stock scripts keep running");
 }
 
 // Undo an installed inline hook: restore the prologue, free the thunks.
@@ -6149,6 +6223,17 @@ static void logNewNativeResolution() {
         if (pass) Sleep(500);
         for (int i = 0; i < total; ++i) {
             if (ok[i]) continue;
+            // Enhanced has no bucket table: InitNativeTables filled the native CACHE, keyed by the public hash
+            // (what CallNative asks for first). Reading only g_nativeTable made this report 0/233 UNRESOLVED
+            // for natives that were in use ("call worked") on the friend's first Enhanced run.
+            {
+                NativeHandler hc = nullptr;
+                if (nativeCacheFind(kNew[i].hash, hc) && hc && isExecutable((const void*)hc)) {
+                    ok[i] = true;
+                    ++resolved;
+                    continue;
+                }
+            }
             // The 3889 hash first, then the hash as given: the order CallNative uses.
             for (uint64_t want : {buildHash(kNew[i].hash), kNew[i].hash}) {
                 const NativeHandler h = g_getNativeHandler ? g_getNativeHandler(g_nativeTable, want)
@@ -6165,7 +6250,9 @@ static void logNewNativeResolution() {
     // valid code but no runtime native table (it is populated on the heap at boot), so handler addresses
     // can only be obtained live; with these RVAs their bodies disassemble offline to find the fragment/txd
     // streaming stores for the CStreaming content route. Diagnostic only (not shipped behaviour).
-    {
+    // Legacy 3889 only: the hashes are 3889 build hashes and the RVAs below are 3889 RVAs. On Enhanced they logged
+    // UNRESOLVED / MISMATCH noise (the friend's first run) about natives that work.
+    if (g_build == &kProfile3889) {
         struct DiagNative { const char* name; uint64_t hash; };
         static const DiagNative kDiag[] = {
             {"REQUEST_MODEL",                 0xEC9DAA34BBB4658Cull},
@@ -6189,7 +6276,7 @@ static void logNewNativeResolution() {
     // store objects are runtime-constructed (absent/zero in the image dump), so their slot pool ptr, counts
     // and base stream index can only be read live; these drive the loose-model registration (Track 2).
     // Reads are bounded to the mapped image (RVAs < image size) so a wrong offset logs MISMATCH, never faults.
-    if (g_imageBase && g_imageSize > 0x3000000) {
+    if (g_build == &kProfile3889 && g_imageBase && g_imageSize > 0x3000000) {   // 3889 RVAs: noise on Enhanced
         struct StoreRef { const char* name; uintptr_t objRva; uintptr_t vtRva; };
         static const StoreRef kStores[] = {
             {"FragmentStore", 0x2f5d690, 0x1bb4190},
@@ -6215,7 +6302,7 @@ static void logNewNativeResolution() {
     // (b) one pass brute-forces the name-hash offset across the whole pool + collects occupancy stats;
     // (c) window-dump the streaming-info manager across each store's global range to expose the handle
     // bit layout even without a name anchor. Bounded, validated reads; NO game-function calls.
-    if (g_imageBase && g_imageSize > 0x3000000) {
+    if (g_build == &kProfile3889 && g_imageBase && g_imageSize > 0x3000000) {   // 3889 RVAs: noise on Enhanced
         auto joaat = [](const char* s) -> uint32_t {
             uint32_t h = 0;
             for (; *s; ++s) { char c = *s; if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
@@ -6319,7 +6406,7 @@ static void logNewNativeResolution() {
     // + their vtables (the fiPackfile/fiCollection interface our custom collection must clone) + object
     // layout. Heap coll ptrs are low (<4GB); their vtable ptr is a high image VA -> RVA = vt - g_imageBase.
     // Bounded (first 3 non-null, <=4096 scanned, 56 vtable slots). NO game-function calls -> no crash risk.
-    if (g_imageBase && g_imageSize > 0x3000000) {
+    if (g_build == &kProfile3889 && g_imageBase && g_imageSize > 0x3000000) {   // 3889 RVAs: noise on Enhanced
         const uint8_t* const* reg = reinterpret_cast<const uint8_t* const*>(g_imageBase + 0x2c67400);
         const int32_t cap = *reinterpret_cast<const int32_t*>(g_imageBase + 0x1b81588);
         GLOGI("hook: [fidiag] registry=%p cap=%d imageBase=%p imageSize=0x%llx",
@@ -6397,7 +6484,7 @@ static void logNewNativeResolution() {
     //      sentinel [0x1e2ee00].
     // Bounded reads inside the mapped image; NO game-function calls -> no crash risk (same contract as
     // [fidiag]/[vehdiag2]). Remove with the other diagnostics before shipping.
-    if (g_imageBase && g_imageSize > 0x3000000) {
+    if (g_build == &kProfile3889 && g_imageBase && g_imageSize > 0x3000000) {   // 3889 RVAs: noise on Enhanced
         auto RVof = [&](const void* p) -> unsigned long long {
             const uintptr_t r = (uintptr_t)((const uint8_t*)p - g_imageBase);
             return (r < (uintptr_t)g_imageSize) ? (unsigned long long)r : 0xffffffffULL;
@@ -6707,6 +6794,7 @@ static void pollCodePatches() {
     // soon as GtaThread::Tick decrypts -- ideally before startup's first tick, so first.
     if (g_noSpScripts && !g_noSpInstalled && noSpInstall())
         g_noSpInstalled = true;
+    noSpVerifyTick();   // Enhanced: once the thread array exists, check the hook against the live vtable
 
     // Boot straight to Story Mode (opt-in): as soon as the landing-page
     // check's Arxan-decrypted code appears, patch it once — before the
@@ -6722,6 +6810,7 @@ static void pollCodePatches() {
 
 static bool codePatchesPending() {
     return (g_noSpScripts && !g_noSpInstalled) ||
+           (g_noSpActive && !g_noSpVerified && g_build->gtaThreadTickSig) ||
            (g_skipLanding && !g_landingPatched && g_build->landingPageSig) ||
            (g_netHost && !g_netHostInstalled);
 }
