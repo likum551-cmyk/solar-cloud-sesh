@@ -333,6 +333,8 @@ namespace gage::server {
         }
         line += first ? "none]" : "]";
         line += ", misses with a player on foot within 3 m " + std::to_string(n.meleeNearMiss - o.meleeNearMiss) +
+                ", judged by the clock (the attacker's samples were late) " + std::to_string(n.meleeByTimer - o.meleeByTimer) +
+                ", per-swing lines over budget " + std::to_string(n.meleeLinesSuppressed - o.meleeLinesSuppressed) +
                 ", damage applied by judged hits " + std::to_string(n.meleeAdjDamage - o.meleeAdjDamage) +
                 "; client-reported melee Hits: confirming a judged hit " + std::to_string(cf) + ", paid before the judgement " + std::to_string(fi) +
                 ", on another target " + std::to_string(ot) + ", contradicting the judgement (accepted on the game's word) " + std::to_string(co) +
@@ -2015,9 +2017,8 @@ namespace gage::server {
             {
                 stats_.meleeClaimContradict++;
                 if (const melee::SwingBook::Result* r = c.swings.Find(h.shotSeq, (double)nowMs))
-                    if (meleeVerdictLogs_ < 40)
+                    if (MeleeLineBudget(nowMs))
                     {
-                        meleeVerdictLogs_++;
                         Log("melee: client-reported Hit from " + c.name + " on id " + std::to_string(h.targetId) + " accepted although the server judged that swing " +
                             melee::OutcomeName(r->outcome) + " (nearest living player on foot " + std::to_string(r->distM) + " m, " +
                             std::to_string(r->angleDeg) + " degrees off the heading): reach or cone may be too tight");
@@ -2097,24 +2098,43 @@ namespace gage::server {
         }
     }
 
+    // R4 T3: at most 30 melee detail lines per 10 s (judged swings, contradicting claims); the rest are counted.
+    bool Server::MeleeLineBudget(uint64_t nowMs)
+    {
+        if (nowMs - meleeLogWindowMs_ >= 10000) { meleeLogWindowMs_ = nowMs; meleeLogWindowLines_ = 0; }
+        if (meleeLogWindowLines_ >= 30)
+        {
+            stats_.meleeLinesSuppressed++;
+            return false;
+        }
+        meleeLogWindowLines_++;
+        meleeVerdictLogs_++;
+        return true;
+    }
+
     void Server::JudgeSwing(Conn& c, const melee::SwingBook::Pending& p, uint64_t nowMs)
     {
         using melee::Outcome;
         stats_.meleeJudged++;
         melee::Verdict v;
+        melee::SwingLogCtx lc;                 // R4 T3: what the per-swing line needs besides the verdict
+        lc.name = c.name.c_str();
+        lc.seq = p.seq;
+        lc.weapon = p.weapon;
+        lc.pressMs = p.pressMs;
+        lc.nowMs = (double)nowMs;
+        lc.byTimer = p.byTimer;
+        if (p.byTimer) stats_.meleeByTimer++;
         const auto finish = [&](const melee::Verdict& vv) {
             stats_.meleeOutcome[(size_t)vv.outcome]++;
             c.swings.Record(p, vv);
             const bool miss = vv.outcome != Outcome::Hit && vv.outcome != Outcome::ClaimedFirst && vv.outcome != Outcome::AttackerOut;
             const bool near3 = miss && vv.distM >= 0.0f && vv.distM <= 3.0f;
             if (near3) stats_.meleeNearMiss++;
-            if ((vv.outcome == Outcome::Hit || near3) && meleeVerdictLogs_ < 40)
-            {
-                meleeVerdictLogs_++;
-                Log("melee: " + c.name + " swing (shotSeq " + std::to_string((int)p.seq) + ", weapon 0x" + [&] { char b[12]; std::snprintf(b, sizeof b, "%08X", (unsigned)p.weapon); return std::string(b); }() +
-                    ") judged " + melee::OutcomeName(vv.outcome) + (vv.target != proto::kNoPlayer && vv.outcome == Outcome::Hit ? " on id " + std::to_string(vv.target) : std::string()) +
-                    ": nearest living player on foot " + std::to_string(vv.distM) + " m (reach " + std::to_string(vv.reachM) + " m), " + std::to_string(vv.angleDeg) + " degrees off the heading");
-            }
+            // R4 T3: EVERY judged swing says what happened and why (0.4.9: 11 swings, 0 blows confirmed, no line to say why). At most
+            // 30 a 10 s window (MeleeLineBudget); the rest are counted in the `melee:` line.
+            if (MeleeLineBudget(nowMs))
+                Log(melee::FormatSwingLine(lc, vv));
         };
         if (c.swings.ClaimedBefore(p))
         {
@@ -2126,6 +2146,7 @@ namespace gage::server {
             (c.ped.flags & (proto::kPfRagdoll | proto::kPfFalling | proto::kPfParachute | proto::kPfClimbing | proto::kPfVaulting)) != 0)
         {
             v.outcome = Outcome::AttackerOut;
+            lc.attackerWhy = c.dead ? "dead" : !c.hasState ? "no state" : Untrusted(c, nowMs) ? "untrusted after a jump" : "ragdoll, falling, parachute, climbing or vaulting";
             finish(v);
             return;
         }
@@ -2133,8 +2154,13 @@ namespace gage::server {
         for (const auto& kv : players_)
         {
             Conn& o = *kv.second;
-            if (&o == &c || !o.hasState || ac::Dist(c.k, o.k) > 8.0f) continue;
-            if (!repl_.Relevant(c.id, o.id)) continue;
+            if (&o == &c) continue;
+            lc.others++;
+            if (!o.hasState) { lc.noState++; continue; }
+            const float dNow = ac::Dist(c.k, o.k);
+            if (lc.nearestAnyM < 0 || dNow < lc.nearestAnyM) { lc.nearestAnyM = dNow; lc.nearestAnyId = o.id; }
+            if (dNow > 8.0f) { lc.beyondPrefilter++; continue; }
+            if (!repl_.Relevant(c.id, o.id)) { lc.notRelevant++; continue; }
             melee::Candidate cd;
             cd.id = o.id;
             cd.track = &o.track;
@@ -2144,6 +2170,7 @@ namespace gage::server {
         v = melee::Adjudicate(c.track, p.pressMs + melee::kStrikeDelayMs, p.weapon, cands.data(), cands.size(), cfg_.meleeReachPercent);
         if (v.outcome != Outcome::Hit)
         {
+            if (v.outcome == Outcome::AttackerOut) lc.attackerWhy = "in a vehicle at the blow";
             finish(v);
             return;
         }

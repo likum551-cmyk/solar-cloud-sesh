@@ -1009,6 +1009,10 @@ namespace gage::game {
         // TASK_START_SCENARIO_IN_PLACE(ped, name, 0, playEnterAnim true).
         bool     TaskStartScenarioInPlace(int32_t ped, const char* scenario);
         int      IsEntityPlayingAnim(int32_t entity, const char* dict, const char* name);  // taskFlag 3
+        // R4 T3. GET_ENTITY_ANIM_CURRENT_TIME / GET_ENTITY_ANIM_TOTAL_TIME (entity, dict, name) -> float seconds. Neither hash is in the crossmap
+        // (natives wanted, docs/sync-specs/combat.md, R4 T3): this returns false WITHOUT calling anything and sets both to -1 (unknown). The swing's
+        // progress check (sync::SwingProbe) already takes the times, so filling this in is the only missing step.
+        bool     GetEntityAnimTimes(int32_t entity, const char* dict, const char* name, float& current, float& total);
         int      IsPedUsingAnyScenario(int32_t ped);
         bool     SetEntityMaxHealth(int32_t entity, int value);
         // R3 T1: SET_PED_MAX_HEALTH(ped, value): the PED maximum (the entity one is not what bounds a player ped's health in the live

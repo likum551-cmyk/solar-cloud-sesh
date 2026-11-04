@@ -3110,6 +3110,8 @@ static void PipelineHealthTests()
 #include "t4_server_tests.h"
 #define R3T6_SERVER
 #include "r3_t6_tests.h"   // R3 T6 melee: the server-side judgement (apps/server/melee.h) as pure units + the config keys
+#define R4T3_SERVER
+#include "r4_t3_tests.h"   // R4 T3 punches: the judgement at the live geometry (a displaced puppet) and the per-swing line
 
 int main()
 {
@@ -3143,6 +3145,7 @@ int main()
     t4srv::T4ServerTests();
     std::printf("-- R3 T6: melee judgement (melee.h), swing book, claims, config\n");
     r3t6::ServerTests();
+    r4t3::ServerTests();
     std::printf("-- damage scaling (damage.h)\n");
     DamageScaleUnitTests();
     std::printf("-- tick clock and sample ages (N6c)\n");
@@ -3155,7 +3158,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 111 + t4srv::kT4ServerChecks + r3t6::kServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 111 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

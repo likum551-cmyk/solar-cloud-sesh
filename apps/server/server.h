@@ -207,6 +207,8 @@ namespace gage::server {
         uint64_t meleeSwingsTooClose = 0;    // ... dropped: closer than the minimum swing gap (or more than the queue holds)
         uint64_t meleeJudged = 0;            // swings judged (a blow time that came)
         uint64_t meleeOutcome[melee::kOutcomes] = {};   // ... by melee::Outcome
+        uint64_t meleeLinesSuppressed = 0;   // R4 T3: per-swing log lines over the 30-per-10-s budget
+        uint64_t meleeByTimer = 0;           // R4 T3: swings judged by the clock because the attacker's samples had not reached the blow
         uint64_t meleeNearMiss = 0;          // judged misses with a living player on foot within 3 m (reach or cone too tight?)
         uint64_t meleeAdjDamage = 0;         // damage taken off players by adjudicated hits (scaled, armour and health)
         uint64_t meleeClaimConfirm = 0;      // client-reported melee Hits for a swing and target the server already hit (no damage)
@@ -437,7 +439,10 @@ namespace gage::server {
         // R3 T6 (apps/server/melee.h): the swings whose blow time has come are judged from the stored tracks; the 10 s `melee:` line.
         void JudgeMelee(uint64_t nowMs);
         void JudgeSwing(Conn& c, const melee::SwingBook::Pending& p, uint64_t nowMs);
+        bool MeleeLineBudget(uint64_t nowMs);   // R4 T3: the budget of melee detail lines (30 per 10 s)
         void LogMeleeSummary(const Stats& n, const Stats& o);
+        uint64_t meleeLogWindowMs_ = 0;   // R4 T3: the per-swing line budget's window
+        uint32_t meleeLogWindowLines_ = 0;
         uint32_t meleeVerdictLogs_ = 0;   // judgement lines written (capped: the first ones are the tuning data)
         void RetryDeferredHits(Conn& c, uint64_t nowMs);
         void CheckMove(Conn& c, const proto::PlayerState& s, uint64_t nowMs);

@@ -5245,6 +5245,13 @@ int World::IsEntityPlayingAnim(int32_t entity, const char* dict, const char* nam
     return (uint32_t)r[0] ? 1 : 0;
 }
 
+bool World::GetEntityAnimTimes(int32_t entity, const char* dict, const char* name, float& current, float& total) {
+    (void)entity; (void)dict; (void)name;
+    current = -1.0f;      // R4 T3: the two natives are not in the crossmap; neutral until they are (see hook.h)
+    total = -1.0f;
+    return false;
+}
+
 int World::IsPedUsingAnyScenario(int32_t ped) {
     if (!ped) return 0;
     uint64_t arg[] = { entArg(ped) };
