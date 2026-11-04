@@ -330,6 +330,12 @@ static std::vector<Case> Corpus()
         m.dvx = -12.5f; m.dvy = 24.5f; m.dyaw = -2.25f; m.nx = 0.5f; m.ny = -0.75f; m.closing = 38.5f; m.depth = 0.31f;
         v.push_back(Make("VehicleImpact", m));
     }
+    {   // R3 T5: the round trip the server measures to each vehicle controller (unreliable, about 1 Hz)
+        LinkInfo m;
+        m.e.push_back({3, 48});
+        m.e.push_back({9, 120});
+        v.push_back(Make("LinkInfo", m));
+    }
     for (Case& c : v)
         if (c.name == "VehicleWorld" || c.name == "VehicleUpdate" || c.name == "VehicleCmd register") c.lossy = true;
     return v;
@@ -567,6 +573,30 @@ static void HostileCounts()
               good.size() == kVehicleImpactBytes && Decode(good.data(), good.size(), out) && !Decode(nx.data(), nx.size(), out) && !Decode(dv.data(), dv.size(), out) &&
                   !Decode(id.data(), id.size(), out) && !Decode(oid.data(), oid.size(), out) && Encode(nan).empty() && Encode(far).empty() && sat);
     }
+    {   // R3 T5 LinkInfo: [44][count][count x (id, rtt)]; a count over kMaxLinkEntries, a repeated id, a count the bytes do not hold, trailing bytes and an empty
+        // list's extra byte are refused; the encoder refuses 33 entries; the empty list is valid (2 bytes)
+        LinkInfo m;
+        m.e.push_back({3, 48});
+        m.e.push_back({9, 65535});
+        const Bytes good = Encode(m);
+        LinkInfo out;
+        Bytes over = good, rep = good, shortc = good, trail = good, none = Encode(LinkInfo());
+        over[1] = (uint8_t)(kMaxLinkEntries + 1);
+        rep[6] = 3; rep[7] = 0;               // the second id repeats the first
+        shortc[1] = 3;                        // claims 3 entries, holds 2
+        trail.push_back(0);
+        LinkInfo full, tooMany;
+        for (uint16_t i = 0; i < kMaxLinkEntries; i++) full.e.push_back({i, (uint16_t)(i * 7)});
+        tooMany = full;
+        tooMany.e.push_back({99, 1});
+        const Bytes fb = Encode(full);
+        LinkInfo back;
+        Check("hostile: LinkInfo is 2 + 4 per entry, carries the largest round trip (65535), refuses a count over 32, a repeated id, a count the bytes do not hold and trailing bytes; the encoder refuses 33 entries; 32 and the empty list round-trip",
+              good.size() == 10 && good[0] == (uint8_t)Msg::LinkInfo && Decode(good.data(), good.size(), out) && out.e.size() == 2 && out.e[1].id == 9 && out.e[1].rttMs == 65535 &&
+                  !Decode(over.data(), over.size(), out) && !Decode(rep.data(), rep.size(), out) && !Decode(shortc.data(), shortc.size(), out) && !Decode(trail.data(), trail.size(), out) &&
+                  Encode(tooMany).empty() && !fb.empty() && Decode(fb.data(), fb.size(), back) && back.e.size() == kMaxLinkEntries && back.e[31].rttMs == 217 &&
+                  none.size() == 2 && Decode(none.data(), none.size(), back) && back.e.empty());
+    }
 }
 
 // The UDP query datagrams (query.h): exactly 24 bytes, every single-bit flip, every other length.
@@ -750,7 +780,7 @@ int main()
     QueryFuzz();
     ValidatorFuzz();
     // per case: valid + prefix + trailing + bit flips + random = 5 checks; 11 hostile-count checks; 5 query checks; 1 validator check.
-    const size_t expected = corpus.size() * 5 + 11 + 5 + 1 + 1;
+    const size_t expected = corpus.size() * 5 + 12 + 5 + 1 + 1;
     std::printf("\n%d checks, %d failed (%zu message cases)\n", g_run, g_failed, corpus.size());
     if (g_run != (int)expected)
     {

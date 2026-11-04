@@ -131,6 +131,10 @@ namespace gage::server {
         // VehicleUpdate (the sample time of the vehicle's motion).
         sync::SampleClock stateClock;
         sync::SampleClock vehClock;
+        // R3 T5: half the round trip (ms) the contact arbiter moves this controller's vehicle samples back by (the SampleClock places a sample
+        // at its sample time + the fastest uplink), slewed so the arbiter's track keeps increasing, and when it last moved.
+        double arbCorrMs = 0;
+        uint64_t arbCorrAtMs = 0;
 
         // v4 combat: the server's own vitals. `deathMs` is valid while dead.
         uint8_t health = proto::kDefaultHealth;
@@ -1270,6 +1274,7 @@ namespace gage::server {
         }
         vehicles_.AssignControllers(nowMs, tick_, controlCandidates_);
         BroadcastImpacts(nowMs);
+        BroadcastLinkInfo(nowMs);
         // The entries' ageMs is measured against the tick's NOMINAL time (its slot), not the clock of a loop that got
         // round to it late (the same rule as the WorldState entries').
         const uint64_t nominalMs = tickNominalUs_ / 1000;
@@ -1349,6 +1354,47 @@ namespace gage::server {
         }
     }
 
+    // R3 T5: the round trip the arbiter and LinkInfo use: ENet's smoothed value, or the quietest of the last interval when that is lower
+    // (the SampleClock's constant is the FASTEST path, not the mean).
+    uint32_t Server::LinkRttMs(const Conn& c) const
+    {
+        if (!c.peer) return 0;
+        uint32_t r = c.peer->roundTripTime;
+        if (c.peer->lastRoundTripTime > 0 && c.peer->lastRoundTripTime < r) r = c.peer->lastRoundTripTime;
+        return r;
+    }
+
+    // R3 T5: about once a second, tell every joined client the round trip of each player that controls a vehicle (docs/api/protocol.md).
+    void Server::BroadcastLinkInfo(uint64_t nowMs)
+    {
+        if (nowMs - linkInfoMs_ < 1000) return;
+        linkInfoMs_ = nowMs;
+        proto::LinkInfo m;
+        for (uint16_t id = 0; id < proto::kMaxVehicles && m.e.size() < proto::kMaxLinkEntries; id++)
+        {
+            const VehicleStore::Vehicle* v = vehicles_.Get(id);
+            if (!v || v->s.ctrl == proto::kNoPlayer) continue;
+            bool have = false;
+            for (const proto::LinkEntry& e : m.e)
+                if (e.id == v->s.ctrl) { have = true; break; }
+            if (have) continue;
+            const auto pit = players_.find(v->s.ctrl);
+            if (pit == players_.end()) continue;
+            proto::LinkEntry e;
+            e.id = v->s.ctrl;
+            e.rttMs = (uint16_t)std::min<uint32_t>(65535u, LinkRttMs(*pit->second));
+            m.e.push_back(e);
+        }
+        if (m.e.empty()) return;
+        const proto::Bytes bytes = proto::Encode(m);
+        if (bytes.empty()) return;
+        for (auto& kv : players_)
+        {
+            SendTo(*kv.second, proto::kChanState, bytes, false);
+            stats_.linkInfoSent++;
+        }
+    }
+
     std::vector<proto::VehicleState> Server::Vehicles() const
     {
         std::vector<proto::VehicleState> out;
@@ -1404,6 +1450,17 @@ namespace gage::server {
             // T4: the arbiter keeps the controller's recent track (on the server's time base) to resolve contacts with other controllers' vehicles
             sync::impact::ArbSample as;
             as.tMs = (double)std::min(sampleMs, nowMs);
+            // R3 T5: the stamp is the sample's time + the fastest uplink (SampleClock), which differs per controller: two cars that touch at
+            // one instant sit at two different times on the arbiter's base (30 ms apart is 1.2 m at 40 m/s closing). The true time is half the
+            // round trip earlier. ENet's smoothed value moves slowly; the slew keeps the track strictly increasing.
+            if (cfg_.contactLagCapMs > 0 && c.peer)
+            {
+                const double target = std::min<double>(cfg_.contactLagCapMs, 0.5 * (double)LinkRttMs(c));
+                const double dt = c.arbCorrAtMs ? (double)(nowMs - c.arbCorrAtMs) : 1e9;
+                c.arbCorrAtMs = nowMs;
+                c.arbCorrMs = sync::impact::SlewArbCorrMs(c.arbCorrMs, target, dt);
+                as.tMs -= c.arbCorrMs;
+            }
             as.p = {u.k.x, u.k.y};
             as.v = {u.k.vx, u.k.vy};
             as.h = (double)proto::QuatHeading(u.rot) * (3.14159265358979323846 / 180.0);

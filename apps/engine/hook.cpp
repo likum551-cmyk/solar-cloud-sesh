@@ -4191,7 +4191,7 @@ static int nearbyCall(World& w, gage::ambient::Id id, const char* name, uint64_t
     uint64_t args[] = { (uint64_t)(uint32_t)around, (uint64_t)(uintptr_t)buf, (uint64_t)(uint32_t)(int32_t)-1 };
     if (!ambCall(w, id, name, hash, args, withIgnore ? 3 : 2))
         return -1;
-    return gage::ambient::ParseNearby(buf, cap, out);
+    return gage::ambient::ParseNearby(buf, cap, out, &gage::ambient::g_lastNearbyEcho);   // R3 T5: slot 0 may still hold the capacity
 }
 
 int World::NearbyPeds(int32_t around, int32_t* out, int cap) {

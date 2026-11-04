@@ -51,6 +51,8 @@
 //   * T3 vehicle visual state: VehicleUpdate and the full VehicleWorld entry grow by u8 tyres, u8 tyresRim, u8 windows; flags2 bits
 //     6 / 7 are brake lights and handbrake; a vehicle Hit names a part in `bone` ((part << 8) | slot).
 //   * T4 collisions: Msg::VehicleImpact (40): the server's resolution of a contact between two controllers' vehicles.
+//   * R3 T5 vehicle position: Msg::LinkInfo (44): the server's smoothed round trip of every vehicle controller, so a receiver can draw a
+//     nearby car where its owner really is (half the owner's and half our round trip are in no timestamp).
 //
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
@@ -184,8 +186,10 @@ namespace gage::proto {
         // 32..39 are reserved for further desync-round-2 messages (31 is T1 SeatNotice): the numbers
         // between are not defined messages, a Decode of them fails and PeekType only range-checks.
         VehicleImpact    = 40, // S->C reliable (T4, vehicle collisions): the server's resolution of a contact between two vehicles for one controller
+        // 41..43 are reserved for other round-3 messages.
+        LinkInfo         = 44, // S->C state channel, about 1 Hz (R3 T5, vehicle position): the round trip the server measures to each vehicle controller
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::VehicleImpact;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::LinkInfo;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -758,6 +762,19 @@ namespace gage::proto {
     };
     constexpr size_t kVehicleImpactBytes = 21;
 
+    // ---- R3 T5: link info (docs/api/protocol.md "R3 T5 link info") ----
+    // The sender's stamp of a vehicle sample carries the sample time + the FASTEST uplink (SampleClock absorbs the constant part), and a
+    // frame arrives the fastest downlink after its tick, so a car drawn at the newest data is still half its controller's and half our round
+    // trip behind its owner's real position: 2-3 m at 25 m/s on a 100 ms path (R3 T5). The client knows its own round trip; the controller's
+    // only the server does. Every ~1 s each client gets the smoothed round trip (ms) of the players that control a vehicle. Unreliable
+    // (a lost one is replaced by the next), at most kMaxLinkEntries entries.
+    struct LinkEntry { uint16_t id = 0; uint16_t rttMs = 0; };
+    constexpr size_t kMaxLinkEntries = 32;
+    struct LinkInfo
+    {
+        std::vector<LinkEntry> e;
+    };
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -808,6 +825,8 @@ namespace gage::proto {
     Bytes Encode(const SeatNotice& m);   // T1 seats: empty (refused) for a field Decode would refuse
     // T4: refuses a non-finite value or a vehicle id at or above kMaxVehicles; saturates dv, dyaw, closing and depth at the wire's range.
     Bytes Encode(const VehicleImpact& m);
+    // R3 T5: [44][u8 count][count x (u16 id, u16 rttMs)]; empty (refused) for more than kMaxLinkEntries entries.
+    Bytes Encode(const LinkInfo& m);
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -856,6 +875,8 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, PeerAnimStop& out);
     // T4: exactly kVehicleImpactBytes bytes; refuses a vehicle id at or above kMaxVehicles and -128 in an i8 field.
     bool Decode(const uint8_t* p, size_t n, VehicleImpact& out);
+    // R3 T5: exactly 2 + 4 * count bytes; refuses a count over kMaxLinkEntries and a repeated id.
+    bool Decode(const uint8_t* p, size_t n, LinkInfo& out);
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would

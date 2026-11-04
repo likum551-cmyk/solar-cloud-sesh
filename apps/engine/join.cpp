@@ -60,6 +60,7 @@ namespace {
         std::atomic<bool> live{false};   // Welcome received, session not over
         std::atomic<bool> stop{false};   // Disconnect() asked
         std::atomic<uint16_t> myId{0};
+        std::atomic<uint32_t> rttMs{0};  // R3 T5: ClientSession::lowRttMs(), refreshed every worker pass
     };
 
     Shared& Sh()
@@ -162,6 +163,8 @@ namespace {
                 if (gapMs > beatLoopGapMaxMs) beatLoopGapMaxMs = gapMs;
                 passAt = now;
             }
+            if (joined)
+                Sh().rttMs.store(session.lowRttMs(), std::memory_order_relaxed);
             if (joined && Clock::now() - beatAt >= std::chrono::seconds(10))
             {
                 // Datagrams both ways tell a dead path (in == 0) from a socket that cannot send.
@@ -407,6 +410,10 @@ namespace {
                     if (peers.onVehicleImpact)
                         timed("vehicleImpact", [&] { peers.onVehicleImpact(e.impact); });
                     break;
+                case net::Event::Type::LinkInfo:
+                    if (peers.onLinkInfo)
+                        timed("linkInfo", [&] { peers.onLinkInfo(e.linkInfo); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())
@@ -470,6 +477,7 @@ namespace gage::join {
     bool IsConnected() { return Sh().live.load(); }
 
     uint16_t MyId() { return Sh().myId.load(); }
+    uint32_t RttMs() { return Sh().rttMs.load(std::memory_order_relaxed); }
 
     bool VehicleMailbox::Put(const proto::VehicleUpdate& u, int32_t sampleMs)
     {
@@ -740,6 +748,7 @@ namespace gage::join {
             S.stop.store(false);
             S.live.store(false);
             S.myId.store(0);
+            S.rttMs.store(0);
             events = S.events;
             peers = S.peers;
             S.worker = new std::thread(Worker, o, events, peers);

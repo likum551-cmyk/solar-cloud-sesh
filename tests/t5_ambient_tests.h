@@ -29,7 +29,7 @@ namespace t5 {
 namespace amb = gage::ambient;
 using Report = void (*)(const char* name, bool ok, const std::string& got);
 
-constexpr int kPureChecks = 57;
+constexpr int kPureChecks = 62;   // R3 T5: +5 (ParseNearby's capacity echo, the enumeration breakdown of the line)
 constexpr int kWorldChecks = 10;
 
 inline std::string S(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -381,6 +381,63 @@ inline int RunPure(Report check, const std::string& repoDir)
         char small[80];
         const int sl = amb::FormatLine(small, sizeof small, r);
         C("line: a short buffer is cut safely and stays NUL-terminated", sl >= 0 && sl < (int)sizeof small && small[sl] == 0 && std::strlen(small) == (size_t)sl);
+    }
+
+    // ---- R3 T5: the live `near[peds=64 vehs=64] deleted=0` --------------------------------------------------------------------
+    // GET_PED_NEARBY_PEDS(ped, arr, -1) returns the count and leaves arr[0] (the capacity we put in) alone. The old parse read slot 0 as the count: 64.
+    {
+        auto oldParse = [](const uint64_t* slots, int cap, int32_t* out) -> int {   // the pre-R3 ParseNearby, verbatim
+            if (!slots || !out || cap <= 0) return -1;
+            const int32_t k = (int32_t)(uint32_t)slots[0];
+            if (k < 0 || k > cap) return -1;
+            for (int i = 0; i < k; ++i) out[i] = (int32_t)(uint32_t)slots[1 + i];
+            return k;
+        };
+        uint64_t buf[1 + amb::kNearbyCap] = {};
+        buf[0] = (uint64_t)amb::kNearbyCap;              // the capacity going in; the native left it, and wrote 3 handles (P2's ped, its anchor, a stray)
+        buf[1] = 0x1001; buf[2] = 0x1002; buf[3] = 0x1003;
+        int32_t o1[amb::kNearbyCap], o2[amb::kNearbyCap];
+        bool echo = false;
+        const int oldN = oldParse(buf, amb::kNearbyCap, o1);
+        const int newN = amb::ParseNearby(buf, amb::kNearbyCap, o2, &echo);
+        C("R3 T5 parse: slot 0 still at the capacity (the native returns the count and does not write it back) -> OLD read 64 handles (the live near[peds=64]), NEW reads the 3 real ones and says it was an echo",
+          oldN == amb::kNearbyCap && newN == 3 && echo && o2[0] == 0x1001 && o2[2] == 0x1003, S("old %d new %d echo %d", oldN, newN, (int)echo));
+        amb::ExemptSet ex;
+        ex.Add(0x1001); ex.Add(0x1002);
+        ex.SetComplete(true);
+        std::vector<int32_t> pOld, pNew;
+        const amb::SweepStats sOld = amb::PlanSweep(o1, oldN, ex, 10, pOld), sNew = amb::PlanSweep(o2, newN, ex, 10, pNew);
+        C("R3 T5 parse: the same deletions either way (the 61 zero slots were dropped as invalid: the old numbers lied, nothing wrong was ever deleted) and the new breakdown is 3 seen / 2 exempt / 0 invalid",
+          pOld.size() == 1 && pNew.size() == 1 && pOld[0] == 0x1003 && pNew[0] == 0x1003 && sOld.invalid == 61 && sNew.invalid == 0 && sNew.seen == 3 && sNew.exempt == 2,
+          S("old seen %d invalid %d; new seen %d invalid %d exempt %d", sOld.seen, sOld.invalid, sNew.seen, sNew.invalid, sNew.exempt));
+        uint64_t b2[1 + amb::kNearbyCap] = {};
+        b2[0] = 5; b2[1] = 7; b2[2] = 8; b2[3] = 9; b2[4] = 10; b2[5] = 11;
+        const int n5 = amb::ParseNearby(b2, amb::kNearbyCap, o2, &echo);
+        const int first5 = o2[0];
+        const bool echo5 = echo;
+        uint64_t b3[1 + amb::kNearbyCap];
+        b3[0] = (uint64_t)amb::kNearbyCap;
+        for (int i = 1; i <= amb::kNearbyCap; ++i) b3[i] = (uint64_t)(100 + i);
+        const int n64 = amb::ParseNearby(b3, amb::kNearbyCap, o2, &echo);
+        const bool echo64 = echo;
+        b3[0] = (uint64_t)amb::kNearbyCap + 1;
+        const int bad = amb::ParseNearby(b3, amb::kNearbyCap, o2, &echo);
+        C("R3 T5 parse: a count below the capacity in slot 0 is trusted (the other layout); 64 real handles are all read; a count above the capacity rejects the whole read",
+          n5 == 5 && first5 == 7 && !echo5 && n64 == amb::kNearbyCap && echo64 && bad == -1 && amb::ParseNearby(nullptr, 64, o2) == -1 && amb::ParseNearby(b3, 0, o2) == -1);
+        // the 10 s line carries the breakdown
+        amb::Report r;
+        r.sw.master = true;
+        r.nearPeds = 3; r.nearVehs = 2;
+        r.enumSeen[0] = 30; r.enumExempt[0] = 20; r.enumUnproven[0] = 1; r.enumInvalid[0] = 2; r.enumPlanned[0] = 7; r.enumCapEcho[0] = 10;
+        r.enumSeen[1] = 12; r.enumExempt[1] = 12; r.enumCapEcho[1] = 10;
+        char line[1600];
+        amb::FormatLine(line, sizeof line, r);
+        const std::string L = line;
+        C("R3 T5 line: the enumeration breakdown (seen / exempt / unproven / invalid / planned / capacity-echo, peds and vehicles) is on the engine: ambient line and the line still ends with ]",
+          L.find("enum[peds seen=30 exempt=20 unproven=1 invalid=2 planned=7 capacity-echo=10; vehs seen=12 exempt=12 unproven=0 invalid=0 planned=0 capacity-echo=10]") != std::string::npos &&
+              L.find("near[peds=3 vehs=2]") != std::string::npos && L.back() == ']', L.substr(L.find("near["), 120));
+        C("R3 T5 line: the report struct starts with no enumeration numbers (a fresh window), so a window without a sweep prints zeros, not the last window's",
+          amb::Report().enumSeen[0] == 0 && amb::Report().enumCapEcho[1] == 0);
     }
 
     // ---- the engine really calls it before the gate (source-order guard) ---------------------------------------------

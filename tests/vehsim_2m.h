@@ -111,6 +111,7 @@ struct World {
     double rest = 0.2, mu = 0.2, grip = 6.0, rollDrag = 0.1, angDamp = 3.0, baum = 0.25, slop = 0.01;
     std::vector<std::vector<char>> touched;      // pairs that touched in the physics since the flags were cleared
     std::vector<std::vector<V2>> touchPt;        // where (the first time since cleared)
+    uint32_t blowups = 0;                        // R3 T5: bodies the planar solver launched past 80 m/s (deep interlock of two boxes): clamped, counted, reported
     void Init(int n) { touched.assign(n, std::vector<char>(n, 0)); touchPt.assign(n, std::vector<V2>(n)); }
     void ClearTouched() { for (auto& r : touched) std::fill(r.begin(), r.end(), 0); }
     void Step(double dt, const std::vector<char>& skip) {
@@ -152,6 +153,13 @@ struct World {
                 }
                 const double corr = std::max(0.0, c.depth - slop) * baum / (iA + iB);
                 A.p = A.p - c.n * (corr * iA); B.p = B.p + c.n * (corr * iB);
+                for (Body* q : {&A, &B})
+                    if (Norm(q->v) > 80.0 || std::fabs(q->w) > 30.0) {
+                        ++blowups;
+                        const double k = std::min(1.0, 80.0 / std::max(Norm(q->v), 1e-9));
+                        q->v = q->v * k;
+                        q->w = std::max(-30.0, std::min(30.0, q->w));
+                    }
             }
     }
 };
@@ -393,6 +401,11 @@ struct Opt {
     double tickHz = 30;
     int flagMode = 1;                 // the collision flag: 0 never, 1 previous frame's contacts
     bool lead = true;                 // PresentLead
+    // R3 T5. stampBias: the server's SampleClock places a sample at its true time + the controller's fastest uplink (the older runs placed the
+    // true time). arbCorrect: the server moves the arbiter's samples back by half the controller's round trip (Config::contactLagCapMs).
+    // nearClock: copies near the local car are drawn at NearT + the link lag (NearLeadWantMs, NearLeadConfig) instead of the delayed clock
+    // + the shared delay. proximity: the proximity contact path (a copy about to overlap our car opens the contact grace).
+    bool stampBias = false, arbCorrect = false, nearClock = false, proximity = false;
     bool grace = true;                // the contact grace on copies (VehicleDriveConfig::contactGraceMs 400 / 0)
     bool graceOffWhenImpact = false;  // with impacts arbitrated the grace can be switched off (the copy follows its controller's stream)
     imp::AdoptCfg adoptCfg;
@@ -418,7 +431,7 @@ struct Result {
     double posErrCar[3][3] = {};                                                   // [car][time]
     // cross-screen relative position disagreement of the first two cars
     double screenDiv[3] = {0, 0, 0};
-    uint32_t snaps = 0, pops = 0, graces = 0, claims = 0, predictions = 0;
+    uint32_t snaps = 0, pops = 0, graces = 0, claims = 0, predictions = 0, blowups = 0;
     double popMax = 0;
     // impacts
     uint32_t impacts = 0, applied = 0, noLocal = 0, tiny = 0, stale = 0;
@@ -583,7 +596,10 @@ inline Result Run(const Scene& sc, const Opt& o) {
                 const Sample& s = uplink[i];
                 if (s.ctrl == ctrl[s.car]) {          // a sample from a controller the server no longer has is refused
                     if (!haveNewest[s.car] || s.t > newest[s.car].t) { newest[s.car] = s; haveNewest[s.car] = 1; }
-                    arb.Note(uint16_t(s.car), uint16_t(s.ctrl), s.a);
+                    imp::ArbSample as = s.a;
+                    if (o.stampBias) as.tMs += o.upMs[s.ctrl];                                              // SampleClock: true time + the fastest uplink
+                    if (o.arbCorrect) as.tMs -= 0.5 * (o.upMs[s.ctrl] + o.downMs[s.ctrl]);                 // the server's half round trip
+                    arb.Note(uint16_t(s.car), uint16_t(s.ctrl), as);
                 }
                 uplink.erase(uplink.begin() + long(i));
             } else ++i;
@@ -624,7 +640,7 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     f.ctrlNow.push_back({c, ctrl[c]});
                     if (ctrl[c] == m || !haveNewest[c]) continue;
                     Frame::Ent e; e.car = c; e.s = newest[c].s;
-                    const double age = std::min(255.0, std::floor(tt - newest[c].t));
+                    const double age = std::min(255.0, std::floor(std::max(0.0, tt - newest[c].t - (o.stampBias ? o.upMs[ctrl[c]] : 0.0))));
                     e.s.tMs = SnapshotStampMs(tick, tickMs, uint32_t(age));
                     f.ents.push_back(e);
                 }
@@ -695,7 +711,8 @@ inline Result Run(const Scene& sc, const Opt& o) {
                 mc.frames.erase(mc.frames.begin(), mc.frames.begin() + long(used));
                 // the copies
                 gp::Body* own = nullptr;
-                for (int c = 0; c < nc; ++c) if (mc.real[c]) { own = &mc.w.b[c]; break; }
+                int ownIdx = -1;
+                for (int c = 0; c < nc; ++c) if (mc.real[c]) { own = &mc.w.b[c]; ownIdx = c; break; }
                 for (int c = 0; c < nc; ++c) {
                     if (mc.real[c] || !mc.clock.Ready()) continue;
                     Recv& rc = *mc.rc[c];
@@ -703,9 +720,19 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     const double ex = rc.extra.UpdateGap(rc.ip.TypicalGapMs(), mc.clock.TickMs(), nowLocal, mc.clock.Config().maxSlew);
                     const double dtLast = rc.lastDriveMs > 0 ? t - rc.lastDriveMs : 0.0;
                     double add = 0;
-                    if (o.lead) add = rc.lead.Update(own ? gp::Norm(P.p - own->p) : 1e9, mc.clock.DelayMs() + ex, dtLast);
+                    const double renderT = mc.clock.RenderT(nowLocal);
+                    if (o.lead) {
+                        double want = mc.clock.DelayMs() + ex;
+                        if (o.nearClock) {
+                            rc.lead.SetConfig(NearLeadConfig());
+                            const int owner = ctrl[c];
+                            want = NearLeadWantMs(mc.clock.NearT(nowLocal), LinkLagMs(o.upMs[m] + o.downMs[m], o.upMs[owner] + o.downMs[owner]), renderT, ex);
+                        }
+                        add = rc.lead.Update(own ? gp::Norm(P.p - own->p) : 1e9, want, dtLast);
+                    }
                     VehicleSample s;
-                    const double dispT = mc.clock.RenderT(nowLocal) - ex + add;
+                    const double dispT = renderT - ex + add;
+                    if (o.nearClock) rc.ip.SetExtrapolateMaxMs(500.0 + add);
                     if (!rc.ip.Sample(dispT, s)) continue;
                     rc.lastTarget = s; rc.haveTarget = true; rc.lastDisp = dispT;
                     VehicleDriveInput in;
@@ -720,6 +747,11 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     (void)anyTouch;
                     in.contact = flag && !rc.lastFlag;
                     rc.lastFlag = flag;
+                    if (o.proximity && own) {
+                        const imp::Pose po{imp::V2{own->p.x, own->p.y}, imp::V2{own->v.x, own->v.y}, own->h, own->w};
+                        const imp::Pose pc{imp::V2{P.p.x, P.p.y}, imp::V2{s.vel.x, s.vel.y}, P.h, s.angVel.z};
+                        in.proximity = imp::PredictOverlap(po, sc.cars[ownIdx].mc, pc, sc.cars[c].mc, imp::ProximityCfg()).hit;
+                    }
                     if (!rc.haveLast) { P.p = {s.pos.x, s.pos.y}; P.h = vq::HeadingDeg(s.rot) * kPi / 180.0; P.v = {0, 0}; rc.haveLast = true; }
                     const VehicleDriveOutput out = rc.ctl.Update(in);
                     if (useAdopt && out.contactOpened && !out.snap) {
@@ -899,6 +931,7 @@ inline Result Run(const Scene& sc, const Opt& o) {
         }
     }
     R.maxPenetrationScreen = penetMax;
+    for (int m = 0; m < nm; ++m) R.blowups += M[m]->w.blowups;
     R.arb = arb.stats();
     for (int m = 0; m < nm; ++m) {
         for (int c = 0; c < nc; ++c) R.graces += M[m]->rc[c]->ctl.Stats().contacts;

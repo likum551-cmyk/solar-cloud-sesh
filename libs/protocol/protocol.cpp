@@ -549,6 +549,20 @@ namespace gage::proto {
         return w.take();
     }
 
+    Bytes Encode(const LinkInfo& m)
+    {
+        if (m.e.size() > kMaxLinkEntries) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::LinkInfo);
+        w.u8((uint8_t)m.e.size());
+        for (const LinkEntry& e : m.e)
+        {
+            w.u16(e.id);
+            w.u16(e.rttMs);
+        }
+        return w.take();
+    }
+
     Bytes Encode(const Killed& m)
     {
         wire::Writer w;
@@ -1013,6 +1027,27 @@ namespace gage::proto {
         return true;
     }
 
+    bool Decode(const uint8_t* p, size_t n, LinkInfo& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::LinkInfo)) return false;
+        const uint8_t count = r.u8();
+        if (count > kMaxLinkEntries) return false;
+        LinkInfo m;
+        for (uint8_t i = 0; i < count; i++)
+        {
+            LinkEntry e;
+            e.id = r.u16();
+            e.rttMs = r.u16();
+            for (const LinkEntry& o : m.e)
+                if (o.id == e.id) return false;
+            m.e.push_back(e);
+        }
+        if (!r.done()) return false;
+        out = std::move(m);
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, Killed& out)
     {
         wire::Reader r(p, n);
@@ -1352,6 +1387,7 @@ namespace gage::proto {
         case Msg::PeerAnimStop:     return "PeerAnimStop";
         case Msg::SeatNotice:       return "SeatNotice";
         case Msg::VehicleImpact:    return "VehicleImpact";
+        case Msg::LinkInfo:         return "LinkInfo";
         }
         return "?";
     }

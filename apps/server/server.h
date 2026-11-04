@@ -177,6 +177,7 @@ namespace gage::server {
         uint64_t vehiclePartHits = 0;        // v6: vehicle Hits that set a tyre / window bit (VehicleStore::HitPart)
         uint64_t vehicleImpacts = 0;         // T4: contacts between two controllers' vehicles the arbiter resolved
         uint64_t vehicleImpactsSent = 0;     // ... VehicleImpact messages sent (one per controller)
+        uint64_t linkInfoSent = 0;           // R3 T5: LinkInfo messages sent (one per client per second)
         uint64_t hitsAccepted = 0;
         uint64_t hitsRejected = 0;           // failed validation (dead, unknown, range, relevance, rate, 0 damage)
         uint64_t kills = 0;
@@ -456,6 +457,8 @@ namespace gage::server {
         proto::PedState Shown(const Conn& c) const;
         void BroadcastVehicles(uint64_t nowMs);
         void BroadcastImpacts(uint64_t nowMs);   // T4
+        uint32_t LinkRttMs(const Conn& c) const;
+        void BroadcastLinkInfo(uint64_t nowMs);  // R3 T5: ~1 Hz, each client gets the round trip of the players that control a vehicle
         void VehicleDestroyed(uint16_t id);
         void Accept(Conn& c, const std::string& name);
         void Refuse(Conn& c, proto::RefuseReason reason, const std::string& text);
@@ -492,6 +495,7 @@ namespace gage::server {
         std::vector<sync::impact::ContactArbiter::Live> contactLive_;    // scratch
         std::vector<sync::impact::ImpactOut> contactOut_;                // scratch
         uint32_t impactSeq_ = 0;
+        uint64_t linkInfoMs_ = 0;                                        // R3 T5: when LinkInfo last went out
         uint64_t impactLogMs_ = 0, impactLogCount_ = 0, impactLogClaims_ = 0;
         uint32_t nextSpawnPoint_ = 0;
         Metrics metrics_;

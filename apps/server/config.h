@@ -60,6 +60,9 @@ namespace gage::server {
         uint32_t vehicleEnterDistance = 10;      // m, 1..100: Enter / Register range from the player
         uint32_t vehicleMaxSpeed = 150;          // m/s, 10..600: a VehicleUpdate above it is clamped to it up to twice it (T4: a hyper car's overshoot), refused above that
         uint32_t fuelDrainPerMinute = 10;        // permille per minute while driven with the engine on, 0..1000
+        // R3 T5: the contact arbiter places a controller's samples at their TRUE time, not the SampleClock's (sample time + the fastest uplink): each
+        // sample is moved back by half the controller's round trip, at most this many ms (0..500, 0 = off; server.json contactLagCapMs).
+        uint32_t contactLagCapMs = 150;
 
         // ---- server.json keys: combat (protocol v4; damage scaling v5, apps/server/damage.h) ----
         // playerHealth: the maximum a player has at join, after `heal` and after a respawn, announced in

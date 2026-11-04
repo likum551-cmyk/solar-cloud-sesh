@@ -6,7 +6,7 @@
 
 namespace t4net {
 
-constexpr int kT4NetChecks = 3;
+constexpr int kT4NetChecks = 4;   // R3 T5: +1 (LinkInfo through the real server)
 
 static void T4NetworkTests()
 {
@@ -30,11 +30,11 @@ static void T4NetworkTests()
         const bool dec = proto::Decode(b.data(), b.size(), back);
         proto::Msg t;
         Check("T4 wire: VehicleImpact is message 40, 21 bytes laid out byte for byte (seq, ids, the contact time on the receiver's clock, dv in 1/64 m/s, yaw in 1/256 rad/s, the normal in 1/127, "
-              "closing in 0.25 m/s, depth in cm); it decodes back; PeekType knows 40 and not 41; the name is VehicleImpact",
+              "closing in 0.25 m/s, depth in cm); it decodes back; PeekType knows 40 and not 45 (R3 T5 added 44 LinkInfo); the name is VehicleImpact",
               b == want && b.size() == proto::kVehicleImpactBytes && dec && back.seq == m.seq && back.vehId == 5 && back.otherId == 9 && back.sampleMs == 0xA1B2 &&
                   back.dvx == -1.0f && back.dvy == 24.5f && back.dyaw == -2.0f && back.nx == 1.0f && back.ny == -1.0f && back.closing == 40.0f && back.depth == 0.25f &&
                   proto::PeekType(b.data(), b.size(), t) && t == proto::Msg::VehicleImpact && std::string(proto::ToString(t)) == "VehicleImpact" &&
-                  proto::kMsgLast == 40 && []{ const uint8_t x = 41; proto::Msg y; return !proto::PeekType(&x, 1, y); }(),
+                  proto::kMsgLast == 44 && []{ const uint8_t x = 45; proto::Msg y; return !proto::PeekType(&x, 1, y); }(),
               Hex(b));
     }
 
@@ -112,6 +112,29 @@ static void T4NetworkTests()
               errB < 70.0 && st.vehicleImpacts == 1 && st.vehicleImpactsSent == 2,
           std::to_string(ia.size()) + "/" + std::to_string(ib.size()) + " impacts, dv " + std::to_string(dvA) + " / " + std::to_string(dvB) + ", closing " + std::to_string(closing) + ", clock error " +
               std::to_string(errA) + " / " + std::to_string(errB) + " ms, server " + std::to_string(st.vehicleImpacts) + " impacts " + std::to_string(st.vehicleImpactsSent) + " sent");
+
+    // ---- R3 T5: LinkInfo, the server's measure of each vehicle controller's round trip, reaches every client (about once a second while cars are driven) ----
+    {
+        auto links = [](const Probe& p) {
+            std::vector<proto::LinkInfo> r;
+            for (const net::Event& e : p.events)
+                if (e.type == net::Event::Type::LinkInfo) r.push_back(e.linkInfo);
+            return r;
+        };
+        rig.Until([&] { return !links(alice).empty() && !links(bob).empty(); }, 2500);
+        const std::vector<proto::LinkInfo> la = links(alice), lb = links(bob);
+        auto has = [](const proto::LinkInfo& l, uint16_t id) {
+            for (const proto::LinkEntry& e : l.e)
+                if (e.id == id) return true;
+            return false;
+        };
+        const bool both = !la.empty() && !lb.empty() && has(la.back(), alice.s.myId()) && has(la.back(), bob.s.myId()) && has(lb.back(), alice.s.myId()) && has(lb.back(), bob.s.myId());
+        uint32_t maxRtt = 0;
+        for (const proto::LinkEntry& e : (la.empty() ? proto::LinkInfo() : la.back()).e) maxRtt = std::max<uint32_t>(maxRtt, e.rttMs);
+        Check("R3 T5 net: LinkInfo (message 44) reaches both clients through the real server while two cars are driven, names both controllers, with a loopback round trip under 200 ms; the server counted the sends",
+              both && maxRtt < 200 && rig.srv.stats().linkInfoSent >= 2, std::to_string(la.size()) + "/" + std::to_string(lb.size()) + " messages, max rtt " + std::to_string(maxRtt) + " ms, sent " +
+                  std::to_string(rig.srv.stats().linkInfoSent));
+    }
 
     // ---- the speed cap: over it is clamped, far over it is still dropped ----
     {

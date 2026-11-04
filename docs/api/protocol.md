@@ -1155,3 +1155,30 @@ Server policy changes that need no wire change (T4):
 * `Rules::maxSpeedSoftFactor` (2.0): a `VehicleUpdate` whose velocity is over `vehicleMaxSpeed` (150) but under twice it is accepted with the velocity clamped to the cap (it used to be
   refused as `BadArg`, which froze a hyper car for everybody else); above twice the cap it is refused as before.
 <!-- T4-END -->
+
+<!-- R3-T5-BEGIN: vehicle position / link info (desync overhaul round 3). Append-only section; the orchestrator does the single kVersion 6 -> 7 bump. -->
+## R3 T5: link info (`LinkInfo`, message 44)
+
+Wire change for protocol v7 (the orchestrator bumps `kVersion` once, in lockstep with the client version): ONE new message and no change to any existing layout.
+Design, numbers and the live test: docs/sync-specs/vehicle-position.md. Numbers 41..43 stay reserved for other round-3 messages (the orchestrator renumbers on a clash).
+
+### 44 `LinkInfo` (server to client, state channel, unreliable, about once a second): 2 + 4 x count bytes
+
+A sender's stamp (`VehicleUpdate.sampleMs`, placed by the server's `SampleClock` at its sample time plus the controller's FASTEST uplink) and a frame's tick (it reaches a client
+the fastest downlink later) leave half the controller's and half the receiver's round trip out of a car's drawn position: 2-3 m at 25 m/s on a 100 ms path. The receiver knows its own
+round trip; the controller's only the server does. Every second each joined client gets the round trip the server measures to every player that controls a vehicle.
+
+| offset | size | field | |
+|---|---|---|---|
+| 0 | 1 | type | 44 |
+| 1 | 1 | `count` | `u8`, 0..32 |
+| 2 + 4 i | 2 | `id` | `u16`: the player id of a vehicle controller (unique in the message) |
+| 4 + 4 i | 2 | `rttMs` | `u16`: ENet's smoothed round trip to that player in ms, or the quietest of its last interval when that is lower (0 = not measured yet) |
+
+Strict decoding: exactly `2 + 4 x count` bytes, `count <= 32`, no repeated `id`. `Encode` refuses more than 32 entries. A lost message is replaced by the next; a client that never
+gets one uses its own round trip for both halves (`sync::LinkLagMs(own, 0)`). The server sends nothing while no vehicle has a controller.
+
+Server policy changes that need no wire change (R3 T5):
+* `server.json` `contactLagCapMs` (0..500, default 150; 0 = off): the contact arbiter places each controller's `VehicleUpdate` at its `SampleClock` time MINUS half that controller's round
+  trip (capped, slewed at 0.25 ms per ms), so two cars that touch at one instant sit at one time on the arbiter's base even when their uplinks differ.
+<!-- R3-T5-END -->
