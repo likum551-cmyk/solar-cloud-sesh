@@ -105,6 +105,12 @@ namespace gage::server {
             // T4: a reported velocity above maxSpeed but below maxSpeed * maxSpeedSoftFactor is CLAMPED to maxSpeed and accepted (a hyper car's
             // overshoot must not freeze it for everybody else); above that it is BadArg as before. The position is still judged by displacement.
             float    maxSpeedSoftFactor = 2.0f;
+            // R3 T4 (vehicle damage): a controller's report that ADDS a smashed window, a broken door / headlight, a dent or a lower petrol tank is
+            // taken only when the car shows some damage anywhere (the server's or the report's body health is below cleanHealth, or a Hit
+            // already named the bit): a clean car with a window "smashed" in every update was the round-2 live read of a slot that never was one.
+            // Defence in depth behind the client's own baselines (libs/sync/vehicle_damage.h); false = trust the report as in v6.
+            bool     damageNeedsHealthLoss = true;
+            uint16_t cleanHealth = 995;
         };
 
         // One player as AssignControllers sees them: where they are, whether the server has a position of theirs, and
@@ -622,8 +628,17 @@ namespace gage::server {
             // Health only goes down from the controller's side (a crash); never repaired by a client. What the
             // motion-only entry leaves out (health, lights, doors) and changes is sent in full for a few frames.
             const uint16_t body = std::min(V.s.bodyHealth, u.bodyHealth), engine = std::min(V.s.engineHealth, u.engineHealth);
-            const bool visChanged = MergeVisual(V, u.tyres, u.tyresRim, u.windows, nowMs); // v6
-            if (body != V.s.bodyHealth || engine != V.s.engineHealth || u.flags2 != V.s.flags2 || u.doors != V.s.doors || visChanged)
+            // R3 T4: a car whose body health is still (nearly) full cannot have gained a smashed window or a broken part since the last report.
+            const bool looksClean = rules_.damageNeedsHealthLoss && std::min(body, u.bodyHealth) >= rules_.cleanHealth;
+            uint8_t reportWindows = u.windows;
+            if (looksClean && (reportWindows & ~V.s.windows))
+            {
+                reportWindows = (uint8_t)(reportWindows & V.s.windows);
+                ++windowRejects_;
+            }
+            const bool visChanged = MergeVisual(V, u.tyres, u.tyresRim, reportWindows, nowMs); // v6
+            const bool dmgChanged = u.hasDmg && MergeDamage(V, u.dmg, looksClean); // v7
+            if (body != V.s.bodyHealth || engine != V.s.engineHealth || u.flags2 != V.s.flags2 || u.doors != V.s.doors || visChanged || dmgChanged)
                 V.changedTick = lastTick_ + 1; // told in full from the next frame on
             V.s.bodyHealth = body;
             V.s.engineHealth = engine;
@@ -644,6 +659,9 @@ namespace gage::server {
             }
             return Code::Ok;
         }
+        // R3 T4 counters: window bits and damage-block rises refused because the car still looked clean (see Rules::damageNeedsHealthLoss).
+        uint64_t windowRejects() const { return windowRejects_; }
+        uint64_t damageRejects() const { return damageRejects_; }
         // The vehicle's measured movement: true when its displacement said it moved at least ac::kMovingSpeed
         // within the last `withinMs` of `nowMs`.
         bool MovedRecently(uint16_t id, uint64_t nowMs, uint64_t withinMs) const
@@ -723,6 +741,17 @@ namespace gage::server {
                 V->changedTick = tick;
             }
             return changed;
+        }
+
+        // R3 T4: forget every damage-block field of V (a repair: the future admin / gamemode path). Body and engine health are the caller's.
+        bool RepairDamage(uint16_t id, uint32_t tick)
+        {
+            Vehicle* V = Mutable(id);
+            if (!V) return false;
+            V->s.dmg = proto::VehicleDamage();
+            V->changedTick = tick;
+            NoteTick(tick);
+            return true;
         }
 
         // A validated hit: `damage` off the body health, half of it off the engine health.
@@ -903,12 +932,12 @@ namespace gage::server {
             return true;
         }
 
-        // Encoded size of an entry after its id and header byte: a full one (46 bytes + 2 per occupant; v6 added the
-        // tyre, rim and window masks), or the motion-only one (24).
+        // Encoded size of an entry after its id and header byte: a full one (46 bytes in v6, which added the tyre, rim and window masks;
+        // v7 adds the damage block, 3..11 bytes: 49 for a clean car; + 2 per occupant), or the motion-only one (24).
         static constexpr size_t kMotionOnlyBytes = 24;
         static size_t FullBytes(const proto::VehicleState& s)
         {
-            size_t n = 46;
+            size_t n = 46 + proto::VehicleDamageBytes(s.dmg);
             for (uint16_t p : s.seats)
                 if (p != proto::kNoPlayer) n += 2;
             return n;
@@ -917,6 +946,7 @@ namespace gage::server {
     private:
         static constexpr uint32_t kFreshFrames = 3;   // a newcomer / change is sent in this many frames
         static constexpr uint64_t kVisAckMs = 3000;   // a Hit's visual bit waits this long for the controller to show it
+        uint64_t windowRejects_ = 0, damageRejects_ = 0;   // R3 T4
         static constexpr uint32_t kRemovedRepeat = 3; // a "destroyed" notice rides this many frames
         static constexpr size_t kMaxRemovedPerFrame = 255; // the wire's u8 nRemoved
 
@@ -1023,6 +1053,35 @@ namespace gage::server {
             V.s.tyres = next[0];
             V.s.tyresRim = next[1];
             V.s.windows = next[2];
+            return changed;
+        }
+        // v7: the controller's damage block merged into V's truth. Damage only goes UP, like body and engine health (a crash cannot be
+        // undone by a client; a repair path would call RepairDamage): the petrol tank takes the lower value, broken parts are OR-ed, a
+        // dent takes the deeper value. A rise on a car that still looks clean is refused (and counted). True when V's block changed.
+        bool MergeDamage(Vehicle& V, const proto::VehicleDamage& d, bool looksClean)
+        {
+            proto::VehicleDamage next = V.s.dmg;
+            bool refused = false;
+            if (d.petrol < next.petrol)
+            {
+                if (looksClean) refused = true;
+                else next.petrol = d.petrol;
+            }
+            const uint8_t addParts = (uint8_t)(d.parts & ~next.parts);
+            if (addParts)
+            {
+                if (looksClean) refused = true;
+                else next.parts = (uint8_t)(next.parts | d.parts);
+            }
+            for (size_t i = 0; i < proto::kVehDentProbes; i++)
+                if (d.dent[i] > next.dent[i])
+                {
+                    if (looksClean) refused = true;
+                    else next.dent[i] = d.dent[i];
+                }
+            if (refused) ++damageRejects_;
+            const bool changed = next != V.s.dmg;
+            V.s.dmg = next;
             return changed;
         }
         // Nobody controls V: it stands still.

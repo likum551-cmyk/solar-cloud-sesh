@@ -5599,6 +5599,78 @@ bool World::SetVehicleBrakeLights(int32_t veh, bool on) {
 }
 #undef GAGE_T3_NEEDS_HASH
 
+// ---- R3 T4 vehicle damage state (protocol v7). All hashes are resolved ones (hook.h, "Desync round 3"); a call that cannot be made
+// returns false, which every caller reads as "no information" (a read) or "not done" (a write).
+bool World::GetVehiclePetrolTankHealth(int32_t veh, float& health) {
+    return callHandleGetFloat(*this, native::GET_VEHICLE_PETROL_TANK_HEALTH, veh, health);
+}
+
+bool World::SetVehiclePetrolTankHealth(int32_t veh, float health) {
+    return callHandleFloat(*this, native::SET_VEHICLE_PETROL_TANK_HEALTH, veh, health);
+}
+
+bool World::SetVehicleDamage(int32_t veh, float x, float y, float z, float damage, float radius, bool focusOnModel) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), FloatArg(x), FloatArg(y), FloatArg(z), FloatArg(damage), FloatArg(radius), boolArg(focusOnModel) };
+    return CallNative(native::SET_VEHICLE_DAMAGE, args, 7, nullptr);
+}
+
+bool World::GetVehicleDeformationAtPos(int32_t veh, float x, float y, float z, float& dx, float& dy, float& dz) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), FloatArg(x), FloatArg(y), FloatArg(z) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_DEFORMATION_AT_POS, args, 4, r)) return false;
+    memcpy(&dx, &r[0], 4);       // a Vector3 return: three padded slots, as GET_ENTITY_COORDS
+    memcpy(&dy, &r[1], 4);
+    memcpy(&dz, &r[2], 4);
+    return true;
+}
+
+bool World::IsVehicleDoorDamaged(int32_t veh, int door, bool& damaged) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)door };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_VEHICLE_DOOR_DAMAGED, args, 2, r)) return false;
+    damaged = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::GetIsDoorValid(int32_t veh, int door, bool& valid) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)door };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_IS_DOOR_VALID, args, 2, r)) return false;
+    valid = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetVehicleDoorBroken(int32_t veh, int door, bool deleteDoor) {
+    if (!veh) return false;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)door, boolArg(deleteDoor) };
+    return CallNative(native::SET_VEHICLE_DOOR_BROKEN, args, 3, nullptr);
+}
+
+bool World::IsVehicleHeadlightDamaged(int32_t veh, bool left, bool& damaged) {
+    if (!veh) return false;
+    uint64_t arg[] = { entArg(veh) };
+    uint64_t r[4] = {};
+    if (!CallNative(left ? native::GET_IS_LEFT_VEHICLE_HEADLIGHT_DAMAGED : native::GET_IS_RIGHT_VEHICLE_HEADLIGHT_DAMAGED, arg, 1, r)) return false;
+    damaged = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetVehicleCanBeVisiblyDamaged(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_CAN_BE_VISIBLY_DAMAGED, veh, on);
+}
+
+bool World::SetVehicleEngineCanDegrade(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_ENGINE_CAN_DEGRADE, veh, on);
+}
+
+bool World::SetDisableVehiclePetrolTankDamage(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE, veh, on);
+}
+
 bool World::GetConvertibleRoofState(int32_t veh, int& state) {
     if (!veh) return false;
     uint64_t arg[] = { entArg(veh) };

@@ -250,6 +250,13 @@ static std::vector<Case> Corpus()
         b.motionOnly = true;
         m.vehicles = {a, b};
         v.push_back(Make("VehicleWorld", m));
+        // R3 T4 (v7): the same frame with a damage block on the full entry (petrol, a broken door and a lamp, three dents) and on a second full one (max)
+        m.vehicles[0].dmg.petrol = 99;
+        m.vehicles[0].dmg.parts = kDoorHood | kVehDmgLampR;
+        m.vehicles[0].dmg.dent[1] = 7;
+        m.vehicles[0].dmg.dent[4] = 250;
+        m.vehicles[0].dmg.dent[7] = 1;
+        v.push_back(Make("VehicleWorld damage", m));
     }
     {
         VehicleCmd m;
@@ -291,6 +298,15 @@ static std::vector<Case> Corpus()
         m.tyresRim = 0x06;
         m.windows = 0x11;
         v.push_back(Make("VehicleUpdate", m));
+        // R3 T4 (v7): with the damage block (flags bit 5 on the wire): two dents, a broken door and headlight, a leaking tank
+        m.hasDmg = true;
+        m.dmg.petrol = 61;
+        m.dmg.parts = kDoorFrontLeft | kVehDmgLampL;
+        m.dmg.dent[0] = 200;
+        m.dmg.dent[5] = 3;
+        v.push_back(Make("VehicleUpdate damage", m));
+        m.dmg = VehicleDamage();
+        v.push_back(Make("VehicleUpdate clean block", m));
     }
     { VehicleResult m; m.op = VehicleOp::Enter; m.code = VehicleResultCode::SeatTaken; m.vehId = 6; v.push_back(Make("VehicleResult", m)); }
     { Hit m; m.kind = HitKind::Player; m.targetId = 5; m.weapon = 0x1B06D571u; m.damage = 40; m.bone = 31086; m.shotSeq = 3; v.push_back(Make("Hit", m)); }
@@ -337,7 +353,7 @@ static std::vector<Case> Corpus()
         v.push_back(Make("LinkInfo", m));
     }
     for (Case& c : v)
-        if (c.name == "VehicleWorld" || c.name == "VehicleUpdate" || c.name == "VehicleCmd register") c.lossy = true;
+        if (c.name.rfind("VehicleWorld", 0) == 0 || c.name.rfind("VehicleUpdate", 0) == 0 || c.name == "VehicleCmd register") c.lossy = true;
     return v;
 }
 
