@@ -394,31 +394,13 @@ namespace {
     //
     // The DllMain then runs on the same thread the game's own module loads use,
     // not on this worker thread.
-    // True when the host exe is GTA V Enhanced (GTA5_Enhanced.exe): matched by shape, like the launcher's
-    // BattlEye-wrapper check, so a renamed edition string still counts.
-    static bool HostIsEnhanced()
-    {
-        wchar_t exe[MAX_PATH] = {};
-        if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
-        for (wchar_t* c = exe; *c; ++c)
-            if (*c >= L'A' && *c <= L'Z') *c = (wchar_t)(*c + 32);
-        const wchar_t* base = wcsrchr(exe, L'\\');
-        return wcsstr(base ? base + 1 : exe, L"enhanced") != nullptr;
-    }
-
+    //
+    // Enhanced note (2026-11-04): on GTA5_Enhanced.exe this poll times out after 15 s and the caller falls back to
+    // a worker-thread load, so the engine attaches ~26 s after the game starts. 0.4.11 skipped the poll (attach at
+    // 2.5 s) and the friend's game died with 0xC0000005 a few seconds after its first frame, twice. The ~26 s
+    // attach is the timing proven live on Enhanced (0.4.10, 144 s in the world), so the wait stays as it was.
     HMODULE LoadOnMainThread(const std::wstring& path, DWORD mainTid)
     {
-        // Enhanced: the earliest-created thread parks in a long kernel wait and never enters the hijack blob
-        // (friend's 0.4.10 log: "main-thread load did not complete in 15 s", then the worker-thread load below
-        // got the engine in, 27 s after the game started). Skip the 15 s poll and take that same worker path
-        // directly. Nothing is left behind: no blob, no crash-catch VEH, and the main thread is not flagged
-        // unusable, so a later load is not refused.
-        if (HostIsEnhanced())
-        {
-            GLOGI("gage_loader: [main] GTA V Enhanced host: the main-thread hijack is known not to run there; "
-                  "loading %s on a worker thread", Narrow(path).c_str());
-            return LdrLoadDirect(path);
-        }
         if (g_mainThreadUnusable)
         {
             GLOGE("gage_loader: [main] skipping %s: the main thread is unusable for loads "

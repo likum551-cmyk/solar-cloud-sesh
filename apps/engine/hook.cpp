@@ -961,6 +961,10 @@ struct BuildProfile {
     const char*        gtaThreadTickSig;
     int                gtaThreadTickFnOffset;
     size_t             threadStateOff;
+    // Enhanced: hook GtaThread::Tick only once the stock boot has run (main_persistent is a live thread), not the
+    // moment its code decrypts. 0.4.11 hooked it 3 s into the process, before one script had ticked, and the game
+    // died with 0xC0000005 a few seconds after its first frame (twice). Legacy keeps the early hook (false).
+    bool               noSpAfterBoot;
 };
 
 const BuildProfile kProfile3889 = {
@@ -975,6 +979,7 @@ const BuildProfile kProfile3889 = {
     "E8 ?? ?? ?? ?? 84 C0 8B 05 ?? ?? ?? ?? 74 ?? 83 C0",              // landingPageSig
     0, 0, 0, 0,                                                        // Enhanced-only fields: unused on Legacy (bucketed path)
     nullptr, 0, 0,                                                     // gtaThreadTickSig / fn offset / state offset: Legacy uses its own pattern in noSpInstall
+    false,                                                             // noSpAfterBoot: Legacy hooks Tick as soon as it decrypts (proven live)
 };
 
 // Enhanced build 1158.13, DX12. Every value here was derived from the friend's
@@ -1020,6 +1025,10 @@ const BuildProfile kProfile1158 = {
     // first 17 bytes are whole instructions with no CALL, so netJump takes it. The code is verified offline only;
     // noSpVerifyTick cross-checks it live against the vtable.
     "56 57 53 48 83 EC 20 48 89 CE 80 B9 ?? ?? 00 00 00 74 08 8B 7E 18 E9", 0, 0x18,
+    // noSpAfterBoot: the friend's 0.4.11 run hooked Tick 3 s into the process (before any stock script had ticked) and
+    // the game died with 0xC0000005 a few seconds after its first frame, twice; 0.4.10 (no hook, engine attached at
+    // ~26 s) ran 144 s. The no-op now lands once main_persistent is live, i.e. after the stock boot created the player.
+    true,
 };
 
 // Selected in Init() by main-module file name; defaults to Legacy so the live
@@ -2738,10 +2747,16 @@ int noScriptTick(uint8_t* thread, int) { return *(int*)(thread + g_threadStateOf
 // Poller thread. True once installed or definitively given up; false to keep retrying while the
 // script code is still encrypted.
 uint8_t* findAnyScriptThread();   // defined with the other thread finders below
+bool noSpBootReached();           // likewise (needs findScriptThread / joaat)
 
 // The Tick function we hooked (null until noSpInstall succeeds) and whether noSpVerifyTick has finished.
 uint8_t* g_noSpTickFn = nullptr;
 bool g_noSpVerified = false;
+
+// How long noSpInstall waits for the stock boot (noSpAfterBoot builds) before leaving the stock scripts running.
+// Enhanced reached main_persistent 63 s after process start on the friend's 0.4.10 run; this is counted from the
+// poller's first look, with room for a slow disk and the loading screen.
+const ULONGLONG kNoSpBootWaitMs = 300000, kNoSpBootLogMs = 10000;
 
 bool noSpInstall() {
     // Legacy 3889: the pattern sits inside the function (fn = match - 0xB). Enhanced: an entry-anchored
@@ -2753,6 +2768,25 @@ bool noSpInstall() {
     }
     const char* sig = profileSig ? g_build->gtaThreadTickSig : "48 83 EC 20 80 B9 ?? 01 00 00 00 8B FA";
     const int fnOffset = profileSig ? g_build->gtaThreadTickFnOffset : -0xB;
+    // Enhanced (noSpAfterBoot): let the stock boot run first. The script-thread array only exists once the poller
+    // installed the script tick (natives validated), so until then this simply keeps waiting; the trailing poller
+    // loop (codePatchesPending) carries on after the native table validates.
+    if (g_build->noSpAfterBoot && !noSpBootReached()) {
+        static ULONGLONG firstWait = 0, lastLog = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (!firstWait) firstWait = lastLog = now;
+        if (now - firstWait > kNoSpBootWaitMs) {
+            GLOGW("hook: [nosp] the stock boot (main_persistent) did not appear in %llu s; stock scripts keep running",
+                  (unsigned long long)(kNoSpBootWaitMs / 1000));
+            return true;
+        }
+        if (now - lastLog >= kNoSpBootLogMs) {
+            lastLog = now;
+            GLOGI("hook: [nosp] waiting for the stock boot (main_persistent live) before hooking GtaThread::Tick "
+                  "(%llu s)", (unsigned long long)((now - firstWait) / 1000));
+        }
+        return false;
+    }
     uint8_t* m = netFindUnique("gtaThreadTick", sig);
     if (!m) {
         const ULONGLONG now = GetTickCount64();
@@ -2992,7 +3026,7 @@ uint8_t* findScriptThread(uint32_t hash) {
     // at gage.log, not a silently stuck load. Legacy leaves threadScriptName 0 and
     // skips this block entirely (behaviour byte-identical).
     static bool diagged = false;
-    if (kThreadName && !diagged) {
+    if (kThreadName && !diagged && a.size > 0) {   // the poller's boot wait can look before the first thread exists
         diagged = true;
         for (uint16_t i = 0; i < a.size && i < 16; ++i) {
             uint8_t* t = a.data[i];
@@ -3068,6 +3102,22 @@ uint8_t* findAnyScriptThread() {
         if (id && handler) return t;
     }
     return nullptr;
+}
+
+// noSpAfterBoot builds: the stock boot has run far enough to leave the game with a player once main_persistent is a
+// live thread (on the friend's 0.4.10 run: the ped appeared at 57 s, main_persistent 6 s later). Needs the script
+// thread array, which the poller sets when it installs the script tick, so false until then.
+bool noSpBootReached() {
+    static const uint32_t kMainPersistent = joaat("main_persistent");
+    uint8_t* t = findScriptThread(kMainPersistent);
+    if (!t) return false;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GLOGI("hook: [nosp] stock boot reached: main_persistent is live (thread %p, id %u); hooking GtaThread::Tick now",
+              (void*)t, *(uint32_t*)(t + g_build->threadId));
+    }
+    return true;
 }
 
 // Called by the detour at the top of run_script_threads, on the game thread.

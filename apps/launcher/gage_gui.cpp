@@ -63,7 +63,7 @@ using net::ServerInfo;
 // Constants
 // ---------------------------------------------------------------------------
 
-static const wchar_t* kClientVersion = L"0.4.11";
+static const wchar_t* kClientVersion = L"0.4.12";
 static const wchar_t* kClass = L"GAGE_MP_Launcher";
 static const wchar_t* kTitle = L"Solar Launcher";
 static const int kAppIconId = 1;  // gage_gui.rc
