@@ -26,6 +26,7 @@
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_visual.h"
 #include "sync/pedstate.h"
+#include "sync/cover.h"
 #include "sync/vehicle_entry.h"
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
@@ -249,7 +250,9 @@ namespace {
         bool stealthOn = false;          // SET_PED_STEALTH_MOVEMENT is on for this ped
         double stealthAtMs = 0;          // ... when it was last (re)asserted
         sync::NameTagTrack nameTag;      // W10: this peer's tag across frames (eased alpha, last position, LOS cache)
-        sync::CoverWindow cover;         // 0d: TASK_PUT_PED_DIRECTLY_INTO_COVER as a window (issued, started, fallback, ended)
+        sync::CoverPuppet cover;         // R3 T3: the verified cover window (Wait / Pending / Held / crouch-pose fallback), libs/sync/cover.h
+        float coverIssuePos[3] = {0, 0, 0};   // ... where the puppet stood when the cover task went out (how far the game moved it)
+        double coverIssueMs = 0;              // ... and when
         int enterVeh = -1;               // the server vehicle id a TASK_ENTER_VEHICLE walks this ped to (-1 = none)
         double enterTaskMs = 0;          // ... when it was issued (> 0 while it runs); EnterWarpDue's clock
         // ---- W9 (vehicles, passengers, collision; script tick) ----
@@ -678,6 +681,13 @@ namespace {
     // follows the sender's pose and warps into the seat when the seat list names the player (sync::EnterWalkMode).
     std::atomic<bool> g_peerEnterTask{false};
     std::atomic<uint32_t> g_vehWorldsIn{0}, g_emotesIn{0};
+    // R3 T3 (libs/sync/cover.h): cover_sync=task|pose|off (HKCU, read at Welcome; default task with the verified window and the crouch-pose
+    // fallback), the breaker that sends every hold to the pose fallback after consecutive refused tasks, and the SENDER's cover classifier
+    // (ReadLocalPedState, script tick) with its 10 s counters.
+    std::atomic<int> g_coverSyncMode{(int)sync::CoverSyncMode::Task};
+    sync::CoverBreaker g_coverBreaker;
+    sync::CoverSense g_coverSense;
+    uint32_t g_coverSenderLogged = 0;
 
     // A single "companion" ped that mirrors the local player at a fixed offset:
     // proves the SpawnPed/EntityPos pipeline end-to-end before any live peer.
@@ -1290,6 +1300,17 @@ namespace {
         g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
+        {
+            // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
+            const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
+            g_coverSyncMode.store((int)cm);
+            g_coverBreaker.Reset();
+            GLOGI("engine: cover (R3 T3): cover_sync=%s (%s)", sync::CoverSyncName(cm),
+                  cm == sync::CoverSyncMode::Task ? "a puppet is put into cover only when it is within 0.30 m of the sender's pose and the game confirms it with "
+                                                    "IS_PED_IN_COVER; otherwise it stands / crouches on the sender's position"
+                  : cm == sync::CoverSyncMode::Pose ? "no cover task, the crouch pose on the sender's position"
+                                                     : "the cover flag is ignored");
+        }
         {
             // Sync plan W3: hit_react off|bullet|ragdoll|both (anything else, the default: both),
             // peer_muzzle=0, peer_shoot=script (real fire is the default since the 0.4.3 fixes).
@@ -4715,76 +4736,114 @@ namespace {
         }
     }
 
-    // 0d: cover as a window (sync::CoverWindow), once per DrivePeer from TickPeerTierB. The puppet is put on the sender's pose of the
-    // edge first (the native looks for a cover point at the coordinates it is given), then TASK_PUT_PED_DIRECTLY_INTO_COVER(ped, pose,
-    // timeout -1, allowPeekingAndFiring false, blendIn 0, forceInitialFacingDirection false, forceFaceLeft false, identifier -1,
-    // doEntry false). Returns true while the cover task owns the ped: DrivePeer then runs no gait task, no velocity push and no
-    // anchor move (LocoController::Update is not called). INFERRED, not verifiable without a game: that these parameters find a
-    // cover point at a car; the log line "engine: vault / cover (0d)" counts issued / started / fallback / ended per 10 s.
+    // R3 T3: cover as a VERIFIED window (libs/sync/cover.h CoverPuppet), once per DrivePeer from TickPeerTierB. The 0d version put the puppet on
+    // the sender's pose (a SET at 1 m or more: a teleport), issued TASK_PUT_PED_DIRECTLY_INTO_COVER at coordinates where a car is no cover
+    // point and froze the puppet for 700 ms; it then stood upright on the pose while the sender crouched, or was snapped onto a cover point
+    // the game found a few decimetres away. Now: nothing is forced. The puppet stays under the locomotion pipeline until it is within 0.30 m
+    // of the pose and the pose is nearly still; the task goes out ONCE (parameters as in 0d: time -1, no peek / fire, blend 0, doEntry false)
+    // and counts only when IS_PED_IN_COVER reads true within the window, the puppet is still near the pose and faces the sender's way. A puppet
+    // the game moved (a snap), a task that is not accepted (no cover point, or a puppet that ignores tasks), a sender that slides along the
+    // cover or aims all end in ONE ClearPedTasksNow and the pose fallback: the pipeline keeps the puppet on the sender's position and the
+    // crouch hint (kPfStealth, set by the sender) crouches it. Returns true while the cover task owns the ped (DrivePeer then runs no gait
+    // task, no velocity push and no anchor move). Every step is counted per puppet ("engine: cover puppet (R3 T3) id=..." every 10 s).
     bool TickPeerCover(Peer& pe, int id, const sync::Pose& pose, double nowMs)
     {
         const proto::PedState& ps = pose.ped;
-        const bool flag = (ps.flags & proto::kPfCover) != 0 && (ps.flags & proto::kPfRagdoll) == 0 && pe.seatedVeh < 0;
-        bool inCover = false;
-        float drift = 0.0f;
+        const sync::CoverSyncMode mode = (sync::CoverSyncMode)g_coverSyncMode.load(std::memory_order_relaxed);
+        pe.cover.SetMode(mode);
+        sync::CoverIn in;
+        in.flag = (ps.flags & proto::kPfCover) != 0 && (ps.flags & proto::kPfRagdoll) == 0 && (ps.flags & proto::kPfDead) == 0 && pe.seatedVeh < 0;
+        in.aiming = sync::AimWanted(ps.flags, ps.weapon);
+        in.poseSpeed = std::sqrt(pose.k.vx * pose.k.vx + pose.k.vy * pose.k.vy);
+        in.nowMs = nowMs;
+        float cx = 0, cy = 0, cz = 0;
+        if (pe.cover.NeedsPed(in.flag) && g_world->GetEntityCoords(pe.ped, cx, cy, cz))
+        {
+            in.pedReadable = true;
+            const float dx = cx - pose.k.x, dy = cy - pose.k.y, dz = cz - pose.k.z;
+            in.distM = std::sqrt(dx * dx + dy * dy + dz * dz);
+            in.headingErrDeg = sync::CoverHeadingErrDeg(g_world->GetEntityHeading(pe.ped), Heading360(pose.k.heading));
+            const float mx = cx - pe.coverIssuePos[0], my = cy - pe.coverIssuePos[1], mz = cz - pe.coverIssuePos[2];
+            in.movedM = std::sqrt(mx * mx + my * my + mz * mz);
+        }
         if (pe.cover.Busy())
         {
-            inCover = g_world->IsPedInCover(pe.ped, false);
-            float cx = 0, cy = 0, cz = 0;
-            if (g_world->GetEntityCoords(pe.ped, cx, cy, cz))
-                drift = std::sqrt((cx - pose.k.x) * (cx - pose.k.x) + (cy - pose.k.y) * (cy - pose.k.y));
+            in.pedInCover = g_world->IsPedInCover(pe.ped, false);
+            in.pedGoingInto = g_world->IsPedGoingIntoCover(pe.ped);
         }
-        const sync::CoverWindow::Phase before = pe.cover.CurrentPhase();
-        const sync::CoverWindow::Out cv = pe.cover.Update(flag, inCover, drift, nowMs);
-        if (before == sync::CoverWindow::Phase::Pending && pe.cover.CurrentPhase() == sync::CoverWindow::Phase::Held)
+        const sync::CoverStats before = pe.cover.Stats();
+        sync::CoverOut cv = pe.cover.Update(in, &g_coverBreaker);
+        static int coverLogged = 0;
+        if (cv.accepted)
         {
             ++g_v4.coverStarted;
-            PeerLog(false, "engine: remote peer id=%d (%s) is in cover (IS_PED_IN_COVER)", id, pe.name.c_str());
+            if (coverLogged < 24)
+            {
+                ++coverLogged;
+                PeerLog(false, "engine: cover id=%d (%s): IS_PED_IN_COVER confirmed %.0f ms after the task (puppet %.2f m from the sender's pose, moved %.2f m "
+                        "by the game, heading off %.0f deg)", id, pe.name.c_str(), nowMs - pe.coverIssueMs, in.distM, in.movedM, in.headingErrDeg);
+            }
         }
-        bool failed = cv.failed;
         if (cv.issue)
         {
             ++g_v4.coverIssued;
-            PrePlacePeer(pe, pose);
             pe.aimTask = false;
-            const bool called = g_world->TaskPutPedDirectlyIntoCover(pe.ped, pose.k.x, pose.k.y, pose.k.z, -1, false, 0.0f, false,
-                                                                     false, -1, false);
+            if (cv.nudge)
+            {
+                // At most 0.30 m (the window gates on it): the puppet is put exactly on the pose so the cover point is searched where the sender is.
+                g_world->SetEntityCoordsNoOffset(pe.ped, pose.k.x, pose.k.y, pose.k.z);
+                if (in.headingErrDeg > sync::kPrePlaceHeadingDeg)
+                    g_world->SetEntityHeading(pe.ped, Heading360(pose.k.heading));
+                cx = pose.k.x; cy = pose.k.y; cz = pose.k.z;
+            }
+            pe.coverIssuePos[0] = cx; pe.coverIssuePos[1] = cy; pe.coverIssuePos[2] = cz;
+            pe.coverIssueMs = nowMs;
+            const bool called = g_world->TaskPutPedDirectlyIntoCover(pe.ped, pose.k.x, pose.k.y, pose.k.z, -1, false, 0.0f, false, false, -1, false);
             if (!called)
             {
-                pe.cover.NoteIssueFailed();
-                failed = true;
+                const sync::CoverOut f = pe.cover.NoteIssueFailed(nowMs, &g_coverBreaker);
+                cv.why = f.why;
+                cv.suspend = false;
             }
-            static int coverLogged = 0;
-            if (coverLogged < 8)
+            if (coverLogged < 24)
             {
                 ++coverLogged;
-                PeerLog(!called, "engine: remote peer id=%d (%s) takes cover (flags 0x%x): TASK_PUT_PED_DIRECTLY_INTO_COVER at "
-                        "%.2f %.2f %.2f %s", id, pe.name.c_str(), (unsigned)ps.flags, pose.k.x, pose.k.y, pose.k.z,
-                        called ? "issued; the puppet is checked with IS_PED_IN_COVER" : "could not be called");
+                PeerLog(!called, "engine: cover id=%d (%s): sender in cover (flags 0x%x, pose speed %.2f m/s), puppet %.2f m from the pose%s: "
+                        "TASK_PUT_PED_DIRECTLY_INTO_COVER at %.2f %.2f %.2f %s", id, pe.name.c_str(), (unsigned)ps.flags, (double)in.poseSpeed, in.distM,
+                        cv.nudge ? " (put exactly on it first)" : "", pose.k.x, pose.k.y, pose.k.z,
+                        called ? "issued once; checked with IS_PED_IN_COVER within 400 ms" : "could not be called");
             }
         }
-        if (failed)
+        if (cv.stay)
+        {
+            g_world->TaskStayInCover(pe.ped);
+            if (coverLogged < 24)
+            {
+                ++coverLogged;
+                PeerLog(true, "engine: cover id=%d (%s): out of cover while the sender is in it for 350 ms: TASK_STAY_IN_COVER once", id, pe.name.c_str());
+            }
+        }
+        if (cv.why != sync::CoverWhy::None)
         {
             ++g_v4.coverFailed;
-            ClearPedTasksNow(pe.ped);                  // no half-run task: the controller keeps the ped on the sender's pose
-            pe.aimTask = false;
-            LocoReset(pe, kSiteCoverFail);
-            static int failLogged = 0;
-            if (failLogged < 8)
+            if (coverLogged < 24)
             {
-                ++failLogged;
-                PeerLog(true, "engine: remote peer id=%d (%s): not in cover 700 ms after TASK_PUT_PED_DIRECTLY_INTO_COVER (no cover "
-                        "point at the pose?): the puppet stands on the pose until the flag falls", id, pe.name.c_str());
+                ++coverLogged;
+                PeerLog(true, "engine: cover id=%d (%s): FALLBACK to the crouch pose on the sender's position (%s): puppet %.2f m from the pose, moved %.2f m "
+                        "by the game, heading off %.0f deg, IS_PED_IN_COVER %d IS_PED_GOING_INTO_COVER %d, %s", id, pe.name.c_str(), sync::CoverWhyName(cv.why),
+                        in.distM, in.movedM, in.headingErrDeg, (int)in.pedInCover, (int)in.pedGoingInto, cv.clear ? "task cleared once" : "no task was on the ped");
             }
         }
-        if (cv.ended)
+        if (cv.clear)
         {
-            ++g_v4.coverEnded;
+            if (cv.ended)
+                ++g_v4.coverEnded;
             if (pe.seatedVeh < 0)
-                ClearPedTasksNow(pe.ped);              // out of cover: the controller re-issues its gait
+                ClearPedTasksNow(pe.ped);              // once: the controller re-issues its gait and keeps the ped on the pose
             pe.aimTask = false;
-            LocoReset(pe, kSiteCoverExit);
+            LocoReset(pe, cv.why != sync::CoverWhy::None ? kSiteCoverFail : kSiteCoverExit);
         }
+        (void)before;
         return cv.suspend;
     }
 
@@ -4877,7 +4936,13 @@ namespace {
     bool TickPeerTierB(Peer& pe, int id, const sync::Pose& pose, double nowMs)
     {
         const proto::PedState& ps = pose.ped;
-        const sync::PedEdges e = pe.edges.Update({ ps.flags, ps.move, ps.vehId });
+        // R3 T3: the sender's crouch hint in cover (kPfStealth set with kPfCover) is the POSE fallback's crouch; while the cover task path owns the
+        // hold (not the fallback) the stealth edge is not applied over a cover task. It is applied the moment the window falls back to the pose.
+        uint16_t edgeFlags = ps.flags;
+        if ((ps.flags & proto::kPfCover) && (sync::CoverSyncMode)g_coverSyncMode.load(std::memory_order_relaxed) == sync::CoverSyncMode::Task &&
+            pe.cover.CurrentPhase() != sync::CoverPhase::Pose)
+            edgeFlags = (uint16_t)(edgeFlags & ~proto::kPfStealth);
+        const sync::PedEdges e = pe.edges.Update({ edgeFlags, ps.move, ps.vehId });
         const int32_t ped = pe.ped;
         if (e.reloadStart && pe.seatedVeh < 0)
         {
@@ -5869,6 +5934,14 @@ namespace {
                         }
                         report.emplace_back(LocoLine(it->first, pe));   // W8: why the controller issued tasks, what was last applied
                         report.emplace_back(LocoSlideLine(it->first, pe));   // Sync A: the slide metric
+                    }
+                    {
+                        // R3 T3: one cover line per puppet with cover activity in the last 10 s (the window is taken either way)
+                        const sync::CoverStats cw = pe.cover.TakeWindow();
+                        const std::string cl = sync::CoverPuppetLine(it->first, pe.name, pe.cover.Mode(), pe.cover.CurrentPhase(), pe.cover.LastWhy(), cw,
+                                                                     pe.cover.Stats());
+                        if (!cl.empty())
+                            report.emplace_back(cl);
                     }
                     pe.slide.Reset();
                     pe.shootingFrames = 0;
@@ -8935,12 +9008,21 @@ namespace {
                   c.climbFallbacks - last.climbFallbacks,
                   g_fallbackStates.load(std::memory_order_relaxed) - lastFallbackStates);
             lastFallbackStates = g_fallbackStates.load(std::memory_order_relaxed);
+            // R3 T3: the sender's own cover reads of the last 10 s (always in the 0d line, in full when any read was true)
+            const sync::CoverSenderStats sndCover = g_coverSense.Take();
+            const std::string sndLine = sync::CoverSenderLine((int)join::MyId(), sndCover);
             GLOGI("engine: vault / cover (0d), last 10 s: TASK_CLIMB issued %u, started %u (the puppet really climbed / vaulted), "
                   "placement fallbacks %u; puppet put on the sender's pose before a task: nudged %u, set outright %u; cover: "
-                  "task issued %u, started %u (IS_PED_IN_COVER), never started (fallback: stands on the pose) %u, ended %u",
+                  "task issued %u, started %u (IS_PED_IN_COVER), fell back to the crouch pose on the sender's position %u, ended %u (R3 T3: cover_sync=%s; the "
+                  "SENDER side, ours: IS_PED_IN_COVER true %u, IS_PED_GOING_INTO_COVER true %u, IS_PED_AIMING_FROM_COVER true %u of %u reads, kPfCover sent on %u; "
+                  "the breaker opened %u times)",
                   c.climbTasks - last.climbTasks, c.climbStarted - last.climbStarted, c.climbFallbacks - last.climbFallbacks,
                   c.prePlaceNudged - last.prePlaceNudged, c.prePlaceSet - last.prePlaceSet, c.coverIssued - last.coverIssued,
-                  c.coverStarted - last.coverStarted, c.coverFailed - last.coverFailed, c.coverEnded - last.coverEnded);
+                  c.coverStarted - last.coverStarted, c.coverFailed - last.coverFailed, c.coverEnded - last.coverEnded,
+                  sync::CoverSyncName((sync::CoverSyncMode)g_coverSyncMode.load()), sndCover.inReads, sndCover.goingReads, sndCover.aimingReads, sndCover.samples,
+                  sndCover.sentCover, g_coverBreaker.Opens());
+            if (!sndLine.empty())
+                GLOGI("%s", sndLine.c_str());
             GLOGI("engine: anims: last 10 s: %u emote events in, %u started, %u dictionary timeouts, %u ended "
                   "not-playing, %u missing dictionaries; ours %s",
                   emotes - lastEmotes, c.emotesStarted - last.emotesStarted, c.emoteDictTimeouts - last.emoteDictTimeouts,
@@ -9055,8 +9137,26 @@ namespace {
             if (g_world->IsPedPerformingMeleeAction(lp))       s.flags |= proto::kPfMelee;
             if (g_world->IsPedReloading(lp))                   s.flags |= proto::kPfReloading;
             if (g_world->GetPedStealthMovement(lp))            s.flags |= proto::kPfStealth;
-            if (g_world->IsPedInCover(lp, false))              s.flags |= proto::kPfCover;
+            // R3 T3: cover, classified (libs/sync/cover.h CoverSense): IS_PED_IN_COVER / IS_PED_GOING_INTO_COVER / IS_PED_AIMING_FROM_COVER.
+            // kPfCover for in-cover and aiming-from-cover (and a 150 ms hold over a read gap); going-into sends nothing (the ped is still running
+            // to the cover: the others keep following its pose). A low head in cover is the crouch hint, sent as kPfStealth ("crouched").
+            sync::CoverReads cr;
+            cr.inCover = g_world->IsPedInCover(lp, false);
+            cr.goingInto = g_world->IsPedGoingIntoCover(lp);
+            cr.aimingFrom = g_world->IsPedAimingFromCover(lp);
+            cr.x = px; cr.y = py; cr.z = pz; cr.heading = heading;
+            if (cr.inCover || cr.aimingFrom)
+            {
+                float hx = 0, hy = 0, hz = 0;
+                if (g_world->GetPedBoneCoords(lp, 31086, 0.0f, 0.0f, 0.0f, hx, hy, hz) && std::isfinite(hz))   // SKEL_Head
+                    cr.headAboveM = hz - pz;
+            }
+            const sync::CoverSenderOut co = g_coverSense.Update(cr, nowMs);
+            if (co.sendCover)                                  s.flags |= proto::kPfCover;
+            if (co.sendCrouch)                                 s.flags |= proto::kPfStealth;
         }
+        else if (g_coverSense.Up())
+            g_coverSense.Update(sync::CoverReads(), nowMs);    // got into a vehicle: the hold ends
         // Entering (move 5) / exiting (move 6) a NETWORKED car, with its server id, so the others can play the
         // door walk instead of seeing the ped appear in the seat. Not while seated (move 4 stands).
         {
