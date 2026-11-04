@@ -2,7 +2,7 @@
 # Build, test and roll out gage-server on the VPS (native Linux build, systemd unit gage-server).
 #
 #   deploy-server.sh [--dry-run] [--build-only] [--wait SECONDS] [--allow-players] [--no-announce]
-#                    [--no-auto-rollback] [--jobs N]
+#                    [--no-auto-rollback] [--jobs N] [--skip-tests]
 #   deploy-server.sh --activate <stamp|previous> [--allow-players] [--wait S] ...   switch to a staged release
 #   deploy-server.sh --rollback                      same as --activate previous
 #   deploy-server.sh --status                        what runs now, which releases exist
@@ -31,7 +31,7 @@ SCRIPT_NAME=deploy-server
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; }
 
-BUILD_ONLY=0; ACTIVATE=''; STATUS=0; WAIT=30; ALLOW_PLAYERS=0; ANNOUNCE=1; AUTO_ROLLBACK=1; JOBS=''
+BUILD_ONLY=0; ACTIVATE=''; STATUS=0; WAIT=30; ALLOW_PLAYERS=0; ANNOUNCE=1; AUTO_ROLLBACK=1; JOBS=''; SKIP_TESTS=0
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) DRY_RUN=1; shift ;;
@@ -43,6 +43,7 @@ while [ $# -gt 0 ]; do
     --allow-players) ALLOW_PLAYERS=1; shift ;;
     --no-announce) ANNOUNCE=0; shift ;;
     --no-auto-rollback) AUTO_ROLLBACK=0; shift ;;
+    --skip-tests) SKIP_TESTS=1; shift ;;
     --jobs) [ $# -ge 2 ] && is_uint "$2" && [ "$2" -ge 1 ] || usage_die "--jobs needs a positive number"; JOBS=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage_die "unknown argument $1" ;;
@@ -289,7 +290,9 @@ done
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/gage-deploy-server.XXXXXX")
 defer "rm -rf -- $(printf '%q' "$SCRATCH")"
 tests_run=0
+[ "$SKIP_TESTS" = 0 ] || warn "--skip-tests: netcode_test and server_test are NOT run on this build (they are still compiled; the canary below still runs)"
 for t in netcode_test server_test; do
+  [ "$SKIP_TESTS" = 0 ] || continue
   log "running $t (timeout 900 s)"
   set +e
   ( cd "$SCRATCH" && timeout -k 10 900 "$BUILD/selftest/$t" ) < /dev/null > "$LOGDIR/$STAMP-$t.log" 2>&1
@@ -302,7 +305,7 @@ for t in netcode_test server_test; do
   tests_run=$((tests_run + 1))
   grep -iE 'passed|skipped' "$LOGDIR/$STAMP-$t.log" | tail -n 3 || true
 done
-[ "$tests_run" -eq 2 ] || die "expected to run 2 tests, ran $tests_run"
+[ "$SKIP_TESTS" = 1 ] || [ "$tests_run" -eq 2 ] || die "expected to run 2 tests, ran $tests_run"
 
 # canary: does the NEW binary accept the PRODUCTION config? (an unknown key is a fatal error at start)
 CANARY_PORT=$(ops_js free-udp-port)
@@ -334,7 +337,7 @@ install -m 755 "$BIN" "$NEW_REL/gage-server"
   echo "compiler: $(g++ --version | head -n 1)"
   echo "cmake:   $(cmake --version | head -n 1)"
   echo "source:  $GAGE_SRC fingerprint $( (cd "$GAGE_SRC" && LC_ALL=C find apps/server libs cmake third_party/enet -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum) | cut -c1-16 )"
-  echo "tests:   netcode_test, server_test passed; canary ok"
+  if [ "$SKIP_TESTS" = 1 ]; then echo "tests:   SKIPPED (--skip-tests); canary ok"; else echo "tests:   netcode_test, server_test passed; canary ok"; fi
 } > "$NEW_REL/BUILD-INFO"
 log "staged $NEW_REL ($(file_size "$NEW_REL/gage-server") bytes, sha256 $(sha256_of "$NEW_REL/gage-server"))"
 # Machine-readable (tools/deploy/release.sh reads it): the stamp of the release that was just staged, on its own line.

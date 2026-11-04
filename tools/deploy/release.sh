@@ -2,7 +2,7 @@
 # Release the client AND the game server together, so they always move in lockstep and players are forced onto the
 # matching launcher as fast as possible. Run on the VPS as root from the source tree (/opt/gage/src).
 #
-#   release.sh <version> --notes TEXT [--countdown SECONDS] [--jobs N] [--dry-run]
+#   release.sh <version> --notes TEXT [--countdown SECONDS] [--jobs N] [--skip-tests] [--dry-run]
 #
 #   <version>        x.y.z. Must equal kClientVersion in apps/launcher/gage_gui.cpp (refused otherwise).
 #   --notes TEXT     release notes the launcher shows (max 2000 characters). Required.
@@ -11,6 +11,10 @@
 #                    10 s (the marks that fit), then the server restarts. 0 = restart at once. No players online =
 #                    no countdown.
 #   --jobs N         parallel compile jobs for both builds.
+#   --skip-tests     quick release: build-client.sh runs with --tests off and deploy-server.sh with --skip-tests (the
+#                    selftests are NOT run on the VPS; everything is still built and the canary still runs). Only for a
+#                    commit whose tests were already run elsewhere. Printed loudly; the run then also prints
+#                    `RELEASE_TESTS=skipped`. Off by default.
 #   --dry-run        run every sub-script's own --dry-run, print the rest of the plan, change nothing. Exit 1 if a real
 #                    run would stop.
 #
@@ -43,13 +47,14 @@ SCRIPT_NAME=release
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; }
 
-VERSION=''; NOTES=''; NOTES_SET=0; COUNTDOWN=60; JOBS=''
+VERSION=''; NOTES=''; NOTES_SET=0; COUNTDOWN=60; JOBS=''; SKIP_TESTS=0
 while [ $# -gt 0 ]; do
   case $1 in
     --notes) [ $# -ge 2 ] || usage_die "--notes needs a value"; NOTES=$2; NOTES_SET=1; shift 2 ;;
     --countdown) [ $# -ge 2 ] && is_uint "$2" && [ "$2" -le 600 ] || usage_die "--countdown needs seconds (0..600)"; COUNTDOWN=$2; shift 2 ;;
     --jobs) [ $# -ge 2 ] && is_uint "$2" && [ "$2" -ge 1 ] || usage_die "--jobs needs a positive number"; JOBS=$2; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --skip-tests) SKIP_TESTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) usage_die "unknown option $1" ;;
     *) [ -z "$VERSION" ] || usage_die "more than one version given"; VERSION=$1; shift ;;
@@ -170,13 +175,16 @@ stop_or_note() {
 # ---- 1 build the client --------------------------------------------------------------------------------------------
 BC=("$BUILD_SH")
 [ -z "$JOBS" ] || BC+=(--jobs "$JOBS")
+[ "$SKIP_TESTS" = 0 ] || BC+=(--tests off)
 [ "$DRY_RUN" = 0 ] || BC+=(--dry-run)
+[ "$SKIP_TESTS" = 0 ] || warn "--skip-tests: NO selftest is run on this release (client: --tests off; server: --skip-tests). Run them elsewhere on this commit."
 rc=0; run_step build-client "${BC[@]}" || rc=$?
 [ "$rc" -eq 0 ] || stop_or_note build-client "$rc" "nothing live changed. Fix the build and run release.sh again."
 
 # ---- 2 build, test and stage the server (no live change) ---------------------------------------------------------------
 SS=("$SERVER_SH" --build-only)
 [ -z "$JOBS" ] || SS+=(--jobs "$JOBS")
+[ "$SKIP_TESTS" = 0 ] || SS+=(--skip-tests)
 [ "$DRY_RUN" = 0 ] || SS+=(--dry-run)
 before=''
 [ "$DRY_RUN" = 1 ] || before=$(find -H "$REL" -mindepth 1 -maxdepth 1 -type d -name '2*Z' -printf '%f\n' 2>/dev/null | sort || true)
@@ -327,4 +335,5 @@ fi
 now_players=${last#*\"players\":}; now_players=${now_players%%,*}
 log "verified: the live server reports protocol $got (players: $now_players)"
 log "release $VERSION is live: client published (mandatory), server release $STAMP active"
+[ "$SKIP_TESTS" = 0 ] || printf 'RELEASE_TESTS=skipped\n'
 printf 'RELEASE_RESULT=ok version=%s stamp=%s protocol=%s\n' "$VERSION" "$STAMP" "$got"
