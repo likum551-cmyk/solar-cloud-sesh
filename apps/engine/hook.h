@@ -1043,6 +1043,11 @@ namespace gage::game {
                                              bool allowPeekingAndFiring, float blendInDuration,
                                              bool forceInitialFacingDirection, bool forceFaceLeft,
                                              int identifier, bool doEntry);
+        // R3 T3 (cover): IS_PED_GOING_INTO_COVER (the transition into cover), IS_PED_AIMING_FROM_COVER, TASK_STAY_IN_COVER (hold the cover
+        // the ped is in). All three false / false / false when the native cannot be called.
+        bool     IsPedGoingIntoCover(int32_t ped);
+        bool     IsPedAimingFromCover(int32_t ped);
+        bool     TaskStayInCover(int32_t ped);
         bool     IsPedPerformingMeleeAction(int32_t ped);            // IS_PED_PERFORMING_MELEE_ACTION
         // 0..10 (alloc8or); the native has to be called again every frame to hold.
         bool     SetPedMoveRateOverride(int32_t ped, float value);

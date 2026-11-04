@@ -5356,6 +5356,21 @@ bool World::TaskPutPedDirectlyIntoCover(int32_t ped, float x, float y, float z, 
     return CallNative(native::TASK_PUT_PED_DIRECTLY_INTO_COVER, args, 11, nullptr);
 }
 
+// R3 T3 (cover).
+bool World::IsPedGoingIntoCover(int32_t ped) {
+    return callPedBool(*this, native::IS_PED_GOING_INTO_COVER, ped);
+}
+
+bool World::IsPedAimingFromCover(int32_t ped) {
+    return callPedBool(*this, native::IS_PED_AIMING_FROM_COVER, ped);
+}
+
+bool World::TaskStayInCover(int32_t ped) {
+    if (!ped) return false;
+    uint64_t args[] = { entArg(ped) };
+    return CallNative(native::TASK_STAY_IN_COVER, args, 1, nullptr);
+}
+
 bool World::IsPedPerformingMeleeAction(int32_t ped) {
     return callPedBool(*this, native::IS_PED_PERFORMING_MELEE_ACTION, ped);
 }
