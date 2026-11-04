@@ -34,6 +34,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 namespace gage::server::melee {
@@ -80,6 +82,19 @@ namespace gage::server::melee {
         }
         bool Empty() const { return n_ == 0; }
         size_t Size() const { return n_; }
+        // R4 T3: how far `ms` is from the nearest stored sample (ms): 0 inside a dense run, large when the pose at `ms` was
+        // extrapolated from an old sample (a stalled or alt-tabbed player). -1 when empty. The per-swing log line prints it.
+        double GapMs(double ms) const
+        {
+            if (!n_) return -1.0;
+            double best = 1e18;
+            for (size_t i = 0; i < n_; ++i)
+            {
+                const double d = std::fabs(At_(i).ms - ms);
+                if (d < best) best = d;
+            }
+            return best;
+        }
         double NewestMs() const { return n_ ? At_(n_ - 1).ms : 0.0; }
         // The pose at `ms`: interpolated between the two samples around it, the nearest one when they are further
         // apart than kTrackGapMs, the oldest / newest outside the stored range. False when empty.
@@ -191,6 +206,15 @@ namespace gage::server::melee {
         float distM = -1;              // to the chosen target, or to the nearest living one on foot when none was chosen (-1: nobody near)
         float angleDeg = -1;           // the same player's angle off the attacker's heading
         float reachM = 0;              // the reach that applied (with the slack)
+        // R4 T3: the data a miss needs to explain itself (the per-swing log line). All filled by Adjudicate.
+        uint16_t nearestId = proto::kNoPlayer;   // the nearest living player on foot (the one distM / angleDeg describe), whatever the reach
+        float nearestDz = 0;           // its vertical separation from the attacker
+        double attackerGapMs = -1;     // the attacker's pose at the blow came from a sample this far from the blow time (-1: no pose)
+        double targetGapMs = -1;       // the same for the nearest player's pose at blow - render delay
+        float attackerX = 0, attackerY = 0, attackerHeading = 0;
+        float nearestX = 0, nearestY = 0;
+        uint32_t considered = 0;       // candidates with a track
+        uint32_t verticalOut = 0;      // ... of which further than kMaxDz above or below the attacker (another floor)
     };
 
     // Which player a blow at `blowMs` hit. `attacker` must hold samples; a candidate without any is skipped.
@@ -203,6 +227,8 @@ namespace gage::server::melee {
         v.reachM = rules.reachM + kSlackM;
         if (!attacker.At(blowMs, a))
             return v;
+        v.attackerGapMs = attacker.GapMs(blowMs);
+        v.attackerX = a.x; v.attackerY = a.y; v.attackerHeading = a.heading;
         if (a.inVehicle)
         {
             v.outcome = Outcome::AttackerOut;
@@ -218,10 +244,14 @@ namespace gage::server::melee {
             Sample t;
             if (!c.track || !c.track->At(blowMs - renderDelayMs, t))
                 continue;
+            ++v.considered;
             const float dx = t.x - a.x, dy = t.y - a.y, dz = t.z - a.z;
             const float d = std::sqrt(dx * dx + dy * dy);
             if (std::fabs(dz) > kMaxDz)
+            {
+                ++v.verticalOut;
                 continue;
+            }
             float angle = 0.0f;
             if (d > 1e-3f)
             {
@@ -233,6 +263,10 @@ namespace gage::server::melee {
             {
                 nearestM = d;
                 nearestAngle = angle;
+                v.nearestId = c.id;
+                v.nearestDz = dz;
+                v.nearestX = t.x; v.nearestY = t.y;
+                v.targetGapMs = c.track->GapMs(blowMs - renderDelayMs);
             }
             if (d > v.reachM)
                 continue;
@@ -283,6 +317,7 @@ namespace gage::server::melee {
             uint8_t seq = 0;
             double pressMs = 0;
             uint32_t weapon = 0;
+            bool byTimer = false;      // R4 T3: judged because the clock passed the blow time, not because the attacker's samples reached it
         };
         struct Result
         {
@@ -359,6 +394,7 @@ namespace gage::server::melee {
             if (attackerNewestMs < blow && nowMs < blow + kStrikeLateMs)
                 return false;
             out = p;
+            out.byTimer = attackerNewestMs < blow;
             for (size_t i = 1; i < nPending_; ++i)
                 pending_[i - 1] = pending_[i];
             --nPending_;
@@ -419,6 +455,79 @@ namespace gage::server::melee {
         if (r->outcome == Outcome::Hit)
             return r->target == (int32_t)target ? ClaimKind::Confirms : ClaimKind::OtherTarget;
         return ClaimKind::Contradicts;
+    }
+
+    // ---- the per-swing log line (R4 T3) --------------------------------------------------------------------------------------
+    //
+    // Live 0.4.9: GI swung 11 times, the server confirmed 0 blows, and the log could not say why (only hits and misses within 3 m were
+    // logged, 40 lines in all). One line per judged swing now, with the reason and the numbers the reason rests on: distance, angle, the
+    // target id, the time window (how late the swing was judged and from how far a sample each pose was taken) and how many players were
+    // left out before the judgement (no state, beyond the 8 m pre-filter, not relevant). The first part keeps the R3 wording
+    // ("judged hit on id N: nearest living player on foot X m (reach R m), A degrees off the heading"): the tests and the tuning notes grep it.
+    struct SwingLogCtx
+    {
+        const char* name = "";
+        uint8_t seq = 0;
+        uint32_t weapon = 0;
+        double pressMs = 0, nowMs = 0;
+        bool byTimer = false;                 // judged by the clock (+90 ms after the blow time), not by the attacker's samples
+        const char* attackerWhy = "";         // for AttackerOut: dead / untrusted / ragdoll ... / in a vehicle
+        uint32_t others = 0, noState = 0, beyondPrefilter = 0, notRelevant = 0;   // the other players and why they were not candidates
+        uint16_t nearestAnyId = proto::kNoPlayer;   // the nearest other player by current position, even one the pre-filter dropped
+        float nearestAnyM = -1;
+    };
+    inline std::string FormatSwingLine(const SwingLogCtx& c, const Verdict& v)
+    {
+        char buf[1100], w[12];
+        std::snprintf(w, sizeof w, "%08X", (unsigned)c.weapon);
+        std::string line = std::string("melee: ") + c.name + " swing (shotSeq " + std::to_string((int)c.seq) + ", weapon 0x" + w + ") judged " + OutcomeName(v.outcome) +
+                           (v.target != proto::kNoPlayer && v.outcome == Outcome::Hit ? " on id " + std::to_string(v.target) : std::string());
+        if (v.distM < 0.0f)
+            std::snprintf(buf, sizeof buf, ": no living player on foot with a pose (reach %.2f m)", (double)v.reachM);
+        else
+            std::snprintf(buf, sizeof buf, ": nearest living player on foot %.2f m (reach %.2f m), %.1f degrees off the heading", (double)v.distM, (double)v.reachM, (double)v.angleDeg);
+        line += buf;
+        // why
+        switch (v.outcome)
+        {
+        case Outcome::Hit:
+            std::snprintf(buf, sizeof buf, "; why: id %u inside the reach and the cone", (unsigned)v.target);
+            break;
+        case Outcome::NoTarget:
+            if (v.nearestId != proto::kNoPlayer)
+                std::snprintf(buf, sizeof buf, "; why: id %u is the nearest and stands %.2f m away, %.2f m beyond the reach (dz %.1f)", (unsigned)v.nearestId,
+                              (double)v.distM, (double)(v.distM - v.reachM), (double)v.nearestDz);
+            else
+                std::snprintf(buf, sizeof buf, "; why: no living player on foot had a pose to judge against (considered %u of %u others: no state %u, beyond 8 m %u, "
+                              "not relevant %u, another floor %u)", v.considered, c.others, c.noState, c.beyondPrefilter, c.notRelevant, v.verticalOut);
+            break;
+        case Outcome::Behind:
+            std::snprintf(buf, sizeof buf, "; why: id %u at %.2f m is %.1f degrees off the heading, outside the facing cone", (unsigned)v.nearestId, (double)v.distM, (double)v.angleDeg);
+            break;
+        case Outcome::TargetDead:        std::snprintf(buf, sizeof buf, "; why: only a dead player was within the reach"); break;
+        case Outcome::TargetInVehicle:   std::snprintf(buf, sizeof buf, "; why: only a player in a vehicle was within the reach"); break;
+        case Outcome::AttackerOut:       std::snprintf(buf, sizeof buf, "; why: the attacker is out (%s)", c.attackerWhy); break;
+        case Outcome::Budget:            std::snprintf(buf, sizeof buf, "; why: the hit rate or the damage budget refused an otherwise valid hit"); break;
+        case Outcome::ClaimedFirst:      std::snprintf(buf, sizeof buf, "; why: a client-reported Hit already paid for this swing"); break;
+        default:                         buf[0] = 0; break;
+        }
+        line += buf;
+        // the time window and the geometry
+        std::snprintf(buf, sizeof buf,
+                      "; timing: judged %.0f ms after the blow time (press + %.0f ms), %s; attacker pose from a sample %.0f ms off the blow, target pose (blow - %.0f ms) from a sample %.0f ms off; "
+                      "attacker at %.1f, %.1f heading %.0f%s",
+                      c.nowMs - (c.pressMs + kStrikeDelayMs), kStrikeDelayMs, c.byTimer ? "by the clock (the attacker's samples had not reached it)" : "by the attacker's samples",
+                      v.attackerGapMs, kRenderDelayMs, v.targetGapMs, (double)v.attackerX, (double)v.attackerY, (double)v.attackerHeading,
+                      v.nearestId != proto::kNoPlayer ? "" : "; ");
+        line += buf;
+        if (v.nearestId != proto::kNoPlayer)
+        {
+            std::snprintf(buf, sizeof buf, ", id %u at %.1f, %.1f; ", (unsigned)v.nearestId, (double)v.nearestX, (double)v.nearestY);
+            line += buf;
+        }
+        std::snprintf(buf, sizeof buf, "%u other players, nearest by position id %d at %.2f m", c.others, c.nearestAnyId == proto::kNoPlayer ? -1 : (int)c.nearestAnyId, (double)c.nearestAnyM);
+        line += buf;
+        return line;
     }
 
 }

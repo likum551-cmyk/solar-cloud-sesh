@@ -300,6 +300,15 @@ namespace {
         uint32_t swingLocoMark = 0;      // the locomotion controller's task count at the issue: more later = a task replaced the swing
         double swingIssuedMs = 0;
         bool swingRetried = false;       // the one bounded re-issue was spent
+        // R4 T3: the swing in flight, for the progress check and the per-swing line
+        sync::SwingAttempt swingAttempt; // variant + duration it was issued with (the survey's attempt or the ladder's rung)
+        int swingPlanIdx = -1;           // the survey plan entry (-1: not a survey swing)
+        uint32_t swingNo = 0;            // this session's swing number
+        sync::SwingProbe::Result swingFirst = sync::SwingProbe::Result::Idle;   // what the first sighting said
+        bool swingSay = false;           // the overlay names this swing (survey / a /swing test)
+        bool swingResetPending = false;  // a full-body swing ran: pe.loco.Reset() when SwingProbe::Active() ends
+        float poseX = 0, poseY = 0, poseZ = 0;   // R4 T3: the pose DrivePeer was given this frame (where the owner really is), for the swing line
+        bool poseKnown = false;
         int swingLocalHp = 0;            // melee-task rung: the local player's health + armour at the issue (harm breaker)
         double swingMeleeUntilMs = 0;    // melee-task rung: when the puppet's melee task is ended again (0 = none running)
         sync::MeleeEventGate meleeEvents; // 0.4.5: the damage event of THIS puppet is cleared on the first frame of a swing window (stale ones)
@@ -607,6 +616,15 @@ namespace {
     std::atomic<int> g_meleeAnimWanted{(int)sync::SwingMode::Auto};
     sync::SwingLadder g_swingLadder;
     sync::SwingDiag g_swingDiag, g_swingDiagLast;
+    // R4 T3: melee_survey = N (default 1): the first N passes over the survey plan (libs/sync/swing.h SwingSurvey) issue each swing as the next
+    // attempt whatever was seen before, then the ladder is pinned to the attempt that PROGRESSED; 0 = off (the R3 ladder alone). melee_follow = 0
+    // turns the +100 / +250 / +450 ms progress check off (the 0e first-sighting probe alone). Both re-read at Welcome.
+    std::atomic<int> g_meleeSurveyWanted{1};
+    std::atomic<bool> g_meleeFollowWanted{true};
+    sync::SwingSurvey g_swingSurvey;
+    uint32_t g_swingNo = 0, g_ownSwingNo = 0;
+    int g_swingDurationMs = 400;                       // the duration of a non-survey swing (a survey winner may set it to the clip's length)
+    bool g_swingTestForce = false;                     // a /swing test: the overlay names the attempt
     double g_meleeTaskModUntilMs = 0;                  // the AI melee modifier is held at 0 until then (the melee-task rung), 0 = not held
     bool g_meleeTaskModSet = false;
     std::atomic<uint32_t> g_meleeConfirmCount{0}, g_meleeConfirmDamage{0}, g_meleeConfirmKills{0};
@@ -861,7 +879,7 @@ namespace {
     // path (SendChat) parses the line off the game thread and queues it; the script
     // tick drains and runs it, because the vehicle/weapon natives must run there.
     struct Command {
-        enum Kind { Heal, Kill, Tp, Car, Gun, Fix, Emote, Scenario, StopAnim } kind = Heal;
+        enum Kind { Heal, Kill, Tp, Car, Gun, Fix, Emote, Scenario, StopAnim, Swing } kind = Heal;
         float x = 0, y = 0, z = 0;    // /tp
         std::string arg;              // /car, /gun model/weapon name; /e dictionary; /scenario name
         std::string arg2;             // /e clip name
@@ -1466,6 +1484,13 @@ namespace {
                 const std::wstring ma = reg::Get(L"melee_anim");
                 g_meleeAnimWanted.store((int)(ma == L"play" ? sync::SwingMode::Play : ma == L"melee_task" ? sync::SwingMode::MeleeTask
                                                                                   : ma == L"off" ? sync::SwingMode::Off : sync::SwingMode::Auto));
+                // R4 T3: melee_survey (cycles over the survey plan, default 1, 0 = off) and melee_follow (0 = no progress check)
+                const std::wstring sv = reg::Get(L"melee_survey");
+                int cycles = 1;
+                if (!sv.empty() && sv[0] >= L'0' && sv[0] <= L'9')
+                    cycles = sv[0] - L'0';
+                g_meleeSurveyWanted.store(cycles > 3 ? 3 : cycles);
+                g_meleeFollowWanted.store(reg::Get(L"melee_follow") != L"0");
             }
             GLOGI("engine: combat client: hit reactions %s (a melee blow: a short stagger), muzzle flash %s, remote shots via %s "
                   "(hit_react / peer_muzzle / peer_shoot); AI weapon damage modifier 0.0 once the tick sets it, AI melee modifier %s "
@@ -2722,6 +2747,7 @@ namespace {
             c.arg = tok[1];
         }
         else if (verb == "stopanim") c.kind = Command::StopAnim;
+        else if (verb == "swing") c.kind = Command::Swing;     // R4 T3: a punch on the nearest other player's puppet, the next survey attempt (local only)
         else return false;  // unknown: let it go to the server as chat
 
         std::lock_guard<std::mutex> lk(g_cmdMtx);
@@ -2729,6 +2755,8 @@ namespace {
             g_cmdQueue.push_back(c);
         return true;
     }
+
+    void RunSwingTest(int32_t lp);   // R4 T3, defined with the swing display (PlayPeerSwing)
 
     // Run any queued commands and advance a pending vehicle spawn. Script tick only.
     // lp is the local ped, now is GetTickCount().
@@ -2793,6 +2821,9 @@ namespace {
                     ++g_animDiag.Of(sync::AnimKind::LocalEmote).restarted;
                 ++g_v4.emotesStarted;
                 GLOGI("engine: /scenario %s", c.arg.c_str());
+                break;
+            case Command::Swing:
+                RunSwingTest(lp);
                 break;
             case Command::StopAnim:
                 g_localEmote.Stop();
@@ -3415,6 +3446,18 @@ namespace {
         return ph >= 1 ? ph : 100;
     }
 
+    // R4 T3. A swing in flight whose ped is gone, dead or seated is nobody's to judge: the probe is cancelled (so SwingProbe::Active() cannot
+    // stay true and hold the locomotion controller off for good) and its survey entry is handed back as not evidence.
+    void AbandonPeerSwing(Peer& pe)
+    {
+        pe.swingProbe.Cancel();
+        if (pe.swingPlanIdx >= 0)
+        {
+            g_swingSurvey.OnResult((size_t)pe.swingPlanIdx, false, sync::SwingProbe::Progress::None, true);
+            pe.swingPlanIdx = -1;
+        }
+    }
+
     // A fresh remote ped: hit detection needs it damageable, so it is held at kPeerHpPool and
     // restored after every hit (ProbePeerHits). If the pool cannot be set (or read back) the ped
     // stays invincible and nothing is detected on it.
@@ -3442,7 +3485,7 @@ namespace {
         pe.enterVeh = -1;
         pe.enterTaskMs = 0;
         pe.emote.OnNewPed(NowMs());
-        pe.swingProbe.Cancel();                        // 0e: a swing issued on the old ped is nobody's to judge
+        AbandonPeerSwing(pe);                          // 0e: a swing issued on the old ped is nobody's to judge
         pe.swingPending.Clear();
         pe.audit.CancelAll();                          // T2: a one-shot asked of the old ped is nobody's to judge
         pe.water.Reset();                              // W8: a fresh ped has no water edge and no climb in progress
@@ -3729,16 +3772,78 @@ namespace {
         return true;
     }
 
+    // R4 T3. Whether the survey may issue its melee-task entry on this puppet: auto mode, the breaker closed, the puppet's own anchor ped exists
+    // (not in loco_mode=straight, the 0.4.9 default: the entry is then skipped and counted).
+    bool SurveyMeleeTaskOk(const Peer& pe)
+    {
+        return g_swingLadder.Mode() == sync::SwingMode::Auto && !g_swingLadder.MeleeTripped() && pe.anchor && g_world->EntityExists(pe.anchor);
+    }
+
+    // R4 T3. Once the survey plan is done and every attempt has reported: pin the ladder to the attempt whose swings PROGRESSED best and log the table.
+    void SurveyFinishCheck()
+    {
+        const int w = g_swingSurvey.TakeWinner();
+        if (w == -2)
+            return;
+        std::string tab;
+        for (size_t i = 0; i < sync::kSurveyPlan; ++i)
+        {
+            char t[200];
+            std::snprintf(t, sizeof(t), "%s[%s: issued %u, progressed %u, blended out / flicker / frozen %u, not seen %u]", tab.empty() ? "" : " ",
+                          sync::SurveyAttemptName(sync::SurveyPlanAt(i)).c_str(), g_swingSurvey.Issued(i), g_swingSurvey.Progressed(i),
+                          g_swingSurvey.Failed(i), g_swingSurvey.Unseen(i));
+            tab += t;
+        }
+        if (w >= 0)
+        {
+            const sync::SwingAttempt win = sync::SurveyPlanAt((size_t)w);
+            g_swingLadder.PinTo(win.variant);
+            g_swingDurationMs = win.durationMs;
+            char line[1600];
+            std::snprintf(line, sizeof(line), "engine: melee survey DONE (%u planned swings, %u entries skipped): the swing that PROGRESSED best is '%s'; the ladder is pinned there. %s",
+                          (unsigned)g_swingSurvey.Planned(), g_swingSurvey.Skipped(), sync::SurveyAttemptName(win).c_str(), tab.c_str());
+            g_peerLog.push_back({ false, line });
+        }
+        else
+        {
+            char line[1600];
+            std::snprintf(line, sizeof(line), "engine: melee survey DONE (%u planned swings, %u entries skipped): NO attempt was still playing at +100 / +250 ms (or none could be read): %s "
+                          "-- see the per-swing lines for what took it off the ped, and when", (unsigned)g_swingSurvey.Planned(), g_swingSurvey.Skipped(), tab.c_str());
+            g_peerLog.push_back({ true, line });
+        }
+    }
+
     // TASK_PLAY_ANIM of the swing (or the melee task); the probe follows it (PeerSwingService). `retry`: the one bounded re-issue after a
-    // locomotion task replaced it.
+    // locomotion task replaced it. R4 T3: while the survey is on, the attempt (variant + duration) is the survey's next plan entry, otherwise the
+    // ladder's rung with the current duration; the probe now FOLLOWS the swing (+100 / +250 / +450 ms) so SwingProbe::Active() covers the window.
     void IssuePeerSwing(Peer& pe, SwingSet& set, size_t idx, double nowMs, bool late, bool retry = false)
     {
         SwingClip& c = set.list[idx];
         sync::AnimKindStats& dk = g_animDiag.Of(sync::AnimKind::PeerSwing);
-        const sync::SwingVariant var = g_swingLadder.Current();
+        sync::SwingAttempt att;
+        size_t planIdx = (size_t)-1;
+        if (retry)
+            att = pe.swingAttempt;
+        else
+        {
+            if (pe.swingProbe.Active())
+                AbandonPeerSwing(pe);                  // the previous swing's follow was not over: it is overtaken (a survey entry of it is queued again)
+            att.variant = g_swingLadder.Current();
+            att.durationMs = g_swingDurationMs;
+            const sync::SwingMode sm = g_swingLadder.Mode();
+            if (g_swingSurvey.Active() && (sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play))
+            {
+                const sync::SwingAttempt sa = g_swingSurvey.Next(SurveyMeleeTaskOk(pe), &planIdx);
+                if (planIdx != (size_t)-1)
+                    att = sa;
+                else
+                    SurveyFinishCheck();               // only skipped entries were left: the survey is over
+            }
+        }
+        const sync::SwingVariant var = att.variant;
         const bool ok = var == sync::SwingVariant::MeleeTask
                             ? IssuePeerMeleeTask(pe, nowMs)
-                            : g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, kSwingMs, sync::SwingVariantFlags(var), 1.0f);
+                            : g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, att.durationMs, sync::SwingVariantFlags(var), 1.0f);
         if (ok)
         {
             ++g_v4.peerSwings;
@@ -3748,8 +3853,28 @@ namespace {
             if (retry)
                 ++g_swingDiag.retried;
             else
+            {
                 ++g_swingDiag.issued, ++g_swingDiag.variantIssued[(size_t)var];
-            pe.swingProbe.Begin(nowMs, idx);
+                pe.swingNo = ++g_swingNo;
+                pe.swingPlanIdx = planIdx != (size_t)-1 ? (int)planIdx : -1;
+                pe.swingFirst = sync::SwingProbe::Result::Idle;
+                pe.swingSay = pe.swingPlanIdx >= 0 || g_swingTestForce;
+                g_swingTestForce = false;
+                if (pe.swingPlanIdx >= 0)
+                    ++g_swingDiag.surveyed;
+                if (pe.swingSay)
+                {
+                    char say[200];
+                    std::snprintf(say, sizeof(say), "Swing test %u: %s", (unsigned)(pe.swingPlanIdx >= 0 ? g_swingSurvey.Step() : 0u),
+                                  sync::SurveyAttemptName(att).c_str());
+                    game::Overlay::PushSystemLine(say);
+                }
+            }
+            pe.swingAttempt = att;
+            // the window the locomotion controller stays away: the swing's duration (the melee task's own end, 150 ms past kSwingMs, for that rung)
+            pe.swingProbe.Begin(nowMs, idx, g_meleeFollowWanted.load(std::memory_order_relaxed), att.durationMs,
+                                var == sync::SwingVariant::MeleeTask ? kSwingMs + 200.0 : -1.0);
+            pe.swingResetPending = var == sync::SwingVariant::FullBody;   // a whole-body clip replaced the gait task: the controller re-issues it when the swing is over
             pe.swingProbeArmed = &set == &g_swingSetArmed;
             pe.swingVariant = var;
             pe.swingLocoMark = LocoTaskCount(pe);
@@ -3762,6 +3887,8 @@ namespace {
             ++g_v4.peerSwingFailed;
             ++dk.failed;
             ++g_swingDiag.notIssuedFailed;
+            if (planIdx != (size_t)-1)
+                g_swingSurvey.OnResult(planIdx, false, sync::SwingProbe::Progress::None, true);   // not issued: not evidence
         }
     }
 
@@ -3805,6 +3932,7 @@ namespace {
         SwingClip* c = SwingClipFor(weapon, nowMs, &set, &idx);
         if (!c && g_swingLadder.OnNoClips())
         {
+            g_swingSurvey.Start(0);                    // R4 T3: no clip exists, nothing to survey: the melee task is the only rung
             ++g_swingDiag.escalations;
             PeerLog(true, "engine: melee swing: none of the candidate clip dictionaries exists in this game: the ladder goes straight to the melee task "
                     "(melee_anim=%s)", sync::SwingModeName(g_swingLadder.Mode()));
@@ -3887,14 +4015,23 @@ namespace {
                     ++g_swingDiag.notIssuedDictLate;   // it waited 250 ms and the dictionary did not load
             }
         }
-        if (!pe.swingProbe.Active())
+        const bool swingActive = pe.swingProbe.Active();
+        if (pe.swingResetPending && !swingActive)
+        {
+            pe.swingResetPending = false;
+            pe.loco.Reset();                           // R4 T3: the whole-body clip took the gait task: re-issue it now that the swing is over
+        }
+        if (!swingActive)
             return;
         SwingSet& set = pe.swingProbeArmed ? g_swingSetArmed : g_swingSetUnarmed;
         const size_t ci = pe.swingProbe.Candidate();
         SwingClip& c = set.list[ci];
         const bool viaMelee = pe.swingVariant == sync::SwingVariant::MeleeTask;
         const int playing = viaMelee ? g_world->IsPedInMeleeCombat(pe.ped) : g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip);
-        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, playing);
+        float animCur = -1.0f, animTotal = -1.0f;
+        if (!viaMelee && playing == 1)
+            g_world->GetEntityAnimTimes(pe.ped, c.dict, c.clip, animCur, animTotal);   // neutral (-1) until GET_ENTITY_ANIM_CURRENT_TIME / _TOTAL_TIME exist
+        const sync::SwingProbe::Result r = pe.swingProbe.Tick(nowMs, playing, animCur, animTotal);
         if (r == sync::SwingProbe::Result::Pending)
         {
             // One bounded retry: a locomotion task was issued on the ped since the swing and the clip is not playing (yet): the task most
@@ -3906,23 +4043,117 @@ namespace {
             }
             return;
         }
-        if (r == sync::SwingProbe::Result::Idle)
+        if (r == sync::SwingProbe::Result::Idle || r == sync::SwingProbe::Result::Following)
             return;
-        if (r == sync::SwingProbe::Result::Shown)
+        // The ladder's reaction to a swing, once its outcome is final: a survey swing never moves it (the survey pins the winner); a swing seen
+        // AND progressed pins the variant; one not seen, or seen and blended out, counts as a miss and may move it up a rung.
+        const auto settleLadder = [&](bool good, bool busy, const char* howBad) {
+            if (pe.swingPlanIdx >= 0)
+                return;
+            if (good)
+            {
+                if (g_swingLadder.Mode() != sync::SwingMode::Off && pe.swingVariant == g_swingLadder.Current() && !g_swingLadder.Pinned())
+                    PeerLog(false, "engine: melee swing: variant '%s' is SEEN playing on peer id=%d (read-back%s): pinned", sync::SwingVariantName(pe.swingVariant), id,
+                            g_meleeFollowWanted.load() ? ", and still playing at +100 / +250 ms" : "");
+                g_swingLadder.OnResult(sync::SwingProbe::Result::Shown, false);
+                return;
+            }
+            const bool up = g_swingLadder.OnResult(sync::SwingProbe::Result::NotShown, busy);
+            if (up)
+            {
+                ++g_swingDiag.escalations;
+                PeerLog(true, "engine: melee swing: the swing was %s on peer id=%d: the ladder moves up to '%s' (melee_anim=%s)", howBad, id,
+                        sync::SwingVariantName(g_swingLadder.Current()), sync::SwingModeName(g_swingLadder.Mode()));
+            }
+        };
+        const auto surveyFinish = [&]() { SurveyFinishCheck(); };
+        // the per-swing line (the first 60 of a session, then one per 5 s)
+        const auto swingLine = [&](sync::SwingProbe::Result first, bool busy) {
+            static uint32_t lines = 0;
+            static double lastMs = -1e9;
+            if (lines >= 60 && nowMs - lastMs < 5000.0)
+                return;
+            ++lines;
+            lastMs = nowMs;
+            sync::SwingLineIn li;
+            li.peerId = id;
+            li.index = pe.swingNo;
+            li.surveyStep = pe.swingPlanIdx >= 0 ? (int)(g_swingSurvey.Step() > 0 ? g_swingSurvey.Step() - 1 : 0) : -1;
+            li.surveySteps = (int)g_swingSurvey.Planned();
+            li.variant = pe.swingVariant;
+            li.flags = sync::SwingVariantFlags(pe.swingVariant);
+            li.durationMs = pe.swingAttempt.durationMs;
+            li.dict = viaMelee ? "(melee task, no clip)" : c.dict;
+            li.clip = viaMelee ? "-" : c.clip;
+            li.startMs = pe.swingIssuedMs;
+            li.retried = pe.swingRetried;
+            li.locoTasksMeanwhile = LocoTaskCount(pe) - pe.swingLocoMark;
+            li.busy = busy;
+            li.firstResult = first;
+            li.progress = pe.swingProbe.Verdict();
+            li.tailPlaying = pe.swingProbe.TailStillPlaying();
+            li.cutShort = pe.swingProbe.ClipCutShort();
+            li.first = pe.swingProbe.First();
+            for (size_t k = 0; k < sync::SwingProbe::kSamples; ++k)
+                li.at[k] = pe.swingProbe.At(k);
+            g_peerLog.push_back({ false, sync::SwingLine(li) });
+        };
+        if (r == sync::SwingProbe::Result::Shown || r == sync::SwingProbe::Result::Followed)
         {
-            ++dk.shown;
-            ++g_swingDiag.shown;
-            ++g_swingDiag.variantShown[(size_t)pe.swingVariant];
-            if (pe.swingRetried)
-                ++g_swingDiag.retriedShown;
-            if (g_swingLadder.Mode() != sync::SwingMode::Off && pe.swingVariant == g_swingLadder.Current() && !g_swingLadder.Pinned())
-                PeerLog(false, "engine: melee swing: variant '%s' is SEEN playing on peer id=%d (read-back): pinned", sync::SwingVariantName(pe.swingVariant), id);
-            g_swingLadder.OnResult(r, false);
-            if (!viaMelee)
-                set.book.OnProbe(ci, r);               // the clip is verified for good
-            if (g_animFirstUse.Note(std::string("swing-shown:") + c.dict + "/" + c.clip))
-                PeerLog(false, "engine: anim first use: swing clip %s / %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) on peer id=%d: the "
-                        "names are right", c.dict, c.clip, id);
+            const bool followed = r == sync::SwingProbe::Result::Followed;
+            if (!followed)
+            {
+                // the first sighting (IS_ENTITY_PLAYING_ANIM / IS_PED_IN_MELEE_COMBAT true): the effect counter of R3, kept as it was
+                ++dk.shown;
+                ++g_swingDiag.shown;
+                ++g_swingDiag.variantShown[(size_t)pe.swingVariant];
+                if (pe.swingRetried)
+                    ++g_swingDiag.retriedShown;
+                pe.swingFirst = sync::SwingProbe::Result::Shown;
+                if (!viaMelee)
+                    set.book.OnProbe(ci, r);           // the clip is verified for good
+                if (g_animFirstUse.Note(std::string("swing-shown:") + c.dict + "/" + c.clip))
+                    PeerLog(false, "engine: anim first use: swing clip %s / %s is SEEN playing (IS_ENTITY_PLAYING_ANIM true) on peer id=%d: the "
+                            "names are right", c.dict, c.clip, id);
+                if (g_meleeFollowWanted.load(std::memory_order_relaxed))
+                    return;                            // the progress check decides the ladder (Followed)
+                settleLadder(true, false, "");
+                return;
+            }
+            // the progress check is over
+            const sync::SwingProbe::Progress pv = pe.swingProbe.Verdict();
+            using PG = sync::SwingProbe::Progress;
+            const bool busy = pe.seatedVeh >= 0 || pe.hitReact.Active() || pe.emote.Active() || g_world->IsPedRagdoll(pe.ped);
+            if (pv == PG::Progressed)
+                ++g_swingDiag.progressed, ++g_swingDiag.variantProgressed[(size_t)pe.swingVariant];
+            else if (pv == PG::BlendedOut)
+                ++g_swingDiag.blendedOut;
+            else if (pv == PG::Flicker)
+                ++g_swingDiag.flicker;
+            else if (pv == PG::Frozen)
+                ++g_swingDiag.frozen;
+            else
+                ++g_swingDiag.progressUnread;
+            if (pe.swingProbe.TailStillPlaying())
+                ++g_swingDiag.tail;
+            if (pe.swingProbe.ClipCutShort())
+                ++g_swingDiag.cutShort;
+            swingLine(sync::SwingProbe::Result::Shown, busy);
+            if (pe.swingSay)
+            {
+                char say[200];
+                std::snprintf(say, sizeof(say), "  -> %s", sync::SwingProbe::ProgressName(pv));
+                game::Overlay::PushSystemLine(say);
+            }
+            if (pe.swingPlanIdx >= 0)
+            {
+                g_swingSurvey.OnResult((size_t)pe.swingPlanIdx, true, pv, busy);
+                pe.swingPlanIdx = -1;
+                surveyFinish();
+                return;
+            }
+            settleLadder(pv == PG::Progressed || pv == PG::Unread, busy,
+                         pv == PG::BlendedOut ? "seen playing at the first frame and BLENDED OUT within 250 ms" : pv == PG::Flicker ? "seen playing and then lost" : "seen playing but its anim time did not advance");
             return;
         }
         if (r == sync::SwingProbe::Result::NotShown)
@@ -3940,16 +4171,16 @@ namespace {
             else
                 ++g_swingDiag.unseenPlain;
             // The clip is blamed only for a miss nothing else explains: a busy ped or a locomotion task is not the name's fault.
-            const bool demoted = !viaMelee && why == sync::SwingMiss::Plain ? set.book.OnProbe(ci, r) : false;
-            // A clip demoted this swing gets its successor a fresh run before the ladder moves (the miss may be the name, not the variant).
-            const bool up = !demoted && g_swingLadder.OnResult(r, busy);
-            if (up)
+            const bool demoted = !viaMelee && why == sync::SwingMiss::Plain && pe.swingPlanIdx < 0 ? set.book.OnProbe(ci, r) : false;
+            swingLine(sync::SwingProbe::Result::NotShown, busy);
+            if (pe.swingPlanIdx >= 0)
             {
-                ++g_swingDiag.escalations;
-                PeerLog(true, "engine: melee swing: the swing was not seen playing %s on peer id=%d: the ladder moves up to '%s' (melee_anim=%s)",
-                        busy ? "(ped busy)" : overwritten ? "(a locomotion task was issued meanwhile)" : "(nothing explains it)", id,
-                        sync::SwingVariantName(g_swingLadder.Current()), sync::SwingModeName(g_swingLadder.Mode()));
+                g_swingSurvey.OnResult((size_t)pe.swingPlanIdx, false, sync::SwingProbe::Progress::None, busy);
+                pe.swingPlanIdx = -1;
+                surveyFinish();
             }
+            else if (!demoted)
+                settleLadder(false, busy, busy ? "not seen playing (ped busy)" : overwritten ? "not seen playing (a locomotion task was issued meanwhile)" : "not seen playing (nothing explains it)");
             if (g_animFirstUse.Note(std::string("swing-unseen:") + c.dict + "/" + c.clip + "/" + std::to_string((int)pe.swingVariant)))
                 PeerLog(true, "engine: anim first use: swing %s %s / %s [%s] was issued on peer id=%d but the read-back never saw it in 250 ms (%s): "
                         "the clip name is probably WRONG (names are INFERRED; /e <dict> <clip> tests one by hand), a task replaced it, or that native cannot "
@@ -3962,6 +4193,56 @@ namespace {
         }
         ++g_swingDiag.unreadable;                      // Unknown: the read-back native never answered
         set.book.OnProbe(ci, r);
+        swingLine(sync::SwingProbe::Result::Unknown, false);
+        if (pe.swingPlanIdx >= 0)
+        {
+            g_swingSurvey.OnResult((size_t)pe.swingPlanIdx, false, sync::SwingProbe::Progress::None, true);   // unreadable: not evidence
+            pe.swingPlanIdx = -1;
+            surveyFinish();
+        }
+    }
+
+    // R4 T3: /swing. A punch on the nearest other player's puppet within 25 m, through the same path a real swing takes (PlayPeerSwing), LOCAL ONLY:
+    // the friend sees nothing and nobody is hurt. While the survey is on it plays the next plan entry and the overlay names it ("Swing test N: ...")
+    // and then what the read-back said, so one person alone with one puppet in view can say which attempt he SAW. After the survey it plays the
+    // pinned variant; typing /swing again starts a new pass.
+    void RunSwingTest(int32_t lp)
+    {
+        float lx = 0, ly = 0, lz = 0;
+        if (!join::IsConnected() || !g_world->GetEntityCoords(lp, lx, ly, lz))
+        {
+            game::Overlay::PushSystemLine("Swing test: join a server first.");
+            return;
+        }
+        Peer* best = nullptr;
+        int bestId = -1;
+        float bestD2 = 25.0f * 25.0f;
+        for (auto& kv : g_peers)
+        {
+            Peer& pe = kv.second;
+            float px, py, pz;
+            if (!pe.ped || pe.deadShown || pe.seatedVeh >= 0 || !g_world->GetEntityCoords(pe.ped, px, py, pz))
+                continue;
+            const float d2 = (px - lx) * (px - lx) + (py - ly) * (py - ly) + (pz - lz) * (pz - lz);
+            if (d2 < bestD2)
+            {
+                bestD2 = d2;
+                best = &pe;
+                bestId = kv.first;
+            }
+        }
+        if (!best)
+        {
+            game::Overlay::PushSystemLine("Swing test: no other player within 25 m.");
+            return;
+        }
+        const sync::SwingMode sm = g_swingLadder.Mode();
+        if ((sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play) && !g_swingSurvey.Active() && g_swingLadder.Enabled())
+            g_swingSurvey.Start(1);                    // a finished survey: a new pass
+        g_swingTestForce = true;
+        PlayPeerSwing(*best, bestId, UnarmedHash(), NowMs());
+        g_swingTestForce = false;
+        GLOGI("engine: /swing on peer id=%d (%.1f m away)", bestId, std::sqrt(bestD2));
     }
 
     // A muzzle flash for a remote shot: the "core" particle asset's per-class effect (sync::MuzzleFlashEffect,
@@ -4049,6 +4330,7 @@ namespace {
         if (pe.deadShown)
         {
             pe.shotDebt.Clear();
+            AbandonPeerSwing(pe);                      // R4 T3: a dead puppet judges no swing (and holds no locomotion task off)
             return;
         }
         // 0c: a swing is a shotSeq step OR the rising edge of the sender's kPfMelee (the flag was sent since v5 and the
@@ -6470,6 +6752,7 @@ namespace {
                 }
                 UpdatePeerDeath(pe, it->first, pose, nowMs);
                 DrivePeer(pe, it->first, pose, pe.lastDriveMs > 0 ? nowMs - pe.lastDriveMs : 0.0, nowMs);
+                pe.poseX = pose.k.x; pe.poseY = pose.k.y; pe.poseZ = pose.k.z; pe.poseKnown = true;   // R4 T3: where the owner really is, for the swing line
                 ProbePeerHits(pe, it->first, lp, lpVeh, lpVehSpeed, nowMs);
                 pe.lastDriveMs = nowMs;
                 ++pe.samples;
@@ -9427,6 +9710,14 @@ namespace {
         g_localReact.Clear();
         g_meleeGate.Reset();
         g_swingLadder.SetMode((sync::SwingMode)g_meleeAnimWanted.load());   // R3 T6: a new session starts the ladder from the registry mode again
+        {
+            // R4 T3: ... and the survey from its first attempt (only where animations are tried at all: auto / play)
+            const sync::SwingMode sm = g_swingLadder.Mode();
+            g_swingSurvey.Start(sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play ? (uint32_t)g_meleeSurveyWanted.load() : 0u);
+            g_swingDurationMs = 400;
+            g_swingNo = 0;
+            g_ownSwingNo = 0;
+        }
         ReleaseSwingDicts();
         g_haveRespawnOk = false;
         g_localSeat = -1;
@@ -10320,9 +10611,54 @@ namespace {
         }
         if (!g_meleeGate.Tick(nowMs, control, action))
             return;
+        const double sinceLastSwing = nowMs - g_lastSwingMs;
         g_lastSwingMs = nowMs;
         ++g_shotSeq;
         ++g_v4.meleeSwings;
+        {
+            // R4 T3: ONE line per counted swing of ours (the first 30, then one per 10 s) that says whether there was a puppet to hit, how far
+            // it is from us and how far it is from where its owner's pose puts it (0.4.9: 11 swings, "windows opened on a puppet 0", no line said why).
+            static double lastLineMs = -1e9;
+            ++g_ownSwingNo;
+            if (g_ownSwingNo <= 30 || nowMs - lastLineMs >= 10000.0)
+            {
+                lastLineMs = nowMs;
+                sync::OwnSwingIn oi;
+                oi.index = g_ownSwingNo;
+                oi.sinceLastMs = sinceLastSwing;
+                float lx = 0, ly = 0, lz = 0;
+                const bool haveLocal = g_world->GetEntityCoords(lp, lx, ly, lz);
+                float bestD2 = 1e30f;
+                for (const auto& kv : g_peers)
+                {
+                    const Peer& pe = kv.second;
+                    ++oi.peers;
+                    if (!pe.ped)
+                        continue;
+                    ++oi.spawned;
+                    if (pe.hpPool && !pe.deadShown)
+                        ++oi.hittable;
+                    float px, py, pz;
+                    if (!haveLocal || !g_world->GetEntityCoords(pe.ped, px, py, pz))
+                        continue;
+                    const float d2 = (px - lx) * (px - lx) + (py - ly) * (py - ly) + (pz - lz) * (pz - lz);
+                    if (d2 < bestD2)
+                    {
+                        bestD2 = d2;
+                        oi.nearestId = kv.first;
+                        oi.nearestM = std::sqrt(d2);
+                        oi.poseErrM = -1.0f;
+                        oi.poseDistM = -1.0f;
+                        if (pe.poseKnown)
+                        {
+                            oi.poseErrM = std::sqrt((px - pe.poseX) * (px - pe.poseX) + (py - pe.poseY) * (py - pe.poseY) + (pz - pe.poseZ) * (pz - pe.poseZ));
+                            oi.poseDistM = std::sqrt((pe.poseX - lx) * (pe.poseX - lx) + (pe.poseY - ly) * (pe.poseY - ly) + (pe.poseZ - lz) * (pe.poseZ - lz));
+                        }
+                    }
+                }
+                GLOGI("%s", sync::OwnSwingLine(oi).c_str());
+            }
+        }
         static int logged = 0;
         if (logged < 6)
         {

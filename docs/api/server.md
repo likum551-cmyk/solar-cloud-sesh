@@ -258,8 +258,13 @@ depends on the client reading GTA's damage event off a puppet. The server decide
 * **The `melee:` line** (every 10 s while anything happened): `melee: last 10 s: swings seen N (too close to the previous swing N), judged N
   [hit=N no_target=N behind=N target_dead=N target_in_vehicle=N attacker_out=N budget=N claimed_first=N], misses with a player on foot within
   3 m N, damage applied by judged hits N; client-reported melee Hits: confirming a judged hit N, paid before the judgement N, on another target N,
-  contradicting the judgement N, for a swing the server holds no judgement of N; adjudication on, reach x100%`. The first 40 hits and near misses
-  are also logged one per line with the nearest player's distance and angle off the heading. `combat: last 10 s` gained `defer_dropped` (a Hit
+  contradicting the judgement N, for a swing the server holds no judgement of N; adjudication on, reach x100%` (R4 T3 added `judged by the clock
+  (the attacker's samples were late) N` and `per-swing lines over budget N` before the damage). **Every judged swing** is also logged, one line each
+  (at most 30 per 10 s; the rest are counted): `melee: <name> swing (shotSeq S, weapon 0x...) judged <outcome>[ on id N]: nearest living player on foot X m
+  (reach R m), A degrees off the heading; why: ...; timing: judged T ms after the blow time (press + 220 ms), by the attacker's samples|by the clock;
+  attacker pose from a sample G ms off the blow, target pose (blow - 100 ms) from a sample H ms off; attacker at x, y heading h, id N at x, y; K other
+  players, nearest by position id N at D m`. The `why` names the nearest player's id and how far beyond the reach it stands, or the angle and the cone
+  (Behind), or why nobody was a candidate (no state / beyond 8 m / not relevant / another floor), or why the attacker threw no punch. `combat: last 10 s` gained `defer_dropped` (a Hit
   that waited for its shot and died with its shooter was dropped uncounted before).
 
 ### Anti-cheat rules (protocol v4)
