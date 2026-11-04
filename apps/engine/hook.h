@@ -1044,6 +1044,11 @@ namespace gage::game {
                                              bool forceInitialFacingDirection, bool forceFaceLeft,
                                              int identifier, bool doEntry);
         bool     IsPedPerformingMeleeAction(int32_t ped);            // IS_PED_PERFORMING_MELEE_ACTION
+        // R3 T6. IS_PED_IN_MELEE_COMBAT: 1 yes, 0 no, -1 the native could not be called (the swing read-back of the melee-task rung).
+        int      IsPedInMeleeCombat(int32_t ped);
+        // R3 T6. TASK_PUT_PED_DIRECTLY_INTO_MELEE(ped, target, blendIn, timeInMelee, strafePhaseSync, aiCombatFlags): false when a handle is 0 or
+        // the native is unavailable. The caller guarantees `target` can be hurt by nobody that matters (the puppet's own invincible anchor).
+        bool     TaskPutPedDirectlyIntoMelee(int32_t ped, int32_t target, float blendIn, float timeInMelee, float strafePhaseSync, int aiCombatFlags);
         // 0..10 (alloc8or); the native has to be called again every frame to hold.
         bool     SetPedMoveRateOverride(int32_t ped, float value);
         // 0.4.3 fixes (W8). IS_PED_VAULTING: a vault or slide over an obstacle (IS_PED_CLIMBING is the climb).

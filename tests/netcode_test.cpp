@@ -3554,6 +3554,7 @@ static server::Config ShippedCombatConfig()
     c.respawnArmour = d.respawnArmour;
     c.maxHitDistance = 100;
     c.respawnDelayMs = 300;
+    c.meleeAdjudicate = 0;   // R3 T6: these scenarios pin the client-claim path of 0.4.5; tests/r3_t6_tests.h (AdjConfig) turns the server's own judgement on
     return c;
 }
 
@@ -4319,6 +4320,8 @@ static void MeleeFightSimTests()
 #include "t6_health_tests.h"   // T6 health: the real server and session into the client's tracker and HUD (uses the helpers above)
 #include "t1_seats_net_tests.h"   // T1 seats (wire v6): the three-client scenario against the real server
 #include "t4_netcode_tests.h"
+#define R3T6_NET
+#include "r3_t6_tests.h"   // R3 T6 melee: the real server judging swings by itself (about 12 s)
 
 int main()
 {
@@ -4367,6 +4370,8 @@ int main()
     t1net::SeatNetworkTests();
     std::printf("-- T4: vehicle collisions (VehicleImpact over the real server)\n");
     t4net::T4NetworkTests();
+    std::printf("-- R3 T6: the server judges melee swings itself\n");
+    r3t6::NetTests();
     std::printf("-- metrics and budget\n");
     MetricsTests();
     ShutdownTests();
@@ -4375,7 +4380,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks + t1net::kNetChecks + t4net::kT4NetChecks; // 0.4.5 melee audit +12; W8 +1 melee ceiling; T6 health network checks; T1 seats (reworded checks, not added, + the three-client scenario and the wire rules); T4 collisions (+3: VehicleImpact wire, head-on arbitration, the speed clamp)
+    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks + t1net::kNetChecks + t4net::kT4NetChecks + r3t6::kNetChecks; // 0.4.5 melee audit +12; W8 +1 melee ceiling; T6 health network checks; T1 seats (reworded checks, not added, + the three-client scenario and the wire rules); T4 collisions (+3: VehicleImpact wire, head-on arbitration, the speed clamp)
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

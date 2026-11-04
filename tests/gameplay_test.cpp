@@ -56,6 +56,8 @@ static void Check(const char* name, bool ok, const std::string& got = "")
     std::printf("%s  %s%s%s\n", ok ? "ok  " : "FAIL", name, got.empty() ? "" : "  got: ", got.c_str());
 }
 
+#define R3T6_CLIENT
+#include "r3_t6_tests.h"   // R3 T6 melee: the swing ladder against a puppet with switchable behaviours
 #include "t6_health_tests.h"   // T6 health: the server -> wire -> client apply -> HUD chain on a simulated ped (needs Check above)
 
 static std::string F(const char* fmt, ...)
@@ -3090,6 +3092,8 @@ int main()
     anim_audit::TestAnimAudit();
     t6health::TestPure();
     t1::RunPure();                                  // T1 seats
+    std::printf("-- R3 T6: swing ladder, read-back reasons, bounded retry\n");
+    r3t6::ClientTests();
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3100,9 +3104,9 @@ int main()
     // + 0.4.5 melee audit 8 (punch, combo, miss then hit, stale event, window edge, guns, event gate, client/server window)
     const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks + 8;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + t1::kPureChecks)   // + 0e animation audit (tests/anim_audit_tests.h); + T6 health (tests/t6_health_tests.h); + T1 seats (tests/t1_seats_tests.h)
+    if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + t1::kPureChecks + r3t6::kClientChecks)   // + 0e animation audit (tests/anim_audit_tests.h); + T6 health (tests/t6_health_tests.h); + T1 seats (tests/t1_seats_tests.h)
     {
-        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + t1::kPureChecks);
+        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + t1::kPureChecks + r3t6::kClientChecks);
         return 1;
     }
     return g_failed ? 1 : 0;

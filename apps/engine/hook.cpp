@@ -5360,6 +5360,21 @@ bool World::IsPedPerformingMeleeAction(int32_t ped) {
     return callPedBool(*this, native::IS_PED_PERFORMING_MELEE_ACTION, ped);
 }
 
+int World::IsPedInMeleeCombat(int32_t ped) {
+    if (!ped) return 0;
+    uint64_t arg[] = { (uint64_t)(uint32_t)ped };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_PED_IN_MELEE_COMBAT, arg, 1, r)) return -1;
+    return (uint32_t)r[0] ? 1 : 0;
+}
+
+bool World::TaskPutPedDirectlyIntoMelee(int32_t ped, int32_t target, float blendIn, float timeInMelee, float strafePhaseSync, int aiCombatFlags) {
+    if (!ped || !target) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)target, FloatArg(blendIn), FloatArg(timeInMelee),
+                        FloatArg(strafePhaseSync), (uint64_t)(uint32_t)aiCombatFlags };
+    return CallNative(native::TASK_PUT_PED_DIRECTLY_INTO_MELEE, args, 6, nullptr);
+}
+
 bool World::SetPedMoveRateOverride(int32_t ped, float value) {
     return callHandleFloat(*this, native::SET_PED_MOVE_RATE_OVERRIDE, ped, value);
 }
