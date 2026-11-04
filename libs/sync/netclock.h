@@ -119,6 +119,10 @@ namespace gage::sync {
         uint32_t baselineSteps = 0;   // frames after which the baseline (the clock offset estimate) moved by more than 5 ms
         uint32_t delayRises = 0;      // times the delay rose at once (a jitter burst the estimate had not covered)
         uint32_t reorderedFrames = 0; // frames whose tick was older than the newest seen (jitter, counted as such)
+        // R3 T5: how big the delay rises were. 58 rises per 10 s (live log) can be 58 steps of 1 ms or 58 of 20 ms; the count alone cannot say.
+        uint32_t delayRisesBig = 0;   // rises of more than 5 ms at once
+        double delayRiseSumMs = 0, delayRiseMaxMs = 0;
+        uint32_t nearResyncs = 0;     // hard resyncs of the near clock (NearT)
     };
 
     class NetClock
@@ -144,6 +148,13 @@ namespace gage::sync {
 
         // The timeline time to show at nowMs (see above). Call it with the frame's time for every consumer.
         double RenderT(double nowMs);
+
+        // R3 T5 (the near-car clock): the timeline time of the frame that arrives NOW over the fastest path (nowMs - baseline), steered by
+        // the same +-10% slew and resync as RenderT but WITHOUT the delay. A car near the local player is drawn at NearT + the link lag
+        // (what the sender's stamp does not carry: half the owner's and half our round trip) instead of RenderT - class extra + a lead
+        // that is meant to cancel the delay: the delay (which rises and falls, 58 rises per 10 s live) and the class extra then cannot
+        // move a near car at all. Idempotent for one nowMs; never runs backwards.
+        double NearT(double nowMs);
 
         // The unwrapped tick (0 at the first frame this clock saw), the timeline time of a tick, and back: the
         // fractional ABSOLUTE tick (not wrapped) a timeline time stands for.
@@ -176,6 +187,8 @@ namespace gage::sync {
             return d;
         }
         double TakeBaselineStepMaxMs() { const double m = stepMaxMs_; stepMaxMs_ = 0.0; return m; }
+        // R3 T5: the largest single delay rise (ms) since the last take.
+        double TakeDelayRiseMaxMs() { const double m = riseMaxWinMs_; riseMaxWinMs_ = 0.0; return m; }
 
         // Forget everything: a new session (its ticks restart, its timeline has nothing to do with the old one).
         void Reset();
@@ -204,6 +217,9 @@ namespace gage::sync {
 
         bool haveRender_ = false;
         double renderT_ = 0, lastNowMs_ = 0;
+        double riseMaxWinMs_ = 0;
+        bool haveNear_ = false;
+        double nearT_ = 0, lastNearNowMs_ = 0;
         NetClockStats stats_;
         ArrivalWindow frameGaps_;
         double lastFrameRecvMs_ = 0, lastBase_ = 0, stepMaxMs_ = 0, baseMark_ = 0;

@@ -421,6 +421,7 @@ void VehicleDriveController::Reset()
     offAcc_ = 0;
     underFloorMs_ = 0;
     graceOn_ = false;
+    proxGrace_ = false;
     graceAgeMs_ = cooldownMs_ = 0;
     haveCmd_ = false;
     kickN_ = 0;
@@ -430,6 +431,7 @@ void VehicleDriveController::Reset()
 void VehicleDriveController::EndGrace(double cooldownMs)
 {
     graceOn_ = false;
+    proxGrace_ = false;
     graceAgeMs_ = 0;
     cooldownMs_ = cooldownMs > 0.0 ? cooldownMs : 0.0;
     haveCmd_ = false;    // the next frame's velocity is the adopted one: no deviation test against the last command
@@ -473,6 +475,7 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
             if (graceAgeMs_ >= cfg_.contactGraceMs)
             {
                 graceOn_ = false;
+                proxGrace_ = false;
                 cooldownMs_ = cfg_.contactCooldownMs;
             }
         }
@@ -490,7 +493,11 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
             haveDev = true;
             o.devMs = float(Len(devV));
         }
-        if (!graceOn_ && cooldownMs_ <= 0.0 && started_ && !tg.teleported)
+        // R3 T5: a grace the PROXIMITY trigger opened (the copy is about to overlap our car) is upgraded by the first real contact evidence:
+        // the flag, the speed loss or the kick then report contactOpened as usual, so the engine adopts the copy's response to the hit.
+        const bool canOpen = !graceOn_ && cooldownMs_ <= 0.0 && started_ && !tg.teleported;
+        const bool canUpgrade = graceOn_ && proxGrace_ && started_ && !tg.teleported;
+        if (canOpen || canUpgrade)
         {
             bool byDecel = false, byKick = false;
             if (haveDev && speed >= cfg_.contactMinSpeedMs)
@@ -500,13 +507,17 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
             }
             if (haveDev && cfg_.contactKickMs > 0.0f && kickMuteMs_ <= 0.0)
                 byKick = Len(devV) > cfg_.contactKickMs;
-            if (in.contact || byDecel || byKick)
+            const bool hard = in.contact || byDecel || byKick;
+            if (hard || (canOpen && in.proximity))
             {
+                if (canUpgrade) ++stats_.proximityUpgrades;
                 graceOn_ = true;
                 graceAgeMs_ = 0;
+                proxGrace_ = !hard;
                 ++stats_.contacts;
                 if (in.contact) { ++stats_.contactsByFlag; o.contactOpened = 1; }
                 else if (byDecel) { ++stats_.contactsByDecel; o.contactOpened = 2; }
+                else if (!byKick) { ++stats_.contactsByProximity; o.contactOpened = 4; }
                 else
                 {
                     ++stats_.contactsByKick;

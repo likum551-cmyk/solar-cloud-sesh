@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstdarg>
+#include <filesystem>
+#include <fstream>
 
 namespace t4srv {
 
@@ -17,7 +19,7 @@ static std::string T4F(const char* fmt, ...)
     return buf;
 }
 
-constexpr int kT4ServerChecks = 2;
+constexpr int kT4ServerChecks = 3;   // R3 T5: +1 (contactLagCapMs)
 
 static void T4ServerTests()
 {
@@ -128,6 +130,28 @@ static void T4ServerTests()
                   std::fabs(yWay - 6.0f) < 1e-3f && oldOver == Code::BadArg && vo.SpeedClamps() == 0,
               T4F("140 -> %s %.1f; 160 -> %s %.2f at y %.1f (clamps %llu); 301 -> %s; v5 rule: %s", proto::ToString(ok), vOk, proto::ToString(over), vOver, yOver, (unsigned long long)clamps,
                 proto::ToString(way), proto::ToString(oldOver)));
+    }
+
+    // ---- R3 T5: contactLagCapMs, the half-round-trip correction of the arbiter's sample times ----
+    {
+        const std::string path = (std::filesystem::temp_directory_path() / "r3t5_server_cfg.json").string();
+        auto load = [&](const std::string& text, server::Config& c) {
+            std::ofstream(path, std::ios::binary) << text;
+            std::string err;
+            return server::LoadConfigFile(path, c, &err);
+        };
+        server::Config def, a, b, c, d;
+        const bool defOk = def.contactLagCapMs == 150;
+        const bool ok0 = load("{ \"contactLagCapMs\": 0 }", a) && a.contactLagCapMs == 0;
+        const bool ok500 = load("{ \"contactLagCapMs\": 500 }", b) && b.contactLagCapMs == 500;
+        c.contactLagCapMs = 77;
+        const bool bad501 = !load("{ \"contactLagCapMs\": 501 }", c) && c.contactLagCapMs == 77;
+        d.contactLagCapMs = 77;
+        const bool badText = !load("{ \"contactLagCapMs\": \"150\" }", d) && d.contactLagCapMs == 77;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        Check("R3 T5 config: contactLagCapMs defaults to 150 ms, loads 0 (off) and 500, and 501 or a string is refused with the config untouched",
+              defOk && ok0 && ok500 && bad501 && badText, T4F("default %d, 0 %d, 500 %d, 501 refused %d, string refused %d", (int)defOk, (int)ok0, (int)ok500, (int)bad501, (int)badText));
     }
 }
 

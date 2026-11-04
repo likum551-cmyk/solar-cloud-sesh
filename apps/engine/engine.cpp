@@ -30,6 +30,7 @@
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
 #include "sync/vehicle_impact.h"
+#include "sync/vehicle_position.h"
 #include "sync/vehicle_syncd.h"
 #include "sync/seat_intent.h"
 #include "sync/nametag.h"
@@ -341,7 +342,7 @@ namespace {
     {
         bool have = false;
         sync::ArrivalWindow frameGaps;
-        double baselineDriftMs = 0, stepMaxMs = 0, delayMs = 0, targetMs = 0, excessP95Ms = 0, ageP95Ms = 0;
+        double baselineDriftMs = 0, stepMaxMs = 0, delayMs = 0, targetMs = 0, excessP95Ms = 0, ageP95Ms = 0, riseMaxMs = 0;
         sync::NetClockStats stats, seen;   // seen: as of the previous report
     };
     PipeClockReport s_pipeClock;
@@ -443,6 +444,7 @@ namespace {
         sync::impact::ImpactTracker impactTracker;   // a car we control: the velocity jumps the game's physics gave it (a contact with a copy)
         uint32_t lastImpactSeq = 0;                  // the newest server VehicleImpact applied / judged for this car
         double divCheckAtMs = 0;                     // a copy whose response we adopted: when to compare it with its controller's stream (0 = none)
+        uint32_t proxUpgradesSeen = 0;               // R3 T5: drive stats at the last frame (proximity graces that a real contact upgraded)
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -466,6 +468,25 @@ namespace {
     // T4 (vehicle collisions): impact_sync=0 in HKCU\Software\GAGE-MP keeps the contact grace (W9 / Sync B) as the only contact handling and
     // ignores the server's VehicleImpact messages. Default on; re-read at every Welcome.
     std::atomic<bool> g_impactSync{true};
+    // R3 T5 (vehicle position, docs/sync-specs/vehicle-position.md). veh_near_clock=0 draws near copies as round 2 did (the lead = the shared delay + the class
+    // extra, 30 / 45 m, 250 ms cap, no link lag); veh_prox_contact=0 switches the proximity contact path off. Default on; re-read at every Welcome.
+    std::atomic<bool> g_nearClock{true}, g_proxContact{true};
+    // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
+    std::mutex g_linkMtx;
+    std::map<uint16_t, uint32_t> g_linkRtt;   // g_linkMtx
+    // R3 T5 counters / windows (script tick).
+    struct T5Stats
+    {
+        sync::PositionDiag pos;                  // drawn vs the owner's report now, per speed / distance band
+        uint32_t proxOpened = 0, proxUpgraded = 0, proxFrames = 0;   // proximity graces opened / turned into a real contact / copies predicted to overlap
+        uint32_t linkInfoIn = 0;                 // LinkInfo messages received (join worker: atomic in effect, read for the log only)
+        double lagSum = 0; uint32_t lagN = 0; double lagMax = 0;     // the link lag used (ms) over the driven frames
+        uint32_t ownerRttUnknown = 0;            // driven frames whose controller's round trip the server had not told us (ours stood in)
+        uint32_t sentFrames[4] = {};             // as controller: updates sent per speed band (the other machine's line is its view of these)
+        double sentSpeedSum = 0; uint32_t sentN = 0;
+    };
+    T5Stats g_t5;
+    std::atomic<uint32_t> g_linkInfoIn{0};
     // The server's VehicleImpact messages (join worker -> script tick), newest last, at most kMaxImpactQueue waiting.
     std::mutex g_impactMtx;
     std::vector<proto::VehicleImpact> g_impactQueue;   // g_impactMtx
@@ -1288,6 +1309,8 @@ namespace {
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
         g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
+        g_nearClock.store(reg::Get(L"veh_near_clock") != L"0");     // R3 T5: the near-car clock + link lag (0 = round 2's lead)
+        g_proxContact.store(reg::Get(L"veh_prox_contact") != L"0"); // R3 T5: the proximity contact path (0 = the flag / speed loss / kick triggers only)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
@@ -1598,6 +1621,16 @@ namespace {
         e.kind = NetEvent::SeatNote;
         e.seat = n;
         PushEvent(std::move(e), true);                 // reliable and ordered with the VehicleResults: never the one dropped
+    }
+
+    // R3 T5: the round trip the server measures to each vehicle controller (join worker); the near-car lead reads it under g_linkMtx.
+    void OnLinkInfo(const proto::LinkInfo& m)
+    {
+        std::lock_guard<std::mutex> lk(g_linkMtx);
+        g_linkRtt.clear();
+        for (const proto::LinkEntry& e : m.e)
+            g_linkRtt[e.id] = e.rttMs;
+        g_linkInfoIn.fetch_add(1, std::memory_order_relaxed);
     }
 
     // T4: the server's resolution of a contact of a vehicle we control; queued for the script tick (TickVehicles applies it).
@@ -1960,13 +1993,21 @@ namespace {
         int budget = ambient::kSweepMaxDeletes;
         for (int pass = 0; pass < 2; ++pass)           // 0: peds, 1: vehicles
         {
+            ambient::g_lastNearbyEcho = false;
             const int n = pass == 0 ? g_world->NearbyPeds(lp, found, ambient::kNearbyCap)
                                     : g_world->NearbyVehicles(lp, found, ambient::kNearbyCap);
             (pass == 0 ? g_ambRep.nearPeds : g_ambRep.nearVehs) = n;
+            if (ambient::g_lastNearbyEcho)
+                ++g_ambRep.enumCapEcho[pass];
             if (n <= 0)
                 continue;
             const ambient::SweepStats st = ambient::PlanSweep(found, n, g_ambExempt, budget, plan);
             g_ambRep.protectedSeen += (uint32_t)st.exempt;
+            g_ambRep.enumSeen[pass] += (uint32_t)st.seen;       // R3 T5: what each enumeration was made of (the live `near[peds=64 vehs=64]` was the capacity)
+            g_ambRep.enumExempt[pass] += (uint32_t)st.exempt;
+            g_ambRep.enumUnproven[pass] += (uint32_t)st.unproven;
+            g_ambRep.enumInvalid[pass] += (uint32_t)st.invalid;
+            g_ambRep.enumPlanned[pass] += (uint32_t)st.planned;
             for (const int32_t h : plan)
                 if (g_world->EntityExists(h) == 1 && g_world->DeleteAmbientEntity(h))
                 {
@@ -5426,6 +5467,7 @@ namespace {
             s_pipeClock.frameGaps = clk.TakeFrameGaps();
             s_pipeClock.baselineDriftMs = clk.TakeBaselineDriftMs();
             s_pipeClock.stepMaxMs = clk.TakeBaselineStepMaxMs();
+            s_pipeClock.riseMaxMs = clk.TakeDelayRiseMaxMs();
             s_pipeClock.delayMs = clk.DelayMs();
             s_pipeClock.targetMs = clk.TargetDelayMs();
             s_pipeClock.excessP95Ms = clk.ExcessP95Ms();
@@ -5576,8 +5618,15 @@ namespace {
     // on that timeline, up to the present: the delay and the class extra it is otherwise behind by, weighted 1 within
     // 30 m of the local player and 0 beyond 45 m (`distM`), the interpolator extrapolating past its newest snapshot
     // by the velocity (arc, capped at 500 ms). `leadMs` returns what was added. dtMs is the frame gap for the slew.
+    //
+    // R3 T5 (docs/sync-specs/vehicle-position.md): with veh_near_clock (default) a near copy is drawn at NetClock::NearT + the link lag instead
+    // (sync::NearLeadWantMs): the lead takes the difference to the delayed clock, so neither the shared delay (it rises and falls) nor the class
+    // extra moves it, and the stamp's missing half round trips (the owner's uplink, our downlink) are added. `ctrl` is the controller's player id
+    // (its round trip comes from the server's LinkInfo; ours from the session). `ideal` (optional) is the owner's report sampled at the same
+    // instant plus the lag: the diagnostic's reference; `lagOut` the link lag, `unledOut` how far the interpolation time is behind it.
     bool SampleVehInterp(uint16_t id, double nowMs, sync::VehicleSample& out, sync::PresentLead* lead = nullptr,
-                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr, double* dispOut = nullptr)
+                         double distM = 1e9, double dtMs = 0.0, double* leadMs = nullptr, double* dispOut = nullptr,
+                         uint16_t ctrl = proto::kNoPlayer, sync::VehicleSample* ideal = nullptr, double* lagOut = nullptr, double* unledOut = nullptr)
     {
         PeersLock lk(g_peersMtx, true);
         if (!g_syncLive || !g_sync.Clock().Ready())
@@ -5588,12 +5637,40 @@ namespace {
         VehNet& v = it->second;
         sync::NetClock& clock = g_sync.Clock();
         const double extra = v.extra.UpdateGap(v.interp.TypicalGapMs(), clock.TickMs(), nowMs, clock.Config().maxSlew);
-        const double add = lead ? lead->Update(distM, clock.DelayMs() + extra, dtMs) : 0.0;
+        const double renderT = clock.RenderT(nowMs);
+        const double nearT = clock.NearT(nowMs);
+        const bool nearOn = g_nearClock.load(std::memory_order_relaxed);
+        double lagMs = 0.0;
+        {
+            // the lag the stamp does not carry: half our round trip (the fastest downlink) + half the controller's (the fastest uplink SampleClock absorbs)
+            double ownerRtt = 0.0;
+            {
+                std::lock_guard<std::mutex> llk(g_linkMtx);
+                const auto rt = g_linkRtt.find(ctrl);
+                if (rt != g_linkRtt.end()) ownerRtt = (double)rt->second;
+            }
+            if (ownerRtt <= 0.0 && ctrl != proto::kNoPlayer && lagOut) ++g_t5.ownerRttUnknown;
+            lagMs = sync::LinkLagMs((double)join::RttMs(), ownerRtt);
+        }
+        double add = 0.0;
+        if (lead)
+        {
+            lead->SetConfig(nearOn ? sync::NearLeadConfig() : sync::PresentLeadConfig());
+            const double want = nearOn ? sync::NearLeadWantMs(nearT, lagMs, renderT, extra) : clock.DelayMs() + extra;
+            add = lead->Update(distM, want, dtMs);
+        }
         if (leadMs)
             *leadMs = add;
-        const double disp = clock.RenderT(nowMs) - extra + add;
+        v.interp.SetExtrapolateMaxMs(sync::VehicleInterpConfig().extrapolateMaxMs + (nearOn ? add : 0.0));   // R3 T5: the cap grows with the lead
+        const double disp = renderT - extra + add;
         if (dispOut)
             *dispOut = disp;
+        if (lagOut)
+            *lagOut = lagMs;
+        if (unledOut)
+            *unledOut = nearT + lagMs - disp;
+        if (ideal)
+            v.interp.Sample(nearT + lagMs, *ideal);
         return v.interp.Sample(disp, out);
     }
     // T4: the copy's own response to a hit becomes its trajectory from `snap.tMs` on (VehicleInterpolator::ReplaceFrom); the stream's pushes are
@@ -5610,6 +5687,21 @@ namespace {
         PeersLock lk(g_peersMtx, true);
         const auto it = g_vehNet.find(id);
         return it != g_vehNet.end() ? it->second.interp.Stats().guarded : 0u;
+    }
+    // R3 T5: the vehicles' interpolator totals over every copy (session totals; the position line prints the 10 s deltas): snapshots stored, identical or
+    // earlier-placed resends dropped, stale ones, teleports.
+    void VehInterpTotals(uint32_t& accepted, uint32_t& repeats, uint32_t& stale, uint32_t& teleports)
+    {
+        accepted = repeats = stale = teleports = 0;
+        PeersLock lk(g_peersMtx, true);
+        for (const auto& kv : g_vehNet)
+        {
+            const sync::VehicleInterpStats& s = kv.second.interp.Stats();
+            accepted += s.accepted;
+            repeats += s.repeats;
+            stale += s.stale;
+            teleports += s.teleports;
+        }
     }
     void ClearVehInterp(uint16_t id)
     {
@@ -5653,13 +5745,16 @@ namespace {
             if (reportNow && s_pipeClock.have && !g_peers.empty())
             {
                 const PipeClockReport& pc = s_pipeClock;
-                char line[420];
+                char line[600];
                 std::snprintf(line, sizeof(line),
                               "engine: pipe clock: %u world/vehicle frames in the last 10 s (arrival gap ms mean %.0f p95 %.0f max %.0f), clock offset moved %+.1f ms, "
-                              "%u steps over 5 ms (largest %.0f ms), %u delay rises, %u reordered frames, %u resyncs; shared delay %.0f ms (target %.0f), lateness p95 "
+                              "%u steps over 5 ms (largest %.0f ms), %u delay rises (%u over 5 ms, mean %.1f ms, largest %.1f ms), %u reordered frames, %u resyncs; shared delay %.0f ms (target %.0f), lateness p95 "
                               "excess %.0f + age %.0f ms",
                               pc.frameGaps.n + 1, pc.frameGaps.MeanMs(), pc.frameGaps.PercentileMs(0.95), pc.frameGaps.maxMs, pc.baselineDriftMs,
                               pc.stats.baselineSteps - pc.seen.baselineSteps, pc.stepMaxMs, pc.stats.delayRises - pc.seen.delayRises,
+                              pc.stats.delayRisesBig - pc.seen.delayRisesBig,
+                              pc.stats.delayRises > pc.seen.delayRises ? (pc.stats.delayRiseSumMs - pc.seen.delayRiseSumMs) / (pc.stats.delayRises - pc.seen.delayRises) : 0.0,
+                              pc.riseMaxMs,
                               pc.stats.reorderedFrames - pc.seen.reorderedFrames, pc.stats.resyncs - pc.seen.resyncs, pc.delayMs, pc.targetMs,
                               pc.excessP95Ms, pc.ageP95Ms);
                 report.emplace_back(line);
@@ -6426,6 +6521,10 @@ namespace {
             const bool haveLc = lpVeh && g_world->GetEntityCoords(lpVeh, lcx, lcy, lcz);
             for (auto& kv : g_vehs)
                 kv.second.contactPosValid = false;
+            // R3 T5 (proximity contact): OUR vehicle as the oriented box the server's arbiter uses, read once per frame and only when a copy is close enough to ask.
+            sync::impact::Pose t5OwnPose;
+            sync::impact::MassClass t5OwnMc = sync::impact::MassClass::Car;
+            bool t5OwnTried = false, t5OwnOk = false;
             size_t spawned = 0;
             for (const auto& kv : g_vehs)
                 if (kv.second.handle)
@@ -6602,7 +6701,11 @@ namespace {
                                                                (double)(st.k.z - lpz) * (st.k.z - lpz))
                                                    : 1e9;
                     double dispT = 0.0;   // T4: the interpolation time of this frame (an adopted response is stored at it)
-                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT))
+                    sync::VehicleSample t5Ideal;   // R3 T5: the owner's report sampled at (now + link lag): the diagnostic's reference
+                    double t5Lag = 0.0, t5Unled = 0.0;
+                    const bool t5Diag = leadDist < 120.0;
+                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT, st.ctrl,
+                                        t5Diag ? &t5Ideal : nullptr, &t5Lag, &t5Unled))
                     {
                         if (v.leadMs > 1.0)
                             ++g_v4.leadFrames;
@@ -6630,7 +6733,66 @@ namespace {
                             }
                             else
                                 v.lastContactFlag = false;
+                            // R3 T5 (proximity contact): this copy's drawn pose against OUR vehicle, both as the arbiter's boxes, 120 ms ahead.
+                            in.proximity = false;
+                            if (g_proxContact.load(std::memory_order_relaxed) && haveLc && !mine && leadDist < 40.0)
+                            {
+                                if (!t5OwnTried)
+                                {
+                                    t5OwnTried = true;
+                                    float ovx = 0, ovy = 0, ovz = 0, oqx, oqy, oqz, oqw, owx = 0, owy = 0, owz = 0;
+                                    if (g_world->GetEntityVelocity(lpVeh, ovx, ovy, ovz) && g_world->GetEntityQuaternion(lpVeh, oqx, oqy, oqz, oqw))
+                                    {
+                                        if (!g_world->GetEntityRotationVelocity(lpVeh, owx, owy, owz)) owz = 0;
+                                        t5OwnPose.p = { (double)lcx, (double)lcy };
+                                        t5OwnPose.v = { (double)ovx, (double)ovy };
+                                        t5OwnPose.h = sync::vq::HeadingDeg({ oqx, oqy, oqz, oqw }) * (3.14159265358979323846 / 180.0);
+                                        t5OwnPose.w = owz;
+                                        static int32_t clsHandle = 0;
+                                        static int cls = -1;
+                                        if (clsHandle != lpVeh) { clsHandle = lpVeh; cls = g_world->GetVehicleClass(lpVeh); }
+                                        t5OwnMc = cls >= 0 ? sync::impact::MassClassOfVehicleClass(cls) : sync::impact::MassClass::Car;
+                                        t5OwnOk = true;
+                                    }
+                                }
+                                if (t5OwnOk)
+                                {
+                                    const sync::impact::Pose pc{ { (double)in.localPos.x, (double)in.localPos.y }, { (double)s.vel.x, (double)s.vel.y },
+                                                                 sync::vq::HeadingDeg(in.localRot) * (3.14159265358979323846 / 180.0), (double)s.angVel.z };
+                                    const sync::impact::MassClass cmc = v.vehClass >= 0 ? sync::impact::MassClassOfVehicleClass(v.vehClass) : sync::impact::MassClass::Car;
+                                    if (sync::impact::PredictOverlap(t5OwnPose, t5OwnMc, pc, cmc, sync::impact::ProximityCfg()).hit)
+                                    {
+                                        in.proximity = true;
+                                        ++g_t5.proxFrames;
+                                    }
+                                }
+                            }
                             sync::VehicleDriveOutput o = v.drive.Update(in);
+                            if (t5Diag)
+                            {
+                                // R3 T5: drawn (the entity's position before this frame's commands) vs the owner's report at (now + link lag), the aim and the tracking.
+                                auto d3 = [](const sync::DriveVec& a, const sync::DriveVec& b) {
+                                    return std::sqrt((double)(a.x - b.x) * (a.x - b.x) + (double)(a.y - b.y) * (a.y - b.y) + (double)(a.z - b.z) * (a.z - b.z));
+                                };
+                                sync::PositionDiag::Frame pf;
+                                pf.speedMps = std::sqrt((double)s.vel.x * s.vel.x + (double)s.vel.y * s.vel.y + (double)s.vel.z * s.vel.z);
+                                pf.distM = leadDist;
+                                pf.totalM = d3(in.localPos, t5Ideal.pos);
+                                pf.targetM = d3(s.pos, t5Ideal.pos);
+                                pf.trackM = o.posErrorM;
+                                pf.unledMs = t5Unled;
+                                pf.leadMs = v.leadMs;
+                                pf.snapped = o.snap;
+                                g_t5.pos.Add(pf);
+                                g_t5.lagSum += t5Lag;
+                                ++g_t5.lagN;
+                                g_t5.lagMax = std::max(g_t5.lagMax, t5Lag);
+                            }
+                            {
+                                const uint32_t pu = v.drive.Stats().proximityUpgrades;
+                                g_t5.proxUpgraded += pu - v.proxUpgradesSeen;
+                                v.proxUpgradesSeen = pu;
+                            }
                             // T4 (vehicle collisions): when this copy took an impulse inside the last frame (the contact the controller just
                             // detected), that is the OTHER car's response to the hit from the game's own physics. The controller's next command
                             // would pull it back to the stream, which still carries the pre-impact motion for the whole network latency: the copy
@@ -6686,6 +6848,8 @@ namespace {
                                     ++g_v4.contactsFlag;
                                 else if (o.contactOpened == 2)
                                     ++g_v4.contactsDecel;
+                                else if (o.contactOpened == 4)
+                                    ++g_t5.proxOpened;                  // R3 T5: the proximity trigger (the copy was about to overlap our car)
                                 else
                                     ++g_v4.contactsKick;
                                 static int graceLogged = 0;
@@ -6694,7 +6858,7 @@ namespace {
                                     ++graceLogged;
                                     PeerLog(false, "engine: vehicle id=%u: contact on the remote copy (%s): soft correction for %.0f ms "
                                             "(speed %.1f m/s, error %.2f m, deviation from the last command %.1f m/s)", id,
-                                            o.contactOpened == 1 ? "collision flag" : (o.contactOpened == 2 ? "speed loss" : "velocity kick"),
+                                            o.contactOpened == 1 ? "collision flag" : (o.contactOpened == 2 ? "speed loss" : (o.contactOpened == 4 ? "proximity: about to overlap our car" : "velocity kick")),
                                             sync::VehicleDriveConfig().contactGraceMs, std::sqrt((double)in.localVel.x * in.localVel.x + (double)in.localVel.y * in.localVel.y +
                                                                                         (double)in.localVel.z * in.localVel.z), (double)o.posErrorM,
                                             (double)o.devMs);
@@ -7795,6 +7959,14 @@ namespace {
             if (join::SendVehicleState(u, sampleMs))
             {
                 ++g_v4.vehUpdates;
+                {
+                    // R3 T5, the controller's side of the position line: how fast the cars we send were going (the other machine's per-band numbers are its
+                    // view of exactly these frames).
+                    const double sp = std::sqrt((double)u.k.vx * u.k.vx + (double)u.k.vy * u.k.vy + (double)u.k.vz * u.k.vz);
+                    ++g_t5.sentFrames[sync::PositionDiag::SpeedBand(sp)];
+                    g_t5.sentSpeedSum += sp;
+                    ++g_t5.sentN;
+                }
                 v.sentOnce = true;
                 v.sentFlags = u.flags;
                 v.sentFlags2 = u.flags2;
@@ -8837,6 +9009,44 @@ namespace {
                 }
             }
             {
+                // R3 T5 (vehicle position): where a remote copy is DRAWN against where its owner's report puts it now (+ the link lag), per speed and distance band,
+                // with the terms behind it, and the controller's side (how fast the cars we send were going), so ONE log has both views. Read with
+                // docs/sync-specs/vehicle-position.md: a mean of metres at 15-30 m/s with "aim N ms behind" ~ 0 = the lag is the network (check the link lag line);
+                // "aim" large = the lead is not closing the render delay; "tracking" large = the drive controller / physics.
+                static uint32_t lastLinkIn = 0, lastAcc = 0, lastRep = 0, lastStale = 0, lastTele = 0;
+                uint32_t acc = 0, rep = 0, stl = 0, tel = 0;
+                VehInterpTotals(acc, rep, stl, tel);
+                const sync::PositionDiag::Window pw = g_t5.pos.Take();
+                const uint32_t linkIn = g_linkInfoIn.load(std::memory_order_relaxed);
+                if (pw.frames > 0 || g_t5.sentN > 0 || linkIn != lastLinkIn)
+                {
+                    std::string owners;
+                    {
+                        std::lock_guard<std::mutex> llk(g_linkMtx);
+                        for (const auto& rt : g_linkRtt)
+                            owners += (owners.empty() ? "" : ", ") + std::to_string(rt.first) + ":" + std::to_string(rt.second) + " ms";
+                    }
+                    const sync::NetClock& clk5 = g_sync.Clock();
+                    GLOGI("engine: vehicle position (R3 T5), last 10 s: near clock %s, proximity contact %s; our round trip %u ms, controllers' (server's view) [%s], %u LinkInfo in, "
+                          "owner's round trip unknown on %u frames; link lag used mean %.0f max %.0f ms; shared delay %.0f ms; copies: %s; proximity: %u frames predicted an overlap, "
+                          "%u graces opened, %u upgraded to a real contact; snapshots in 10 s: %u stored, %u resends dropped, %u stale, %u teleports; "
+                          "as controller: %u updates sent (mean speed %.1f m/s; speed bands 0-5/5-15/15-30/over 30: %u/%u/%u/%u)",
+                          g_nearClock.load() ? "on" : "OFF", g_proxContact.load() ? "on" : "OFF", (unsigned)join::RttMs(), owners.c_str(), linkIn - lastLinkIn,
+                          g_t5.ownerRttUnknown, g_t5.lagN ? g_t5.lagSum / g_t5.lagN : 0.0, g_t5.lagMax, clk5.DelayMs(), sync::PositionDiag::Format(pw).c_str(),
+                          g_t5.proxFrames, g_t5.proxOpened, g_t5.proxUpgraded, (acc >= lastAcc ? acc - lastAcc : 0u), (rep >= lastRep ? rep - lastRep : 0u), (stl >= lastStale ? stl - lastStale : 0u), (tel >= lastTele ? tel - lastTele : 0u),
+                          g_t5.sentN, g_t5.sentN ? g_t5.sentSpeedSum / g_t5.sentN : 0.0,
+                          g_t5.sentFrames[0], g_t5.sentFrames[1], g_t5.sentFrames[2], g_t5.sentFrames[3]);
+                }
+                lastLinkIn = linkIn;
+                lastAcc = acc; lastRep = rep; lastStale = stl; lastTele = tel;
+                g_t5.proxFrames = g_t5.proxOpened = g_t5.proxUpgraded = 0;
+                g_t5.lagSum = g_t5.lagMax = 0.0;
+                g_t5.lagN = g_t5.ownerRttUnknown = 0;
+                g_t5.sentN = 0;
+                g_t5.sentSpeedSum = 0.0;
+                for (uint32_t& sf : g_t5.sentFrames) sf = 0;
+            }
+            {
                 // T4 (vehicle collisions): the contacts our cars felt, the copies whose response was adopted, the server's impacts and what became of
                 // them, and the divergence estimate (a copy against its controller's stream 500 ms after the contact). Read with
                 // docs/sync-specs/vehicle-collisions.md: "adopted" > 0 with "refused" 0 = the copy path ran; "applied" > 0 = the server's resolution
@@ -9625,6 +9835,7 @@ namespace gage::engine {
         sinks.onVehicleResult = OnVehicleResult;
         sinks.onSeatNotice = OnSeatNotice;
         sinks.onVehicleImpact = OnVehicleImpact;   // T4
+        sinks.onLinkInfo = OnLinkInfo;             // R3 T5
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

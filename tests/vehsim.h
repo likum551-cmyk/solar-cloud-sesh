@@ -238,6 +238,11 @@ struct NetCfg {
     double handoverMs = -1.0;       // the sender's source changes here: the new controller's car is handoverLagMs behind the old one's
     double handoverLagMs = 0.0;
     uint64_t seed = 1;
+    // R3 T5: the REAL stamp. SampleClock places a sample at sender + min(recv - sender), so the constant part of the uplink latency (upMs) is
+    // absorbed into the offset: the stamp (and so ageMs) lags the true sample time by upMs. The older sims stamped the true time (false).
+    bool stampBias = false;
+    // R3 T5: the live log's rhythm: WorldState and VehicleWorld of one tick arrive 0.5 ms apart (601 frames per 10 s at 30 Hz, gap mean 17 ms).
+    bool secondStream = false;
 };
 
 struct RunCfg {
@@ -254,6 +259,11 @@ struct RunCfg {
     double measureToMs = 1e12;
     VehicleDriveConfig drive;
     VehicleInterpConfig interp;
+    // R3 T5: the near-car clock (NetClock::NearT + the link lag, the lead taking the difference to the delayed clock): off = round 2's lead
+    // (the delay + the class extra). linkLagMs = (our RTT + the owner's RTT) / 2 when on.
+    bool nearClock = false;
+    double linkLagMs = 0.0;
+    PresentLeadConfig leadCfg;
     // Extra hooks (mutants and probes): called per frame after the controller output, before Apply
     std::function<void(VehicleDriveOutput&)> tweak;
     // trace: per frame (now, display time, position error, heading error deg, snap, mode)
@@ -281,6 +291,18 @@ struct Metrics {
     double zFloatMax = 0;                 // largest vertical error while the truth is in the air
     double popMax = 0;                    // largest per-frame displacement beyond the truth's own (m): a snap or a jump
     int pops = 0;                         // frames with a pop over 0.3 m
+    // R3 T5: the copy against the owner's TRUE position at the same global instant (the pipeline's error plus the network latency the
+    // sender's stamp does not carry), and how much that error moves from frame to frame (a steady lag does not; a flapping clock does).
+    double nowMean = 0, nowP95 = 0, nowMax = 0;
+    double stepP95 = 0, stepMax = 0;      // |change of (copy - truth now)| per frame, m
+    double leadMean = 0, leadMax = 0;     // ms
+    int nowFrames = 0;
+    // R3 T5: the shared clock over the measured window (rises are counted from the start of the run)
+    double delayMeanMs = 0, delayMaxMs = 0, delayMinMs = 1e9;
+    uint32_t delayRises = 0, delayRisesBig = 0;
+    double riseMeanMs = 0, riseMaxMs = 0;
+    double runSec = 0;
+    uint32_t resyncs = 0, baselineSteps = 0;
 };
 
 struct Frame { double arrive; int64_t tick; std::vector<VehicleSnapshot> snaps; };
@@ -353,7 +375,7 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
                 const Sample& sm = samples[size_t(newest)];
                 // a still car's newest sample is relayed again and again: the receiver drops the identical ones (VehPush::Repeat)
                 VehicleSnapshot s = sm.s;
-                const double age = std::min(255.0, std::floor(tt - sm.t));
+                const double age = std::min(255.0, std::floor(std::max(0.0, tt - sm.t - (nc.stampBias ? nc.upMs : 0.0))));
                 s.tMs = SnapshotStampMs(tick, tickMs, uint32_t(age));
                 f.snaps.push_back(s);
             }
@@ -367,7 +389,7 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
     NetClock clock(ncfg);
     VehicleInterpolator ip(rc.interp);
     VehicleDriveController ctl(rc.drive);
-    PresentLead lead;
+    PresentLead lead(rc.leadCfg);
     ClassDelay extra;
     Puppet pup;
     pup.ground = truth.S().ground;
@@ -375,7 +397,9 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
     bool spawned = false;
 
     Metrics m;
-    std::vector<double> posErrs;
+    std::vector<double> posErrs, nowErrs, stepErrs;
+    double lastEx = 0, lastEy = 0, lastEz = 0, delaySum = 0;
+    bool haveLastErr = false;
     double sumPos = 0, sumAng = 0, sumLat = 0, sumSpeedSq = 0, stillAngSum = 0;
     int stillFrames = 0, speedFrames = 0;
     double lastTime = -1;
@@ -398,6 +422,7 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
             if (f.tick * tickMs < rc.startMs) continue;                          // before the receiver connected
             if (!haveOrigin) { haveOrigin = true; originMs = double(f.tick) * tickMs; }
             clock.OnFrame(uint32_t(f.tick), f.arrive);
+            if (nc.secondStream) clock.OnFrame(uint32_t(f.tick), f.arrive + 0.5);
             for (const VehicleSnapshot& s : f.snaps) {
                 if (rc.handoverMs >= 0 && !handed && f.tick * tickMs >= rc.handoverMs && !rc.handoverKeep) {
                     ip.Clear();
@@ -413,11 +438,17 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
         if (!clock.Ready()) continue;
         const double ex = extra.UpdateGap(ip.TypicalGapMs(), clock.TickMs(), now, clock.Config().maxSlew);
         double add = 0;
-        if (rc.lead) add = lead.Update(rc.leadDistM, clock.DelayMs() + ex, dt);
-        const double disp = clock.RenderT(now) - ex + add;
+        const double renderT = clock.RenderT(now);
+        if (rc.lead) {
+            const double want = rc.nearClock ? NearLeadWantMs(clock.NearT(now), rc.linkLagMs, renderT, ex) : clock.DelayMs() + ex;
+            add = lead.Update(rc.leadDistM, want, dt);
+        }
+        const double disp = renderT - ex + add;
+        if (rc.nearClock) ip.SetExtrapolateMaxMs(rc.interp.extrapolateMaxMs + add);
         VehicleSample s;
         if (!ip.Sample(disp, s)) continue;
         const TruthPt tp = truth.At(disp + originMs);
+        const TruthPt tn = truth.At(now);
         if (!spawned) {
             spawned = true;
             pup.pos = s.pos;
@@ -434,6 +465,7 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
         in.dtMs = now - lastTime;
         // the error each frame starts with
         const double pe = Dist3(pup.pos, tp.pos);
+        const double peNow = Dist3(pup.pos, tn.pos);
         const double ae = Deg(vq::AngleBetween(pup.rot, tp.rot));
         VehicleDriveOutput o = ctl.Update(in);
         if (rc.tweak) rc.tweak(o);
@@ -471,6 +503,23 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
                 const double a = Dist3(o.velocity, lastVel) / (in.dtMs / 1000.0);
                 m.accelSpikeMax = std::max(m.accelSpikeMax, a);
             }
+            {
+                const double ex2 = double(pup.pos.x) - tn.pos.x, ey2 = double(pup.pos.y) - tn.pos.y, ez2 = double(pup.pos.z) - tn.pos.z;
+                if (haveLastErr) {
+                    const double st = std::sqrt((ex2 - lastEx) * (ex2 - lastEx) + (ey2 - lastEy) * (ey2 - lastEy) + (ez2 - lastEz) * (ez2 - lastEz));
+                    stepErrs.push_back(st);
+                    m.stepMax = std::max(m.stepMax, st);
+                }
+                lastEx = ex2; lastEy = ey2; lastEz = ez2; haveLastErr = true;
+                nowErrs.push_back(peNow);
+                m.nowMean += peNow;
+                m.nowMax = std::max(m.nowMax, peNow);
+                delaySum += clock.DelayMs();
+                m.delayMaxMs = std::max(m.delayMaxMs, clock.DelayMs());
+                m.delayMinMs = std::min(m.delayMinMs, clock.DelayMs());
+                m.leadMean += lead.LeadMs();
+                m.leadMax = std::max(m.leadMax, lead.LeadMs());
+            }
             if (haveLastPos && in.dtMs > 0) {
                 const double dx = pup.pos.x - lastPos.x - tp.vel.x * in.dtMs / 1000.0, dy = pup.pos.y - lastPos.y - tp.vel.y * in.dtMs / 1000.0;
                 const double pop = std::sqrt(dx * dx + dy * dy);
@@ -497,9 +546,28 @@ inline Metrics Run(const Truth& truth, const RunCfg& rc) {
         std::sort(posErrs.begin(), posErrs.end());
         m.posP95 = posErrs[size_t(posErrs.size() * 0.95)];
         if (speedFrames > 0) m.speedRippleRms = std::sqrt(sumSpeedSq / speedFrames);
+        if (!nowErrs.empty()) {
+            m.delayMeanMs = delaySum / double(nowErrs.size());
+            m.nowFrames = int(nowErrs.size());
+            m.nowMean /= double(nowErrs.size());
+            m.leadMean /= double(nowErrs.size());
+            std::sort(nowErrs.begin(), nowErrs.end());
+            m.nowP95 = nowErrs[size_t(double(nowErrs.size()) * 0.95)];
+        }
+        if (!stepErrs.empty()) {
+            std::sort(stepErrs.begin(), stepErrs.end());
+            m.stepP95 = stepErrs[size_t(double(stepErrs.size()) * 0.95)];
+        }
         if (stillFrames > 0) m.headingStillErr = stillAngSum / stillFrames;
     }
     if (endN > 0) { m.endPosErr = endPosSum / endN; m.endAngErr = endAngSum / endN; }
+    m.delayRises = clock.Stats().delayRises;
+    m.delayRisesBig = clock.Stats().delayRisesBig;
+    m.riseMeanMs = clock.Stats().delayRises ? clock.Stats().delayRiseSumMs / double(clock.Stats().delayRises) : 0.0;
+    m.riseMaxMs = clock.Stats().delayRiseMaxMs;
+    m.resyncs = clock.Stats().resyncs;
+    m.baselineSteps = clock.Stats().baselineSteps;
+    m.runSec = durMs / 1000.0;
     m.snaps = ctl.Stats().snaps;
     m.persistentSnaps = ctl.Stats().persistentSnaps;
     m.underFloorSnaps = ctl.Stats().underFloorSnaps;

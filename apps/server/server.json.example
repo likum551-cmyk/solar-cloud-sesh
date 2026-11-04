@@ -35,6 +35,7 @@
   "vehicleEmptyDespawnSeconds": 600,
   "vehicleEnterDistance": 10,
   "vehicleMaxSpeed": 150,
+  "contactLagCapMs": 150,
   "fuelDrainPerMinute": 10,
   "playerHealth": 200,
   "firearmDamagePercent": 72,

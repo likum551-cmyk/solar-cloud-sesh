@@ -244,10 +244,24 @@ private:
 // Read the array a GET_PED_NEARBY_* style native fills: slot 0 = count (the capacity going in), then one
 // handle per 8-byte slot, low 32 bits. -1 when the count is not plausible (a wrong array layout must
 // reject the whole read, not feed garbage handles to a delete).
-inline int ParseNearby(const uint64_t* slots, int cap, int32_t* out) {
+//
+// R3 T5 (the live line `near[peds=64 vehs=64]` with `deleted=0`): both counts were exactly the capacity we put into slot 0. The scripts' idiom
+// is `arr[0] = capacity; count = GET_PED_NEARBY_PEDS(ped, arr, -1)`: the COUNT is the native's return value and slot 0 is left alone, so reading
+// slot 0 as the count read the capacity (64) and passed 63 zero slots on as "handles" (PlanSweep drops them as invalid, so nothing wrong was ever
+// deleted, but the numbers lied and a count of exactly 64 could not be told from an echo). When slot 0 still holds the capacity it is treated as an
+// echo and the handles are the leading run of non-zero slots (the buffer is zeroed before the call); when it holds something smaller it is trusted as
+// the count (the other layout the comment above allowed for). `echo` (optional) says which case it was.
+inline bool g_lastNearbyEcho = false;   // R3 T5: whether the last World::NearbyPeds / NearbyVehicles read had slot 0 still at the capacity (script tick only)
+inline int ParseNearby(const uint64_t* slots, int cap, int32_t* out, bool* echo = nullptr) {
+    if (echo) *echo = false;
     if (!slots || !out || cap <= 0) return -1;
-    const int32_t n = (int32_t)(uint32_t)slots[0];
+    int32_t n = (int32_t)(uint32_t)slots[0];
     if (n < 0 || n > cap) return -1;
+    if (n == cap) {
+        if (echo) *echo = true;
+        n = 0;
+        while (n < cap && (int32_t)(uint32_t)slots[1 + n] != 0) ++n;
+    }
     for (int i = 0; i < n; ++i) out[i] = (int32_t)(uint32_t)slots[1 + i];
     return n;
 }
@@ -297,6 +311,10 @@ struct Report {
     uint32_t protectedSeen = 0;            // exempt handles met in sweeps this window
     uint32_t deleted = 0;                  // entities the sweep deleted this window
     int nearPeds = -1, nearVehs = -1;      // enumeration counts at the last sweep (-1: no enumeration)
+    // R3 T5: what the sweeps of this window made of each enumeration ([0] peds, [1] vehicles), summed over the sweeps: handles read, of which exempt
+    // (ours), unproven (not on the list but the list was incomplete), invalid (0 / -1 / repeated), planned for deletion, and how many reads had
+    // slot 0 still at the capacity (the count was the native's return value).
+    uint32_t enumSeen[2] = {}, enumExempt[2] = {}, enumUnproven[2] = {}, enumInvalid[2] = {}, enumPlanned[2] = {}, enumCapEcho[2] = {};
     bool breaker = false;
     uint32_t breakerLost = 0;
     Switches sw;
@@ -308,14 +326,17 @@ inline int FormatLine(char* buf, size_t cap, const Report& r) {
     int n = std::snprintf(buf, cap,
         "engine: ambient: %.0fs link=%s ticks[connected=%u entering=%u offline=%u ended=%u] frames[script=%u render=%u] "
         "ran[periodic=%u clear=%u sweep=%u] skipped[master=%u spawn0=%u natives=%u render=%u] "
-        "switches[master=%d render=%d clear=%d sweep=%d] sweep=%s breaker=%s lost=%u exempt=%d protected=%u deleted=%u near[peds=%d vehs=%d] calls[",
+        "switches[master=%d render=%d clear=%d sweep=%d] sweep=%s breaker=%s lost=%u exempt=%d protected=%u deleted=%u near[peds=%d vehs=%d] "
+        "enum[peds seen=%u exempt=%u unproven=%u invalid=%u planned=%u capacity-echo=%u; vehs seen=%u exempt=%u unproven=%u invalid=%u planned=%u capacity-echo=%u] calls[",
         r.windowSec, Name(r.link),
         r.ticks[(int)Link::Connected], r.ticks[(int)Link::Entering], r.ticks[(int)Link::Offline], r.ticks[(int)Link::Ended],
         r.frameScript, r.frameRender, r.periodic, r.clears, r.sweeps,
         r.skipped[(int)Skip::MasterOff], r.skipped[(int)Skip::SpawnZero], r.skipped[(int)Skip::NativesDown], r.skipped[(int)Skip::RenderOff],
         (int)r.sw.master, (int)r.sw.renderFallback, (int)r.sw.areaClear, (int)r.sw.sweep,
         r.sweepAvailable ? "on" : "no-hash", r.breaker ? "TRIPPED" : "off", r.breakerLost, r.exemptCount, r.protectedSeen, r.deleted,
-        r.nearPeds, r.nearVehs);
+        r.nearPeds, r.nearVehs,
+        r.enumSeen[0], r.enumExempt[0], r.enumUnproven[0], r.enumInvalid[0], r.enumPlanned[0], r.enumCapEcho[0],
+        r.enumSeen[1], r.enumExempt[1], r.enumUnproven[1], r.enumInvalid[1], r.enumPlanned[1], r.enumCapEcho[1]);
     if (n < 0) return 0;
     size_t used = (size_t)n < cap ? (size_t)n : cap - 1;
     bool first = true;

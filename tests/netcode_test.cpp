@@ -381,14 +381,14 @@ static void CodecTests()
     // PeekType.
     {
         proto::Msg m = proto::Msg::Hello;
-        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; T1 (v6): 31 SeatNotice; T4 (v6): 40 VehicleImpact
-        // (32..39 are reserved for other round-2 messages; PeekType only range-checks them). 41 is the first value past the last message.
-        const uint8_t zero = 0, firstUnknown = 41, ff = 255, impact = 40;
+        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; T1 (v6): 31 SeatNotice; T4 (v6): 40 VehicleImpact; R3 T5: 44 LinkInfo
+        // (32..39 and 41..43 are reserved for other messages; PeekType only range-checks them). 45 is the first value past the last message.
+        const uint8_t zero = 0, firstUnknown = 45, ff = 255, impact = 40, link = 44;
         bool allKnown = true;
         for (uint8_t t = 1; t <= 31; t++)
             allKnown = allKnown && proto::PeekType(&t, 1, m) && (uint8_t)m == t;
-        Check("codec: PeekType accepts 1..31 and 40 and rejects empty, 0, 41, 255",
-              allKnown && proto::kMsgLast == 40 && proto::PeekType(&impact, 1, m) && m == proto::Msg::VehicleImpact && !proto::PeekType(&zero, 0, m) &&
+        Check("codec: PeekType accepts 1..31, 40 and 44 and rejects empty, 0, 45, 255",
+              allKnown && proto::kMsgLast == 44 && proto::PeekType(&impact, 1, m) && m == proto::Msg::VehicleImpact && proto::PeekType(&link, 1, m) && m == proto::Msg::LinkInfo && !proto::PeekType(&zero, 0, m) &&
                   !proto::PeekType(nullptr, 0, m) && !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
     }
 
