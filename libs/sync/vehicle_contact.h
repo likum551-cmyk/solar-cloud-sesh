@@ -120,4 +120,60 @@ namespace gage::sync {
         float prevDev_ = 0.0f;
     };
 
+
+    // R4 T2 (docs/sync-specs/vehicle-collision-authority.md, section 1): WHAT a copy's collision flag touched. HAS_ENTITY_COLLIDED_WITH_ANYTHING says yes or no; no native in hook.h names
+    // the other entity, so the classification is by the evidence we can read: a vehicle we control near the copy, another copy near it, its height above the ground (GET_ENTITY_HEIGHT_ABOVE_GROUND:
+    // a car on its wheels reads 0.3-0.9 m at its origin), and how much speed it lost against what the controller commanded (a solid thing stops a car; a kerb, a bump or the road do not).
+    // This is a heuristic labelled as such in the log; its job is to say, in numbers, how many of GI's 4-8 flag edges per window were NOT a car.
+    enum class TouchKind : uint8_t { OwnCar = 0, OtherCopy, Airborne, Solid, Ground, kCount };
+    struct TouchCfg
+    {
+        double ownNearM = 10.0;       // origin to origin: a vehicle we control this close is the likely toucher (contactNearM of the drive gate)
+        double copyNearM = 7.0;       // another copy this close
+        double airborneM = 1.6;       // origin height above the ground above this: in the air / on a prop
+        double solidLossMs = 3.0;     // lost this much speed against the last command: something solid stopped it
+    };
+    struct TouchEvidence
+    {
+        double ownDistM = -1.0;       // nearest vehicle we control (negative: none / unknown)
+        double copyDistM = -1.0;      // nearest other remote copy
+        double heightM = -1.0;        // GET_ENTITY_HEIGHT_ABOVE_GROUND of the copy (negative: unknown)
+        double speedLossMs = 0.0;     // VehicleDriveOutput.devMs: |last command - the car's own velocity|
+    };
+    inline TouchKind ClassifyTouch(const TouchEvidence& e, const TouchCfg& c = TouchCfg())
+    {
+        if (e.ownDistM >= 0.0 && e.ownDistM <= c.ownNearM) return TouchKind::OwnCar;
+        if (e.copyDistM >= 0.0 && e.copyDistM <= c.copyNearM) return TouchKind::OtherCopy;
+        if (e.heightM > c.airborneM) return TouchKind::Airborne;
+        if (e.speedLossMs >= c.solidLossMs) return TouchKind::Solid;
+        return TouchKind::Ground;
+    }
+    inline const char* TouchName(TouchKind k)
+    {
+        static const char* const n[] = {"a car we control", "another copy", "in the air / on a prop", "something solid (speed lost)", "the ground / a kerb (no speed lost)"};
+        const int i = static_cast<int>(k);
+        return n[i < 0 || i >= static_cast<int>(TouchKind::kCount) ? 4 : i];
+    }
+    // The 10 s tally of the flag's rising edges by what they touched, with the gate's verdict.
+    class TouchTally
+    {
+    public:
+        struct Window
+        {
+            uint32_t byKind[static_cast<int>(TouchKind::kCount)] = {};
+            uint32_t gated = 0;                  // edges that opened no grace because no vehicle we control was near
+            double heightMax = 0, lossMax = 0;   // over the edges of the window
+        };
+        void Add(TouchKind k, bool gated, double heightM, double lossMs)
+        {
+            ++w_.byKind[static_cast<int>(k)];
+            if (gated) ++w_.gated;
+            if (std::isfinite(heightM) && heightM > w_.heightMax) w_.heightMax = heightM;
+            if (std::isfinite(lossMs) && lossMs > w_.lossMax) w_.lossMax = lossMs;
+        }
+        Window Take() { const Window w = w_; w_ = Window(); return w; }
+    private:
+        Window w_;
+    };
+
 }   // namespace gage::sync

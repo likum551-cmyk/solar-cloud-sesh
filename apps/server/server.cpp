@@ -1313,6 +1313,23 @@ namespace gage::server {
             io.seq = ++impactSeq_;
             stats_.vehicleImpacts++;
             impactLogCount_++;
+            {
+                // R4 T2: what the arbiter computed for this contact, so a big velocity change on a client's log can be traced to its closing speed, masses and normal
+                const double dvA = sync::impact::Len(io.dv[0]), dvB = sync::impact::Len(io.dv[1]);
+                impactWinClosing_ = std::max(impactWinClosing_, io.closing);
+                impactWinDv_ = std::max(impactWinDv_, std::max(dvA, dvB));
+                if (impactWinLines_ < 8)
+                {
+                    ++impactWinLines_;
+                    static const char* const kMc[] = {"light", "car", "heavy"};
+                    char b[420];
+                    std::snprintf(b, sizeof(b), "contact: impact #%u vehicle %u (%s, controller %u) with vehicle %u (%s, controller %u): closing %.1f m/s along the normal (%.2f, %.2f), "
+                                  "depth %.2f m; velocity change %.1f m/s for the first, %.1f m/s for the second (restitution %.2f)",
+                                  io.seq, (unsigned)io.id[0], kMc[(int)io.mc[0]], (unsigned)io.ctrl[0], (unsigned)io.id[1], kMc[(int)io.mc[1]], (unsigned)io.ctrl[1], io.closing,
+                                  io.n.x, io.n.y, io.depth, dvA, dvB, sync::impact::SolverCfg().restitution);
+                    Log(b);
+                }
+            }
             for (int k = 0; k < 2; k++)
             {
                 if (!io.stampOk[k]) continue;
@@ -1345,11 +1362,14 @@ namespace gage::server {
                 Log("contact: " + std::to_string(impactLogCount_) + " impact(s) in the last 10 s (" + std::to_string(stats_.vehicleImpacts) + " total, " +
                     std::to_string(stats_.vehicleImpactsSent) + " messages), pairs examined " + std::to_string(a.pairsExamined) + ", soft touches " +
                     std::to_string(a.softTouches) + ", skipped untrusted " + std::to_string(a.untrusted) + ", dv capped " + std::to_string(a.capped) +
-                    ", max closing " + std::to_string((int)a.maxClosing) + " m/s; empty-car claims " + std::to_string(vehicles_.Claims()) + ", velocity clamps " +
+                    ", max closing " + std::to_string((int)a.maxClosing) + " m/s (this window " + std::to_string((int)impactWinClosing_) + "), largest velocity change this window " +
+                    std::to_string((int)impactWinDv_) + " m/s; empty-car claims " + std::to_string(vehicles_.Claims()) + ", velocity clamps " +
                     std::to_string(vehicles_.SpeedClamps()));
             }
             impactLogMs_ = nowMs;
             impactLogCount_ = 0;
+            impactWinClosing_ = impactWinDv_ = 0.0;
+            impactWinLines_ = 0;
             impactLogClaims_ = vehicles_.SpeedClamps();
         }
     }

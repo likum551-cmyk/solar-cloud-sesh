@@ -6,6 +6,8 @@ GI, live (0.4.7, only his `gage.log` exists): "car collisions are non existent: 
 Evidence levels: **simulated** = the offline simulations (tests/vehsim.h one car, tests/vehsim_2m.h two machines) with the real controllers, interpolator, NetClock, PresentLead,
 arbiter and tracker; **measured live** = a number in GI's log; **compiled only** = the engine glue. Nothing below was run in the game.
 
+> **R4 T2 (2026-11-05)**: what 'drawn vs the owner's report now' can and cannot see (it is blind to a wrong link lag and to the extrapolation error), why the speed bands mix distances, and the acceleration-aware extrapolation: docs/sync-specs/vehicle-collision-authority.md sections 0 and 2.
+
 ## 1. Root cause: the lead closes the render DELAY, not the network LATENCY (simulated; consistent with the live numbers)
 
 * Round 2's lead (`PresentLead`, 30 / 45 m) draws a near copy at `RenderT - extra + lead` with `lead = shared delay + extra`: "now on the server's timeline". That is applied (it

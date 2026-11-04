@@ -527,6 +527,10 @@ namespace {
     // R3 T5 (vehicle position, docs/sync-specs/vehicle-position.md). veh_near_clock=0 draws near copies as round 2 did (the lead = the shared delay + the class
     // extra, 30 / 45 m, 250 ms cap, no link lag); veh_prox_contact=0 switches the proximity contact path off. Default on; re-read at every Welcome.
     std::atomic<bool> g_nearClock{true}, g_proxContact{true};
+    // R4 T2 (docs/sync-specs/vehicle-collision-authority.md). veh_contact_gate=0: a copy's flag / speed loss / kick opens the contact grace whatever it touched (round 3);
+    // default on = only with a vehicle we control within kContactNearM. veh_accel_extrap=0: constant-velocity extrapolation of the copies (round 3). Re-read at every Welcome.
+    std::atomic<bool> g_contactGate{true}, g_accelExtrap{true};
+    constexpr double kContactNearM = 10.0;       // origin to origin: a vehicle we control this close is the likely toucher of a copy
     // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
     std::mutex g_linkMtx;
     std::map<uint16_t, uint32_t> g_linkRtt;   // g_linkMtx
@@ -559,6 +563,19 @@ namespace {
         uint32_t dropped = 0;                                           // queue overflow
     };
     T4Stats g_t4;                                                       // script tick (dropped: g_impactMtx)
+    // R4 T2 (script tick): what the copies' collision flags touched, the contact gate's verdicts, the divergence check after EVERY contact, and the arbiter's numbers as the
+    // controller of the hit car sees them (the authoritative change and the closing speed behind it).
+    struct R4Stats
+    {
+        sync::ContactWatch watch;
+        sync::TouchTally tally;
+        uint32_t gatedEdges = 0, gatedKick = 0, gatedLoss = 0;         // contact evidence ignored because no vehicle we control was near (flag edges / kicks / speed losses)
+        uint32_t impactsAuth = 0;                                      // server impacts for cars we control, received
+        double authDvMax = 0, closingMax = 0, depthMax = 0;            // ... the largest authoritative change, closing speed and depth among them
+        double ownMinM = 1e9;                                          // the closest a copy came to a vehicle we control (origin to origin) in the window
+        uint32_t ownUnder3m = 0;                                       // ... copy-frames closer than 3 m
+    };
+    R4Stats g_r4;
     constexpr int kPeerHpPool = 1000;             // a remote ped's local health, restored after every hit
     // Sync plan W3 (combat client), re-read at every Welcome:
     //   hit_react = off | bullet | ragdoll | both (default both): bullet = a flinch from a 1-damage point-blank
@@ -1415,6 +1432,8 @@ namespace {
         g_impactSync.store(reg::Get(L"impact_sync") != L"0");   // T4: the vehicle impact handling (default on; 0 = the W9 contact grace only)
         g_nearClock.store(reg::Get(L"veh_near_clock") != L"0");     // R3 T5: the near-car clock + link lag (0 = round 2's lead)
         g_proxContact.store(reg::Get(L"veh_prox_contact") != L"0"); // R3 T5: the proximity contact path (0 = the flag / speed loss / kick triggers only)
+        g_contactGate.store(reg::Get(L"veh_contact_gate") != L"0"); // R4 T2: a copy's contact counts only with a vehicle we control near (0 = any contact, round 3)
+        g_accelExtrap.store(reg::Get(L"veh_accel_extrap") != L"0"); // R4 T2: acceleration-aware extrapolation of copies (0 = constant velocity, round 3)
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
@@ -6197,6 +6216,7 @@ namespace {
         if (leadMs)
             *leadMs = add;
         v.interp.SetExtrapolateMaxMs(sync::VehicleInterpConfig().extrapolateMaxMs + (nearOn ? add : 0.0));   // R3 T5: the cap grows with the lead
+        v.interp.SetAccelExtrapolation(g_accelExtrap.load(std::memory_order_relaxed));                         // R4 T2
         const double disp = renderT - extra + add;
         if (dispOut)
             *dispOut = disp;
@@ -7263,6 +7283,10 @@ namespace {
                 ++g_t4.dup;
                 continue;
             }
+            ++g_r4.impactsAuth;
+            g_r4.authDvMax = std::max(g_r4.authDvMax, std::sqrt((double)m.dvx * m.dvx + (double)m.dvy * m.dvy));
+            g_r4.closingMax = std::max(g_r4.closingMax, (double)m.closing);
+            g_r4.depthMax = std::max(g_r4.depthMax, (double)m.depth);
             v.lastImpactSeq = m.seq;
             float cx = 0, cy = 0, cz = 0;
             bool isNear = false;
@@ -7304,6 +7328,12 @@ namespace {
                 g_world->SetEntityAngularVelocity(v.handle, ax, ay, az + (float)d.dw);
             v.impactTracker.NoteWritten({ nvx, nvy }, haveRot ? az + d.dw : 0.0, d.dv, d.dw);
             ++g_t4.applied;
+            {
+                // R4 T2: the OTHER car's copy is the one to compare with its owner after this impact (+0.5 / +1 / +2 s)
+                const auto ot = g_vehs.find(m.otherId);
+                if (ot != g_vehs.end() && ot->second.handle && ot->second.st.ctrl != me)
+                    g_r4.watch.Open(m.otherId, sync::ContactWatch::kServerImpact, nowMs);
+            }
             const double dvLen = sync::impact::Len(d.dv);
             g_t4.appliedDvSum += dvLen;
             g_t4.appliedDvMax = std::max(g_t4.appliedDvMax, dvLen);
@@ -7339,6 +7369,21 @@ namespace {
             sync::impact::Pose t5OwnPose;
             sync::impact::MassClass t5OwnMc = sync::impact::MassClass::Car;
             bool t5OwnTried = false, t5OwnOk = false;
+            // R4 T2: where the vehicles we control are this frame (the contact gate and the touch classification): the local player's vehicle and any empty car handed to us
+            struct OwnCar { float x, y; };
+            static std::vector<OwnCar> r4Own;       // script tick only; reused
+            r4Own.clear();
+            if (haveLc)
+                r4Own.push_back({ lcx, lcy });
+            for (const auto& okv : g_vehs)
+            {
+                const NetVeh& ov = okv.second;
+                if (!ov.handle || ov.handle == lpVeh || !ov.haveState || ov.st.ctrl != me)
+                    continue;
+                float ox = 0, oy = 0, oz = 0;
+                if (g_world->GetEntityCoords(ov.handle, ox, oy, oz))
+                    r4Own.push_back({ ox, oy });
+            }
             size_t spawned = 0;
             for (const auto& kv : g_vehs)
                 if (kv.second.handle)
@@ -7583,7 +7628,64 @@ namespace {
                                     }
                                 }
                             }
+                            // R4 T2 (contact gate): a vehicle we control within kContactNearM? Only then do the flag / speed loss / kick mean a car-to-car contact.
+                            double r4OwnDist = -1.0;
+                            for (const OwnCar& oc : r4Own)
+                            {
+                                const double ddx = (double)oc.x - in.localPos.x, ddy = (double)oc.y - in.localPos.y;
+                                const double dd = std::sqrt(ddx * ddx + ddy * ddy);
+                                if (r4OwnDist < 0.0 || dd < r4OwnDist)
+                                    r4OwnDist = dd;
+                            }
+                            in.ownNear = !g_contactGate.load(std::memory_order_relaxed) || (r4OwnDist >= 0.0 && r4OwnDist <= kContactNearM);
+                            if (r4OwnDist >= 0.0)
+                            {
+                                g_r4.ownMinM = std::min(g_r4.ownMinM, r4OwnDist);
+                                if (r4OwnDist < 3.0)
+                                    ++g_r4.ownUnder3m;
+                            }
                             sync::VehicleDriveOutput o = v.drive.Update(in);
+                            {
+                                // R4 T2: what did the flag touch (the evidence we can read), what the gate decided, and the watch that compares this copy with its owner after the contact
+                                if (in.contact)
+                                {
+                                    sync::TouchEvidence ev;
+                                    ev.ownDistM = r4OwnDist;
+                                    for (const auto& okv : g_vehs)
+                                    {
+                                        if (okv.first == id || !okv.second.handle || !okv.second.haveState)
+                                            continue;
+                                        const double ddx = (double)okv.second.st.k.x - st.k.x, ddy = (double)okv.second.st.k.y - st.k.y;
+                                        const double dd = std::sqrt(ddx * ddx + ddy * ddy);
+                                        if (ev.copyDistM < 0.0 || dd < ev.copyDistM)
+                                            ev.copyDistM = dd;
+                                    }
+                                    ev.heightM = g_world->GetEntityHeightAboveGround(h);
+                                    ev.speedLossMs = o.devMs;
+                                    const sync::TouchKind kind = sync::ClassifyTouch(ev);
+                                    g_r4.tally.Add(kind, !in.ownNear, ev.heightM, ev.speedLossMs);
+                                    static int touchLogged = 0;
+                                    if (touchLogged < 12)
+                                    {
+                                        ++touchLogged;
+                                        PeerLog(false, "engine: vehicle id=%u: collision flag rose on the remote copy: touched %s (by the evidence: nearest car we control %.1f m, nearest other copy %.1f m, "
+                                                "height above ground %.2f m, speed lost against the last command %.1f m/s, own speed %.1f m/s)%s", id, sync::TouchName(kind),
+                                                ev.ownDistM, ev.copyDistM, (double)ev.heightM, ev.speedLossMs,
+                                                std::sqrt((double)in.localVel.x * in.localVel.x + (double)in.localVel.y * in.localVel.y + (double)in.localVel.z * in.localVel.z),
+                                                in.ownNear ? "" : "; no vehicle we control within the gate range: NO grace, the copy keeps following its owner");
+                                    }
+                                }
+                                if (o.contactIgnored)
+                                {
+                                    if (o.contactIgnored == 1) ++g_r4.gatedEdges;
+                                    else if (o.contactIgnored == 2) ++g_r4.gatedLoss;
+                                    else ++g_r4.gatedKick;
+                                    g_r4.watch.Open(id, sync::ContactWatch::kWorld, nowMs);
+                                }
+                                if (o.contactOpened)
+                                    g_r4.watch.Open(id, o.contactOpened == 1 ? sync::ContactWatch::kFlag : (o.contactOpened == 2 ? sync::ContactWatch::kSpeedLoss :
+                                                    (o.contactOpened == 4 ? sync::ContactWatch::kProximity : sync::ContactWatch::kKick)), nowMs);
+                            }
                             if (t5Diag)
                             {
                                 // R3 T5: drawn (the entity's position before this frame's commands) vs the owner's report at (now + link lag), the aim and the tracking.
@@ -7600,6 +7702,7 @@ namespace {
                                 pf.leadMs = v.leadMs;
                                 pf.snapped = o.snap;
                                 g_t5.pos.Add(pf);
+                                g_r4.watch.Sample(id, nowMs, pf.totalM, o.posErrorM);   // R4 T2: the divergence check after EVERY contact (+0.5 / +1 / +2 s)
                                 g_t5.lagSum += t5Lag;
                                 ++g_t5.lagN;
                                 g_t5.lagMax = std::max(g_t5.lagMax, t5Lag);
@@ -7636,6 +7739,8 @@ namespace {
                                     v.drive.EndGrace(kAdoptCooldownMs);
                                     o.setVelocity = o.setAngularVelocity = o.setQuaternion = false;
                                     ++g_t4.adopted;
+                                    if (!g_r4.watch.Active(id))
+                                        g_r4.watch.Open(id, sync::ContactWatch::kAdoption, nowMs);
                                     v.divCheckAtMs = nowMs + 500.0;
                                     static int adoptLogged = 0;
                                     if (adoptLogged < 12)
@@ -10046,6 +10151,32 @@ namespace {
                 lastT4.divMax = 0.0;
                 g_t4.divMax = 0.0;
                 lastGuard = guardNow;
+            }
+            {
+                // R4 T2 (docs/sync-specs/vehicle-collision-authority.md): what the copies' collision flags touched and what the contact gate did with it, how close a copy came to a
+                // vehicle we control, the arbiter's numbers for our cars (authoritative change, closing speed, depth), and the divergence check after EVERY contact.
+                const sync::TouchTally::Window tw = g_r4.tally.Take();
+                const sync::ContactWatch::Window cw = g_r4.watch.Take();
+                uint32_t edges = 0;
+                for (uint32_t c : tw.byKind) edges += c;
+                bool anyWatch = cw.merged || cw.dropped;
+                for (int c = 1; c < sync::ContactWatch::kCauses; ++c) anyWatch = anyWatch || cw.opened[c];
+                if (edges || anyWatch || g_r4.impactsAuth || g_r4.gatedKick || g_r4.gatedLoss)
+                {
+                    GLOGI("engine: vehicle contacts (R4 T2), last 10 s: contact gate %s (a grace needs a vehicle we control within %.0f m), acceleration-aware extrapolation %s; "
+                          "collision flag rose %u times on copies, touching: a car we control %u, another copy %u, in the air / on a prop %u, something solid (speed lost) %u, the ground / a kerb %u "
+                          "(highest %.2f m above ground, largest speed loss %.1f m/s); evidence ignored by the gate: %u flag edges, %u speed losses, %u kicks; closest copy to a vehicle we "
+                          "control %.1f m (%u copy-frames under 3 m); server impacts for our cars %u: largest authoritative change %.1f m/s, closing speed %.1f m/s, depth %.2f m; "
+                          "copy vs the owner after a contact: %s",
+                          g_contactGate.load() ? "on" : "OFF", kContactNearM, g_accelExtrap.load() ? "on" : "OFF", edges,
+                          tw.byKind[(int)sync::TouchKind::OwnCar], tw.byKind[(int)sync::TouchKind::OtherCopy], tw.byKind[(int)sync::TouchKind::Airborne],
+                          tw.byKind[(int)sync::TouchKind::Solid], tw.byKind[(int)sync::TouchKind::Ground], tw.heightMax, tw.lossMax,
+                          g_r4.gatedEdges, g_r4.gatedLoss, g_r4.gatedKick, g_r4.ownMinM < 1e8 ? g_r4.ownMinM : -1.0, g_r4.ownUnder3m, g_r4.impactsAuth, g_r4.authDvMax,
+                          g_r4.closingMax, g_r4.depthMax, sync::ContactWatch::Format(cw).c_str());
+                }
+                g_r4.gatedEdges = g_r4.gatedKick = g_r4.gatedLoss = g_r4.impactsAuth = g_r4.ownUnder3m = 0;
+                g_r4.authDvMax = g_r4.closingMax = g_r4.depthMax = 0.0;
+                g_r4.ownMinM = 1e9;
             }
             {
                 static SyncDStats lastD;
