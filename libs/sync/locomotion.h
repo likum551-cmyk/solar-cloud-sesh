@@ -162,6 +162,15 @@
 //         anchor fallback doubles for each stall in a row (20, 40, 80 ... s, cap 300 s) and the streak ends after 90 s without one.
 //     LocoDiag (above) is the slide metric of the 10 s "engine: loco slide" line.
 //
+// 10. R4 T1 (docs/sync-specs/onfoot.md "R4 T1"): LocoMode::Blend. Live (0.4.9) the straight task moved the puppet 1.3-2x too fast, the velocity push
+//     (the ped's own velocity read + a capped correction) peaked at 30 m/s and the persistent-error snap teleported it. In Blend the gait task is
+//     only the ANIMATION (a far point on the pose's line, the move blend ratio a continuous speed knob trimmed by the correction the writes
+//     needed) and the POSITION is a velocity write on every frame, FiveM's blender: the pose's velocity + clamp(error / blendSmoothS, blendMaxDiffMs),
+//     never more than blendHardCapMs above the pose's velocity, z left to the game, no coordinate write but a snap beyond blendSnapM or a teleport.
+//     BlendWatch compares what the ped did (GET_ENTITY_VELOCITY and its positions) with the velocity written the frame before; an error that does
+//     not close sends the puppet to the rigid follow (LocoLevel::Placed, reasons BlendFighting / BlendNoTrack), never to a bigger push.
+//     LocoInput::swingActive (all modes) holds every task issue and repair while a melee swing animation plays.
+//
 // CONSTANTS (LocoConfig defaults)
 //   idleUp/Down        0.50 / 0.25 m/s  old GTAN GetPedSpeed: walk from 0.5; band below
 //   walkRunUp/Down     3.10 / 2.10 m/s  W11: was 2.90 / 2.40; around 2.6, walk max 1.8 .. run min 3.5
@@ -212,7 +221,12 @@ namespace gage::sync {
 
     // W11: how a moving gait is tasked. Straight: TASK_GO_STRAIGHT_TO_COORD at a far point, re-issued on turn / drift /
     // arrival. Anchor: TASK_GO_TO_ENTITY once at an invisible entity the engine moves every frame (LocoOutput::anchorPos).
-    enum class LocoMode : uint8_t { Straight, Anchor };
+    //
+    // R4 T1 (desync round 4): Blend. The gait task is the straight one (a far point along the pose velocity, issued rarely) and carries ONLY the
+    // animation; the POSITION is driven by a velocity write on every frame, modelled on FiveM's ped blender (CNetBlenderPed): velocity =
+    // the pose's velocity + clamp((pose - ped) / blendSmoothS, blendMaxDiffMs), the vertical velocity left to the game, no coordinate write
+    // except a hard snap beyond blendSnapM (or a real teleport). Cfg::push is ignored in this mode. See "R4 T1" below.
+    enum class LocoMode : uint8_t { Straight, Anchor, Blend };
 
     // T2 (desync round 2): how the position error of a walking / running puppet is closed.
     //   Velocity: SET_ENTITY_VELOCITY (animation velocity + a correction). Its effect on a ped under a task is a MODEL (replaces the
@@ -240,7 +254,10 @@ namespace gage::sync {
         StraightStuck,    // a straight task re-issued after a stall stalled again: nothing moves the ped, follow the pose rigidly
         Recovered,        // a fallback timer ran out: the better level is tried again
         Shared,           // another puppet's controller found the same failure (LevelWitness): imposed here without waiting to see it
+        BlendFighting,    // R4 T1: Blend: the error stayed above blendFailErrM and did not shrink, and the ped moved other than the velocity written
+        BlendNoTrack,     // R4 T1: Blend: the same error without evidence of a fight (blocked, or snaps that did not hold)
     };
+    constexpr int kLocoLevelWhyCount = 10;
 
     // R3 T2 (desync round 3): what the controller has learned about a coordinate write on this puppet. The live log (0.4.7) showed
     // "the task ran, the ped's own speed 0.00 m/s" under TWO different task types: either every coordinate write cancels the walk
@@ -386,6 +403,39 @@ namespace gage::sync {
         int   maxRepairs = 3;
         float deadPlacedMs = 120000.0f, deadPlacedMaxMs = 600000.0f;
 
+        // R4 T1 (desync round 4), LocoMode::Blend only (the numbers are FiveM's blender, CNetBlenderPed, in spirit: velocity = target velocity +
+        // clamp((predicted - object position) / blendSmoothTime, maxVelDiffFromTarget), the vertical velocity kept, no coordinate write).
+        //  - blendSmoothS / blendMaxDiffMs: the horizontal correction is error / blendSmoothS, capped at blendMaxDiffMs on top of the pose's
+        //    (low-passed) velocity. blendHardCapMs is the absolute ceiling of |velocity written - pose velocity| whatever else happens (the 0.4.9
+        //    push reached 30 m/s because only the correction was capped, not the base it was built on): no ladder step, no snap recovery and no
+        //    stall can write more than the pose's velocity + this.
+        //  - blendDeadM / blendStillDeadM / blendStillMaxMs: no write inside the dead band; a standing ped is slid into place at most at
+        //    blendStillMaxMs, and left to the game inside blendStillDeadM.
+        //  - blendSnapM: the only coordinate write, beyond this distance (3D) or on Pose::teleported (the persistent-error snap is off in Blend).
+        //  - self-check: the error above blendFailErrM that is not closing faster than blendFailCloseMs (m/s) for blendFailMs means the writes
+        //    do not carry the ped (or it is blocked): Placed (the rigid follow, whose per-frame step is capped at pose speed + blendHardCapMs)
+        //    for placedMs (doubling), never a bigger push. blendFightMs: a frame whose read-back (GET_ENTITY_VELOCITY) or position-derived
+        //    velocity differs from the velocity written the frame before by more than this counts as a frame the task FIGHTS the write.
+        //  - gait animation: the move blend ratio is a continuous speed knob (the nominal speeds are its integer points), trimmed by an
+        //    integrator on the mean correction (a task that runs faster than the pose is braked by the writes: the blend ratio then falls).
+        //    blendTrimGain 1/s per m/s of mean correction, dead zone blendTrimDeadMs, range blendTrimMin..Max; blendSetStep = the smallest change
+        //    sent to the running task. gaitMinHoldMs: a moving gait, once shown, holds at least this long (Blend sets 400, else 0 = off).
+        //  - blendStallLimit: stall re-issues of a task that never shows a gait before the controller calls the gait source dead
+        //    (NoGaitSource: the position is still carried by the velocity) and re-issues only every blendDeadRetryMs.
+        float blendSmoothS = 0.25f, blendMaxDiffMs = 2.5f, blendHardCapMs = 3.0f;
+        float blendDeadM = 0.03f, blendStillDeadM = 0.12f, blendStillMaxMs = 1.5f;
+        float blendSnapM = 6.0f;
+        float blendFailErrM = 1.2f, blendFailMs = 1000.0f, blendFailCloseMs = 0.5f, blendFightMs = 1.0f;
+        float blendTurnLeadS = 0.3f;      // a gait task issued during a turn aims blendTurnLeadS x the turn rate ahead (<= 70 degrees)
+        float blendFightErrM = 0.7f, blendFightShare = 0.75f;   // ... or this error with this share of frames fighting: twice as fast to Placed
+        float blendTrimGain = 0.25f, blendTrimDeadMs = 0.15f, blendTrimMin = -1.2f, blendTrimMax = 0.6f, blendSetStep = 0.08f;
+        float gaitMinHoldMs = 0.0f;
+        int   blendStallLimit = 3;
+        float blendDeadRetryMs = 15000.0f;
+        // R4 T1, all modes: LocoInput::swingActive (a melee swing animation plays) holds every task re-issue and repair for as long as it is set
+        // and swingHoldMs after (the engine's probe goes false the moment the clip is SEEN playing, the clip plays on for ~0.5 s).
+        float swingHoldMs = 700.0f;
+
         float velTauMs = 120.0f;       // one-pole low-pass of the pose velocity (W1 item 4)
         float steerDeadbandM = 0.08f;  // no steering under this horizontal error
         float ragdollMaxMs = 8.0f;     // cap of the whole velocity while ragdolling
@@ -401,6 +451,10 @@ namespace gage::sync {
     // self-checks and the degradation ladder on. `anchor` picks the first level (Anchor or Straight). One definition, so the
     // numbers measured are the numbers shipped.
     LocoConfig ShippedLocoConfig(bool anchor);
+    // R4 T1: the same for any of the three modes. Anchor = the 0.4.8 combination (anchor + nudge), Straight = the 0.4.9 one (straight +
+    // velocity push), Blend = the round-4 default (straight gait task + blended velocity, self-checks on, the R3 quiet window / repairs off:
+    // the velocity writes are the point of the mode, not a thing to prove harmless).
+    LocoConfig ShippedLocoConfig(LocoMode mode);
     // R3 T2: `c` with every round-3 rule off = the round-2 (0.4.7) controller: no quiet window / write verdict, the lost task trusted on the
     // gait natives alone, 500 ms re-issue spacing, no first-gait window or forced-issue gap, no hold or cap on the ladder, no repair, the
     // short dead timers. The registry switch loco_r3=0 (engine) and the before / after tables of the tests use this one definition.
@@ -449,6 +503,9 @@ namespace gage::sync {
         bool noAnchor = false;
         // R3 T2: LocoRepair steps the engine has already done on this puppet (the next one is asked for after this many).
         int repairsDone = 0;
+        // R4 T1 (task 3's interface): a melee swing animation plays on this puppet. No movement task is issued and no repair (ClearPedTasks) is
+        // asked while it is set (and swingHoldMs after); pending re-issues go out afterwards. The velocity drive and the snap are unaffected.
+        bool swingActive = false;
     };
 
     // Why a GoStraight was issued (LocoOutput::why; the per-trigger counters of LocoStats). W8 item 3: the live test
@@ -523,6 +580,11 @@ namespace gage::sync {
         WriteVerdict writeVerdict = WriteVerdict::Unknown;
         bool verdictChanged = false;
         bool capHit = false;
+        // R4 T1. blend: the Blend velocity drive wrote this frame's velocity (so the engine's push counters are the blend's); corrMs: its
+        // correction on top of the pose velocity (m/s, 0 when nothing was written); swingHeld: a task / repair was held back by swingActive.
+        bool blend = false;
+        float corrMs = 0;
+        bool swingHeld = false;
     };
 
     struct LocoStats
@@ -539,7 +601,7 @@ namespace gage::sync {
         // whose velocity read was our own last push fed back (GET_ENTITY_VELOCITY returned what we set)
         uint32_t settles = 0, graceFrames = 0, contaminated = 0;
         // T2: nudge frames, level changes (and by LocoLevelWhy)
-        uint32_t nudgeFrames = 0, levelChanges = 0, levelWhy[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint32_t nudgeFrames = 0, levelChanges = 0, levelWhy[kLocoLevelWhyCount] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         double nudgedM = 0, travelledM = 0;   // metres written by nudges / metres the ped moved while a moving gait was shown (cumulative)
         // R3 T2: quiet windows opened / ended with the ped showing a gait (writes harm) / ended without one; pulses written; repairs
         // asked; re-issues the spacing rules held back (or deferred); level changes the hold or the cap refused; frames the engine
@@ -548,6 +610,13 @@ namespace gage::sync {
         uint32_t quietWindows = 0, quietHarm = 0, quietClear = 0, pulses = 0, repairs = 0, issuesHeld = 0, changesRefused = 0;
         uint32_t gaitReadFrames = 0, commandedFrames = 0, latencyN = 0;
         double latencySumMs = 0;
+        // R4 T1: frames the blend drive wrote a velocity; frames whose read-back (GET_ENTITY_VELOCITY) / position-derived velocity differed
+        // from the velocity written the frame before by more than blendFightMs, out of the frames both could be compared; frames the
+        // correction sat at its cap; hard snaps that were not a teleport (the first frame excluded); task / repair holds by swingActive;
+        // blend degradations to Placed; the largest correction (m/s); stall re-issues of a task that never showed a gait
+        uint32_t blendFrames = 0, fightVelFrames = 0, fightPosFrames = 0, fightCmpFrames = 0, satFrames = 0, hardSnaps = 0, swingHeld = 0;
+        uint32_t blendDegrades = 0, deadStalls = 0;
+        double maxCorrMs = 0;
     };
 
     class LocomotionController
@@ -601,6 +670,13 @@ namespace gage::sync {
         int LevelChangesTotal() const { return levelChangesTotal_; }
         bool LadderFrozen() const { return ladderFrozen_; }
         float MeanLatencyMs() const { return stats_.latencyN ? static_cast<float>(stats_.latencySumMs / stats_.latencyN) : -1.0f; }
+        // R4 T1: Blend. The mean correction along the track (m/s, negative = the writes brake a ped that runs ahead), the trim of the move blend
+        // ratio it drives, whether the gait source is called dead (no gait in spite of re-issues), and the share of recent comparable frames the
+        // task fought the velocity written (0..1, a low-pass over ~1.5 s).
+        float BlendMeanCorr() const { return static_cast<float>(corrAlongLp_); }
+        float BlendTrim() const { return blendTrim_; }
+        bool NoGaitSource() const { return noGaitSource_; }
+        float FightShare() const { return static_cast<float>(fightShare_); }
         float SelfSpeed() const { return haveSelf_ ? static_cast<float>(std::sqrt(double(selfV_.x) * selfV_.x + double(selfV_.y) * selfV_.y)) : -1.0f; }
 
         // Gait inference with hysteresis: the gait after `current` sees `speed` (m/s).
@@ -611,6 +687,11 @@ namespace gage::sync {
 
     private:
         LocoOutput UpdateImpl(const LocoInput& in);
+        // R4 T1: the Blend velocity drive of one frame (`ped` = where the ped is, after any snap), and its bookkeeping: the comparison of what the
+        // ped did against the velocity written the frame before, the closing rate of the error, the self-check and the trim of the move blend ratio
+        void BlendDrive(const LocoInput& in, const LocoVec& ped, double dt, LocoOutput& o);
+        void BlendWatch(const LocoInput& in, double dt, bool snapped, bool active);
+        void BlendTrimStep(double along, double dt);
         LocoConfig cfg_;
         bool started_ = false;
         Gait gait_ = Gait::Still;           // the gait being shown (debounced)
@@ -697,6 +778,19 @@ namespace gage::sync {
         bool LadderMayChange(bool deeper);   // the hold and the cap (counts a refusal)
         int failSnaps_ = 0; double sinceFailSnapMs_ = 1e9; bool snapStorm_ = false;
 
+        // R4 T1
+        double gaitHeldMs_ = 0;               // how long the commanded gait has been what it is (gaitMinHoldMs)
+        double swingHoldLeftMs_ = 0;
+        float blendTrim_ = 0;                 // trim of the move blend ratio (driven by the mean correction)
+        double corrAlongLp_ = 0;              // low-passed along-track correction (m/s)
+        double blendFailMs_ = 0, closeRate_ = 0, prevErrH_ = -1, fightShare_ = 0, fightF_ = 0, fightN_ = 0;
+        bool havePrevErr_ = false;
+        int deadStallStreak_ = 0;
+        bool noGaitSource_ = false;
+        double prevDirX_ = 0, prevDirY_ = 0, omegaLp_ = 0;   // the pose's direction last frame and its turn rate (rad/s)
+        bool havePrevDir_ = false;
+        bool lastBlendWrite_ = false;         // last frame's output was a blend velocity write (the read-back / position comparison has a reference)
+
         bool ragdollActive_ = false;
         bool haveJumpSeq_ = false;
         int32_t lastJumpSeq_ = 0;
@@ -737,6 +831,11 @@ namespace gage::sync {
         float rate = 1.0f;           // LocoOutput::moveRate
         bool rateClamped = false;    // LocoOutput::rateClamped
         float selfSpeed = -1.0f;     // LocomotionController::SelfSpeed() (the ped's own speed, m/s)
+        // R4 T1
+        LocoVec poseVel;             // the pose's velocity (the base of the blend's correction)
+        bool snapped = false;        // LocoOutput::snap
+        bool blend = false;          // LocoOutput::blend
+        bool blendPlaced = false;    // the Placed level of the blend (the push counters are then nudges)
     };
 
     struct LocoDiagSummary
@@ -755,6 +854,12 @@ namespace gage::sync {
         uint32_t rateFrames = 0;
         double rateMin = 0, rateMean = 0, rateMax = 0, rateClampFrac = 0;
         double selfSpeedMs = 0;                    // mean own speed over the moving frames (net of nudges)
+        // R4 T1: the pose-ped error percentiles (0.05 m bins; the top bin is "8 m and over"), the largest correction on top of the pose velocity
+        // (m/s) over the frames the blend wrote, snaps, frames the read-back / the position-derived velocity differed from the velocity written
+        // the frame before by more than 1 m/s and the frames that could be compared
+        double errP50M = 0, errP95M = 0;
+        double maxCorrMs = 0;
+        uint32_t blendFrames = 0, snapFrames = 0, fightVelFrames = 0, fightPosFrames = 0, fightCmpFrames = 0;
     };
 
     class LocoDiag
@@ -776,6 +881,13 @@ namespace gage::sync {
         double prevNowMs_ = 0;
         double stuckMs_ = 0;
         bool stuckCounted_ = false;
+        // R4 T1
+        static constexpr int kErrBins = 161;
+        uint32_t errHist_[kErrBins] = {};
+        double maxCorr_ = 0;
+        uint32_t blendFrames_ = 0, snapFrames_ = 0, fightVel_ = 0, fightPos_ = 0, fightCmp_ = 0;
+        bool prevPushed_ = false;
+        LocoVec prevPush_;
     };
 
     // R3 T2 (desync round 3): the gait DIAGNOSTIC. "The task ran but the ped showed no gait" was all the 0.4.7 log could say; this puts
@@ -840,10 +952,10 @@ namespace gage::sync {
         double ActiveMs(LocoLevel level, double nowMs) const;
         void Reset() { *this = LevelWitness(); }
         uint32_t Globals() const { return globals_; }
-        static constexpr double kWitnessMs = 60000.0, kImposeStraightMs = 45000.0, kImposeNoRateMs = 120000.0;
+        static constexpr double kWitnessMs = 60000.0, kImposeStraightMs = 45000.0, kImposeNoRateMs = 120000.0, kImposePlacedMs = 45000.0;   // (R4 T1: Placed = the blend's rigid follow)
     private:
         struct Slot { bool have = false; int id = -1; double atMs = 0, untilMs = 0; };
-        Slot slot_[2];   // 0 = anchor failures (-> Straight), 1 = rate ineffective (-> NoRate)
+        Slot slot_[3];   // 0 = anchor failures (-> Straight), 1 = rate ineffective (-> NoRate), 2 = blend fighting the task (-> Placed)
         uint32_t globals_ = 0;
     };
 

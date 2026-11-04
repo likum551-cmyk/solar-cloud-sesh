@@ -142,18 +142,20 @@ namespace {
     // frame without an anchor entity, while aiming, and for 20 s after a lost task.
     // Read by the join worker's OnWelcome and by the game thread's SyncNet (Peer construction): atomic.
     //
-    // The walking-variant test series (client 0.4.8 -> 0.4.11): the build's DEFAULT variant is baked here, one flip per release, so every
-    // player on a version runs the same one with nothing in the registry. A registry value (loco_mode / loco_push) still overrides it and
-    // the Welcome log line says which side decided. 0.4.8 = anchor + nudge, 0.4.9 = straight + velocity, 0.4.10 = anchor + velocity,
-    // 0.4.11 = straight + nudge.
-    constexpr bool kBakedLocoAnchor = false;     // true = anchor, false = straight
-    constexpr bool kBakedLocoNudge = false;      // true = nudge,  false = velocity
-    std::atomic<bool> g_locoAnchor{kBakedLocoAnchor};
+    // The walking-variant test series: the build's DEFAULT variant is baked here, one flip per release, so every player on a version runs the
+    // same one with nothing in the registry. A registry value (loco_mode) still overrides it and the Welcome log line says which side decided.
+    // 0.4.8 = anchor (anchor task + coordinate nudge), 0.4.9 = straight (straight task + velocity push), R4 T1 (0.4.10) = blend (straight task as
+    // the gait source only + a velocity write every frame, libs/sync/locomotion.h "R4 T1"). One tri-state instead of the two bools of 0.4.9:
+    // anchor and straight keep the push they were tested with (loco_push still overrides it for those two).
+    enum LocoSel : int { kLocoSelAnchor = 0, kLocoSelStraight = 1, kLocoSelBlend = 2 };
+    constexpr int kBakedLocoMode = kLocoSelBlend;
+    std::atomic<bool> g_locoAnchor{kBakedLocoMode == kLocoSelAnchor};
+    std::atomic<bool> g_locoBlend{kBakedLocoMode == kLocoSelBlend};
     // T2 (desync round 2): loco_push = nudge (default) | velocity: how a walking puppet's position error is closed. Nudge = a few mm of
     // SET_ENTITY_COORDS_NO_OFFSET per frame (exact whatever SET_ENTITY_VELOCITY does to a ped under a task); velocity = the 0.4.6 push.
     // loco_selfcheck = 0 turns the degradation ladder off (anchor -> straight -> blend-carried speed -> rigid follow, each step
     // logged as "engine: loco level"). Both re-read at every Welcome like loco_mode.
-    std::atomic<bool> g_locoPushNudge{kBakedLocoNudge};
+    std::atomic<bool> g_locoPushNudge{kBakedLocoMode == kLocoSelAnchor};   // (anchor: nudge, straight: velocity; unused by blend)
     std::atomic<bool> g_locoSelfCheck{true};
     // R3 T2 (desync round 3): loco_r3 = 0 switches every round-3 rule off at once (the quiet window and write verdict, the lost task needing
     // the ped's own speed, the re-issue spacing, the ladder hold and cap: sync::Round2Behaviour); loco_repair = 0 only the repairs of a
@@ -164,8 +166,8 @@ namespace {
     std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
     {
-        sync::LocoConfig c = sync::ShippedLocoConfig(g_locoAnchor.load());
-        if (!g_locoPushNudge.load())
+        sync::LocoConfig c = g_locoBlend.load() ? sync::ShippedLocoConfig(sync::LocoMode::Blend) : sync::ShippedLocoConfig(g_locoAnchor.load());
+        if (!g_locoBlend.load() && !g_locoPushNudge.load())
             c.push = sync::PushMode::Velocity;
         c.selfCheck = g_locoSelfCheck.load();
         if (!g_locoR3.load())
@@ -1363,26 +1365,33 @@ namespace {
               g_peerDrive.load() == kDrivePlace ? "PLACEMENT (stage 1: set onto the pose, no animation)"
                                                 : "TASKS (locomotion controller)",
               drive.empty() ? L"<unset>" : drive.c_str());
-        // W11: loco_mode = anchor | straight; unset or anything else = this build's baked variant (kBakedLocoAnchor).
+        // W11 / R4 T1: loco_mode = anchor | straight | blend; unset or anything else = this build's baked variant (kBakedLocoMode).
         const std::wstring locoModeReg = reg::Get(L"loco_mode");
-        const bool locoModeFromReg = locoModeReg == L"anchor" || locoModeReg == L"straight";
-        g_locoAnchor.store(locoModeFromReg ? locoModeReg == L"anchor" : kBakedLocoAnchor);
+        const bool locoModeFromReg = locoModeReg == L"anchor" || locoModeReg == L"straight" || locoModeReg == L"blend";
+        const int locoSel = locoModeFromReg ? (locoModeReg == L"anchor" ? kLocoSelAnchor : locoModeReg == L"blend" ? kLocoSelBlend : kLocoSelStraight)
+                                            : kBakedLocoMode;
+        g_locoAnchor.store(locoSel == kLocoSelAnchor);
+        g_locoBlend.store(locoSel == kLocoSelBlend);
         GLOGI("engine: remote on-foot walking via %s (loco_mode, %s)",
-              g_locoAnchor.load() ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
-                                  : "TASK_GO_STRAIGHT_TO_COORD at a far point",
+              locoSel == kLocoSelBlend ? "BLEND: TASK_GO_STRAIGHT_TO_COORD at a far point as the gait animation only, the position carried by a velocity write on every frame "
+                                         "(pose velocity + a capped correction; FiveM's ped blender); the rigid follow of the pose when the read-back shows the writes are not honoured"
+              : locoSel == kLocoSelAnchor ? "TASK_GO_TO_ENTITY on an invisible anchor (falls back to straight while aiming, without the entity and after a lost task)"
+                                          : "TASK_GO_STRAIGHT_TO_COORD at a far point",
               locoModeFromReg ? "REGISTRY override" : "build default");
-        // T2: the position-error push and the degradation ladder (see LocoCfg). loco_push = nudge | velocity; unset = the baked variant.
+        // T2: the position-error push and the degradation ladder (see LocoCfg). loco_push = nudge | velocity (anchor and straight only; blend has its own
+        // drive); unset = the push that variant was tested with (anchor: nudge, straight: velocity).
         const std::wstring locoPushReg = reg::Get(L"loco_push");
         const bool locoPushFromReg = locoPushReg == L"nudge" || locoPushReg == L"velocity";
-        g_locoPushNudge.store(locoPushFromReg ? locoPushReg == L"nudge" : kBakedLocoNudge);
+        g_locoPushNudge.store(locoPushFromReg ? locoPushReg == L"nudge" : locoSel == kLocoSelAnchor);
         g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
         g_locoR3.store(reg::Get(L"loco_r3") != L"0");
         g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
         GLOGI("engine: remote on-foot round-3 rules %s (loco_r3): quiet window + write verdict, re-issue spacing, ladder hold / cap; repairs of a puppet "
               "no task moves %s (loco_repair)", g_locoR3.load() ? "ON" : "OFF (round-2 controller)", g_locoRepair.load() ? "ON" : "OFF");
         GLOGI("engine: remote on-foot position error closed by %s (loco_push, %s), self-checks / degradation ladder %s (loco_selfcheck)",
-              g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
-              locoPushFromReg ? "REGISTRY override" : "build default",
+              g_locoBlend.load() ? "the BLEND velocity (pose velocity + at most 2.5 m/s, never more than 3 m/s above it; a coordinate write only for a snap beyond 6 m or a teleport; loco_push is not used)"
+              : g_locoPushNudge.load() ? "a coordinate NUDGE (SET_ENTITY_COORDS_NO_OFFSET, a few mm per frame)" : "SET_ENTITY_VELOCITY (0.4.6 push)",
+              g_locoBlend.load() ? "loco_mode=blend" : locoPushFromReg ? "REGISTRY override" : "build default",
               g_locoSelfCheck.load() ? "ON (anchor -> straight -> blend-carried speed -> rigid follow, each step logged)" : "OFF");
         g_locoDegradeReset.store(true);
         // W10: name tags on by default; nametags=0 turns them off, nametags_los=<int> the LOS trace flags.
@@ -4833,7 +4842,7 @@ namespace {
     {
         switch (l)
         {
-        case sync::LocoLevel::Full:     return "full (anchor task + move rate + nudge)";
+        case sync::LocoLevel::Full:     return "full (the configured mode: anchor task + nudge / straight task + velocity / blend velocity)";
         case sync::LocoLevel::Straight: return "straight task";
         case sync::LocoLevel::NoRate:   return "straight task, speed carried by the blend ratio";
         case sync::LocoLevel::Placed:   return "rigid follow of the pose";
@@ -4852,6 +4861,8 @@ namespace {
         case sync::LocoLevelWhy::StraightStuck:   return "the straight task stalled again after a re-issue: nothing moves the ped";
         case sync::LocoLevelWhy::Recovered:       return "a fallback timer ran out: the better level is tried again";
         case sync::LocoLevelWhy::Shared:          return "another puppet's controller found the same failure";
+        case sync::LocoLevelWhy::BlendFighting:   return "BLEND: the ped did other than the velocity written and the error stayed up (the task fights the write)";
+        case sync::LocoLevelWhy::BlendNoTrack:    return "BLEND: the error stayed up with no sign of a fight (blocked, or snaps that did not hold)";
         }
         return "?";
     }
@@ -4881,6 +4892,42 @@ namespace {
     // simulated-ped tests measured). skate = metres our velocity pushes moved the ped / metres it moved, while the pose moves;
     // ~0 means the stride carries it. idle slide = metres pushed while the ped is told to stand. "speed" = from the ped's positions
     // against the pose's. Tasks and the learned animation speeds come from the controller.
+    const char* LocoModeName()
+    {
+        return g_locoBlend.load() ? "blend" : g_locoAnchor.load() ? "anchor" : "straight";
+    }
+    // R4 T1: the one-line verdict of the last 10 s about the blend, from READ-BACKS: frames the velocity the game reports (GET_ENTITY_VELOCITY) and the
+    // ped's own displacement differed from the velocity written the frame before by more than 1 m/s. 'blend ok' | 'blend fighting the task: N frames
+    // ...' | 'blend DEGRADED ...'. Not a blend: says which mode runs.
+    std::string BlendVerdict(const Peer& pe, const sync::LocoDiagSummary& d)
+    {
+        char b[420];
+        if (!g_locoBlend.load())
+        {
+            std::snprintf(b, sizeof(b), "mode %s (no blend verdict)", LocoModeName());
+            return b;
+        }
+        const sync::LocoStats& a = pe.loco.Stats();
+        const sync::LocoStats& o = pe.locoSeen;
+        if (pe.loco.Level() == sync::LocoLevel::Placed)
+        {
+            std::snprintf(b, sizeof(b), "blend DEGRADED to the rigid follow of the pose (%u falls this session, %u in the last 10 s): the writes were not honoured, "
+                          "followed by coordinate steps of at most the pose speed + 3 m/s instead",
+                          (unsigned)a.blendDegrades, (unsigned)(a.blendDegrades - o.blendDegrades));
+            return b;
+        }
+        const uint32_t cmp = d.fightCmpFrames;
+        const uint32_t worst = d.fightVelFrames > d.fightPosFrames ? d.fightVelFrames : d.fightPosFrames;
+        if (cmp >= 30 && worst * 4 >= cmp)
+        {
+            std::snprintf(b, sizeof(b), "blend fighting the task: %u frames the velocity read back differs from the write by > 1 m/s (of %u compared; by the ped's positions %u)",
+                          (unsigned)d.fightVelFrames, (unsigned)cmp, (unsigned)d.fightPosFrames);
+            return b;
+        }
+        std::snprintf(b, sizeof(b), "blend ok (%u of %u frames differ from the write by > 1 m/s by the read-back, %u by positions)", (unsigned)d.fightVelFrames, (unsigned)cmp,
+                      (unsigned)d.fightPosFrames);
+        return b;
+    }
     std::string LocoSlideLine(int id, const Peer& pe)
     {
         const sync::LocoDiagSummary d = pe.slide.Summary();
@@ -4922,6 +4969,20 @@ namespace {
                       a.levelWhy[(int)sync::LocoLevelWhy::Shared] - b.levelWhy[(int)sync::LocoLevelWhy::Shared],
                       g_locoPushNudge.load() ? "nudge" : "velocity");
         line += t2;
+        {
+            // R4 T1: the blend's numbers (also printed in the other modes, where the corrections are the older push / nudge): speed from positions
+            // against the pose, the largest per-frame correction on top of the POSE velocity, snaps, the error percentiles, the verdict
+            char r4[900];
+            std::snprintf(r4, sizeof(r4),
+                          " | R4 T1: mode %s, speed from positions %.2f vs pose %.2f m/s (ratio %.2f), largest per-frame correction %.2f m/s above the pose velocity (mean along the "
+                          "track %.2f), hard snaps %u (%u snap frames incl. teleports), pose-ped error p50 %.2f p95 %.2f max %.2f m, move blend ratio trim %.2f, gait source %s, "
+                          "task issues held by a melee swing %u; verdict: %s",
+                          LocoModeName(), d.derivedSpeedMs, d.poseSpeedMs, d.poseSpeedMs > 0.05 ? d.derivedSpeedMs / d.poseSpeedMs : 0.0, d.maxCorrMs, pe.loco.BlendMeanCorr(),
+                          (unsigned)(a.hardSnaps - b.hardSnaps), (unsigned)d.snapFrames, d.errP50M, d.errP95M, d.maxErrM, pe.loco.BlendTrim(),
+                          pe.loco.NoGaitSource() ? "NONE (the task shows no gait; the position is carried by the velocity)" : "ok", (unsigned)(a.swingHeld - b.swingHeld),
+                          BlendVerdict(pe, d).c_str());
+            line += r4;
+        }
         return line;
     }
 
@@ -4942,7 +5003,7 @@ namespace {
                       a.whyForced - b.whyForced, a.whyBlend - b.whyBlend, a.whyTurn - b.whyTurn, a.whyDrift - b.whyDrift,
                       a.whyArrive - b.whyArrive, a.whyStall - b.whyStall, a.standStill - b.standStill, a.resets - b.resets,
                       hard.c_str(), a.softResets - b.softResets, soft.c_str(), a.softKept - b.softKept,
-                      a.softReissued - b.softReissued, pe.anchor ? "on" : "off", g_locoAnchor.load() ? "anchor" : "straight",
+                      a.softReissued - b.softReissued, pe.anchor ? "on" : "off", LocoModeName(),
                       pe.anchor, a.anchorIssues - b.anchorIssues, a.anchorFrames - b.anchorFrames,
                       a.anchorFallbacks - b.anchorFallbacks, pe.anchorSpawnFails, a.gaitKept - b.gaitKept,
                       (unsigned)pe.lastPed.flags, (unsigned)pe.lastPed.move,
@@ -5120,6 +5181,7 @@ namespace {
                       s.quietHarm, s.quietClear, s.pulses, (int)pe.loco.Level(), (unsigned)pe.loco.LevelChangesTotal(),
                       pe.loco.LadderFrozen() ? " (FROZEN by the cap)" : "", pe.repairsDone, pe.recipe);
         std::string line = buf;
+        line += "; R4 T1 " + BlendVerdict(pe, pe.slide.Summary());
         if (g.commandedFrames > 0)
             line += "; active task types [" + ActiveTaskTypes(pe.ped) + "]";
         return line;
@@ -5691,6 +5753,7 @@ namespace {
             in.noAnchor = !(anchorWanted && EnsureAnchor(pe, pose, nowMs));
         }
         in.repairsDone = pe.repairsDone;                   // R3 T2
+        in.swingActive = pe.swingProbe.Active();           // R4 T1: no movement task / repair while the swing's clip is being read back (task 3's interface)
         // T2: a failure two puppets' controllers found is imposed on this one too (the game is one game), until its timer runs out.
         if (g_locoDegradeReset.exchange(false))
             g_locoDegrade.Reset();
@@ -5698,6 +5761,9 @@ namespace {
             pe.loco.Degrade(sync::LocoLevel::Straight, sync::LocoLevelWhy::Shared, ms);
         if (const double ms = g_locoDegrade.ActiveMs(sync::LocoLevel::NoRate, nowMs); ms > 0.0)
             pe.loco.Degrade(sync::LocoLevel::NoRate, sync::LocoLevelWhy::Shared, ms);
+        if (g_locoBlend.load())
+            if (const double ms = g_locoDegrade.ActiveMs(sync::LocoLevel::Placed, nowMs); ms > 0.0)
+                pe.loco.Degrade(sync::LocoLevel::Placed, sync::LocoLevelWhy::Shared, ms);   // R4 T1: two puppets found the writes ignored
         const sync::LocoOutput o = pe.loco.Update(in);
         if (o.paused)
             return;                                    // leaving a vehicle: the exit animation owns the ped
@@ -5757,6 +5823,10 @@ namespace {
             df.rate = o.moveRate;
             df.rateClamped = o.rateClamped;
             df.selfSpeed = pe.loco.SelfSpeed();
+            df.poseVel = in.vel;                           // R4 T1
+            df.snapped = o.snap;
+            df.blend = o.blend;
+            df.blendPlaced = o.level == sync::LocoLevel::Placed;
             pe.slide.Observe(df);
         }
 

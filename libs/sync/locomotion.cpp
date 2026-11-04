@@ -107,6 +107,14 @@ void LocomotionController::ResetHard()
     quietLeftMs_ = 0.0;
     harmlessEvidMs_ = 0.0;
     sinceIssueGaitMs_ = -1.0;
+    blendFailMs_ = 0.0;         // R4 T1: a new ped / a hard reset restarts the blend's self-check and its trim
+    blendTrim_ = 0.0f;
+    corrAlongLp_ = 0.0;
+    closeRate_ = 0.0;
+    havePrevErr_ = false;
+    fightShare_ = 0.0;
+    fightF_ = fightN_ = 0.0;
+    lastBlendWrite_ = false;
 }
 
 void LocomotionController::Pause(double ms) { pauseMs_ = ms > 0.0 ? ms : 0.0; }
@@ -133,6 +141,8 @@ void LocomotionController::ResetForNewPed()
     snapStorm_ = false;
     failSnaps_ = 0;
     mismatchMs_ = 0.0;
+    noGaitSource_ = false;      // R4 T1: a new ped may have a working gait source
+    deadStallStreak_ = 0;
     ragdollActive_ = false;
     haveJumpSeq_ = false;
     lastJumpSeq_ = 0;
@@ -206,10 +216,17 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
         o.writeVerdict = writeVerdict_;
         o.verdictChanged = verdictChangedPending_;
         o.capHit = capHitPending_;
+        // (R4 T1: a repair is only ever asked for in the evaluation that a melee swing skips, so none is pending while one plays)
         o.repair = repairPending_;
         verdictChangedPending_ = capHitPending_ = false;
         repairPending_ = LocoRepair::None;
     }
+    if (o.blend && o.setVelocity)
+    {
+        ++stats_.blendFrames;
+        if (o.corrMs > stats_.maxCorrMs) stats_.maxCorrMs = o.corrMs;
+    }
+    lastBlendWrite_ = o.blend && o.setVelocity && !o.snap;
     return o;
 }
 
@@ -239,6 +256,12 @@ void LocomotionController::Degrade(LocoLevel to, LocoLevelWhy why, double ms)
         if (rateOffLeftMs_ < ms) rateOffLeftMs_ = ms;
         pendingWhy_ = why;
     }
+    else if (to == LocoLevel::Placed && cfg_.mode == LocoMode::Blend)
+    {
+        // R4 T1: two puppets found that the velocity writes do not carry a ped here: the rigid follow, without finding out again
+        if (placedLeftMs_ < ms) placedLeftMs_ = ms;
+        pendingWhy_ = why;
+    }
 }
 
 LocoConfig ShippedLocoConfig(bool anchor)
@@ -248,6 +271,37 @@ LocoConfig ShippedLocoConfig(bool anchor)
     c.push = PushMode::Nudge;
     c.selfCheck = true;
     c.fastDownFrac = 0.6f;
+    return c;
+}
+
+LocoConfig ShippedLocoConfig(LocoMode mode)
+{
+    if (mode != LocoMode::Blend)
+    {
+        LocoConfig c = ShippedLocoConfig(mode == LocoMode::Anchor);
+        c.push = mode == LocoMode::Anchor ? PushMode::Nudge : PushMode::Velocity;   // 0.4.8 = anchor + nudge, 0.4.9 = straight + velocity
+        return c;
+    }
+    LocoConfig c;
+    c.mode = LocoMode::Blend;
+    c.push = PushMode::Velocity;       // (unused: Blend has its own drive)
+    c.selfCheck = true;
+    c.fastDownFrac = 0.6f;
+    // the velocity writes are the mode: nothing to prove harmless, nothing the engine could repair about them
+    c.quietTrial = false;
+    c.maxRepairs = 0;
+    // a moving gait holds at least 400 ms, a change UP no sooner than a change down (no start-window exemption)
+    c.gaitDebounceMs = 400.0f;
+    c.upDebounceMs = 400.0f;
+    c.startWindowMs = 0.0f;
+    c.gaitMinHoldMs = 400.0f;
+    c.stallFirstMs = 1500.0f;
+    // the gait task's target is a FAR point along the pose velocity (the bearing from the ped must stay within a few degrees of the pose's
+    // direction for the whole life of a task: a nearer target swings the task's heading sideways as the ped closes on it and, when the game
+    // only half-honours the velocity written, drags the ped off the line)
+    c.leadS = 8.0f;
+    c.leadMinM = 12.0f;
+    c.leadMaxM = 40.0f;
     return c;
 }
 
@@ -284,6 +338,12 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     steadyMs_ += dt;
     sinceMoveStartMs_ += dt;
     sinceAnchorStallMs_ += dt;
+    gaitHeldMs_ += dt;
+    // R4 T1: a melee swing plays: tasks and repairs are held for as long as the engine says so and swingHoldMs after
+    if (in.swingActive) swingHoldLeftMs_ = cfg_.swingHoldMs;
+    else if (swingHoldLeftMs_ > 0.0) swingHoldLeftMs_ = swingHoldLeftMs_ > dt ? swingHoldLeftMs_ - dt : 0.0;
+    const bool swingBlocks = swingHoldLeftMs_ > 0.0;
+    const bool blendCfg = cfg_.mode == LocoMode::Blend;
     // R3 T2: a fallback timer that runs out is a level change UP (Recovered): it waits for the hold after the last change and never
     // happens once the cap froze the ladder (the timer then rests at 1 ms: the level stays).
     const bool ladderHolds = cfg_.selfCheck && (ladderFrozen_ || levelHoldLeftMs_ > dt);
@@ -302,6 +362,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     sincePlacedMs_ += dt;
     runDown(rateOffLeftMs_);
     runDown(placedLeftMs_);
+    const bool placedNow = cfg_.selfCheck && placedLeftMs_ > 0.0;   // (R4 T1: after its timer ran down, so the whole frame agrees on the level)
     if (quietActive_) { quietLeftMs_ -= dt; quietElapsedMs_ += dt; }
     if (quietInitial_)
     {
@@ -435,7 +496,12 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     else if (!settling) { pendingGait_ = gait_; pendingMs_ = 0; }
     if (!settling)
     {
+        // R4 T1: a moving gait, once shown, holds gaitMinHoldMs (a pose speed that dips across a band edge for a moment must not make the
+        // animation flap); leaving Still is never held and neither is a teleport
+        if (cfg_.gaitMinHoldMs > 0.0f && cand != gait_ && gait_ != Gait::Still && gaitHeldMs_ < cfg_.gaitMinHoldMs && !in.teleported && started_)
+            cand = gait_;
         if (gait_ == Gait::Still && cand != Gait::Still) sinceMoveStartMs_ = 0;
+        if (cand != gait_) gaitHeldMs_ = 0.0;
         gait_ = cand;
     }
     if (gait_ != gaitPrev_) { steadyMs_ = 0; gaitPrev_ = gait_; }
@@ -465,9 +531,9 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     const double ex = double(in.pos.x) - ped.x, ey = double(in.pos.y) - ped.y, ez = double(in.pos.z) - ped.z;
     const double dist = std::sqrt(ex * ex + ey * ey + ez * ez);
     const double speed3 = std::sqrt(double(in.vel.x) * in.vel.x + double(in.vel.y) * in.vel.y + double(in.vel.z) * in.vel.z);
-    bool snap = !started_ || in.teleported || dist > cfg_.snapBaseM + cfg_.snapPerSpeedS * speed3;
+    bool snap = !started_ || in.teleported || dist > (blendCfg ? double(cfg_.blendSnapM) : cfg_.snapBaseM + cfg_.snapPerSpeedS * speed3);
     bool persistentSnap = false;
-    if (!snap)
+    if (!snap && !blendCfg)   // R4 T1: Blend has no persistent-error snap (the capped velocity and the self-check answer a lasting error)
     {
         offAcc_ += static_cast<float>((dist - cfg_.offToleranceM) * dtS);
         if (offAcc_ < 0.0f) offAcc_ = 0.0f;
@@ -501,6 +567,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         sinceFailSnapMs_ = 0.0;
         if (failSnaps_ >= cfg_.snapStormN) { snapStorm_ = writeVerdict_ != WriteVerdict::Harm; failSnaps_ = 0; }   // (with Harm our own writes make the snaps)
     }
+    if (snap && wasStarted && !in.teleported) ++stats_.hardSnaps;   // R4 T1: a snap that was neither the first nor a teleport
     if (snap)
     {
         o.snap = true;
@@ -524,6 +591,9 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
             o.heading = WrapDeg360(in.pedHeading + WrapDeg180(double(in.heading) - in.pedHeading) * k);
         }
     }
+
+    // R4 T1: the Blend's read-backs and self-check (before the drive: this frame's decision may already be Placed)
+    if (blendCfg) BlendWatch(in, dt, snap, !jumping && !ragdollActive_ && !in.swimming && !placedNow);
 
     // ---- the ped's animation velocity (Sync A) ----
     // GET_ENTITY_VELOCITY is the base of the residual push (the push is that velocity plus a correction). If the game keeps
@@ -567,13 +637,19 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     // and nothing at all while the error is inside the dead band. Jumps, ragdoll and swimming keep the push above.
     {
         // T2: on foot (not jumping, ragdolling or swimming) the position error is closed by a coordinate nudge, not a velocity.
-        const bool nudgeMode = cfg_.push == PushMode::Nudge && !jumping && !ragdollActive_ && !in.swimming;
-        const bool residual = !nudgeMode && cfg_.residualMaxMs > 0.0f && in.havePedVel && !jumping && !ragdollActive_ && !in.swimming;
+        // R4 T1: in Blend the only coordinate writes are the snap and, at the Placed level, the rigid follow (the nudge branch below)
+        const bool nudgeMode = (blendCfg ? placedNow : cfg_.push == PushMode::Nudge) && !jumping && !ragdollActive_ && !in.swimming;
+        const bool blendDrive = blendCfg && !placedNow && !jumping && !ragdollActive_ && !in.swimming;
+        const bool residual = !blendCfg && !nudgeMode && cfg_.residualMaxMs > 0.0f && in.havePedVel && !jumping && !ragdollActive_ && !in.swimming;
         if (!residual || snap) { corrFx_ = corrFy_ = 0.0f; }
         o.setVelocity = true;
         if (snap)
         {
             o.velocity = in.vel;
+        }
+        else if (blendDrive)
+        {
+            BlendDrive(in, ped, dt, o);
         }
         else if (nudgeMode)
         {
@@ -584,7 +660,10 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
             const double he = HLen(hx, hy);
             double dead = placed ? cfg_.placedDeadM : (moving ? cfg_.nudgeDeadM : cfg_.nudgeStillDeadM);
             const double tau = placed ? cfg_.placedTauMs : cfg_.nudgeTauMs;
-            const double cap = placed ? cfg_.placedNudgeMaxMs : (moving ? cfg_.nudgeMaxMs : cfg_.nudgeStillMaxMs);
+            double cap = placed ? cfg_.placedNudgeMaxMs : (moving ? cfg_.nudgeMaxMs : cfg_.nudgeStillMaxMs);
+            // R4 T1: the rigid follow of the Blend keeps up with the pose it follows (a sprint is 7.5 m/s; the old fixed 8 m/s lagged it) and
+            // never writes more than the pose's own speed + the blend's correction ceiling per second
+            if (placed && blendCfg) cap = HLen(vf_.x, vf_.y) + cfg_.blendHardCapMs;
             // the start of a movement: the clip is still getting up to speed, a bounded lag is tolerated (Sync A's grace, as a band)
             if (moving && !placed && sinceMoveStartMs_ < cfg_.startGraceMs && cfg_.nudgeStartGraceM > dead)
             {
@@ -592,6 +671,14 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
                 if (he < dead) ++stats_.graceFrames;
             }
             double dx = 0, dy = 0, dzv = 0;
+            // R4 T1: the rigid follow of the Blend adds the part of the pose's velocity the ped does not carry itself (the pose velocity less
+            // the ped's own displacement net of our writes), so a pose at 7 m/s is not followed 0.4 m late
+            double ffx = 0, ffy = 0;
+            if (placed && blendCfg && haveSelf_)
+            {
+                ffx = (double(vf_.x) - selfV_.x) * dtS;
+                ffy = (double(vf_.y) - selfV_.y) * dtS;
+            }
             // R3 T2: a quiet window writes nothing; with the verdict Harm (every write cancels the walk) the error is closed by one
             // PULSE per pulseMs beyond pulseMinErrM instead of a write every frame (the rigid Placed follow stays per frame: nothing
             // else is left there).
@@ -623,6 +710,13 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
                     dx = hx / he * mag;
                     dy = hy / he * mag;
                 }
+                if (ffx != 0.0 || ffy != 0.0)
+                {
+                    dx += ffx;
+                    dy += ffy;
+                    const double tm = HLen(dx, dy), maxStep2 = cap * dtS;
+                    if (tm > maxStep2 && tm > 0.0) { dx *= maxStep2 / tm; dy *= maxStep2 / tm; }
+                }
                 const double dz = double(in.pos.z) - ped.z;
                 if (std::fabs(dz) > cfg_.nudgeZBandM)
                 {
@@ -630,6 +724,17 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
                     if (cz > cfg_.zCorrMaxMs) cz = cfg_.zCorrMaxMs;
                     if (cz < -cfg_.zCorrMaxMs) cz = -cfg_.zCorrMaxMs;
                     dzv = cz * dtS;
+                }
+            }
+            if (placed && blendCfg)
+            {
+                // the rigid follow still lets the gait task run: the trim keeps braking / speeding it by what the follow has to close
+                const double spdP = HLen(vf_.x, vf_.y);
+                if (moving && spdP >= 1.0)
+                {
+                    // (the part of the pose's velocity the ped does not carry itself, along the track: negative = it runs ahead of the pose)
+                    const double ca = haveSelf_ ? ((double(vf_.x) - selfV_.x) * vf_.x + (double(vf_.y) - selfV_.y) * vf_.y) / spdP : 0.0;
+                    BlendTrimStep(Clamp(ca, -double(cfg_.blendMaxDiffMs), double(cfg_.blendMaxDiffMs)), dt);
                 }
             }
             const double nm = HLen(dx, dy);
@@ -749,6 +854,19 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         dirx = -std::sin(r);
         diry = std::cos(r);
     }
+    // R4 T1: the pose's turn rate (rad/s, low-passed): a gait task issued in the middle of a turn aims where the turn is going, not where it
+    // has got to (an issue 0.3 s into a 90 degree turn aimed 45 degrees short, and a ped half-obeying its velocity walked the old line)
+    {
+        if (blendCfg && sp >= 1.0 && havePrevDir_ && dt >= 4.0 && !in.teleported)
+        {
+            const double cr = prevDirX_ * diry - prevDirY_ * dirx, dp = prevDirX_ * dirx + prevDirY_ * diry;
+            const double w = std::atan2(cr, dp) / (dt / 1000.0);
+            omegaLp_ += (w - omegaLp_) * (1.0 - std::exp(-dt / 150.0));
+        }
+        else omegaLp_ = 0.0;
+        if (blendCfg && sp >= 1.0) { prevDirX_ = dirx; prevDirY_ = diry; havePrevDir_ = true; }
+        else havePrevDir_ = false;
+    }
     if (anchorMode)
     {
         // Anchor mode: the entity the ped runs to is moved EVERY frame to pose + direction * lead (the pose is already the
@@ -788,7 +906,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     if (holding)
     {
         // about to stand still: let the running task finish, issue nothing new (the move rate is held: it only lasts while called)
-        if (rateAvail && !in.swimming) { o.setMoveRate = true; o.moveRate = lastRate_; }
+        if (rateAvail && !in.swimming && !blendCfg) { o.setMoveRate = true; o.moveRate = lastRate_; }
         return o;
     }
     if (gait_ == Gait::Still)
@@ -796,7 +914,12 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         mismatchMs_ = 0;
         reevaluate_ = false;      // nothing to keep or re-issue: the stand-still task is the running one
         gaitShown_ = Gait::Still;
-        if (lastTask_ != LocoTask::StandStill || forceIssue_)
+        if (swingBlocks && (lastTask_ != LocoTask::StandStill || forceIssue_))
+        {
+            o.swingHeld = true;       // R4 T1: held while a melee swing plays (forceIssue_ stays: it goes out afterwards)
+            ++stats_.swingHeld;
+        }
+        else if (lastTask_ != LocoTask::StandStill || forceIssue_)
         {
             o.task = LocoTask::StandStill;
             o.standStillMs = cfg_.standStillMs;
@@ -815,18 +938,39 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     // seconds (GTAN's 1 s lead made the target "reached" after half a second).
     const double leadM = settling ? 0.0 : Clamp(sp * cfg_.leadS, cfg_.leadMinM, cfg_.leadMaxM);
     LocoVec anchor; // the target without its lead: where the pose is, plus the ped's error to it
-    anchor.x = static_cast<float>(in.pos.x + (double(in.pos.x) - ped.x));
-    anchor.y = static_cast<float>(in.pos.y + (double(in.pos.y) - ped.y));
+    // (Blend: the target is on the POSE's line. The ped's error is closed by the velocity; aiming the task past the pose by that error made a
+    // transient error at the moment of the issue a lasting sideways aim for the whole life of the task)
+    anchor.x = static_cast<float>(in.pos.x + (blendCfg ? 0.0 : double(in.pos.x) - ped.x));
+    anchor.y = static_cast<float>(in.pos.y + (blendCfg ? 0.0 : double(in.pos.y) - ped.y));
     LocoVec target;
-    target.x = static_cast<float>(anchor.x + dirx * leadM);
-    target.y = static_cast<float>(anchor.y + diry * leadM);
+    double tdx = dirx, tdy = diry;
+    if (blendCfg && omegaLp_ != 0.0)
+    {
+        const double a = Clamp(omegaLp_ * cfg_.blendTurnLeadS, -1.2, 1.2), ca = std::cos(a), sa = std::sin(a);
+        tdx = dirx * ca - diry * sa;
+        tdy = dirx * sa + diry * ca;
+    }
+    target.x = static_cast<float>(anchor.x + tdx * leadM);
+    target.y = static_cast<float>(anchor.y + tdy * leadM);
     target.z = in.pos.z;
 
     // Animation speed. The override scales the gait animation to the pose speed (rate = speed over the
     // gait's nominal speed, clamped); the task's blend ratio is then the plain gait. Without it the
     // blend ratio itself carries the speed, quantised so it changes rarely.
     float blend = BlendRatio(gait_);
-    if (rateAvail && !in.swimming)
+    if (blendCfg)
+    {
+        // R4 T1: the move blend ratio is a continuous speed knob, the nominal speeds its integer points (1 walk .. 3 sprint), trimmed by what
+        // the writes had to correct; no move rate override (it would scale the speed a second time)
+        double b;
+        if (sp < cfg_.nominalWalk) b = sp / cfg_.nominalWalk;
+        else if (sp < cfg_.nominalRun) b = 1.0 + (sp - cfg_.nominalWalk) / (cfg_.nominalRun - cfg_.nominalWalk);
+        else b = 2.0 + (sp - cfg_.nominalRun) / (cfg_.nominalSprint - cfg_.nominalRun);
+        b += blendTrim_;
+        blend = static_cast<float>(Clamp(b, 0.5, 3.0));
+        rateIneffMs_ = 0.0;
+    }
+    else if (rateAvail && !in.swimming)
     {
         // Sync A: the closed loop. The speed to show is the pose's plus what closes the along-track error in rateTcS (a ped
         // behind the pose runs faster, one ahead slower; settling: the distance to the pose), over the gait's LEARNED nominal.
@@ -933,12 +1077,15 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         }
     }
     else winMs_ = winNudgedM_ = winTravelM_ = 0.0;
+    if (blendCfg) { stuckNow = draggingNow = false; lagMs_ = 0.0; }   // R4 T1: the blend's own self-check (BlendWatch) replaces both
+    // R4 T1: a gait read after a stall re-issue ends the dead-gait streak
+    if (blendCfg && gait_ != Gait::Still && in.pedGait != Gait::Still) { deadStallStreak_ = 0; noGaitSource_ = false; }
 
     // A stall: the ped shows no gait at all although a moving one is commanded (the task ended or was
     // cancelled by the game). The only gait-mismatch trigger left; the others were churn.
     mismatchMs_ = (in.pedGait == Gait::Still && !in.swimming &&
                    !(cfg_.selfCheck && writeVerdict_ == WriteVerdict::Harm && sinceWriteMs_ < cfg_.harmSettleMs)) ? mismatchMs_ + dt : 0.0;   // a swimmer shows no land gait
-    if (cfg_.selfCheck && cfg_.lostNeedsLowSpeed && mismatchMs_ > 0.0 && haveSelf_ && sp >= cfg_.stuckMinPoseMs &&
+    if (cfg_.selfCheck && cfg_.lostNeedsLowSpeed && !blendCfg && mismatchMs_ > 0.0 && haveSelf_ && sp >= cfg_.stuckMinPoseMs &&
         HLen(selfV_.x, selfV_.y) >= 0.6 * sp)
         mismatchMs_ = 0.0;   // R3 T2: it moves with the pose (its own displacement agrees) although the gait natives read Still: not lost
 
@@ -986,6 +1133,15 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         }
     }
 
+    // R4 T1: a melee swing animation plays: no task is issued and no stall / turn / drift rule is evaluated (their side effects would repeat on
+    // every frame of the swing); forceIssue_ and a pending SoftReset stay, so the task goes out right after
+    if (swingBlocks)
+    {
+        o.swingHeld = true;
+        ++stats_.swingHeld;
+        return o;
+    }
+
     // Re-issue only when the task would otherwise be wrong: the commanded (debounced) gait changed, the
     // blend ratio moved a step (fallback only), or - at most every minReissueMs - the direction turned
     // by more than turnReissueDeg, the target drifted driftM from where the last one has moved to, the
@@ -1000,7 +1156,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     if (!issue && gait_ != gaitShown_ && gaitShown_ != Gait::Still)
         ++stats_.gaitKept;
     gaitShown_ = gait_;
-    if (!issue && !rateAvail && !rateLadderOff && sinceIssueMs_ >= cfg_.blendReissueMs &&
+    if (!issue && !blendCfg && !rateAvail && !rateLadderOff && sinceIssueMs_ >= cfg_.blendReissueMs &&
         std::fabs(blend - lastBlend_) >= cfg_.blendStep - 1e-4f)
     {
         issue = true;
@@ -1055,7 +1211,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         double driftM = HLen(anchor.x - px, anchor.y - py);
         if (lastSp >= kDirMinSpeedMs)
             driftM = std::fabs((anchor.x - px) * (-double(lastTargetVel_.y) / lastSp) + (anchor.y - py) * (double(lastTargetVel_.x) / lastSp));
-        const bool drift = !anchorMode && driftM > cfg_.driftM;
+        const bool drift = !anchorMode && !blendCfg && driftM > cfg_.driftM;   // (Blend: the position is not the task's job)
         bool turn = false;
         if (sp >= cfg_.idleUp && lastSp >= cfg_.idleUp)
         {
@@ -1068,13 +1224,13 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         // Sync A: a lost task is noticed stallFirstMs after its issue; only after a stall re-issue does stallRetryMs apply (the first
         // stall used to wait 2.5 s: a puppet whose go-to failed was dragged along in an idle pose for that long, at every start).
         const bool lostNow = mismatchMs_ >= cfg_.stallMs;
-        const bool stormNow = snapStorm_;
+        const bool stormNow = snapStorm_ && !blendCfg;
         // R3 T2: the first stall waits firstGaitWindowMs while the issue is still waiting for its first gait (a task that has not had
         // its chance is not lost), and a failure seen while coordinate writes were flowing first gets a QUIET window.
         const double stallFirst = (cfg_.selfCheck && sinceIssueGaitMs_ >= 0.0)
                                       ? std::fmax(double(cfg_.stallFirstMs), double(cfg_.firstGaitWindowMs)) : double(cfg_.stallFirstMs);
         const bool fireNow = !soft && (lostNow || stuckNow || stormNow || (draggingNow && anchorMode)) &&
-                             (stormNow || sinceIssueMs_ >= (lastIssueWasStall_ ? cfg_.stallRetryMs : stallFirst));
+                             (stormNow || sinceIssueMs_ >= (noGaitSource_ ? double(cfg_.blendDeadRetryMs) : (lastIssueWasStall_ ? cfg_.stallRetryMs : stallFirst)));
         bool quietHold = quietActive_;
         if (fireNow && cfg_.selfCheck && cfg_.quietTrial && writeVerdict_ == WriteVerdict::Unknown && !quietActive_ && placedLeftMs_ <= 0.0 &&
             (lostNow || stuckNow || stormNow))
@@ -1110,7 +1266,14 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
             sinceStallEventMs_ = 0.0;
         }
         snapStorm_ = false;
-        if (stallNow && !anchorMode && cfg_.selfCheck && stallEvents_ >= 2 && placedLeftMs_ <= 0.0)
+        if (stallNow && blendCfg)
+        {
+            // R4 T1: a task that never shows a gait: re-issued (spaced), and after blendStallLimit tries the source is called dead. The
+            // position is carried by the velocity either way, so there is nothing to repair and no level to give up.
+            ++stats_.deadStalls;
+            if (++deadStallStreak_ >= cfg_.blendStallLimit) noGaitSource_ = true;
+        }
+        if (stallNow && !blendCfg && !anchorMode && cfg_.selfCheck && stallEvents_ >= 2 && placedLeftMs_ <= 0.0)
         {
             // The straight task was re-issued after a stall and stalled again: nothing the tasks do moves this ped. R3 T2: before the
             // rigid follow, the ENGINE is asked to repair the ped (clear its tasks and flags; then the lean and the alt creation
@@ -1230,7 +1393,17 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         // quantised speed and the Blend rule above re-issues.
         // Held every frame it differs from the issued one (the task may reassert its own), and once more when it is back at
         // the issued one (what was set last stays).
-        if ((rateAvail || rateLadderOff) && (std::fabs(blend - lastBlend_) > 1e-4f || std::fabs(blend - blendSet_) > 1e-4f))
+        if (blendCfg)
+        {
+            // R4 T1: the blend ratio is the continuous speed knob: sent to the running task when it moved a step (cfg_.blendSetStep)
+            if (std::fabs(blend - blendSet_) >= cfg_.blendSetStep)
+            {
+                o.setBlend = true;
+                o.moveBlendRatio = blend;
+                blendSet_ = blend;
+            }
+        }
+        else if ((rateAvail || rateLadderOff) && (std::fabs(blend - lastBlend_) > 1e-4f || std::fabs(blend - blendSet_) > 1e-4f))
         {
             o.setBlend = true;
             o.moveBlendRatio = blend;
@@ -1240,6 +1413,136 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     return o;
 }
 
+// R4 T1: what the ped did against the velocity written the frame before, how fast the error closes, the self-check that sends the blend to
+// the rigid follow when the writes do not carry the ped, and (BlendDrive) the velocity itself.
+void LocomotionController::BlendWatch(const LocoInput& in, double dt, bool snapped, bool active)
+{
+    const double dtS = dt / 1000.0;
+    const double errH = HLen(double(in.pos.x) - in.pedPos.x, double(in.pos.y) - in.pedPos.y);
+    if (lastBlendWrite_ && !snapped && !in.teleported && havePrevPed_ && dt >= 4.0 && dt <= 250.0)
+    {
+        // the ped's own displacement over the frame (positions, net of nothing: Blend writes no coordinate except a snap) and the velocity
+        // the game reports, each against what was written. Two readings because either can lie (a read that returns our own write; a
+        // displacement stopped by a wall): the share of frames either differs by more than blendFightMs is the "fight".
+        const double ivx = (double(in.pedPos.x) - prevPedAfter_.x) / dtS, ivy = (double(in.pedPos.y) - prevPedAfter_.y) / dtS;
+        const bool fightPos = HLen(ivx - lastPush_.x, ivy - lastPush_.y) > cfg_.blendFightMs;
+        const bool fightVel = in.havePedVel && HLen(double(in.pedVel.x) - lastPush_.x, double(in.pedVel.y) - lastPush_.y) > cfg_.blendFightMs;
+        ++stats_.fightCmpFrames;
+        if (fightPos) ++stats_.fightPosFrames;
+        if (fightVel) ++stats_.fightVelFrames;
+        // the share over a leaky window (half a second of frames): a ped that does nothing it was told is seen in a dozen frames
+        const double dk = std::exp(-dt / 600.0);
+        fightF_ = fightF_ * dk + (fightPos || fightVel ? 1.0 : 0.0);
+        fightN_ = fightN_ * dk + 1.0;
+        fightShare_ = fightN_ >= 8.0 ? fightF_ / fightN_ : 0.0;
+    }
+    if (havePrevErr_ && !snapped && !in.teleported && dt >= 4.0 && dt <= 250.0)
+    {
+        const double inst = (prevErrH_ - errH) / dtS;
+        closeRate_ += (inst - closeRate_) * (1.0 - std::exp(-dt / 300.0));
+    }
+    else closeRate_ = 0.0;
+    prevErrH_ = snapped ? 0.0 : errH;
+    havePrevErr_ = true;
+    if (!cfg_.selfCheck) return;
+    const bool storm = snapStorm_;
+    snapStorm_ = false;                      // (a snap storm in Blend is a tracking failure, not a stalled task)
+    // two ways to a failure: a big error that does not close, or a moderate one that does not close while nearly every frame shows the ped
+    // doing other than the velocity written (the writes are ignored: no reason to wait for the error to grow)
+    const bool slowFail = errH > cfg_.blendFailErrM && closeRate_ < cfg_.blendFailCloseMs;
+    const bool fightFail = errH > cfg_.blendFightErrM && fightShare_ > cfg_.blendFightShare && closeRate_ < 0.3;
+    if (active && !snapped && (slowFail || fightFail)) blendFailMs_ += dt * (fightFail ? 2.0 : 1.0);
+    else blendFailMs_ = blendFailMs_ > 2.0 * dt ? blendFailMs_ - 2.0 * dt : 0.0;
+    if (active && (blendFailMs_ >= cfg_.blendFailMs || storm) && LadderMayChange(true))
+    {
+        // the writes do not carry the ped (or something holds it): the rigid follow, whose per-frame step is capped at the pose's speed +
+        // blendHardCapMs, never a bigger push. It is tried again after the timer (doubling per failure in a row).
+        if (sincePlacedMs_ > 300000.0) placedFailStreak_ = 0;
+        double dur = cfg_.placedMs;
+        for (int i = 0; i < placedFailStreak_ && dur < cfg_.placedDurMaxMs; ++i) dur *= 2.0;
+        if (dur > cfg_.placedDurMaxMs) dur = cfg_.placedDurMaxMs;
+        ++placedFailStreak_;
+        sincePlacedMs_ = 0.0;
+        placedLeftMs_ = dur;
+        pendingWhy_ = fightShare_ >= 0.3 ? LocoLevelWhy::BlendFighting : LocoLevelWhy::BlendNoTrack;
+        ++stats_.blendDegrades;
+        blendFailMs_ = 0.0;
+        corrAlongLp_ = 0.0;
+        closeRate_ = 0.0;
+    }
+}
+
+void LocomotionController::BlendDrive(const LocoInput& in, const LocoVec& ped, double dt, LocoOutput& o)
+{
+    const bool moving = gait_ != Gait::Still;
+    const double hx = double(in.pos.x) - ped.x, hy = double(in.pos.y) - ped.y;
+    const double he = HLen(hx, hy);
+    const double dead = moving ? cfg_.blendDeadM : cfg_.blendStillDeadM;
+    o.blend = true;
+    const double spd = HLen(vf_.x, vf_.y);
+    if (!moving && he < dead)
+    {
+        o.setVelocity = false;               // a standing ped near its pose: the game's idle owns it
+        corrAlongLp_ *= 0.9;
+        return;
+    }
+    // FiveM's blender: velocity = target velocity + clamp((predicted - object position) / blendSmoothTime, maxVelDiffFromTarget)
+    double cx = 0, cy = 0;
+    const double capC = moving ? cfg_.blendMaxDiffMs : cfg_.blendStillMaxMs;
+    if (he >= dead && he > 1e-6)
+    {
+        const double tS = cfg_.blendSmoothS > 0.01f ? double(cfg_.blendSmoothS) : 0.01;
+        double cl = he / tS;
+        if (cl >= capC) { cl = capC; ++stats_.satFrames; }
+        cx = hx / he * cl;
+        cy = hy / he * cl;
+    }
+    double vx = double(vf_.x) + cx, vy = double(vf_.y) + cy;
+    // the ceiling: whatever the base and the correction add up to, never more than blendHardCapMs beyond the pose's own (raw) velocity
+    const double ddx = vx - in.vel.x, ddy = vy - in.vel.y, dl = HLen(ddx, ddy);
+    if (dl > cfg_.blendHardCapMs && dl > 0.0)
+    {
+        vx = in.vel.x + ddx * cfg_.blendHardCapMs / dl;
+        vy = in.vel.y + ddy * cfg_.blendHardCapMs / dl;
+    }
+    o.velocity.x = static_cast<float>(vx);
+    o.velocity.y = static_cast<float>(vy);
+    // vertical: the game's physics owns it (a read-and-rewrite of its own z velocity) unless the pose is far above / below the ped
+    double vz = in.vel.z;
+    o.velocityZFromPhysics = true;
+    const double dz = double(in.pos.z) - ped.z;
+    if (std::fabs(dz) > cfg_.zDeadbandM)
+    {
+        double cz = cfg_.zGain * (dz > 0 ? dz - cfg_.zDeadbandM : dz + cfg_.zDeadbandM);
+        if (cz > cfg_.zCorrMaxMs) cz = cfg_.zCorrMaxMs;
+        if (cz < -cfg_.zCorrMaxMs) cz = -cfg_.zCorrMaxMs;
+        vz += cz;
+        o.velocityZFromPhysics = false;
+    }
+    o.velocity.z = static_cast<float>(vz);
+    o.corrMs = static_cast<float>(HLen(vx - in.vel.x, vy - in.vel.y));
+    if (moving && spd >= 1.0) BlendTrimStep((cx * vf_.x + cy * vf_.y) / spd, dt);
+    else corrAlongLp_ *= 0.95;
+}
+
+// The trim of the move blend ratio: a task that runs faster than the pose is braked by the writes (the mean correction along the track is
+// negative) and its blend ratio falls until the writes need not brake it; one that is slower is the mirror image. `along` is the correction
+// along the pose's direction (m/s) this frame: the blend's own, or at the Placed level the error that the rigid follow closes.
+void LocomotionController::BlendTrimStep(double along, double dt)
+{
+    corrAlongLp_ += (along - corrAlongLp_) * (1.0 - std::exp(-dt / 400.0));
+    if (accLp_ < cfg_.steadyAccMs2 && sinceMoveStartMs_ >= 600.0)
+    {
+        const double ex = std::fabs(corrAlongLp_) - cfg_.blendTrimDeadMs;
+        if (ex > 0.0)
+        {
+            blendTrim_ = static_cast<float>(blendTrim_ + (corrAlongLp_ < 0 ? -1.0 : 1.0) * cfg_.blendTrimGain * ex * dt / 1000.0);
+            if (blendTrim_ < cfg_.blendTrimMin) blendTrim_ = cfg_.blendTrimMin;
+            if (blendTrim_ > cfg_.blendTrimMax) blendTrim_ = cfg_.blendTrimMax;
+        }
+    }
+}
+
 void LocoDiag::Observe(const LocoDiagFrame& f)
 {
     ++frames_;
@@ -1247,6 +1550,12 @@ void LocoDiag::Observe(const LocoDiagFrame& f)
     const double err = HLen(hx, hy);
     errSum_ += err;
     if (err > errMax_) errMax_ = err;
+    {
+        int bin = static_cast<int>(err / 0.05);
+        if (bin >= kErrBins) bin = kErrBins - 1;
+        ++errHist_[bin];
+    }
+    if (f.snapped) ++snapFrames_;
     const double dtS = f.dtMs > 0 ? f.dtMs / 1000.0 : 0.0;
     // the ped's speed from its positions: this frame's read against the previous one (the distance it moved in dt)
     double derived = 0;
@@ -1254,6 +1563,16 @@ void LocoDiag::Observe(const LocoDiagFrame& f)
     const bool had = havePrev_ && gapMs > 0.0 && gapMs <= 250.0;
     if (had)
         derived = HLen(double(f.pedPos.x) - prevPed_.x, double(f.pedPos.y) - prevPed_.y) / (gapMs / 1000.0);
+    // R4 T1: what the ped did against the velocity written the frame before (the read-back and the position-derived velocity)
+    if (prevPushed_ && !f.snapped && had)
+    {
+        ++fightCmp_;
+        if (f.havePedVel && HLen(double(f.pedVel.x) - prevPush_.x, double(f.pedVel.y) - prevPush_.y) > 1.0) ++fightVel_;
+        const double ivx = (double(f.pedPos.x) - prevPed_.x) / (gapMs / 1000.0), ivy = (double(f.pedPos.y) - prevPed_.y) / (gapMs / 1000.0);
+        if (HLen(ivx - prevPush_.x, ivy - prevPush_.y) > 1.0) ++fightPos_;
+    }
+    prevPushed_ = f.pushed && f.blend && !f.snapped;
+    prevPush_ = f.push;
     prevPed_ = f.pedPos;
     prevNowMs_ = f.nowMs;
     havePrev_ = true;
@@ -1263,6 +1582,13 @@ void LocoDiag::Observe(const LocoDiagFrame& f)
         anchorSum_ += ad;
         if (ad > anchorMax_) anchorMax_ = ad;
         ++anchorFrames_;
+    }
+    if (f.pushed && f.blend)
+    {
+        // the blend's push is measured against the POSE velocity (the base it is built on), not against the ped's own read
+        ++blendFrames_;
+        const double cm = HLen(double(f.push.x) - f.poseVel.x, double(f.push.y) - f.poseVel.y);
+        if (cm > maxCorr_) maxCorr_ = cm;
     }
     if (f.pushed)
     {
@@ -1340,6 +1666,24 @@ LocoDiagSummary LocoDiag::Summary() const
     s.rateFrames = rateFrames_;
     if (rateFrames_) { s.rateMin = rateMin_; s.rateMax = rateMax_; s.rateMean = rateSum_ / rateFrames_; s.rateClampFrac = double(rateClamped_) / rateFrames_; }
     if (selfN_) s.selfSpeedMs = selfSum_ / selfN_;
+    s.maxCorrMs = maxCorr_;
+    s.blendFrames = blendFrames_;
+    s.snapFrames = snapFrames_;
+    s.fightVelFrames = fightVel_;
+    s.fightPosFrames = fightPos_;
+    s.fightCmpFrames = fightCmp_;
+    if (frames_)
+    {
+        const uint32_t n50 = (frames_ + 1) / 2, n95 = static_cast<uint32_t>(frames_ * 0.95 + 0.999);
+        uint32_t acc = 0;
+        bool d50 = false, d95 = false;
+        for (int i = 0; i < kErrBins && !(d50 && d95); ++i)
+        {
+            acc += errHist_[i];
+            if (!d50 && acc >= n50) { s.errP50M = (i + 1) * 0.05; d50 = true; }
+            if (!d95 && acc >= n95) { s.errP95M = (i + 1) * 0.05; d95 = true; }
+        }
+    }
     return s;
 }
 
@@ -1390,11 +1734,12 @@ bool LevelWitness::Report(LocoLevelWhy why, int id, double nowMs)
     int k = -1;
     if (why == LocoLevelWhy::AnchorLost || why == LocoLevelWhy::AnchorStuck || why == LocoLevelWhy::AnchorDragging) k = 0;
     else if (why == LocoLevelWhy::RateIneffective) k = 1;
+    else if (why == LocoLevelWhy::BlendFighting) k = 2;      // R4 T1
     if (k < 0) return false;
     Slot& s = slot_[k];
     if (s.have && s.id != id && nowMs - s.atMs <= kWitnessMs)
     {
-        s.untilMs = nowMs + (k == 0 ? kImposeStraightMs : kImposeNoRateMs);
+        s.untilMs = nowMs + (k == 0 ? kImposeStraightMs : k == 1 ? kImposeNoRateMs : kImposePlacedMs);
         s.have = false;
         ++globals_;
         return true;
@@ -1407,7 +1752,7 @@ bool LevelWitness::Report(LocoLevelWhy why, int id, double nowMs)
 
 double LevelWitness::ActiveMs(LocoLevel level, double nowMs) const
 {
-    const int k = level == LocoLevel::Straight ? 0 : level == LocoLevel::NoRate ? 1 : -1;
+    const int k = level == LocoLevel::Straight ? 0 : level == LocoLevel::NoRate ? 1 : level == LocoLevel::Placed ? 2 : -1;
     if (k < 0) return 0.0;
     return slot_[k].untilMs > nowMs ? slot_[k].untilMs - nowMs : 0.0;
 }
