@@ -5250,6 +5250,17 @@ bool World::SetEntityMaxHealth(int32_t entity, int value) {
     return callHandleInt(*this, native::SET_ENTITY_MAX_HEALTH, entity, value);
 }
 
+bool World::SetPedMaxHealth(int32_t ped, int value) {
+    return callHandleInt(*this, native::SET_PED_MAX_HEALTH, ped, value);
+}
+
+bool World::SetPlayerMaxArmour(int value) {
+    uint64_t player[4] = {};
+    if (!CallNative(native::PLAYER_ID, nullptr, 0, player)) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)player[0], (uint64_t)(uint32_t)value };
+    return CallNative(native::SET_PLAYER_MAX_ARMOUR, args, 2, nullptr);
+}
+
 int World::EntityExists(int32_t entity) {
     if (!entity) return 0;
     uint64_t arg[] = { entArg(entity) };

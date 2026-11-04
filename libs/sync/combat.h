@@ -25,12 +25,81 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 namespace gage::sync {
+
+    // ---- R3 T1: the health scale (DIRECT or SCALED) ------------------------------------------------------------
+    //
+    // Live 0.4.7: Welcome.playerHealth 200 -> the ped's maximum 300, GET_ENTITY_MAX_HEALTH read 300, yet the player
+    // ped's health never rose above 200 (bar 50 %, the reconciler gave up). What GTA does with a health above 200 is
+    // therefore MEASURED at the start (HealthController) and the engine runs in one of two modes:
+    //   DIRECT  GTA holds 100 + playerHealth: the ped's health IS the server's number plus 100 (the 0.4.7 behaviour).
+    //   SCALED  GTA holds only 100 + ceiling (ceiling < playerHealth): the server's number stays the truth and the ped
+    //           carries a PROPORTIONAL value in 101..100+ceiling, never above the ceiling (so it never reads as a
+    //           mismatch). Damage the tracker sees in GTA units is scaled back by playerHealth / ceiling.
+    enum class HealthMode : uint8_t { Auto, Direct, Scaled };
+
+    inline HealthMode ParseHealthMode(std::string_view s)
+    {
+        auto eq = [&](const char* w) {
+            size_t i = 0;
+            for (; w[i]; ++i)
+                if (i >= s.size() || (s[i] | 0x20) != w[i])
+                    return false;
+            return i == s.size();
+        };
+        return eq("direct") ? HealthMode::Direct : eq("scaled") ? HealthMode::Scaled : HealthMode::Auto;
+    }
+    inline const char* HealthModeName(HealthMode m)
+    {
+        return m == HealthMode::Direct ? "direct" : m == HealthMode::Scaled ? "scaled" : "auto";
+    }
+
+    struct HealthScale
+    {
+        int ph = 100;       // Welcome.playerHealth (server units)
+        int ceiling = 0;    // GTA health above 100 the ped can hold; 0 (unknown) or >= ph means DIRECT
+
+        bool Scaled() const { return ceiling > 0 && ph > 0 && ceiling < ph; }
+        int  Span() const { return Scaled() ? ceiling : ph; }     // GTA units that stand for the server's 1..ph
+        int  GtaMax() const { return 100 + Span(); }               // the maximum the ped is given
+        // The GTA health above 100 for a server value: 0 only for 0, else at least 1 (a living player never sits on
+        // GTA's death line) and at most the ceiling.
+        int ToGta(int serverHp) const
+        {
+            if (serverHp <= 0)
+                return 0;
+            if (!Scaled())
+                return serverHp;
+            const int g = (int)(((long long)serverHp * ceiling + ph / 2) / ph);
+            return g < 1 ? 1 : (g > ceiling ? ceiling : g);
+        }
+        // A GTA health above 100 as a server value (nearest).
+        int ToServer(int gta) const
+        {
+            if (gta <= 0)
+                return 0;
+            if (!Scaled())
+                return gta;
+            const long long v = ((long long)gta * ph + ceiling / 2) / ceiling;
+            return v > ph ? ph : (int)v;
+        }
+        // GTA health lost -> server health lost (nearest, at least 1 for any loss).
+        int LossToServer(int gtaLoss) const
+        {
+            if (gtaLoss <= 0)
+                return 0;
+            if (!Scaled())
+                return gtaLoss;
+            const long long v = ((long long)gtaLoss * ph + ceiling / 2) / ceiling;
+            return v < 1 ? 1 : (int)v;
+        }
+    };
 
     // ---- VitalsTracker ----------------------------------------------------------------------
 
@@ -47,6 +116,9 @@ namespace gage::sync {
         double reconcileAfterMs = 1000.0;
         double reconcileRetryMs = 3000.0; // between two reconciliations of the same mismatch
         int    reconcileTries = 3;        // a mismatch that survives this many writes is GTA holding the ped there: stop writing
+        // R3 T1: a mismatch GTA kept (the give-up above) asks the engine to MEASURE the ped again (the ceiling may differ from
+        // what the start measured) at most this many times per ped; the ped handle not yet probed asks once.
+        int    reprobes = 3;
     };
 
     // What the ped shows this tick (the engine reads it with natives).
@@ -76,6 +148,10 @@ namespace gage::sync {
         int  setHealth = 0;                // GTA scale
         int  setArmour = 0;
         bool kill = false;                 // the server has us dead but the ped lives: kill it
+        // R3 T1: measure this ped's health ceiling now (HealthController::Begin) and do nothing else this tick: the ped's
+        // handle was never probed, or a mismatch survived the reconciliation (probeWhy names which).
+        bool        probe = false;
+        const char* probeWhy = "";
     };
 
     struct VitalsStats
@@ -99,6 +175,10 @@ namespace gage::sync {
         uint32_t maxWrites = 0, maxWriteFails = 0, maxReadBackOff = 0; // SET_ENTITY_MAX_HEALTH calls, failed calls, reads that differ from the wish
         int      lastMaxWanted = 0, lastMaxReadBack = 0;
         int      obsHealth = 0, obsMax = 0;        // the ped's health and max at the last readable tick
+        // R3 T1
+        uint32_t probeAsks = 0;                    // ticks that asked for a probe (a ped handle never probed)
+        uint32_t reprobes = 0;                     // ... because a mismatch survived the reconciliation
+        uint32_t scaleChanges = 0;                 // SetScale calls that changed the mode or the ceiling
     };
 
     class VitalsTracker
@@ -129,6 +209,12 @@ namespace gage::sync {
         // The result of a SET_ENTITY_MAX_HEALTH the engine just made (wanted value, the native's result, and
         // GET_ENTITY_MAX_HEALTH read straight back): counted for the 10 s diagnostics.
         void NoteMaxWrite(int wanted, bool ok, int readBack);
+        // R3 T1: the health scale the engine measured for the ped (HealthController): DIRECT or SCALED. A change makes the
+        // next tick put the server's value on the ped in the new units, never a loss.
+        void SetScale(const HealthScale& s);
+        // The engine has just probed this ped handle: no probe is asked for it.
+        void NoteProbed(int32_t ped);
+        const HealthScale& Scale() const { return scale_; }
 
         // Once per script tick while the player is in the world (not while respawning).
         VitalsOut Tick(const VitalsObs& o);
@@ -151,6 +237,10 @@ namespace gage::sync {
         int lastMax_ = 0;          // the ped's max health at the last readable Tick (0 = none yet)
         int lastGoodMax_ = 0;      // T6: the newest max above 100 (a failed read substitutes it, not a blind 200)
         int32_t pedHandle_ = 0;    // T6: the ped handle of the last tick
+        HealthScale scale_;        // R3 T1: DIRECT (the default) or SCALED
+        int lastHG_ = 0, lastAG_ = 0; // R3 T1: the ped's health above 100 / armour at the last Tick (GTA units; the SCALED loss detection)
+        int32_t probedPed_ = 0, askedPed_ = 0;
+        int reprobeBudget_ = 3;
         double mismatchSinceMs_ = 0; // T6: when the ped's health first sat steady off the server's value (0 = it does not)
         int mismatchHealth_ = -1;  // ... and what it read then
         int reconcileTries_ = 0;
@@ -665,6 +755,307 @@ namespace gage::sync {
         const int m = maxHp > 100 ? maxHp : (lastGoodMax > 100 ? lastGoodMax : PedMaxHealth(playerHealth));
         return HealthFraction(hp, m);
     }
+
+    // ---- R3 T1: measuring what GTA really holds, and the controller that runs the DIRECT / SCALED choice ----------------------
+    //
+    // Round 2 assumed "SET_ENTITY_MAX_HEALTH(100 + ph) lets the ped hold 100 + ph" and the read-back of the MAX proved nothing about the
+    // HEALTH. The probe writes in the order the engine uses and reads the real health after every write:
+    //   SET_ENTITY_MAX_HEALTH(w), SET_ENTITY_HEALTH(w), read    -> h1   (h1 >= w: the entity maximum is enough)
+    //   SET_PED_MAX_HEALTH(w),    SET_ENTITY_HEALTH(w), read    -> h2   (h2 >= w, h1 < w: the ped maximum lifts the cap)
+    // and what stays below w after both is the CEILING (the ped is capped whatever the maxima say).
+    enum class HealthBehaviour : uint8_t
+    {
+        Unknown,        // the health could not be read: nothing was learnt
+        Holds,          // SET_ENTITY_MAX_HEALTH alone is enough (the round 2 model)
+        FollowsPedMax,  // only SET_PED_MAX_HEALTH lifts the cap
+        Capped,         // health stays at a ceiling below the wish whatever the maxima read (the live 0.4.7 log: 200)
+    };
+    inline const char* HealthBehaviourName(HealthBehaviour b)
+    {
+        return b == HealthBehaviour::Holds ? "GTA holds the health (SET_ENTITY_MAX_HEALTH is enough)"
+             : b == HealthBehaviour::FollowsPedMax ? "the cap follows SET_PED_MAX_HEALTH"
+             : b == HealthBehaviour::Capped ? "HEALTH CAPPED below the wish whatever the maxima read"
+             : "unknown (health unreadable)";
+    }
+
+    struct ProbeStep
+    {
+        const char* what = "";   // "start", "SET_ENTITY_MAX_HEALTH", "SET_ENTITY_HEALTH", "SET_PED_MAX_HEALTH", "+1 frame", "+1 s"
+        int  arg = 0;
+        bool ok = true;          // the native's result
+        int  hp = 0, max = 0;    // GET_ENTITY_HEALTH / GET_ENTITY_MAX_HEALTH read straight after
+    };
+
+    struct HealthProbeResult
+    {
+        static constexpr int kMaxSteps = 8;
+        ProbeStep steps[kMaxSteps];
+        int stepCount = 0;
+        int wanted = 0;                              // 100 + playerHealth
+        int hpAfter = 0;                             // GET_ENTITY_HEALTH after the last write (0 = unreadable)
+        int ceiling = 0;                             // hpAfter - 100 when readable, else 0
+        HealthBehaviour behaviour = HealthBehaviour::Unknown;
+        bool anyWriteFailed = false;
+        void Add(const char* what, int arg, bool ok, int hp, int max)
+        {
+            if (!ok)
+                anyWriteFailed = true;
+            if (stepCount < kMaxSteps)
+            {
+                ProbeStep& st = steps[stepCount++];
+                st.what = what; st.arg = arg; st.ok = ok; st.hp = hp; st.max = max;
+            }
+        }
+    };
+
+    // P (the engine wraps World, the tests a simulated ped): bool SetEntityMax(int), bool SetPedMax(int), bool SetHealth(int),
+    // int GetHealth() (<= 0 unreadable), int GetMax().
+    template <class P>
+    inline HealthProbeResult RunHealthProbe(P& ped, int wanted)
+    {
+        HealthProbeResult r;
+        r.wanted = wanted;
+        r.Add("start", 0, true, ped.GetHealth(), ped.GetMax());
+        bool ok = ped.SetEntityMax(wanted);
+        r.Add("SET_ENTITY_MAX_HEALTH", wanted, ok, ped.GetHealth(), ped.GetMax());
+        ok = ped.SetHealth(wanted);
+        const int h1 = ped.GetHealth();
+        r.Add("SET_ENTITY_HEALTH", wanted, ok, h1, ped.GetMax());
+        ok = ped.SetPedMax(wanted);
+        r.Add("SET_PED_MAX_HEALTH", wanted, ok, ped.GetHealth(), ped.GetMax());
+        ok = ped.SetHealth(wanted);
+        const int h2 = ped.GetHealth();
+        r.Add("SET_ENTITY_HEALTH", wanted, ok, h2, ped.GetMax());
+        r.hpAfter = h2 > 0 ? h2 : (h1 > 0 ? h1 : 0);
+        if (r.hpAfter <= 100)
+        {
+            r.hpAfter = 0;                            // unreadable, or a ped the write killed: nothing learnt
+            r.behaviour = HealthBehaviour::Unknown;
+        }
+        else
+        {
+            r.ceiling = r.hpAfter - 100;
+            r.behaviour = h1 >= wanted ? HealthBehaviour::Holds : h2 >= wanted ? HealthBehaviour::FollowsPedMax : HealthBehaviour::Capped;
+        }
+        return r;
+    }
+
+    // The scale for a measured ceiling (GTA units above 100; 0 = unknown) and the registry wish (health_mode).
+    //   direct  always DIRECT (the 0.4.7 behaviour, the roll-back)
+    //   scaled  always SCALED; an unmeasurable ceiling is taken as 100 (the 200 cap of the live log)
+    //   auto    SCALED when the ped holds less than playerHealth, else DIRECT; an unmeasurable ceiling stays DIRECT
+    inline HealthScale ChooseHealthScale(HealthMode wish, int ph, int ceiling)
+    {
+        HealthScale s;
+        s.ph = (ph >= 1 && ph <= 255) ? ph : 100;
+        if (wish == HealthMode::Direct)
+            return s;
+        int c = ceiling;
+        if (c < 10)
+            c = wish == HealthMode::Scaled ? 100 : 0;   // a ceiling this low is a misread, not a cap
+        s.ceiling = c;
+        return s;
+    }
+
+    // The bar the SERVER's number draws: health minus the self-damage already reported (the answer is in flight), over playerHealth.
+    inline float ServerBarFraction(int health, int pending, int ph)
+    {
+        if (ph <= 0)
+            return 0.0f;
+        const int v = health - (pending > 0 ? pending : 0);
+        const float f = (float)v / (float)ph;
+        return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    }
+
+    // Runs the write sequence, measures, chooses DIRECT or SCALED and tells the tracker; keeps the 1-frame / 1-second
+    // read-backs and the log lines (the engine prints them). Script tick only. The engine and the tests both drive it.
+    class HealthController
+    {
+    public:
+        struct Line { bool warn = false; std::string text; };
+
+        HealthMode wish = HealthMode::Auto;
+
+        const HealthScale& Scale() const { return scale_; }
+        bool Scaled() const { return scale_.Scaled(); }
+        int  Ceiling() const { return ceiling_; }                  // GTA health above 100 the ped held at the last measurement (0 = none yet)
+        HealthBehaviour Behaviour() const { return behaviour_; }
+        uint32_t Probes() const { return probes_; }
+        uint32_t CeilingDrops() const { return drops_; }          // the +1 frame read found less than the probe left
+        uint32_t LateOff() const { return lateOff_; }             // the +1 s read disagreed with the tracker
+        int LastHp() const { return lastHp_; }
+        int LastMax() const { return lastMax_; }
+        bool Settling() const { return recheckPending_; }
+
+        // Session start / ped swap / respawn / the tracker's request. `tick` numbers the script tick in progress.
+        template <class P>
+        void Begin(P& ped, int32_t handle, int ph, VitalsTracker& tr, uint32_t tick, double nowMs, const char* why)
+        {
+            ph_ = (ph >= 1 && ph <= 255) ? ph : 100;
+            const int wanted = PedMaxHealth(ph_);
+            HealthProbeResult r = RunHealthProbe(ped, wanted);
+            ++probes_;
+            behaviour_ = r.behaviour;
+            ceiling_ = r.ceiling;
+            scale_ = ChooseHealthScale(wish, ph_, r.ceiling);
+            if (scale_.Scaled())
+            {
+                // The ped's maximum is what its top is called: the ceiling, so the ped at 100 + ceiling is "full" for GTA too.
+                const int gm = scale_.GtaMax();
+                const bool a = ped.SetEntityMax(gm);
+                const bool b = ped.SetPedMax(gm);
+                r.Add("SET_*_MAX_HEALTH (scaled)", gm, a && b, ped.GetHealth(), ped.GetMax());
+            }
+            lastHp_ = ped.GetHealth();
+            lastMax_ = ped.GetMax();
+            tr.SetScale(scale_);
+            tr.NoteProbed(handle);
+            tr.NoteMaxWrite(wanted, !r.anyWriteFailed, lastMax_);
+            handle_ = handle;
+            probeHp_ = r.hpAfter;
+            recheckPending_ = r.hpAfter > 0;
+            recheckTick_ = tick + 1;
+            latePending_ = true;
+            lateAt_ = nowMs + 1000.0;
+            // One line with every step.
+            char b[160];
+            std::string t = "engine: health: probe [";
+            t += why;
+            std::snprintf(b, sizeof(b), "] ped %d, playerHealth %d -> wish max %d, health_mode=%s: ", (int)handle, ph_, wanted, HealthModeName(wish));
+            t += b;
+            for (int i = 0; i < r.stepCount; ++i)
+            {
+                const ProbeStep& st = r.steps[i];
+                if (st.arg)
+                    std::snprintf(b, sizeof(b), "%s(%d) %s -> hp %d max %d; ", st.what, st.arg, st.ok ? "ok" : "FAILED", st.hp, st.max);
+                else
+                    std::snprintf(b, sizeof(b), "%s: hp %d max %d; ", st.what, st.hp, st.max);
+                t += b;
+            }
+            std::snprintf(b, sizeof(b), "=> %s; ceiling %s%d; mode %s (ceiling %d of playerHealth %d)", HealthBehaviourName(r.behaviour),
+                          r.ceiling ? "" : "n/a ", r.ceiling, scale_.Scaled() ? "SCALED" : "DIRECT", scale_.ceiling, ph_);
+            t += b;
+            const bool warn = r.behaviour == HealthBehaviour::Capped || r.behaviour == HealthBehaviour::Unknown || r.anyWriteFailed;
+            Push(warn, t);
+        }
+
+        // Every script tick before the tracker. Returns true when the tracker must skip this tick (the probe's one-frame check is due
+        // next tick and the ped still holds the probe's value, not the server's).
+        template <class P>
+        bool Pre(P& ped, int32_t handle, VitalsTracker& tr, uint32_t tick, double nowMs)
+        {
+            if ((recheckPending_ || latePending_) && handle != 0 && handle != handle_)
+                recheckPending_ = latePending_ = false;              // another ped now: its own probe follows
+            if (recheckPending_ && tick >= recheckTick_)
+            {
+                recheckPending_ = false;
+                const int hp = ped.GetHealth(), mx = ped.GetMax();
+                lastHp_ = hp;
+                lastMax_ = mx;
+                char b[256];
+                if (hp > 100 && probeHp_ > 100 && hp < probeHp_)
+                {
+                    // GTA took part of it back after a frame: the ceiling is what is left.
+                    ++drops_;
+                    behaviour_ = HealthBehaviour::Capped;
+                    ceiling_ = hp - 100;
+                    scale_ = ChooseHealthScale(wish, ph_, ceiling_);
+                    if (scale_.Scaled())
+                    {
+                        const int gm = scale_.GtaMax();
+                        ped.SetEntityMax(gm);
+                        ped.SetPedMax(gm);
+                    }
+                    tr.SetScale(scale_);
+                    std::snprintf(b, sizeof(b), "engine: health: probe +1 frame: ped hp %d max %d, the probe left hp %d => GTA TOOK IT BACK, ceiling now %d; mode %s",
+                                  hp, mx, probeHp_, ceiling_, scale_.Scaled() ? "SCALED" : "DIRECT");
+                    Push(true, b);
+                }
+                else
+                {
+                    std::snprintf(b, sizeof(b), "engine: health: probe +1 frame: ped hp %d max %d (the probe left hp %d): unchanged", hp, mx, probeHp_);
+                    Push(false, b);
+                }
+            }
+            if (latePending_ && !recheckPending_ && nowMs >= lateAt_)
+            {
+                latePending_ = false;
+                const int hp = ped.GetHealth(), mx = ped.GetMax();
+                lastHp_ = hp;
+                lastMax_ = mx;
+                const int want = 100 + scale_.ToGta((int)tr.Health());
+                const bool settled = tr.Pending() == 0 && !tr.ServerDead();
+                const bool off = settled && hp > 0 && hp != want;
+                if (off)
+                    ++lateOff_;
+                char b[256];
+                std::snprintf(b, sizeof(b), "engine: health: probe +1 s: ped hp %d max %d, tracker wants hp %d (server %u, %s)%s", hp, mx, want,
+                              (unsigned)tr.Health(), scale_.Scaled() ? "SCALED" : "DIRECT", off ? "  <-- differs" : "");
+                Push(off, b);
+            }
+            return recheckPending_;
+        }
+
+        // The newest read-backs the 10 s line shows.
+        void NoteRead(int hp, int mx) { lastHp_ = hp; lastMax_ = mx; }
+
+        // The 10 s line (`engine: health: ...`): ONE line that tells which GTA behaviour is true. `serverMode`: connected and entered
+        // (the bar is then the server's number when SCALED).
+        std::string StatusLine(const VitalsTracker& tr, int ph, bool serverMode) const
+        {
+            const VitalsStats& vs = tr.Stats();
+            const HealthScale& sc = tr.Scale();
+            const float bar = (sc.Scaled() && serverMode && !tr.ServerDead())
+                ? ServerBarFraction((int)tr.Health(), tr.Pending(), ph)
+                : HudHealthFraction(vs.obsHealth, vs.obsMax, ph, tr.LastGoodMax());
+            char b[900];
+            std::snprintf(b, sizeof(b),
+                "engine: health: mode %s (health_mode=%s), measured ceiling %d (%s), ped %d / max %d (GTA wants %d / %d), server health %u of "
+                "playerHealth %d, bar %.0f%%; read-backs: probe hp %d max %d; probes %u (+1 frame took back %u, +1 s differed %u); "
+                "totals: max changes %u, gains undone %u, largest self-hit %u, ped swaps %u, reconciles %u (gave up %u, re-probes %u), "
+                "max reads unreadable %u, max writes %u (failed %u, read-back differs %u, last wish %d / read %d), scale changes %u",
+                sc.Scaled() ? "SCALED" : "DIRECT", HealthModeName(wish), ceiling_, HealthBehaviourName(behaviour_), vs.obsHealth, vs.obsMax,
+                100 + sc.ToGta((int)tr.Health()), sc.GtaMax(), (unsigned)tr.Health(), ph, bar * 100.0f, lastHp_, lastMax_, probes_, drops_,
+                lateOff_, vs.maxChanges, vs.clampsDown, vs.largestSelfHit, vs.pedSwaps, vs.reconciles, vs.reconcileGaveUp, vs.reprobes,
+                vs.maxUnreadable, vs.maxWrites, vs.maxWriteFails, vs.maxReadBackOff, vs.lastMaxWanted, vs.lastMaxReadBack, vs.scaleChanges);
+            return b;
+        }
+
+        bool TakeLine(Line& out)
+        {
+            if (lines_.empty())
+                return false;
+            out = lines_.front();
+            lines_.erase(lines_.begin());
+            return true;
+        }
+        void Reset()                                   // a session began or ended
+        {
+            recheckPending_ = latePending_ = false;
+            lines_.clear();
+        }
+
+    private:
+        void Push(bool warn, const std::string& t)
+        {
+            if (lines_.size() < 32)
+            {
+                Line l;
+                l.warn = warn;
+                l.text = t;
+                lines_.push_back(l);
+            }
+        }
+        HealthScale scale_;
+        int ph_ = 100, ceiling_ = 0, probeHp_ = 0, lastHp_ = 0, lastMax_ = 0;
+        HealthBehaviour behaviour_ = HealthBehaviour::Unknown;
+        int32_t handle_ = 0;
+        bool recheckPending_ = false, latePending_ = false;
+        uint32_t recheckTick_ = 0;
+        double lateAt_ = 0;
+        uint32_t probes_ = 0, drops_ = 0, lateOff_ = 0;
+        std::vector<Line> lines_;
+    };
 
     // What a protocol v5 Damage is to this client (it reaches every relevant player, not only the two involved).
     enum class DamageAbout : uint8_t

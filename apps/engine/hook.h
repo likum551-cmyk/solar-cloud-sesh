@@ -1006,6 +1006,10 @@ namespace gage::game {
         int      IsEntityPlayingAnim(int32_t entity, const char* dict, const char* name);  // taskFlag 3
         int      IsPedUsingAnyScenario(int32_t ped);
         bool     SetEntityMaxHealth(int32_t entity, int value);
+        // R3 T1: SET_PED_MAX_HEALTH(ped, value): the PED maximum (the entity one is not what bounds a player ped's health in the live
+        // 0.4.7 log); false when it cannot be called. SET_PLAYER_MAX_ARMOUR(PLAYER_ID(), value) likewise.
+        bool     SetPedMaxHealth(int32_t ped, int value);
+        bool     SetPlayerMaxArmour(int value);
         int      EntityExists(int32_t entity);              // DOES_ENTITY_EXIST
         bool     IsHornActive(int32_t veh);                  // false also when uncallable
         // SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(PLAYER_ID(), m): 0 stops GTA's own regeneration.
