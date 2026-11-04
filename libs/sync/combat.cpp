@@ -33,6 +33,8 @@ void VitalsTracker::Reset(uint8_t health, uint8_t armour)
     mismatchSinceMs_ = 0;
     mismatchHealth_ = -1;
     reconcileTries_ = 0;
+    reprobeBudget_ = cfg_.reprobes;
+    lastHG_ = lastAG_ = 0;
 }
 
 void VitalsTracker::NotePedReplaced()
@@ -47,6 +49,26 @@ void VitalsTracker::NotePedReplaced()
     mismatchSinceMs_ = 0;
     mismatchHealth_ = -1;
     reconcileTries_ = 0;
+    reprobeBudget_ = cfg_.reprobes;
+}
+
+void VitalsTracker::SetScale(const HealthScale& s)
+{
+    if (s.ph != scale_.ph || s.ceiling != scale_.ceiling || s.Scaled() != scale_.Scaled())
+        ++stats_.scaleChanges;
+    scale_ = s;
+    // Whatever the ped carries was written in the old units: take a baseline and put the server's value on in the new ones.
+    applyPending_ = true;
+    rebase_ = true;
+    mismatchSinceMs_ = 0;
+    mismatchHealth_ = -1;
+    reconcileTries_ = 0;
+}
+
+void VitalsTracker::NoteProbed(int32_t ped)
+{
+    if (ped != 0)
+        probedPed_ = askedPed_ = ped;
 }
 
 void VitalsTracker::NoteMaxWrite(int wanted, bool ok, int readBack)
@@ -126,10 +148,21 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
             NotePedReplaced();
         }
         pedHandle_ = o.ped;
+        // R3 T1: a ped nobody measured (the entry's model swap, a handle the engine never probed) is measured now.
+        if (!o.dead && o.ped != probedPed_ && o.ped != askedPed_)
+        {
+            askedPed_ = o.ped;
+            ++stats_.probeAsks;
+            out.probe = true;
+            out.probeWhy = "ped handle not probed";
+            return out;
+        }
     }
     stats_.obsHealth = o.health;
     stats_.obsMax = o.maxHealth;
-    const int expHealth = MinI((int)health_, maxH - 100);   // what the ped can show of the server's health
+    // What the ped can show of the server's health, GTA units above 100: DIRECT the server's number cut to the ped's maximum,
+    // SCALED the proportional value (never above the ceiling, never 0 for a living player).
+    const int expHealth = scale_.Scaled() ? scale_.ToGta((int)health_) : MinI((int)health_, maxH - 100);
     const int localTotal = o.dead ? 0 : MaxI(0, o.health - 100) + MaxI(0, o.armour);
 
     if (serverDead_)
@@ -184,10 +217,14 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
         applyServer();
         return out;
     }
+    const int curHG = o.dead ? 0 : MaxI(0, o.health - 100);
+    const int curAG = o.dead ? 0 : MaxI(0, o.armour);
     if (rebase_)
     {
         rebase_ = false;
         lastLocal_ = localTotal;
+        lastHG_ = curHG;
+        lastAG_ = curAG;
         if (!o.dead)
             return out;
     }
@@ -196,14 +233,25 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
         // A remote puppet (a ram, a thrown car) hurt us: its owner's client sends the Hit, and the
         // server's Damage then puts the value on the ped. Reporting the loss too would count it twice.
         lastLocal_ = localTotal;
+        lastHG_ = curHG;
+        lastAG_ = curAG;
         puppetUntilMs_ = o.nowMs + cfg_.puppetGraceMs;
         if (!o.dead)
             puppetApplyAtMs_ = o.nowMs + cfg_.puppetGraceMs;   // no Damage by then: put the server's value back
         ++stats_.puppetLosses;
         return out;
     }
-    const int delta = lastLocal_ - localTotal;
+    int delta = lastLocal_ - localTotal;
+    if (scale_.Scaled())
+    {
+        // SCALED: the ped's health moves in GTA units that stand for more server health; scale the HEALTH loss back (armour is
+        // not scaled). A gain keeps its sign: it is undone below, whatever its size.
+        const int dH = lastHG_ - curHG;
+        delta = (dH > 0 ? scale_.LossToServer(dH) : -scale_.LossToServer(-dH)) + (lastAG_ - curAG);
+    }
     lastLocal_ = localTotal;
+    lastHG_ = curHG;
+    lastAG_ = curAG;
     if (o.dead && o.nowMs < puppetUntilMs_)
         return out;                    // rammed to death: the attacker's Hit gets its grace to kill us first
 
@@ -234,6 +282,15 @@ VitalsOut VitalsTracker::Tick(const VitalsObs& o)
             {
                 ++reconcileTries_;          // counted once per mismatch
                 ++stats_.reconcileGaveUp;
+                if (reprobeBudget_ > 0)
+                {
+                    // R3 T1: GTA keeps the ped somewhere the scale did not expect: have the ceiling measured again.
+                    --reprobeBudget_;
+                    ++stats_.reprobes;
+                    out.probe = true;
+                    out.probeWhy = "reconciliation gave up";
+                    return out;
+                }
             }
         }
     }

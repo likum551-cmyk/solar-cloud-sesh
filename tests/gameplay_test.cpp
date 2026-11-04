@@ -57,6 +57,7 @@ static void Check(const char* name, bool ok, const std::string& got = "")
 }
 
 #include "t6_health_tests.h"   // T6 health: the server -> wire -> client apply -> HUD chain on a simulated ped (needs Check above)
+#include "r3_t1_health_tests.h"   // R3 T1 health: the measured GTA ceiling, DIRECT / SCALED, under 5 switchable GTA models
 
 static std::string F(const char* fmt, ...)
 {
@@ -3089,6 +3090,8 @@ int main()
     std::printf("-- 0e: animation audit (scripted emote / swing simulations, dictionary streaming, diagnostics)\n");
     anim_audit::TestAnimAudit();
     t6health::TestPure();
+    if (r3t1::TestPure() != r3t1::kPureChecks)
+        ++g_failed;                                 // R3 T1 health (tests/r3_t1_health_tests.h)
     t1::RunPure();                                  // T1 seats
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
@@ -3100,9 +3103,9 @@ int main()
     // + 0.4.5 melee audit 8 (punch, combo, miss then hit, stale event, window edge, guns, event gate, client/server window)
     const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks + 8;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + t1::kPureChecks)   // + 0e animation audit (tests/anim_audit_tests.h); + T6 health (tests/t6_health_tests.h); + T1 seats (tests/t1_seats_tests.h)
+    if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks)   // + R3 T1 health; + 0e animation audit (tests/anim_audit_tests.h); + T6 health (tests/t6_health_tests.h); + T1 seats (tests/t1_seats_tests.h)
     {
-        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + t1::kPureChecks);
+        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks);
         return 1;
     }
     return g_failed ? 1 : 0;

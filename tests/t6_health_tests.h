@@ -13,13 +13,17 @@
 //   TickEntryGuard           GTA swaps the player ped back to a story character -> SET_PLAYER_MODEL gives a NEW ped
 //                            (default health 200, default max 200), then ApplyServerMaxHealth in the same script tick
 //   DrawHud                  HudHealthFraction(hp, max, playerHealth, lastGoodMax)
-// The SimPed is the ONLY assumption about GTA: SET_ENTITY_MAX_HEALTH sets the maximum and cuts a higher health to it,
-// SET_ENTITY_HEALTH keeps at most the maximum, a fresh ped has 200 / 200, RESURRECT_PED fills to the maximum. Those are
-// hypotheses (live-unverified); the flags on SimPed (healthCap, maxReadFails, ignoreWrites, resurrectResetsMax) are the
-// alternatives the code must survive.
-//
-// -DT6_BASELINE compiles this file against the pre-fix libs/sync/combat.* (no VitalsObs::ped, no NoteMaxWrite): it is how
-// the sticking value was reproduced on the base commit (see the T6 report). Production runs never define it.
+// The SimPed is the ONLY assumption about GTA, and since R3 T1 (live 0.4.7: ped 200 / max 300 / server 195 / bar 50 %, the
+// health never rose above 200 although GET_ENTITY_MAX_HEALTH read 300) it is a set of SWITCHABLE MODELS (SimPed::model):
+//   Direct          the round 2 model: SET_ENTITY_MAX_HEALTH raises the health cap (GTA holds 100 + ph)
+//   Cap200          the live log: the health stays at 200 whatever the maxima read
+//   FollowsPedMax   only SET_PED_MAX_HEALTH raises the cap
+//   CapNextFrame    SET_ENTITY_HEALTH is accepted and GTA clamps it to 200 a frame later
+//   Cap150          a ceiling BELOW 200 (health 150: a span of 50)
+// and every scenario runs under each of them (Scenarios(env, full, model)). Since R3 T1 the Client mirrors the engine's
+// HealthController wiring (Begin at session start / swap / respawn / the tracker's request, Pre before every tracker tick).
+// (The T6_BASELINE switch of round 2 is gone: the pre-fix combat.* it compiled against is history; the pre-R3-T1 behaviour is
+// the Direct health_mode wish, which tests/r3_t1_health_tests.h runs against the capped models.)
 #pragma once
 
 #include "sync/combat.h"
@@ -27,6 +31,7 @@
 #include "../apps/server/vehicles.h"   // gage::server::ApplyDamage, the real armour-then-health rule
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -52,47 +57,114 @@ static std::string Fmt(const char* fmt, ...)
 
 // ---- the game's ped ----------------------------------------------------------------------------------------------
 
+// The GTA behaviours the harness can be switched between (see the header comment).
+enum class Model { Direct, Cap200, FollowsPedMax, CapNextFrame, Cap150 };
+static const Model kModels[] = { Model::Direct, Model::Cap200, Model::FollowsPedMax, Model::CapNextFrame, Model::Cap150 };
+static const char* ModelName(Model m)
+{
+    return m == Model::Direct ? "direct" : m == Model::Cap200 ? "cap200" : m == Model::FollowsPedMax ? "pedmax" : m == Model::CapNextFrame ? "nextframe" : "cap150";
+}
+// The GTA health above 100 a player ped can hold under the model once the code has done everything right (999 = as much as asked).
+static int Ceil(Model m)
+{
+    return m == Model::Cap200 || m == Model::CapNextFrame ? 100 : m == Model::Cap150 ? 50 : 999;
+}
+static int Span(Model m, int ph) { return std::min(ph, Ceil(m)); }
+// What the ped must carry (GTA above 100) for a server value, computed here independently of libs/sync.
+static int ExpG(Model m, int ph, int sh)
+{
+    const int c = Ceil(m);
+    if (c >= ph)
+        return sh;
+    if (sh <= 0)
+        return 0;
+    const int g = (int)std::floor((double)sh * c / ph + 0.5);
+    return std::max(1, std::min(c, g));
+}
+// A GTA-unit loss as the server must see it.
+static int ExpLoss(Model m, int ph, int g)
+{
+    const int c = Ceil(m);
+    return c >= ph ? g : std::max(1, (int)std::floor((double)g * ph / c + 0.5));
+}
+
 struct SimPed
 {
     int  handle = 1000;
     int  hp = 200, max = 200, armour = 0;   // a fresh freemode ped: GTA's default health 200 and maximum 200
+    int  pedMax = 200;                      // what SET_PED_MAX_HEALTH set (the cap of FollowsPedMax)
     bool dead = false;
+    Model model = Model::Direct;
     // alternatives to the assumed GTA behaviour
     int  healthCap = 0;                     // > 0: SET_ENTITY_HEALTH never keeps more than this, whatever the maximum
     bool maxReadFails = false;              // GET_ENTITY_MAX_HEALTH answers 0
-    bool setMaxFails = false;               // SET_ENTITY_MAX_HEALTH does nothing and reports failure
+    bool healthReadFails = false;           // R3 T1: GET_ENTITY_HEALTH answers 0 (the probe's read; the tracker's own read is not affected)
+    bool setMaxFails = false;               // SET_ENTITY_MAX_HEALTH / SET_PED_MAX_HEALTH do nothing and report failure
     int  ignoreWrites = 0;                  // the next N SET_ENTITY_HEALTH calls are dropped (a ped in a transition)
     bool resurrectResetsMax = false;        // RESURRECT_PED puts the maximum back to 200
+    int  healthWrites = 0, maxWrites = 0, pedMaxWrites = 0;
 
-    bool SetMax(int m)
+    int Cap() const                         // the most health GTA keeps on this ped right now
     {
+        int cap = max;
+        switch (model)
+        {
+        case Model::Direct: break;
+        case Model::Cap200: cap = std::min(cap, 200); break;
+        case Model::FollowsPedMax: cap = std::min(cap, pedMax); break;
+        case Model::CapNextFrame: break;    // the write is accepted, Frame() clamps
+        case Model::Cap150: cap = std::min(cap, 150); break;
+        }
+        if (healthCap > 0 && healthCap < cap)
+            cap = healthCap;
+        return cap;
+    }
+    bool SetMax(int m)                      // SET_ENTITY_MAX_HEALTH
+    {
+        ++maxWrites;
         if (setMaxFails)
             return false;
         max = m;
-        if (!dead && hp > max)
-            hp = max;
+        if (!dead && hp > Cap())
+            hp = Cap();
+        return true;
+    }
+    bool SetPedMax(int m)                   // SET_PED_MAX_HEALTH
+    {
+        ++pedMaxWrites;
+        if (setMaxFails)
+            return false;
+        pedMax = m;
+        if (model == Model::Direct)
+            max = m;
+        if (!dead && hp > Cap())
+            hp = Cap();
         return true;
     }
     int GetMax() const { return maxReadFails ? 0 : max; }
-    void SetHealth(int v)
+    bool SetHealth(int v)
     {
+        ++healthWrites;
         if (ignoreWrites > 0)
         {
             --ignoreWrites;
-            return;
+            return true;
         }
         if (v <= 100)
         {
             dead = true;
             hp = 0;
-            return;
+            return true;
         }
-        int cap = max;
-        if (healthCap > 0 && healthCap < cap)
-            cap = healthCap;
-        hp = v > cap ? cap : v;
+        hp = std::min(v, Cap());
+        return true;
     }
     int  Health() const { return dead ? 0 : hp; }
+    void Frame()                            // GTA's own per-frame processing
+    {
+        if (!dead && model == Model::CapNextFrame && hp > 200)
+            hp = 200;
+    }
     void Hurt(int d)                        // a fall, fire, a car
     {
         if (dead)
@@ -109,6 +181,7 @@ struct SimPed
         ++handle;
         hp = 200;
         max = 200;
+        pedMax = 200;
         armour = 0;
         dead = false;
     }
@@ -116,8 +189,11 @@ struct SimPed
     {
         dead = false;
         if (resurrectResetsMax)
+        {
             max = 200;
-        hp = max;
+            pedMax = 200;
+        }
+        hp = std::min(max, Cap());
     }
 };
 
@@ -232,8 +308,13 @@ struct FakeLink final : Link
 struct PedPort
 {
     SimPed& p;
-    bool SetMax(int m) { return p.SetMax(m); }
+    bool SetEntityMax(int m) { return p.SetMax(m); }
+    bool SetPedMax(int m) { return p.SetPedMax(m); }
+    bool SetHealth(int h) { return p.SetHealth(h); }
+    int  GetHealth() { return p.healthReadFails ? 0 : p.Health(); }
     int  GetMax() { return p.GetMax(); }
+    // the T6 era names (ApplyMaxHealth)
+    bool SetMax(int m) { return p.SetMax(m); }
 };
 
 struct Client
@@ -241,18 +322,21 @@ struct Client
     Link& link;
     VitalsTracker v;
     VitalsInbox inbox;
+    HealthController hc;                    // R3 T1: the probe and the DIRECT / SCALED choice (the engine's g_health)
     SimPed ped;
     RespawnGate gate;
     int playerHealth = 100;                 // g_playerHealth
     double now = 0;
+    uint32_t tick = 0;                      // TickVitals' script tick number (g_healthTick)
     enum class Life { Alive, Dying } life = Life::Alive;
     std::vector<int> selfHits;              // every environmental self-hit sent
+    std::vector<std::string> log;           // the lines the engine would put in gage.log
     bool swapAtGuard = false;               // GTA swapped the ped back: the guard acts on its next pass
     bool tellHandle = true;                 // TickVitals passes the ped handle (VitalsObs::ped)
     bool tellSwap = true;                   // the guard calls VitalsTracker::NotePedReplaced
     bool haveRespawn = false;
     proto::RespawnOk respawnOk;
-    int swaps = 0, respawns = 0;
+    int swaps = 0, respawns = 0, probesAsked = 0;
 
     static RespawnConfig FastRespawn()
     {
@@ -264,20 +348,24 @@ struct Client
     explicit Client(Link& l, const RespawnConfig& rc = FastRespawn()) : link(l), gate(rc) {}
 
     void Welcome(int ph) { playerHealth = ph ? ph : proto::kDefaultHealth; }
-    int ApplyMax()                          // ApplyServerMaxHealth
+    void Drain()
+    {
+        HealthController::Line l;
+        while (hc.TakeLine(l))
+            log.push_back(l.text);
+    }
+    int ApplyMax(const char* why = "test", bool beforeVitals = false)   // ApplyServerMaxHealth
     {
         PedPort pp{ped};
-#ifdef T6_BASELINE
-        pp.SetMax(PedMaxHealth(playerHealth));
-        return pp.GetMax();
-#else
-        return ApplyMaxHealth(pp, playerHealth, v);
-#endif
+        hc.Begin(pp, ped.handle, playerHealth, v, tick + (beforeVitals ? 1u : 0u), now, why);
+        Drain();
+        return ped.GetMax();
     }
     void ResetV4()                          // ResetV4Units
     {
         v.Reset((uint8_t)playerHealth, 0);
-        ApplyMax();
+        hc.Reset();
+        ApplyMax("session start", true);
         gate.OnAlive();
         life = Life::Alive;
     }
@@ -310,7 +398,11 @@ struct Client
     }
     void TickVitals()
     {
-        if (!VitalsTickDue(true, life == Life::Alive, life == Life::Dying, v.ServerDead()))
+        ++tick;
+        PedPort pp{ped};
+        const bool hold = hc.Pre(pp, ped.handle, v, tick, now);
+        Drain();
+        if (hold || !VitalsTickDue(true, life == Life::Alive, life == Life::Dying, v.ServerDead()))
             return;
         VitalsObs ob;
         ob.nowMs = now;
@@ -318,11 +410,15 @@ struct Client
         ob.maxHealth = ped.GetMax();
         ob.armour = ped.armour;
         ob.dead = ped.dead;
-#ifndef T6_BASELINE
         if (tellHandle)
             ob.ped = ped.handle;
-#endif
         const VitalsOut o = v.Tick(ob);
+        if (o.probe)
+        {
+            ++probesAsked;
+            ApplyMax(o.probeWhy);
+            return;
+        }
         for (int i = 0; i < o.selfHitCount; ++i)
         {
             selfHits.push_back(o.selfHits[i]);
@@ -353,8 +449,8 @@ struct Client
             gate.OnAlive();
             life = Life::Alive;
             ++respawns;
-            ApplyMax();                     // before the health: a value above the old maximum would be cut
-            ped.SetHealth(100 + (int)v.Health());
+            ApplyMax("respawn");            // before the health: a value above the old maximum would be cut
+            ped.SetHealth(100 + v.Scale().ToGta((int)v.Health()));
             ped.armour = (int)v.Armour();
             return;
         }
@@ -368,16 +464,15 @@ struct Client
         swapAtGuard = false;
         ped.Swap();                         // SetPlayerModel(kFreemodeMale): a new ped
         ++swaps;
-        ApplyMax();                         // ... and the server maximum health, in the same script tick
-#ifndef T6_BASELINE
+        ApplyMax("ped guard swap");         // ... and the server maximum health, in the same script tick
         if (tellSwap)
             v.NotePedReplaced();
-#endif
     }
     void Tick()
     {
         now += 16.0;
         link.Idle();
+        ped.Frame();
         DrainEvents();
         TickVitals();
         TickLife();
@@ -392,13 +487,12 @@ struct Client
     }
     float Bar() const                       // DrawHud
     {
-#ifdef T6_BASELINE
-        return HealthFraction(ped.Health(), ped.GetMax());
-#else
+        if (v.Scale().Scaled() && !v.ServerDead())
+            return ServerBarFraction((int)v.Health(), v.Pending(), playerHealth);
         return HudHealthFraction(ped.Health(), ped.GetMax(), playerHealth, v.LastGoodMax());
-#endif
     }
     int Hits() const { int s = 0; for (int h : selfHits) s += h; return s; }
+    int Span() const { return t6health::Span(ped.model, playerHealth); }
 };
 
 // The T6 counters; all zero against the pre-fix tracker (T6_BASELINE has none of them).
@@ -410,9 +504,8 @@ struct Cnt
 static Cnt CountersOf(const VitalsTracker& v)
 {
     Cnt c;
-    c.maxChanges = v.Stats().maxChanges;
-#ifndef T6_BASELINE
     const VitalsStats& s = v.Stats();
+    c.maxChanges = s.maxChanges;
     c.reconciles = s.reconciles;
     c.gaveUp = s.reconcileGaveUp;
     c.maxUnreadable = s.maxUnreadable;
@@ -422,18 +515,17 @@ static Cnt CountersOf(const VitalsTracker& v)
     c.swaps = s.pedSwaps;
     c.wanted = s.lastMaxWanted;
     c.readBack = s.lastMaxReadBack;
-#endif
     return c;
 }
 
 // The bar the server's number implies, and whether the ped agrees with it.
 static float ExpectedBar(int serverHealth, int ph) { return (float)serverHealth / (float)ph; }
 static bool BarIs(const Client& c, int serverHealth) { return std::fabs(c.Bar() - ExpectedBar(serverHealth, c.playerHealth)) < 0.01f; }
-static bool PedIs(const Client& c, int serverHealth) { return c.ped.Health() == 100 + std::min(serverHealth, c.ped.max - 100); }
+static bool PedIs(const Client& c, int serverHealth) { return c.ped.Health() == 100 + ExpG(c.ped.model, c.playerHealth, serverHealth); }
 static std::string Got(const Client& c, Link& l)
 {
-    return Fmt("ped %d/%d bar %.0f%% server %d self-hits %d (%d)", c.ped.Health(), c.ped.max, c.Bar() * 100.0f, l.ServerHealth(),
-               (int)c.selfHits.size(), c.Hits());
+    return Fmt("[%s %s] ped %d/%d bar %.0f%% server %d self-hits %d (%d)", ModelName(c.ped.model), c.hc.Scaled() ? "SCALED" : "DIRECT", c.ped.Health(),
+               c.ped.max, c.Bar() * 100.0f, l.ServerHealth(), (int)c.selfHits.size(), c.Hits());
 }
 
 // ---- scenarios (shared by the pure run and the real-server run) -------------------------------------------------------
@@ -450,28 +542,31 @@ struct Env
 template <class F>
 static void Section(const char* what, F&& body) { std::printf("-- T6 health: %s\n", what); body(); }
 
-static std::string Tag(int ph) { return Fmt("playerHealth %d", ph); }
+static std::string Tag(int ph, Model m = Model::Direct) { return Fmt("[%s] playerHealth %d", ModelName(m), ph); }
 
 // Join: the ped is sized to the server and sits at full health.
-static void Join(Env& env, int ph)
+static void Join(Env& env, int ph, Model m)
 {
     Link& l = env.Open(ph);
     Client c(l);
+    c.ped.model = m;
     c.Welcome(ph);
     c.ResetV4();
     c.Run(1500);
-    Check(("join: " + Tag(ph) + ": the ped has max 100+ph and full health, the bar reads 100 %, nothing was sent").c_str(),
-          c.ped.max == 100 + ph && c.ped.Health() == 100 + ph && c.Bar() > 0.995f && c.selfHits.empty(),
+    const int top = 100 + Span(m, ph);
+    Check(("join: " + Tag(ph, m) + ": the ped has the maximum it can hold (100 + min(ph, ceiling)) and is at it, the bar reads 100 %, nothing was sent").c_str(),
+          c.ped.max == top && c.ped.Health() == top && c.Bar() > 0.995f && c.selfHits.empty() && l.ServerHealth() == ph,
           Got(c, l));
     env.Close();
 }
 
 // T0's S1 and the reproduction of "sticks at 50": GTA gives the player a new default ped (hp 200, max 200) and the
 // guard raises its maximum to the server's in the same script tick. Damaged first (the server holds ph - 40) or not.
-static void SwapDefaultPed(Env& env, int ph, bool damagedFirst)
+static void SwapDefaultPed(Env& env, int ph, bool damagedFirst, Model m)
 {
     Link& l = env.Open(ph);
     Client c(l);
+    c.ped.model = m;
     c.Welcome(ph);
     c.ResetV4();
     c.Run(500);
@@ -485,7 +580,7 @@ static void SwapDefaultPed(Env& env, int ph, bool damagedFirst)
     c.swapAtGuard = true;
     c.Run(3000);
     const int after = l.ServerHealth();
-    Check(("swap: " + Tag(ph) + (damagedFirst ? ", hurt for 40 first" : ", at full health") +
+    Check(("swap: " + Tag(ph, m) + (damagedFirst ? ", hurt for 40 first" : ", at full health") +
            ": the swapped ped gets the server's health back on the new ped (hp, bar), the server's number is untouched, "
            "no self-hit is sent, and the swap really happened")
               .c_str(),
@@ -495,48 +590,54 @@ static void SwapDefaultPed(Env& env, int ph, bool damagedFirst)
 
 // Environmental damage still works (the PRESENCE check for everything that suppresses self-hits): a fall of 30 is one
 // self-hit of 30, the server takes it, the ped and the bar follow.
-static void Fall(Env& env, int ph)
+static void Fall(Env& env, int ph, Model m)
 {
     Link& l = env.Open(ph);
     Client c(l);
+    c.ped.model = m;
     c.Welcome(ph);
     c.ResetV4();
     c.Run(500);
-    c.ped.Hurt(30);
+    c.ped.Hurt(30);                         // 30 GTA units
     c.Run(1500);
-    Check(("fall: " + Tag(ph) + ": a 30-point fall is exactly one self-hit of 30, the server holds ph-30, the ped and the bar agree")
+    const int loss = ExpLoss(m, ph, 30);    // ... which is this many server points when the ped runs in a smaller range
+    Check(("fall: " + Tag(ph, m) + ": a 30-unit fall is exactly one self-hit (30 scaled back by ph / ceiling when SCALED), the server holds ph - that, the ped and the bar agree")
               .c_str(),
-          c.selfHits.size() == 1 && c.selfHits[0] == 30 && l.ServerHealth() == ph - 30 && PedIs(c, ph - 30) && BarIs(c, ph - 30) &&
+          c.selfHits.size() == 1 && c.selfHits[0] == loss && l.ServerHealth() == ph - loss && PedIs(c, ph - loss) && BarIs(c, ph - loss) &&
               c.v.Pending() == 0,
           Got(c, l));
     env.Close();
 }
 
 // A big fall during a swap's aftermath is still reported: after the swap settles, a 60-point fall is a self-hit of 60.
-static void FallAfterSwap(Env& env, int ph)
+static void FallAfterSwap(Env& env, int ph, Model m)
 {
     Link& l = env.Open(ph);
     Client c(l);
+    c.ped.model = m;
     c.Welcome(ph);
     c.ResetV4();
     c.Run(300);
     c.swapAtGuard = true;
     c.Run(2000);
-    c.ped.Hurt(60);
+    const int fall = std::min(60, Span(m, ph) * 3 / 5);   // 60 GTA units (a 50-unit span cannot take 60)
+    c.ped.Hurt(fall);
     c.Run(1500);
-    Check(("fall after a swap: " + Tag(ph) + ": the swap itself costs nothing, the later 60-point fall is one self-hit of 60 and the server holds ph-60")
+    const int loss = ExpLoss(m, ph, fall);
+    Check(("fall after a swap: " + Tag(ph, m) + ": the swap itself costs nothing, the later big fall is one self-hit (scaled back when SCALED) and the server holds ph - that")
               .c_str(),
-          c.swaps == 1 && c.selfHits.size() == 1 && c.selfHits[0] == 60 && l.ServerHealth() == ph - 60 && PedIs(c, ph - 60) &&
-              BarIs(c, ph - 60),
+          c.swaps == 1 && c.selfHits.size() == 1 && c.selfHits[0] == loss && l.ServerHealth() == ph - loss && PedIs(c, ph - loss) &&
+              BarIs(c, ph - loss),
           Got(c, l));
     env.Close();
 }
 
 // Shot, healed, killed, respawned.
-static void LifeCycle(Env& env, int ph, bool resurrectResetsMax)
+static void LifeCycle(Env& env, int ph, bool resurrectResetsMax, Model m)
 {
     Link& l = env.Open(ph);
     Client c(l);
+    c.ped.model = m;
     c.ped.resurrectResetsMax = resurrectResetsMax;
     c.Welcome(ph);
     c.ResetV4();
@@ -551,10 +652,10 @@ static void LifeCycle(Env& env, int ph, bool resurrectResetsMax)
     c.Run(300);
     const bool died = c.ped.dead && c.life == Client::Life::Dying;
     c.Run(4000);                            // the respawn gate asks, the server answers, the ped comes back
-    Check(("life cycle: " + Tag(ph) + (resurrectResetsMax ? ", RESURRECT resets the max" : "") +
+    Check(("life cycle: " + Tag(ph, m) + (resurrectResetsMax ? ", RESURRECT resets the max" : "") +
            ": shot (ph-50, bar follows), healed (full), killed (ped dies), respawned (full health on max 100+ph, bar 100 %)")
               .c_str(),
-          shot && healed && died && c.respawns == 1 && c.ped.max == 100 + ph && c.ped.Health() == 100 + ph && c.Bar() > 0.995f &&
+          shot && healed && died && c.respawns == 1 && c.ped.max == 100 + Span(m, ph) && c.ped.Health() == 100 + Span(m, ph) && c.Bar() > 0.995f &&
               l.ServerHealth() == ph && c.selfHits.empty(),
           Fmt("%s [shot %d healed %d died %d respawns %d]", Got(c, l).c_str(), shot, healed, died, c.respawns));
     env.Close();
@@ -562,11 +663,12 @@ static void LifeCycle(Env& env, int ph, bool resurrectResetsMax)
 
 // A second session: Welcome, ResetV4Units, the bar is full again. A different playerHealth in the second session
 // (an ops change from 100 to 200) is picked up at once: the maximum follows the NEW Welcome.
-static void Reconnect(Env& env, int ph1, int ph2)
+static void Reconnect(Env& env, int ph1, int ph2, Model m)
 {
     {
         Link& l = env.Open(ph1);
         Client c(l);
+        c.ped.model = m;
         c.Welcome(ph1);
         c.ResetV4();
         c.Run(300);
@@ -576,13 +678,14 @@ static void Reconnect(Env& env, int ph1, int ph2)
     }
     Link& l = env.Open(ph2);
     Client c2(l);
+    c2.ped.model = m;
     c2.Welcome(ph2);
     c2.ResetV4();
     c2.Run(1500);
-    Check(("reconnect: playerHealth " + std::to_string(ph1) + " then " + std::to_string(ph2) +
+    Check(("reconnect: [" + std::string(ModelName(m)) + "] playerHealth " + std::to_string(ph1) + " then " + std::to_string(ph2) +
            ": the new session sizes the ped to the new Welcome and the bar is full")
               .c_str(),
-          c2.ped.max == 100 + ph2 && c2.ped.Health() == 100 + ph2 && c2.Bar() > 0.995f && c2.selfHits.empty() && l.ServerHealth() == ph2,
+          c2.ped.max == 100 + Span(m, ph2) && c2.ped.Health() == 100 + Span(m, ph2) && c2.Bar() > 0.995f && c2.selfHits.empty() && l.ServerHealth() == ph2,
           Got(c2, l));
     env.Close();
 }
@@ -592,22 +695,27 @@ static int PureOnly()
 {
     int n = 0;
     {
-        // ABSOLUTE RECONCILIATION: a write GTA dropped leaves the ped steady at 200 on a max of 300 (server 200). The
-        // tracker took the 200 as its baseline (the write was "done"), so the change detector never fires: the old code kept
-        // a half bar for the whole session. Presence: it is corrected within about 1.5 s with no self-hit.
-        FakeLink l(200);
-        Client c(l);
-        c.Welcome(200);
-        c.ped.ignoreWrites = 1;             // the first SET_ENTITY_HEALTH (the tracker's first apply) is lost
-        c.ResetV4();
-        c.Run(300);
-        const bool stuckFirst = c.ped.max == 300 && c.ped.Health() == 200 && c.Bar() < 0.51f;   // the symptom, before the check
-        c.Run(2500);
-        Check("absolute check: a dropped write (ped steady at 200 on max 300, server 200) is put right within 3 s, no self-hit "
-              "(the old code stayed at 50 % for the session)",
-              stuckFirst && c.ped.Health() == 300 && c.Bar() > 0.995f && c.selfHits.empty() && CountersOf(c.v).reconciles >= 1,
-              Got(c, l));
-        ++n;
+        // ABSOLUTE RECONCILIATION: a TRACKER write GTA dropped leaves the ped steady off the server's value (the server took 20
+        // from a shooter, the ped keeps its old health), the loss detector sees no change and never notices. The old code stayed
+        // there for the session. Presence: it is corrected within about 3 s with no self-hit. Under both the DIRECT and the
+        // SCALED model of GTA (R3 T1: the probe of the start must not eat this write: it is dropped AFTER the start).
+        for (Model m : { Model::Direct, Model::Cap200 })
+        {
+            FakeLink l(200);
+            Client c(l);
+            c.ped.model = m;
+            c.Welcome(200);
+            c.ResetV4();
+            c.Run(500);
+            c.ped.ignoreWrites = 1;             // the tracker's next apply (after the Damage) is lost
+            l.HurtBy(20);
+            c.Run(300);
+            const bool stuckFirst = l.ServerHealth() == 180 && c.ped.Health() == 100 + Span(m, 200) && !PedIs(c, 180);   // the symptom, before the check
+            c.Run(3000);
+            Check((std::string("absolute check: a dropped write (ped steady off the server's 180) is put right within 4 s, no self-hit [") + ModelName(m) + "]").c_str(),
+                  stuckFirst && PedIs(c, 180) && BarIs(c, 180) && c.selfHits.empty() && CountersOf(c.v).reconciles >= 1, Got(c, l));
+            ++n;
+        }
     }
     {
         // GET_ENTITY_MAX_HEALTH reads 0 on a few frames mid-session (damaged, server 150 of 200): the old tracker
@@ -638,20 +746,22 @@ static int PureOnly()
         ++n;
     }
     {
-        // A GTA that refuses to keep more than 200 on the player (hypothesis, live-unverified): the bar stays at 50 % and
-        // that cannot be fixed from here, but the tracker must not fight it forever or turn it into damage.
+        // A GTA that refuses to keep more than 200 on the player (MEASURED LIVE in 0.4.7), health_mode=direct (the pre-R3-T1 behaviour):
+        // the bar stays at 50 % and the tracker must not fight it forever or turn it into damage. R3 T1: every give-up asks for one
+        // re-probe (bounded to 3 per ped), so 4 episodes of 3 writes.
         FakeLink l(200);
         Client c(l);
-        c.ped.healthCap = 200;
+        c.ped.model = Model::Cap200;
+        c.hc.wish = HealthMode::Direct;
         c.Welcome(200);
         c.ResetV4();
-        c.Run(20000);
+        c.Run(60000);
         const Cnt st = CountersOf(c.v);
-        Check("GTA holds the ped at 200 on a max of 300 (hypothesis): reconciliation tries 3 times then gives up (counted), "
-              "no self-hit, the server keeps 200",
-              c.ped.Health() == 200 && c.selfHits.empty() && l.ServerHealth() == 200 && st.reconciles == 3 && st.gaveUp == 1 &&
-                  c.Bar() < 0.51f,
-              Fmt("%s reconciles %u gaveUp %u", Got(c, l).c_str(), st.reconciles, st.gaveUp));
+        Check("GTA holds the ped at 200 on a max of 300, health_mode=direct: reconciliation tries 3 times per episode then gives up (counted), at most 3 re-probes, "
+              "no self-hit, the server keeps 200, the bar stays at 50 % (the live 0.4.7 state)",
+              c.ped.Health() == 200 && c.selfHits.empty() && l.ServerHealth() == 200 && st.reconciles == 12 && st.gaveUp == 4 &&
+                  c.v.Stats().reprobes == 3 && c.Bar() < 0.51f && !c.hc.Scaled(),
+              Fmt("%s reconciles %u gaveUp %u reprobes %u", Got(c, l).c_str(), st.reconciles, st.gaveUp, c.v.Stats().reprobes));
         ++n;
     }
     for (int mode = 0; mode < 2; ++mode)
@@ -728,24 +838,24 @@ static int PureOnly()
     return n;
 }
 
-// The whole set against one Env. `quick` skips the repeats for the extra playerHealth values.
-static void Scenarios(Env& env, bool full)
+// The whole set against one Env under one GTA model. `full` runs the repeats for the extra playerHealth values.
+static void Scenarios(Env& env, bool full, Model m)
 {
     for (int ph : {100, 200, 255})
     {
-        Join(env, ph);
-        SwapDefaultPed(env, ph, false);
-        SwapDefaultPed(env, ph, true);
-        Fall(env, ph);
+        Join(env, ph, m);
+        SwapDefaultPed(env, ph, false, m);
+        SwapDefaultPed(env, ph, true, m);
+        Fall(env, ph, m);
         if (full || ph == 200)
         {
-            FallAfterSwap(env, ph);
-            LifeCycle(env, ph, false);
+            FallAfterSwap(env, ph, m);
+            LifeCycle(env, ph, false, m);
         }
     }
-    LifeCycle(env, 200, true);
-    Reconnect(env, 100, 200);
-    Reconnect(env, 200, 255);
+    LifeCycle(env, 200, true, m);
+    Reconnect(env, 100, 200, m);
+    Reconnect(env, 200, 255, m);
 }
 
 struct FakeEnv final : Env
@@ -755,16 +865,17 @@ struct FakeEnv final : Env
     void Close() override { l.reset(); }
 };
 
-// Scenarios() runs: 3 x (join, swap x2, fall) + 3 x (fall after swap, life cycle) with full=true + 1 + 2.
-constexpr int kScenarioChecks = 3 * 4 + 3 * 2 + 1 + 2;
-constexpr int kPureOnlyChecks = 8;
+// Scenarios() runs: 3 x (join, swap x2, fall) + 3 x (fall after swap, life cycle) with full=true + 1 + 2, under each of the 5 models.
+constexpr int kScenarioChecks = 5 * (3 * 4 + 3 * 2 + 1 + 2);
+constexpr int kPureOnlyChecks = 9;
 constexpr int kPureChecks = kScenarioChecks + kPureOnlyChecks;
 
 static void TestPure()
 {
-    std::printf("-- T6 health: server -> wire -> client apply -> HUD, simulated ped, fake server\n");
+    std::printf("-- T6 health: server -> wire -> client apply -> HUD, simulated ped (5 GTA models), fake server\n");
     FakeEnv env;
-    Scenarios(env, true);
+    for (Model m : kModels)
+        Scenarios(env, true, m);
     PureOnly();
 }
 
@@ -866,14 +977,20 @@ struct RigEnv final : Env
     }
 };
 
-// Scenarios() with full=false: ph 100 and 255 run join / swap x2 / fall, ph 200 adds fall-after-swap and the life cycle; + 1 + 2.
-constexpr int kNetworkChecks = 3 * 4 + 2 + 1 + 2 + 1;
+// Scenarios() with full=false: ph 100 and 255 run join / swap x2 / fall, ph 200 adds fall-after-swap and the life cycle; + 1 + 2;
+// under the models in kNetModels (Direct: the round 2 chain, Cap200: the live 0.4.7 behaviour).
+static const Model kNetModels[] = { Model::Direct, Model::Cap200 };
+constexpr int kNetworkChecks = 2 * (3 * 4 + 2 + 1 + 2) + 1;
 
 static void NetworkTests()
 {
     std::printf("-- T6 health: the real server (Welcome.playerHealth, Hit, Damage, heal, kill, Respawn) into the client's tracker and HUD\n");
+    const auto t0 = std::chrono::steady_clock::now();
     RigEnv env;
-    Scenarios(env, false);
+    for (Model m : kNetModels)
+        Scenarios(env, false, m);
+    std::printf("-- T6 health network: %lld ms for %d checks over %d models\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(),
+                kNetworkChecks - 1, (int)(sizeof(kNetModels) / sizeof(kNetModels[0])));
     // The wire itself: Welcome carries the configured value (it is what sizes the ped), a self-hit is accepted.
     bool welcome = false;
     {
