@@ -32,6 +32,7 @@
 
 #include "vehsim.h"
 #include "sync/vehicle_impact.h"
+#include "sync/vehicle_position.h"
 
 #include <array>
 #include <cstring>
@@ -300,12 +301,17 @@ struct CarDef {
     bool empty = false;                         // nobody drives it
     bool persist = false;                       // the driver keeps the foot down after a crash (else he brakes 250 ms after his car first touches anything)
     imp::MassClass mc = imp::MassClass::Car;
+    std::function<double(double)> yawCmd;       // R4 T2: the driver's steering as a wanted yaw rate (rad/s) by time (s); empty: none
+    double reactM = 0;                          // R4 T2: > 0: the driver brakes (wants speed 0) once another car is within this many metres on his screen
 };
 struct Scene {
     std::string name;
     std::vector<CarDef> cars;
     int machines = 2;
     double durMs = 7000;
+    // R4 T2: a machine with no real car (the last driver of a parked car, a bystander) still has a PLAYER somewhere; the copies' lead fades with the distance to him.
+    bool hasViewer[4] = {false, false, false, false};
+    double viewerX[4] = {0, 0, 0, 0}, viewerY[4] = {0, 0, 0, 0};
 };
 
 inline std::function<double(double)> Hold(double v) { return [v](double) { return v; }; }
@@ -408,6 +414,20 @@ struct Opt {
     bool stampBias = false, arbCorrect = false, nearClock = false, proximity = false;
     bool grace = true;                // the contact grace on copies (VehicleDriveConfig::contactGraceMs 400 / 0)
     bool graceOffWhenImpact = false;  // with impacts arbitrated the grace can be switched off (the copy follows its controller's stream)
+    // R4 T2: MODELS of what the game does that the planar world does not (every one is an unknown; the report runs each).
+    //   respAlpha     how much of a velocity command the copy's body takes within one frame (1 = all, the old assumption; < 1: tyres / suspension lag it)
+    //   worldFlagHz   rising edges per second of the copy's collision flag with NO car near (kerb, pole, prop, ground), each held worldFlagFrames frames
+    //   worldBumpMs   ... and the velocity change (m/s, random direction in the ground plane) the touched thing gives the copy at the edge (0: flag only)
+    bool accelExtrap = false;         // R4 T2: VehicleInterpConfig::accelExtrapolation. The harness default is round 3's constant-velocity extrapolation so the R2/R3 pins keep their numbers; R4 T2's runs set true (the shipped default)
+    double respAlpha = 1.0;
+    double worldFlagHz = 0.0, worldBumpMs = 0.0;
+    int worldFlagFrames = 8;
+    // R4 T2: the drive's contact gate (VehicleDriveInput.ownNear): a contact counts only with a car this machine controls within ownNearM (0 = no gate, as shipped)
+    double ownNearM = 0.0;
+    double lagErrMs = 0.0;                      // R4 T2: the link lag the near clock uses is wrong by this (the engine's lag is ENet's smoothed RTT / 2 + the server's, not the truth)
+    double winFromMs = -1.0, winToMs = -1.0;    // the window of the 'truth' statistics when the scene has no reference contact
+    std::function<void(double, int, int, const VehicleSample&, const VehicleSample&, const gp::Body&, const gp::Body&)> copyTrace;   // (t, machine, car, target, ideal, the copy's body, the owner's real body) every copy frame
+    std::function<void(double, int, double, double)> viewTrace;   // (ms after the reference contact, car, position divergence, velocity divergence) every 250 ms
     imp::AdoptCfg adoptCfg;
     bool confirm = true;              // the guard ends early when the controller's stream shows the impact
     double adoptCooldownMs = 150.0;
@@ -442,6 +462,24 @@ struct Result {
     imp::ContactArbiter::Stats arb;     // the arbiter's counters
     struct Applied { double t; int m, car; imp::V2 dvAuth, dvLocal, corr; double dwAuth, dwCorr; int why; double tcLocalAgeMs; };
     std::vector<Applied> log;          // every impact message a machine decided on
+    // R4 T2: the divergence between the machines' VIEWS of one car at the same global instant (the owner's real car against its copy on every
+    // other machine, the worst of them), at tRef + {0, 500, 1000, 2000} ms (tRef = the reference's first contact). This is the number a player
+    // sees: A's screen shows car X real, B's screen shows it as a copy. cars 0 and 1 only.
+    static constexpr int kViewT = 4;
+    double viewDiv[2][kViewT] = {}, viewDivVel[2][kViewT] = {};
+    // ground truth for the 'drawn vs the owner's report now' line: the approach window [tRef-1500, tRef-300] ms, per copy frame, the REAL distance of the
+    // copy from its owner's real car at the same instant (truthApproach*) against the engine's metric computed the same way (the entity against the
+    // owner's snapshots sampled at NearT + the link lag, metricApproach*).
+    double truthApproachMean = 0, truthApproachMax = 0, metricApproachMean = 0, metricApproachMax = 0;
+    uint32_t approachFrames = 0;
+    // the velocity change a REAL car went through in the 1 s after the reference contact (max |v(t) - v before the contact|), against the closing speed
+    // the reference had at its contact, cars 0 and 1; plus the largest change of any real car between two consecutive ms.
+    double dvMaxCar[2] = {0, 0}, closingRef = 0, dvStepMax = 0;
+    // R4 T2: the ContactWatch the engine runs on every copy, mirrored here: watches opened by cause (ContactWatch::Cause), and the comparisons at +0.5 / +1 / +2 s
+    uint32_t watchOpened[ContactWatch::kCauses] = {};
+    uint32_t watchN[ContactWatch::kChecks] = {};
+    double watchSum[ContactWatch::kChecks] = {}, watchMax[ContactWatch::kChecks] = {};
+    uint32_t adoptions = 0, gatedIgnored = 0;
 };
 
 struct Sample { double t, arrive; int car; VehicleSnapshot s; imp::ArbSample a; int ctrl; };
@@ -460,9 +498,10 @@ inline void SetBodyFromDef(gp::Body& b, const CarDef& c) {
 }
 
 // The driver of a real car: hold the target speed along the heading (accel 6, brake 9); an empty car brakes to a stop.
-inline void Drive(gp::Body& b, const CarDef& c, double tSec, double dt, bool crashed) {
+inline void Drive(gp::Body& b, const CarDef& c, double tSec, double dt, bool crashed, bool react = false) {
     const double vf = gp::Dot(b.v, b.Fwd());
-    const double want = (c.empty || (crashed && !c.persist)) ? 0.0 : c.vTarget(tSec);
+    const double want = (c.empty || (crashed && !c.persist) || react) ? 0.0 : c.vTarget(tSec);
+    if (c.yawCmd && !crashed && !c.empty) b.w = c.yawCmd(tSec);
     double a = 0;
     if (vf < want) a = std::min(6.0 * dt, want - vf);
     else if (vf > want) a = -std::min(9.0 * dt, vf - want);
@@ -483,7 +522,12 @@ inline RefRun RunRef(const Scene& sc) {
     std::vector<char> skip(n, 0);
     std::vector<double> touchMs(n, -1);
     for (int ms = 0; ms < int(sc.durMs); ++ms) {
-        for (int i = 0; i < n; ++i) Drive(w.b[i], sc.cars[i], ms / 1000.0, 0.001, touchMs[i] >= 0 && ms - touchMs[i] >= 250.0);
+        for (int i = 0; i < n; ++i) {
+            bool react = false;
+            if (sc.cars[i].reactM > 0)
+                for (int j = 0; j < n; ++j) if (j != i && gp::Norm(w.b[j].p - w.b[i].p) < sc.cars[i].reactM) react = true;
+            Drive(w.b[i], sc.cars[i], ms / 1000.0, 0.001, touchMs[i] >= 0 && ms - touchMs[i] >= 250.0, react);
+        }
         w.ClearTouched();
         w.Step(0.001, skip);
         for (int i = 0; i < n; ++i)
@@ -509,6 +553,7 @@ struct Recv {
     gp::V2 lastPos; bool haveLast = false;
     VehicleSample lastTarget; bool haveTarget = false;   // the controller's last target (the copy as the machine shows it)
     double lastDisp = 0;
+    int worldLeft = 0;
     explicit Recv(const VehicleDriveConfig& dc) : ctl(dc) {}
 };
 
@@ -526,6 +571,7 @@ struct Mach {
     Rng rng;
     std::vector<double> nextSend;     // per car, when this machine samples it
     std::vector<char> hadContact;
+    ContactWatch watch;               // R4 T2: the engine's divergence check after every contact, one per machine
     std::vector<double> ownTouchMs;   // when our real car c first touched anything on this machine (the driver brakes 250 ms later)
     Mach(const NetClockConfig& c, uint64_t seed) : clock(c), rng(seed) {}
 };
@@ -556,6 +602,7 @@ inline Result Run(const Scene& sc, const Opt& o) {
             gp::Body b; SetBodyFromDef(b, sc.cars[c]);
             mc->w.b.push_back(b);
             mc->rc.push_back(std::make_unique<Recv>(dc));
+            mc->rc.back()->ip.SetAccelExtrapolation(o.accelExtrap);
             mc->trk.emplace_back();
             mc->pred.emplace_back();
             mc->real.push_back(sc.cars[c].ctrl == m ? 1 : 0);
@@ -588,6 +635,19 @@ inline Result Run(const Scene& sc, const Opt& o) {
     const double tRef = ref.contactMs;
     const double checkAt[3] = {500, 1000, 3000};
     bool checked[3] = {false, false, false};
+    const double viewAt[Result::kViewT] = {0, 500, 1000, 2000};
+    bool viewChecked[Result::kViewT] = {false, false, false, false};
+    double truthSum = 0, metricSum = 0;
+    std::vector<gp::V2> prevRealV(nc);
+    std::vector<char> havePrevRealV(nc, 0);
+    gp::V2 vPreContact[2];
+    bool vPreSet = false;
+    if (tRef >= 0) {
+        const int ms0 = std::max(0, int(tRef) - 10);
+        for (int c = 0; c < 2 && c < nc; ++c) vPreContact[c] = ref.traj[ms0][c].v;
+        vPreSet = true;
+        if (nc >= 2) R.closingRef = gp::Norm(ref.traj[ms0][0].v - ref.traj[ms0][1].v);
+    }
 
     for (double t = 0; t < sc.durMs; t += 1.0) {
         // ---- uplink -> server ----
@@ -726,15 +786,50 @@ inline Result Run(const Scene& sc, const Opt& o) {
                         if (o.nearClock) {
                             rc.lead.SetConfig(NearLeadConfig());
                             const int owner = ctrl[c];
-                            want = NearLeadWantMs(mc.clock.NearT(nowLocal), LinkLagMs(o.upMs[m] + o.downMs[m], o.upMs[owner] + o.downMs[owner]), renderT, ex);
+                            want = NearLeadWantMs(mc.clock.NearT(nowLocal), LinkLagMs(o.upMs[m] + o.downMs[m], o.upMs[owner] + o.downMs[owner]) + o.lagErrMs, renderT, ex);
                         }
-                        add = rc.lead.Update(own ? gp::Norm(P.p - own->p) : 1e9, want, dtLast);
+                        const double leadDist = own ? gp::Norm(P.p - own->p) : (sc.hasViewer[m] ? gp::Norm(P.p - gp::V2{sc.viewerX[m], sc.viewerY[m]}) : 1e9);
+                        add = rc.lead.Update(leadDist, want, dtLast);
                     }
                     VehicleSample s;
                     const double dispT = renderT - ex + add;
                     if (o.nearClock) rc.ip.SetExtrapolateMaxMs(500.0 + add);
                     if (!rc.ip.Sample(dispT, s)) continue;
                     rc.lastTarget = s; rc.haveTarget = true; rc.lastDisp = dispT;
+                    {
+                        const bool inWin = o.winFromMs >= 0 ? (t >= o.winFromMs && t <= o.winToMs) : (tRef >= 0 && t >= tRef - 1500.0 && t <= tRef - 300.0);
+                        if (inWin && rc.haveLast) {
+                            // R4 T2: the engine's 'drawn vs the owner's report now' for this copy frame (needs the near clock), and the TRUTH it stands for:
+                            // the copy against the owner's real car at the same global instant
+                            const int owner = ctrl[c];
+                            const gp::Body& rb = M[owner]->w.b[c];
+                            const double truth = gp::Norm(P.p - rb.p);
+                            truthSum += truth; ++R.approachFrames;
+                            R.truthApproachMax = std::max(R.truthApproachMax, truth);
+                            if (o.copyTrace) {
+                                VehicleSample idl; const double lag0 = LinkLagMs(o.upMs[m] + o.downMs[m], o.upMs[owner] + o.downMs[owner]);
+                                rc.ip.Sample(mc.clock.NearT(nowLocal) + lag0, idl);
+                                o.copyTrace(t, m, c, s, idl, P, rb);
+                            }
+                            if (o.nearClock) {
+                                const double lag = LinkLagMs(o.upMs[m] + o.downMs[m], o.upMs[owner] + o.downMs[owner]) + o.lagErrMs;
+                                VehicleSample ideal;
+                                if (rc.ip.Sample(mc.clock.NearT(nowLocal) + lag, ideal)) {
+                                    const double metric = std::sqrt(double(P.p.x - ideal.pos.x) * (P.p.x - ideal.pos.x) + double(P.p.y - ideal.pos.y) * (P.p.y - ideal.pos.y));
+                                    metricSum += metric;
+                                    R.metricApproachMax = std::max(R.metricApproachMax, metric);
+                                }
+                            }
+                        }
+                    }
+                    bool worldFlag = false;
+                    if (o.worldFlagHz > 0.0) {
+                        if (rc.worldLeft > 0) { --rc.worldLeft; worldFlag = true; }
+                        else if (mc.rng.U() < o.worldFlagHz * (1000.0 / o.fps) / 1000.0) {
+                            rc.worldLeft = o.worldFlagFrames; worldFlag = true;
+                            if (o.worldBumpMs > 0.0) { const double a = mc.rng.Range(0, 2 * kPi); P.v = P.v + gp::V2{std::cos(a), std::sin(a)} * o.worldBumpMs; }
+                        }
+                    }
                     VehicleDriveInput in;
                     in.target = s;
                     in.localPos = V3(P.p.x, P.p.y, 0);
@@ -743,9 +838,13 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     in.dtMs = rc.lastDriveMs > 0 ? t - rc.lastDriveMs : 0.0;
                     bool anyTouch = false;
                     for (int j = 0; j < nc; ++j) if (j != c && mc.w.touched[c][j]) anyTouch = true;
-                    const bool flag = o.flagMode == 0 ? false : rc.prevTouch;
+                    const bool flag = (o.flagMode == 0 ? false : rc.prevTouch) || worldFlag;
                     (void)anyTouch;
                     in.contact = flag && !rc.lastFlag;
+                    if (o.ownNearM > 0.0) {
+                        in.ownNear = false;
+                        for (int j = 0; j < nc; ++j) if (mc.real[j] && gp::Norm(mc.w.b[j].p - P.p) < o.ownNearM) in.ownNear = true;
+                    }
                     rc.lastFlag = flag;
                     if (o.proximity && own) {
                         const imp::Pose po{imp::V2{own->p.x, own->p.y}, imp::V2{own->v.x, own->v.y}, own->h, own->w};
@@ -754,6 +853,20 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     }
                     if (!rc.haveLast) { P.p = {s.pos.x, s.pos.y}; P.h = vq::HeadingDeg(s.rot) * kPi / 180.0; P.v = {0, 0}; rc.haveLast = true; }
                     const VehicleDriveOutput out = rc.ctl.Update(in);
+                    {
+                        // R4 T2: the engine's ContactWatch on this copy
+                        if (out.contactIgnored) { ++R.gatedIgnored; mc.watch.Open(uint16_t(c), ContactWatch::kWorld, t); }
+                        if (out.contactOpened) mc.watch.Open(uint16_t(c), out.contactOpened == 1 ? ContactWatch::kFlag : (out.contactOpened == 2 ? ContactWatch::kSpeedLoss : (out.contactOpened == 4 ? ContactWatch::kProximity : ContactWatch::kKick)), t);
+                        if (mc.watch.Active(uint16_t(c))) {
+                            const int owner = ctrl[c];
+                            VehicleSample idl;
+                            const double lag = LinkLagMs(o.upMs[m] + o.downMs[m], o.upMs[owner] + o.downMs[owner]) + o.lagErrMs;
+                            double total = gp::Norm(P.p - M[owner]->w.b[c].p);
+                            if (o.nearClock && rc.ip.Sample(mc.clock.NearT(nowLocal) + lag, idl))
+                                total = std::sqrt(double(P.p.x - idl.pos.x) * (P.p.x - idl.pos.x) + double(P.p.y - idl.pos.y) * (P.p.y - idl.pos.y));
+                            mc.watch.Sample(uint16_t(c), t, total, out.posErrorM);
+                        }
+                    }
                     if (useAdopt && out.contactOpened && !out.snap) {
                         // the copy took an impulse inside the last frame: that IS the other car's response to the hit. Adopt it as the
                         // copy's trajectory (the stream, still showing the pre-impact motion, is refused until it shows the impact) and
@@ -775,7 +888,10 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     }
                     if (out.snap) { P.p = {out.snapPos.x, out.snapPos.y}; P.h = vq::HeadingDeg(out.snapRot) * kPi / 180.0; if (rc.snapsSeen++ > 0) ++R.snaps; }
                     else if (out.setQuaternion) P.h = vq::HeadingDeg(out.rot) * kPi / 180.0;
-                    if (out.setVelocity) P.v = {out.velocity.x, out.velocity.y};
+                    if (out.setVelocity) {
+                        if (o.respAlpha >= 1.0) P.v = {out.velocity.x, out.velocity.y};
+                        else P.v = P.v + (gp::V2{out.velocity.x, out.velocity.y} - P.v) * o.respAlpha;
+                    }
                     if (out.setAngularVelocity) P.w = out.angularVelocity.z;
                     // pop: the copy's own jump beyond the sender's motion
                     const int key = c * nm + m;
@@ -879,7 +995,12 @@ inline Result Run(const Scene& sc, const Opt& o) {
             }
             // physics of this machine for 1 ms
             for (int c = 0; c < nc; ++c)
-                if (mc.real[c]) Drive(mc.w.b[c], sc.cars[c], t / 1000.0, 0.001, mc.ownTouchMs[c] >= 0 && t - mc.ownTouchMs[c] >= 250.0);
+                if (mc.real[c]) {
+                    bool react = false;
+                    if (sc.cars[c].reactM > 0)
+                        for (int j = 0; j < nc; ++j) if (j != c && gp::Norm(mc.w.b[j].p - mc.w.b[c].p) < sc.cars[c].reactM) react = true;
+                    Drive(mc.w.b[c], sc.cars[c], t / 1000.0, 0.001, mc.ownTouchMs[c] >= 0 && t - mc.ownTouchMs[c] >= 250.0, react);
+                }
             mc.w.Step(0.001, skipNone);
             if (o.trace) for (int c = 0; c < nc; ++c) o.trace(t, m, c, mc.real[c] != 0, mc.w.b[c]);
             // first contact of a real car with anything on this machine; penetration with a copy
@@ -906,7 +1027,33 @@ inline Result Run(const Scene& sc, const Opt& o) {
                     if (ov > 0.3) R.trueOverlapMs += 1.0;
                 }
             }
+        for (int c = 0; c < nc; ++c) {
+            const gp::V2 v = realBody(c).v;
+            if (havePrevRealV[c]) R.dvStepMax = std::max(R.dvStepMax, gp::Norm(v - prevRealV[c]));
+            prevRealV[c] = v; havePrevRealV[c] = 1;
+            if (tRef >= 0 && vPreSet && c < 2 && t >= tRef && t <= tRef + 1000.0) R.dvMaxCar[c] = std::max(R.dvMaxCar[c], gp::Norm(v - vPreContact[c]));
+        }
         if (tRef >= 0) {
+            if (o.viewTrace && t >= tRef && std::fmod(t - tRef, 250.0) < 1.0) {
+                for (int c = 0; c < 2 && c < nc; ++c) {
+                    const int owner = ctrl[c];
+                    double dd = 0, dvv = 0;
+                    for (int m = 0; m < nm; ++m) if (m != owner) { dd = std::max(dd, gp::Norm(M[m]->w.b[c].p - M[owner]->w.b[c].p)); dvv = std::max(dvv, gp::Norm(M[m]->w.b[c].v - M[owner]->w.b[c].v)); }
+                    o.viewTrace(t - tRef, c, dd, dvv);
+                }
+            }
+            for (int k = 0; k < Result::kViewT; ++k) {
+                if (viewChecked[k] || t < tRef + viewAt[k]) continue;
+                viewChecked[k] = true;
+                for (int c = 0; c < 2 && c < nc; ++c) {
+                    const int owner = ctrl[c];
+                    for (int m = 0; m < nm; ++m) {
+                        if (m == owner) continue;
+                        R.viewDiv[c][k] = std::max(R.viewDiv[c][k], gp::Norm(M[m]->w.b[c].p - M[owner]->w.b[c].p));
+                        R.viewDivVel[c][k] = std::max(R.viewDivVel[c][k], gp::Norm(M[m]->w.b[c].v - M[owner]->w.b[c].v));
+                    }
+                }
+            }
             for (int k = 0; k < 3; ++k) {
                 if (checked[k] || t < tRef + checkAt[k]) continue;
                 checked[k] = true;
@@ -931,6 +1078,13 @@ inline Result Run(const Scene& sc, const Opt& o) {
         }
     }
     R.maxPenetrationScreen = penetMax;
+    for (int m = 0; m < nm; ++m) {
+        const ContactWatch::Window w = M[m]->watch.Take();
+        for (int c = 0; c < ContactWatch::kCauses; ++c) R.watchOpened[c] += w.opened[c];
+        for (int k = 0; k < ContactWatch::kChecks; ++k) { R.watchN[k] += w.check[k].n; R.watchSum[k] += w.check[k].sum; R.watchMax[k] = std::max(R.watchMax[k], w.check[k].max); }
+    }
+    R.adoptions = R.predictions;
+    if (R.approachFrames) { R.truthApproachMean = truthSum / R.approachFrames; R.metricApproachMean = metricSum / R.approachFrames; }
     for (int m = 0; m < nm; ++m) R.blowups += M[m]->w.blowups;
     R.arb = arb.stats();
     for (int m = 0; m < nm; ++m) {

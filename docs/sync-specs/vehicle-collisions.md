@@ -9,6 +9,8 @@ game's physics is INFERRED and labelled live-unverified at the end.
 > missed a T-bone whose controllers had 15 ms and 60 ms uplinks 4 times out of 4). See docs/sync-specs/vehicle-position.md for the measurement and the fix (near-car clock + link lag,
 > `LinkInfo`, the arbiter's half-round-trip correction, the proximity contact).
 
+> **R4 T2 (2026-11-05)** adds the contact rule (a copy softens only for a vehicle WE control within 10 m), acceleration-aware extrapolation and the divergence check after every contact: see docs/sync-specs/vehicle-collision-authority.md.
+
 ## Why two cars hitting each other look nothing alike (first-hand, from the code and the two-machine simulation)
 
 Every vehicle is simulated by exactly one client (its controller; `VehicleState.ctrl`). On every other machine it is a copy: a solid body whose velocity, angular velocity and pose

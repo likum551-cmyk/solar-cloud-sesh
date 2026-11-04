@@ -207,6 +207,15 @@ namespace gage::sync {
         double bufferBackMaxMs = 300.0;   // Sync D: Buffering walks the oldest snapshot back along its motion at most this long (0 = pinned, as before)
         bool arcExtrapolation = true;     // ours: velocity turns with the body
         float arcMaxRadS = 2.0f;          // ours: above this |w| (a spin) extrapolate straight
+        // R4 T2 (docs/sync-specs/vehicle-collision-authority.md, section 2): extrapolate with the car's TANGENTIAL ACCELERATION (the change of its horizontal speed over
+        // the last accelMinSpanMs or more, clamped to +-accelMaxMs2; a change faster than accelRejectMs2 is a collision, not a pedal, and counts as 0; a braking car stops
+        // and never reverses). A copy drawn 100-200 ms past its newest snapshot (the near-car clock) otherwise carries the stale velocity forward: it runs `a*L` too fast, and
+        // the drive controller's proportional correction settles at e = a*L/g, 0.5-0.65 m for 9 m/s^2 at 92 ms RTT, for as long as the owner brakes. false = constant velocity (R3).
+        bool accelExtrapolation = true;
+        double accelMinSpanMs = 90.0;     // the speeds compared are at least this far apart (30 Hz samples, 1/32 m/s quantisation)
+        double accelMaxSpanMs = 400.0;    // ... and no further (a stale pair says nothing about now)
+        float accelMaxMs2 = 10.0f;        // clamp of the estimate (a car brakes at ~1 g)
+        float accelRejectMs2 = 14.0f;     // above this the speed change is a hit, not a pedal: no acceleration extrapolation
     };
 
     struct VehicleInterpStats { uint32_t accepted = 0, teleports = 0, stale = 0, invalid = 0, bridgeResets = 0, repeats = 0, injected = 0, guarded = 0; };
@@ -239,6 +248,9 @@ namespace gage::sync {
         // R3 T5: the extrapolation cap (VehicleInterpConfig::extrapolateMaxMs) for the next Samples. A near copy is drawn `lead` ms past the delayed clock,
         // i.e. that much further past its newest snapshot: the cap then has to grow by the lead or a network hole of (cap - lead) ms freezes it. Clamped to
         // [100, 2000]; a non-finite value is ignored. Not part of the buffer: Clear() keeps it.
+        void SetAccelExtrapolation(bool on) { cfg_.accelExtrapolation = on; }
+        // R4 T2: the tangential acceleration (m/s^2, + = speeding up) the next Sample past the newest snapshot extrapolates with; 0 when off, with one snapshot or without a pair 40..accelMaxSpanMs apart.
+        double TangentialAccel() const;
         void SetExtrapolateMaxMs(double ms) { if (std::isfinite(ms)) cfg_.extrapolateMaxMs = ms < 100.0 ? 100.0 : (ms > 2000.0 ? 2000.0 : ms); }
         void Clear();
         int Count() const { return count_; }
@@ -261,7 +273,7 @@ namespace gage::sync {
         static constexpr int kGapRing = 8;
         const VehicleSnapshot& At(int i) const { return ring_[(head_ + i) % kVehicleRing]; }
         DriveVec OmegaOf(int i) const; // snapshot i's angular velocity (given or derived)
-        void Extrapolate(const VehicleSnapshot& s, const DriveVec& w, double dtMs, DriveVec& pos, DriveQuat& rot) const;
+        void Extrapolate(const VehicleSnapshot& s, const DriveVec& w, double dtMs, DriveVec& pos, DriveQuat& rot, double aT = 0.0) const;
 
         VehicleInterpConfig cfg_;
         VehicleSnapshot ring_[kVehicleRing];
@@ -334,6 +346,11 @@ namespace gage::sync {
         // seen). Opens the grace like a contact (contactOpened 4) when none is open, so the copy yields to the hit instead of being a wall; the first
         // real evidence (flag, speed loss, kick) during that grace is reported as a contact (contactOpened 1..3) so the response can be adopted.
         bool proximity = false;
+        // R4 T2 (docs/sync-specs/vehicle-collision-authority.md, section 1): a vehicle THIS machine controls (the local player's, or an empty car the server handed us) is
+        // within the engine's contact range of this copy. The flag, the speed loss and the kick open the grace only with it: a touch of the world, a ped or another copy is
+        // not an event of the owner's world, and a soft correction there only lets the copy drift off the owner's stream for 400 ms. true (the default) = every contact counts,
+        // as in round 3 (veh_contact_gate=0 and every older test).
+        bool ownNear = true;
     };
 
     struct VehicleDriveOutput
@@ -363,6 +380,8 @@ namespace gage::sync {
         // previous command or the frame gap was a hitch): how much physics did not honour. contactOpened = what opened a grace THIS frame.
         float devMs = 0;
         uint8_t contactOpened = 0; // 0 none, 1 collision flag, 2 speed loss along the travel direction, 3 kick (any-direction deviation), 4 proximity (R3 T5)
+        // R4 T2: contact evidence that did NOT open a grace because no vehicle we control was near (VehicleDriveInput.ownNear false): 0 none, 1 flag, 2 speed loss, 3 kick
+        uint8_t contactIgnored = 0;
     };
 
     struct VehicleDriveStats
@@ -371,6 +390,7 @@ namespace gage::sync {
         uint32_t contacts = 0, contactsByFlag = 0, contactsByDecel = 0;   // W9: graces opened, and what opened them
         uint32_t contactsByKick = 0, kickMutes = 0;                       // Sync B: ... by a velocity deviation in any direction; kick budget exhausted
         uint32_t contactsByProximity = 0, proximityUpgrades = 0;          // R3 T5: ... by the predicted overlap; proximity graces that a real contact upgraded
+        uint32_t contactsIgnored = 0, ignoredByFlag = 0;                  // R4 T2: contact evidence with no controlled vehicle near (a world / ped / copy touch): no grace
     };
 
     // ---- sender steering ----

@@ -498,6 +498,8 @@ namespace gage::server {
         uint32_t impactSeq_ = 0;
         uint64_t linkInfoMs_ = 0;                                        // R3 T5: when LinkInfo last went out
         uint64_t impactLogMs_ = 0, impactLogCount_ = 0, impactLogClaims_ = 0;
+        double impactWinClosing_ = 0, impactWinDv_ = 0;   // R4 T2: the largest closing speed / velocity change among the impacts of this 10 s window
+        int impactWinLines_ = 0;                          // ... and how many per-impact lines were written in it
         uint32_t nextSpawnPoint_ = 0;
         Metrics metrics_;
         Metrics statsMark_;           // metrics_ as of the previous `stats` report

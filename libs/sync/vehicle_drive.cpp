@@ -217,8 +217,39 @@ DriveVec VehicleInterpolator::OmegaOf(int i) const
     return DriveVec{};
 }
 
+// R4 T2: the horizontal speed after tSec of a tangential acceleration aT from s0 (never below 0), as a factor of s0.
+static double AccelSpeedFactor(const DriveVec& v, double aT, double tSec)
+{
+    const double s0 = std::sqrt(double(v.x) * v.x + double(v.y) * v.y);
+    if (!(aT != 0.0) || !(s0 > 1.0) || !(tSec > 0.0)) return 1.0;
+    const double te = aT < 0.0 ? std::fmin(tSec, s0 / -aT) : tSec;
+    return std::fmax(0.0, 1.0 + aT * te / s0);
+}
+
+double VehicleInterpolator::TangentialAccel() const
+{
+    if (!cfg_.accelExtrapolation || count_ < 2) return 0.0;
+    const VehicleSnapshot& n = At(count_ - 1);
+    int pick = -1;
+    for (int i = count_ - 2; i >= 0; --i)
+    {
+        const double span = n.tMs - At(i).tMs;
+        if (span > cfg_.accelMaxSpanMs) break;
+        if (span >= cfg_.accelMinSpanMs) { pick = i; break; }
+        if (span >= 40.0) pick = i;      // the best shorter pair if no longer one exists
+    }
+    if (pick < 0) return 0.0;
+    const VehicleSnapshot& o = At(pick);
+    const double span = (n.tMs - o.tMs) / 1000.0;
+    const double sn = std::sqrt(double(n.vel.x) * n.vel.x + double(n.vel.y) * n.vel.y);
+    const double so = std::sqrt(double(o.vel.x) * o.vel.x + double(o.vel.y) * o.vel.y);
+    const double a = (sn - so) / span;
+    if (!std::isfinite(a) || std::fabs(a) > cfg_.accelRejectMs2) return 0.0;      // a collision is not an acceleration
+    return a > cfg_.accelMaxMs2 ? cfg_.accelMaxMs2 : (a < -cfg_.accelMaxMs2 ? -cfg_.accelMaxMs2 : a);
+}
+
 void VehicleInterpolator::Extrapolate(const VehicleSnapshot& s, const DriveVec& wf, double dtMs, DriveVec& pos,
-                                      DriveQuat& rot) const
+                                      DriveQuat& rot, double aT) const
 {
     const double t = dtMs / 1000.0;
     const D3 w = ToD(wf), v = ToD(s.vel);
@@ -237,6 +268,18 @@ void VehicleInterpolator::Extrapolate(const VehicleSnapshot& s, const DriveVec& 
     else
     {
         disp = Scale(v, t);
+    }
+    if (aT != 0.0 && t > 0.0)
+    {
+        // the travelled distance with the speed changing linearly (a stop ends it): the arc / line above scaled in the horizontal plane
+        const double s0 = std::sqrt(v.x * v.x + v.y * v.y);
+        if (s0 > 1.0)
+        {
+            const double te = aT < 0.0 ? std::fmin(t, s0 / -aT) : t;
+            const double kd = (s0 * te + 0.5 * aT * te * te) / (s0 * t);
+            disp.x *= kd;
+            disp.y *= kd;
+        }
     }
     pos = ToF(Add(ToD(s.pos), SafeV(disp)));
 }
@@ -363,7 +406,8 @@ bool VehicleInterpolator::Sample(double t, VehicleSample& out)
     {
         const double dt = t - newest.tMs;
         const bool hold = dt > cfg_.extrapolateMaxMs;
-        Extrapolate(newest, OmegaOf(count_ - 1), hold ? cfg_.extrapolateMaxMs : dt, out.pos, out.rot);
+        const double aT = TangentialAccel();
+        Extrapolate(newest, OmegaOf(count_ - 1), hold ? cfg_.extrapolateMaxMs : dt, out.pos, out.rot, aT);
         out.steering = newest.steering;
         if (hold)
         {
@@ -378,6 +422,12 @@ bool VehicleInterpolator::Sample(double t, VehicleSample& out)
             out.vel = (cfg_.arcExtrapolation && wl > 1e-6 && wl <= cfg_.arcMaxRadS)
                           ? ToF(SafeV(RotateD(ExpD(Scale(ToD(w), dt / 1000.0)), ToD(newest.vel))))
                           : newest.vel;
+            if (aT != 0.0)
+            {
+                const double f = AccelSpeedFactor(newest.vel, aT, dt / 1000.0);
+                out.vel.x = float(out.vel.x * f);
+                out.vel.y = float(out.vel.y * f);
+            }
             out.angVel = w;
         }
         return true;
@@ -507,7 +557,15 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
             }
             if (haveDev && cfg_.contactKickMs > 0.0f && kickMuteMs_ <= 0.0)
                 byKick = Len(devV) > cfg_.contactKickMs;
-            const bool hard = in.contact || byDecel || byKick;
+            const bool hard0 = in.contact || byDecel || byKick;
+            const bool hard = hard0 && in.ownNear;
+            if (hard0 && !in.ownNear && !(canOpen && in.proximity))
+            {
+                // R4 T2: a touch of something that is not ours (the world, a ped, another copy): the owner's stream stays the truth, no grace
+                ++stats_.contactsIgnored;
+                if (in.contact) ++stats_.ignoredByFlag;
+                o.contactIgnored = in.contact ? 1 : (byDecel ? 2 : 3);
+            }
             if (hard || (canOpen && in.proximity))
             {
                 if (canUpgrade) ++stats_.proximityUpgrades;
