@@ -1,4 +1,6 @@
-# GAGE game protocol v6
+# GAGE game protocol v7
+
+v7 (desync overhaul round 3, client 0.4.8) adds, against v6: the vehicle damage block (`flags` bit 5 of `VehicleUpdate`, and the full `VehicleWorld` entry: petrol tank, broken doors, headlights, dent probes) [section "R3 T4"] and `LinkInfo` (44) [section "R3 T5"]. Every other layout is the v6 one described below. A v6 peer is refused by the version gate (`Refuse(VersionMismatch)`).
 
 v6 (desync overhaul round 2, client 0.4.7) adds, against v5: seat/enter intents and `SeatNotice` (31) [T1 section], vehicle visual state (`tyres`, `tyresRim`, `windows`, brake/handbrake bits, part Hits) [section 16, T3] and `VehicleImpact` (40) [T4 section]. Every other layout is the v5 one described below. A v5 peer is refused by the version gate (`Refuse(VersionMismatch)`).
 

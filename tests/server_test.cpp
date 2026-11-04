@@ -945,8 +945,8 @@ static void QueryLiveTests()
         int size = 0;
         const query::Nonce n1 = MakeNonce(0xA1);
         const bool got = AskQuery(rig, udp, n1, rep, &size);
-        Check("query live: a request is answered with exactly 24 bytes carrying protocol 6 (kVersion), players 2, maxPlayers 8 and the nonce",
-              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 6 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
+        Check("query live: a request is answered with exactly 24 bytes carrying protocol 7 (kVersion), players 2, maxPlayers 8 and the nonce",
+              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 7 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
               got ? "players " + std::to_string(rep.players) : "no reply");
         query::Reply rep2;
         const query::Nonce n2 = MakeNonce(0x5C);
@@ -1337,7 +1337,7 @@ static void AnnounceTests()
                   NumField(p.v, "port") == rig.srv.port() && StrField(p.v, "name") == cfg.name &&
                   StrField(p.v, "gamemode") == "race" && StrField(p.v, "lang") == "pt-BR" &&
                   StrField(p.v, "url") == "https://example.org/x" && NumField(p.v, "players") == 0 &&
-                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 6, // v6: the master list shows protocol 6
+                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 7, // v6: the master list shows protocol 6
               first ? r0.head + "\n" + r0.body : "no request");
 
         Probe a(rig);

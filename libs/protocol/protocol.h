@@ -1,4 +1,4 @@
-// GAGE protocol v6: the messages between the GAGE client engine and the GAGE server
+// GAGE protocol v7: the messages between the GAGE client engine and the GAGE server
 // (docs/api/protocol.md has every byte layout; docs/ENGINE-PLAN.md the history). Transport is
 // ENet: channel kChanReliable carries control and chat (reliable, ordered), kChanState carries
 // per-tick movement (unreliable, sequenced).
@@ -45,6 +45,11 @@
 //   * Emotes: PlayAnim / PlayScenario / StopAnim (C->S) relayed as PeerAnim / PeerScenario /
 //     PeerAnimStop; the current looping one is replayed to newcomers like a look.
 //
+// v7 against v6 (desync overhaul round 3; the byte layouts are in docs/api/protocol.md, sections "R3 T4" and "R3 T5"):
+//   * R3 T4 vehicle damage: an optional damage block (flags bit 5) in VehicleUpdate and the full VehicleWorld entry: petrol tank,
+//     broken doors, headlights, dent probes. An undamaged car costs nothing in a VehicleUpdate and 3 bytes in a full entry.
+//   * R3 T5 link info: Msg::LinkInfo (44), the server's round trip to each vehicle controller, about once a second.
+//
 // v6 against v5 (desync overhaul round 2; the byte layouts are in docs/api/protocol.md, sections T1, 16 and T4):
 //   * T1 seats: VehicleOp EnterIntent (10) / CancelIntent (11) and Msg::SeatNotice (31): the server reserves a seat on an enter
 //     intent and tells every client, which replay the game's own enter task on the puppet.
@@ -88,7 +93,8 @@ namespace gage::proto {
     // v5: sampleMs, vehicle controller / owner / ageMs / motion-only entries / lights and doors, damage
     //     scaling inputs (Welcome.playerHealth, Damage bone and flags, Killed flags), PedState.vehId.
     // v6: seat intents + SeatNotice, vehicle visual state (tyres, windows, brake lights), VehicleImpact.
-    constexpr uint16_t kVersion = 6;
+    // v7: vehicle damage block (petrol, doors, headlights, dents), LinkInfo.
+    constexpr uint16_t kVersion = 7;
 
     constexpr uint8_t kChanReliable = 0; // control, chat, join/leave: reliable ordered
     constexpr uint8_t kChanState    = 1; // PlayerState, WorldState, WorldCoarse: unreliable sequenced

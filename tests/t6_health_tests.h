@@ -978,9 +978,11 @@ struct RigEnv final : Env
 };
 
 // Scenarios() with full=false: ph 100 and 255 run join / swap x2 / fall, ph 200 adds fall-after-swap and the life cycle; + 1 + 2;
-// under the models in kNetModels (Direct: the round 2 chain, Cap200: the live 0.4.7 behaviour).
-static const Model kNetModels[] = { Model::Direct, Model::Cap200 };
-constexpr int kNetworkChecks = 2 * (3 * 4 + 2 + 1 + 2) + 1;
+// under the models in kNetModels. Round 3: ONE model through the real server (Cap200 = the behaviour measured in GI's 0.4.7 log); the
+// other four models run in the pure harness (TestPure, no sockets), which keeps netcode_test's real-time cost near the round 2 level
+// (two models cost 27 s, one 13.6 s: the deploy gate is 900 s and netcode_test already takes minutes).
+static const Model kNetModels[] = { Model::Cap200 };
+constexpr int kNetworkChecks = 1 * (3 * 4 + 2 + 1 + 2) + 1;
 
 static void NetworkTests()
 {

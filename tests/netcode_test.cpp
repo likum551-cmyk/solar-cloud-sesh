@@ -249,10 +249,10 @@ static void CodecTests()
                                               0x20, 0x00, 0xE0, 0xFF, 0x10, 0x00};            // velocity
         proto::Hello h;
         h.name = "Al";
-        // v6 (deliberate): the frozen Hello layout now carries version 6.
-        const proto::Bytes wantHello = {1, 6, 0, 2, 0, 'A', 'l'}; // type, u16 version 6, u16 length, bytes
-        Check("codec: Hello is type, u16 version (6), u16-length string, little-endian",
-              proto::kVersion == 6 && proto::Encode(h) == wantHello, Hex(proto::Encode(h)));
+        // v7 (deliberate): the frozen Hello layout now carries version 7.
+        const proto::Bytes wantHello = {1, 7, 0, 2, 0, 'A', 'l'}; // type, u16 version 7, u16 length, bytes
+        Check("codec: Hello is type, u16 version (7), u16-length string, little-endian",
+              proto::kVersion == 7 && proto::Encode(h) == wantHello, Hex(proto::Encode(h)));
 
         // v3 (deliberate): PlayerState is the v2 29 bytes plus the ped block; v4 (deliberate): the ped block
         // gains the shot byte (8 bytes): 37, 43 while aiming; v5 (deliberate): + u16 sampleMs after the ack: 39, 45.
