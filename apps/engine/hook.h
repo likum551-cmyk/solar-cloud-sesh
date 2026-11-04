@@ -817,7 +817,12 @@ namespace gage::game {
         // events blocked (it ignores threats and shoves), no ragdoll, no evasive dive, no ambient
         // anims, keeps its task, config flag 188 (DisableHurt) on, invincible. Default components
         // until ApplyPedLook. SpawnPed stays the companion's.
-        int32_t  SpawnRemotePed(int modelHash, float x, float y, float z, float heading);
+        // R3 T2 `recipe` (the repairs of libs/sync LocoRepair): 0 = all of the above; 1 = LEAN (invincible, heading, non-temporary
+        // events blocked and nothing else: no ragdoll block, no keep-task, no ambient / dive flags, no config flag 188, no freeze or
+        // collision call); 2 = ALT (lean, a CIVMALE ped type and no script-host flag). A puppet that never gets a gait from any task
+        // is created again with the next recipe; gage.log says which one it is ("engine: spawned remote peer ... recipe").
+        int32_t  SpawnRemotePed(int modelHash, float x, float y, float z, float heading, int recipe = 0);
+        bool     IsPedStill(int32_t ped);                            // IS_PED_STILL (R3 T2 diagnostic)
         bool     SetEntityCoordsNoOffset(int32_t handle, float x, float y, float z);  // hard snap, no axis offset
         bool     SetEntityVelocity(int32_t handle, float vx, float vy, float vz);    // m/s, world axes
         bool     GetEntityVelocity(int32_t handle, float& vx, float& vy, float& vz); // m/s, world axes

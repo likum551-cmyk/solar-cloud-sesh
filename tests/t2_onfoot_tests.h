@@ -35,6 +35,11 @@ struct Model {
     bool pivot = false;
     bool persistRead = false;   // GET_ENTITY_VELOCITY returns the velocity we set (Replace only)
     double nominal = 1.0;
+    // R3 T2: causes of "the task runs and the ped shows no gait, own speed 0.00" (tests/r3_t2_tests.h)
+    double writeResetMs = 0;    // every coordinate write (nudge or snap) cancels the walk for this long: no motion, no gait read
+    double taskLatencyMs = 0;   // a task (re)issue needs this long before the ped moves / reads a gait; a re-issue restarts the wait
+    int fixAtRepair = -1;       // >= 0: the follow behaviour is Honour once the engine has done this many LocoRepair steps (a flag was the cause)
+    bool gaitBlind = false;     // the IS_PED_WALKING / RUNNING / SPRINTING natives read Still whatever the ped does (wrong hashes): it moves fine
     std::string Name() const {
         static const char* fn[] = {"honour", "sluggish", "dead", "nonemove"};
         static const char* vn[] = {"replace", "add", "ignore"};
@@ -62,6 +67,7 @@ struct Ped {
     LocoVec lastSet; bool hasLastSet = false;
     LocoVec animVel;
     double t = 0;
+    double holdUntilT = -1, issuedT = -1e9;   // R3: write-reset hold, time of the last task issue
 
     double AnimSpeed(double b) const {
         if (b <= 0) return 0;
@@ -70,12 +76,14 @@ struct Ped {
         return nomRun + (nomSprint - nomRun) * (std::min(b, 3.0) - 2);
     }
     Gait GameGait() const {
+        if (m.gaitBlind) return Gait::Still;
         const double s = std::hypot(animVel.x, animVel.y);
         return s < 0.5 ? Gait::Still : s < 2.65 ? Gait::Walk : s < 5.75 ? Gait::Run : Gait::Sprint;
     }
     LocoVec Readback() const { return m.persistRead && hasLastSet ? lastSet : animVel; }
     void Anim(double dtMs) {
         double vd = 0;
+        const bool held = t < holdUntilT || (m.taskLatencyMs > 0 && task != 0 && (t - issuedT) * 1000.0 < m.taskLatencyMs);
         const double arriveR = task == 2 ? 0.1 : 0.25;
         const LocoVec& tg = task == 2 ? anchor : target;
         const double dx = double(tg.x) - pos.x, dy = double(tg.y) - pos.y, d = std::hypot(dx, dy);
@@ -86,6 +94,7 @@ struct Ped {
                 if (task == 2 && m.follow == Follow::Dead) vd = 0;
                 if (task == 2 && m.follow == Follow::Sluggish) vd *= 0.6;
                 if (m.follow == Follow::NoneMove) vd = 0;
+                if (held) vd = 0;
             }
             const double want = std::atan2(-dx, dy) * 180.0 / kPi;
             const double diff = WrapDeg(want - facing);
@@ -98,6 +107,7 @@ struct Ped {
         }
         const double k = 1.0 - std::exp(-dtMs / (vd > speed ? accelTauMs : decelTauMs));
         speed += (vd - speed) * k;
+        if (held) speed = 0;
         if (speed < 0.02) speed = 0;
         t += dtMs / 1000.0;
         const double rip = 1.0 + ripple * std::min(1.0, speed / 2.0) * std::sin(2 * kPi * rippleHz * t);
@@ -114,12 +124,21 @@ struct Result {
     LocoLevel finalLevel = LocoLevel::Full;
     double firstLevelChangeMs = -1, lastLevelChangeMs = -1;
     std::vector<std::pair<LocoLevel, LocoLevelWhy>> changes;
+    std::vector<double> changeAtMs;       // R3: when each level change happened
+    std::vector<std::pair<double, LocoRepair>> repairs;   // R3: LocoRepair requests (time, step)
+    struct Issue { double atMs; LocoWhy why; };
+    std::vector<Issue> issues;            // R3: every gait task issue
+    double firstGaitMs = -1;              // R3: first time (after 500 ms) the ped read a gait while the pose moved > 1 m/s
+    double steadyGaitFrac = 0;            // R3: share of the frames after 12 s (pose > 1 m/s) the ped read a gait
+    uint32_t verdictChanges = 0; WriteVerdict verdict = WriteVerdict::Unknown;
+    uint32_t capHits = 0;
 };
 
 struct RunOpts {
     double loss = 0.02, jitterMs = 10.0, delayMs = 130.0, fps = 60.0;
     uint64_t seed = 7;
     bool anchorEntity = true;     // the engine can create the anchor (false: noAnchor every frame)
+    int repairsDone0 = 0;         // R3: LocoRepair steps the engine is taken to have done already (LocoConfig::maxRepairs = none will be asked)
     double warmupMs = 2000;       // errors before this are not counted (the first snap, the start)
     double traceFromMs = -1, traceToMs = -1;
 };
@@ -140,6 +159,8 @@ static Result Run(const SlideScenario& sc, const Model& m, const LocoConfig& cfg
     std::vector<double> errs;
     double speedRatioSum = 0; int speedRatioN = 0;
     bool teleDone = false, first = true;
+    int repairs = op.repairsDone0;
+    double gaitFramesLate = 0, framesLate = 0;
     const double dtBase = 1000.0 / op.fps;
     double now = 0, lastNow = 0;
     LocoLevel lastLevel = LocoLevel::Full;
@@ -196,9 +217,20 @@ static Result Run(const SlideScenario& sc, const Model& m, const LocoConfig& cfg
         const LocoVec rb = ped.Readback();
         in.pedVel = rb; in.havePedVel = true;
         in.noAnchor = !op.anchorEntity;
+        in.repairsDone = repairs;
         const LocoOutput o = lc.Update(in);
+        if (o.verdictChanged) ++res.verdictChanges;
+        if (o.capHit) ++res.capHits;
+        if (o.repair != LocoRepair::None) {
+            res.repairs.push_back({now, o.repair});
+            ++repairs;
+            if (m.fixAtRepair >= 0 && repairs >= m.fixAtRepair) ped.m.follow = Follow::Honour;
+            if (o.repair == LocoRepair::ClearTasks) { ped.task = 0; lc.Reset(); }
+            else { ped.task = 0; ped.speed = 0; ped.lost = false; lc.ResetForNewPed(); }
+        }
         if (o.levelChanged) {
             res.changes.push_back({o.level, o.levelWhy});
+            res.changeAtMs.push_back(now);
             if (res.firstLevelChangeMs < 0) res.firstLevelChangeMs = now;
             res.lastLevelChangeMs = now;
         }
@@ -206,6 +238,8 @@ static Result Run(const SlideScenario& sc, const Model& m, const LocoConfig& cfg
         // ---- apply as DrivePeer does ----
         if (o.snap) { ped.pos = o.snapPos; ped.facing = o.heading; ped.speed = 0; ped.lost = false; }
         if (o.nudge && !o.snap) { ped.pos.x += o.nudgeDelta.x; ped.pos.y += o.nudgeDelta.y; }
+        if ((o.snap || o.nudge) && m.writeResetMs > 0) ped.holdUntilT = ped.t + m.writeResetMs / 1000.0;
+        if (o.task == LocoTask::GoStraight || o.task == LocoTask::GoToAnchor) { ped.issuedT = ped.t; res.issues.push_back({now, o.why}); }
         if (o.setHeading && !o.snap && o.gait == Gait::Still && ped.task == 0) ped.facing = o.heading;
         if (o.moveAnchor) ped.anchor = o.anchorPos;
         if (o.task == LocoTask::GoStraight) { ped.task = 1; ped.target = o.target; ped.blend = o.moveBlendRatio; ped.lost = false; }
@@ -214,6 +248,10 @@ static Result Run(const SlideScenario& sc, const Model& m, const LocoConfig& cfg
         if (o.setBlend) ped.blend = o.moveBlendRatio;
         ped.rate = o.setMoveRate ? o.moveRate : 1.0f;
         ped.Anim(dt);
+        if (poseSp > 1.0) {
+            if (res.firstGaitMs < 0 && now >= 500 && ped.GameGait() != Gait::Still) res.firstGaitMs = now;
+            if (now >= 12000) { ++framesLate; if (ped.GameGait() != Gait::Still) ++gaitFramesLate; }
+        }
         LocoVec v = ped.animVel;
         if (o.setVelocity) {
             if (m.vel == VelSem::Add) { v.x += o.velocity.x; v.y += o.velocity.y; }
@@ -231,9 +269,9 @@ static Result Run(const SlideScenario& sc, const Model& m, const LocoConfig& cfg
         df.rateSet = o.setMoveRate; df.rate = o.moveRate; df.rateClamped = o.rateClamped; df.selfSpeed = lc.SelfSpeed();
         diag.Observe(df);
         if (op.traceFromMs >= 0 && now >= op.traceFromMs && now < op.traceToMs)
-            std::printf("    t=%6.0f pose (%.2f,%.2f) sp %.2f ped (%.2f,%.2f) speed %.2f err %.2f gait %d task %d why %d rate %.2f blend %.1f nudge %.3f lvl %d self %.2f\n", now,
+            std::printf("    t=%6.0f pose (%.2f,%.2f) sp %.2f ped (%.2f,%.2f) speed %.2f err %.2f gait %d task %d why %d rate %.2f blend %.1f nudge %.3f lvl %d self %.2f verdict %d quiet %d\n", now,
                         ppos.x, ppos.y, poseSp, in.pedPos.x, in.pedPos.y, std::hypot(v.x, v.y), std::hypot(double(ppos.x) - in.pedPos.x, double(ppos.y) - in.pedPos.y),
-                        int(o.gait), int(o.task), int(o.why), ped.rate, ped.blend, std::hypot(o.nudgeDelta.x, o.nudgeDelta.y), int(o.level), lc.SelfSpeed());
+                        int(o.gait), int(o.task), int(o.why), ped.rate, ped.blend, std::hypot(o.nudgeDelta.x, o.nudgeDelta.y), int(o.level), lc.SelfSpeed(), int(lc.Verdict()), int(o.quiet));
         ped.pos.x = float(ped.pos.x + v.x * dt / 1000.0);
         ped.pos.y = float(ped.pos.y + v.y * dt / 1000.0);
         if (now >= op.warmupMs) {
@@ -252,6 +290,8 @@ static Result Run(const SlideScenario& sc, const Model& m, const LocoConfig& cfg
     res.speedRatio = speedRatioN ? speedRatioSum / speedRatioN : 0;
     res.snaps = res.st.snaps;
     res.finalLevel = lastLevel;
+    res.verdict = lc.Verdict();
+    res.steadyGaitFrac = framesLate > 0 ? gaitFramesLate / framesLate : 0;
     return res;
 }
 
@@ -350,6 +390,9 @@ static Score ScoreDesign(const LocoConfig& cfg, const std::vector<Model>& models
 }
 
 // ---- the designs ----------------------------------------------------------------------------------------------------------
+
+// R3 T2: the shipped config with every round-3 rule switched off = the round-2 (0.4.7) controller, for before / after tables.
+static LocoConfig R2Cfg(bool anchor) { return Round2Behaviour(ShippedLocoConfig(anchor)); }
 
 // HEAD (4e2ef63) as shipped: anchor, velocity residual push, closed-loop rate, no self-checks.
 static LocoConfig HeadCfg(LocoMode mode) { LocoConfig c; c.mode = mode; return c; }
@@ -472,6 +515,7 @@ static void Explore() {
     std::printf("  T2 model matrix: %zu models x scored scenarios\n", models.size());
     ScoreDesign(HeadCfg(LocoMode::Anchor), models, true, true, "HEAD anchor (velocity push)");
     ScoreDesign(HeadCfg(LocoMode::Straight), models, true, true, "HEAD straight (loco_mode=straight)");
+    ScoreDesign(R2Cfg(true), models, true, true, "round-2 anchor (nudge + ladder, 0.4.7)");
     ScoreDesign(ShippedLocoConfig(true), models, true, true, "T2 shipped anchor (nudge + ladder)");
     ScoreDesign(ShippedLocoConfig(false), models, true, true, "T2 shipped straight (nudge + ladder)");
     {
@@ -551,8 +595,8 @@ static void TestMatrix() {
           F("%d runs; shipped p95 %.2f skate %.1f%% | 0.4.6 p95 %.2f skate %.1f%%", gs.runs, gs.meanP95, gs.meanSkate * 100, gh.meanP95, gh.meanSkate * 100));
     // A straight-mode user (loco_mode=straight) gets the nudge and the ladder too.
     const Agg st = Collect(ShippedLocoConfig(false), unknown), sth = Collect(HeadCfg(LocoMode::Straight), unknown);
-    Check("T2 matrix: loco_mode=straight with the nudge: mean error p95 on the 30 unknown models under 0.6 m (0.4.6 straight: over 1.1 m)",
-          st.meanP95 <= 0.6 && sth.meanP95 >= 1.1, F("shipped straight %.2f m, 0.4.6 straight %.2f m", st.meanP95, sth.meanP95));
+    Check("T2 matrix: loco_mode=straight with the nudge: mean error p95 on the 30 unknown models under 0.7 m (round 2: 0.6, the quiet first task of round 3 costs the rest; 0.4.6 straight: over 1.1 m)",
+          st.meanP95 <= 0.7 && sth.meanP95 >= 1.1, F("shipped straight %.2f m, 0.4.6 straight %.2f m", st.meanP95, sth.meanP95));
 }
 
 static void TestNudge() {
@@ -659,10 +703,11 @@ static void TestLadder() {
     }
     {
         Model m; m.follow = Follow::NoneMove;
-        const Result r = first(m, ShippedLocoConfig(true), run);
+        RunOpts norep = op; norep.repairsDone0 = ShippedLocoConfig(true).maxRepairs;   // R3: the engine has no repair left to try (the round-3 repairs: tests/r3_t2_tests.h)
+        const Result r = Run(run, m, ShippedLocoConfig(true), norep);
         const Result h = first(m, HeadCfg(LocoMode::Anchor), run);
-        Check("T2 ladder: when no task moves the ped at all it follows the pose rigidly within 4 s (Placed: StraightStuck) and the run's error p95 is under 1.5 m (0.4.6: over 3.5 m)",
-              r.finalLevel == LocoLevel::Placed && r.lastLevelChangeMs > 0 && r.lastLevelChangeMs <= 4000 && r.p95Err <= 1.5 && h.p95Err >= 3.5,
+        Check("T2 ladder: when no task moves the ped at all (and no repair is left) it follows the pose rigidly within 7 s (Placed: StraightStuck) and the run's error p95 is under 3.2 m (round 2: 1.5; the 1.55 s quiet start of the first task and the 1.5 s first-gait window cost the difference; 0.4.6: over 3.5 m)",
+              r.finalLevel == LocoLevel::Placed && r.lastLevelChangeMs > 0 && r.lastLevelChangeMs <= 7000 && r.p95Err <= 3.2 && h.p95Err >= 3.5,
               F("final level %d, Placed at %.0f ms, p95 %.2f m; 0.4.6 p95 %.2f m", int(r.finalLevel), r.lastLevelChangeMs, r.p95Err, h.p95Err));
     }
     {

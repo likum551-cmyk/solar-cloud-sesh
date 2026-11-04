@@ -4317,7 +4317,7 @@ bool callPedToggle(World& w, uint64_t hash, int32_t ped, bool on) {
 }
 }  // namespace
 
-int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float heading) {
+int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float heading, int recipe) {
     static bool loggedModelWait = false, loggedCreateFail = false, loggedSetupFail = false;
     const uint64_t model = (uint64_t)(uint32_t)modelHash;
     uint64_t reqArgs[] = { model };
@@ -4332,8 +4332,9 @@ int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float he
     }
 
     // CREATE_PED(pedType, model, x, y, z, heading, isNetwork, bScriptHostPed)
-    uint64_t args[] = { 26 /* PED_TYPE_MISSION */, model, FloatArg(x), FloatArg(y), FloatArg(z),
-                        FloatArg(heading), 0 /* isNetwork */, 1 /* bScriptHostPed */ };
+    // R3 T2 recipe 2 (ALT): PED_TYPE_CIVMALE (4) and no script-host flag; 0 and 1: PED_TYPE_MISSION, script host.
+    uint64_t args[] = { recipe >= 2 ? 4ull : 26ull /* PED_TYPE_MISSION */, model, FloatArg(x), FloatArg(y), FloatArg(z),
+                        FloatArg(heading), 0 /* isNetwork */, recipe >= 2 ? 0ull : 1ull /* bScriptHostPed */ };
     uint64_t ret[4] = {};
     if (!CallNative(native::CREATE_PED, args, 8, ret))
         return 0;
@@ -4354,15 +4355,19 @@ int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float he
     // behaves (it flinches, dives, ragdolls or wanders), so the count is logged once.
     int failed = 0;
     failed += !SetEntityInvincible(ped, true);
-    failed += !FreezeEntityPosition(ped, false);
-    failed += !SetEntityCollision(ped, true);
+    if (recipe <= 0) {
+        failed += !FreezeEntityPosition(ped, false);
+        failed += !SetEntityCollision(ped, true);
+    }
     failed += !SetEntityHeading(ped, heading);
     failed += !callPedToggle(*this, native::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, ped, true);
-    failed += !SetPedCanRagdoll(ped, false);
-    failed += !callPedToggle(*this, native::SET_PED_CAN_EVASIVE_DIVE, ped, false);
-    failed += !callPedToggle(*this, native::SET_PED_CAN_PLAY_AMBIENT_ANIMS, ped, false);
-    failed += !callPedToggle(*this, native::SET_PED_KEEP_TASK, ped, true);
-    failed += !SetPedConfigFlag(ped, 188 /* PCF_DisableHurt */, true);
+    if (recipe <= 0) {
+        failed += !SetPedCanRagdoll(ped, false);
+        failed += !callPedToggle(*this, native::SET_PED_CAN_EVASIVE_DIVE, ped, false);
+        failed += !callPedToggle(*this, native::SET_PED_CAN_PLAY_AMBIENT_ANIMS, ped, false);
+        failed += !callPedToggle(*this, native::SET_PED_KEEP_TASK, ped, true);
+        failed += !SetPedConfigFlag(ped, 188 /* PCF_DisableHurt */, true);
+    }
     if (failed && !loggedSetupFail) {
         loggedSetupFail = true;
         GLOGW("hook: SpawnRemotePed: %d of 10 setup natives could not be called (see 'new natives' line)",
@@ -4371,6 +4376,8 @@ int32_t World::SpawnRemotePed(int modelHash, float x, float y, float z, float he
     CallNative(native::SET_MODEL_AS_NO_LONGER_NEEDED, reqArgs, 1, nullptr);
     return ped;
 }
+
+bool World::IsPedStill(int32_t ped) { return callPedBool(*this, native::IS_PED_STILL, ped); }
 
 bool World::SetEntityCoordsNoOffset(int32_t handle, float x, float y, float z) {
     if (!handle) return false;
