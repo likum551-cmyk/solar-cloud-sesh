@@ -69,6 +69,15 @@ Expected: `600 root .../update-signing-key.pem`, `644 root .../update-signing-pu
 
 ## Release (client + server together)
 
+**From GI's PC in one command** (`tools/deploy/ship.sh`): it checks the version and that everything is committed, runs `pack-source.sh`, uploads the tarball and `ship-remote.sh` (plus an optional packs `.tar`) in one `scp`, then in one `ssh` runs `unpack-source.sh`, `publish-packs.sh` (dry run, then real) and `release.sh --skip-tests` on the VPS, detached, and streams its log (`/opt/gage/logs/ship/<stamp>.log`) back. Ctrl+C stops the watching, not the release.
+
+```
+bash tools/deploy/ship.sh 0.4.20 --notes "what changed" --dry-run                      # pack + upload, VPS checks only
+bash tools/deploy/ship.sh 0.4.20 --notes "what changed" [--packs H:/.../SolarRP-packs-x.tar]   # LIVE
+```
+
+The manual steps below are what it runs.
+
 **This is how a normal release goes out.** The client and the game server must always move together: a client built for protocol N cannot play on a server speaking N-1 or N+1, and the server refuses it. `tools/deploy/release.sh` does both and forces the players over:
 
 ```
