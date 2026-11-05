@@ -1,4 +1,4 @@
-// STATUS 2026-11-02: compile-verified, LIVE-UNVERIFIED. Gated OFF by default (HKCU pack_mount != 1).
+// STATUS 2026-11-05: the loose route is LIVE-proven (Jesko, Legacy 3889); the NG dlc.rpf route is live-untested. On by default when a pack folder is present (pack_mount below), Legacy GTA5.exe only.
 //
 // pack_stream: mount one already-built add-on DLC pack (e.g. the Jesko car) into GTA V Legacy
 // 1.0.3889 at run time, THROUGH THE GAME'S OWN ExtraContentManager, without patching the game.
@@ -37,26 +37,55 @@
 // overridden to a relative/folder device (Mount 0x94307c folder branch: +0xc8=1, +0xb8=the folder path),
 // so DlcSetup2 reads setup2.xml/content.xml off disk and RunPackGroup registers the data-files + nested
 // stream RPFs. This never calls fiPackfile::Open and never touches the encryption gate -- the clean route
-// for an OPEN add-on pack. Model files still live in a nested x64/vehicles.rpf (the stock pipeline has no
-// loose-model path); whether that nested OPEN RPF is accepted is what the first folder-mode run decides.
+// for an OPEN add-on pack. A nested OPEN x64/vehicles.rpf is NOT accepted (live 2026-11-02: the game's INT3
+// at +0x136af5b), so in folder mode the models sit LOOSE in <pack>/stream/ (*.yft/*.ytd/*.ydr/*.ydd) and
+// are registered, before the change set runs, through the game's own loose-file streaming routine
+// (RVA 0x169e4d4 -> image 0 = the RawStreamer collection); content.xml then lists only the data metas.
+// vehicles.meta's CVehicleModelInfo::Init finds the fragment/txd slots by name, already bound to the files.
+//
+// MANY PACKS (2026-11-05): every folder under %LOCALAPPDATA%\GAGE-MP\packs\ with a dlc.rpf is a pack, mounted one per
+// tick in name order (tools/packs/stage_packs.mjs lays them out from the operator's DLC PACKS folder):
+//   <pack>\setup2.xml present  -> loose folder (OPEN packs: metas loose, models in stream\, dlc.rpf only as the gate)
+//   otherwise                  -> the dlc.rpf itself through the game's own loader (NG / AES packs; OPEN is refused)
+// Each pack's cars come from its content.xml -> VEHICLE_METADATA_FILE -> <modelName> (pack_meta.h): off disk for a
+// loose pack, through the game's device for a dlc.rpf pack. They are polled into the cdimage and listed for the menu.
 //
 // Registry (all under HKCU\Software\GAGE-MP, strings):
-//   pack_mount  = "1"  to arm this at all (default off: Tick is a no-op).
-//   pack_folder = "1"  strategy B: loose-folder device instead of a packfile mount (default off = packfile).
-//   pack_name   logical pack name, default "gage_jesko" (names the %LOCALAPPDATA% folder).
-//   pack_path   absolute path to the pack's dlc.rpf; default
-//               %LOCALAPPDATA%\GAGE-MP\packs\<pack_name>\dlc.rpf (what the launcher will drop).
-//   pack_device path string handed to AddDlcPack verbatim (must end in '/'); when unset, the folder
-//               of pack_path is used as a forward-slash OS path. Set this to
-//               "platform:/dlcpacks/<name>/" for the proven device form.
-//   pack_model  model name verified present after the mount, default "jesko".
+//   pack_mount  = "1" arms it, "0" keeps it off; unset = armed when a pack folder is present (0.4.14). Never on a game
+//                 that is not Legacy GTA5.exe (Enhanced is a different binary: none of these signatures apply).
+//   pack_name   = <folder>  mount only that pack (default: all of them).
+//   pack_probe  = "1"  diagnostic: mount under extra:/ and list the visible files instead of running the change set.
 //
-// Threading: Tick() is game-thread only (the script tick), like dlc::Tick / World::ApplyPedOutfit.
+// Threading: Tick() and PackOfModel() are game-thread only (the script tick), like dlc::Tick / World::ApplyPedOutfit;
+// Vehicles() is a locked copy for any thread (the overlay's car browser).
 #pragma once
 
 #include "hook.h"
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 namespace gage::game::content {
+
+    // One car a mounted pack carries.
+    struct PackVehicle {
+        std::string model;    // the /car name
+        std::string make;     // vehicles.meta <vehicleMakeName>
+        std::string label;    // vehicles.meta <gameName>
+        std::string vclass;   // vehicles.meta <vehicleClass> (VC_SUPER, ...)
+        std::string pack;     // the pack folder name, lower case
+        bool ready = false;   // IS_MODEL_IN_CDIMAGE said yes
+    };
+
+    // Every car of every mounted pack, sorted by make then model. Any thread (a locked copy).
+    std::vector<PackVehicle> Vehicles();
+
+    // Changes whenever Vehicles() would return something new (a pack mounted, a car reached the cdimage). Any thread.
+    uint32_t VehiclesGeneration();
+
+    // The pack folder name (lower case) a model hash came from, or nullptr. Game thread.
+    const char* PackOfModel(uint32_t modelHash);
 
     enum class Status {
         Idle,      // off (pack_mount != 1), not in the world yet, or not reached the mount

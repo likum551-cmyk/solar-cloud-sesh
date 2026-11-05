@@ -14,6 +14,7 @@
 #include "overlay.h"
 #include "brand_apparel.h"
 #include "pack_stream.h"
+#include "pack_meta.h"
 #include "quit_gate.h"
 #include "ambient.h"
 #include "common/common.h"
@@ -725,6 +726,11 @@ namespace {
     sync::EntryPressGuard g_entryGuard;
     int g_exitNetId = -1;          // the networked car the link last sent Exit for, and when (PedState move 6)
     double g_exitAtMs = -1e9;
+    // 0.4.14 diagnostic (the puppet's vehicle exit "drops to the ground"): when OUR ped's CTaskExitVehicle (GET_IS_TASK_ACTIVE 2) began
+    // while GET_VEHICLE_PED_IS_IN still named the car. The Exit line says how long after it the link sent Exit: a delay about the
+    // exit animation's length means the others start their climb-out that late, behind a pose already on the ground. -1 = not seen.
+    double g_exitTaskAtMs = -1.0;
+    constexpr int kTaskExitVehicle = 2;                // eTaskTypeIndex TASK_EXIT_VEHICLE (alloc8or GET_IS_TASK_ACTIVE doc)
     double g_entryChatMs = -1e9;   // the last F / G refusal line (rate limit)
     // Per vehicle model: the seat bones' indices (-1 = not found) and the seat count, read once.
     struct SeatInfo
@@ -3833,7 +3839,21 @@ namespace {
         int last = -2;                                 // the probe's last read (-2 = none yet)
         uint32_t no = 0, frames = 0, flips = 0;
         float x0 = 0, y0 = 0, z0 = 0;
+        // 0.4.14, Anim only: the last phase (0..1) and length (s) read while the clip was on the ped (-1 = never read). A clip gone
+        // at phase ~1 FINISHED; gone at a low phase was CUT (the task types / script status at that frame say by what).
+        float lastPhase = -1, lenS = -1;
     };
+    std::string TraceAnimState(const ClipTrace& t)
+    {
+        char b[160];
+        const int st = g_world->GetScriptTaskStatus(t.ped, game::World::kScriptTaskPlayAnim);
+        if (t.lastPhase < 0.0f)
+            std::snprintf(b, sizeof(b), "phase never read, PLAY_ANIM script status %d", st);
+        else
+            std::snprintf(b, sizeof(b), "last phase %.2f of %.2f s (%s), PLAY_ANIM script status %d", (double)t.lastPhase, (double)t.lenS,
+                          t.lastPhase >= 0.9f ? "near the end: FINISHED" : "CUT before its end", st);
+        return b;
+    }
     constexpr size_t kTraceSlots = 6;
     constexpr uint32_t kTraceRunMax = 48;
     constexpr double kTraceClipMarks[] = { 20.0, 100.0, 250.0, 600.0, 1300.0 };
@@ -3870,8 +3890,18 @@ namespace {
         t->startMs = NowMs();
         t->no = ++g_clipTraceCount;
         g_world->GetEntityCoords(ped, t->x0, t->y0, t->z0);
-        GLOGI("engine: trace #%u begins: %s; task types right after the issue [%s]%s", t->no, tag.c_str(), ActiveTaskTypes(ped).c_str(),
-              g_clipTraceCount == kTraceRunMax ? " (the last trace of this run)" : "");
+        std::string clipInfo;
+        if (probe == TraceProbe::Anim)
+        {
+            float raw = -1.0f;
+            const bool have = g_world->GetAnimDuration(t->dict.c_str(), t->clip.c_str(), raw);
+            char b[160];
+            std::snprintf(b, sizeof(b), "; GET_ANIM_DURATION %s, PLAY_ANIM script status %d", have ? std::to_string(raw).c_str() : "not callable",
+                          g_world->GetScriptTaskStatus(ped, game::World::kScriptTaskPlayAnim));
+            clipInfo = b;
+        }
+        GLOGI("engine: trace #%u begins: %s; task types right after the issue [%s]%s%s", t->no, tag.c_str(), ActiveTaskTypes(ped).c_str(),
+              clipInfo.c_str(), g_clipTraceCount == kTraceRunMax ? " (the last trace of this run)" : "");
     }
 
     // The probe's read: 1 / 0, -1 unreadable. An exit reads "still in a vehicle".
@@ -3915,6 +3945,16 @@ namespace {
             const double el = nowMs - t.startMs;
             ++t.frames;
             const int now = TraceRead(t);
+            const bool animKind = t.probe == TraceProbe::Anim;
+            if (animKind && now == 1)
+            {
+                float cur = -1.0f, len = -1.0f, ph = -1.0f;
+                if (g_world->GetEntityAnimTimes(t.ped, t.dict.c_str(), t.clip.c_str(), cur, len, &ph))
+                {
+                    t.lastPhase = ph;
+                    t.lenS = len;
+                }
+            }
             if (now != t.last)
             {
                 const bool firstRead = t.last == -2;
@@ -3924,9 +3964,10 @@ namespace {
                 if (gone)
                     t.goneMs = el;
                 if (t.flips++ < 10)
-                    GLOGI("engine: trace #%u (%s): %s %s -> %d at +%.0f ms (frame %u)%s%s%s", t.no, t.tag.c_str(), TraceProbeName(t.probe),
+                    GLOGI("engine: trace #%u (%s): %s %s -> %d at +%.0f ms (frame %u)%s%s%s%s%s", t.no, t.tag.c_str(), TraceProbeName(t.probe),
                           firstRead ? "first read" : (t.last == 1 ? "1" : t.last == 0 ? "0" : "-1"), now, el, t.frames,
-                          gone ? "; GONE, task types now [" : "", gone ? ActiveTaskTypes(t.ped).c_str() : "", gone ? "]" : "");
+                          gone ? "; GONE, task types now [" : "", gone ? ActiveTaskTypes(t.ped).c_str() : "", gone ? "]" : "",
+                          gone && animKind ? "; " : "", gone && animKind ? TraceAnimState(t).c_str() : "");
                 t.last = now;
             }
             const bool exitKind = t.probe == TraceProbe::Exit;
@@ -3944,20 +3985,21 @@ namespace {
                         toPose = std::sqrt(dx * dx + dy * dy + dz * dz);
                     }
                 GLOGI("engine: trace #%u (%s) +%.0f ms (mark %.0f, frame %u): %s %d, ragdoll %d, falling %d, speed %.2f m/s, moved %.2f m (z %+.2f), "
-                      "%s%.2f m from the sender's pose; task types [%s]", t.no, t.tag.c_str(), el, marks[t.mark], t.frames, TraceProbeName(t.probe), now,
+                      "%s%.2f m from the sender's pose; task types [%s]%s%s", t.no, t.tag.c_str(), el, marks[t.mark], t.frames, TraceProbeName(t.probe), now,
                       g_world->IsPedRagdoll(t.ped) ? 1 : 0, g_world->IsPedFalling(t.ped) ? 1 : 0, (double)g_world->GetEntitySpeed(t.ped),
                       haveXyz ? std::sqrt((x - t.x0) * (x - t.x0) + (y - t.y0) * (y - t.y0) + (z - t.z0) * (z - t.z0)) : -1.0, haveXyz ? (double)(z - t.z0) : 0.0,
-                      toPose < 0.0f ? "no pose: " : "", (double)toPose, ActiveTaskTypes(t.ped).c_str());
+                      toPose < 0.0f ? "no pose: " : "", (double)toPose, ActiveTaskTypes(t.ped).c_str(),
+                      animKind ? "; " : "", animKind ? TraceAnimState(t).c_str() : "");
                 ++t.mark;
             }
             if (t.mark >= nMarks)
             {
-                GLOGI("engine: trace #%u (%s) done: %s first read 1 at %s, %s; %u frames in %.0f ms (%.1f ms a frame)", t.no, t.tag.c_str(),
+                GLOGI("engine: trace #%u (%s) done: %s first read 1 at %s, %s; %u frames in %.0f ms (%.1f ms a frame)%s%s", t.no, t.tag.c_str(),
                       TraceProbeName(t.probe), t.seenMs >= 0 ? (std::to_string((int)t.seenMs) + " ms").c_str() : "never",
                       t.goneMs >= 0 ? ("GONE at +" + std::to_string((int)t.goneMs) + " ms").c_str()
                               : (exitKind ? (t.last == 1 ? "still in a vehicle at the end" : "out of the vehicle at the end")
                                           : (t.last == 1 ? "still 1 at the end" : "never went 1 -> 0")),
-                      t.frames, el, t.frames ? el / t.frames : 0.0);
+                      t.frames, el, t.frames ? el / t.frames : 0.0, animKind ? "; " : "", animKind ? TraceAnimState(t).c_str() : "");
                 t.used = false;
             }
         }
@@ -9023,6 +9065,16 @@ namespace {
                     break;
                 }
         }
+        if (lp && lpVeh)
+        {
+            if (g_exitTaskAtMs < 0.0 && g_world->GetIsTaskActive(lp, kTaskExitVehicle))
+            {
+                g_exitTaskAtMs = nowMs;
+                GLOGI("engine: vehicle: our exit task (CTaskExitVehicle) started in vehicle %d (GET_VEHICLE_PED_IS_IN still names it)", lpVeh);
+            }
+        }
+        else if (g_exitTaskAtMs >= 0.0 && nowMs - g_exitTaskAtMs > 5000.0)
+            g_exitTaskAtMs = -1.0;                     // out of a car the link sent no Exit for (not networked): forget it
         sync::VehLinkIn in;
         in.nowMs = nowMs;
         in.veh = lpVeh;
@@ -9104,6 +9156,12 @@ namespace {
             what = "Exit";
             g_exitNetId = o.netId;                     // PedState.move 6 (exiting) names this car for a moment
             g_exitAtMs = nowMs;
+            if (g_exitTaskAtMs >= 0.0)
+                GLOGI("engine: vehicle: Exit for id=%d goes out %.0f ms after our exit task started (the others' climb-out starts that much late)",
+                      o.netId, nowMs - g_exitTaskAtMs);
+            else
+                GLOGI("engine: vehicle: Exit for id=%d: no CTaskExitVehicle was seen while seated (a warp, a death, or the read is not callable)", o.netId);
+            g_exitTaskAtMs = -1.0;
             if (g_entryGuard.NoteExit(nowMs))
             {
                 ++g_v4.quickExits;
@@ -9704,8 +9762,14 @@ namespace {
         if (!(n < 12 || n % 120 == 0))
             return;
         float x = 0, y = 0, z = 0;
+        // The setter and the getter do not use exactly the same frame: on the live Jesko (0.4.14, 2026-11-05) the
+        // yaw read back to 3 decimals every time while roll / pitch were 0.01-0.02 off, which is a ~1.16 rad/s
+        // yaw vector tilted by the car's ~0.6 degree body tilt, not a write that failed. So x / y get a tolerance
+        // relative to the whole vector (3 % = a 1.7 degree frame difference); z keeps the tight one.
+        const float mag = std::sqrt(wrote.x * wrote.x + wrote.y * wrote.y + wrote.z * wrote.z);
         const auto close = [](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.01f * std::fabs(b); };
-        if (g_world->GetEntityRotationVelocity(veh, x, y, z) && close(x, wrote.x) && close(y, wrote.y) && close(z, wrote.z))
+        const auto closeTilt = [mag](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.03f * mag; };
+        if (g_world->GetEntityRotationVelocity(veh, x, y, z) && closeTilt(x, wrote.x) && closeTilt(y, wrote.y) && close(z, wrote.z))
         {
             ++st.angOk;
             return;
@@ -9828,7 +9892,7 @@ namespace {
             GLOGI("engine: hyper assist (%s, vehicle %d), last %.0f s: %u frames (%u on the ground, brake pedal down in %u), peak speed %.0f km/h of %.0f; "
                   "applied: downforce %u frames (mean %.1f m/s^2), lateral grip %u (mean %.1f), brake assist %u (mean %.1f), yaw cap %u; "
                   "writes: velocity %u, angular %u; failures: reads %u, velocity writes %u, angular writes %u; read-back: velocity ok %u / bad %u, "
-                  "angular ok %u / bad %u; health top-ups %u; mask 0x%x%s%s", p.model, st.veh, (now - st.logMs) / 1000.0, st.frames, st.grounded,
+                  "angular ok %u / bad %u; health top-ups %u; mask 0x%x%s%s", sync::HyperProfileName(p), st.veh, (now - st.logMs) / 1000.0, st.frames, st.grounded,
                   st.brakeDown, (double)st.peakMs * 3.6, (double)p.targetKmh, st.downN, st.downN ? st.downSum / st.downN : 0.0, st.gripN,
                   st.gripN ? st.gripSum / st.gripN : 0.0, st.brakeN, st.brakeN ? st.brakeSum / st.brakeN : 0.0, st.yawN, st.velN, st.angN,
                   st.readFail, st.velFail, st.angFail, st.velOk, st.velBad, st.angOk, st.angBad, st.healthFixed, st.mask,
@@ -9838,6 +9902,35 @@ namespace {
         st.readFail = st.velFail = st.angFail = st.healthFixed = 0;
         st.downSum = st.gripSum = st.brakeSum = 0;
         st.peakMs = 0;
+    }
+
+    // The Tab menu's car browser (overlay "Cars" page): every car of every mounted pack, pushed only when the pack list
+    // or the loading state changed (a 1000-car copy is not a per-frame cost). Script tick.
+    void PushCarList(game::content::Status packs)
+    {
+        static uint32_t s_gen = ~0u;
+        static int s_status = -1;
+        const uint32_t gen = game::content::VehiclesGeneration();
+        if (gen == s_gen && (int)packs == s_status)
+            return;
+        s_gen = gen;
+        s_status = (int)packs;
+        const std::vector<game::content::PackVehicle> list = game::content::Vehicles();
+        std::vector<game::Overlay::CarEntry> out(std::min<std::size_t>(list.size(), (std::size_t)game::Overlay::kMaxCars));
+        auto put = [](char* dst, std::size_t cap, const std::string& s) {
+            const std::size_t n = std::min(s.size(), cap - 1);
+            std::memcpy(dst, s.data(), n);
+            dst[n] = 0;
+        };
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const game::content::PackVehicle& v = list[i];
+            put(out[i].model, sizeof(out[i].model), v.model);
+            put(out[i].name, sizeof(out[i].name), game::content::CarDisplayName(v.make, v.label, v.model));
+            put(out[i].vclass, sizeof(out[i].vclass), game::content::CarClassName(v.vclass));
+            put(out[i].pack, sizeof(out[i].pack), v.pack);
+            out[i].ready = v.ready;
+        }
+        game::Overlay::SetCars(out.data(), (int)out.size(), packs == game::content::Status::Pending);
     }
 
     void TickHyperTune(int32_t lp)
@@ -9852,7 +9945,7 @@ namespace {
         if (!hashed)
         {
             for (size_t i = 0; i < sync::kHyperProfileCount; ++i)
-                hashes[i] = g_world->HashKey(sync::kHyperProfiles[i].model);
+                hashes[i] = sync::kHyperProfiles[i].model ? g_world->HashKey(sync::kHyperProfiles[i].model) : 0u;   // 0 = a pack-wide row
             hashed = true;
         }
         const int32_t veh = lp ? g_world->GetVehiclePedIsIn(lp) : 0;
@@ -9865,6 +9958,8 @@ namespace {
         const sync::HyperProfile* prof = nullptr;
         for (size_t i = 0; i < sync::kHyperProfileCount; ++i)
             if (hashes[i] && hashes[i] == model) prof = &sync::kHyperProfiles[i];
+        if (!prof)                                     // a model from a content pack with a pack-wide row (the NG packs' names come from the game)
+            prof = sync::HyperProfileForPack(game::content::PackOfModel(model));
         if (!prof)
         {
             st.lastMs = 0;
@@ -9914,7 +10009,7 @@ namespace {
                 GLOGI("engine: hyper tune (%s) vehicle %d handling: toughness %s [strong body %s, strong axles %s, tyres cannot burst %s, wheels cannot "
                       "break %s, engine cannot degrade %s, tank damage off %s; health back to 1000 when it reads lower]; assists mask 0x%x of "
                       "downforce %.1f m/s^2 at %.0f km/h (cap %.1f), lateral grip rate %.1f /s up to %.1f m/s^2, brake assist +%.1f m/s^2, yaw cap "
-                      "%.1f m/s^2 / speed from %.0f m/s, anti-roll %.1f /s (grip, brake and anti-roll fade in over %.0f..%.0f m/s)", prof->model, veh,
+                      "%.1f m/s^2 / speed from %.0f m/s, anti-roll %.1f /s (grip, brake and anti-roll fade in over %.0f..%.0f m/s)", sync::HyperProfileName(*prof), veh,
                       prof->tough ? "ON" : "off", t.strong ? "set" : "NOT callable", t.axles ? "set" : "NOT callable", t.tyres ? "set" : "NOT callable",
                       t.wheels ? "set" : "NOT callable", t.degrade ? "set" : "NOT callable", t.tank ? "set" : "NOT callable", st.mask,
                       (double)a.downAtRefMs2, (double)a.downRefMs * 3.6, (double)a.downCapMs2, (double)a.gripRate, (double)a.gripCapMs2,
@@ -11334,8 +11429,12 @@ namespace {
             TickClipTraces(NowMs());                   // 0.4.13: follows the issued clips / ragdolls / exits frame by frame (reads only)
         if (inScript && mayChange)
             TickHyperTune(lp);                         // the hyper cars (libs/sync/hypertune.h): power every frame, top speed once
-        if (inScript && mayChange && lp)
-            game::content::Tick(*g_world);             // auto-mount the add-on pack (Jesko) through the game's own DLC loader, if armed (pack_mount=1; default off)
+        if (inScript && mayChange && lp) {
+            // Auto-mount the add-on car packs through the game's own DLC loader, if armed (pack_mount=1; default off),
+            // and hand the Tab menu's car browser the list whenever it (or the loading state) changes.
+            const game::content::Status packs = game::content::Tick(*g_world);
+            PushCarList(packs);
+        }
         // The session ended (OnEnded marked every peer gone and every server vehicle removed): the entry gate
         // below returns before TickPeers / TickVehicles run, so the remote peds and server vehicles would stay
         // frozen in the world until a later session finished its entry (W4 review, fix 1). Run the cleanup pass

@@ -1,6 +1,8 @@
 #pragma once
 // Hyper tune: the Solar RP "hyper" cars (GI 2026-11-02: the Jesko with giga acceleration and a 500 km/h top
-// speed; GI 2026-11-04: the same for /car dubsta, plus handling that holds it together at that speed). Pure numbers
+// speed; GI 2026-11-04: the same for /car dubsta, plus handling that holds it together at that speed; GI 2026-11-05:
+// the tune belongs to the Jesko, 600 km/h, ~12.5 % less acceleration, better handling; the Dubsta keeps the same tune
+// as the stand-in while the Jesko model cannot be streamed yet). Pure numbers
 // and pure math, no game calls: the engine applies them to the vehicle the LOCAL player drives (the owner's client is
 // the authority for its car; everyone else sees the result through the normal vehicle sync).
 //
@@ -8,17 +10,16 @@
 //   MODIFY_VEHICLE_TOP_SPEED(veh, HyperTopSpeedPercent)  once per vehicle, from GET_VEHICLE_ESTIMATED_MAX_SPEED
 //   SET_VEHICLE_MAX_SPEED(veh, target)                   once per vehicle: the cap the game enforces
 //
-// The server's anti-cheat limits a VehicleUpdate to vehicleMaxSpeed (default 150 m/s = 540 km/h), which is above the
-// target here. T4: an overshoot above the cap (a downhill, a jump, the game's enforcement lagging a frame) is no longer
-// DROPPED, which froze the car for every other client for as long as it lasted: up to twice the cap the server clamps the
-// replicated velocity to the cap and takes the position (VehicleStore::Rules::maxSpeedSoftFactor); above that it refuses.
-// A hyper target above 540 km/h (150 m/s) needs "vehicleMaxSpeed" raised in server.json (config.cpp accepts 10..600 m/s);
-// kHyperTargetKmh stays under the shipped default on purpose.
+// The server's anti-cheat limits a VehicleUpdate to vehicleMaxSpeed (default 170 m/s = 612 km/h since 2026-11-05, was
+// 150), which is above the target here. T4: an overshoot above the cap (a downhill, a jump, the game's enforcement lagging
+// a frame) is no longer DROPPED, which froze the car for every other client for as long as it lasted: up to twice the cap
+// the server clamps the replicated velocity to the cap and takes the position (VehicleStore::Rules::maxSpeedSoftFactor);
+// above that it refuses. The same cap is the driver's PlayerState move limit (Server::CheckMove). A server.json that still
+// says "vehicleMaxSpeed": 150 overrides the default: 600 km/h (166.7 m/s) then shows to the others as 540 km/h.
 //
-// PER-MODEL PROFILES (kHyperProfiles). The Jesko is the original and its row is exactly the numbers above with no handling
-// extras (a custom model whose own handling is built for the speed). The Dubsta is a stock 4x4 SUV: tall, soft, and with
-// brakes, tyres and a body made for 160 km/h. Its profile adds, with NATIVES AND PER-FRAME VELOCITY WRITES ONLY (nothing
-// here touches CHandlingData: no per-build offsets are known):
+// PER-MODEL PROFILES (kHyperProfiles). Both rows carry the same tune: the Jesko is the car it is made for; the Dubsta (a stock
+// 4x4 SUV: tall, soft, brakes, tyres and a body made for 160 km/h) is the stand-in until the Jesko model streams. The tune
+// adds, with NATIVES AND PER-FRAME VELOCITY WRITES ONLY (nothing here touches CHandlingData: no per-build offsets are known):
 //
 //   toughness (natives, once per car and re-asserted every 2 s; health topped up every 250 ms)
 //     SET_VEHICLE_STRONG(true)                  documented: no crash damage (bullets and explosions still hurt)
@@ -41,7 +42,7 @@
 // at 400 km/h throws the car. A velocity change over a known dt is an acceleration in m/s^2 whatever the mass: it can be
 // bounded, tested offline and read back (the engine verifies every write against the next read). Every assist is capped so
 // that one frame's horizontal change stays under the local ImpactTracker's 1.5 m/s jump threshold (libs/sync/vehicle_impact.h):
-// grip + brake <= (22 + 12) / 30 s = 1.13 m/s. The frame length is clamped to kHyperMaxDt.
+// grip + brake <= (26 + 14) / 30 s = 1.33 m/s. The frame length is clamped to kHyperMaxDt.
 //
 // The world frame is GTA's: metres, z up, a vehicle's forward is its body +y, right is +x, up is +z, and the quaternion
 // rotates body -> world. The angular velocity is the WORLD rotation vector in rad/s (GET_ENTITY_ROTATION_VELOCITY; its yaw
@@ -56,9 +57,9 @@
 
 namespace gage::sync {
 
-    constexpr float kHyperTargetKmh = 500.0f;
-    constexpr float kHyperTargetMs = kHyperTargetKmh / 3.6f;   // 138.9 m/s
-    constexpr float kHyperPower = 4.0f;                         // cheat power multiplier (1 = stock)
+    constexpr float kHyperTargetKmh = 600.0f;                   // GI 2026-11-05 (was 500)
+    constexpr float kHyperTargetMs = kHyperTargetKmh / 3.6f;   // 166.7 m/s
+    constexpr float kHyperPower = 3.5f;                         // cheat power multiplier (1 = stock); GI 2026-11-05: 12.5 % below the old 4.0
     constexpr float kHyperMaxPercent = 400.0f;                  // never more than 5x the stock top speed
 
     // MODIFY_VEHICLE_TOP_SPEED takes a percentage added to the handling's top speed (100 = double). From the game's
@@ -254,39 +255,72 @@ namespace gage::sync {
 
     struct HyperProfile
     {
-        const char* model;      // the /car name (lower case: the engine hashes it with GET_HASH_KEY, which ignores case)
-        float targetKmh;        // top speed the game is made to allow; must stay under the server's vehicleMaxSpeed (540 km/h)
+        const char* model;      // the /car name (lower case: the engine hashes it with GET_HASH_KEY, which ignores case);
+                                // nullptr = a pack-wide row (below)
+        float targetKmh;        // top speed the game is made to allow; must stay under the server's vehicleMaxSpeed (612 km/h default)
         float power;            // SET_VEHICLE_CHEAT_POWER_INCREASE, every frame
         bool tough;             // the toughness natives and the health top-up
         HyperAssist assist;     // the driving assists (all zero = none)
+        const char* pack = nullptr;   // content pack folder name (lower case): the row also tunes every model that pack
+                                      // carries when no row names the model itself (an NG pack's model names are only
+                                      // known once the game has mounted it)
     };
 
-    // The Dubsta's numbers, from first principles; none of them has been felt in a game yet (see the engine's log lines):
-    //   downforce   10 m/s^2 at 500 km/h (about 1 g of extra weight, 5.2 m/s^2 at 360 km/h, 1.9 at 216), cap 13: a soft SUV's
-    //               suspension has to carry it, so it is a hypercar's lower end, not an F1 car's
-    //   grip        22 m/s^2 (2.2 g) at most, rate 5 /s: a slide of 8 m/s (5 degrees at 100 m/s) is gone in 0.4 s
-    //   brakes      +12 m/s^2 on top of the stock ~9: 2 g at a hypercar's level, from 252 km/h up, fading out below
-    //   steering    the same 22 m/s^2 as a yaw cap: 0.16 rad/s (9 deg/s) at 500 km/h, 0.37 rad/s at 216 km/h, 0.73 rad/s at
-    //               108 km/h (more than any turn of a real road), so only a spin is cut
-    //   anti-roll   3 /s: a 4 rad/s roll rate is below 1 rad/s in half a second
-    constexpr HyperAssist MakeDubstaAssist()
+    // The tune's handling numbers (GI 2026-11-05 "better handling": every assist ~20 % firmer than the 0.4.13 Dubsta set, the
+    // downforce scaled with the new top speed). From first principles; none of them has been felt in a game yet:
+    //   downforce   14 m/s^2 at 600 km/h (the 0.4.13 curve k v^2 kept: 10 at 500 km/h, 5.0 at 360), cap 17
+    //   grip        26 m/s^2 (2.65 g) at most, rate 6 /s: a slide of 8 m/s is gone in 0.33 s (was 22, 5 /s)
+    //   brakes      +14 m/s^2 on top of the stock ~9 (was +12): 600 km/h to 0 in under 8 s with the pedal down
+    //   steering    26 m/s^2 as a yaw cap (was 22): 0.16 rad/s at 600 km/h, 0.43 rad/s at 216 km/h; only a spin is cut
+    //   anti-roll   4 /s (was 3): a 4 rad/s roll rate is below 1 rad/s in 0.35 s
+    //   one frame:  (26 + 14) / 30 s = 1.33 m/s < the impact tracker's 1.5 m/s (the tests assert it)
+    constexpr HyperAssist MakeHyperAssist()
     {
         HyperAssist a;
         a.downRefMs = kHyperTargetMs;
-        a.downAtRefMs2 = 10.0f;
-        a.downCapMs2 = 13.0f;
-        a.gripRate = 5.0f;
-        a.gripCapMs2 = 22.0f;
-        a.brakeMs2 = 12.0f;
-        a.yawLatMs2 = 22.0f;
-        a.tiltRate = 3.0f;
+        a.downAtRefMs2 = 14.0f;
+        a.downCapMs2 = 17.0f;
+        a.gripRate = 6.0f;
+        a.gripCapMs2 = 26.0f;
+        a.brakeMs2 = 14.0f;
+        a.yawLatMs2 = 26.0f;
+        a.tiltRate = 4.0f;
         return a;
     }
 
-    // The Jesko row is exactly what it was before profiles existed (target, power, no extras): tests pin it.
+    // The road cars from the content packs (GI 2026-11-05: "tune them to whatever you think fits"). Their real top speeds,
+    // a modest power lift over the pack's own handling, no toughness (an RP car crashes like a car), and a light assist set
+    // that only keeps them planted near their top speed: about a third of the hyper set.
+    //   downforce   4 m/s^2 at the car's own top speed (k v^2), cap 6
+    //   grip        12 m/s^2 at most, rate 3 /s       brakes  +6 m/s^2       steering  16 m/s^2 yaw cap       anti-roll  2 /s
+    //   one frame:  (12 + 6) / 30 s = 0.6 m/s < the impact tracker's 1.5 m/s
+    constexpr HyperAssist MakeStreetAssist(float targetKmh)
+    {
+        HyperAssist a;
+        a.downRefMs = targetKmh / 3.6f;
+        a.downAtRefMs2 = 4.0f;
+        a.downCapMs2 = 6.0f;
+        a.gripRate = 3.0f;
+        a.gripCapMs2 = 12.0f;
+        a.brakeMs2 = 6.0f;
+        a.yawLatMs2 = 16.0f;
+        a.tiltRate = 2.0f;
+        return a;
+    }
+
+    // GI 2026-11-05: the tune is the Jesko's (unchanged since); the Dubsta still carries the same one as the old stand-in.
+    // Pack cars: targets are the real cars' top speeds; none of these has been driven in the game yet.
     inline constexpr HyperProfile kHyperProfiles[] = {
-        { "jesko",  kHyperTargetKmh, kHyperPower, false, HyperAssist() },
-        { "dubsta", kHyperTargetKmh, kHyperPower, true,  MakeDubstaAssist() },
+        { "jesko",    kHyperTargetKmh, kHyperPower, true,  MakeHyperAssist() },
+        { "dubsta",   kHyperTargetKmh, kHyperPower, true,  MakeHyperAssist() },
+        // Koenigsegg Regera: 410 km/h, the one other hypercar: the hyper assists (downforce on the same k v^2 curve: 6.5 m/s^2
+        // at 410 km/h), 2.4x power, no toughness. NG pack: "regera" is the expected model name, the pack row catches any other.
+        { "regera",   410.0f, 2.4f,  false, MakeHyperAssist(), "vehicle_regera" },
+        { "rs6",      305.0f, 1.5f,  false, MakeStreetAssist(305.0f) },   // Audi RS6 (C8): 305 km/h, 600 hp wagon
+        { "bmwm5",    305.0f, 1.45f, false, MakeStreetAssist(305.0f) },   // BMW M5 (F90): 305 km/h with the limiter off
+        { "diablosv", 300.0f, 1.35f, false, MakeStreetAssist(300.0f) },   // Lamborghini Diablo SV: 300 km/h
+        { nullptr,    250.0f, 1.25f, false, MakeStreetAssist(250.0f), "vehicle_nissan350z" },   // Nissan 350Z: 250 km/h (limited)
+        { nullptr,    285.0f, 1.35f, false, MakeStreetAssist(285.0f), "vehicle_supra" },        // Toyota Supra: ~285 km/h
     };
     inline constexpr size_t kHyperProfileCount = sizeof(kHyperProfiles) / sizeof(kHyperProfiles[0]);
 
@@ -296,7 +330,19 @@ namespace gage::sync {
     {
         if (!model) return nullptr;
         for (size_t i = 0; i < kHyperProfileCount; ++i)
-            if (std::strcmp(kHyperProfiles[i].model, model) == 0) return &kHyperProfiles[i];
+            if (kHyperProfiles[i].model && std::strcmp(kHyperProfiles[i].model, model) == 0) return &kHyperProfiles[i];
+        return nullptr;
+    }
+
+    // What a log line calls the row: the model, else the pack it covers.
+    inline const char* HyperProfileName(const HyperProfile& p) { return p.model ? p.model : (p.pack ? p.pack : "?"); }
+
+    // The pack-wide row for a content pack folder name (lower case), or nullptr.
+    inline const HyperProfile* HyperProfileForPack(const char* pack)
+    {
+        if (!pack || !*pack) return nullptr;
+        for (size_t i = 0; i < kHyperProfileCount; ++i)
+            if (kHyperProfiles[i].pack && std::strcmp(kHyperProfiles[i].pack, pack) == 0) return &kHyperProfiles[i];
         return nullptr;
     }
 

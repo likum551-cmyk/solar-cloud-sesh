@@ -5,6 +5,7 @@
 // real vehicle-fragment entries. The builder must reproduce them from the decoded field inputs; if the
 // format drifts, these fail. No game, no GPU, pure host code.
 #include "../apps/engine/pack_collection.h"
+#include "../apps/engine/pack_meta.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -362,8 +363,93 @@ static void TestRsc7PageFlags() {
     CHECK(DecodeRsc7Pages(0x0fffffffu).totalSize > 0xffffffffULL, "total is 64-bit (no wrap above 4 GiB)");
 }
 
+// ---- 8. pack_meta: content.xml / vehicles.meta scans (the content-pack mount's model list) -------------
+static void TestPackMeta() {
+    // the shape of the rs6 pack's content.xml (2026-11-05), plus a commented-out item and an odd-case type
+    const std::string content =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CDataFileMgr__ContentsOfDataFileXml>\n  <dataFiles>\n"
+        "    <Item>\n      <filename>dlc_rs6:/common/data/vehiclelayouts.meta</filename>\n"
+        "      <fileType>VEHICLE_LAYOUTS_FILE</fileType>\n    </Item>\n"
+        "    <Item>\n      <filename>dlc_rs6:/common/data/vehicles.meta</filename>\n"
+        "      <fileType>VEHICLE_METADATA_FILE</fileType>\n      <overlay value=\"false\" />\n    </Item>\n"
+        "    <!-- <Item><filename>dlc_rs6:/old/vehicles.meta</filename><fileType>VEHICLE_METADATA_FILE</fileType></Item> -->\n"
+        "    <Item>\n      <filename> dlc_rs6:/common/data/extra.meta </filename>\n      <fileType>vehicle_metadata_file</fileType>\n    </Item>\n"
+        "    <Item>\n      <filename>dlc_rs6:/%PLATFORM%/levels/gta5/vehicles/vehicles.rpf</filename>\n"
+        "      <fileType>RPF_FILE</fileType>\n    </Item>\n  </dataFiles>\n"
+        "  <contentChangeSets><Item><filesToEnable><Item>dlc_rs6:/common/data/vehicles.meta</Item></filesToEnable></Item>"
+        "</contentChangeSets>\n</CDataFileMgr__ContentsOfDataFileXml>\n";
+    const auto metas = MetaFilesOfType(content, "VEHICLE_METADATA_FILE");
+    CHECK(metas.size() == 2, "metas %u", (unsigned)metas.size());
+    CHECK(metas.size() == 2 && metas[0] == "dlc_rs6:/common/data/vehicles.meta" && metas[1] == "dlc_rs6:/common/data/extra.meta",
+          "meta names (comment skipped, trimmed, type case-insensitive)");
+    CHECK(MetaFilesOfType(content, "RPF_FILE").size() == 1, "one rpf");
+    CHECK(MetaFilesOfType(content, "AUDIO_GAMEDATA").empty(), "absent type -> empty");
+    CHECK(MetaFilesOfType("<no data files/>", "VEHICLE_METADATA_FILE").empty(), "no dataFiles -> empty");
+    CHECK(PathInPack("dlc_rs6:/common/data/vehicles.meta") == "common/data/vehicles.meta", "path in pack");
+    CHECK(PathInPack("dlc_rs6:/%PLATFORM%/levels/a.rpf") == "x64/levels/a.rpf", "%%PLATFORM%% -> x64");
+    CHECK(PathInPack("data/handling.meta") == "data/handling.meta", "no prefix kept");
+
+    // two vehicles (the diabloSV pack's field order), a commented one, a duplicate and an invalid name
+    const std::string veh =
+        "<CVehicleModelInfo__InitDataList>\n  <InitDatas>\n"
+        "    <Item>\n      <modelName>diabloSV</modelName>\n      <txdName>diabloSV</txdName>\n"
+        "      <handlingId>diabloSV</handlingId>\n      <gameName>Diablo SV</gameName>\n"
+        "      <vehicleMakeName>Lamborghini</vehicleMakeName>\n      <vehicleClass>VC_SUPER</vehicleClass>\n    </Item>\n"
+        "    <!-- <Item><modelName>oldcar</modelName></Item> -->\n"
+        "    <Item>\n      <modelName> rs6 </modelName>\n      <gameName>RS6</gameName>\n      <vehicleMakeName>AUDI</vehicleMakeName>\n"
+        "    </Item>\n"
+        "    <Item>\n      <modelName>RS6</modelName>\n    </Item>\n"
+        "    <Item>\n      <modelName>bad name!</modelName>\n    </Item>\n"
+        "  </InitDatas>\n  <txdRelationships><Item><parent>vehicles_race_generic</parent><child>diabloSV</child></Item>"
+        "</txdRelationships>\n</CVehicleModelInfo__InitDataList>\n";
+    const auto v = ParseVehiclesMeta(veh);
+    CHECK(v.size() == 2, "vehicles %u", (unsigned)v.size());
+    if (v.size() == 2) {
+        CHECK(v[0].model == "diabloSV" && v[0].make == "Lamborghini" && v[0].label == "Diablo SV" && v[0].vclass == "VC_SUPER",
+              "diabloSV fields: %s / %s / %s / %s", v[0].model.c_str(), v[0].make.c_str(), v[0].label.c_str(), v[0].vclass.c_str());
+        CHECK(v[1].model == "rs6" && v[1].make == "AUDI" && v[1].label == "RS6" && v[1].vclass.empty(),
+              "rs6 fields (trimmed; class absent -> empty, not the next car's)");
+    }
+    CHECK(ParseVehiclesMeta("").empty() && ParseVehiclesMeta("<modelName></modelName>").empty(), "empty -> none");
+}
+
+// The overlay car browser's text rules (pack_meta.h), on the names the staged packs really carry (2026-11-05).
+static void TestCarBrowserText() {
+    using namespace gage::game::content;
+    struct Row { const char *make, *label, *model, *want; };
+    const Row rows[] = {
+        {"jesko", "jesko", "jesko", "Jesko"},                          // same once squashed, all lower case -> capital
+        {"BMW M5", "BMWM5", "bmwm5", "BMW M5"},                        // same once squashed -> the spaced spelling
+        {"AUDI", "RS6", "rs6", "AUDI RS6"},                            // different -> make + label
+        {"Lamborghini", "Diablo SV", "diabloSV", "Lamborghini Diablo SV"},
+        {"BMW", "BMW M3 GTR", "m3gtr", "BMW M3 GTR"},                  // label starts with the make -> the label
+        {"", "", "supra", "Supra"},                                    // nothing -> the model
+        {"NULL", "CARNOTFOUND", "z350", "Z350"},                       // the game's "no text" labels count as missing
+        {"Nissan", "", "z350", "Nissan Z350"},                         // a lone make is followed by the model
+        {"", "Skyline GT-R", "r34", "Skyline GT-R"},
+        {"  Audi  ", " RS6 ", "rs6", "Audi RS6"},                      // trimmed
+    };
+    for (const Row& r : rows) {
+        const std::string got = CarDisplayName(r.make, r.label, r.model);
+        CHECK(got == r.want, "CarDisplayName('%s', '%s', '%s') = '%s', want '%s'", r.make, r.label, r.model, got.c_str(), r.want);
+    }
+    CHECK(CarClassName("VC_SUPER") == "Super", "class super: %s", CarClassName("VC_SUPER").c_str());
+    CHECK(CarClassName("VC_SPORT_CLASSIC") == "Sport classic", "class sport classic: %s", CarClassName("VC_SPORT_CLASSIC").c_str());
+    CHECK(CarClassName("vc_sedan") == "Sedan" && CarClassName("").empty() && CarClassName("SUPER") == "Super",
+          "class edge cases: '%s' '%s' '%s'", CarClassName("vc_sedan").c_str(), CarClassName("").c_str(), CarClassName("SUPER").c_str());
+
+    const std::string hay = "lamborghini diablo sv diablosv super vehicle_lambo";
+    CHECK(MatchesAllTerms("", hay) && MatchesAllTerms("   ", hay) && MatchesAllTerms(nullptr, hay), "a blank query matches");
+    CHECK(MatchesAllTerms("LAMBO", hay) && MatchesAllTerms("diablo  super", hay) && MatchesAllTerms(" sv ", hay),
+          "any case, any term order, extra spaces");
+    CHECK(!MatchesAllTerms("diablo sedan", hay), "every term must match (AND), not any");
+    CHECK(!MatchesAllTerms("jesko", hay) && !MatchesAllTerms("lambox", hay), "a missing term fails");
+}
+
 int main() {
     TestGoldenVectors();
+    TestPackMeta();
+    TestCarBrowserText();
     TestRoundTrip();
     TestRsc7Parse();
     TestBuildImage();

@@ -25,10 +25,12 @@
 // its cuts at the top-right and bottom-left.
 #include "overlay.h"
 #include "overlay_internal.h"
+#include "pack_meta.h"
 #include "common/logger.h"
 #include "protocol/protocol.h"
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImGuiContext::ConfigNavWindowingKey* (UiInit)
 
 #include <windows.h>
 
@@ -118,6 +120,9 @@ struct Data {
     uint32_t chatSeq = 0;
     std::vector<NameTag> tags;      // W10: the newest list SetNameTags was given
     ULONGLONG tagsAt = 0;           // ... and when (GetTickCount64)
+    std::vector<CarEntry> cars;     // the Tab menu's car browser: the newest list SetCars was given
+    bool carsLoading = false;
+    uint32_t carsSeq = 0;
 };
 // Heap-allocated and never freed: a join-worker thread may push a chat line while the DLL's
 // statics are being destroyed.
@@ -240,6 +245,28 @@ struct Ui {
     char      buf[kBufLen] = {};
     int       scroll = 0;
     bool      invJustOpened = false;
+    int       invTab = 0;                   // the Tab menu's page: 0 quick actions, 1 cars (kept between openings)
+
+    // The car browser (the Tab menu's "Cars" page): the render thread's copy of SetCars' list, the search and the page.
+    struct CarRow {
+        std::string model, name, vclass, pack;
+        std::string cmd;                    // "/car <model>"
+        std::string hay;                    // name, model, class and pack in lower case: what the search looks in
+        bool ready = false;
+    };
+    std::vector<CarRow> cars;
+    uint32_t  carsSeq = ~0u;
+    bool      carsLoading = false;
+    std::vector<int> carHits;               // indexes into cars that match the search, in list order
+    std::string carHitsQuery;               // the query carHits was built for
+    bool      carHitsStale = true;
+    char      carQuery[64] = {};
+    int       carPage = 0;
+    int       searchFocusFrames = 0;        // focus the search box this many more frames (it takes a frame or two)
+    bool      searchActive = false;         // the search box held the keyboard last frame
+    bool      searchSelectAll = false;      // the next activation selects the query (opening / switching to the page)
+    float     wheelAcc = 0.0f;              // mouse wheel over the list, one page per whole notch
+    float     railX = 0.0f, railW = 0.0f;   // the Tab menu's gold rail, eased over the open tab (from the panel's left)
 
     std::vector<ViewLine> view;
     uint32_t              viewSeq = ~0u;
@@ -489,8 +516,31 @@ void OpenInventory()
     u.invOpen = true;
     u.invJustOpened = true;
     u.invA = 0.0f;
+    u.searchFocusFrames = u.invTab == 1 ? 3 : 0;   // the cars page opens ready to type...
+    u.searchSelectAll = u.invTab == 1;             // ...over the last query, which the first key replaces
+    u.held.clear();
+    u.wheelAcc = 0.0f;
 }
-void CloseInventory() { u.invOpen = false; }
+// The Tab menu's pages (a header tab click, or Ctrl+Tab). The cars page takes the keyboard for its search at once.
+void SwitchInvTab(int t)
+{
+    if (t == u.invTab)
+        return;
+    u.invTab = t;
+    u.searchFocusFrames = t == 1 ? 3 : 0;
+    u.searchSelectAll = t == 1;
+    u.searchActive = false;
+    u.held.clear();
+    u.wheelAcc = 0.0f;
+}
+void CloseInventory()
+{
+    u.invOpen = false;
+    u.searchFocusFrames = 0;
+    u.searchActive = false;
+    u.searchSelectAll = false;
+    u.held.clear();
+}
 
 // What the player submitted: trim, queue for the engine, echo commands as a dim line.
 void Submit(const char* raw)
@@ -1175,15 +1225,513 @@ float KeyCap(ImDrawList* dl, float x, float y, const char* label, float a)
     return x + w + lean;
 }
 
+// ---- the Tab menu's quick actions page --------------------------------------------------------
+// The three columns of kActions under the header, the line of typed commands, and the key hints. The y values are
+// offsets from the panel's top (DrawInventory's layout).
+void DrawQuickActionsPage(ImDrawList* dl, float px, float py, float pw, float pad, float rowH, float rowGap, float headY0, float rowsY0, float helpY0, float footSepY0, float footH,
+                          const char* const (&kHelp)[3], float a, UiState& L)
+{
+    // Typed commands, one line under the columns.
+    {
+        const float hy = py + helpY0;
+        const char* lead = "Or type in chat";
+        Text(dl, u.small, ImVec2(px + pad, hy), kInk2, a * 0.82f, lead);
+        float hx = px + pad + Measure(u.small, lead).x + S(24.0f);
+        for (const char* line : kHelp) {
+            Text(dl, u.small, ImVec2(hx, hy), kInk, a * 0.90f, line);
+            hx += Measure(u.small, line).x + S(26.0f);
+        }
+    }
+
+    // Footer: how to drive it without the mouse, as key caps.
+    const float footY = py + footSepY0;
+    dl->AddLine(ImVec2(px + pad, footY), ImVec2(px + pw - pad, footY), Col(kHair, 0.14f * a), u.px1);
+    {
+        const float capH = u.small.px + S(8.0f);
+        const float capY = footY + std::floor((footH - capH) * 0.5f);
+        const float g = S(8.0f), gg = S(22.0f);
+        float x = px + pad;
+        x = KeyCap(dl, x, capY, "Arrows", a) + g;
+        Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "move");
+        x += Measure(u.small, "move").x + gg;
+        x = KeyCap(dl, x, capY, "Enter", a) + g;
+        Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "run");
+        // Right group, laid out from its measured width.
+        const float lean = capH * kSkew;
+        const float wTab = Measure(u.small, "Tab").x + S(16.0f) + lean;
+        const float wEsc = Measure(u.small, "Esc").x + S(16.0f) + lean;
+        const float wOr = Measure(u.small, "or").x, wClose = Measure(u.small, "close").x;
+        float rx = px + pw - pad - (wTab + g + wOr + g + wEsc + g + wClose);
+        rx = KeyCap(dl, rx, capY, "Tab", a) + g;
+        Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "or");
+        rx = KeyCap(dl, rx + wOr + g, capY, "Esc", a) + g;
+        Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "close");
+    }
+
+    // Columns
+    const float gapC = S(26.0f);
+    const float colW = std::floor((pw - 2.0f * pad - 2.0f * gapC) / 3.0f);
+    const float headY = py + headY0;
+    const float rowsY = py + rowsY0;
+    int rowIndex[3] = {0, 0, 0};
+    for (int c = 0; c < 3; ++c)
+        Text(dl, u.small, ImVec2(px + pad + (colW + gapC) * (float)c, headY), kInk2, a * 0.82f, kColumnTitle[c]);
+
+    L.actionCount = 0;
+    int clicked = -1;
+    for (int i = 0; i < kActionCount; ++i) {
+        const Action& act = kActions[i];
+        const float cx = px + pad + (colW + gapC) * (float)act.column;
+        const float cy = rowsY + (rowH + rowGap) * (float)rowIndex[act.column]++;
+        const float lean = rowH * kSkew;
+        ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+        ImGui::PushID(i);
+        const bool pressed = ImGui::InvisibleButton("##act", ImVec2(colW, rowH));
+        if (u.invJustOpened && i == 0)
+            ImGui::SetItemDefaultFocus();
+        // The keyboard focus ring shows only while the keyboard is the one steering (NavVisible);
+        // otherwise the default-focused first row would stay lit next to the hovered one.
+        const bool hot = ImGui::IsItemHovered() || (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible);
+        const bool down = ImGui::IsItemActive();
+        ImGui::PopID();
+        if (pressed)
+            clicked = i;
+
+        const float x1 = cx + colW - lean;
+        ImU32 fill = Col(kInk, 0.09f * a), edge = 0;
+        if (down)      { fill = Col(kGoldDown, 0.62f * a); edge = Col(kGoldHot, 0.95f * a); }
+        else if (hot)  { fill = Col(kGold, 0.30f * a); edge = Col(kGold, 0.95f * a); }
+        PlateSlant(dl, cx, cy, x1, cy + rowH, fill, edge);
+        if (hot)
+            PlateSlant(dl, cx, cy, cx + S(4.0f), cy + rowH, Col(kGold, a), 0);   // the lit row's tick
+        Text(dl, u.semi, ImVec2(cx + S(18.0f) + lean * 0.5f, cy + std::floor((rowH - u.semi.px) * 0.5f)), kInk,
+             a, act.label);
+        // The command, right-aligned; when the row is too narrow for label and command it is cut
+        // with an ellipsis rather than dropped (a missing label looks like a bug).
+        const ImVec2 ls = Measure(u.semi, act.label);
+        const float cmdR = x1 - S(14.0f) + lean * 0.5f;
+        const float cmdAvail = cmdR - (cx + S(18.0f) + lean * 0.5f + ls.x + S(14.0f));
+        const std::string cmdText = FitText(u.small, act.cmd, cmdAvail);
+        if (!cmdText.empty())
+            Text(dl, u.small, ImVec2(cmdR - Measure(u.small, cmdText.c_str()).x, cy + std::floor((rowH - u.small.px) * 0.5f)),
+                 kInk, a * (hot ? 0.90f : 0.66f), cmdText.c_str());
+
+        if (L.actionCount < UiState::kMaxActions) {
+            const int k = L.actionCount++;
+            L.actionRect[k][0] = cx; L.actionRect[k][1] = cy; L.actionRect[k][2] = colW; L.actionRect[k][3] = rowH;
+            std::snprintf(L.actionCmd[k], sizeof(L.actionCmd[k]), "%s", act.cmd);
+        }
+    }
+
+    if (clicked >= 0) {
+        Submit(kActions[clicked].cmd);
+        CloseInventory();
+    }
+}
+
+// ---- the Tab menu's cars page -----------------------------------------------------------------
+constexpr int kCarCols = 2, kCarRows = 8, kCarsPerPage = kCarCols * kCarRows;
+static_assert(kCarsPerPage <= UiState::kMaxActions, "UiState::kMaxActions is too small for a page of cars");
+
+// 1234567 -> "1,234,567"
+std::string Thousands(int n)
+{
+    std::string s = std::to_string(n < 0 ? 0 : n);
+    for (int i = (int)s.size() - 3; i > 0; i -= 3)
+        s.insert((std::size_t)i, ",");
+    return s;
+}
+
+// A small leaning button (the pager), key-cap sized but dressed like the rows (ink 0.09 at rest, no edge; gold on
+// hover / press), so what is clickable never looks like a key legend. A disabled one is dimmed and never pressed.
+// Returns pressed; *right gets its right edge, rect its box.
+bool CapButton(ImDrawList* dl, const char* id, float x, float y, const char* label, bool enabled, float a, float* right,
+               float rect[4])
+{
+    const float h = u.small.px + S(8.0f);
+    const float w = Measure(u.small, label).x + S(16.0f);
+    const float lean = h * kSkew;
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    const bool pressed = ImGui::InvisibleButton(id, ImVec2(w + lean, h)) && enabled;
+    const bool hot = enabled && (ImGui::IsItemHovered() || (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible));
+    const bool down = enabled && ImGui::IsItemActive();
+    const float k = enabled ? 1.0f : 0.38f;
+    ImU32 fill = Col(kInk, (enabled ? 0.09f : 0.04f) * a), edge = 0;
+    if (down)     { fill = Col(kGoldDown, 0.62f * a); edge = Col(kGoldHot, 0.95f * a); }
+    else if (hot) { fill = Col(kGold, 0.30f * a); edge = Col(kGold, 0.95f * a); }
+    PlateSlant(dl, x, y, x + w, y + h, fill, edge);
+    Text(dl, u.small, ImVec2(x + S(8.0f) + lean * 0.5f, y + S(4.0f)), kInk, a * 0.94f * k, label);
+    rect[0] = x; rect[1] = y; rect[2] = w + lean; rect[3] = h;
+    *right = x + w + lean;
+    return pressed;
+}
+
+// The search glyph: a lens and its handle, from primitives (like the vitals icons), in a box of side s.
+void IconSearch(ImDrawList* dl, float x, float y, float s, ImU32 col)
+{
+    const float r = s * 0.34f, t = std::fmax(1.5f, s * 0.13f);
+    const ImVec2 c(x + s * 0.42f, y + s * 0.42f);
+    dl->AddCircle(c, r, col, 24, t);
+    const float d = r * 0.7071f;
+    dl->AddLine(ImVec2(c.x + d + t * 0.3f, c.y + d + t * 0.3f), ImVec2(x + s * 0.94f, y + s * 0.94f), col, t * 1.25f);
+}
+
+// Copy SetCars' list when it changed, and rebuild the search hits when the list or the query changed.
+void RefreshCars()
+{
+    std::vector<CarEntry> fresh;
+    bool loading = false, got = false;
+    {
+        DLock lk;
+        const Data& d = D();
+        if (d.carsSeq != u.carsSeq) {
+            fresh = d.cars;
+            loading = d.carsLoading;
+            u.carsSeq = d.carsSeq;
+            got = true;
+        }
+    }
+    if (got) {
+        u.carsLoading = loading;
+        u.cars.clear();
+        u.cars.reserve(fresh.size());
+        for (const CarEntry& e : fresh) {
+            Ui::CarRow r;
+            r.model = e.model; r.name = e.name[0] ? e.name : e.model; r.vclass = e.vclass; r.pack = e.pack;
+            r.ready = e.ready;
+            r.cmd = "/car " + r.model;
+            r.hay = r.name + " " + r.model + " " + r.vclass + " " + r.pack;
+            for (char& c : r.hay)
+                c = (char)std::tolower((unsigned char)c);
+            u.cars.push_back(std::move(r));
+        }
+        u.carHitsStale = true;
+    }
+    if (u.carHitsStale || u.carHitsQuery != u.carQuery) {
+        if (u.carHitsQuery != u.carQuery)
+            u.carPage = 0;                     // a new search starts on its first page
+        u.carHitsQuery = u.carQuery;
+        u.carHitsStale = false;
+        u.carHits.clear();
+        for (int i = 0; i < (int)u.cars.size(); ++i)
+            if (content::MatchesAllTerms(u.carQuery, u.cars[(std::size_t)i].hay))
+                u.carHits.push_back(i);
+    }
+}
+
+// The cars page under the header: the search line, a page of cars in two columns, the pager, the key hints.
+// Its y values are offsets from the panel's top (CarsPageLayout), so DrawInventory can size the panel first.
+struct CarsLayout {
+    float searchY0, searchH, rowsY0, rowsH, pagerY0, pagerH, footSepY0, footH, ph;
+};
+CarsLayout CarsPageLayout(float sepY0, float rowH, float rowGap, float footH)
+{
+    CarsLayout c;
+    c.searchY0 = sepY0 + S(22.0f);
+    c.searchH = S(46.0f);
+    c.rowsY0 = c.searchY0 + c.searchH + S(22.0f);
+    c.rowsH = (rowH + rowGap) * (float)kCarRows - rowGap;
+    c.pagerY0 = c.rowsY0 + c.rowsH + S(20.0f);
+    c.pagerH = u.small.px + S(8.0f);
+    c.footSepY0 = c.pagerY0 + c.pagerH + S(20.0f);
+    c.footH = footH;
+    c.ph = c.footSepY0 + footH;
+    return c;
+}
+
+void DrawCarsPage(ImDrawList* dl, float px, float py, float pw, float pad, float rowH, float rowGap, const CarsLayout& cl,
+                  float a, UiState& L)
+{
+    RefreshCars();
+    const int total = (int)u.cars.size(), matched = (int)u.carHits.size();
+    const int pages = std::max(1, (matched + kCarsPerPage - 1) / kCarsPerPage);
+    // PgUp / PgDn and the wheel over the list turn the page (read before the clamp so a press at the end is a no-op).
+    // The page owns the two keys: keyboard navigation would otherwise also take them (NavUpdatePageUpPageDown reads
+    // only unowned keys) and move the focus off the search onto a pager button, so a following Enter pressed that.
+    const ImGuiID pagerOwner = ImGui::GetID("##carspager");
+    ImGui::SetKeyOwner(ImGuiKey_PageDown, pagerOwner);
+    ImGui::SetKeyOwner(ImGuiKey_PageUp, pagerOwner);
+    if (ImGui::IsKeyPressed(ImGuiKey_PageDown))
+        ++u.carPage;
+    if (ImGui::IsKeyPressed(ImGuiKey_PageUp))
+        --u.carPage;
+    const float listX0 = px + pad, listX1 = px + pw - pad;
+    const float rowsY = py + cl.rowsY0;
+    // A precision touchpad sends a small wheel delta every frame: sum them and turn one page per whole notch.
+    if (ImGui::IsMouseHoveringRect(ImVec2(listX0, rowsY), ImVec2(listX1, rowsY + cl.rowsH), false)) {
+        u.wheelAcc += ImGui::GetIO().MouseWheel;
+        while (u.wheelAcc <= -1.0f) { ++u.carPage; u.wheelAcc += 1.0f; }
+        while (u.wheelAcc >= 1.0f) { --u.carPage; u.wheelAcc -= 1.0f; }
+    } else {
+        u.wheelAcc = 0.0f;
+    }
+    u.carPage = std::max(0, std::min(pages - 1, u.carPage));
+
+    // ---- the search line: a leaning well like the chat's input line, the ImGui text box laid over it ----
+    const float sy = py + cl.searchY0, sh = cl.searchH;
+    const float sx = listX0, sw = (listX1 - listX0) - sh * kSkew;
+    // The edge is gold while the box has the keyboard (as of last frame: the plate is drawn before the box), and at
+    // rest while there is nothing to search.
+    PlateSlant(dl, sx, sy, sx + sw, sy + sh, Col(kInk, 0.07f * a), 0);
+    PlateSlant(dl, sx, sy, sx + sw, sy + sh, Col(kGround, 0.80f * a),
+               u.searchActive && (total > 0 || u.carsLoading) ? Col(kGold, 0.85f * a) : Col(kHair, 0.20f * a));
+    const float lean = sh * kSkew;
+    const float icon = std::floor(u.body.px * 0.95f);
+    IconSearch(dl, sx + S(18.0f) + lean * 0.5f, sy + std::floor((sh - icon) * 0.5f), icon, Col(kInk2, 0.80f * a));
+    // The count, right-aligned in the well: "1,024 cars", or "12 of 1,024" while searching; nothing while there are
+    // no cars at all (the empty state below says why).
+    std::string count;
+    if (total > 0)
+        count = (u.carQuery[0] ? Thousands(matched) + " of " + Thousands(total) : Thousands(total) + (total == 1 ? " car" : " cars")) +
+                (u.carsLoading ? " so far" : "");
+    const float countW = count.empty() ? 0.0f : Measure(u.small, count.c_str()).x;
+    // Its right edge is the rows' right-hand text edge (a row's x1 - S(14) + lean / 2), so count, ids and pager align.
+    const float countX = listX1 - S(14.0f) - rowH * kSkew * 0.5f - countW;
+    if (!count.empty())
+        Text(dl, u.small, ImVec2(countX, sy + std::floor((sh - u.small.px) * 0.5f)), kInk2, a * 0.82f, count.c_str());
+
+    const float textX = sx + S(18.0f) + lean * 0.5f + icon + S(12.0f);
+    ImGui::SetCursorScreenPos(ImVec2(textX, sy));
+    ImGui::SetNextItemWidth(std::fmax(S(80.0f), countX - S(16.0f) - textX));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, std::floor((sh - u.body.px) * 0.5f)));
+    ImGui::PushFont(u.body.font);
+    // With no packs at all (and none loading) there is nothing to search: the box is not handed the keyboard.
+    const bool searchable = total > 0 || u.carsLoading;
+    if (!searchable && u.searchActive)
+        ImGui::ClearActiveID();                  // the packs went away while it was typing: give the keyboard back
+    if (u.searchFocusFrames > 0) {
+        if (!u.searchActive && searchable)
+            ImGui::SetKeyboardFocusHere(0);
+        --u.searchFocusFrames;
+    }
+    // Select-all only for the activation that opening the page asked for (a focus request otherwise keeps the caret,
+    // and a click puts it where the click was).
+    const ImGuiInputTextFlags tf = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter |
+                                   ImGuiInputTextFlags_NoUndoRedo |
+                                   (u.searchSelectAll ? ImGuiInputTextFlags_AutoSelectAll : ImGuiInputTextFlags_None);
+    const bool enterInSearch = ImGui::InputTextWithHint("##carsearch", "Search by name, model, class or pack", u.carQuery,
+                                                        sizeof(u.carQuery), tf, ChatCharFilter);
+    u.searchActive = ImGui::IsItemActive();
+    if (u.searchActive)
+        u.searchSelectAll = false;
+    ImGui::PopFont();
+    ImGui::PopStyleVar();
+    L.searchX = sx; L.searchY = sy; L.searchW = sw + lean; L.searchH = sh;
+    RefreshCars();                               // the query may have changed this frame
+
+    // ---- the page of cars, column by column (an alphabetical list reads down, then across) ----
+    const float gapC = S(26.0f);
+    const float colW = std::floor((listX1 - listX0 - gapC * (float)(kCarCols - 1)) / (float)kCarCols);
+    const int first = u.carPage * kCarsPerPage;
+    const int onPage = std::max(0, std::min(kCarsPerPage, (int)u.carHits.size() - first));
+    // Always exactly one lit car (the row the keys act on and the status line describes): the row under the pointer
+    // or the arrow keys, else the first car on THIS page the game has. Enter in the search spawns it. The buttons are
+    // laid out first so this frame's hover decides the lit row before any row is drawn.
+    int clicked = -1;
+    bool hotK[kCarsPerPage] = {}, downK[kCarsPerPage] = {};
+    int hotRow = -1;
+    for (int k = 0; k < onPage; ++k) {
+        const Ui::CarRow& car = u.cars[(std::size_t)u.carHits[(std::size_t)(first + k)]];
+        const float cx = listX0 + (colW + gapC) * (float)(k / kCarRows);
+        const float cy = rowsY + (rowH + rowGap) * (float)(k % kCarRows);
+        ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+        ImGui::PushID(first + k);
+        const bool pressed = ImGui::InvisibleButton("##car", ImVec2(colW, rowH));
+        hotK[k] = ImGui::IsItemHovered() || (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible);
+        downK[k] = car.ready && ImGui::IsItemActive();
+        ImGui::PopID();
+        if (hotK[k] && hotRow < 0)
+            hotRow = k;
+        if (pressed && car.ready)
+            clicked = u.carHits[(std::size_t)(first + k)];
+    }
+    int litK = hotRow;
+    for (int k = 0; k < onPage && litK < 0; ++k)
+        if (u.cars[(std::size_t)u.carHits[(std::size_t)(first + k)]].ready)
+            litK = k;
+    if (litK < 0 && onPage > 0)
+        litK = 0;                                // nothing on the page is loaded: still describe the first row
+    L.actionCount = 0;
+    for (int k = 0; k < onPage; ++k) {
+        const Ui::CarRow& car = u.cars[(std::size_t)u.carHits[(std::size_t)(first + k)]];
+        const int col = k / kCarRows, row = k % kCarRows;
+        const float cx = listX0 + (colW + gapC) * (float)col;
+        const float cy = rowsY + (rowH + rowGap) * (float)row;
+        const float rl = rowH * kSkew;
+        const bool hot = hotK[k], down = downK[k];
+
+        const float x1 = cx + colW - rl;
+        const bool lit = hot && car.ready;       // a car the game does not have never lights up as an action
+        const bool resting = k == litK && !hot && car.ready;   // the default lit car: tick and hairline, no gold fill
+        ImU32 fill = Col(kInk, 0.09f * a), edge = 0;
+        if (down)         { fill = Col(kGoldDown, 0.62f * a); edge = Col(kGoldHot, 0.95f * a); }
+        else if (lit)     { fill = Col(kGold, 0.30f * a); edge = Col(kGold, 0.95f * a); }
+        else if (hot || resting) { edge = Col(kHair, 0.22f * a); }
+        PlateSlant(dl, cx, cy, x1, cy + rowH, fill, edge);
+        if (lit || down || resting)
+            PlateSlant(dl, cx, cy, cx + S(4.0f), cy + rowH, Col(kGold, a), 0);
+        // Right: the model (what /car takes), or why the car cannot spawn. The name gets the room first; the
+        // right-hand text is cut before the name is.
+        const char* right = car.ready ? car.model.c_str() : (u.carsLoading ? "loading" : "not loaded");
+        const float nameX = cx + S(18.0f) + rl * 0.5f;
+        const float rightR = x1 - S(14.0f) + rl * 0.5f;
+        const float inner = rightR - nameX;
+        const float rightWant = std::fmin(Measure(u.small, right).x, inner * 0.34f);
+        const std::string name = FitText(u.semi, car.name.c_str(), inner - rightWant - S(14.0f));
+        Text(dl, u.semi, ImVec2(nameX, cy + std::floor((rowH - u.semi.px) * 0.5f)), kInk, a * (car.ready ? 1.0f : 0.56f),
+             name.c_str());
+        const float rightAvail = inner - Measure(u.semi, name.c_str()).x - S(14.0f);
+        const std::string rt = FitText(u.small, right, rightAvail);
+        if (!rt.empty()) {
+            const Rgb rc = car.ready || u.carsLoading ? kInk : kEmber;
+            const float ra = car.ready ? (hot ? 0.90f : 0.66f) : (u.carsLoading ? 0.50f : 0.85f);
+            Text(dl, u.small, ImVec2(rightR - Measure(u.small, rt.c_str()).x, cy + std::floor((rowH - u.small.px) * 0.5f)),
+                 rc, a * ra, rt.c_str());
+        }
+        if (L.actionCount < UiState::kMaxActions) {
+            const int n = L.actionCount++;
+            L.actionRect[n][0] = cx; L.actionRect[n][1] = cy; L.actionRect[n][2] = colW; L.actionRect[n][3] = rowH;
+            std::snprintf(L.actionCmd[n], sizeof(L.actionCmd[n]), "%s", car.cmd.c_str());
+        }
+    }
+
+    // ---- nothing to list: loading, no packs, or a search with no hits. Built from the rows' own plate, anchored where
+    // the list starts (heading at the row-text x), so the page never shows a bare void. ----
+    if (onPage == 0) {
+        std::string head, sub;
+        const bool loadingNow = u.carsLoading;
+        if (total == 0 && loadingNow) {
+            head = "Loading car packs";
+            sub = "Cars appear here as each pack mounts.";
+        } else if (total == 0) {
+            head = "No car packs mounted";
+            sub = "Add-on cars appear here once their packs load.";
+        } else {
+            std::string q = FitText(u.semi, u.carQuery, (listX1 - listX0) * 0.5f);
+            head = (loadingNow ? "No match yet for \xE2\x80\x9C" : "No cars match \xE2\x80\x9C") + q + "\xE2\x80\x9D";
+            sub = loadingNow ? "More car packs are still loading." : "Search by name, model, class or pack, for example";
+        }
+        const float bh = rowH * 2.0f + rowGap;
+        const float x1 = listX1 - bh * kSkew;    // a taller plate leans further: its top-right corner ends at listX1
+        PlateSlant(dl, listX0, rowsY, x1, rowsY + bh, Col(kInk, 0.09f * a), 0);
+        const float tx = listX0 + S(18.0f) + rowH * kSkew * 0.5f;   // the rows' text x, not this taller plate's
+        const float hy = rowsY + S(22.0f);
+        Text(dl, u.semi, ImVec2(tx, hy), kInk, a, FitText(u.semi, head.c_str(), x1 - tx - S(14.0f)).c_str());
+        const float sy2 = hy + u.semi.px + S(10.0f);
+        const std::string subFit = FitText(u.small, sub.c_str(), x1 - tx - S(14.0f));
+        Text(dl, u.small, ImVec2(tx, sy2), kInk2, a * 0.82f, subFit.c_str());
+        if (total > 0 && !loadingNow && subFit == sub) {
+            // The example searches in command ink, like the quick actions page's "Or type in chat" line.
+            float ex = tx + Measure(u.small, sub.c_str()).x + S(8.0f);
+            for (const char* w : {"super", "lambo"}) {
+                if (ex + Measure(u.small, w).x > x1 - S(14.0f))
+                    break;
+                Text(dl, u.small, ImVec2(ex, sy2), kInk, a * 0.90f, w);
+                ex += Measure(u.small, w).x + S(14.0f);
+            }
+        }
+        if (loadingNow) {
+            // Indeterminate progress: a short lit segment sweeping along the plate's foot, the loader's lit-bar idiom.
+            const float y1 = rowsY + bh, y0 = y1 - std::fmax(2.0f, S(3.0f));
+            const float span = x1 - listX0, seg = std::floor(span * 0.18f);
+            const float t = (float)std::fmod(ImGui::GetTime() / 1.6, 1.0);
+            const float sx0 = listX0 + (span + seg) * t - seg;
+            const float a0 = std::fmax(listX0, sx0), a1 = std::fmin(x1, sx0 + seg);
+            if (a1 > a0)
+                dl->AddRectFilled(ImVec2(a0, y0), ImVec2(a1, y1), Col(kGold, a));
+        }
+    }
+
+    // ---- the status line: the lit car (the command first, then its class and pack) on the left, the pager right ----
+    const float pgY = py + cl.pagerY0, capH = cl.pagerH;
+    if (matched > 0) {                           // no pager over an empty state
+        float rx = 0.0f;
+        const float lean2 = capH * kSkew, g = S(10.0f);
+        const float wPrev = Measure(u.small, "Previous").x + S(16.0f) + lean2;
+        const float wNext = Measure(u.small, "Next").x + S(16.0f) + lean2;
+        char pageText[48];
+        std::snprintf(pageText, sizeof(pageText), "Page %s of %s", Thousands(u.carPage + 1).c_str(), Thousands(pages).c_str());
+        const float wPage = Measure(u.small, pageText).x;
+        float bx = listX1 - (wPrev + g + wPage + g + wNext);
+        const float pagerX0 = bx;
+        if (CapButton(dl, "##prev", bx, pgY, "Previous", u.carPage > 0, a, &rx, L.pagePrevRect))
+            --u.carPage;
+        Text(dl, u.small, ImVec2(rx + g, pgY + S(4.0f)), kInk, a * 0.80f, pageText);
+        if (CapButton(dl, "##next", rx + g + wPage + g, pgY, "Next", u.carPage + 1 < pages, a, &rx, L.pageNextRect))
+            ++u.carPage;
+        u.carPage = std::max(0, std::min(pages - 1, u.carPage));
+
+        const float infoEnd = pagerX0 - S(20.0f);
+        float ix = listX0;
+        const float ty = pgY + S(4.0f);
+        if (litK >= 0) {
+            const Ui::CarRow& car = u.cars[(std::size_t)u.carHits[(std::size_t)(first + litK)]];
+            // "/car rs6   Super · rs6". A car the game does not have says so instead of advertising a command that
+            // would not run.
+            const std::string cmd = FitText(u.small, car.ready ? car.cmd.c_str() : (u.carsLoading ? "loading" : "not loaded"),
+                                            infoEnd - ix);
+            Text(dl, u.small, ImVec2(ix, ty), car.ready || u.carsLoading ? kInk : kEmber,
+                 a * (car.ready ? 0.92f : (u.carsLoading ? 0.50f : 0.85f)), cmd.c_str());
+            ix += Measure(u.small, cmd.c_str()).x + S(22.0f);
+            std::string where = car.vclass;
+            if (!car.pack.empty())
+                where += (where.empty() ? "" : "  \xC2\xB7  ") + car.pack;
+            if (!where.empty() && ix < infoEnd)
+                Text(dl, u.small, ImVec2(ix, ty), kInk2, a * 0.72f, FitText(u.small, where.c_str(), infoEnd - ix).c_str());
+        }
+    }
+
+    // ---- footer: the keys ----
+    const float footY = py + cl.footSepY0;
+    dl->AddLine(ImVec2(listX0, footY), ImVec2(listX1, footY), Col(kHair, 0.14f * a), u.px1);
+    {
+        const float fcapH = u.small.px + S(8.0f);
+        const float capY = footY + std::floor((cl.footH - fcapH) * 0.5f);
+        const float g = S(8.0f), gg = S(22.0f);
+        // A key with nothing to do right now (an empty page, a single page) is dimmed like a disabled pager button.
+        const float aRows = onPage > 0 ? a : a * 0.38f, aPage = pages > 1 ? a : a * 0.38f;
+        float x = listX0;                        // the quick actions page's order: Arrows, then Enter
+        x = KeyCap(dl, x, capY, "Arrows", aRows) + g;
+        Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, aRows * 0.80f, "move");
+        x += Measure(u.small, "move").x + gg;
+        x = KeyCap(dl, x, capY, "Enter", aRows) + g;
+        Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, aRows * 0.80f, "spawn");
+        x += Measure(u.small, "spawn").x + gg;
+        x = KeyCap(dl, x, capY, "PgUp", aPage) + g;
+        x = KeyCap(dl, x, capY, "PgDn", aPage) + g;
+        Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, aPage * 0.80f, "page");
+        const float lean3 = fcapH * kSkew;
+        const float wTab = Measure(u.small, "Tab").x + S(16.0f) + lean3;
+        const float wEsc = Measure(u.small, "Esc").x + S(16.0f) + lean3;
+        const float wOr = Measure(u.small, "or").x, wClose = Measure(u.small, "close").x;
+        float rx = listX1 - (wTab + g + wOr + g + wEsc + g + wClose);
+        rx = KeyCap(dl, rx, capY, "Tab", a) + g;
+        Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "or");
+        rx = KeyCap(dl, rx + wOr + g, capY, "Esc", a) + g;
+        Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "close");
+    }
+
+    // Enter in the search spawns the lit car (when the game has it); a click spawns its row.
+    if (enterInSearch && clicked < 0 && litK >= 0 && u.cars[(std::size_t)u.carHits[(std::size_t)(first + litK)]].ready)
+        clicked = u.carHits[(std::size_t)(first + litK)];
+    L.litCar = litK;
+    L.carsTotal = total; L.carsMatched = matched; L.carPage = u.carPage; L.carPages = pages; L.carsLoading = u.carsLoading;
+    if (clicked >= 0) {
+        Submit(u.cars[(std::size_t)clicked].cmd.c_str());
+        CloseInventory();
+    }
+}
+
 void DrawInventory(float W, float H, float hudA, UiState& L)
 {
+    RefreshCars();                                            // the cars tab shows its count on either page
     const float a = u.invA * hudA;
     const float pad = S(30.0f);
     const float rowH = S(42.0f), rowGap = S(8.0f);
     const float pw = std::fmin(S(880.0f), W - S(48.0f));     // never wider than the screen
 
-    // The panel is as tall as its content: the tallest column, then one line of typed commands, then
-    // the footer with the key hints.
+    // The panel is as tall as its page's content. Quick actions: the tallest column, then one line of typed
+    // commands, then the footer with the key hints. Cars: CarsPageLayout.
     int rowCount[3] = {0, 0, 0};
     for (int i = 0; i < kActionCount; ++i)
         ++rowCount[kActions[i].column];
@@ -1195,10 +1743,15 @@ void DrawInventory(float W, float H, float hudA, UiState& L)
     const float helpY0 = rowsY0 + contentH + S(22.0f);
     const float footSepY0 = helpY0 + u.small.px + S(18.0f);
     const float footH = S(52.0f);
-    const float ph = footSepY0 + footH;
+    const float phQuick = footSepY0 + footH;
+    const CarsLayout cl = CarsPageLayout(sepY0, rowH, rowGap, footH);
+    const bool carsPage = u.invTab == 1;
+    const float ph = carsPage ? cl.ph : phQuick;
 
+    // Placed for the taller page, so the header (and the tabs under the cursor) stays put when the page changes;
+    // only the bottom edge moves.
     const float px = std::floor((W - pw) * 0.5f);
-    const float py = std::floor((H - ph) * 0.5f + (1.0f - u.invA) * S(14.0f));
+    const float py = std::floor((H - std::fmax(phQuick, cl.ph)) * 0.5f + (1.0f - u.invA) * S(14.0f));
 
     ImGui::SetNextWindowPos(ImVec2(px, py));
     ImGui::SetNextWindowSize(ImVec2(pw, ph));
@@ -1213,117 +1766,84 @@ void DrawInventory(float W, float H, float hudA, UiState& L)
     if (began) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         PlateChamfer(dl, px, py, px + pw, py + ph, S(30.0f), Col(kPanel, 0.95f * a), Col(kHair, 0.16f * a));
-        // Solar gold at rest: a rail along the top edge, from the end of the chamfer.
-        dl->AddRectFilled(ImVec2(px + S(30.0f), py), ImVec2(px + S(30.0f) + S(120.0f), py + std::fmax(2.0f, S(3.0f))),
-                          Col(kGold, a));
 
-        // Header
-        Text(dl, u.title, ImVec2(px + pad, py + S(22.0f)), kInk, a, "Quick actions");
+        // Header: the two pages as tabs, in the title face. The open one is ink and the plate's Solar gold rail (along
+        // the top edge, the one straight gold bar every plate carries) sits over it, sliding when the page changes; the
+        // other is a dimmer caption that lifts on hover. A click, Ctrl+Tab, or Arrows + Enter
+        // switches. The cars tab carries its count while it is closed (open, the search well says it).
         const float sepY = py + sepY0;
         dl->AddLine(ImVec2(px + pad, sepY), ImVec2(px + pw - pad, sepY), Col(kHair, 0.14f * a), u.px1);
-
-        // Typed commands, one line under the columns.
         {
-            const float hy = py + helpY0;
-            const char* lead = "Or type in chat";
-            Text(dl, u.small, ImVec2(px + pad, hy), kInk2, a * 0.82f, lead);
-            float hx = px + pad + Measure(u.small, lead).x + S(24.0f);
-            for (const char* line : kHelp) {
-                Text(dl, u.small, ImVec2(hx, hy), kInk, a * 0.90f, line);
-                hx += Measure(u.small, line).x + S(26.0f);
+            static const char* const kTabs[2] = {"Quick actions", "Cars"};
+            const float ty = py + S(22.0f);
+            float tx = px + pad;
+            float openX = tx, openW = 0.0f;
+            int switchTo = -1;
+            for (int t = 0; t < 2; ++t) {
+                const bool open = u.invTab == t;
+                const ImVec2 ts = Measure(u.title, kTabs[t]);
+                std::string badge;
+                if (t == 1 && !open && !u.cars.empty())
+                    badge = Thousands((int)u.cars.size());
+                const float badgeW = badge.empty() ? 0.0f : S(10.0f) + Measure(u.small, badge.c_str()).x;
+                const float hitY0 = py + S(12.0f), hitY1 = sepY - S(2.0f);
+                ImGui::SetCursorScreenPos(ImVec2(tx - S(6.0f), hitY0));
+                ImGui::PushID(100 + t);
+                const bool pressed = ImGui::InvisibleButton("##tab", ImVec2(ts.x + badgeW + S(12.0f), hitY1 - hitY0));
+                const bool hot = ImGui::IsItemHovered() || (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible);
+                ImGui::PopID();
+                if (pressed && !open)
+                    switchTo = t;
+                Text(dl, u.title, ImVec2(tx, ty), open ? kInk : kInk2, a * (open ? 1.0f : (hot ? 0.86f : 0.52f)), kTabs[t]);
+                if (!badge.empty())
+                    Text(dl, u.small, ImVec2(tx + ts.x + S(10.0f), ty + AscentPx(u.title) - AscentPx(u.small)), kInk2,
+                         a * 0.52f, badge.c_str());
+                if (open) {                      // a closed tab's hover is its label lifting (0.52 -> 0.86), nothing more
+                    openX = tx;
+                    openW = ts.x;
+                }
+                L.tabRect[t][0] = tx; L.tabRect[t][1] = hitY0; L.tabRect[t][2] = ts.x + badgeW; L.tabRect[t][3] = hitY1 - hitY0;
+                tx += ts.x + badgeW + S(40.0f);
             }
-        }
-
-        // Footer: how to drive it without the mouse, as key caps.
-        const float footY = py + footSepY0;
-        dl->AddLine(ImVec2(px + pad, footY), ImVec2(px + pw - pad, footY), Col(kHair, 0.14f * a), u.px1);
-        {
-            const float capH = u.small.px + S(8.0f);
-            const float capY = footY + std::floor((footH - capH) * 0.5f);
-            const float g = S(8.0f), gg = S(22.0f);
-            float x = px + pad;
-            x = KeyCap(dl, x, capY, "Arrows", a) + g;
-            Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "move");
-            x += Measure(u.small, "move").x + gg;
-            x = KeyCap(dl, x, capY, "Enter", a) + g;
-            Text(dl, u.small, ImVec2(x, capY + S(4.0f)), kInk, a * 0.80f, "run");
-            // Right group, laid out from its measured width.
-            const float lean = capH * kSkew;
-            const float wTab = Measure(u.small, "Tab").x + S(16.0f) + lean;
-            const float wEsc = Measure(u.small, "Esc").x + S(16.0f) + lean;
-            const float wOr = Measure(u.small, "or").x, wClose = Measure(u.small, "close").x;
-            float rx = px + pw - pad - (wTab + g + wOr + g + wEsc + g + wClose);
-            rx = KeyCap(dl, rx, capY, "Tab", a) + g;
-            Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "or");
-            rx = KeyCap(dl, rx + wOr + g, capY, "Esc", a) + g;
-            Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "close");
-        }
-
-        // Columns
-        const float gapC = S(26.0f);
-        const float colW = std::floor((pw - 2.0f * pad - 2.0f * gapC) / 3.0f);
-        const float headY = sepY + (headY0 - sepY0);
-        const float rowsY = py + rowsY0;
-        int rowIndex[3] = {0, 0, 0};
-        for (int c = 0; c < 3; ++c)
-            Text(dl, u.small, ImVec2(px + pad + (colW + gapC) * (float)c, headY), kInk2, a * 0.82f, kColumnTitle[c]);
-
-        L.actionCount = 0;
-        int clicked = -1;
-        for (int i = 0; i < kActionCount; ++i) {
-            const Action& act = kActions[i];
-            const float cx = px + pad + (colW + gapC) * (float)act.column;
-            const float cy = rowsY + (rowH + rowGap) * (float)rowIndex[act.column]++;
-            const float lean = rowH * kSkew;
-            ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-            ImGui::PushID(i);
-            const bool pressed = ImGui::InvisibleButton("##act", ImVec2(colW, rowH));
-            if (u.invJustOpened && i == 0)
-                ImGui::SetItemDefaultFocus();
-            // The keyboard focus ring shows only while the keyboard is the one steering (NavVisible);
-            // otherwise the default-focused first row would stay lit next to the hovered one.
-            const bool hot = ImGui::IsItemHovered() || (ImGui::IsItemFocused() && ImGui::GetIO().NavVisible);
-            const bool down = ImGui::IsItemActive();
-            ImGui::PopID();
-            if (pressed)
-                clicked = i;
-
-            const float x1 = cx + colW - lean;
-            ImU32 fill = Col(kInk, 0.09f * a), edge = 0;
-            if (down)      { fill = Col(kGoldDown, 0.62f * a); edge = Col(kGoldHot, 0.95f * a); }
-            else if (hot)  { fill = Col(kGold, 0.30f * a); edge = Col(kGold, 0.95f * a); }
-            PlateSlant(dl, cx, cy, x1, cy + rowH, fill, edge);
-            if (hot)
-                PlateSlant(dl, cx, cy, cx + S(4.0f), cy + rowH, Col(kGold, a), 0);   // the lit row's tick
-            Text(dl, u.semi, ImVec2(cx + S(18.0f) + lean * 0.5f, cy + std::floor((rowH - u.semi.px) * 0.5f)), kInk,
-                 a, act.label);
-            // The command, right-aligned; when the row is too narrow for label and command it is cut
-            // with an ellipsis rather than dropped (a missing label looks like a bug).
-            const ImVec2 ls = Measure(u.semi, act.label);
-            const float cmdR = x1 - S(14.0f) + lean * 0.5f;
-            const float cmdAvail = cmdR - (cx + S(18.0f) + lean * 0.5f + ls.x + S(14.0f));
-            const std::string cmdText = FitText(u.small, act.cmd, cmdAvail);
-            if (!cmdText.empty())
-                Text(dl, u.small, ImVec2(cmdR - Measure(u.small, cmdText.c_str()).x, cy + std::floor((rowH - u.small.px) * 0.5f)),
-                     kInk, a * (hot ? 0.90f : 0.66f), cmdText.c_str());
-
-            if (L.actionCount < UiState::kMaxActions) {
-                const int k = L.actionCount++;
-                L.actionRect[k][0] = cx; L.actionRect[k][1] = cy; L.actionRect[k][2] = colW; L.actionRect[k][3] = rowH;
-                std::snprintf(L.actionCmd[k], sizeof(L.actionCmd[k]), "%s", act.cmd);
+            // The rail: eased toward the open tab (offsets from the panel, so the open-slide does not drag it). It
+            // never starts inside the top-left chamfer.
+            const float wantX = std::fmax(S(30.0f), openX - px), wantW = openW;
+            const float dt = ImGui::GetIO().DeltaTime;
+            if (u.invJustOpened || u.railW <= 0.0f) {
+                u.railX = wantX;
+                u.railW = wantW;
+            } else {
+                u.railX = Ease(u.railX, wantX, 16.0f, dt, 0.5f);
+                u.railW = Ease(u.railW, wantW, 16.0f, dt, 0.5f);
             }
+            dl->AddRectFilled(ImVec2(px + std::floor(u.railX), py),
+                              ImVec2(px + std::floor(u.railX + u.railW), py + std::fmax(2.0f, S(3.0f))), Col(kGold, a));
+            // Ctrl+Tab, at the header's right end in the footer's muted key style.
+            {
+                const float capH = u.small.px + S(8.0f);
+                const float capY = ty + std::floor((u.title.px - capH) * 0.5f) + S(2.0f);
+                const float lean = capH * kSkew, g = S(8.0f);
+                const float wCap = Measure(u.small, "Ctrl+Tab").x + S(16.0f) + lean;
+                const float wLbl = Measure(u.small, "switch").x;
+                const float cx = px + pw - pad - (wCap + g + wLbl);
+                const float r = KeyCap(dl, cx, capY, "Ctrl+Tab", a * 0.82f) + g;
+                Text(dl, u.small, ImVec2(r, capY + S(4.0f)), kInk, a * 0.66f, "switch");
+            }
+            if (switchTo >= 0)
+                SwitchInvTab(switchTo);
         }
 
-        if (clicked >= 0) {
-            Submit(kActions[clicked].cmd);
-            CloseInventory();
-        }
+        if (carsPage)
+            DrawCarsPage(dl, px, py, pw, pad, rowH, rowGap, cl, a, L);
+        else
+            DrawQuickActionsPage(dl, px, py, pw, pad, rowH, rowGap, headY0, rowsY0, helpY0, footSepY0, footH, kHelp, a, L);
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
     u.invJustOpened = false;
 
     L.invOpen = true;
+    L.invTab = u.invTab;
     L.invX = px; L.invY = py; L.invW = pw; L.invH = ph;
 }
 
@@ -1581,6 +2101,11 @@ void UiInit(float scale)
     u.num   = load(kBoldItalic, 5, 76.0f, 56.0f, kLatinRanges);
     u.numMid = load(kBoldItalic, 5, 22.0f, 17.0f, kLatinRanges);   // the vitals values, in the brand's numerals
     BuildStyle(scale);
+    // Ctrl+Tab turns the Tab menu's page (UiFrame), so ImGui must not also take it for its window switcher.
+    if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
+        ctx->ConfigNavWindowingKeyNext = ImGuiKey_None;
+        ctx->ConfigNavWindowingKeyPrev = ImGuiKey_None;
+    }
 }
 
 void UiSetTextures(const UiTextures& t)
@@ -1663,7 +2188,9 @@ void UiFrame()
             if (esc)
                 CloseChat();
         } else if (u.invOpen) {
-            if (tab || esc)
+            if (tab && io.KeyCtrl)
+                SwitchInvTab(1 - u.invTab);   // Ctrl+Tab turns the page (ImGui's own Ctrl+Tab window switch is off: UiInit)
+            else if (tab || esc)
                 CloseInventory();
         } else if (tab) {
             OpenInventory();
@@ -1675,11 +2202,29 @@ void UiFrame()
     // The text box takes focus a frame or two after the chat opens, and ImGui drops the characters
     // queued before then. Hold what the player types meanwhile and put it back in front, in order,
     // on the first frame the box is active.
-    if (u.chatOpen) {
-        if (!u.inputActive) {
+    // The Tab menu's car search works the same way, and also takes whatever is typed while it does not have the keyboard
+    // (after a click on the pager or a tab, or while the arrows steer the rows): the characters are held and the box
+    // is focused again, caret kept (no select-all, which would eat the query on the next key).
+    const bool carsPage = u.invOpen && !u.chatOpen && u.invTab == 1;
+    if (carsPage && !u.searchActive) {
+        bool printable = false;
+        for (int i = 0; i < io.InputQueueCharacters.Size; ++i)
+            printable |= io.InputQueueCharacters[i] >= 0x20 && io.InputQueueCharacters[i] != 0x7f;
+        if (printable && u.searchFocusFrames == 0) {
+            u.searchFocusFrames = 3;
+            u.searchSelectAll = false;
+        }
+    }
+    const bool boxWaiting = (u.chatOpen && !u.inputActive) || (carsPage && !u.searchActive && u.searchFocusFrames > 0);
+    const bool boxReady = (u.chatOpen && u.inputActive) || (carsPage && u.searchActive);
+    if (u.chatOpen || carsPage) {
+        if (boxWaiting) {
             for (int i = 0; i < io.InputQueueCharacters.Size && u.held.size() < (std::size_t)kBufLen; ++i)
-                u.held.push_back(io.InputQueueCharacters[i]);
+                if (io.InputQueueCharacters[i] >= 0x20 && io.InputQueueCharacters[i] != 0x7f)   // not the Tab that opened it
+                    u.held.push_back(io.InputQueueCharacters[i]);
             io.InputQueueCharacters.resize(0);
+        } else if (!boxReady) {
+            u.held.clear();                      // the box never took focus: drop what was held for it
         } else if (!u.held.empty()) {
             ImVector<ImWchar> merged;
             for (std::size_t i = 0; i < u.held.size(); ++i)
@@ -1808,6 +2353,32 @@ void SetNameTags(const NameTag* tags, int count)
     Data& d = D();
     d.tags.swap(v);
     d.tagsAt = GetTickCount64();
+}
+
+void SetCars(const CarEntry* cars, int count, bool loading)
+{
+    std::vector<CarEntry> v;
+    if (cars && count > 0) {
+        v.assign(cars, cars + std::min(count, kMaxCars));
+        for (CarEntry& e : v) {
+            // Same rule as every pushed string: our own terminators, control characters become spaces.
+            auto clean = [](char* s, std::size_t cap) {
+                s[cap - 1] = 0;
+                const std::string c = Clean(s, cap - 1);
+                std::memset(s, 0, cap);
+                std::memcpy(s, c.data(), c.size());
+            };
+            clean(e.model, sizeof(e.model));
+            clean(e.name, sizeof(e.name));
+            clean(e.vclass, sizeof(e.vclass));
+            clean(e.pack, sizeof(e.pack));
+        }
+    }
+    DLock lk;
+    Data& d = D();
+    d.cars.swap(v);
+    d.carsLoading = loading;
+    ++d.carsSeq;
 }
 
 bool PopOutgoing(char* out, std::size_t cap)

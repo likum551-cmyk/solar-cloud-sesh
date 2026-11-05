@@ -32,8 +32,12 @@
 	encode zstd gzip
 
 	# The manifest is the one file that changes under a fixed name: never cache it, so a published release is seen at once.
-	@manifest path /update/version.json
+	@manifest path /update/version.json /update/packs.json
 	header @manifest Cache-Control "no-store"
+
+	# Car-pack files (tools/deploy/publish-packs.sh) are named by their SHA-256: the same name never holds other bytes.
+	@packblob path_regexp packblob ^/update/packs/[0-9a-f]{64}$
+	header @packblob Cache-Control "public, max-age=31536000, immutable"
 
 	# Installers are named by version and never replaced by different bytes (publish-client.sh refuses that). Both
 	# naming generations are served: SolarRP-Setup-<v>.exe and the pre-rename GAGE-MP-Setup-<v>.exe.

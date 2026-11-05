@@ -1,0 +1,174 @@
+// stage_packs.mjs - lay the operator's car packs out the way the engine mounts them (apps/engine/pack_stream.cpp).
+//
+//   node tools/packs/stage_packs.mjs [--src=<DLC PACKS dir>] [--dest=<packs dir>] [--only=<pack>] [--force] [--dry-run]
+//
+//   --src      folder of packs, one sub-folder each holding a dlc.rpf (default: <repo>/DLC PACKS)
+//   --dest     where the engine looks (default: %LOCALAPPDATA%\GAGE-MP\packs)
+//   --only     stage just this pack folder
+//   --force    restage a pack that is already staged (default: an existing one is left alone and reported)
+//   --dry-run  read and report every pack, write nothing
+//
+// Per pack, by the dlc.rpf header's encryption word:
+//   OPEN / NONE  -> a LOOSE folder: setup2.xml + a content.xml that lists only the data metas the game can take loose,
+//                   those metas at their own paths, every model resource (.yft .ytd .ydr .ydd, from any nested archive)
+//                   flat in stream\, and the dlc.rpf itself (AddDlcPack's gate file; it is never opened). The game
+//                   refuses a nested OPEN archive, so nested .rpf entries leave content.xml.
+//   NG / AES     -> the dlc.rpf as it is: the game reads those archives itself (nothing here can, by design: this tool
+//                   never holds a key).
+// Staging goes to <dest>\<pack>.staging and is swapped in only when complete. Exit 1 if any pack failed.
+//
+// Reading the archives reuses content/dlc/gage_apparel/tools/pack_dlc_rpf.mjs --extract (it only reads the TOC). No
+// dependencies.
+
+import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, readSync, closeSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repo = path.resolve(here, "..", "..");
+const packTool = path.join(repo, "content", "dlc", "gage_apparel", "tools", "pack_dlc_rpf.mjs");
+
+const args = Object.fromEntries(process.argv.slice(2).map((a) => {
+  const m = /^--([^=]+)(?:=(.*))?$/.exec(a);
+  if (!m) { console.error(`unknown argument ${a}`); process.exit(2); }
+  return [m[1], m[2] ?? true];
+}));
+const known = new Set(["src", "dest", "only", "force", "dry-run"]);
+for (const k of Object.keys(args)) if (!known.has(k)) { console.error(`unknown option --${k}`); process.exit(2); }
+
+const src = path.resolve(String(args.src ?? path.join(repo, "DLC PACKS")));
+const local = process.env.LOCALAPPDATA;
+if (!args.dest && !local) { console.error("LOCALAPPDATA is not set; pass --dest"); process.exit(2); }
+const dest = path.resolve(String(args.dest ?? path.join(local, "GAGE-MP", "packs")));
+const dry = !!args["dry-run"], force = !!args.force;
+
+const ENC_NONE = 0, ENC_OPEN = 0x4e45504f, ENC_AES = 0x0ffffff9, ENC_NG = 0x0fefffff, RPF7 = 0x52504637, RSC7 = 0x37435352;
+// The data-file types the game takes from a loose folder mid-session (the Jesko run, 2026-11-05: handling, vehicles,
+// carcols, carvariations, dlctext). Everything else (nested RPF_FILE, audio, unlocks, ...) leaves content.xml.
+const KEEP_TYPES = new Set(["HANDLING_FILE", "VEHICLE_METADATA_FILE", "CARCOLS_FILE", "VEHICLE_VARIATION_FILE",
+  "VEHICLE_LAYOUTS_FILE", "TEXTFILE_METAFILE"]);
+const MODEL_EXT = new Set([".yft", ".ytd", ".ydr", ".ydd"]);
+
+const stripComments = (s) => s.replace(/<!--[\s\S]*?-->/g, "");
+const field = (block, tag) => { const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(block); return m ? m[1].trim() : ""; };
+const inPack = (name) => { const i = name.indexOf(":/"); return (i >= 0 ? name.slice(i + 2) : name).replace(/%PLATFORM%/g, "x64"); };
+
+function header(file) {
+  const fd = openSync(file, "r");
+  try { const b = Buffer.alloc(16); const n = readSync(fd, b, 0, 16, 0); return n === 16 ? { magic: b.readUInt32LE(0), enc: b.readUInt32LE(12) } : null; }
+  finally { closeSync(fd); }
+}
+
+function walk(dir, out = []) {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) walk(p, out); else out.push(p);
+  }
+  return out;
+}
+
+function isRsc7(file) {
+  const fd = openSync(file, "r");
+  try { const b = Buffer.alloc(4); return readSync(fd, b, 0, 4, 0) === 4 && b.readUInt32LE(0) === RSC7; }
+  finally { closeSync(fd); }
+}
+
+function models(vehiclesMeta) {
+  const s = stripComments(vehiclesMeta);
+  return [...s.matchAll(/<modelName>\s*([^<]*?)\s*<\/modelName>/g)].map((m) => m[1]).filter((m) => /^[A-Za-z0-9_-]{1,63}$/.test(m));
+}
+
+// Rewrite content.xml: drop the dataFiles items not kept, and their lines in every change set's file lists.
+function filterContent(xml, keepNames) {
+  const keep = (n) => keepNames.has(n.trim().toLowerCase());
+  let out = xml.replace(/<dataFiles>([\s\S]*?)<\/dataFiles>/, (all, body) =>
+    "<dataFiles>" + body.replace(/[ \t]*<Item>[\s\S]*?<\/Item>[ \t]*\r?\n?/g, (item) => (keep(field(item, "filename")) ? item : "")) + "</dataFiles>");
+  out = out.replace(/<(filesToEnable|filesToDisable)>([\s\S]*?)<\/\1>/g, (all, tag, body) =>
+    `<${tag}>` + body.replace(/[ \t]*<Item>([^<]*)<\/Item>[ \t]*\r?\n?/g, (line, name) => (keep(name) ? line : "")) + `</${tag}>`);
+  return out;
+}
+
+function stageLoose(name, rpf, staging, report) {
+  const x = path.join(staging, ".extract");
+  const r = spawnSync(process.execPath, [packTool, `--extract=${rpf}`, `--out=${x}`], { encoding: "utf8" });
+  if (r.status !== 0) throw new Error(`extract failed (exit ${r.status}): ${(r.stderr || r.stdout || "").trim().split("\n").slice(-2).join(" | ")}`);
+  for (const f of ["setup2.xml", "content.xml"])
+    if (!existsSync(path.join(x, f))) throw new Error(`${f} is missing at the archive root`);
+  const content = readFileSync(path.join(x, "content.xml"), "utf8");
+  const items = [...stripComments(content).matchAll(/<dataFiles>([\s\S]*?)<\/dataFiles>/g)].flatMap((m) => [...m[1].matchAll(/<Item>[\s\S]*?<\/Item>/g)].map((i) => i[0]));
+  const kept = new Set(), dropped = [];
+  for (const it of items) {
+    const fname = field(it, "filename"), type = field(it, "fileType").toUpperCase();
+    const rel = inPack(fname);
+    const file = path.join(x, ...rel.split("/"));
+    if (!KEEP_TYPES.has(type)) { dropped.push(`${rel} (${type})`); continue; }
+    if (!existsSync(file) || !statSync(file).isFile()) { dropped.push(`${rel} (${type}, not in the archive)`); continue; }
+    kept.add(fname.trim().toLowerCase());
+    const to = path.join(staging, ...rel.split("/"));
+    mkdirSync(path.dirname(to), { recursive: true });
+    copyFileSync(file, to);
+    if (type === "VEHICLE_METADATA_FILE") report.models.push(...models(readFileSync(file, "utf8")));
+  }
+  writeFileSync(path.join(staging, "content.xml"), filterContent(content, kept));
+  copyFileSync(path.join(x, "setup2.xml"), path.join(staging, "setup2.xml"));
+  const stream = path.join(staging, "stream");
+  mkdirSync(stream, { recursive: true });
+  const seen = new Map();
+  for (const f of walk(x)) {
+    if (!MODEL_EXT.has(path.extname(f).toLowerCase())) continue;
+    if (!isRsc7(f)) { report.warnings.push(`${path.relative(x, f)} has no RSC7 header; not streamed`); continue; }
+    const base = path.basename(f), key = base.toLowerCase();
+    if (seen.has(key)) { report.warnings.push(`${base} appears twice (${seen.get(key)} kept)`); continue; }
+    seen.set(key, path.relative(x, f));
+    copyFileSync(f, path.join(stream, base));
+  }
+  report.stream = seen.size;
+  report.dropped = dropped;
+  copyFileSync(rpf, path.join(staging, "dlc.rpf"));
+  rmSync(x, { recursive: true, force: true });
+  if (!report.models.length) report.warnings.push("no <modelName> in any kept vehicles.meta");
+  if (!seen.size) report.warnings.push("no model resources found");
+}
+
+if (!existsSync(src)) { console.error(`no source folder ${src}`); process.exit(1); }
+const packs = readdirSync(src, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)
+  .filter((n) => !args.only || n.toLowerCase() === String(args.only).toLowerCase()).sort((a, b) => a.localeCompare(b));
+if (!packs.length) { console.error(`no pack folders in ${src}${args.only ? ` named ${args.only}` : ""}`); process.exit(1); }
+if (!dry) mkdirSync(dest, { recursive: true });
+
+let failed = 0, staged = 0, skipped = 0;
+for (const name of packs) {
+  const rpf = path.join(src, name, "dlc.rpf");
+  const target = path.join(dest, name);
+  const report = { models: [], warnings: [], dropped: [], stream: 0 };
+  try {
+    if (!/^[\x20-\x7e]+$/.test(name)) throw new Error("the folder name is not plain ASCII (the game takes narrow paths)");
+    if (!existsSync(rpf)) throw new Error("no dlc.rpf");
+    const h = header(rpf);
+    if (!h || h.magic !== RPF7) throw new Error(`not an RPF7 archive${h ? ` (magic 0x${h.magic.toString(16)})` : ""}`);
+    const mode = h.enc === ENC_OPEN || h.enc === ENC_NONE ? "loose" : h.enc === ENC_NG || h.enc === ENC_AES ? "rpf" : null;
+    if (!mode) throw new Error(`unknown encryption word 0x${h.enc.toString(16)}`);
+    const encName = h.enc === ENC_OPEN ? "OPEN" : h.enc === ENC_NONE ? "NONE" : h.enc === ENC_NG ? "NG" : "AES";
+    if (existsSync(target) && !force) { console.log(`= ${name}: already staged (${encName}); --force restages it`); skipped++; continue; }
+    if (dry) { console.log(`~ ${name}: ${encName} -> ${mode === "loose" ? "loose folder" : "dlc.rpf as is"} (dry run)`); continue; }
+    const staging = target + ".staging";
+    rmSync(staging, { recursive: true, force: true });
+    mkdirSync(staging, { recursive: true });
+    if (mode === "loose") stageLoose(name, rpf, staging, report);
+    else copyFileSync(rpf, path.join(staging, "dlc.rpf"));
+    if (existsSync(target)) { rmSync(target + ".old", { recursive: true, force: true }); renameSync(target, target + ".old"); }
+    renameSync(staging, target);
+    rmSync(target + ".old", { recursive: true, force: true });
+    staged++;
+    console.log(`+ ${name}: ${encName} -> ${mode === "loose" ? `loose folder, ${report.stream} model file(s) in stream\\, cars: ${report.models.join(", ") || "-"}` : "dlc.rpf as is (the game reads it; its cars are listed in game)"}`);
+    for (const d of report.dropped) console.log(`    dropped from content.xml: ${d}`);
+    for (const w of report.warnings) console.log(`    WARNING: ${w}`);
+  } catch (e) {
+    failed++;
+    console.error(`! ${name}: ${e.message}`);
+    rmSync(target + ".staging", { recursive: true, force: true });
+  }
+}
+console.log(`${staged} staged, ${skipped} already staged, ${failed} failed -> ${dest}`);
+process.exit(failed ? 1 : 0);

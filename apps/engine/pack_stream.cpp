@@ -14,8 +14,14 @@
 
 #include <windows.h>
 
+#include "pack_meta.h"
+
+#include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstdint>
+#include <cwchar>
+#include <list>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -108,6 +114,30 @@ const Sig kProbeSigs[kProbeSigCount] = {
 uintptr_t g_probeAddr[kProbeSigCount] = {};
 bool      g_probeResolvedOnce = false;
 bool      g_probeReady        = false;
+
+// Loose model files (folder mode, <pack>/stream/*.yft|ytd|ydr|ydd). GTA's own "register a loose file with
+// the streaming system" routine (3889 static RE 2026-11-05, clean code): it resolves the file's device; a
+// plain OS path lands on the local device, which is not a collection (vt+0x148 = false) and reports image 0
+// (vt+0x168 = 0), so the file goes to image 0 = the game's RawStreamer collection (vtable RVA 0x1b7d5e0),
+// whose +0x1a8 appends the path to its own file list and returns the file index. The handle is
+// (0 << 16) | index, and 0x169e5e0 picks the streaming module from the extension (yft -> FragmentStore,
+// ytd -> TxdStore), adds a slot named after the file's base name and writes the handle into the
+// streaming-info array. The RawStreamer reads size and RSC7 page flags from the file itself on first use,
+// so no RPF, no packfile open and no encryption gate is involved.
+//   int* RegisterStreamFile(int* outGlobalIndex /*rcx*/, const char* path /*rdx*/, bool /*r8b, both
+//        game callers pass 1*/, const char* name /*r9: "jesko.yft"; null = path*/,
+//        bool fatalIfMissing /*[rsp+0x28]: 1 = the game's fatal error, so always 0 here*/,
+//        bool allowOverride /*[rsp+0x30]: re-point an object that already has a handle*/)
+const Sig kRegStreamSig = {
+    "RegStreamFile",  // RVA 0x169e4d4 (unique in both 3889 dumps)
+    "48 89 5C 24 08 48 89 6C 24 18 48 89 7C 24 20 41 54 41 56 41 57 48 83 EC 50 48 8B EA 4C 8B FA 48 8B D9 "
+    "4D 85 C9 B2 01 48 8B CD 45 8A E0 4D 0F 45 F9 E8",
+    "3889 RE 2026-11-05: device -> RawStreamer +0x1a8 -> streaming-info register 0x169e5e0" };
+using RegStreamFileFn = int* (*)(int* out, const char* path, uint8_t one, const char* name,
+                                 uint8_t fatalIfMissing, uint8_t allowOverride);
+constexpr uint32_t kStreamInfoMgrRva = 0x2ea23d0u;  // strStreamingInfoManager: [+0] 8-byte (handle, flags) array, [+8] count
+constexpr uint32_t kImageRegistryRva = 0x2c67400u;  // fiCollection* per image index
+constexpr uint32_t kRawStreamerVtRva = 0x1b7d5e0u;  // image 0's collection (live fidiag 2026-11-02)
 
 // ---------------------------------------------------------------------------------------------
 // Image bounds, readable-page runs, pattern scan (self-contained; mirrors dlc_mount.cpp).
@@ -360,11 +390,30 @@ uint32_t EntryState(char* e) { return (e && IsReadable(e + kOffEntryState, 4)) ?
 // ---------------------------------------------------------------------------------------------
 Status    g_status   = Status::Idle;
 int       g_enabled  = -1;        // -1 = not read yet
-char      g_fail[192] = "";
+char      g_fail[192] = "";       // the last pack's refusal (FailReason when every pack failed)
 ULONGLONG g_mgrSince  = 0;        // when we first started waiting for the manager singleton
-ULONGLONG g_mountAt   = 0;        // when the change set ran (start of the model wait)
-uint32_t  g_modelHash = 0;
-bool      g_attempted = false;    // the mount chain has been run once (success or fail)
+ULONGLONG g_mountAt   = 0;        // when the last change set ran (start of the model wait)
+ULONGLONG g_pollAt    = 0;        // the next IS_MODEL_IN_CDIMAGE pass
+std::string g_curPack;            // the pack being mounted, for the log lines
+
+// The packs under %LOCALAPPDATA%\GAGE-MP\packs\, one folder each, mounted one per tick in name order.
+struct Paths { std::string device; std::wstring file; };   // AddDlcPack's "<folder>/" + the folder's dlc.rpf
+struct PackModel { MetaVehicle v; uint32_t hash = 0; bool inCdimage = false; };
+struct Pack {
+    std::string name;             // the folder name, lower case (what the tune's pack rows and the menu use)
+    Paths paths;
+    bool folder = false;          // setup2.xml at the root: loose folder (models in stream/); else the dlc.rpf itself
+    bool mounted = false;         // the change set ran
+    std::vector<PackModel> models;
+};
+std::vector<Pack> g_packs;
+size_t g_next = 0;                // the next pack to mount
+bool   g_listed = false;          // g_packs filled
+
+// The menu's copy (overlay thread) of what the packs carry; written on the game thread.
+std::mutex g_vehMutex;
+std::vector<PackVehicle> g_vehShared;
+uint32_t g_vehGen = 0;            // bumped (under g_vehMutex) every time g_vehShared is replaced
 
 void Fail(const char* fmt, ...) GAGE_PRINTF(1, 2);
 void Fail(const char* fmt, ...) {
@@ -372,53 +421,99 @@ void Fail(const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_fail, sizeof(g_fail), fmt, ap);
     va_end(ap);
-    g_status = Status::Failed;
-    GLOGW("hook: [packstream] gave up: %s", g_fail);
+    GLOGW("hook: [packstream] pack '%s' gave up: %s", g_curPack.c_str(), g_fail);
 }
 
+// The main module is Legacy's GTA5.exe. Every signature and RVA in this file comes from the Legacy 1.0.3889 image;
+// Enhanced (GTA5_Enhanced.exe, a different rebuilt binary) must never be scanned with them.
+bool IsLegacyGameExe() {
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return false;
+    const wchar_t* base = wcsrchr(path, L'\\');
+    return _wcsicmp(base ? base + 1 : path, L"GTA5.exe") == 0;
+}
+
+// Any pack folder (one holding a dlc.rpf) under %LOCALAPPDATA%\GAGE-MP\packs\.
+bool AnyPackFolder() {
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+    if (!local || !*local) return false;
+    const std::wstring root = std::wstring(local) + L"\\GAGE-MP\\packs\\";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool any = false;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.' &&
+            GetFileAttributesW((root + fd.cFileName + L"\\dlc.rpf").c_str()) != INVALID_FILE_ATTRIBUTES)
+            any = true;
+    } while (!any && FindNextFileW(h, &fd));
+    FindClose(h);
+    return any;
+}
+
+// pack_mount (HKCU\Software\GAGE-MP): "1" arms the mount, "0" keeps it off, unset = on when packs are present
+// (0.4.14: a tester unzips the packs folder and nothing else). Legacy GTA5.exe only, whatever the value says.
 bool Enabled() {
     if (g_enabled < 0) {
-        g_enabled = (reg::Get(L"pack_mount") == L"1") ? 1 : 0;
-        GLOGI("hook: [packstream] pack mount %s (HKCU\\Software\\GAGE-MP pack_mount=%s)",
-              g_enabled ? "ARMED" : "off", g_enabled ? "1" : "unset or not 1");
+        const std::wstring v = reg::Get(L"pack_mount");
+        const bool legacy = IsLegacyGameExe();
+        const bool present = AnyPackFolder();
+        const bool want = v == L"1" || (v.empty() && present);
+        g_enabled = (want && legacy) ? 1 : 0;
+        GLOGI("hook: [packstream] pack mount %s (pack_mount=%s, pack folders %s, game %s)", g_enabled ? "ARMED" : "off",
+              v.empty() ? "unset" : Narrow(v).c_str(), present ? "present" : "none",
+              legacy ? "Legacy GTA5.exe" : "not Legacy GTA5.exe: packs are Legacy 1.0.3889 only");
     }
     return g_enabled == 1;
 }
 
-// The pack's device path (handed to AddDlcPack, ends in '/') and the on-disk dlc.rpf path (preflighted).
-struct Paths { std::string device; std::wstring file; };
-
-bool ResolvePaths(Paths& out) {
-    const std::wstring name = reg::Get(L"pack_name", L"gage_jesko");
-    std::wstring file = reg::Get(L"pack_path");
-    if (file.empty()) {
-        const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
-        if (!local || !*local) { Fail("LOCALAPPDATA is not set and pack_path is unset"); return false; }
-        file = std::wstring(local) + L"\\GAGE-MP\\packs\\" + name + L"\\dlc.rpf";
+// Every pack folder under %LOCALAPPDATA%\GAGE-MP\packs\ that holds a dlc.rpf (tools/packs/stage_packs.mjs lays them
+// out), in name order; pack_name=<folder> limits the run to that one. Folders whose path is not plain ASCII are skipped
+// (the game takes narrow paths), as are "*.old" / "*.staging" leftovers of a restage.
+void EnumeratePacks() {
+    g_packs.clear();
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+    if (!local || !*local) { GLOGW("hook: [packstream] LOCALAPPDATA is not set; no packs"); return; }
+    const std::wstring root = std::wstring(local) + L"\\GAGE-MP\\packs\\";
+    const std::wstring only = reg::Get(L"pack_name");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { GLOGW("hook: [packstream] no packs folder at %s", Narrow(root).c_str()); return; }
+    std::vector<std::wstring> names;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+        const std::wstring n = fd.cFileName;
+        const auto endsWith = [&n](const wchar_t* sfx) { const size_t k = wcslen(sfx); return n.size() > k && n.compare(n.size() - k, k, sfx) == 0; };
+        if (endsWith(L".old") || endsWith(L".staging")) continue;
+        if (!only.empty() && _wcsicmp(only.c_str(), n.c_str()) != 0) continue;
+        names.push_back(n);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(names.begin(), names.end(), [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+    for (const std::wstring& n : names) {
+        const std::wstring folder = root + n + L"\\";
+        bool ascii = true;
+        for (wchar_t c : folder) if (c > 0x7E || c < 0x20) ascii = false;
+        if (!ascii) { GLOGW("hook: [packstream] pack folder %ls skipped: the path is not plain ASCII", n.c_str()); continue; }
+        if (GetFileAttributesW((folder + L"dlc.rpf").c_str()) == INVALID_FILE_ATTRIBUTES) {
+            GLOGW("hook: [packstream] pack folder %ls skipped: no dlc.rpf", n.c_str());
+            continue;
+        }
+        Pack p;
+        for (wchar_t c : n) p.name.push_back((char)std::tolower((unsigned char)c));
+        p.paths.file = folder + L"dlc.rpf";
+        for (wchar_t c : folder) p.paths.device.push_back(c == L'\\' ? '/' : (char)c);
+        p.folder = GetFileAttributesW((folder + L"setup2.xml").c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (p.paths.device.size() > 248)
+            GLOGW("hook: [packstream] pack %s: device path is %u chars; AddDlcPack truncates past ~248", p.name.c_str(),
+                  (unsigned)p.paths.device.size());
+        g_packs.push_back(std::move(p));
     }
-    out.file = file;
-
-    const std::wstring dev = reg::Get(L"pack_device");
-    if (!dev.empty()) {
-        // Verbatim device form (e.g. "platform:/dlcpacks/<name>/"), must be narrow ASCII + end in '/'.
-        for (wchar_t c : dev)
-            if (c > 0x7E) { Fail("pack_device has a non-ASCII character; the game takes a narrow path"); return false; }
-        out.device = Narrow(dev);
-        if (out.device.empty() || out.device.back() != '/') out.device.push_back('/');
-        return true;
-    }
-
-    // Default: the folder that holds dlc.rpf, as a forward-slash OS path ending in '/'.
-    size_t slash = file.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) { Fail("pack_path has no folder component: %s", Narrow(file).c_str()); return false; }
-    std::wstring folder = file.substr(0, slash + 1);
-    for (wchar_t c : folder)
-        if (c > 0x7E) { Fail("the pack folder path has a non-ASCII character; the game takes a narrow path"); return false; }
-    out.device.clear();
-    for (wchar_t c : folder) out.device.push_back(c == L'\\' ? '/' : (char)c);
-    if (out.device.size() > 248)
-        GLOGW("hook: [packstream] device path is %u chars; AddDlcPack truncates past ~248", (unsigned)out.device.size());
-    return true;
+    GLOGI("hook: [packstream] %u pack(s) under %s%s", (unsigned)g_packs.size(), Narrow(root).c_str(),
+          only.empty() ? "" : "  (pack_name limits the run to one)");
+    for (const Pack& p : g_packs)
+        GLOGI("hook: [packstream]   %-24s %s", p.name.c_str(), p.folder ? "loose folder (setup2.xml + stream/)" : "dlc.rpf (the game's own loader)");
 }
 
 // Read and sanity-check the pack's RPF7 header before the game ever opens it. A header the retail game
@@ -427,7 +522,7 @@ bool Preflight(const std::wstring& file) {
     HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        Fail("pack not found or unreadable: %s (set pack_path, or drop dlc.rpf there)", Narrow(file).c_str());
+        Fail("pack not found or unreadable: %s", Narrow(file).c_str());
         return false;
     }
     uint32_t hdr[4] = {};
@@ -552,20 +647,217 @@ void Probe(void* mgr, char* entry) {
                            : "some files visible but setup2.xml absent -- pack naming/layout issue"));
 }
 
-// Run the whole chain once. Game thread. Sets g_status = Failed on any refusal; returns true when the
-// chain ran to the point of waiting for the model (g_status set to Pending by the caller).
-bool MountSequence(World& world) {
+// ---- the pack's model list ------------------------------------------------------------------------------------
+// A loose pack's content.xml and vehicles.meta are plain files on disk. A dlc.rpf pack (NG) cannot be read outside the
+// game, so its files are read through the game's own device layer once MountGate has mounted it:
+//   fiDevice* GetDevice(const char* path /*rcx*/, bool readOnly /*dl*/)     RVA 0x1364150 (the pack's mount for "dlc_x:/...")
+//   device vtable: +0x08 Open(this, name, readOnly) -> handle (-1 = no), +0x30 Read(this, handle, buf, int len) -> n,
+//                  +0x60 Close(this, handle), +0xb0 GetFileSize(this, name) -> bytes. (The bulk calls at +0x10 / +0x38 /
+//                  +0x68 are what the RSC7 header reader 0x1364d20 uses; the plain ones sit one slot before each, and
+//                  fiPackfile's +0xb0 0x1364a4c returns an entry's uncompressed size, so Read hands back the real text.)
+const Sig kGetDeviceSig = {
+    "GetDevice",      // RVA 0x1364150 (the jmp target of 0x1364148, which every device-for-path caller uses)
+    "48 89 5C 24 08 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 20 48 8D 15 ?? ?? ?? ?? 41 B8 07 00 00 00 48 8B F1 E8",
+    "3889 RE 2026-11-05: fiDevice::GetDevice(path, readOnly)" };
+constexpr size_t kMaxMetaBytes = 4u << 20;   // a vehicles.meta is a few KB; anything this big is not one
+
+bool ReadGameFile(const std::string& path, std::string& out) {
+    static uintptr_t s_fn = 0;
+    static bool s_tried = false;
+    if (!s_tried) {
+        s_tried = true;
+        const Image im = GameImage();
+        const uint8_t* first = nullptr;
+        const int c = (im.base && im.size) ? CountPat(ReadableRuns(im), kGetDeviceSig.pat, &first) : 0;
+        if (c == 1) s_fn = (uintptr_t)first;
+        GLOGI("hook: [packstream] %s %s", kGetDeviceSig.name, c == 1 ? "UNIQUE" : (c == 0 ? "missing" : "ambiguous"));
+    }
+    if (!s_fn) return false;
+    using GetDeviceFn = void* (*)(const char*, uint8_t);
+    using OpenFn = uint64_t (*)(void*, const char*, uint8_t);
+    using ReadFn = int (*)(void*, uint64_t, void*, int);
+    using CloseFn = int (*)(void*, uint64_t);
+    using SizeFn = uint64_t (*)(void*, const char*);
+    void* dev = reinterpret_cast<GetDeviceFn>(s_fn)(path.c_str(), 1);
+    if (!dev || !IsReadable(dev, 8)) return false;
+    void* const* vt = *reinterpret_cast<void* const* const*>(dev);
+    if (!vt || !IsReadable(vt, 0xb8)) return false;
+    const uint64_t size = reinterpret_cast<SizeFn>(vt[0xb0 / 8])(dev, path.c_str());
+    if (size == 0 || size > kMaxMetaBytes) return false;
+    const uint64_t fh = reinterpret_cast<OpenFn>(vt[0x08 / 8])(dev, path.c_str(), 1);
+    if (fh == ~0ull) return false;
+    out.assign((size_t)size, '\0');
+    size_t got = 0;
+    while (got < out.size()) {
+        const int n = reinterpret_cast<ReadFn>(vt[0x30 / 8])(dev, fh, &out[got], (int)(out.size() - got));
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    reinterpret_cast<CloseFn>(vt[0x60 / 8])(dev, fh);
+    out.resize(got);
+    return got > 0;
+}
+
+bool ReadDiskFile(const std::wstring& path, std::string& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz = {};
+    bool ok = GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && (uint64_t)sz.QuadPart <= kMaxMetaBytes;
+    if (ok) {
+        out.assign((size_t)sz.QuadPart, '\0');
+        DWORD got = 0;
+        ok = ReadFile(h, &out[0], (DWORD)out.size(), &got, nullptr) && got == out.size();
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// The vehicles a pack defines: content.xml -> every VEHICLE_METADATA_FILE -> its <modelName> items. `mount` is the
+// pack's device ("dlc_supra:/") for a dlc.rpf pack; a loose pack reads the same files off disk.
+void ReadPackModels(Pack& p, const std::string& mount) {
+    std::string content;
+    std::wstring folderW = p.paths.file;
+    folderW.resize(folderW.size() - wcslen(L"dlc.rpf"));
+    const bool haveContent = p.folder ? ReadDiskFile(folderW + L"content.xml", content)
+                                      : (!mount.empty() && ReadGameFile(mount + "content.xml", content));
+    if (!haveContent) {
+        GLOGW("hook: [packstream] pack %s: content.xml not readable (%s); its cars will not be listed", p.name.c_str(),
+              p.folder ? "on disk" : (mount.empty() ? "no mount point" : mount.c_str()));
+        return;
+    }
+    const std::vector<std::string> metas = MetaFilesOfType(content, "VEHICLE_METADATA_FILE");
+    for (const std::string& m : metas) {
+        std::string text;
+        bool ok = false;
+        if (p.folder) {
+            std::wstring rel;
+            for (char c : PathInPack(m)) rel.push_back(c == '/' ? L'\\' : (wchar_t)(unsigned char)c);
+            ok = ReadDiskFile(folderW + rel, text);
+        } else {
+            ok = ReadGameFile(m, text);
+        }
+        if (!ok) { GLOGW("hook: [packstream] pack %s: %s not readable", p.name.c_str(), m.c_str()); continue; }
+        for (MetaVehicle& v : ParseVehiclesMeta(text)) {
+            bool dup = false;
+            for (const PackModel& o : p.models) if (_stricmp(o.v.model.c_str(), v.model.c_str()) == 0) dup = true;
+            if (dup) continue;
+            PackModel pm;
+            pm.v = std::move(v);
+            p.models.push_back(std::move(pm));
+        }
+    }
+    std::string list;
+    for (const PackModel& pm : p.models) { if (!list.empty()) list += ", "; list += pm.v.model; }
+    GLOGI("hook: [packstream] pack %s: %u vehicle meta file(s), %u car(s): %s", p.name.c_str(), (unsigned)metas.size(),
+          (unsigned)p.models.size(), list.empty() ? "-" : list.c_str());
+}
+
+// The pack's mount point ("dlc_supra:/"): DlcEntry +0x30 is an atString (char* +0x30, WORD length +0x38), which
+// MountGate 0x94301c hands to Mount when the length is nonzero. "" when unreadable or implausible.
+std::string EntryMountPoint(char* e) {
+    if (!e || !IsReadable(e + 0x30, 10)) return "";
+    const char* s = *reinterpret_cast<const char* const*>(e + 0x30);
+    const uint16_t n = *reinterpret_cast<const uint16_t*>(e + 0x38);
+    if (!s || n == 0 || n > 120 || !IsReadable(s, n)) return "";
+    std::string m(s, n);
+    for (char c : m) if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7e) return "";
+    if (m.find(':') == std::string::npos) return "";
+    if (m.back() != '/') m.push_back('/');
+    return m;
+}
+
+// Register every model file in <pack>/stream/ with the game's streaming system (see kRegStreamSig). Runs
+// before the change set, so CVehicleModelInfo::Init (vehicles.meta) finds the "jesko" fragment and txd
+// slots by name, already bound to the files. Returns false (after Fail) only when files are present but
+// none registered; a pack without a stream/ folder is logged and left to its content.xml.
+bool RegisterLooseStream(const Paths& paths) {
+    std::wstring folderW = paths.file;
+    const size_t slash = folderW.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) folderW.resize(slash + 1);
+    const std::wstring streamW = folderW + L"stream\\";
+
+    // .ytd first: a vehicle fragment's textures should already have their slot when the fragment's does.
+    std::vector<std::wstring> files;
+    for (const wchar_t* ext : { L"ytd", L"yft", L"ydr", L"ydd" }) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((streamW + L"*." + ext).c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (files.empty()) {
+        GLOGI("hook: [packstream] stream: no model files in %s (models come from content.xml only)",
+              Narrow(streamW).c_str());
+        return true;
+    }
+
+    const Image im = GameImage();
+    if (!im.base || !im.size) { Fail("stream: game image bounds unavailable"); return false; }
+    const uint8_t* fn = nullptr;
+    const int hits = CountPat(ReadableRuns(im), kRegStreamSig.pat, &fn);
+    if (hits != 1 || !fn) {
+        Fail("stream: %s signature %s (%d hits); not registering %u model files", kRegStreamSig.name,
+             hits == 0 ? "missing" : "ambiguous", hits, (unsigned)files.size());
+        return false;
+    }
+    const uintptr_t base = (uintptr_t)im.base;
+    void* const* registry = reinterpret_cast<void* const*>(base + kImageRegistryRva);
+    void* raw = IsReadable(registry, 8) ? registry[0] : nullptr;
+    const uintptr_t rawVt = (raw && IsReadable(raw, 8)) ? *reinterpret_cast<const uintptr_t*>(raw) : 0;
+    GLOGI("hook: [packstream] stream: %s UNIQUE @ +0x%llx; image 0 collection @0x%llx vtable +0x%llx (%s)",
+          kRegStreamSig.name, (unsigned long long)(fn - im.base), (unsigned long long)(uintptr_t)raw,
+          (unsigned long long)(rawVt ? rawVt - base : 0),
+          rawVt == base + kRawStreamerVtRva ? "RawStreamer, as expected" : "NOT the RawStreamer");
+    if (rawVt != base + kRawStreamerVtRva) {
+        Fail("stream: image 0 is not the RawStreamer collection on this image; not registering loose files");
+        return false;
+    }
+
+    const auto* mgr = reinterpret_cast<const uint8_t*>(base + kStreamInfoMgrRva);
+    int ok = 0;
+    for (const std::wstring& f : files) {
+        bool ascii = true;
+        for (wchar_t c : f) if (c > 0x7E) ascii = false;
+        if (!ascii) { GLOGW("hook: [packstream] stream: skipped %ls (non-ASCII name)", f.c_str()); continue; }
+        const std::string name = Narrow(f);
+        const std::string path = paths.device + "stream/" + name;   // forward-slash OS path
+        int out = -1;
+        reinterpret_cast<RegStreamFileFn>(fn)(&out, path.c_str(), 1, name.c_str(), 0, 0);
+        uint32_t handle = 0, flags = 0;
+        const uint8_t* arr = IsReadable(mgr, 16) ? *reinterpret_cast<uint8_t* const*>(mgr) : nullptr;
+        const uint32_t count = IsReadable(mgr + 8, 4) ? *reinterpret_cast<const uint32_t*>(mgr + 8) : 0;
+        if (out >= 0 && (uint32_t)out < count && arr && IsReadable(arr + (size_t)out * 8, 8)) {
+            handle = *reinterpret_cast<const uint32_t*>(arr + (size_t)out * 8);
+            flags  = *reinterpret_cast<const uint32_t*>(arr + (size_t)out * 8 + 4);
+        }
+        if (out >= 0) ++ok;
+        GLOGI("hook: [packstream] stream: %-16s -> streaming index %d, handle 0x%08x (image %u, file %u), flags 0x%08x%s",
+              name.c_str(), out, (unsigned)handle, (unsigned)(handle >> 16), (unsigned)(handle & 0xffff),
+              (unsigned)flags, out < 0 ? "  REFUSED (file not found by the device, or no module for the extension)" : "");
+    }
+    GLOGI("hook: [packstream] stream: registered %d of %u model files from %s", ok, (unsigned)files.size(),
+          Narrow(streamW).c_str());
+    if (ok == 0) { Fail("stream: none of the %u model files registered", (unsigned)files.size()); return false; }
+    return true;
+}
+
+// Run the whole chain once for one pack. Game thread. Logs (Fail) and returns false on any refusal; true when the
+// pack's change set ran (its models are then polled in the cdimage by Tick).
+bool MountSequence(World& world, Pack& p) {
+    (void)world;
+    g_curPack = p.name;
     void* mgr = Manager();
     if (!mgr) { Fail("ExtraContentManager singleton is null after the wait (boot did not finish?)"); return false; }
     if (!VtableOk(mgr)) { Fail("manager vtable mismatch at @0x%llx; refusing to call into it", (unsigned long long)(uintptr_t)mgr); return false; }
     // Confirmed before touching the pack, so a signature-only run (pack_mount=1, no pack) still validates
     // that the singleton dereferences to a live manager with a sane pack count and the expected vtable.
-    GLOGI("hook: [packstream] manager @0x%llx live, vtable OK, %u packs currently loaded",
+    GLOGI("hook: [packstream] pack %s: manager @0x%llx live, vtable OK, %u packs currently loaded", p.name.c_str(),
           (unsigned long long)(uintptr_t)mgr, (unsigned)Count(mgr));
 
-    Paths paths;
-    if (!ResolvePaths(paths)) return false;              // Fail() already logged
-    const bool folderMode = reg::Get(L"pack_folder") == L"1";
+    const Paths& paths = p.paths;
+    const bool folderMode = p.folder;
     if (folderMode) {
         if (!FolderPreflight(paths)) return false;       // Fail() already logged
     } else if (!Preflight(paths.file)) {
@@ -579,8 +871,7 @@ bool MountSequence(World& world) {
     const uint16_t n1 = Count(mgr);
     GLOGI("hook: [packstream] AddDlcPack returned %u; pack count %u -> %u", (unsigned)added, (unsigned)n0, (unsigned)n1);
     if (!added && n1 == n0) {
-        Fail("AddDlcPack refused \"%s\": the game's device layer could not resolve \"<path>dlc.rpf\". "
-             "Try the proven form via pack_device=platform:/dlcpacks/<name>/ with the pack under the game dir",
+        Fail("AddDlcPack refused \"%s\": the game's device layer could not resolve \"<path>dlc.rpf\"",
              paths.device.c_str());
         return false;
     }
@@ -596,9 +887,11 @@ bool MountSequence(World& world) {
         // Override the packfile entry AddDlcPack built into a relative/folder device: Mount 0x94307c takes
         // its folder branch (0x943144) only when +0xc8 == 1 (==2 is packfile = the crypto path), it loads
         // +0xb8 as a const char* (the loose base folder) and ignores it unless the +0xc0 WORD is nonzero.
-        // The device ctor 0x13659c8 copies the path, so the static string need only outlive DlcSetup2.
-        static std::string s_folder;
-        s_folder = paths.device;                          // "<folder>/" forward-slash, trailing '/'
+        // The device ctor 0x13659c8 copies the path; each pack's string is still kept for the process's life (a
+        // list: its nodes never move), in case the entry's +0xb8 is read again after this call.
+        static std::list<std::string> s_folders;
+        s_folders.push_back(paths.device);                // "<folder>/" forward-slash, trailing '/'
+        const std::string& s_folder = s_folders.back();
         if (!IsReadable(e + kOffEntryType, 4) || !IsReadable(e + kOffEntryPath, 8) || !IsReadable(e + kOffEntryFlag, 2)) {
             Fail("folder-mode: DLC entry device fields (+0xb8/+0xc0/+0xc8) are not writable"); return false;
         }
@@ -648,15 +941,37 @@ bool MountSequence(World& world) {
     }
     GLOGI("hook: [packstream] MountGate ok (state %u) -- dlc.rpf is mounted", (unsigned)EntryState(e));
 
+    // Loose models first, so the change set's vehicles.meta finds them by name.
+    if (folderMode && !RegisterLooseStream(paths)) return false;   // Fail() already logged
+
+    // The car list, while the pack's device is mounted (a dlc.rpf pack can only be read through it).
+    const std::string mount = folderMode ? std::string() : EntryMountPoint(e);
+    if (!folderMode) GLOGI("hook: [packstream] pack %s: mounted at \"%s\"", p.name.c_str(), mount.empty() ? "<unknown>" : mount.c_str());
+    ReadPackModels(p, mount);
+
     reinterpret_cast<RunPackGroupFn>(g_addr[kRunPackGroup])(mgr, packHash, kGroupEarlyOn);
     reinterpret_cast<RunPackGroupFn>(g_addr[kRunPackGroup])(mgr, packHash, kGroupStartup);
-    GLOGI("hook: [packstream] ran EARLY_ON + STARTUP change-set groups for pack 0x%08x", (unsigned)packHash);
-
-    g_modelHash = world.HashKey(Narrow(reg::Get(L"pack_model", L"jesko")).c_str());
-    g_mountAt = GetTickCount64();
-    GLOGI("hook: [packstream] waiting up to %llu ms for model '%ls' (hash 0x%08x) to appear in the cdimage",
-          (unsigned long long)kModelWaitMs, reg::Get(L"pack_model", L"jesko").c_str(), (unsigned)g_modelHash);
+    GLOGI("hook: [packstream] pack %s: ran EARLY_ON + STARTUP change-set groups (0x%08x)", p.name.c_str(), (unsigned)packHash);
     return true;
+}
+
+// Publish the menu's copy: every car of every mounted pack, the ones the cdimage has confirmed first-class.
+void PublishVehicles() {
+    std::vector<PackVehicle> out;
+    for (const Pack& p : g_packs)
+        for (const PackModel& m : p.models) {
+            PackVehicle v;
+            v.model = m.v.model; v.make = m.v.make; v.label = m.v.label; v.vclass = m.v.vclass; v.pack = p.name;
+            v.ready = m.inCdimage;
+            out.push_back(std::move(v));
+        }
+    std::sort(out.begin(), out.end(), [](const PackVehicle& a, const PackVehicle& b) {
+        const int c = _stricmp(a.make.c_str(), b.make.c_str());
+        return c != 0 ? c < 0 : _stricmp(a.model.c_str(), b.model.c_str()) < 0;
+    });
+    std::lock_guard<std::mutex> lk(g_vehMutex);
+    g_vehShared = std::move(out);
+    ++g_vehGen;
 }
 
 }  // namespace
@@ -673,44 +988,98 @@ Status Tick(World& world) {
     // One-time: resolve and log the signatures + the manager global. Even with no pack present this is
     // a complete live validation of the 3889 recon.
     if (!ResolveAll()) {
+        g_curPack = "*";
         Fail("not every ExtraContentManager signature resolved uniquely on this image (see the [packstream] lines)");
+        g_status = Status::Failed;
         return g_status;
     }
 
-    if (!g_attempted) {
+    if (!g_listed) {
         // Wait for the manager singleton to exist (it is built during boot; it should already be up by the
         // time the player is in the world, but give it a bounded grace period rather than failing at once).
         if (!Manager()) {
             if (!g_mgrSince) g_mgrSince = GetTickCount64();
             if (GetTickCount64() - g_mgrSince > kMgrWaitMs) {
+                g_curPack = "*";
                 Fail("the ExtraContentManager singleton stayed null for %llu ms", (unsigned long long)kMgrWaitMs);
+                g_status = Status::Failed;
                 return g_status;
             }
             return Status::Idle;   // try again next tick
         }
-        g_attempted = true;
-        if (MountSequence(world))
-            g_status = Status::Pending;
+        g_listed = true;
+        EnumeratePacks();
+        if (g_packs.empty()) {
+            g_curPack = "*";
+            Fail("no pack folders to mount");
+            g_status = Status::Failed;
+            return g_status;
+        }
+        g_status = Status::Pending;
         return g_status;
     }
 
-    // Pending: wait for the pack's model to become streamable.
-    if (g_status == Status::Pending) {
-        if (g_modelHash && ModelInCdimage(world, g_modelHash)) {
-            g_status = Status::Ready;
-            GLOGI("hook: [packstream] READY: model 0x%08x is in the cdimage; the pack mounted and its "
-                  "change set registered the model", (unsigned)g_modelHash);
-        } else if (GetTickCount64() - g_mountAt > kModelWaitMs) {
-            Fail("the model (hash 0x%08x) did not appear in the cdimage within %llu ms after the change set; "
-                 "the pack mounted but its vehicle meta did not register (check content.xml / setup2.xml types)",
-                 (unsigned)g_modelHash, (unsigned long long)kModelWaitMs);
+    // One pack per tick: a change set parses its metas synchronously, so a long list must not stall one frame.
+    if (g_next < g_packs.size()) {
+        Pack& p = g_packs[g_next++];
+        p.mounted = MountSequence(world, p);
+        for (PackModel& m : p.models) m.hash = world.HashKey(m.v.model.c_str());
+        g_mountAt = GetTickCount64();
+        g_pollAt = 0;
+        PublishVehicles();
+        return g_status;
+    }
+
+    // Every pack ran: poll the cars into the cdimage (2 passes a second), until all are in or the wait runs out.
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_pollAt) return g_status;
+    g_pollAt = now + 500;
+    size_t total = 0, in = 0, mounted = 0;
+    bool changed = false;
+    for (Pack& p : g_packs) {
+        if (!p.mounted) continue;
+        ++mounted;
+        for (PackModel& m : p.models) {
+            ++total;
+            if (!m.inCdimage && m.hash && ModelInCdimage(world, m.hash)) { m.inCdimage = true; changed = true; }
+            if (m.inCdimage) ++in;
         }
+    }
+    if (changed) PublishVehicles();
+    if (in == total || now - g_mountAt > kModelWaitMs) {
+        for (const Pack& p : g_packs)
+            for (const PackModel& m : p.models)
+                if (p.mounted && !m.inCdimage)
+                    GLOGW("hook: [packstream] pack %s: car '%s' (0x%08x) is NOT in the cdimage %llu ms after its change set "
+                          "(its vehicles.meta did not register it)", p.name.c_str(), m.v.model.c_str(), (unsigned)m.hash,
+                          (unsigned long long)(now - g_mountAt));
+        g_status = mounted ? Status::Ready : Status::Failed;
+        GLOGI("hook: [packstream] %s: %u of %u pack(s) mounted, %u of %u car(s) in the cdimage", mounted ? "READY" : "FAILED",
+              (unsigned)mounted, (unsigned)g_packs.size(), (unsigned)in, (unsigned)total);
     }
     return g_status;
 }
 
 const char* FailReason() {
     return g_status == Status::Failed ? g_fail : "";
+}
+
+std::vector<PackVehicle> Vehicles() {
+    std::lock_guard<std::mutex> lk(g_vehMutex);
+    return g_vehShared;
+}
+
+uint32_t VehiclesGeneration() {
+    std::lock_guard<std::mutex> lk(g_vehMutex);
+    return g_vehGen;
+}
+
+const char* PackOfModel(uint32_t modelHash) {
+    if (!modelHash) return nullptr;
+    for (const Pack& p : g_packs)
+        for (const PackModel& m : p.models)
+            if (m.hash == modelHash) return p.name.c_str();
+    return nullptr;
 }
 
 }  // namespace gage::game::content

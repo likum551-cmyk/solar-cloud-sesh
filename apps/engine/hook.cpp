@@ -848,6 +848,11 @@ const HashMapping kCrossmap3889[] = {
     {native::SET_VEHICLE_TYRES_CAN_BURST,                 0x439C904840715871},
     {native::SET_VEHICLE_WHEELS_CAN_BREAK,                0x72241E9BCAEB0F8B},
     {native::IS_ENTITY_IN_AIR,                            0x3F18810075C77D41},
+    // 0.4.14 anim read-backs: YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced by name; public hashes and units in hook.h.
+    {native::GET_ENTITY_ANIM_CURRENT_TIME,                0x82E64DE58A6B84A8},
+    {native::GET_ENTITY_ANIM_TOTAL_TIME,                  0x58C2315AA20FAF06},
+    {native::GET_ANIM_DURATION,                           0x6CEF2D1ADD6A5E7F},
+    {native::GET_SCRIPT_TASK_STATUS,                      0x9B5C1660CCDF7189},
     // 0.4.4 (W11): lookup tool, public and 3889 agree.
     {native::TASK_GO_TO_ENTITY,                           0xAB3658A740EED98E},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
@@ -5375,11 +5380,44 @@ int World::IsEntityPlayingAnim(int32_t entity, const char* dict, const char* nam
     return (uint32_t)r[0] ? 1 : 0;
 }
 
-bool World::GetEntityAnimTimes(int32_t entity, const char* dict, const char* name, float& current, float& total) {
-    (void)entity; (void)dict; (void)name;
-    current = -1.0f;      // R4 T3: the two natives are not in the crossmap; neutral until they are (see hook.h)
+bool World::GetEntityAnimTimes(int32_t entity, const char* dict, const char* name, float& current, float& total, float* phase) {
+    current = -1.0f;
     total = -1.0f;
-    return false;
+    if (phase) *phase = -1.0f;
+    if (!entity || !dict || !name) return false;
+    uint64_t args[] = { entArg(entity), ptrArg(dict), ptrArg(name) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_ENTITY_ANIM_TOTAL_TIME, args, 3, r)) return false;
+    float totalMs = 0.0f;
+    memcpy(&totalMs, &r[0], 4);                          // MILLISECONDS (alloc8or doc)
+    if (!(totalMs > 0.0f) || !std::isfinite(totalMs)) return false;   // not on the entity
+    uint64_t r2[4] = {};
+    if (!CallNative(native::GET_ENTITY_ANIM_CURRENT_TIME, args, 3, r2)) return false;
+    float ph = 0.0f;
+    memcpy(&ph, &r2[0], 4);                              // PHASE 0..1
+    if (!std::isfinite(ph)) return false;
+    if (phase) *phase = ph;
+    total = totalMs / 1000.0f;
+    current = ph * total;
+    return true;
+}
+
+bool World::GetAnimDuration(const char* dict, const char* name, float& raw) {
+    raw = -1.0f;
+    if (!dict || !name) return false;
+    uint64_t args[] = { ptrArg(dict), ptrArg(name) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_ANIM_DURATION, args, 2, r)) return false;
+    memcpy(&raw, &r[0], 4);
+    return std::isfinite(raw);
+}
+
+int World::GetScriptTaskStatus(int32_t ped, uint32_t taskHash) {
+    if (!ped) return -1;
+    uint64_t args[] = { entArg(ped), (uint64_t)taskHash };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_SCRIPT_TASK_STATUS, args, 2, r)) return -1;
+    return (int)(int32_t)(uint32_t)r[0];
 }
 
 int World::IsPedUsingAnyScenario(int32_t ped) {
@@ -6261,6 +6299,10 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_VEHICLE_TYRES_CAN_BURST),
         GAGE_NEW_NATIVE(SET_VEHICLE_WHEELS_CAN_BREAK),
         GAGE_NEW_NATIVE(IS_ENTITY_IN_AIR),
+        GAGE_NEW_NATIVE(GET_ENTITY_ANIM_CURRENT_TIME),
+        GAGE_NEW_NATIVE(GET_ENTITY_ANIM_TOTAL_TIME),
+        GAGE_NEW_NATIVE(GET_ANIM_DURATION),
+        GAGE_NEW_NATIVE(GET_SCRIPT_TASK_STATUS),
         GAGE_NEW_NATIVE(GET_VEHICLE_LIGHTS_STATE),
         GAGE_NEW_NATIVE(SET_VEHICLE_FULLBEAM),
         GAGE_NEW_NATIVE(SET_VEHICLE_INTERIORLIGHT),

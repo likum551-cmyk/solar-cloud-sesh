@@ -78,8 +78,10 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
         `{"type":"status","text":"<human>"}` (0..n times during launch; at least
         every 5 s while waiting for the store to bring the game up), and finally
         `{"type":"launchResult","ok":<bool>,"code":<int>,"error":"<msg|empty>"}`
-      (There is no `assetProgress` message any more: Solar RP servers have no client
-      file host, so the SPA's download bar receives no data.)
+      (There is no `assetProgress` message any more. Since 0.4.14 the launcher downloads the
+      server's car packs on a Legacy PLAY before the game starts (docs/UPDATES.md "Car packs");
+      that progress arrives as `status` lines ("Checking cars…", "Downloading cars: X of Y MB (P%)…"),
+      and a failed download never fails the launch.)
       `error` is always empty when `ok` is true (success detail arrives as a `status`).
       While a launch is in progress, further `launch` messages are ignored; an
       invalid server (empty host / port outside 0..65535) gets `launchResult` code 5.

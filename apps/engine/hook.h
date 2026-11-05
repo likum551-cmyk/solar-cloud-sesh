@@ -408,6 +408,17 @@ namespace gage::game {
         constexpr uint64_t SET_VEHICLE_TYRES_CAN_BURST                 = 0xEB9DC3C7D8596C46;
         constexpr uint64_t SET_VEHICLE_WHEELS_CAN_BREAK                = 0x29B18B4FD460CA8F;
         constexpr uint64_t IS_ENTITY_IN_AIR                            = 0x886E37EC497200B6;
+        // 0.4.14 anim read-backs (the 0.4.12 "clip gone before +600 ms" question: finished or cut?). Public hashes and docs from alloc8or
+        // natives.json; each 3889 hash is YimMenu b3889 crossmap.hpp at the natives.hpp index AND agrees by name with YimMenuV2 `enhanced`
+        // Crossmap.hpp (lookup tool, 2026-11-05). R4's "not in the crossmap" was wrong.
+        //   GET_ENTITY_ANIM_CURRENT_TIME  public 0x346D81500D088F42  3889 0x82E64DE58A6B84A8  float (Entity, dict, name): PHASE 0..1 (wraps on a loop)
+        //   GET_ENTITY_ANIM_TOTAL_TIME    public 0x50BD2730B191E360  3889 0x58C2315AA20FAF06  float (Entity, dict, name): MILLISECONDS
+        //   GET_ANIM_DURATION             public 0xFEDDF04D62B8D790  3889 0x6CEF2D1ADD6A5E7F  float (dict, name): unit undocumented (seconds by usage)
+        //   GET_SCRIPT_TASK_STATUS        public 0x77F1BEB8863288D5  3889 0x9B5C1660CCDF7189  int (Ped, Hash task): 0 waiting .. 1 performing .. 7 finished
+        constexpr uint64_t GET_ENTITY_ANIM_CURRENT_TIME                = 0x346D81500D088F42;
+        constexpr uint64_t GET_ENTITY_ANIM_TOTAL_TIME                  = 0x50BD2730B191E360;
+        constexpr uint64_t GET_ANIM_DURATION                           = 0xFEDDF04D62B8D790;
+        constexpr uint64_t GET_SCRIPT_TASK_STATUS                      = 0x77F1BEB8863288D5;
         // 0.4.4 (W11, anchor steering). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
         //   TASK_GO_TO_ENTITY  public 0x6A071245EB0D1882  3889 0xAB3658A740EED98E
         //                      void (Entity entity, Entity target, int duration, float distance, float moveBlendRatio,
@@ -1022,10 +1033,15 @@ namespace gage::game {
         // TASK_START_SCENARIO_IN_PLACE(ped, name, 0, playEnterAnim true).
         bool     TaskStartScenarioInPlace(int32_t ped, const char* scenario);
         int      IsEntityPlayingAnim(int32_t entity, const char* dict, const char* name);  // taskFlag 3
-        // R4 T3. GET_ENTITY_ANIM_CURRENT_TIME / GET_ENTITY_ANIM_TOTAL_TIME (entity, dict, name) -> float seconds. Neither hash is in the crossmap
-        // (natives wanted, docs/sync-specs/combat.md, R4 T3): this returns false WITHOUT calling anything and sets both to -1 (unknown). The swing's
-        // progress check (sync::SwingProbe) already takes the times, so filling this in is the only missing step.
-        bool     GetEntityAnimTimes(int32_t entity, const char* dict, const char* name, float& current, float& total);
+        // R4 T3 / 0.4.14. The clip's position and length in SECONDS (sync::SwingProbe's unit): GET_ENTITY_ANIM_CURRENT_TIME is a phase 0..1
+        // and GET_ENTITY_ANIM_TOTAL_TIME milliseconds, so current = phase * total. False (both -1) when either cannot be called or the
+        // total reads <= 0 (the clip is not on the entity). `phase`, when given, gets the raw phase.
+        bool     GetEntityAnimTimes(int32_t entity, const char* dict, const char* name, float& current, float& total, float* phase = nullptr);
+        // GET_ANIM_DURATION(dict, name): the clip's length from the dictionary (no entity), raw value; false when it cannot be called.
+        bool     GetAnimDuration(const char* dict, const char* name, float& raw);
+        // GET_SCRIPT_TASK_STATUS(ped, taskHash): 0 waiting to start, 1 performing, 2 dormant, ... 7 finished; -1 when it cannot be called.
+        static constexpr uint32_t kScriptTaskPlayAnim = 0x87B9A382;   // SCRIPT_TASK_PLAY_ANIM
+        int      GetScriptTaskStatus(int32_t ped, uint32_t taskHash);
         int      IsPedUsingAnyScenario(int32_t ped);
         bool     SetEntityMaxHealth(int32_t entity, int value);
         // R3 T1: SET_PED_MAX_HEALTH(ped, value): the PED maximum (the entity one is not what bounds a player ped's health in the live

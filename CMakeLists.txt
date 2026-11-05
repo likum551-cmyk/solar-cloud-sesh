@@ -159,6 +159,7 @@ add_executable(GAGE-MP
     apps/launcher/integrity.cpp
     apps/launcher/legacy_handoff.cpp
     apps/launcher/updater.cpp
+    apps/launcher/pack_sync.cpp
 )
 add_dependencies(GAGE-MP gage_ui_embed gage_integrity gage_launch_shim)
 target_include_directories(GAGE-MP PRIVATE
@@ -215,6 +216,14 @@ add_executable(update_check_test tests/update_check_test.cpp apps/launcher/updat
 target_include_directories(update_check_test PRIVATE ${CMAKE_BINARY_DIR}/gen) # build_config.h: the baked key
 target_link_libraries(update_check_test PRIVATE gage_common winhttp ws2_32 shell32 bcrypt)
 set_target_properties(update_check_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
+# pack_sync_test.exe: the launcher's car-pack download (apps/launcher/pack_sync.cpp): manifest signature and
+# validation, then install / update / resume / removal against a fake network in a %TEMP% scratch folder (an
+# in-process CNG key signs the fixtures). Never shipped.
+add_executable(pack_sync_test tests/pack_sync_test.cpp apps/launcher/pack_sync.cpp apps/launcher/updater.cpp
+    libs/net/serverfinder.cpp libs/net/ping.cpp libs/net/serverquery.cpp)
+target_link_libraries(pack_sync_test PRIVATE gage_common winhttp ws2_32 shell32 bcrypt)
+set_target_properties(pack_sync_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
 # integrity_test.exe: the launcher's check of its own DLLs, never shipped
 add_executable(integrity_test tests/integrity_test.cpp)

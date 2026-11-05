@@ -138,21 +138,23 @@ static void T4NetworkTests()
 
     // ---- the speed cap: over it is clamped, far over it is still dropped ----
     {
+        // Relative to the rig's (default) cap, so a change of the shipped default (150 -> 170 m/s on 2026-11-05) keeps the test meaning the same.
+        const float cap = (float)server::Config().vehicleMaxSpeed;
         const server::Stats s0 = rig.srv.stats();
         proto::VehicleUpdate u;
-        u.seq = ++seqA; u.vehId = sa.vehId; u.k = Kin(0.0f, ya0 + 40.0f, 30.0f, 0.0f, 0.0f, 160.0f); u.rot = rotA; u.flags = proto::kVehEngine;
+        u.seq = ++seqA; u.vehId = sa.vehId; u.k = Kin(0.0f, ya0 + 40.0f, 30.0f, 0.0f, 0.0f, cap + 10.0f); u.rot = rotA; u.flags = proto::kVehEngine;
         alice.s.SendVehicleState(u, (int32_t)((uint64_t)(MsSince(tStart) + kClkA) & 0xFFFFu));
         rig.Until([&] { return rig.srv.stats().vehicleUpdatesAccepted > s0.vehicleUpdatesAccepted; }, 1500);
         const server::VehicleStore::Vehicle* v = rig.srv.FindVehicle(sa.vehId);
-        const bool clamped = v && std::fabs(v->s.k.vy - 150.0f) < 0.05f && std::fabs(v->s.k.y - (ya0 + 40.0f)) < 0.05f;
+        const bool clamped = v && std::fabs(v->s.k.vy - cap) < 0.05f && std::fabs(v->s.k.y - (ya0 + 40.0f)) < 0.05f;
         proto::VehicleUpdate farUpd = u;
         farUpd.seq = ++seqA;
-        farUpd.k = Kin(0.0f, ya0 + 41.0f, 30.0f, 0.0f, 0.0f, 400.0f);
+        farUpd.k = Kin(0.0f, ya0 + 41.0f, 30.0f, 0.0f, 0.0f, cap * 2.0f + 60.0f);   // over twice the cap: refused
         alice.s.SendVehicleState(farUpd, (int32_t)((uint64_t)(MsSince(tStart) + kClkA) & 0xFFFFu));
         rig.Until([&] { return rig.srv.stats().vehicleUpdatesInvalid > s0.vehicleUpdatesInvalid; }, 1500);
         const server::Stats s1 = rig.srv.stats();
         const server::VehicleStore::Vehicle* v2 = rig.srv.FindVehicle(sa.vehId);
-        Check("T4 net speed cap: a 160 m/s update (a hyper car's overshoot of the 150 m/s cap) is ACCEPTED with its velocity clamped to 150 and its position taken; 400 m/s is still refused and counted invalid",
+        Check("T4 net speed cap: an update 10 m/s over the cap (a hyper car's overshoot) is ACCEPTED with its velocity clamped to the cap and its position taken; over twice the cap is still refused and counted invalid",
               clamped && s1.vehicleUpdatesAccepted == s0.vehicleUpdatesAccepted + 1 && s1.vehicleUpdatesInvalid == s0.vehicleUpdatesInvalid + 1 && v2 && std::fabs(v2->s.k.y - (ya0 + 40.0f)) < 0.05f &&
                   rig.srv.VehicleSpeedClamps() >= 1,
               std::string(clamped ? "clamped" : "not clamped") + ", " + std::to_string(s1.vehicleUpdatesAccepted - s0.vehicleUpdatesAccepted) + " accepted, " +

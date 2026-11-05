@@ -52,6 +52,7 @@
 #include "integrity.h"
 #include "legacy_handoff.h"
 #include "updater.h"
+#include "pack_sync.h"
 #include "version_gate.h"  // the lockstep policy: protocol gate, every update mandatory, check timing (pure; tests/version_gate_test.cpp)
 #include "build_config.h"  // generated: GAGE_UPDATE_URL, GAGE_UPDATE_PUBKEY
 #include "ui_html.h"  // generated: embedded SPA bytes (kUiHtml / kUiHtmlLen)
@@ -63,7 +64,7 @@ using net::ServerInfo;
 // Constants
 // ---------------------------------------------------------------------------
 
-static const wchar_t* kClientVersion = L"0.4.13";
+static const wchar_t* kClientVersion = L"0.4.14";
 static const wchar_t* kClass = L"GAGE_MP_Launcher";
 static const wchar_t* kTitle = L"Solar Launcher";
 static const int kAppIconId = 1;  // gage_gui.rc
@@ -669,6 +670,36 @@ static std::string VersionText(uint32_t packed) {
     return b;
 }
 
+static std::vector<std::string> UpdateUrls();  // with the update code below
+
+// Download the car packs the server publishes (packs.json next to the update manifest) into
+// %LOCALAPPDATA%\GAGE-MP\packs, with progress as launch status lines. Launch worker thread; never fails the launch.
+// gage_mp.cfg pack_sync=0 switches it off (an operator staging packs by hand).
+static void SyncCarPacks() {
+    if (cfg::Get(L"pack_sync", L"1") == L"0") { GLOGI("packs: pack_sync=0 in gage_mp.cfg, not syncing"); return; }
+    if (!kUpdatePubKey || !*kUpdatePubKey) { GLOGW("packs: no update key baked into this build, not syncing"); return; }
+    PostStatusFromWorker(L"Checking cars…");
+    ULONGLONG last = 0;
+    const packsync::Result r = packsync::Sync(packsync::DefaultRoot(), UpdateUrls(), kUpdatePubKey, packsync::DefaultIo(),
+        [&last](const packsync::Progress& p) {
+            const ULONGLONG now = GetTickCount64();
+            if (p.totalBytes == 0 || (now - last < 400 && p.doneBytes < p.totalBytes)) return;
+            last = now;
+            wchar_t b[160];
+            swprintf(b, 160, L"Downloading cars: %llu of %llu MB (%d%%)…", p.doneBytes >> 20, (p.totalBytes + (1u << 20) - 1) >> 20,
+                     (int)(p.doneBytes * 100 / p.totalBytes));
+            PostStatusFromWorker(b);
+        });
+    if (!r.published) {
+        GLOGI("packs: no packs.json reachable (%s); starting with the packs already on this PC", r.error.c_str());
+    } else if (!r.ok) {
+        GLOGW("packs: %s", r.error.c_str());
+        PostStatusFromWorker(L"Some cars could not be downloaded. Starting without them…");
+    } else if (r.packsInstalled > 0 || r.packsRemoved > 0) {
+        PostStatusFromWorker(L"Cars up to date.");
+    }
+}
+
 static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const std::wstring& playerName) {
     // 0. The lockstep gate (version_gate.h). Ask the server which protocol it enforces: a server AHEAD of this
     //    launcher means a release is out that we have not installed (refuse, and have the UI thread look for the
@@ -722,6 +753,13 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
         PostLaunch({ false, 11, L"Solar RP's own file " + badFile +
                                     L" is missing or was changed after install. Reinstall Solar RP." });
         return;
+    }
+
+    // 1c. The server's car packs (pack_sync.h): Legacy only (GTA5.exe; Enhanced cannot mount them), and only while the
+    //     game is not running (a running engine has its packs mounted). Never fatal: without them the game still starts.
+    if (_wcsicmp(baseName(game).c_str(), L"GTA5.exe") == 0) {
+        if (launch::FindGame().pid) GLOGI("packs: the game is already running; not syncing car packs now");
+        else SyncCarPacks();
     }
 
     // 2. Server handoff (the injected chain reads these from the registry; the

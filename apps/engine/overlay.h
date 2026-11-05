@@ -71,6 +71,20 @@ namespace gage::game::Overlay {
     };
     void SetNameTags(const NameTag* tags, int count);
 
+    // The Tab menu's "Cars" page: every car the mounted content packs carry (pack_stream.h Vehicles()). The list
+    // REPLACES the previous one, is copied under the data lock (any thread), and is shown in the order given;
+    // entries past kMaxCars are ignored. `loading` says packs are still being mounted (an empty list then reads
+    // "loading", not "no packs"). Strings are UTF-8, cut at their buffers. Clicking a car submits "/car <model>".
+    static constexpr int kMaxCars = 4096;
+    struct CarEntry {
+        char model[64] = {};    // the /car name
+        char name[80] = {};     // what the row shows (pack_meta.h CarDisplayName)
+        char vclass[32] = {};   // "Super" (CarClassName), may be empty
+        char pack[64] = {};     // the pack folder it came from
+        bool ready = false;     // the game has the model (IS_MODEL_IN_CDIMAGE); a not-ready row is dimmed
+    };
+    void SetCars(const CarEntry* cars, int count, bool loading);
+
     // A chat line for the log. name is empty/null for a server or system line;
     // self marks the local player's own line. UTF-8, control characters become
     // spaces, name is cut at 32 bytes and text at 256.
@@ -182,6 +196,14 @@ namespace gage::game::Overlay {
         int   actionCount = 0;
         float actionRect[kMaxActions][4] = {};    // x, y, w, h of each button
         char  actionCmd[kMaxActions][48] = {};
+        // the Tab menu's pages: 0 quick actions, 1 cars. On the cars page actionRect / actionCmd hold its rows.
+        int   invTab = 0;
+        float tabRect[2][4] = {};                 // the two page tabs in the header
+        float searchX = 0, searchY = 0, searchW = 0, searchH = 0;
+        float pageNextRect[4] = {}, pagePrevRect[4] = {};
+        int   carsTotal = 0, carsMatched = 0, carPage = 0, carPages = 0;
+        int   litCar = -1;                        // the lit row on the cars page (Enter's target), -1 when none
+        bool  carsLoading = false;
         // speedometer (bottom-right; speedShown is the eased number on screen, speedLit of
         // speedSegments gauge bars are lit)
         bool  speedoVisible = false;

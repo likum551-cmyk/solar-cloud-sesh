@@ -128,3 +128,24 @@ Build the exe with `cmake --build build/win --target update_check_test`.
 - A launcher left open looks again every 2 minutes (and on the events listed under "Lockstep releases"), so a release reaches it within about that time; one that cannot reach the update host keeps its last known state and retries on the next tick.
 - The lockstep behaviour (the 2-minute poll, the activation / restore / game-exit / PLAY checks, the protocol gate, the parked PLAY) is pinned by `tests/version_gate_test.cpp` for the decisions only; the window-message wiring in `gage_gui.cpp` compiles and was not run against a live second release.
 - Launchers built before solar-rp.com existed fetch over plain HTTP (the bare-IP URL). The signature carries the trust, not the transport; see the attacker table.
+
+## Car packs (0.4.14)
+
+The launcher also downloads the server's car packs (apps/launcher/pack_sync.h), with the same key and trust model as the
+update: nothing is believed before the signature verifies against the baked key.
+
+- **Served:** `<update dir>/packs.json` (`{"signed","sig"}`; payload `{"v":1,"kind":"packs","issued","packs":[{"name",
+  "files":[{"path","size","sha256"}]}]}`) and every file as `<update dir>/packs/<sha256>`. `kind` keeps the two manifests
+  apart: neither verifier accepts the other's payload (pack_sync_test checks both directions).
+- **Publishing (VPS):** `bash tools/deploy/publish-packs.sh <packs folder | packs .tar>`. It copies new blobs first, signs
+  with `tools/packs/sign_packs.mjs` (refuses a key that is not the baked one, and any name or path the launcher would
+  refuse), switches packs.json atomically and checks it through Caddy. The published set replaces the previous one.
+- **On PLAY:** for a Legacy game (`GTA5.exe`) that is not running yet, the launcher fetches packs.json next to the update
+  manifest it uses, downloads the missing files into `%LOCALAPPDATA%\GAGE-MP\packs\.sync\blobs`, checks each hash, and
+  swaps each pack folder in whole (two renames), so the engine never mounts half a pack. Progress shows as launch `status`
+  lines ("Downloading cars: X of Y MB"). Failures never stop the launch. Packs it installed and the server no longer lists
+  are removed; folders it never installed are left alone. A hash cache (`.sync\state.txt`, keyed by size + mtime) keeps a
+  current set to a few milliseconds. `pack_sync=0` in gage_mp.cfg switches it off.
+- **Enhanced** downloads nothing: the pack loader is Legacy-only (apps/engine/pack_stream.h).
+- **Tests:** `pack_sync_test` (signature, validation, install / update / stray file / in-place edit / removal / bad bytes /
+  resume); `pack_sync_test --e2e <update url> <pub> <root>` runs one real WinHTTP sync against a served packs.json.
