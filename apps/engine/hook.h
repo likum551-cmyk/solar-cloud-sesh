@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace gage::game {
 
@@ -200,6 +201,21 @@ namespace gage::game {
         constexpr uint64_t GET_BLIP_SPRITE                                  = 0x1FC877464A04FC4F;
         constexpr uint64_t REMOVE_BLIP                                      = 0x86A652570E5F25DD;
         constexpr uint64_t DOES_BLIP_EXIST                                  = 0xA6DB27D19ECBB7DA;
+        // 0.4.20 map clean-up (sync/mapclear.h): hide SP blips, keep the arrow / north / waypoint, clear the stale
+        // waypoint at entry, uncover the fog of war. Public hashes and signatures: alloc8or natives.json (HUD::,
+        // MISC::); 3889 hashes in kCrossmap3889 (lookup tool: YimMenu b3889 and YimMenuV2 enhanced AGREE for all).
+        constexpr uint64_t GET_BLIP_INFO_ID_DISPLAY                         = 0x1E314167F701DC3B;  // int (Blip)
+        constexpr uint64_t SET_BLIP_DISPLAY                                 = 0x9029B2F3DA924928;  // void (Blip, int displayId)
+        constexpr uint64_t GET_MAIN_PLAYER_BLIP_ID                          = 0xDCD4EC3F419D02FA;  // Blip ()
+        constexpr uint64_t GET_NORTH_BLID_INDEX                             = 0x3F0CF9CB7E589B88;  // Blip ()
+        constexpr uint64_t GET_WAYPOINT_BLIP_ENUM_ID                        = 0x186E5D252FA50E7D;  // int ()
+        constexpr uint64_t GET_NUMBER_OF_ACTIVE_BLIPS                       = 0x9A3FF3DE163034E8;  // int ()
+        constexpr uint64_t SET_THIS_SCRIPT_CAN_REMOVE_BLIPS_CREATED_BY_ANY_SCRIPT = 0xB98236CAAECEF897;  // void (BOOL)
+        constexpr uint64_t IS_WAYPOINT_ACTIVE                               = 0x1DD1F58F493F1DA5;  // BOOL ()
+        constexpr uint64_t SET_WAYPOINT_OFF                                 = 0xA7E4E2D361C2627F;  // void ()
+        constexpr uint64_t SET_MINIMAP_HIDE_FOW                             = 0xF8DEE0A5600CBB93;  // void (BOOL): true = the entire map revealed
+        constexpr uint64_t GET_MINIMAP_FOW_DISCOVERY_RATIO                  = 0xE0130B41D3CF4574;  // float ()
+        constexpr uint64_t GET_MINIMAP_FOW_COORDINATE_IS_REVEALED           = 0x6E31B91145873922;  // BOOL (float x, y, z)
 
         // remote-player ped driving (GTA Network / RAGECOOP style: a locomotion task, a per-frame
         // velocity steer and a rare hard snap), the local-state readers the sender needs, and the
@@ -792,6 +808,27 @@ namespace gage::game {
         // player's waypoint. A logged no-op while the blip natives do not resolve; it walks
         // about a thousand sprite ids, so call it on a cadence (seconds), not every frame.
         void     ClearSpBlips();
+        // 0.4.20 map clean-up (sync/mapclear.h decides; script tick only). CollectBlips walks every sprite id in
+        // [firstSprite, lastSprite] with GET_FIRST / GET_NEXT_BLIP_INFO_ID and returns the live blips (handle, sprite,
+        // display; display -1 when unreadable); false when a blip native does not resolve. HideBlip issues
+        // SET_BLIP_DISPLAY(blip, 0) and returns the display read back (-1 unreadable). MapKeepHandles reads the main
+        // player blip, the north blip and the waypoint sprite (GET_WAYPOINT_BLIP_ENUM_ID; ok=false when unreadable).
+        struct MapBlip { int32_t handle; int sprite; int display; };
+        bool     CollectBlips(int firstSprite, int lastSprite, std::vector<MapBlip>& out);
+        int      HideBlip(int32_t blip);
+        void     MapKeepHandles(int32_t& mainPlayer, int32_t& north, int& waypointEnum, bool& waypointEnumOk);
+        int      ActiveBlipCount();             // GET_NUMBER_OF_ACTIVE_BLIPS, -1 unresolved
+        // SET_THIS_SCRIPT_CAN_REMOVE_BLIPS_CREATED_BY_ANY_SCRIPT(true) on our host script (blip commands on other
+        // scripts' blips). False when unresolved.
+        bool     AllowAnyScriptBlips();
+        // The stale waypoint: IS_WAYPOINT_ACTIVE, SET_WAYPOINT_OFF when it is, IS_WAYPOINT_ACTIVE again. Returns
+        // false when a native does not resolve; wasActive / activeAfter are the two reads.
+        bool     ClearWaypoint(bool& wasActive, bool& activeAfter);
+        // SET_MINIMAP_HIDE_FOW(hide): true reveals the whole map (alloc8or). False when unresolved.
+        bool     SetMapFowHidden(bool hide);
+        // Read-back of the fog DATA (not of the hide flag, which has no getter): the discovered ratio and whether a
+        // far coordinate (Paleto Bay) is revealed. False when unresolved.
+        bool     MapFowReadback(float& ratio, bool& farRevealed);
         // Diagnostic: log every live GTA script thread (id + script-name hash, resolved to a
         // readable name when known, else hex) to gage.log. `when` tags the line (e.g. "pristine"
         // before suppression, "after-suppress" a few seconds in). Read-only; walks the same

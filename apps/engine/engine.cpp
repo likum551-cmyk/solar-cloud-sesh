@@ -45,6 +45,7 @@
 #include "sync/hypertune.h"
 #include "sync/pausemenu.h"
 #include "sync/radio_off.h"
+#include "sync/mapclear.h"
 #include "common/registry.h"
 
 #include <windows.h>
@@ -591,6 +592,18 @@ namespace {
         sync::LightsStats lights;                // every copy's LightsKeeper counters of this window
     };
     SigStats g_sig;
+    // 0.4.20 map clean-up (the sweep is beside EnterServer). map_clear_blips=0: the 0.4.18 blips (ClearSpBlips at the entry and every 5 s only while stock
+    // scripts run, REMOVE_BLIP). map_reveal=0: the fog of war stays as the story save has it. Unset / 1 = on; re-read at every Welcome.
+    std::atomic<bool> g_mapClearBlips{true}, g_mapReveal{true};
+    void MapReadSwitches()
+    {
+        g_mapClearBlips.store(reg::Get(L"map_clear_blips") != L"0");
+        g_mapReveal.store(reg::Get(L"map_reveal") != L"0");
+        GLOGI("engine: map (0.4.20): map_clear_blips=%s map_reveal=%s",
+              g_mapClearBlips.load() ? "on (every blip but the player arrow, north, a waypoint and our own hidden every 3 s after the entry; the stale waypoint cleared once)"
+                                     : "OFF (0.4.18: ClearSpBlips at the entry)",
+              g_mapReveal.load() ? "on (SET_MINIMAP_HIDE_FOW(true) every 3 s after the entry)" : "OFF (the save's fog of war)");
+    }
     constexpr double kContactNearM = 10.0;       // origin to origin: a vehicle we control this close is the likely toucher of a copy
     // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
     std::mutex g_linkMtx;
@@ -1707,6 +1720,7 @@ namespace {
             GLOGI("engine: vehicle signals (0.4.19): horn hold %d ms renewed every %.0f ms, let go after %.0f ms without a state; mode hash 0x%08x",
                   hc.holdMs, hc.renewMs, hc.staleMs, g_hornHeld.load() ? (unsigned)kHornModeHeldDown : 0u);
         }
+        MapReadSwitches();                                           // 0.4.20: map_clear_blips / map_reveal
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
@@ -2596,6 +2610,125 @@ namespace {
         return s;
     }
 
+    // ---- 0.4.20 map clean-up (GI: "clear the map from all waypoints, and reveal all of it for everyone") ----------------------------------
+    // sync/mapclear.h has the rules and the evidence; the switches (g_mapClearBlips, g_mapReveal) are read by MapReadSwitches at Welcome.
+    // Everything below runs on the script tick.
+    sync::MapClearSchedule g_mapSched;
+    sync::OwnedBlips g_ownedBlips;      // the engine's own blips: none yet; every ADD_BLIP_FOR_* site must Add its handle here
+    struct MapStats                     // one 10 s window
+    {
+        uint32_t sweeps = 0, walkFailed = 0;
+        uint32_t keptPlayer = 0, keptNorth = 0, keptWaypoint = 0, keptOwned = 0;
+        uint32_t fowIssued = 0, fowFailed = 0;
+        double sweepMsMax = 0;
+        sync::BlipTally tally;
+    };
+    MapStats g_mapStats;
+    int g_mapActive = -1;               // GET_NUMBER_OF_ACTIVE_BLIPS after the last sweep (-1 unresolved)
+    const char* g_mapWaypoint = "not yet";   // the entry's stale-waypoint clear, for the 10 s line
+    bool g_mapAnyScript = false;        // SET_THIS_SCRIPT_CAN_REMOVE_BLIPS_CREATED_BY_ANY_SCRIPT resolved on the last sweep
+
+    void SweepMapBlips(bool clearWaypoint, bool census)
+    {
+        MapStats& s = g_mapStats;
+        const int64_t q0 = QpcNow();
+        if (clearWaypoint)
+        {
+            bool was = false, after = false;
+            g_mapWaypoint = !g_world->ClearWaypoint(was, after) ? "UNRESOLVED" : !was ? "none active" : after ? "STILL ACTIVE after SET_WAYPOINT_OFF"
+                                                                                                           : "cleared (inactive on read-back)";
+            GLOGI("engine: map (0.4.20): stale waypoint at the entry: %s", g_mapWaypoint);
+        }
+        g_mapAnyScript = g_world->AllowAnyScriptBlips();
+        sync::BlipKeepSet keep;
+        int wpEnum = 0;
+        bool wpOk = false;
+        g_world->MapKeepHandles(keep.mainPlayer, keep.north, wpEnum, wpOk);
+        keep.waypointSprite = sync::WaypointSpriteFrom(wpEnum, wpOk);
+        static std::vector<game::World::MapBlip> blips;
+        ++s.sweeps;
+        if (!g_world->CollectBlips(sync::kBlipSpriteFirst, sync::kBlipSpriteLast, blips))
+        {
+            ++s.walkFailed;
+            static bool warned = false;
+            if (!warned)
+                GLOGW("engine: map (0.4.20): a blip native did not resolve; SP blips left on the map");
+            warned = true;
+            return;
+        }
+        sync::BlipTally one;            // this sweep only (the census)
+        const sync::MapSweepPlan plan = sync::PlanMapSweep(blips, keep, g_ownedBlips, one);
+        for (const sync::MapSweepPlan::Target& t : plan.hide)
+        {
+            if (!sync::BlipDisplayShows(g_world->HideBlip(t.handle)))
+                one.Hidden(t.sprite);   // read back hidden
+            else
+                one.Refused(t.sprite);  // still shows (or unreadable)
+        }
+        s.keptPlayer += plan.keptPlayer;
+        s.keptNorth += plan.keptNorth;
+        s.keptWaypoint += plan.keptWaypoint;
+        s.keptOwned += plan.keptOwned;
+        s.tally.Merge(one);
+        g_mapActive = g_world->ActiveBlipCount();
+        const double ms = QpcUs(QpcNow() - q0) / 1000.0;
+        if (ms > s.sweepMsMax)
+            s.sweepMsMax = ms;
+        if (census)
+            GLOGI("engine: map (0.4.20): sweep census: %zu blip(s) walked over sprites %d-%d in %.2f ms, the game counts %d active; keep: player blip %d, "
+                  "north blip %d, waypoint sprite %d (%s), %zu own; per sprite: %s",
+                  blips.size(), sync::kBlipSpriteFirst, sync::kBlipSpriteLast, ms, g_mapActive, keep.mainPlayer, keep.north, keep.waypointSprite,
+                  wpOk ? "GET_WAYPOINT_BLIP_ENUM_ID" : "default, enum unreadable", g_ownedBlips.Size(), one.Format(24).c_str());
+    }
+
+    void LogMap()
+    {
+        MapStats& s = g_mapStats;
+        const sync::BlipTally::Row& tot = s.tally.Totals();
+        float ratio = 0.0f;
+        bool farRevealed = false;
+        const bool fowRead = g_world->MapFowReadback(ratio, farRevealed);
+        GLOGI("engine: map (0.4.20), last 10 s: map_clear_blips=%s map_reveal=%s; %u sweep(s) (%u walk failed, max %.2f ms), %u blip(s) walked: hidden %u "
+              "(read back hidden), REFUSED %u (still shows), already hidden %u, kept player %u / north %u / waypoint %u / own %u; game counts %d active; "
+              "any-script blips %s; stale waypoint: %s; fog: SET_MINIMAP_HIDE_FOW(true) issued %u, failed %u; fog data (no getter for the hide flag) "
+              "%s discovered %.3f, Paleto Bay %s; sprites: %s",
+              g_mapClearBlips.load() ? "on" : "OFF", g_mapReveal.load() ? "on" : "OFF", s.sweeps, s.walkFailed, s.sweepMsMax, tot.seen, tot.hidden,
+              tot.refused, tot.already, s.keptPlayer, s.keptNorth, s.keptWaypoint, s.keptOwned, g_mapActive, g_mapAnyScript ? "allowed" : "NOT allowed",
+              g_mapWaypoint, s.fowIssued, s.fowFailed, fowRead ? "read:" : "UNREADABLE:", (double)ratio, farRevealed ? "revealed" : "fogged",
+              s.tally.Format(12).c_str());
+        s = MapStats();
+    }
+
+    // The entry is done (EnterServer): sweep now, then on the schedule. map_clear_blips=0 runs the 0.4.18 one-shot instead.
+    void MapOnEntry(ULONG now)
+    {
+        if (g_mapClearBlips.load() || g_mapReveal.load())
+            g_mapSched.OnEntry((double)now);
+        else
+            g_mapSched.Reset();
+        g_mapWaypoint = "not yet";
+        if (!g_mapClearBlips.load())
+            g_world->ClearSpBlips();
+    }
+
+    // Every script tick (cheap until a sweep is due).
+    void TickMap(ULONG now)
+    {
+        const double t = (double)now;
+        if (g_mapSched.SweepDue(t))
+        {
+            if (g_mapReveal.load())
+                ++(g_world->SetMapFowHidden(true) ? g_mapStats.fowIssued : g_mapStats.fowFailed);
+            if (g_mapClearBlips.load())
+            {
+                const bool wp = g_mapSched.TakeWaypointClear();
+                SweepMapBlips(wp, g_mapSched.TakeCensus());
+            }
+        }
+        if (g_mapSched.LogDue(t))
+            LogMap();
+    }
+
     // True when the entry is finished (or given up); called every script tick.
     bool EnterServer()
     {
@@ -2665,7 +2798,7 @@ namespace {
         g_world->FreezeEntityPosition(ped, true);   // held hidden until the spawn's collision streams in
         g_world->RequestCollisionAt(kSpawn[0], kSpawn[1], kSpawn[2]);
         AmbientClearGuarded(ped, kSpawn[0], kSpawn[1], kSpawn[2], kSpawnClearRadius, "the entry area clear");
-        g_world->ClearSpBlips();
+        MapOnEntry(now);                    // 0.4.20: arms the map sweep (map_clear_blips=0: the 0.4.18 ClearSpBlips one-shot)
         g_world->DisableWanted();
         g_world->DumpLiveScripts("pristine");   // which SP scripts are running at entry (diagnostic)
         g_world->SuppressSPSystems();
@@ -12061,13 +12194,21 @@ namespace {
                 }
                 // Default shop/property/location blips; ours come later. ~1000 natives a call. Those
                 // blips are script-made: with stock scripts off none is ever created (gage.log: "found
-                // 0 blip(s)" at entry), so only the entry's one-shot runs.
-                if (inScript && !g_world->StockScriptsOff())
+                // 0 blip(s)" at entry), so only the entry's one-shot runs. 0.4.20: only with map_clear_blips=0;
+                // otherwise TickMap's sweep (below) hides them whatever the stock-script state.
+                if (inScript && !g_mapClearBlips.load() && !g_world->StockScriptsOff())
                 {
                     WorkSection s(probe, kSecBlips);
                     g_world->ClearSpBlips();
                 }
             }
+        }
+
+        // 0.4.20 map clean-up: the blip sweep + fog reveal every 3 s after the entry, its 10 s line (sync/mapclear.h).
+        if (inScript && g_entry.load() == Entry::Done)
+        {
+            WorkSection s(probe, kSecBlips);
+            TickMap(now);
         }
 
         // One-shot ~8 s after entry: log the live scripts again so we can see which singleplayer

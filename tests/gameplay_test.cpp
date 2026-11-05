@@ -62,6 +62,7 @@ static void Check(const char* name, bool ok, const std::string& got = "")
 #include "r4_t3_tests.h"   // R4 T3 punches: the swing display's progress check, the survey and the ladder under switchable GTA models
 #include "t6_health_tests.h"   // T6 health: the server -> wire -> client apply -> HUD chain on a simulated ped (needs Check above)
 #include "r3_t1_health_tests.h"   // R3 T1 health: the measured GTA ceiling, DIRECT / SCALED, under 5 switchable GTA models
+#include "map_clear_tests.h"   // 0.4.20 map clean-up: blip verdicts, sweep plan, schedule, tally (needs Check above)
 
 static std::string F(const char* fmt, ...)
 {
@@ -3106,6 +3107,7 @@ int main()
     std::printf("-- R4 T3: swing progress check (+100 / +250 / +450 ms), survey, per-swing lines, under switchable GTA models\n");
     r4t3::ClientTests();
     radiooff::RunPure();                            // 0.4.19 radio off (tests/radio_off_tests.h)
+    mapclear::RunPure();                            // 0.4.20 map clean-up (tests/map_clear_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3114,7 +3116,8 @@ int main()
     // + W9 8 (enter warp 1, re-warp limiter 1, press guard 1, passenger engine 1, unseat 2, impact 1, bike class 1; EnterWarpDue's old W6 check stays)
     // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
     // + 0.4.5 melee audit 8 (punch, combo, miss then hit, stale event, window edge, guns, event gate, client/server window)
-    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks + 8;
+    const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks + 8
+                       + mapclear::kChecks;   // + 0.4.20 map clean-up 19
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

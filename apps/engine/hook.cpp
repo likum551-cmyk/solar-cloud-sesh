@@ -669,6 +669,19 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_BLIP_SPRITE,                                  0x8FACE824AEC046E8},
     {native::REMOVE_BLIP,                                      0xFE54B8568B2ABD12},
     {native::DOES_BLIP_EXIST,                                  0xC450B06E5AAA0985},
+    // 0.4.20 map clean-up: peddrive lookup tool, YimMenu b3889 crossmap and YimMenuV2 enhanced AGREE for all 12.
+    {native::GET_BLIP_INFO_ID_DISPLAY,                         0xC4BDFF590B6DE7A5},
+    {native::SET_BLIP_DISPLAY,                                 0xF55F62DA99DB0C2F},
+    {native::GET_MAIN_PLAYER_BLIP_ID,                          0x413A91F497E3428F},
+    {native::GET_NORTH_BLID_INDEX,                             0x8999FC36EFA332BC},
+    {native::GET_WAYPOINT_BLIP_ENUM_ID,                        0x2A3612A4B836469E},
+    {native::GET_NUMBER_OF_ACTIVE_BLIPS,                       0xC802478C8862BDAD},
+    {native::SET_THIS_SCRIPT_CAN_REMOVE_BLIPS_CREATED_BY_ANY_SCRIPT, 0x9F83BF77C7204C05},
+    {native::IS_WAYPOINT_ACTIVE,                               0x02213DC34A224533},
+    {native::SET_WAYPOINT_OFF,                                 0xA4C1E1845880C098},
+    {native::SET_MINIMAP_HIDE_FOW,                             0x84DE06FB962FF36D},
+    {native::GET_MINIMAP_FOW_DISCOVERY_RATIO,                  0x6FF69BB93DBFAF25},
+    {native::GET_MINIMAP_FOW_COORDINATE_IS_REVEALED,           0x9A761B33F5EF75C5},
     // freemode look (ApplyPedOutfit), same YimMenu b3889 source: natives.hpp enum index 4134 / 4135 /
     // 4140 -> crossmap.hpp[index]. Each also equals YimMenuV2 `enhanced` g_Crossmap[Natives.hpp index
     // 4214 / 4215 / 4220] (two separately indexed lists agreeing by native name). Not live-checked
@@ -4415,6 +4428,94 @@ void World::ClearSpBlips() {
     }
 }
 
+// --- 0.4.20 map clean-up: the native side of sync/mapclear.h (the engine decides which blip to hide) ---
+bool World::CollectBlips(int firstSprite, int lastSprite, std::vector<MapBlip>& out) {
+    constexpr size_t kMaxBlips = 2048;   // a cap on one walk, not an expected count
+    constexpr int kPerSpriteGuard = 512; // bounds a cursor that never ends
+    out.clear();
+    // Collect first, act after: GET_FIRST / GET_NEXT_BLIP_INFO_ID(sprite) is a cursor over one sprite's blips.
+    for (int sprite = firstSprite; sprite <= lastSprite && out.size() < kMaxBlips; ++sprite) {
+        uint64_t spriteArg[] = { (uint64_t)(uint32_t)sprite };
+        uint64_t r[4] = {};
+        if (!CallNative(native::GET_FIRST_BLIP_INFO_ID, spriteArg, 1, r)) return false;
+        int32_t blip = (int32_t)(uint32_t)r[0];  // 0 when this sprite has no blip
+        for (int guard = 0; blip && guard < kPerSpriteGuard && out.size() < kMaxBlips; ++guard) {
+            uint64_t blipArg[] = { (uint64_t)(uint32_t)blip };
+            uint64_t exists[4] = {};
+            if (!CallNative(native::DOES_BLIP_EXIST, blipArg, 1, exists)) return false;
+            if (!(uint32_t)exists[0]) break;
+            uint64_t sp[4] = {}, disp[4] = {};
+            const int blipSprite = CallNative(native::GET_BLIP_SPRITE, blipArg, 1, sp) ? (int)(uint32_t)sp[0] : sprite;
+            const int display = CallNative(native::GET_BLIP_INFO_ID_DISPLAY, blipArg, 1, disp) ? (int)(uint32_t)disp[0] : -1;
+            out.push_back({ blip, blipSprite, display });
+            if (!CallNative(native::GET_NEXT_BLIP_INFO_ID, spriteArg, 1, r)) return false;
+            blip = (int32_t)(uint32_t)r[0];
+        }
+    }
+    return true;
+}
+
+int World::HideBlip(int32_t blip) {
+    if (!blip) return -1;
+    uint64_t set[] = { (uint64_t)(uint32_t)blip, 0 };   // SET_BLIP_DISPLAY(blip, 0): "doesn't show up, ever, anywhere"
+    if (!CallNative(native::SET_BLIP_DISPLAY, set, 2, nullptr)) return -1;
+    uint64_t arg[] = { (uint64_t)(uint32_t)blip };
+    uint64_t r[4] = {};
+    return CallNative(native::GET_BLIP_INFO_ID_DISPLAY, arg, 1, r) ? (int)(uint32_t)r[0] : -1;
+}
+
+void World::MapKeepHandles(int32_t& mainPlayer, int32_t& north, int& waypointEnum, bool& waypointEnumOk) {
+    uint64_t r[4] = {};
+    mainPlayer = CallNative(native::GET_MAIN_PLAYER_BLIP_ID, nullptr, 0, r) ? (int32_t)(uint32_t)r[0] : 0;
+    r[0] = 0;
+    north = CallNative(native::GET_NORTH_BLID_INDEX, nullptr, 0, r) ? (int32_t)(uint32_t)r[0] : 0;
+    r[0] = 0;
+    waypointEnumOk = CallNative(native::GET_WAYPOINT_BLIP_ENUM_ID, nullptr, 0, r);
+    waypointEnum = waypointEnumOk ? (int)(uint32_t)r[0] : 0;
+}
+
+int World::ActiveBlipCount() {
+    uint64_t r[4] = {};
+    return CallNative(native::GET_NUMBER_OF_ACTIVE_BLIPS, nullptr, 0, r) ? (int)(uint32_t)r[0] : -1;
+}
+
+bool World::AllowAnyScriptBlips() {
+    uint64_t on[] = { 1 };
+    return CallNative(native::SET_THIS_SCRIPT_CAN_REMOVE_BLIPS_CREATED_BY_ANY_SCRIPT, on, 1, nullptr);
+}
+
+bool World::ClearWaypoint(bool& wasActive, bool& activeAfter) {
+    wasActive = activeAfter = false;
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_WAYPOINT_ACTIVE, nullptr, 0, r)) return false;
+    wasActive = (uint32_t)r[0] != 0;
+    if (!wasActive) return true;
+    if (!CallNative(native::SET_WAYPOINT_OFF, nullptr, 0, nullptr)) return false;
+    r[0] = 0;
+    if (!CallNative(native::IS_WAYPOINT_ACTIVE, nullptr, 0, r)) return false;
+    activeAfter = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetMapFowHidden(bool hide) {
+    uint64_t arg[] = { hide ? 1u : 0u };
+    return CallNative(native::SET_MINIMAP_HIDE_FOW, arg, 1, nullptr);
+}
+
+bool World::MapFowReadback(float& ratio, bool& farRevealed) {
+    ratio = 0.0f;
+    farRevealed = false;
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_MINIMAP_FOW_DISCOVERY_RATIO, nullptr, 0, r)) return false;
+    memcpy(&ratio, &r[0], 4);  // a float in the low 4 bytes
+    // Paleto Bay, the far north of the map: unexplored on a fresh story save.
+    uint64_t at[] = { FloatArg(-150.0f), FloatArg(6350.0f), FloatArg(31.0f) };
+    r[0] = 0;
+    if (!CallNative(native::GET_MINIMAP_FOW_COORDINATE_IS_REVEALED, at, 3, r)) return false;
+    farRevealed = (uint32_t)r[0] != 0;
+    return true;
+}
+
 uint32_t World::GetEntityModel(int32_t handle) {
     if (!handle) return 0;
     uint64_t arg[] = { (uint64_t)(uint32_t)handle };
@@ -6251,6 +6352,18 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_BLIP_SPRITE),
         GAGE_NEW_NATIVE(REMOVE_BLIP),
         GAGE_NEW_NATIVE(DOES_BLIP_EXIST),
+        GAGE_NEW_NATIVE(GET_BLIP_INFO_ID_DISPLAY),
+        GAGE_NEW_NATIVE(SET_BLIP_DISPLAY),
+        GAGE_NEW_NATIVE(GET_MAIN_PLAYER_BLIP_ID),
+        GAGE_NEW_NATIVE(GET_NORTH_BLID_INDEX),
+        GAGE_NEW_NATIVE(GET_WAYPOINT_BLIP_ENUM_ID),
+        GAGE_NEW_NATIVE(GET_NUMBER_OF_ACTIVE_BLIPS),
+        GAGE_NEW_NATIVE(SET_THIS_SCRIPT_CAN_REMOVE_BLIPS_CREATED_BY_ANY_SCRIPT),
+        GAGE_NEW_NATIVE(IS_WAYPOINT_ACTIVE),
+        GAGE_NEW_NATIVE(SET_WAYPOINT_OFF),
+        GAGE_NEW_NATIVE(SET_MINIMAP_HIDE_FOW),
+        GAGE_NEW_NATIVE(GET_MINIMAP_FOW_DISCOVERY_RATIO),
+        GAGE_NEW_NATIVE(GET_MINIMAP_FOW_COORDINATE_IS_REVEALED),
         // remote-player ped driving, sender state readers, appearance read/apply.
         GAGE_NEW_NATIVE(SET_ENTITY_COORDS_NO_OFFSET),
         GAGE_NEW_NATIVE(SET_ENTITY_VELOCITY),
