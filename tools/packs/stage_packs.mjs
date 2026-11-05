@@ -10,6 +10,12 @@
 //   --dry-run  read and report every pack, write nothing
 //   --keep-ng-nested  an OPEN pack whose models sit in an NG nested archive (veh_VOLGA) keeps that archive and its
 //              RPF_FILE line for the game to mount (LIVE-UNVERIFIED in folder mode; default: such a pack fails)
+//   --tex-limit-mib  texture budget (tools/packs/ytd_budget.mjs): a stream\*.ytd whose compressed size is at or above
+//              this loses top mips of its largest textures until it fits (default 15)
+//   --tex-max-dim    ... and so does one with a texture larger than this on a side (default 2048; 0 = no size cap)
+//
+// A loose model file of 0xFFFFFF bytes (16 MiB) or more fails the pack: the game's loose path crashed on one
+// (valkyrietp.ytd, 28 MB); only .ytd files are budgeted, so a .yft that big has to be fixed by hand.
 //
 // Per pack, by the dlc.rpf header's encryption word:
 //   OPEN / NONE  -> a LOOSE folder: setup2.xml + a content.xml that lists only the data metas the game can take loose,
@@ -28,6 +34,7 @@ import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { budgetFile, MiB, TOC_SIZE_MARKER } from "./ytd_budget.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, "..", "..");
@@ -38,8 +45,11 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   if (!m) { console.error(`unknown argument ${a}`); process.exit(2); }
   return [m[1], m[2] ?? true];
 }));
-const known = new Set(["src", "dest", "only", "force", "dry-run", "keep-ng-nested"]);
+const known = new Set(["src", "dest", "only", "force", "dry-run", "keep-ng-nested", "tex-limit-mib", "tex-max-dim"]);
 for (const k of Object.keys(args)) if (!known.has(k)) { console.error(`unknown option --${k}`); process.exit(2); }
+const texLimit = Number(args["tex-limit-mib"] ?? 15) * MiB, texMaxDim = Number(args["tex-max-dim"] ?? 2048);
+if (!(texLimit > 0 && texLimit < TOC_SIZE_MARKER)) { console.error("--tex-limit-mib must be above 0 and below 16"); process.exit(2); }
+if (!(Number.isInteger(texMaxDim) && (texMaxDim === 0 || texMaxDim >= 4))) { console.error("--tex-max-dim must be 0 or an integer >= 4"); process.exit(2); }
 
 const src = path.resolve(String(args.src ?? path.join(repo, "DLC PACKS")));
 const local = process.env.LOCALAPPDATA;
@@ -173,6 +183,23 @@ function stageLoose(name, rpf, staging, report) {
     seen.set(key, path.relative(x, f));
     copyFileSync(f, path.join(stream, base));
   }
+  // Texture budget, then the hard gate: no loose model file may reach the 24-bit size the game's loose path handles.
+  for (const base of [...seen.keys()].map((k) => path.basename(seen.get(k))).sort()) {
+    const file = path.join(stream, base);
+    const isYtd = path.extname(base).toLowerCase() === ".ytd";
+    if (isYtd) {
+      let res;
+      try { res = budgetFile(file, { limit: texLimit, maxDim: texMaxDim || 0xFFFF }); }
+      catch (e) { throw new Error(`texture budget for ${base}: ${e.message}`); }
+      if (res) {
+        const dropped = res.after.textures.reduce((s, t, i) => s + (res.before.textures[i].levels - t.levels), 0);
+        report.textures.push(`${base} ${(res.beforeBytes / 1e6).toFixed(1)} MB -> ${(res.afterBytes / 1e6).toFixed(1)} MB (${res.halved} texture${res.halved === 1 ? "" : "s"} halved, ${dropped} top mip${dropped === 1 ? "" : "s"} dropped)`);
+      }
+    }
+    const size = statSync(file).size;
+    if (size >= TOC_SIZE_MARKER)
+      throw new Error(`${base} is ${size} bytes compressed (16 MiB or more): the game's loose path cannot take it${isYtd ? "" : " (only .ytd files are budgeted)"}`);
+  }
   report.stream = seen.size;
   report.dropped = dropped;
   copyFileSync(rpf, path.join(staging, "dlc.rpf"));
@@ -193,7 +220,7 @@ let failed = 0, staged = 0, skipped = 0;
 for (const name of packs) {
   const rpf = path.join(src, name, "dlc.rpf");
   const target = path.join(dest, name);
-  const report = { models: [], warnings: [], dropped: [], stream: 0, tuned: [], ngNested: [] };
+  const report = { models: [], warnings: [], dropped: [], stream: 0, tuned: [], ngNested: [], textures: [] };
   try {
     if (!/^[\x20-\x7e]+$/.test(name)) throw new Error("the folder name is not plain ASCII (the game takes narrow paths)");
     if (!existsSync(rpf)) throw new Error("no dlc.rpf");
@@ -217,6 +244,7 @@ for (const name of packs) {
     rmSync(target + ".old", { recursive: true, force: true });
     staged++;
     console.log(`+ ${name}: ${encName} -> ${mode === "loose" ? `loose folder, ${report.stream} model file(s) in stream\\${report.ngNested.length ? ` + ${report.ngNested.length} NG nested archive(s)` : ""}, cars: ${report.models.join(", ") || "-"}` : "dlc.rpf as is (the game reads it; its cars are listed in game)"}`);
+    for (const t of report.textures) console.log(`    textures: ${t}`);
     for (const t of report.tuned) console.log(`    tuned: ${t}`);
     for (const d of report.dropped) console.log(`    dropped from content.xml: ${d}`);
     for (const n of report.ngNested) console.log(`    kept NG nested archive (the game reads it): ${n}`);

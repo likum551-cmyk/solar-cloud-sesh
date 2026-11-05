@@ -419,6 +419,35 @@ namespace gage::game {
         constexpr uint64_t GET_ENTITY_ANIM_TOTAL_TIME                  = 0x50BD2730B191E360;
         constexpr uint64_t GET_ANIM_DURATION                           = 0xFEDDF04D62B8D790;
         constexpr uint64_t GET_SCRIPT_TASK_STATUS                      = 0x77F1BEB8863288D5;
+        // 0.4.19 radio off (libs/sync/radio_off.h). Public hashes and signatures from alloc8or natives.json; each 3889 hash is
+        // YimMenu b3889 crossmap.hpp at the natives.hpp index AND agrees with YimMenuV2 `enhanced` Crossmap.hpp by name (and with
+        // YimMenuV2 legacy; lookup tool natlookup.mjs, 2026-11-05):
+        //   SET_USER_RADIO_CONTROL_ENABLED            public 0x19F21E63AE6EAE4E  3889 0x938C85923AD6778A  void (BOOL toggle)
+        //   SET_VEHICLE_RADIO_ENABLED                 public 0x3B988190C0AA6C0B  3889 0x4DC72C4B884A6C59  void (Vehicle, BOOL toggle)
+        //   SET_VEH_RADIO_STATION                     public 0x1B9C0099CB942AC6  3889 0x38911F7BA2D48F10  void (Vehicle, const char* station)
+        //   SET_RADIO_TO_STATION_NAME                 public 0xC69EDA28699D5107  3889 0x166878629B365828  void (const char* station)
+        //   SET_MOBILE_RADIO_ENABLED_DURING_GAMEPLAY  public 0x1098355A16064BB3  3889 0x048A57C4A90E9F0D  void (BOOL toggle)
+        //   SET_AUDIO_FLAG                            public 0xB9EFD5C25018725A  3889 0xCFBD89D2F1F18961  void (const char* flag, BOOL toggle)
+        //   GET_PLAYER_RADIO_STATION_INDEX            public 0xE8AF77C4C06ADC93  3889 0xE1799BB6E4C1CDFB  int (); 255 = off (and on failure)
+        //   IS_VEHICLE_RADIO_ON                       public 0x0BE4BE946463F917  3889 0xC052348A3DF7313F  BOOL (Vehicle)
+        //   IS_HUD_COMPONENT_ACTIVE                   public 0xBC4C9EA5391ECC0D  3889 0x7B035E8A1D320F1B  BOOL (int id); 16 = HUD_RADIO_STATIONS
+        //   IS_DISABLED_CONTROL_PRESSED               public 0xE2587F8CBBD87B1D  3889 0x4465D55576678706  BOOL (int pad, int control)
+        constexpr uint64_t SET_USER_RADIO_CONTROL_ENABLED              = 0x19F21E63AE6EAE4E;
+        constexpr uint64_t SET_VEHICLE_RADIO_ENABLED                   = 0x3B988190C0AA6C0B;
+        constexpr uint64_t SET_VEH_RADIO_STATION                       = 0x1B9C0099CB942AC6;
+        constexpr uint64_t SET_RADIO_TO_STATION_NAME                   = 0xC69EDA28699D5107;
+        constexpr uint64_t SET_MOBILE_RADIO_ENABLED_DURING_GAMEPLAY    = 0x1098355A16064BB3;
+        constexpr uint64_t SET_AUDIO_FLAG                              = 0xB9EFD5C25018725A;
+        constexpr uint64_t GET_PLAYER_RADIO_STATION_INDEX              = 0xE8AF77C4C06ADC93;
+        constexpr uint64_t IS_VEHICLE_RADIO_ON                         = 0x0BE4BE946463F917;
+        constexpr uint64_t IS_HUD_COMPONENT_ACTIVE                     = 0xBC4C9EA5391ECC0D;
+        constexpr uint64_t IS_DISABLED_CONTROL_PRESSED                 = 0xE2587F8CBBD87B1D;
+        // 0.4.19 spawn reveal (GI: "sometimes I spawn with a green hue mid-air"). Lookup tool natlookup.mjs 2026-11-05: YimMenu
+        // b3889 crossmap and YimMenuV2 enhanced agree by name (and legacy):
+        //   CLEAR_TIMECYCLE_MODIFIER       public 0x0F07E7745A236711  3889 0x80F87A4A3B930613  void ()
+        //   GET_TIMECYCLE_MODIFIER_INDEX   public 0xFDF3D97C674AFB66  3889 0x8960847E5FD7B48F  int (); -1 = none
+        constexpr uint64_t CLEAR_TIMECYCLE_MODIFIER                    = 0x0F07E7745A236711;
+        constexpr uint64_t GET_TIMECYCLE_MODIFIER_INDEX                = 0xFDF3D97C674AFB66;
         // 0.4.4 (W11, anchor steering). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
         //   TASK_GO_TO_ENTITY  public 0x6A071245EB0D1882  3889 0xAB3658A740EED98E
         //                      void (Entity entity, Entity target, int duration, float distance, float moveBlendRatio,
@@ -957,6 +986,8 @@ namespace gage::game {
         bool     SetVehicleSiren(int32_t veh, bool on);
         bool     IsVehicleSirenOn(int32_t veh);       // false also when it cannot be called
         bool     StartVehicleHorn(int32_t veh, int durationMs);  // mode 0 (default), not forever
+        // 0.4.18: START_VEHICLE_HORN with a mode hash (alloc8or: the hash of "NORMAL" or "HELDDOWN", or 0), not forever.
+        bool     StartVehicleHorn(int32_t veh, int durationMs, uint32_t modeHash);
         bool     GetVehicleColours(int32_t veh, int& primary, int& secondary);
         bool     SetVehicleColours(int32_t veh, int primary, int secondary);
         bool     SetVehicleDoorsLocked(int32_t veh, int lockState);  // eVehicleLockState: 1 unlocked, 2 locked
@@ -1050,6 +1081,7 @@ namespace gage::game {
         bool     SetPlayerMaxArmour(int value);
         int      EntityExists(int32_t entity);              // DOES_ENTITY_EXIST
         bool     IsHornActive(int32_t veh);                  // false also when uncallable
+        bool     IsHornActive(int32_t veh, bool& active);    // 0.4.18 read-back: false = could not be called (`active` untouched)
         // SET_PLAYER_HEALTH_RECHARGE_MULTIPLIER(PLAYER_ID(), m): 0 stops GTA's own regeneration.
         bool     SetLocalHealthRecharge(float multiplier);
 
@@ -1121,6 +1153,22 @@ namespace gage::game {
         bool     SetVehicleMaxSpeed(int32_t veh, float metresPerSecond);
         float    GetVehicleEstimatedMaxSpeed(int32_t veh);
         // Hyper tune handling (GI 2026-11-04, libs/sync/hypertune.h). True = could be called (IsEntityInAir: `inAir` is only set then).
+        // 0.4.19 radio off (libs/sync/radio_off.h). Setters: true = the native could be called. Getters: false = could not
+        // be called (the out value is then untouched).
+        bool     SetUserRadioControlEnabled(bool on);
+        bool     SetVehicleRadioEnabled(int32_t veh, bool on);
+        bool     SetVehRadioStation(int32_t veh, const char* station);   // "OFF" = radio off
+        bool     SetRadioToStationName(const char* station);
+        bool     SetMobileRadioEnabledDuringGameplay(bool on);
+        bool     SetAudioFlag(const char* flag, bool on);
+        bool     GetPlayerRadioStationIndex(int& index);                 // 255 = off
+        bool     IsVehicleRadioOn(int32_t veh, bool& on);
+        bool     IsHudComponentActive(int id, bool& active);
+        bool     IsDisabledControlPressed(int pad, int control, bool& pressed);
+        // 0.4.19 spawn reveal: the screen state a spawn can be left in (timecycle modifier, animated post-fx).
+        bool     GetTimecycleModifierIndex(int& index);     // -1 = no modifier
+        bool     ClearTimecycleModifier();
+        bool     StopAllPostFx();                           // ANIMPOSTFX_STOP_ALL
         bool     SetVehicleStrong(int32_t veh, bool on);            // true: no crash damage
         bool     SetVehicleHasStrongAxles(int32_t veh, bool on);    // true: axles do not bend
         bool     SetVehicleTyresCanBurst(int32_t veh, bool on);     // false: bulletproof tyres

@@ -21,6 +21,8 @@
 //   5. The real server: A reports a burst tyre -> B's copy has it; C pops a tyre and a window of A's car -> A and B get them,
 //      A applies and reports them, a pop A never shows is dropped, a late joiner gets the state in the full entry, a Hit
 //      with no shot is refused.
+//   6. (R3 T4, tests/r3_t4_tests.h) the vehicle damage state; (0.4.18, tests/vehsignals_tests.h) the horn and headlights / high beam on the
+//      copies: HornSync / LightsKeeper against fake cars, the store, and A's horn / lights through the real server to B's ClientSession.
 #include "netrig.h"
 
 #include "sync/vehicle_body.h"
@@ -982,6 +984,7 @@ static void TestRealServer()
 // ===========================================================================
 
 #include "r3_t4_tests.h"   // R3 T4: vehicle damage state, the sanity layer, the v7 wire (one include, one call below)
+#include "vehsignals_tests.h"   // 0.4.18: the horn and headlights / high beam on the copies (one include, one call below)
 
 int main()
 {
@@ -994,9 +997,10 @@ int main()
     TestRealServer();
     const int r2Checks = g_run;
     RunR3T4Tests();
+    RunVehSignalsTests();
     // A skipped section (an early return) must fail, not pass vacuously: 7 wire + 8 store + 13 visual + 6 steer / brake + 8 real-server
-    // (round 2), then the R3 T4 checks (kR3T4Checks, tests/r3_t4_tests.h).
-    const int expected = 7 + 8 + 13 + 6 + 8 + kR3T4Checks;
+    // (round 2), then the R3 T4 checks (kR3T4Checks, tests/r3_t4_tests.h) and the 0.4.18 signals (kVehSignalsChecks, tests/vehsignals_tests.h).
+    const int expected = 7 + 8 + 13 + 6 + 8 + kR3T4Checks + kVehSignalsChecks;
     (void)r2Checks;
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)

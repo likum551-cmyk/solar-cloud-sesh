@@ -3055,6 +3055,7 @@ static void TestSyncD()
 #include "anim_audit_tests.h"   // 0e: the animation audit's simulations (after Check / F)
 #include "t1_seats_tests.h"   // T1 seats (wire v6): server reservations, puppet replay, local flow, the three-client scenario
 #include "r3_t3_cover_tests.h"   // R3 T3 cover: sender classifier, verified cover window vs the 0d code on a simulated puppet
+#include "radio_off_tests.h"   // 0.4.19 radio off: the rules, the gate, a drive against a game model (old behaviour must fail)
 
 int main()
 {
@@ -3104,6 +3105,7 @@ int main()
     r3t6::ClientTests();
     std::printf("-- R4 T3: swing progress check (+100 / +250 / +450 ms), survey, per-swing lines, under switchable GTA models\n");
     r4t3::ClientTests();
+    radiooff::RunPure();                            // 0.4.19 radio off (tests/radio_off_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3114,9 +3116,9 @@ int main()
     // + 0.4.5 melee audit 8 (punch, combo, miss then hit, stale event, window edge, guns, event gate, client/server window)
     const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks + 8;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
+    if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {
-        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks);
+        std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks);
         return 1;
     }
     return g_failed ? 1 : 0;

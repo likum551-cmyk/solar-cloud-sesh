@@ -26,6 +26,7 @@
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_visual.h"
+#include "sync/vehicle_signals.h"
 #include "sync/vehicle_damage.h"
 #include "sync/pedstate.h"
 #include "sync/cover.h"
@@ -43,6 +44,7 @@
 #include "sync/gtaids.h"
 #include "sync/hypertune.h"
 #include "sync/pausemenu.h"
+#include "sync/radio_off.h"
 #include "common/registry.h"
 
 #include <windows.h>
@@ -509,6 +511,10 @@ namespace {
         uint32_t lastImpactSeq = 0;                  // the newest server VehicleImpact applied / judged for this car
         double divCheckAtMs = 0;                     // a copy whose response we adopted: when to compare it with its controller's stream (0 = none)
         uint32_t proxUpgradesSeen = 0;               // R3 T5: drive stats at the last frame (proximity graces that a real contact upgraded)
+        // ---- 0.4.19 vehicle signals (libs/sync/vehicle_signals.h; a copy somebody else controls, script tick) ----
+        sync::HornSync horn;                         // the controller's horn on this copy: a rise, renewals, the release (veh_horn_sync)
+        sync::LightsKeeper lightsKeep;               // the headlights / high beam kept against the GET_VEHICLE_LIGHTS_STATE read-back (veh_lights_keep)
+        double sigStateMs = -1e9;                    // when the newest state was applied here (a horn without fresh states is let go)
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
@@ -547,6 +553,44 @@ namespace {
     // 400 ms soft-correction grace and the own-physics adoption: rubber-banding every ~1.2 s). veh_ride_lead=0: the car we ride in gets the near-car
     // lead (0.4.15: up to 450 ms of extrapolation ahead of the driver's last report, with the camera inside it). Default on = both fixes. Re-read at Welcome.
     std::atomic<bool> g_rideGate{true}, g_rideLead{true};
+    // 0.4.19 spawn reveal (GI: "sometimes I spawn in with a green hue, mid air", mostly on the first launch after the launcher downloaded
+    // packs). The car packs mount on the game thread from the entry on, and the 0.4.18 reveal (collision loaded, or 4 s) fell in the
+    // middle of it (live 0.4.18: reveal 46.5 s, mounts 45.5-47.8 s). spawn_wait_packs=0: reveal on collision only, as before.
+    // spawn_clear_fx=0: leave the timecycle modifier / animated post-fx as the boot left them. Re-read at Welcome.
+    std::atomic<bool> g_spawnWaitPacks{true}, g_spawnClearFx{true};
+    std::atomic<int>  g_packStatus{0};             // game::content::Status of the last content tick (0 = Idle)
+    ULONG g_revealCheckAt = 0;                     // when the +5 s screen-state line after a reveal is due (0 = none)
+    constexpr ULONG kPackRevealMaxMs  = 30000;     // never hold the loading screen longer than this for the packs
+    constexpr ULONG kPackIdleGraceMs  = 2000;      // Idle this long into the Loading phase = no packs to wait for
+    // 0.4.19 vehicle signals (GI: "make everyone hear the horns from the car, see headlights turn on/off"; libs/sync/vehicle_signals.h). Each one
+    // default on, "0" = the 0.4.17 behaviour, re-read at every Welcome:
+    //   veh_horn_sync=0   a copy's horn is START_VEHICLE_HORN(400 ms, mode 0) for every state that arrives with the horn bit (0.4.17), instead of
+    //                     HornSync (a rise at once, a 300 ms hold renewed every 120 ms, the release, a stale car let go, IS_HORN_ACTIVE read-back)
+    //   veh_horn_held=0   HornSync calls with mode 0 instead of the hash of "HELDDOWN" (alloc8or: "NORMAL" or "HELDDOWN", or 0)
+    //   veh_horn_stop=0   no release call (a 1 ms START_VEHICLE_HORN): the last 300 ms hold runs out by itself
+    //   veh_lights_keep=0 the headlights / high beam of a copy are set on a change only (0.4.17), with no GET_VEHICLE_LIGHTS_STATE read-back and
+    //                     no re-issue of a state the game dropped
+    std::atomic<bool> g_hornSync{true}, g_hornHeld{true}, g_hornStop{true}, g_lightsKeep{true};
+    constexpr uint32_t kHornModeHeldDown = sync::Joaat("HELDDOWN");
+    sync::HornConfig HornConfigNow()
+    {
+        sync::HornConfig c;
+        if (!g_hornStop.load(std::memory_order_relaxed))
+            c.stopMs = 0;
+        return c;
+    }
+    // The 10 s line "engine: vehicle signals (0.4.19)" (ReportVehSignals): this window's counters (script tick).
+    struct SigStats
+    {
+        uint32_t hornStates = 0;                 // copies: states applied with the horn bit (0.4.17 made one START_VEHICLE_HORN of each)
+        uint32_t oldHornCalls = 0;               // veh_horn_sync=0: those calls
+        uint32_t sentUpdates = 0, sentHorn = 0, sentHeadlights = 0, sentHighBeam = 0;   // as controller: VehicleUpdates, and those with each bit
+        uint32_t lightsChanged = 0;              // copies: SET_VEHICLE_LIGHTS issued on a change (ApplyVehicleFields)
+        uint32_t lightsReissueCalls = 0, lightsReissueFail = 0;   // the keeper's SET_VEHICLE_LIGHTS / SET_VEHICLE_FULLBEAM calls (issued, could not be called)
+        sync::HornStats horn;                    // every copy's HornSync counters of this window (drained each tick)
+        sync::LightsStats lights;                // every copy's LightsKeeper counters of this window
+    };
+    SigStats g_sig;
     constexpr double kContactNearM = 10.0;       // origin to origin: a vehicle we control this close is the likely toucher of a copy
     // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
     std::mutex g_linkMtx;
@@ -953,6 +997,176 @@ namespace {
             return 0;
         const int64_t us = ticks / g_qpcFreq * 1000000 + ticks % g_qpcFreq * 1000000 / g_qpcFreq;
         return us > 0xFFFFFFFFll ? 0xFFFFFFFFu : (uint32_t)us;
+    }
+
+    // ---- 0.4.19 radio off (libs/sync/radio_off.h has the rules; GI: no vehicle radio ever, no radio wheel and its slow-mo) ----
+    // no_radio (HKCU\Software\GAGE-MP): unset / 1 = on, 0 = the old behaviour (nothing issued; the read-backs still run, so a
+    // no_radio=0 log shows what the game does by itself). Read at every Welcome; on until the first Welcome.
+    std::atomic<bool> g_noRadio{true};
+    sync::RadioOffGate g_radioGate;
+    struct RadioStats
+    {
+        // issued (what we called; "uncallable" = a setter the build could not call)
+        uint32_t globals = 0, vehApplyNew = 0, vehApplyReadback = 0, vehApplyPeriodic = 0, copiesAtSpawn = 0, copiesReapplied = 0,
+                 holdTicks = 0, uncallable = 0;
+        // read-backs (ticks in or entering a vehicle; every one of them is passive)
+        uint32_t ticksInVeh = 0, vehRadioOn = 0, stationOn = 0, wheelKeyHeld = 0, wheelHudActive = 0, slowFrames = 0, timedFrames = 0,
+                 copiesAudited = 0, copiesRadioOn = 0;
+        int lastStation = -1;           // GET_PLAYER_RADIO_STATION_INDEX at the last seated read (-1 = none / not callable)
+    };
+    RadioStats g_radio;
+    double g_radioReportMs = 0;
+    double g_radioPrevMs = -1;          // the wall clock / game timer of the previous tick in a vehicle (slow-mo ground truth)
+    int g_radioPrevTimer = -1;
+    bool g_radioFirstReport = true;
+
+    void ReadRadioOffSwitch()
+    {
+        g_noRadio.store(reg::Get(L"no_radio") != L"0");
+        GLOGI("engine: radio off (0.4.19): no_radio=%s", g_noRadio.load()
+              ? "on (vehicle radio OFF + disabled on the car we sit in / enter and on every car we create, user radio control and mobile "
+                "radio off, flight music off, controls 81-85 incl. the radio wheel (85, its slow-mo) held disabled in a vehicle)"
+              : "OFF (0 = the game's radio and radio wheel as before; read-backs only)");
+    }
+
+    // The per-vehicle "off": the station first (a disabled radio may ignore it), then the radio itself.
+    bool RadioOffVehicle(int32_t veh)
+    {
+        static const char kOff[] = "OFF";
+        const bool a = g_world->SetVehRadioStation(veh, kOff);
+        const bool b = g_world->SetVehicleRadioEnabled(veh, false);
+        if (!a || !b)
+            ++g_radio.uncallable;
+        return a && b;
+    }
+
+    // Right after CREATE_VEHICLE (a server copy, /car): a remote driver's car plays nothing either.
+    void RadioOffNewVehicle(int32_t veh)
+    {
+        if (!veh || !g_noRadio.load())
+            return;
+        RadioOffVehicle(veh);
+        ++g_radio.copiesAtSpawn;
+    }
+
+    // Every script tick (state may change). lp = the local ped.
+    void TickRadioOff(int32_t lp, double nowMs)
+    {
+        static const char kOff[] = "OFF";
+        static const char kFlightMusic[] = "DisableFlightMusic";
+        const bool on = g_noRadio.load();
+        const int32_t vehIn = lp ? g_world->GetVehiclePedIsIn(lp) : 0;
+        const int32_t vehUsing = lp ? g_world->GetVehiclePedIsUsing(lp) : 0;
+        const int32_t target = sync::RadioTarget(vehIn, vehUsing);
+
+        // Read-backs first: the state this tick, before anything is applied.
+        bool radioOn = false;
+        if (target)
+        {
+            ++g_radio.ticksInVeh;
+            bool vehOn = false;
+            if (g_world->IsVehicleRadioOn(target, vehOn) && vehOn)
+                ++g_radio.vehRadioOn;
+            int station = -1;
+            if (vehIn && g_world->GetPlayerRadioStationIndex(station))
+            {
+                g_radio.lastStation = station;
+                if (station != sync::kRadioStationOff)
+                    ++g_radio.stationOn;
+            }
+            radioOn = sync::RadioReadsOn(vehOn, vehIn != 0, station);
+            bool held = false;
+            if (g_world->IsDisabledControlPressed(0, sync::kControlVehRadioWheel, held) && held)
+                ++g_radio.wheelKeyHeld;
+            bool hud = false;
+            if (g_world->IsHudComponentActive(sync::kHudRadioStations, hud) && hud)
+                ++g_radio.wheelHudActive;
+            const int timer = g_world->GetGameTimer();
+            if (g_radioPrevMs >= 0 && g_radioPrevTimer >= 0 && timer >= 0)
+            {
+                ++g_radio.timedFrames;
+                if (sync::IsSlowFrame((double)(timer - g_radioPrevTimer), nowMs - g_radioPrevMs))
+                    ++g_radio.slowFrames;
+            }
+            g_radioPrevMs = nowMs;
+            g_radioPrevTimer = timer;
+        }
+        else
+        {
+            g_radioPrevMs = -1;
+            g_radioPrevTimer = -1;
+        }
+
+        sync::RadioOffIn in;
+        in.nowMs = nowMs;
+        in.enabled = on;
+        in.vehIn = vehIn;
+        in.vehUsing = vehUsing;
+        in.radioReadsOn = radioOn;
+        const sync::RadioOffOut out = g_radioGate.Tick(in);
+        if (out.applyGlobal)
+        {
+            const bool a = g_world->SetUserRadioControlEnabled(false);
+            const bool b = g_world->SetMobileRadioEnabledDuringGameplay(false);
+            const bool c = g_world->SetAudioFlag(kFlightMusic, true);
+            if (!a || !b || !c)
+                ++g_radio.uncallable;
+            ++g_radio.globals;
+        }
+        if (out.applyVehicle)
+        {
+            RadioOffVehicle(out.applyVehicle);
+            if (vehIn == out.applyVehicle && !g_world->SetRadioToStationName(kOff))   // the player's own station, seated only
+                ++g_radio.uncallable;
+            if (out.why == sync::RadioApplyWhy::NewVehicle) ++g_radio.vehApplyNew;
+            else if (out.why == sync::RadioApplyWhy::ReadBackOn) ++g_radio.vehApplyReadback;
+            else ++g_radio.vehApplyPeriodic;
+        }
+        if (out.holdControls)
+        {
+            for (const int control : sync::kRadioControls)
+            {
+                uint64_t args[] = { 0, (uint64_t)control, 1 };  // DISABLE_CONTROL_ACTION(0, control, true): a per-frame effect
+                g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+            }
+            ++g_radio.holdTicks;
+        }
+
+        if (nowMs - g_radioReportMs < 10000.0)
+            return;
+        g_radioReportMs = nowMs;
+        // The server's copies: does any of them play a radio (a remote driver's car)? Off again if so.
+        for (auto& kv : g_vehs)
+        {
+            const int32_t h = kv.second.handle;
+            bool vehOn = false;
+            if (!h || !g_world->IsVehicleRadioOn(h, vehOn))
+                continue;
+            ++g_radio.copiesAudited;
+            if (!vehOn)
+                continue;
+            ++g_radio.copiesRadioOn;
+            if (on && h != target)
+            {
+                RadioOffVehicle(h);
+                ++g_radio.copiesReapplied;
+            }
+        }
+        const RadioStats& s = g_radio;
+        const bool quiet = !s.ticksInVeh && !s.globals && !s.copiesAtSpawn && !s.copiesRadioOn;
+        if (!quiet || g_radioFirstReport)
+        {
+            g_radioFirstReport = false;
+            GLOGI("engine: radio off (0.4.19), last 10 s: no_radio=%s; issued: globals %u, vehicle off %u (new %u, read-back on %u, periodic %u), "
+                  "copies off at spawn %u, copies off again %u, control-hold ticks %u (5 controls each), uncallable %u; read-back: %u ticks in a "
+                  "vehicle, vehicle radio ON %u, player station not off %u (last index %d, 255 = off), radio-wheel key held %u, radio HUD active %u, "
+                  "slow-mo frames %u of %u (game timer < %.0f%% of the wall clock), copies audited %u / radio ON %u",
+                  on ? "on" : "OFF", s.globals, s.vehApplyNew + s.vehApplyReadback + s.vehApplyPeriodic, s.vehApplyNew, s.vehApplyReadback,
+                  s.vehApplyPeriodic, s.copiesAtSpawn, s.copiesReapplied, s.holdTicks, s.uncallable, s.ticksInVeh, s.vehRadioOn, s.stationOn,
+                  s.lastStation, s.wheelKeyHeld, s.wheelHudActive, s.slowFrames, s.timedFrames, sync::kSlowFrameRatio * 100.0, s.copiesAudited,
+                  s.copiesRadioOn);
+        }
+        g_radio = RadioStats();
     }
     template <typename T> void AtomicMax(std::atomic<T>& a, T v)
     {
@@ -1471,6 +1685,28 @@ namespace {
         g_rideLead.store(reg::Get(L"veh_ride_lead") != L"0");       // 0.4.17: no near-car lead on the car we ride in (0 = 0.4.15)
         GLOGI("engine: passenger ride (0.4.17): veh_ride_gate=%s veh_ride_lead=%s", g_rideGate.load() ? "on" : "OFF (0.4.15)",
               g_rideLead.load() ? "on" : "OFF (0.4.15)");
+        ReadRadioOffSwitch();                                           // 0.4.19: no_radio (0 = the radio and its wheel as before)
+        g_spawnWaitPacks.store(reg::Get(L"spawn_wait_packs") != L"0");  // 0.4.19: the reveal waits for the car packs (0 = collision only)
+        g_spawnClearFx.store(reg::Get(L"spawn_clear_fx") != L"0");      // 0.4.19: clear timecycle modifier + post-fx at the reveal
+        GLOGI("engine: spawn reveal (0.4.19): spawn_wait_packs=%s spawn_clear_fx=%s", g_spawnWaitPacks.load() ? "on" : "OFF (0.4.18)",
+              g_spawnClearFx.load() ? "on" : "OFF (0.4.18)");
+        g_hornSync.store(reg::Get(L"veh_horn_sync") != L"0");       // 0.4.19: a copy's horn follows the state (0 = a 400 ms horn per received state)
+        g_hornHeld.store(reg::Get(L"veh_horn_held") != L"0");       // 0.4.19: mode "HELDDOWN" (0 = mode 0)
+        g_hornStop.store(reg::Get(L"veh_horn_stop") != L"0");       // 0.4.19: the release call (0 = the hold runs out)
+        g_lightsKeep.store(reg::Get(L"veh_lights_keep") != L"0");   // 0.4.19: the lights read-back and re-issue (0 = on change only)
+        {
+            const sync::HornConfig hc = HornConfigNow();
+            GLOGI("engine: vehicle signals (0.4.19): veh_horn_sync=%s, veh_horn_held=%s, veh_horn_stop=%s, veh_lights_keep=%s; indicators: the 3889 "
+                  "script API has no getter (GET_VEHICLE_INDICATOR_LIGHTS is in neither crossmap), so a controller sends them clear and a copy shows "
+                  "them only if something sets the bits; wheel spin: a copy moves by SET_ENTITY_VELOCITY every frame (its wheels roll on the road; no "
+                  "script read-back of a wheel's speed exists); steering: SET_VEHICLE_STEER_BIAS every frame (no read-back of the wheel angle exists)",
+                  g_hornSync.load() ? "on (a rise starts the horn at once, renewed while held)" : "OFF (0.4.17: START_VEHICLE_HORN 400 ms per received state)",
+                  g_hornHeld.load() ? "on (mode HELDDOWN)" : "OFF (mode 0)",
+                  g_hornStop.load() ? "on (a 1 ms call at the release)" : "OFF (the hold runs out)",
+                  g_lightsKeep.load() ? "on (GET_VEHICLE_LIGHTS_STATE read-back on near copies, re-issued on a confirmed difference)" : "OFF (0.4.17: on change only)");
+            GLOGI("engine: vehicle signals (0.4.19): horn hold %d ms renewed every %.0f ms, let go after %.0f ms without a state; mode hash 0x%08x",
+                  hc.holdMs, hc.renewMs, hc.staleMs, g_hornHeld.load() ? (unsigned)kHornModeHeldDown : 0u);
+        }
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
@@ -2560,6 +2796,15 @@ namespace {
         switch (g_life)
         {
         case Life::Alive:
+            if (g_revealCheckAt && now >= g_revealCheckAt && lp)
+            {
+                // 0.4.19: the screen state 5 s after a reveal (GI's green hue mid-air shows here if it comes back).
+                g_revealCheckAt = 0;
+                int tc = -2;
+                g_world->GetTimecycleModifierIndex(tc);
+                GLOGI("engine: 5 s after the reveal: height above ground %.1f m, player switch %s, timecycle modifier %d",
+                      g_world->GetEntityHeightAboveGround(lp), g_world->IsPlayerSwitchInProgress() ? "IN PROGRESS" : "none", tc);
+            }
             if (g_haveRespawnOk)
             {
                 // A RespawnOk while our ped lives (the server had us dead, the local kill did not take):
@@ -2682,15 +2927,37 @@ namespace {
             const ULONG el = now - g_lifePhaseAt;
             const int32_t ped = g_world->LocalPlayer();
             g_world->RequestCollisionAt(g_lifeSpawn[0], g_lifeSpawn[1], g_lifeSpawn[2]);
-            if (g_world->HasCollisionLoadedAround(ped) || el >= kLoadMaxMs)
+            // 0.4.19: the car packs mount on this thread from the entry on; reveal only once they settled (Ready / Failed,
+            // or still Idle after kPackIdleGraceMs = nothing armed), so no mount stall lands inside the reveal.
+            const int ps = g_packStatus.load();
+            const bool packsSettled = !g_spawnWaitPacks.load() || ps == (int)game::content::Status::Ready ||
+                                      ps == (int)game::content::Status::Failed ||
+                                      (ps == (int)game::content::Status::Idle && el >= kPackIdleGraceMs) || el >= kPackRevealMaxMs;
+            const bool collision = g_world->HasCollisionLoadedAround(ped);
+            if (packsSettled && (collision || el >= kLoadMaxMs))
             {
+                int tc = -2;                        // read before any clear: what the boot left (-1 = none)
+                g_world->GetTimecycleModifierIndex(tc);
+                if (g_spawnClearFx.load())
+                {
+                    // Whatever the story-mode boot left on screen (a switch scene's post-fx, a timecycle modifier) goes.
+                    g_world->StopAllPostFx();
+                    g_world->ClearTimecycleModifier();
+                }
+                g_world->RequestCollisionAt(g_lifeSpawn[0], g_lifeSpawn[1], g_lifeSpawn[2]);
                 g_world->ShutdownLoadingScreen();   // dismiss GTA's loading screen (a no-op on respawn)
                 g_world->FreezeEntityPosition(ped, false);
                 g_world->SetPlayerControl(true);    // grant control (a harmless re-assert on respawn)
                 g_world->DoScreenFadeIn(kFadeInMs);
                 g_life = Life::Alive;
-                GLOGI("engine: world reveal complete (%s)",
-                      el >= kLoadMaxMs ? "collision timeout" : "collision loaded");
+                GLOGI("engine: world reveal complete (%s) after %lu ms; packs %s (status %d); height above ground %.1f m, "
+                      "player switch %s, timecycle modifier %d%s",
+                      collision ? "collision loaded" : "collision timeout", (unsigned long)el,
+                      !g_spawnWaitPacks.load() ? "not waited for (spawn_wait_packs=0)"
+                          : (el >= kPackRevealMaxMs && ps == (int)game::content::Status::Pending ? "STILL MOUNTING (30 s cap)" : "settled"),
+                      ps, g_world->GetEntityHeightAboveGround(ped), g_world->IsPlayerSwitchInProgress() ? "IN PROGRESS" : "none", tc,
+                      g_spawnClearFx.load() ? " (post-fx and modifier cleared)" : "");
+                g_revealCheckAt = now ? now + 5000 : 5000;
             }
             break;
         }
@@ -2896,6 +3163,7 @@ namespace {
                     if (g_ownedVehicles.size() >= kMaxOwnedVehicles)
                         g_ownedVehicles.erase(g_ownedVehicles.begin());  // bounded: drop the oldest
                     g_ownedVehicles.push_back(veh);
+                    RadioOffNewVehicle(veh);           // 0.4.19: no radio (before the engine starts it)
                     g_world->PlaceVehicleOnGround(veh);
                     g_world->SetVehicleEngineOn(veh, true);
                     g_world->SetPedIntoVehicle(lp, veh, -1);  // driver seat
@@ -7211,6 +7479,8 @@ namespace {
         v.visReadMs = -1e9;
         v.steerPrevRotMs = -1e9;
         ResetVehicleDamage(v);         // R3 T4: ... nor of the damage state, and every baseline starts over
+        v.horn.Reset();                // 0.4.19: ... nor its horn or lights
+        v.lightsKeep.Reset();
     }
 
     // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
@@ -7637,6 +7907,7 @@ namespace {
         {
             g_world->SetVehicleLights(h, lights);
             v.appliedLights = lights;
+            ++g_sig.lightsChanged;
         }
         if (iControl)
         {
@@ -7658,8 +7929,16 @@ namespace {
             g_world->SetVehicleSiren(h, siren != 0);
             v.appliedSiren = siren;
         }
+        // The horn: 0.4.19 TickVehicleSignals (HornSync) follows the state every frame; veh_horn_sync=0 keeps 0.4.17's call per received state.
         if (st.flags & proto::kVehHorn)
-            g_world->StartVehicleHorn(h, 400);         // renewed by every full state while it sounds
+        {
+            ++g_sig.hornStates;
+            if (!g_hornSync.load(std::memory_order_relaxed))
+            {
+                g_world->StartVehicleHorn(h, 400);     // renewed by every state while it sounds (0.4.17)
+                ++g_sig.oldHornCalls;
+            }
+        }
         if (st.bodyHealth != v.appliedBody)
         {
             g_world->SetVehicleBodyHealth(h, (float)st.bodyHealth);
@@ -7669,6 +7948,54 @@ namespace {
         {
             g_world->SetVehicleEngineHealth(h, (float)st.engineHealth);
             v.appliedEngineHp = st.engineHealth;
+        }
+    }
+
+    // 0.4.19 vehicle signals: the controller's horn and headlights / high beam on a copy somebody else controls, every script tick
+    // (libs/sync/vehicle_signals.h, tested offline in tests/vehsignals_tests.h). The horn follows the newest state's bit (a rise at once, a
+    // hold renewed while it sounds, a release call, a car without fresh states let go) with IS_HORN_ACTIVE as the read-back; the lights
+    // ApplyVehicleFields set on a change are read back on near copies and re-issued when the game dropped them. Switches: veh_horn_sync,
+    // veh_horn_held, veh_horn_stop, veh_lights_keep (see g_hornSync). The 10 s line is "engine: vehicle signals (0.4.19)".
+    struct VehSignalGame
+    {
+        int32_t h;
+        uint32_t hornMode;
+        bool StartHorn(int durationMs) { return g_world->StartVehicleHorn(h, durationMs, hornMode); }
+        bool HornActive(bool& active) { return g_world->IsHornActive(h, active); }
+        bool ReadLights(bool& on, bool& high) { return g_world->GetVehicleLightsState(h, on, high); }
+        bool SetLights(int lightsMode)
+        {
+            const bool ok = g_world->SetVehicleLights(h, lightsMode);
+            ++(ok ? g_sig.lightsReissueCalls : g_sig.lightsReissueFail);
+            return ok;
+        }
+        bool SetFullbeam(bool high)
+        {
+            const bool ok = g_world->SetVehicleFullbeam(h, high);
+            ++(ok ? g_sig.lightsReissueCalls : g_sig.lightsReissueFail);
+            return ok;
+        }
+    };
+    void TickVehicleSignals(NetVeh& v, bool iControl, double nowMs, bool nearUs)
+    {
+        if (iControl || !v.handle || !v.haveState)
+            return;
+        const proto::VehicleState& st = v.st;
+        VehSignalGame g{ v.handle, g_hornHeld.load(std::memory_order_relaxed) ? kHornModeHeldDown : 0u };
+        if (g_hornSync.load(std::memory_order_relaxed))
+        {
+            v.horn.Configure(HornConfigNow());
+            sync::StepHorn(v.horn, g, (st.flags & proto::kVehHorn) != 0, v.sigStateMs, nowMs);
+            g_sig.horn += v.horn.TakeStats();
+        }
+        if (g_lightsKeep.load(std::memory_order_relaxed))
+        {
+            const sync::LightsWant want{ sync::HeadlightsShown((st.flags & proto::kVehLights) != 0, (st.flags2 & proto::kVeh2Headlights) != 0),
+                                         (st.flags2 & proto::kVeh2HighBeam) != 0 };
+            const sync::LightsCmd c = sync::StepLights(v.lightsKeep, g, want, nearUs, nowMs);
+            if (c.setMode)
+                v.appliedLights = c.mode;
+            g_sig.lights += v.lightsKeep.TakeStats();
         }
     }
 
@@ -7723,6 +8050,7 @@ namespace {
             return false;
         }
         g_world->MarkVehicleOwned(h);                  // ours: never cleaned up, no ambient driver made for it
+        RadioOffNewVehicle(h);                         // 0.4.19: a remote driver's car plays no radio either
         g_world->SetEntityQuaternion(h, q.x, q.y, q.z, q.w);
         ForgetVehicleHandle(v);
         v.handle = h;
@@ -8024,11 +8352,14 @@ namespace {
                     v.sentVis = sync::VisualMask();
                     v.steerPrevRotMs = -1e9;
                     ResetVehicleDamage(v);             // R3 T4: new role, new baselines
+                    v.horn.Reset();                    // 0.4.19: the new controller's horn and lights start afresh
+                    v.lightsKeep.Reset();
                 }
                 if (v.appliedVersion != v.stVersion)
                 {
                     ApplyVehicleFields(v, iControl);
                     v.appliedVersion = v.stVersion;
+                    v.sigStateMs = nowMs;              // 0.4.19: a horn is held only while states keep coming
                 }
                 {
                     // T3: tyres / windows. "Near" = the server position within kVisNearM of us (a far copy is only brought to the
@@ -8037,6 +8368,7 @@ namespace {
                     const bool visNear = mine || (haveLp && vdx * vdx + vdy * vdy + vdz * vdz <= kVisNearM * kVisNearM);
                     TickVehicleVisual(v, id, iControl, nowMs, visNear, lp);
                     TickVehicleDamage(v, id, iControl, nowMs, visNear);    // R3 T4
+                    TickVehicleSignals(v, iControl, nowMs, visNear);       // 0.4.19: horn, headlights / high beam
                 }
                 // W9 item 4 (passenger engine sound): the engine flag above is applied only when the server's flag CHANGES, and the
                 // server clears it at 0 fuel, so a car the local ped rides in as a passenger could sit with its engine stopped on
@@ -9505,6 +9837,10 @@ namespace {
                     ++g_dmg.blocksSent;
                 }
                 ++g_vis.sentUpdates;
+                ++g_sig.sentUpdates;                                   // 0.4.18: what our own reads put on the wire (IS_HORN_ACTIVE, GET_VEHICLE_LIGHTS_STATE)
+                if (u.flags & proto::kVehHorn) ++g_sig.sentHorn;
+                if (u.flags2 & proto::kVeh2Headlights) ++g_sig.sentHeadlights;
+                if (u.flags2 & proto::kVeh2HighBeam) ++g_sig.sentHighBeam;
                 if (u.tyres) ++g_vis.sentWithTyres;
                 if (u.windows) ++g_vis.sentWithWindows;
                 if (u.flags2 & proto::kVeh2Brake) ++g_vis.brakeBitsSent;
@@ -10755,6 +11091,31 @@ namespace {
         g_vis.yawRatioN = 0;
     }
 
+    // 0.4.19, every 10 s with the vehicles lines: the horn and the lights of the copies (HornSync / LightsKeeper counters of this window, the
+    // IS_HORN_ACTIVE and GET_VEHICLE_LIGHTS_STATE read-backs) and what our own car put on the wire. "issued" counts calls the game accepted,
+    // "heard" / "match" are read-backs. Script tick.
+    void ReportVehSignals()
+    {
+        const SigStats& s = g_sig;
+        const sync::HornStats& h = s.horn;
+        const sync::LightsStats& l = s.lights;
+        const bool active = s.hornStates || s.sentUpdates || s.lightsChanged || s.lightsReissueCalls || s.lightsReissueFail || h.rises ||
+                            h.probes || h.startsIssued || h.callFails || l.reads || l.readFails;
+        if (join::IsConnected() && active)
+            GLOGI("engine: vehicle signals (0.4.19), last 10 s: horn on copies: %u states with the horn bit; %s: %u rises, %u releases (%u let go without "
+                  "states), START_VEHICLE_HORN issued %u (+%u release calls, %u could not be called, %u back-offs); IS_HORN_ACTIVE read-back (%u asked, "
+                  "%u unreadable): after a rise heard %u / silent %u, while held sounding %u / silent %u, after a release quiet %u / still sounding %u; "
+                  "0.4.17 per-state calls %u; as controller: %u updates sent, %u with the horn, %u with the headlights, %u with the high beam; lights on "
+                  "copies: SET_VEHICLE_LIGHTS on a change %u; %s: read-backs %u (unreadable %u), match %u / differ %u, re-issued %u rounds (%u calls, %u "
+                  "could not be called), restored %u, stuck %u",
+                  s.hornStates, g_hornSync.load() ? "veh_horn_sync on" : "veh_horn_sync OFF", h.rises, h.releases, h.staleReleases, h.startsIssued,
+                  h.stopsIssued, h.callFails, h.suspends, h.probes, h.probeFails, h.riseHeard, h.riseSilent, h.heldHeard, h.heldSilent, h.releaseQuiet,
+                  h.releaseSounding, s.oldHornCalls, s.sentUpdates, s.sentHorn, s.sentHeadlights, s.sentHighBeam, s.lightsChanged,
+                  g_lightsKeep.load() ? "veh_lights_keep on" : "veh_lights_keep OFF", l.reads, l.readFails, l.match, l.mismatch, l.reissued,
+                  s.lightsReissueCalls, s.lightsReissueFail, l.restored, l.stuck);
+        g_sig = SigStats();
+    }
+
     // R3 T4, every 10 s with the vehicles lines: the vehicle damage state, the controller's reads AND the copy's applied state per damaged car, so
     // ONE log shows a divergence (the "ctl" line is what our game reads off a car we control and what we report; the "copy" line is the server's
     // block next to what our game shows on a car somebody else controls), plus the sanity layer's counters and the pedal histogram that answers
@@ -10837,6 +11198,7 @@ namespace {
         lastMs = nowMs;
         ReportVehVisual();                             // T3
         ReportVehDamage();                             // R3 T4
+        ReportVehSignals();                            // 0.4.18
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
         g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;
@@ -11456,10 +11818,13 @@ namespace {
             TickClipTraces(NowMs());                   // 0.4.13: follows the issued clips / ragdolls / exits frame by frame (reads only)
         if (inScript && mayChange)
             TickHyperTune(lp);                         // the hyper cars (libs/sync/hypertune.h): power every frame, top speed once
+        if (inScript && mayChange)
+            TickRadioOff(lp, NowMs());                 // 0.4.19: no vehicle radio, no radio wheel / its slow-mo (libs/sync/radio_off.h)
         if (inScript && mayChange && lp) {
             // Auto-mount the add-on car packs through the game's own DLC loader, if armed (pack_mount=1; default off),
             // and hand the Tab menu's car browser the list whenever it (or the loading state) changes.
             const game::content::Status packs = game::content::Tick(*g_world);
+            g_packStatus.store((int)packs);            // 0.4.19: the spawn reveal waits for the packs to settle
             PushCarList(packs);
         }
         // The session ended (OnEnded marked every peer gone and every server vehicle removed): the entry gate

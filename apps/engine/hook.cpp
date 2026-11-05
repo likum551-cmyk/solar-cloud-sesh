@@ -853,6 +853,20 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_ENTITY_ANIM_TOTAL_TIME,                  0x58C2315AA20FAF06},
     {native::GET_ANIM_DURATION,                           0x6CEF2D1ADD6A5E7F},
     {native::GET_SCRIPT_TASK_STATUS,                      0x9B5C1660CCDF7189},
+    // 0.4.19 radio off: YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced (and legacy) by name; public hashes in hook.h.
+    {native::SET_USER_RADIO_CONTROL_ENABLED,              0x938C85923AD6778A},
+    {native::SET_VEHICLE_RADIO_ENABLED,                   0x4DC72C4B884A6C59},
+    {native::SET_VEH_RADIO_STATION,                       0x38911F7BA2D48F10},
+    {native::SET_RADIO_TO_STATION_NAME,                   0x166878629B365828},
+    {native::SET_MOBILE_RADIO_ENABLED_DURING_GAMEPLAY,    0x048A57C4A90E9F0D},
+    {native::SET_AUDIO_FLAG,                              0xCFBD89D2F1F18961},
+    {native::GET_PLAYER_RADIO_STATION_INDEX,              0xE1799BB6E4C1CDFB},
+    {native::IS_VEHICLE_RADIO_ON,                         0xC052348A3DF7313F},
+    {native::IS_HUD_COMPONENT_ACTIVE,                     0x7B035E8A1D320F1B},
+    {native::IS_DISABLED_CONTROL_PRESSED,                 0x4465D55576678706},
+    // 0.4.19 spawn reveal: lookup tool, YimMenu b3889 and YimMenuV2 enhanced agree by name.
+    {native::CLEAR_TIMECYCLE_MODIFIER,                    0x80F87A4A3B930613},
+    {native::GET_TIMECYCLE_MODIFIER_INDEX,                0x8960847E5FD7B48F},
     // 0.4.4 (W11): lookup tool, public and 3889 agree.
     {native::TASK_GO_TO_ENTITY,                           0xAB3658A740EED98E},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
@@ -5047,6 +5061,13 @@ bool World::StartVehicleHorn(int32_t veh, int durationMs) {
     return CallNative(native::START_VEHICLE_HORN, args, 4, nullptr);
 }
 
+bool World::StartVehicleHorn(int32_t veh, int durationMs, uint32_t modeHash) {
+    if (!veh) return false;
+    // START_VEHICLE_HORN(Vehicle vehicle, int duration, Hash mode, BOOL forever): forever FALSE, so the duration rules.
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)durationMs, (uint64_t)modeHash, 0 };
+    return CallNative(native::START_VEHICLE_HORN, args, 4, nullptr);
+}
+
 bool World::GetVehicleColours(int32_t veh, int& primary, int& secondary) {
     if (!veh) return false;
     uint64_t p = 0, s = 0;  // int* outs: zeroed 8-byte slots, low 4 bytes read
@@ -5455,6 +5476,15 @@ bool World::IsHornActive(int32_t veh) {
     return callPedBool(*this, native::IS_HORN_ACTIVE, veh);
 }
 
+bool World::IsHornActive(int32_t veh, bool& active) {
+    if (!veh) return false;
+    uint64_t arg[] = { (uint64_t)(uint32_t)veh };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_HORN_ACTIVE, arg, 1, r)) return false;
+    active = (uint32_t)r[0] != 0;
+    return true;
+}
+
 bool World::SetLocalHealthRecharge(float multiplier) {
     uint64_t player[4] = {};
     if (!CallNative(native::PLAYER_ID, nullptr, 0, player)) return false;
@@ -5647,6 +5677,86 @@ float World::GetVehicleEstimatedMaxSpeed(int32_t veh) {
     float f = 0.0f;
     memcpy(&f, &r[0], 4);  // native returns a float in the low 4 bytes
     return f;
+}
+
+// 0.4.19 radio off (libs/sync/radio_off.h). Station / flag strings are passed by pointer; callers pass literals.
+bool World::SetUserRadioControlEnabled(bool on) {
+    uint64_t args[] = { on ? 1ull : 0ull };
+    return CallNative(native::SET_USER_RADIO_CONTROL_ENABLED, args, 1, nullptr);
+}
+
+bool World::SetVehicleRadioEnabled(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_RADIO_ENABLED, veh, on);
+}
+
+bool World::SetVehRadioStation(int32_t veh, const char* station) {
+    if (!veh || !station) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)veh, ptrArg(station) };
+    return CallNative(native::SET_VEH_RADIO_STATION, args, 2, nullptr);
+}
+
+bool World::SetRadioToStationName(const char* station) {
+    if (!station) return false;
+    uint64_t args[] = { ptrArg(station) };
+    return CallNative(native::SET_RADIO_TO_STATION_NAME, args, 1, nullptr);
+}
+
+bool World::SetMobileRadioEnabledDuringGameplay(bool on) {
+    uint64_t args[] = { on ? 1ull : 0ull };
+    return CallNative(native::SET_MOBILE_RADIO_ENABLED_DURING_GAMEPLAY, args, 1, nullptr);
+}
+
+bool World::SetAudioFlag(const char* flag, bool on) {
+    if (!flag) return false;
+    uint64_t args[] = { ptrArg(flag), on ? 1ull : 0ull };
+    return CallNative(native::SET_AUDIO_FLAG, args, 2, nullptr);
+}
+
+bool World::GetPlayerRadioStationIndex(int& index) {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_PLAYER_RADIO_STATION_INDEX, nullptr, 0, r)) return false;
+    index = (int)(int32_t)(uint32_t)r[0];
+    return true;
+}
+
+bool World::IsVehicleRadioOn(int32_t veh, bool& on) {
+    if (!veh) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)veh };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_VEHICLE_RADIO_ON, args, 1, r)) return false;
+    on = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::IsHudComponentActive(int id, bool& active) {
+    uint64_t args[] = { (uint64_t)(uint32_t)id };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_HUD_COMPONENT_ACTIVE, args, 1, r)) return false;
+    active = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::IsDisabledControlPressed(int pad, int control, bool& pressed) {
+    uint64_t args[] = { (uint64_t)(uint32_t)pad, (uint64_t)(uint32_t)control };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_DISABLED_CONTROL_PRESSED, args, 2, r)) return false;
+    pressed = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::GetTimecycleModifierIndex(int& index) {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_TIMECYCLE_MODIFIER_INDEX, nullptr, 0, r)) return false;
+    index = (int)(int32_t)(uint32_t)r[0];
+    return true;
+}
+
+bool World::ClearTimecycleModifier() {
+    return CallNative(native::CLEAR_TIMECYCLE_MODIFIER, nullptr, 0, nullptr);
+}
+
+bool World::StopAllPostFx() {
+    return CallNative(native::ANIMPOSTFX_STOP_ALL, nullptr, 0, nullptr);
 }
 
 // Hyper tune handling (the Dubsta, libs/sync/hypertune.h): four (vehicle, BOOL) setters and one BOOL getter.
@@ -6303,6 +6413,18 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_ENTITY_ANIM_TOTAL_TIME),
         GAGE_NEW_NATIVE(GET_ANIM_DURATION),
         GAGE_NEW_NATIVE(GET_SCRIPT_TASK_STATUS),
+        GAGE_NEW_NATIVE(SET_USER_RADIO_CONTROL_ENABLED),
+        GAGE_NEW_NATIVE(SET_VEHICLE_RADIO_ENABLED),
+        GAGE_NEW_NATIVE(SET_VEH_RADIO_STATION),
+        GAGE_NEW_NATIVE(SET_RADIO_TO_STATION_NAME),
+        GAGE_NEW_NATIVE(SET_MOBILE_RADIO_ENABLED_DURING_GAMEPLAY),
+        GAGE_NEW_NATIVE(SET_AUDIO_FLAG),
+        GAGE_NEW_NATIVE(GET_PLAYER_RADIO_STATION_INDEX),
+        GAGE_NEW_NATIVE(IS_VEHICLE_RADIO_ON),
+        GAGE_NEW_NATIVE(IS_HUD_COMPONENT_ACTIVE),
+        GAGE_NEW_NATIVE(IS_DISABLED_CONTROL_PRESSED),
+        GAGE_NEW_NATIVE(CLEAR_TIMECYCLE_MODIFIER),
+        GAGE_NEW_NATIVE(GET_TIMECYCLE_MODIFIER_INDEX),
         GAGE_NEW_NATIVE(GET_VEHICLE_LIGHTS_STATE),
         GAGE_NEW_NATIVE(SET_VEHICLE_FULLBEAM),
         GAGE_NEW_NATIVE(SET_VEHICLE_INTERIORLIGHT),
