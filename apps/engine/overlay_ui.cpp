@@ -722,9 +722,8 @@ void DrawLogo(ImDrawList* dl, float W, float a, UiState& L)
 // Where the margin under the radar is too small for the strip (a safe zone past about
 // 0.95 at 1080p) it tucks up into the radar's bottom edge, at most kStripMaxCover of the radar's height, which is where
 // GTA's bars sit; beyond that the plate returns to the bottom-right, as with the radar off.
-constexpr float kStripFrac = 0.0875f;      // strip height / the game's unscaled radar height (0.4.27: GI asked for 25 % over 0.07; capped by the free margin under the radar)
+constexpr float kElemBandFrac = 0.20f;     // 0.4.28 (GI): the radar element is 80 % map on top, 20 % HP + satiety band at the bottom
 constexpr float kStripMinH = 11.0f;        // and never thinner than this: 11 px holds the 7 px glyph class (2 px above and below) and a 5 px bar
-constexpr float kStripMaxCover = 0.0f;     // 0.4.23: the strip never tucks into the map (GI saw the 0.4.22 tuck overlap it)
 struct Cluster {
     float x = 0, w = 0;                      // left edge and width of the speedometer (and of the vitals plate while it stays here)
     float gut = 0, gap = 0;                  // screen gutter, space between the two plates
@@ -765,27 +764,20 @@ Cluster ClusterLayout(float W, float H)
         const gage::sync::ScreenRect radar =
             gage::sync::RadarKeepOut(W, H, g_radarSafeZone.load(), g_radarSafeZoneOk.load(), 0.0f, g_radarScale.load());
         c.radarX = radar.x0; c.radarY = radar.y0; c.radarW = radar.x1 - radar.x0; c.radarH = radar.y1 - radar.y0;
-        // The strip is kStripFrac of the radar's height (never under kStripMinH px: 720p's 8 px held no 7 px glyph and a 5 px bar), the radar's
-        // width (held to 120..400 px at 1080p). It sits flush under the radar's bottom edge (gap 0), like GTA's own bars.
-        // 0.4.23 (GI, live 2560x1440: the strip tucked 8 px into the map): never cover the map. The strip shrinks to the free
-        // margin under the radar (down to kStripMinH) and rests kStripEdge px above the screen edge; if not even that fits, the
-        // bottom-right plate returns.
         const float edge = std::fmax(2.0f, std::floor(S(2.0f)));
-        const float room = std::floor(H - edge - radar.y1);
-        // 0.4.27: the strip's height follows the game's UNSCALED radar (a smaller map must not shrink the bars; GI asked for them 25 % bigger).
-        const float fullRadarH = c.radarH / std::fmax(0.5f, g_radarScale.load());
-        const float stripH = std::fmax(kStripMinH, std::fmin(std::floor(fullRadarH * kStripFrac), room));
-        const gage::sync::VitalsDock d = gage::sync::DockVitals(W, H, radar, stripH, S(120.0f), S(400.0f), 0.0f, edge,
-                                                                kStripMaxCover);
+        // 0.4.28 (GI): the radar and the vitals are ONE element, the top 80 % map and the bottom 20 % the HP and satiety band, the radar's
+        // own left edge and width. The band covers the bottom kElemBandFrac of the radar rectangle (where GTA's own bars were, plus the map's
+        // bottom edge) instead of hanging under it. DockVitals still decides whether the radar is usable at all (on screen, wide enough).
+        const float stripH = std::fmax(kStripMinH, std::floor(c.radarH * kElemBandFrac));
+        const gage::sync::VitalsDock d = gage::sync::DockVitals(W, H, radar, stripH, S(120.0f), S(400.0f), 0.0f, edge, 1.0f);
         c.dockWhy = (int)d.why;
         if (d.docked) {
             c.docked = true;
-            c.coverPx = d.coverPx;
-            c.vx = std::floor(d.x);
-            c.vw = std::floor(d.w);
-            c.vH = std::floor(d.h);
-            // Slides in from below the screen edge like the cluster plate did (and out again), from the docked top.
-            const float top = std::floor(d.y);
+            c.vx = std::floor(radar.x0);
+            c.vw = std::floor(radar.x1) - c.vx;
+            c.vH = stripH;
+            const float top = std::floor(radar.y1) - stripH;
+            c.coverPx = std::floor(radar.y1) - top;
             c.dockY = top;
             c.vTop = std::floor(top + (1.0f - e) * (H - top));
             c.speedoBottom = std::floor(H - c.gut);        // the speedometer no longer rides on the vitals
@@ -1279,13 +1271,16 @@ void DrawVitalsStrip(ImDrawList* dl, const Cluster& c, float a, UiState& L)
     // Opaque, so no map shows through where the strip tucks into the radar's edge, and the bars read on one flat colour. The bottom-right
     // corner is cut like the speedometer plate's (the family's one diagonal), deep enough to read as a cut (0.55 of the strip's height, 7 px at
     // 1080p); the right half's track is held back from it (padR) so its corner clears the diagonal by 2 px.
-    const float cut = std::floor(sh * 0.55f);
+    // 0.4.28: the band is the bottom 20 % of the radar element (ClusterLayout), ~40 px at 1440p: the glyph fills the middle 56 % of it and
+    // the bar is half the glyph's height, centred on it, so a tall band reads as a frame with two bars in it, not as two slabs.
+    const float cut = 0.0f;   // 0.4.28: no corner cut: inside the radar element a cut shows a triangle of map (capture hud-r5)
     const ImVec2 hull[5] = {{sx, sy}, {sx + sw, sy}, {sx + sw, sy + sh - cut}, {sx + sw - cut, sy + sh}, {sx, sy + sh}};
     dl->AddConvexPolyFilled(hull, 5, Col(kPanel, a));
-    const float pad = sh >= 11.0f ? 2.0f : 1.0f;                    // above and below the glyph
-    const float gs = std::fmax(4.0f, sh - 2.0f * pad);              // the glyph's box = the bar's height + 2 px
-    const float barH = gs - 2.0f;
-    const float gy = sy + pad, by = gy + 1.0f;                      // the one glyph row and the one bar row of both halves
+    dl->AddLine(ImVec2(sx, sy + 0.5f), ImVec2(sx + sw, sy + 0.5f), Col(kGold, 0.55f * a), 1.0f);   // the seam between map and band
+    const float pad = std::fmax(sh >= 11.0f ? 2.0f : 1.0f, std::floor(sh * 0.22f));   // above and below the glyph
+    const float gs = std::fmax(4.0f, sh - 2.0f * pad);
+    const float barH = std::fmax(3.0f, std::floor(gs * 0.5f));
+    const float gy = sy + pad, by = gy + std::floor((gs - barH) * 0.5f);   // the one glyph row and the one bar row of both halves
     const float padX = std::fmax(2.0f, std::floor(S(5.0f)));        // inside the strip's left edge
     const float diagIn = std::fmax(0.0f, (by + barH) - (sy + sh - cut));   // how far the diagonal has moved in at the track's bottom edge
     const float padR = std::fmax(padX, diagIn + 2.0f);              // inside the strip's right edge: clear of the diagonal

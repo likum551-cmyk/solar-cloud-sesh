@@ -37,7 +37,11 @@ namespace gage::sync {
 
     constexpr float kMinimapScaleMin = kRadarScaleMin;   // 0.5
     constexpr float kMinimapScaleMax = kRadarScaleMax;   // 1.0 = the game's own size (untouched)
-    constexpr float kMinimapScaleDefault = 0.50f;        // GI asked for a smaller map: unset means 0.50 (0.4.27: "50 % smaller"; 0.4.25 had 0.80)
+    // 0.4.28: unset = 1.0, the game's own size. The 0.4.25-0.4.27 table writes (0.80, then 0.50) were read back in the table but the drawn
+    // radar never changed on 3889 (GI's live log 2026-11-05: big-radar flip on 1 / off 1 after the write, map still full size), so the
+    // vitals band sized to the scaled radar came out half the map's width. A scale returns as the default once a live run shows a
+    // refresh trigger that makes the drawn radar follow the table; minimap_scale=N still writes it for that test.
+    constexpr float kMinimapScaleDefault = 1.00f;
 
     enum class ScaleSource
     {
