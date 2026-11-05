@@ -55,6 +55,9 @@
 //                 that is not Legacy GTA5.exe (Enhanced is a different binary: none of these signatures apply).
 //   pack_name   = <folder>  mount only that pack (default: all of them).
 //   pack_probe  = "1"  diagnostic: mount under extra:/ and list the visible files instead of running the change set.
+//   pack_ng_tune = "0" an NG pack's gage_tune.json is ignored (default on, 0.4.18): otherwise its HANDLING_FILEs are read
+//                  through the mount, tuned (handling_tune.h) and re-defined by one loose override pack written to
+//                  %LOCALAPPDATA%\GAGE-MP\tune\gage_tune\ and mounted after every other pack.
 //
 // Threading: Tick() and PackOfModel() are game-thread only (the script tick), like dlc::Tick / World::ApplyPedOutfit;
 // Vehicles() is a locked copy for any thread (the overlay's car browser).

@@ -332,7 +332,7 @@ namespace gage::sync {
         { nullptr,    250.0f, 1.0f,  false, MakeStreetAssist(250.0f), "vehicle_nissan350z" },   // Nissan 350Z: 250 km/h (limited)
         { nullptr,    285.0f, 1.0f,  false, MakeStreetAssist(285.0f), "vehicle_supra" },        // Toyota Supra: ~285 km/h
         // 0.4.17 packs (GI added them 2026-11-05): stock power (their pack handling, outliers cut in handling_tune.json), real top speeds
-        // (m3gtr / teslas / w210: the variant is a guess). veh_VOLGA (no models) and veh_valkyrietp (its 152 MB ytd does not extract) are not served yet.
+        // (m3gtr / teslas / w210: the variant is a guess). valkyrietp and volga: 0.4.18.
         { "lp700r",   350.0f, 1.0f,  false, MakeStreetAssist(350.0f) },   // Lamborghini Aventador LP700-4: 350 km/h
         { "m3gtr",    300.0f, 1.0f,  false, MakeStreetAssist(300.0f) },   // BMW M3 GTR (E46): ~300 km/h
         { "mbc63s",   290.0f, 1.0f,  false, MakeStreetAssist(290.0f) },   // Mercedes-AMG C63 S: 290 km/h
@@ -340,6 +340,8 @@ namespace gage::sync {
         { "mbg63",    220.0f, 1.0f,  false, MakeStreetAssist(220.0f) },   // Mercedes-AMG G63: 220 km/h
         { "taycan",   260.0f, 1.0f,  false, MakeStreetAssist(260.0f) },   // Porsche Taycan Turbo S: 260 km/h
         { "teslas",   250.0f, 1.0f,  false, MakeStreetAssist(250.0f) },   // Tesla Model S P100D: 250 km/h
+        { "valkyrietp", 350.0f, 1.0f, false, MakeStreetAssist(350.0f) },  // Aston Martin Valkyrie: ~350 km/h (0.4.18)
+        { "volga",    150.0f, 1.0f,  false, MakeStreetAssist(150.0f) },   // GAZ Volga: ~150 km/h (0.4.18, served once its NG archive mounts)
         { nullptr,    250.0f, 1.0f,  false, MakeStreetAssist(250.0f), "vehicle_w210" },         // Mercedes E-Class W210: 250 km/h (limited)
     };
     inline constexpr size_t kHyperProfileCount = sizeof(kHyperProfiles) / sizeof(kHyperProfiles[0]);

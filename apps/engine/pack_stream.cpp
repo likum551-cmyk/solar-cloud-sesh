@@ -14,6 +14,7 @@
 
 #include <windows.h>
 
+#include "handling_tune.h"
 #include "pack_meta.h"
 
 #include <algorithm>
@@ -552,9 +553,17 @@ struct Pack {
     Paths paths;
     bool folder = false;          // setup2.xml at the root: loose folder (models in stream/); else the dlc.rpf itself
     bool mounted = false;         // the change set ran
+    bool tune = false;            // the NG handling-tune override pack (%LOCALAPPDATA%\GAGE-MP\tune\gage_tune), mounted last
     std::vector<PackModel> models;
 };
 std::vector<Pack> g_packs;
+
+// NG handling tune (0.4.18, handling_tune.h): the CHandlingData items gage_tune.json changed in the NG packs mounted so far.
+int g_ngTuneOn = -1;                      // pack_ng_tune: -1 = not read yet
+bool g_ngTuneSeen = false;                // some NG pack shipped a gage_tune.json
+bool g_tuneQueued = false;                // the override pack was considered (once, after the last pack)
+std::vector<TunedHandlingItem> g_ngTuned;
+std::string g_ngTunePacks;                // "vehicle_regera, vehicle_supra": the packs the items came from
 size_t g_next = 0;                // the next pack to mount
 bool   g_listed = false;          // g_packs filled
 
@@ -991,6 +1000,144 @@ bool RegisterLooseStream(const Paths& paths) {
     return true;
 }
 
+// ---- NG handling tune (0.4.18) ---------------------------------------------------------------------------------
+// An NG pack's handling.meta lives in its encrypted dlc.rpf, so stage_packs cannot tune it; it ships the rules next to
+// the archive as gage_tune.json instead. While the pack is mounted (before its change set runs) its HANDLING_FILEs are
+// read through the game's device, tuned (handling_tune.h) and kept; after the last pack, the tuned items go into one
+// loose override pack that is mounted last. LIVE-UNVERIFIED: that GTA's HANDLING_FILE loader replaces an existing
+// handlingName in place (Rockstar's patchday packs re-define base cars' handling that way). If it appends instead, the
+// cars keep their stock handling and nothing else changes. pack_ng_tune=0 (HKCU\Software\GAGE-MP) switches it off.
+bool NgTuneEnabled() {
+    if (g_ngTuneOn < 0) {
+        const std::wstring v = reg::Get(L"pack_ng_tune");
+        g_ngTuneOn = v == L"0" ? 0 : 1;
+        GLOGI("engine: NG handling tune (0.4.18): pack_ng_tune=%s -> %s", v.empty() ? "unset" : Narrow(v).c_str(),
+              g_ngTuneOn ? "on (an NG pack's gage_tune.json is applied through an override pack)" : "OFF (NG packs keep their own handling)");
+    }
+    return g_ngTuneOn == 1;
+}
+
+void CollectNgTune(const Pack& p, const std::string& mount, std::vector<TunedHandlingItem>& out) {
+    std::wstring folderW = p.paths.file;
+    folderW.resize(folderW.size() - wcslen(L"dlc.rpf"));
+    std::string json;
+    if (!ReadDiskFile(folderW + L"gage_tune.json", json)) return;   // no rules shipped with this pack
+    g_ngTuneSeen = true;
+    if (!NgTuneEnabled()) return;
+    const HandlingTune t = ParseHandlingTune(json);
+    if (!t.ok) {
+        GLOGW("hook: [packstream] pack %s: gage_tune.json not parsed (%s); its handling stays as the pack has it", p.name.c_str(),
+              t.error.c_str());
+        return;
+    }
+    std::string content;
+    if (mount.empty() || !ReadGameFile(mount + "content.xml", content)) {
+        GLOGW("hook: [packstream] pack %s: handling tune: content.xml not readable through the mount (%s)", p.name.c_str(),
+              mount.empty() ? "no mount point" : mount.c_str());
+        return;
+    }
+    const std::vector<std::string> files = MetaFilesOfType(content, "HANDLING_FILE");
+    unsigned tuned = 0, skipped = 0, seen = 0;
+    for (const std::string& m : files) {
+        std::string text;
+        if (!ReadGameFile(m, text)) { GLOGW("hook: [packstream] pack %s: handling tune: %s not readable", p.name.c_str(), m.c_str()); continue; }
+        const HandlingTuneResult r = TuneHandlingMeta(text, t);
+        seen += (unsigned)r.seen;
+        for (const std::string& s : r.skipped) {
+            ++skipped;
+            GLOGW("hook: [packstream] handling tune: %s: SKIPPED %s", p.name.c_str(), s.c_str());
+        }
+        for (const TunedHandlingItem& it : r.items) {
+            ++tuned;
+            GLOGI("hook: [packstream] handling tune: %s: %s", it.name.c_str(), it.changes.c_str());
+            out.push_back(it);
+        }
+    }
+    GLOGI("hook: [packstream] pack %s: handling tune: %u HANDLING_FILE(s), %u item(s), %u tuned, %u skipped", p.name.c_str(),
+          (unsigned)files.size(), seen, tuned, skipped);
+}
+
+// Keep a pack's tuned items once its change set has run (a pack refused before that never loaded the handling the
+// items would redefine). Two packs with one handlingName: the later pack's version wins, as in the game.
+void KeepNgTune(const Pack& p, const std::vector<TunedHandlingItem>& items) {
+    if (items.empty()) return;
+    for (const TunedHandlingItem& it : items) {
+        bool replaced = false;
+        for (TunedHandlingItem& o : g_ngTuned)
+            if (tunedetail::IEq(o.name, it.name)) { o = it; replaced = true; }
+        if (!replaced) g_ngTuned.push_back(it);
+    }
+    g_ngTunePacks += (g_ngTunePacks.empty() ? "" : ", ") + p.name;
+}
+
+bool WriteDiskFile(const std::wstring& path, const void* data, size_t n) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    const bool ok = WriteFile(h, data, (DWORD)n, &put, nullptr) && put == n;
+    return CloseHandle(h) && ok;
+}
+bool WriteDiskText(const std::wstring& path, const std::string& s) { return WriteDiskFile(path, s.data(), s.size()); }
+
+constexpr const wchar_t* kTuneOwnerFile = L"gage_tune.owner";   // marks a folder this code wrote (and may delete)
+constexpr const wchar_t* kTuneFiles[] = { L"setup2.xml", L"content.xml", L"data\\handling.meta", L"dlc.rpf", kTuneOwnerFile };
+
+// Delete a tune folder this code wrote: only its known files, and only when the owner marker is there; a folder with
+// anything else in it survives (RemoveDirectory refuses a non-empty one). True when the folder is gone.
+bool RemoveOwnTuneFolder(const std::wstring& dir) {
+    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+    if (GetFileAttributesW((dir + kTuneOwnerFile).c_str()) == INVALID_FILE_ATTRIBUTES) return false;   // not ours
+    for (const wchar_t* f : kTuneFiles)
+        if (_wcsicmp(f, kTuneOwnerFile) != 0) DeleteFileW((dir + f).c_str());
+    DeleteFileW((dir + kTuneOwnerFile).c_str());
+    RemoveDirectoryW((dir + L"data").c_str());
+    return RemoveDirectoryW(dir.c_str()) != 0;
+}
+
+// Write %LOCALAPPDATA%\GAGE-MP\tune\gage_tune\ (via gage_tune.staging\, then a rename) and describe it as a folder-mode
+// pack. Not under packs\: the launcher's pack sync owns that folder. False (logged) when anything cannot be written.
+bool BuildTunePack(Pack& out) {
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+    if (!local || !*local) { GLOGW("hook: [packstream] handling tune: LOCALAPPDATA is not set"); return false; }
+    const std::wstring root = std::wstring(local) + L"\\GAGE-MP\\tune\\";
+    const std::wstring dir = root + L"gage_tune\\", staging = root + L"gage_tune.staging\\";
+    for (wchar_t c : dir)
+        if (c > 0x7E || c < 0x20) { GLOGW("hook: [packstream] handling tune: %s is not a plain ASCII path", Narrow(dir).c_str()); return false; }
+    CreateDirectoryW(root.c_str(), nullptr);
+    if (!RemoveOwnTuneFolder(staging)) { GLOGW("hook: [packstream] handling tune: %s holds files this code did not write; left alone", Narrow(staging).c_str()); return false; }
+    if (!CreateDirectoryW(staging.c_str(), nullptr) || !CreateDirectoryW((staging + L"data").c_str(), nullptr)) {
+        GLOGW("hook: [packstream] handling tune: cannot create %s (error %lu)", Narrow(staging).c_str(), (unsigned long)GetLastError());
+        return false;
+    }
+    // AddDlcPack's gate file (folder mode never opens it): a well-formed empty RPF7, one empty root directory, OPEN like
+    // the gates of the loose packs stage_packs writes.
+    uint8_t gate[512] = {};
+    const uint32_t words[] = { 0x52504637u /* RPF7 */, 1u /* entries */, 16u /* names */, 0x4E45504Fu /* OPEN */,
+                               0u /* root: name offset */, 0x7FFFFF00u /* directory */, 1u /* first child */, 0u /* children */ };
+    memcpy(gate, words, sizeof(words));
+    const bool wrote = WriteDiskText(staging + kTuneOwnerFile, "written by gage_mp.dll (pack_stream.cpp NG handling tune); deleted and rewritten every launch\n") &&
+                       WriteDiskText(staging + L"setup2.xml", BuildTuneSetup2()) &&
+                       WriteDiskText(staging + L"content.xml", BuildTuneContent()) &&
+                       WriteDiskText(staging + L"data\\handling.meta", BuildTuneMeta(g_ngTuned)) &&
+                       WriteDiskFile(staging + L"dlc.rpf", gate, sizeof(gate));
+    if (!wrote) { GLOGW("hook: [packstream] handling tune: writing %s failed (error %lu)", Narrow(staging).c_str(), (unsigned long)GetLastError()); return false; }
+    if (!RemoveOwnTuneFolder(dir)) { GLOGW("hook: [packstream] handling tune: %s holds files this code did not write; left alone", Narrow(dir).c_str()); return false; }
+    std::wstring from = staging, to = dir;
+    from.pop_back(); to.pop_back();   // MoveFileEx takes the folder names without the trailing separator
+    if (!MoveFileExW(from.c_str(), to.c_str(), 0)) {
+        GLOGW("hook: [packstream] handling tune: rename %s -> %s failed (error %lu)", Narrow(from).c_str(), Narrow(to).c_str(),
+              (unsigned long)GetLastError());
+        return false;
+    }
+    out = Pack();
+    out.name = "gage_tune";
+    out.paths.file = dir + L"dlc.rpf";
+    for (wchar_t c : dir) out.paths.device.push_back(c == L'\\' ? '/' : (char)c);
+    out.folder = true;
+    out.tune = true;
+    return true;
+}
+
 // Run the whole chain once for one pack. Game thread. Logs (Fail) and returns false on any refusal; true when the
 // pack's change set ran (its models are then polled in the cdimage by Tick).
 bool MountSequence(World& world, Pack& p) {
@@ -1109,6 +1256,8 @@ bool MountSequence(World& world, Pack& p) {
     const std::string mount = folderMode ? std::string() : EntryMountPoint(e);
     if (!folderMode) GLOGI("hook: [packstream] pack %s: mounted at \"%s\"", p.name.c_str(), mount.empty() ? "<unknown>" : mount.c_str());
     ReadPackModels(p, mount);
+    std::vector<TunedHandlingItem> ngTuned;      // its handling, read while mounted; applied by the override pack at the end
+    if (!folderMode) CollectNgTune(p, mount, ngTuned);
 
     // The change set takes one DLC vehicle slot per new car and the game never checks the array's end (see
     // kVehStoreSig): refuse a pack that does not fit rather than let it write past the array (0.4.15's crash).
@@ -1134,6 +1283,7 @@ bool MountSequence(World& world, Pack& p) {
     reinterpret_cast<RunPackGroupFn>(g_addr[kRunPackGroup])(mgr, packHash, kGroupEarlyOn);
     reinterpret_cast<RunPackGroupFn>(g_addr[kRunPackGroup])(mgr, packHash, kGroupStartup);
     GLOGI("hook: [packstream] pack %s: ran EARLY_ON + STARTUP change-set groups (0x%08x)", p.name.c_str(), (unsigned)packHash);
+    KeepNgTune(p, ngTuned);
     return true;
 }
 
@@ -1273,6 +1423,10 @@ Status Tick(World& world) {
     if (g_next < g_packs.size()) {
         Pack& p = g_packs[g_next++];
         p.mounted = MountSequence(world, p);
+        if (p.tune)
+            GLOGI("engine: NG handling tune (0.4.18): %u item(s) from %s, override pack %s (live-unverified: the game's "
+                  "HANDLING_FILE loader is expected to replace a handlingName in place)", (unsigned)g_ngTuned.size(),
+                  g_ngTunePacks.c_str(), p.mounted ? "mounted" : "failed");
         for (PackModel& m : p.models) m.hash = world.HashKey(m.v.model.c_str());
         g_mountAt = GetTickCount64();
         g_pollAt = 0;
@@ -1280,13 +1434,32 @@ Status Tick(World& world) {
         return g_status;
     }
 
+    // After the last pack: the NG packs' tuned handling, as one override pack mounted after all of them (next tick).
+    if (!g_tuneQueued) {
+        g_tuneQueued = true;
+        if (!g_ngTuned.empty()) {
+            Pack tp;
+            if (BuildTunePack(tp)) {
+                g_curPack = tp.name;
+                g_packs.push_back(std::move(tp));
+                return g_status;
+            }
+            GLOGW("engine: NG handling tune (0.4.18): %u item(s) from %s, override pack failed (it could not be written)",
+                  (unsigned)g_ngTuned.size(), g_ngTunePacks.c_str());
+        } else if (g_ngTuneSeen && g_ngTuneOn == 1) {
+            GLOGI("engine: NG handling tune (0.4.18): 0 item(s): no rule changed a mounted NG pack's handling; no override pack");
+        }
+    }
+
     // Every pack ran: poll the cars into the cdimage (2 passes a second), until all are in or the wait runs out.
     const ULONGLONG now = GetTickCount64();
     if (now < g_pollAt) return g_status;
     g_pollAt = now + 500;
-    size_t total = 0, in = 0, mounted = 0;
+    size_t total = 0, in = 0, mounted = 0, packs = 0;
     bool changed = false;
     for (Pack& p : g_packs) {
+        if (p.tune) continue;   // the handling override is not a content pack (logged on its own line)
+        ++packs;
         if (!p.mounted) continue;
         ++mounted;
         for (PackModel& m : p.models) {
@@ -1305,7 +1478,7 @@ Status Tick(World& world) {
                           (unsigned long long)(now - g_mountAt));
         g_status = mounted ? Status::Ready : Status::Failed;
         GLOGI("hook: [packstream] %s: %u of %u pack(s) mounted, %u of %u car(s) in the cdimage", mounted ? "READY" : "FAILED",
-              (unsigned)mounted, (unsigned)g_packs.size(), (unsigned)in, (unsigned)total);
+              (unsigned)mounted, (unsigned)packs, (unsigned)in, (unsigned)total);
     }
     return g_status;
 }

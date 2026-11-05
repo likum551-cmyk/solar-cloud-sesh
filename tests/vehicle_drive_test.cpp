@@ -1048,7 +1048,7 @@ static void TestHyperProfiles() {
     // both), names are lower case and unique per kind, the target sits under the server cap, and every assist set keeps
     // one frame's grip + brake under the impact tracker's 1.5 m/s.
     size_t looked = 0, packRows = 0;
-    bool tableOk = kHyperProfileCount == 16;
+    bool tableOk = kHyperProfileCount == 18;
     const auto lower = [](const char* s) { for (; s && *s; ++s) if (*s >= 'A' && *s <= 'Z') return false; return true; };
     const auto same = [](const char* a, const char* b) { return a && b && std::strcmp(a, b) == 0; };
     for (size_t i = 0; i < kHyperProfileCount; ++i) {
@@ -1086,7 +1086,7 @@ static void TestHyperProfiles() {
         const HyperAssistOut ro = HyperAssistStep(HyperProfileFor("rs6")->assist, fast);
         Check("hyper profile: the road cars run at power 1.0 with no downforce (a level car at 80 m/s gets none) and the firmer grip set; "
               "the Regera is at 1.6",
-              roadOk && roadRows == 13 && regera && regera->power == 1.6f && ro.downMs2 == 0.0f,
+              roadOk && roadRows == 15 && regera && regera->power == 1.6f && ro.downMs2 == 0.0f,
               F("%d road rows, rs6 down %.2f", roadRows, (double)ro.downMs2));
     }
     Check("hyper profile: the Dubsta stand-in has the Jesko's acceleration (power), top speed (600 km/h, inside 400..612), toughness and assists",

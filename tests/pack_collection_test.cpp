@@ -6,6 +6,7 @@
 // format drifts, these fail. No game, no GPU, pure host code.
 #include "../apps/engine/pack_collection.h"
 #include "../apps/engine/pack_meta.h"
+#include "../apps/engine/handling_tune.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -446,10 +447,101 @@ static void TestCarBrowserText() {
     CHECK(!MatchesAllTerms("jesko", hay) && !MatchesAllTerms("lambox", hay), "a missing term fails");
 }
 
+// The runtime handling tune for NG packs (handling_tune.h): the same rules file stage_packs.mjs applies to loose packs.
+static void TestHandlingTune() {
+    const int before = g_pass + g_fail;
+    const std::string json = R"({
+      "_comment": ["ignored", "array"],
+      "*": { "scale": { "fTractionCurveMax": 1.15, "fTractionCurveMin": 1.15 } },
+      "REGERA": { "_why": "named set after the * scale", "set": { "fTractionCurveMin": 3.5, "fSuspensionRaise": 0.03 },
+                  "scale": { "fInitialDriveForce": 0.5 } },
+      "broken": { "scale": { "fMissingField": 2 } },
+      "dupe":   { "set": { "fMass": 1000 } }
+    })";
+    const HandlingTune t = ParseHandlingTune(json);
+    CHECK(t.ok && t.haveStar && t.named.size() == 3, "rules parse: ok %d star %d named %u err '%s'", (int)t.ok, (int)t.haveStar,
+          (unsigned)t.named.size(), t.error.c_str());
+    CHECK(!ParseHandlingTune("{ \"*\": { \"scale\": { \"fX\": } } }").ok && !ParseHandlingTune("{} trailing").ok &&
+          ParseHandlingTune("{}").ok, "malformed rules are refused, an empty object is fine");
+
+    const std::string sub =
+        "<SubHandlingData>\n        <Item type=\"CCarHandlingData\">\n          <fTractionCurveMax value=\"9.000000\" />\n"
+        "          <fBackEndPopUpCarImpulseMult value=\"0.100000\" />\n        </Item>\n        <Item type=\"NULL\" />\n"
+        "        <Item type=\"NULL\" />\n      </SubHandlingData>";
+    auto item = [&sub](const char* name, const char* extra) {
+        return std::string("<Item type=\"CHandlingData\">\n      <handlingName>") + name + "</handlingName>\n"
+               "      <fMass value=\"1800.000000\" />\n      <fInitialDriveForce value=\"0.300000\" />\n"
+               "      <fTractionCurveMax value=\"2.950000\" />\n      <fTractionCurveMaxRatio value=\"1.000000\" />\n"
+               "      <fTractionCurveMin value=\"3.050000\" />\n      <fSuspensionRaise value=\"-0.005000\" />\n" + extra +
+               "      " + sub + "\n    </Item>";
+    };
+    const std::string xml = "<?xml version=\"1.0\"?>\n<CHandlingDataMgr>\n  <HandlingData>\n    " + item("regera", "") +
+                            "\n    " + item("broken", "") + "\n    " + item("dupe", "      <fMass value=\"1.0\" />\n") +
+                            "\n  </HandlingData>\n</CHandlingDataMgr>\n";
+    const HandlingTuneResult r = TuneHandlingMeta(xml, t);
+    CHECK(r.seen == 3, "three CHandlingData items seen (nested SubHandlingData items do not end an item early): %d", r.seen);
+    CHECK(r.items.size() == 1 && r.items[0].name == "regera", "only the tunable item is emitted: %u", (unsigned)r.items.size());
+    CHECK(r.skipped.size() == 2, "the missing-field and duplicate-field items are skipped: %u", (unsigned)r.skipped.size());
+    if (r.skipped.size() == 2) {
+        CHECK(r.skipped[0].find("broken: fMissingField not found") == 0, "missing field reason: %s", r.skipped[0].c_str());
+        CHECK(r.skipped[1].find("dupe: fMass found 2 times") == 0, "duplicate field reason: %s", r.skipped[1].c_str());
+    }
+    if (!r.items.empty()) {
+        const std::string& o = r.items[0].text;
+        // * scales max 2.95 -> 3.3925; min 3.05 -> 3.5075, then REGERA's set (case-insensitive name) makes it 3.5.
+        CHECK(o.find("<fTractionCurveMax value=\"3.3925\" />") != std::string::npos, "* scale on max");
+        CHECK(o.find("<fTractionCurveMin value=\"3.5\" />") != std::string::npos, "named set overrides the * scale");
+        CHECK(o.find("<fInitialDriveForce value=\"0.15\" />") != std::string::npos, "named scale");
+        CHECK(o.find("<fSuspensionRaise value=\"0.03\" />") != std::string::npos, "named set of a negative value");
+        CHECK(o.find("<fTractionCurveMaxRatio value=\"1.000000\" />") != std::string::npos, "a longer field name is not a hit");
+        CHECK(o.find(sub) != std::string::npos, "SubHandlingData kept verbatim (its fTractionCurveMax untouched)");
+        CHECK(o.find("<fMass value=\"1800.000000\" />") != std::string::npos, "unlisted fields keep their text");
+        CHECK(r.items[0].changes == "fTractionCurveMax 2.950000->3.3925, fTractionCurveMin 3.050000->3.5075, "
+                                    "fInitialDriveForce 0.300000->0.15, fTractionCurveMin 3.5075->3.5, fSuspensionRaise -0.005000->0.03",
+              "change log: %s", r.items[0].changes.c_str());
+    }
+    // The broken item is left out entirely, not half-applied (no * scale written into the output for it).
+    {
+        bool half = false;
+        for (const TunedHandlingItem& it : r.items) half |= it.name == "broken";
+        CHECK(!half, "a skipped item is never emitted");
+    }
+    // No "*" and no matching name: nothing emitted, nothing skipped.
+    {
+        const HandlingTune t2 = ParseHandlingTune(R"({ "other": { "scale": { "fMass": 2 } } })");
+        const HandlingTuneResult r2 = TuneHandlingMeta(xml, t2);
+        CHECK(t2.ok && r2.seen == 3 && r2.items.empty() && r2.skipped.empty(), "no matching rule: items %u skipped %u",
+              (unsigned)r2.items.size(), (unsigned)r2.skipped.size());
+    }
+    // Number formatting: 6 decimals, shortest form, no "-0".
+    {
+        using tunedetail::FormatValue;
+        CHECK(FormatValue(4.6000000001) == "4.6" && FormatValue(300.0) == "300" && FormatValue(-0.0000001) == "0" &&
+              FormatValue(-0.005) == "-0.005" && FormatValue(2.95 * 1.15) == "3.3925" && FormatValue(0.5505 * 0.67) == "0.368835",
+              "format: %s %s %s %s %s %s", FormatValue(4.6000000001).c_str(), FormatValue(300.0).c_str(), FormatValue(-0.0000001).c_str(),
+              FormatValue(-0.005).c_str(), FormatValue(2.95 * 1.15).c_str(), FormatValue(0.5505 * 0.67).c_str());
+    }
+    // The override pack's files name one HANDLING_FILE that the change set enables, under the setup2 device.
+    {
+        const std::string c = BuildTuneContent(), s = BuildTuneSetup2(), m = BuildTuneMeta(r.items);
+        const auto hf = MetaFilesOfType(c, "HANDLING_FILE");
+        CHECK(hf.size() == 1 && hf[0] == "dlc_gagetune:/data/handling.meta" && PathInPack(hf[0]) == "data/handling.meta",
+              "content.xml lists the one handling file");
+        CHECK(c.find("<Item>dlc_gagetune:/data/handling.meta</Item>") != std::string::npos &&
+              c.find("<changeSetName>gagetune_AUTOGEN</changeSetName>") != std::string::npos &&
+              s.find("<Item>gagetune_AUTOGEN</Item>") != std::string::npos && s.find("<deviceName>dlc_gagetune</deviceName>") != std::string::npos,
+              "setup2.xml's change set is the one content.xml defines");
+        CHECK(TuneHandlingMeta(m, ParseHandlingTune("{}")).seen == 1, "the override meta holds the tuned item");
+    }
+    const int ran = g_pass + g_fail - before;
+    CHECK(ran == 21, "handling tune: %d checks ran before this one (want 21)", ran);
+}
+
 int main() {
     TestGoldenVectors();
     TestPackMeta();
     TestCarBrowserText();
+    TestHandlingTune();
     TestRoundTrip();
     TestRsc7Parse();
     TestBuildImage();

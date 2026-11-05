@@ -1,12 +1,15 @@
 // stage_packs.mjs - lay the operator's car packs out the way the engine mounts them (apps/engine/pack_stream.cpp).
 //
 //   node tools/packs/stage_packs.mjs [--src=<DLC PACKS dir>] [--dest=<packs dir>] [--only=<pack>] [--force] [--dry-run]
+//                                    [--keep-ng-nested]
 //
 //   --src      folder of packs, one sub-folder each holding a dlc.rpf (default: <repo>/DLC PACKS)
 //   --dest     where the engine looks (default: %LOCALAPPDATA%\GAGE-MP\packs)
 //   --only     stage just this pack folder
 //   --force    restage a pack that is already staged (default: an existing one is left alone and reported)
 //   --dry-run  read and report every pack, write nothing
+//   --keep-ng-nested  an OPEN pack whose models sit in an NG nested archive (veh_VOLGA) keeps that archive and its
+//              RPF_FILE line for the game to mount (LIVE-UNVERIFIED in folder mode; default: such a pack fails)
 //
 // Per pack, by the dlc.rpf header's encryption word:
 //   OPEN / NONE  -> a LOOSE folder: setup2.xml + a content.xml that lists only the data metas the game can take loose,
@@ -14,7 +17,8 @@
 //                   flat in stream\, and the dlc.rpf itself (AddDlcPack's gate file; it is never opened). The game
 //                   refuses a nested OPEN archive, so nested .rpf entries leave content.xml.
 //   NG / AES     -> the dlc.rpf as it is: the game reads those archives itself (nothing here can, by design: this tool
-//                   never holds a key).
+//                   never holds a key). Each gets gage_tune.json (a copy of handling_tune.json): the engine applies it
+//                   to the pack's handling.meta at mount, read through the game's own device.
 // Staging goes to <dest>\<pack>.staging and is swapped in only when complete. Exit 1 if any pack failed.
 //
 // Reading the archives reuses content/dlc/gage_apparel/tools/pack_dlc_rpf.mjs --extract (it only reads the TOC). No
@@ -34,14 +38,14 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   if (!m) { console.error(`unknown argument ${a}`); process.exit(2); }
   return [m[1], m[2] ?? true];
 }));
-const known = new Set(["src", "dest", "only", "force", "dry-run"]);
+const known = new Set(["src", "dest", "only", "force", "dry-run", "keep-ng-nested"]);
 for (const k of Object.keys(args)) if (!known.has(k)) { console.error(`unknown option --${k}`); process.exit(2); }
 
 const src = path.resolve(String(args.src ?? path.join(repo, "DLC PACKS")));
 const local = process.env.LOCALAPPDATA;
 if (!args.dest && !local) { console.error("LOCALAPPDATA is not set; pass --dest"); process.exit(2); }
 const dest = path.resolve(String(args.dest ?? path.join(local, "GAGE-MP", "packs")));
-const dry = !!args["dry-run"], force = !!args.force;
+const dry = !!args["dry-run"], force = !!args.force, keepNgNested = !!args["keep-ng-nested"];
 
 const ENC_NONE = 0, ENC_OPEN = 0x4e45504f, ENC_AES = 0x0ffffff9, ENC_NG = 0x0fefffff, RPF7 = 0x52504637, RSC7 = 0x37435352;
 // The data-file types the game takes from a loose folder mid-session (the Jesko run, 2026-11-05: handling, vehicles,
@@ -125,6 +129,8 @@ function stageLoose(name, rpf, staging, report) {
   const x = path.join(staging, ".extract");
   const r = spawnSync(process.execPath, [packTool, `--extract=${rpf}`, `--out=${x}`], { encoding: "utf8" });
   if (r.status !== 0) throw new Error(`extract failed (exit ${r.status}): ${(r.stderr || r.stdout || "").trim().split("\n").slice(-2).join(" | ")}`);
+  // A TOC problem means a file came out wrong or not at all (valkyrietp.ytd before the 16 MiB fix): never stage that.
+  if (/TOC problem/.test(r.stderr || "")) throw new Error(`extract reported problems: ${r.stderr.trim().split(/\r?\n/).slice(0, 3).join(" | ")}`);
   for (const f of ["setup2.xml", "content.xml"])
     if (!existsSync(path.join(x, f))) throw new Error(`${f} is missing at the archive root`);
   const content = readFileSync(path.join(x, "content.xml"), "utf8");
@@ -134,6 +140,17 @@ function stageLoose(name, rpf, staging, report) {
     const fname = field(it, "filename"), type = field(it, "fileType").toUpperCase();
     const rel = inPack(fname);
     const file = path.join(x, ...rel.split("/"));
+    if (type === "RPF_FILE" && keepNgNested && existsSync(file) && statSync(file).isFile() && header(file)?.enc === ENC_NG) {
+      // --keep-ng-nested: an NG archive inside an OPEN pack (veh_VOLGA's x64/vehicles.rpf holds its models). Nothing here
+      // can read it, so it stays a blob and content.xml keeps it: the game mounts it with its own NG keys (name + length
+      // pick the key, both unchanged). LIVE-UNVERIFIED in folder mode (an OPEN nested RPF_FILE crashed the game there).
+      kept.add(fname.trim().toLowerCase());
+      const to = path.join(staging, ...rel.split("/"));
+      mkdirSync(path.dirname(to), { recursive: true });
+      copyFileSync(file, to);
+      report.ngNested.push(rel);
+      continue;
+    }
     if (!KEEP_TYPES.has(type)) { dropped.push(`${rel} (${type})`); continue; }
     if (!existsSync(file) || !statSync(file).isFile()) { dropped.push(`${rel} (${type}, not in the archive)`); continue; }
     kept.add(fname.trim().toLowerCase());
@@ -159,9 +176,11 @@ function stageLoose(name, rpf, staging, report) {
   report.stream = seen.size;
   report.dropped = dropped;
   copyFileSync(rpf, path.join(staging, "dlc.rpf"));
+  const ngBlobs = walk(x).filter((f) => f.toLowerCase().endsWith(".rpf") && header(f)?.enc === ENC_NG).length;
   rmSync(x, { recursive: true, force: true });
   if (!report.models.length) report.warnings.push("no <modelName> in any kept vehicles.meta");
-  if (!seen.size) report.warnings.push("no model resources found");
+  if (!seen.size && !report.ngNested.length)
+    throw new Error("no model resources found" + (ngBlobs ? ` (${ngBlobs} NG nested archive(s) hold them; --keep-ng-nested keeps them for the game to read)` : ""));
 }
 
 if (!existsSync(src)) { console.error(`no source folder ${src}`); process.exit(1); }
@@ -174,7 +193,7 @@ let failed = 0, staged = 0, skipped = 0;
 for (const name of packs) {
   const rpf = path.join(src, name, "dlc.rpf");
   const target = path.join(dest, name);
-  const report = { models: [], warnings: [], dropped: [], stream: 0, tuned: [] };
+  const report = { models: [], warnings: [], dropped: [], stream: 0, tuned: [], ngNested: [] };
   try {
     if (!/^[\x20-\x7e]+$/.test(name)) throw new Error("the folder name is not plain ASCII (the game takes narrow paths)");
     if (!existsSync(rpf)) throw new Error("no dlc.rpf");
@@ -189,14 +208,19 @@ for (const name of packs) {
     rmSync(staging, { recursive: true, force: true });
     mkdirSync(staging, { recursive: true });
     if (mode === "loose") stageLoose(name, rpf, staging, report);
-    else copyFileSync(rpf, path.join(staging, "dlc.rpf"));
+    else {
+      copyFileSync(rpf, path.join(staging, "dlc.rpf"));
+      copyFileSync(path.join(here, "handling_tune.json"), path.join(staging, "gage_tune.json"));
+    }
     if (existsSync(target)) { rmSync(target + ".old", { recursive: true, force: true }); renameSync(target, target + ".old"); }
     renameSync(staging, target);
     rmSync(target + ".old", { recursive: true, force: true });
     staged++;
-    console.log(`+ ${name}: ${encName} -> ${mode === "loose" ? `loose folder, ${report.stream} model file(s) in stream\\, cars: ${report.models.join(", ") || "-"}` : "dlc.rpf as is (the game reads it; its cars are listed in game)"}`);
+    console.log(`+ ${name}: ${encName} -> ${mode === "loose" ? `loose folder, ${report.stream} model file(s) in stream\\${report.ngNested.length ? ` + ${report.ngNested.length} NG nested archive(s)` : ""}, cars: ${report.models.join(", ") || "-"}` : "dlc.rpf as is (the game reads it; its cars are listed in game)"}`);
     for (const t of report.tuned) console.log(`    tuned: ${t}`);
     for (const d of report.dropped) console.log(`    dropped from content.xml: ${d}`);
+    for (const n of report.ngNested) console.log(`    kept NG nested archive (the game reads it): ${n}`);
+    if (mode !== "loose") console.log("    gage_tune.json: the engine tunes its handling at mount");
     for (const w of report.warnings) console.log(`    WARNING: ${w}`);
   } catch (e) {
     failed++;

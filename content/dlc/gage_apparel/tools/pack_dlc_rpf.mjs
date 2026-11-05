@@ -189,14 +189,33 @@ function readArchive(buf, label = "root", recurse = true) {
       const full = p ? `${p}/${c.name}` : c.name;
       if (c.kind === "dir") { walk(c, full); continue; }
       const start = c.off * BLOCK;
-      const len = c.kind === "bin" ? (c.size ? c.size : c.usize) : c.size;
+      let len = c.kind === "bin" ? (c.size ? c.size : c.usize) : c.size;
       if (c.off < Math.ceil((16 + count * 16 + namesLen) / BLOCK)) err(`${full}: data starts inside the header blocks`);
+      let data = null;
+      if (c.kind === "rsc" && c.size === 0xFFFFFF) {
+        // A resource of 16 MiB or more: the 24-bit TOC size is the marker 0xFFFFFF, and the real size is spread over
+        // bytes 2, 5, 7 and 14 of the stored 16-byte header (CodeWalker RpfResourceFileEntry.Read), which is therefore
+        // not an RSC7 header. Rebuild the RSC7 header from the TOC flags (version = sys[31:28] << 4 | gfx[31:28]).
+        if (start + 16 > buf.length) { err(`${full}: big resource header runs past the end of the archive`); continue; }
+        len = (buf[start + 7] | (buf[start + 14] << 8) | (buf[start + 5] << 16) | (buf[start + 2] << 24)) >>> 0;
+        if (len < 16 || start + len > buf.length) { err(`${full}: big resource size ${len} runs past the end of the archive (${buf.length})`); continue; }
+        const h = Buffer.alloc(16);
+        h.writeUInt32LE(RSC7, 0);
+        h.writeUInt32LE((((c.sys >>> 28) & 0xF) << 4) | ((c.gfx >>> 28) & 0xF), 4);
+        h.writeUInt32LE(c.sys, 8);
+        h.writeUInt32LE(c.gfx, 12);
+        data = Buffer.concat([h, buf.subarray(start + 16, start + len)]);
+      }
       if (start + len > buf.length) { err(`${full}: data ${start}+${len} runs past the end of the archive (${buf.length})`); continue; }
-      const data = buf.subarray(start, start + len);
+      if (!data) data = buf.subarray(start, start + len);
       if (c.kind === "rsc" && (data.length < 16 || data.readUInt32LE(0) !== RSC7)) err(`${full}: resource entry without RSC7 magic`);
       if (c.kind === "rsc" && (data.readUInt32LE(8) !== c.sys || data.readUInt32LE(12) !== c.gfx)) err(`${full}: TOC flags differ from the RSC7 header`);
       files.push({ path: full, kind: c.kind, len, data, comp: c.kind === "bin" && c.size !== 0, usize: c.kind === "bin" ? c.usize : len });
-      if (recurse && c.kind === "bin" && c.name.toLowerCase().endsWith(".rpf") && c.size === 0) {
+      // A nested NG / AES archive's TOC is encrypted: reading it as plain gives garbage entries, so it stays a blob.
+      const innerEnc = data.length >= 16 ? data.readUInt32LE(12) : 0;
+      if (recurse && c.kind === "bin" && c.name.toLowerCase().endsWith(".rpf") && c.size === 0 && (innerEnc === ENC_NG || innerEnc === ENC_AES)) {
+        files[files.length - 1].encrypted = innerEnc;
+      } else if (recurse && c.kind === "bin" && c.name.toLowerCase().endsWith(".rpf") && c.size === 0) {
         const inner = readArchive(data, `${label}/${full}`);
         errs.push(...inner.errs);
         files.push(...inner.files.map((f) => ({ ...f, path: `${full}/${f.path}` })));
@@ -298,6 +317,27 @@ function selftest() {
   mutate("RSC7 magic overwritten", (b) => { const f = r.files.find((x) => x.path.endsWith(".ytd")); const i = b.indexOf(f.data.subarray(0, 32)); b.writeUInt32LE(0, i); });
   mutate("an entry not reachable from the root", (b) => b.writeUInt32LE(b.readUInt32LE(4) + 1, 4));
 
+  // A resource of 16 MiB or more (valkyrietp.ytd): TOC size 0xFFFFFF, real size in header bytes 2/5/7/14. Made from a
+  // small one by writing the marker and the size bytes the way a real archive stores them; the reader must hand back
+  // the original file (RSC7 header rebuilt from the TOC flags, version 13 from gfx[31:28] = 0xD).
+  {
+    const big = rsc(0x00000003, 0xD0000004, 5000);
+    const one = dir("", mk("setup2.xml", files.setup), mk("big.ytd", big));
+    classify(one);
+    const b = buildArchive(one, ENC_OPEN);
+    let o = -1;
+    for (let i = 0; i < b.readUInt32LE(4); i++) if (b.readUInt32LE(16 + i * 16 + 4) & 0x80000000 && b.readUInt32LE(16 + i * 16 + 4) !== DIR_MARK) o = 16 + i * 16;
+    if (o < 0) throw new Error("selftest: no resource entry in the big-resource archive");
+    const at = ((b[o + 5] | (b[o + 6] << 8) | (b[o + 7] << 16)) & 0x7FFFFF) * BLOCK, n = big.length;
+    b[o + 2] = 0xFF; b[o + 3] = 0xFF; b[o + 4] = 0xFF;
+    b.fill(0, at, at + 16);
+    b[at + 2] = (n >>> 24) & 0xFF; b[at + 5] = (n >>> 16) & 0xFF; b[at + 7] = n & 0xFF; b[at + 14] = (n >>> 8) & 0xFF;
+    const rb = readArchive(b);
+    const f = rb.files.find((x) => x.path === "big.ytd");
+    check(rb.errs.length === 0 && !!f && f.len === n && f.data.equals(big),
+      `big resource (TOC size 0xFFFFFF): read back as the original ${n}-byte file (${rb.errs[0] ?? (f ? `${f.len} bytes, ${f.data.equals(big) ? "equal" : "DIFFERENT"}` : "missing")})`);
+  }
+
   // AES seal/unseal: a random 32-byte key (NOT a game key - this only proves the transform round-trips).
   const key = createHash("sha256").update("pack_dlc_rpf selftest key").digest();   // 32 deterministic bytes
   const sealed = sealAes(buf, key);
@@ -371,6 +411,7 @@ if (args.extract) {
       try { out = zlib.inflateRawSync(f.data); note = ` (inflated ${f.len} -> ${out.length})`; }
       catch (e) { note = ` (NOT inflated: ${e.message}; wrote raw)`; }
     }
+    if (f.encrypted) note += ` (nested ${f.encrypted === ENC_NG ? "NG" : "AES"} archive: written as is, not read)`;
     writeFileSync(dest, out);
     console.log(`  ${f.kind.padEnd(3)} ${String(out.length).padStart(9)}  ${f.path}${note}`);
     n++;
