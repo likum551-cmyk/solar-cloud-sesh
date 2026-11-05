@@ -337,6 +337,8 @@ add_library(gage_mp SHARED
     apps/engine/loading_screen.cpp
     apps/engine/brand_apparel.cpp
     apps/engine/pack_stream.cpp
+    apps/engine/pack_enh.cpp
+    apps/engine/minimap_size.cpp
 )
 target_link_libraries(gage_mp PRIVATE gage_common gage_netclient gage_sync gage_overlay winhttp ws2_32)
 set_target_properties(gage_mp PROPERTIES
@@ -357,6 +359,8 @@ add_executable(gage_mp_test
     apps/engine/loading_screen.cpp
     apps/engine/brand_apparel.cpp
     apps/engine/pack_stream.cpp
+    apps/engine/pack_enh.cpp
+    apps/engine/minimap_size.cpp
 )
 target_link_libraries(gage_mp_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
 set_target_properties(gage_mp_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
@@ -373,6 +377,7 @@ add_executable(present_hook_test
     tests/present_hook_test.cpp
     apps/engine/present_hook.cpp
     apps/engine/net_guard.cpp
+    apps/engine/pack_enh.cpp
 )
 target_link_libraries(present_hook_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
 set_target_properties(present_hook_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
@@ -442,6 +447,13 @@ set_target_properties(vehicle_drive_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${C
 add_executable(gameplay_test tests/gameplay_test.cpp)
 target_link_libraries(gameplay_test PRIVATE gage_sync)
 set_target_properties(gameplay_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
+
+# pack_profile_test.exe: the per-build car-pack profile (apps/engine/pack_profile.h: Legacy patterns pinned to the shipped text, every
+# Enhanced pattern a UNIQUE hit at its RVA in the offline dump, structure offsets visible in the code) and Round A of the
+# Enhanced car-pack port (pack_enh_core.h, the read-only pack_enh=1 diagnostic) run against the dump plus a synthetic game heap.
+# Pure C++ (no OS calls, no linked libs). Skips LOUDLY without the dump (enhanced EXE/...); GAGE_REQUIRE_IMG=1 makes that a failure.
+add_executable(pack_profile_test tests/pack_profile_test.cpp)
+set_target_properties(pack_profile_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
 # pack_collection_test.exe: offline proofs for the streaming content-pack TOC builder
 # (apps/engine/pack_collection.{h,cpp}); entry bit-packing pinned to live golden vectors. Never shipped.

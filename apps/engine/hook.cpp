@@ -21,6 +21,7 @@
 #include "net_guard.h"
 #include "present_hook.h"
 #include "nosp_pick.h"
+#include "pack_enh.h"
 
 #include <windows.h>
 #include <cmath>
@@ -2477,6 +2478,11 @@ enum class CodeWait { Wait, WaitLog, GiveUp };
 struct CodeWaitClock { ULONGLONG first = 0, lastLog = 0; bool started = false; };
 const ULONGLONG kCodeWaitMs = 120000, kCodeWaitLogMs = 10000;
 CodeWaitClock g_noSpWait, g_landingWait, g_netHostWait;
+// pack_enh=1 (World::packEnh): the Round A car-pack diagnostic is stepped by pollCodePatches until it finishes. It is
+// read-only; g_packEnhDone starts true so a pack_enh=0 run keeps codePatchesPending() exactly as before.
+bool g_packEnh = false;
+bool g_packEnhDone = true;
+CodeWaitClock g_packEnhWait;
 
 CodeWait codeWaitStep(CodeWaitClock& c, ULONGLONG now) {
     if (!c.started) {
@@ -6450,6 +6456,10 @@ void gage::game::Init(World& w) {
         if (g_enhDump)
             GLOGW("hook: Enhanced dump mode ON: the decrypted game image is written to "
                   "%%LOCALAPPDATA%%\\GAGE-MP\\dump once the code decrypts (enh_dump)");
+        // pack_enh: the read-only car-pack diagnostic (pack_enh.h). Armed here, stepped by pollCodePatches; with
+        // pack_enh=0 (default) nothing below runs and g_packEnhDone stays true.
+        g_packEnh = gage::game::content::PackEnhArm(w.packEnh, baseName);
+        g_packEnhDone = !g_packEnh;
     }
 
     // ---- Native registration table ------------------------------------------
@@ -7428,13 +7438,23 @@ static void pollCodePatches() {
     // decrypted (net_host=1). Reversible on Unhook; off unless net_host=1.
     if (g_netHost && !g_netHostInstalled && netHostInstall())
         g_netHostInstalled = true;
+
+    // pack_enh=1: Round A of the car-pack port, READ-ONLY (pack_enh.h). Its patterns sit in code Arxan decrypts late, so it
+    // shares this poller and codeWaitStep's 120 s budget; it throttles its own scans (one image pass per 1.5 s).
+    if (g_packEnh && !g_packEnhDone) {
+        const ULONGLONG now = GetTickCount64();
+        const CodeWait w = codeWaitStep(g_packEnhWait, now);
+        if (gage::game::content::PackEnhStep(now, w == CodeWait::WaitLog, w == CodeWait::GiveUp))
+            g_packEnhDone = true;
+    }
 }
 
 static bool codePatchesPending() {
     return (g_noSpScripts && !g_noSpInstalled) ||
            (g_noSpActive && !g_noSpVerified) ||
            (g_skipLanding && !g_landingPatched && g_build->landingPageSig) ||
-           (g_netHost && !g_netHostInstalled);
+           (g_netHost && !g_netHostInstalled) ||
+           (g_packEnh && !g_packEnhDone);
 }
 
 DWORD WINAPI nativeTablePollerThread(LPVOID) {

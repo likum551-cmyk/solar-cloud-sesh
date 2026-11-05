@@ -15,6 +15,7 @@
 #include "brand_apparel.h"
 #include "pack_stream.h"
 #include "pack_meta.h"
+#include "minimap_size.h"
 #include "quit_gate.h"
 #include "ambient.h"
 #include "common/common.h"
@@ -50,6 +51,7 @@
 #include "sync/radio_off.h"
 #include "sync/mapclear.h"
 #include "sync/minimap.h"
+#include "sync/minimap_size.h"
 #include "sync/noclip.h"
 #include "common/registry.h"
 
@@ -704,8 +706,23 @@ namespace {
     std::atomic<int>  g_barsMode{(int)sync::BarsMode::SetupRefresh};
     std::atomic<bool> g_barsReset{true};
     sync::BarsGate g_barsGate;          // script tick only
+    // 0.4.25 minimap_scale (libs/sync/minimap_size.h, apps/engine/minimap_size.cpp): the radar's three components shrunk in the game's own table. Unset = 0.80,
+    // 1 / 1.0 = untouched, held to 0.5..1.0. Read at the first minimap tick and again at every Welcome; the value reaches minimapsize on the script tick.
+    std::atomic<float> g_miniScaleReq{sync::kMinimapScaleDefault};
+    std::atomic<int>   g_miniScaleSrc{(int)sync::ScaleSource::Unset};
+    std::atomic<bool>  g_miniScaleDirty{false};
+    bool               g_miniScaleInit = false;       // script tick only
+    float              g_miniAppliedScale = 1.0f;     // what the game's table holds now (read back); the overlay's radar rectangle and the clearance check use it
+    void MinimapScaleRead()
+    {
+        const sync::ParsedScale p = sync::ParseMinimapScale(reg::Get(L"minimap_scale"));
+        g_miniScaleReq.store(p.scale);
+        g_miniScaleSrc.store((int)p.src);
+        g_miniScaleDirty.store(true);
+    }
     void MinimapReadSwitches()
     {
+        MinimapScaleRead();
         g_minimap.store(reg::Get(L"minimap") != L"0");
         const sync::BarsMode bm = sync::ParseBarsMode(reg::Get(L"minimap_bars"));
         g_barsMode.store((int)bm);
@@ -3782,8 +3799,8 @@ namespace {
             return "overlay layout not read (no frame drawn yet, or it changed under the read)";
         const float sz = g_miniSafe;             // the value the overlay was given (TickMinimap reads it every 2 s)
         const bool szOk = g_miniSafeOk;
-        const sync::ScreenRect keep = sync::RadarKeepOut(a.displayW, a.displayH, sz, szOk, 0.02f);
-        const sync::ScreenRect radar = sync::RadarKeepOut(a.displayW, a.displayH, sz, szOk, 0.0f);
+        const sync::ScreenRect keep = sync::RadarKeepOut(a.displayW, a.displayH, sz, szOk, 0.02f, g_miniAppliedScale);
+        const sync::ScreenRect radar = sync::RadarKeepOut(a.displayW, a.displayH, sz, szOk, 0.0f, g_miniAppliedScale);
         auto rect = [](float x, float y, float w, float h) { sync::ScreenRect r; r.x0 = x; r.y0 = y; r.x1 = x + w; r.y1 = y + h; return r; };
         std::string hit;
         auto test = [&](const char* name, bool present, const sync::ScreenRect& r) {
@@ -3845,6 +3862,31 @@ namespace {
               bs.refreshOff, g_barsGate.BigmapOn() ? "YES" : "no", clearance.c_str());
         g_barsGate.ClearCounters();
         s = MinimapStats();
+        GLOGI("engine: minimap size (0.4.25), last 10 s: %s; radar rectangle scale %.2f (what the overlay's vitals strip and the clearance check use)",
+              game::minimapsize::Status().c_str(), (double)g_miniAppliedScale);
+    }
+
+    // 0.4.25 minimap_scale: configure the table writer from the registry value (minimap=0 means the radar is hidden, so nothing is touched), let it run, and
+    // ask the radar's movie to flip once after every write so the "minimap" component is re-read. Script tick only.
+    float g_miniCfgScale = -1.0f;                 // the factor last handed to minimapsize (-1 = never)
+    void TickMinimapSize(double nowMs)
+    {
+        if (!g_miniScaleInit)
+        {
+            g_miniScaleInit = true;
+            MinimapScaleRead();
+        }
+        const bool dirty = g_miniScaleDirty.exchange(false);
+        const float want = g_minimap.load() ? g_miniScaleReq.load() : 1.0f;
+        if (dirty || want != g_miniCfgScale)
+        {
+            g_miniCfgScale = want;
+            game::minimapsize::Configure(want, g_minimap.load() ? sync::ScaleSourceName((sync::ScaleSource)g_miniScaleSrc.load()) : "minimap=0: no radar, nothing to resize");
+        }
+        game::minimapsize::Tick(nowMs);
+        if (game::minimapsize::TakeWritten())
+            g_barsGate.RequestFlip();
+        g_miniAppliedScale = game::minimapsize::AppliedScale();
     }
 
     void TickMinimap(double nowMs)
@@ -3855,6 +3897,7 @@ namespace {
             g_barsGate.SetMode((sync::BarsMode)g_barsMode.load());
             g_barsGate.Reset();
         }
+        TickMinimapSize(nowMs);
         sync::RadarInputs in;
         in.switchOn = g_minimap.load();
         in.entryDone = g_entry.load() == Entry::Done;
@@ -3879,7 +3922,7 @@ namespace {
             g_miniSafeMs = nowMs;
             g_miniSafeOk = g_world->SafeZoneSize(g_miniSafe);
         }
-        game::Overlay::SetRadarDock(in.switchOn, g_miniSafe, g_miniSafeOk);
+        game::Overlay::SetRadarDock(in.switchOn, g_miniSafe, g_miniSafeOk, g_miniAppliedScale);
         ++s.ticks;
         if (wanted)
             ++s.wantedTicks;

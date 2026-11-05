@@ -16,6 +16,9 @@
 
 #include "handling_tune.h"
 #include "pack_meta.h"
+#include "pack_profile.h"
+#include "pack_scan.h"
+#include "pack_win.h"
 
 #include <algorithm>
 #include <cctype>
@@ -45,23 +48,16 @@ constexpr uint32_t kEncNg       = 0x0FEFFFFFu;   // NG (real DRM; game reads nat
 constexpr uint32_t kGroupEarlyOn = 0x6f8bd408u;  // joaat("early_on")  -- what the boot loop runs first
 constexpr uint32_t kGroupStartup = 0x5bf6578fu;  // joaat("startup")
 
-constexpr uint32_t kVtableRva    = 0x1a9c508u;   // *mgr == base + this, from the manager ctor (p2 section 5)
-constexpr uint32_t kOffArray     = 0x28;         // mgr -> DlcEntry* array
-constexpr uint32_t kOffCount     = 0x30;         // mgr -> WORD entry count
-constexpr uint32_t kOffGen       = 0x178;        // mgr -> DWORD generation counter (edx to Setup2/MountGate)
-constexpr uint32_t kEntryStride  = 0xf0;
-constexpr uint32_t kOffEntryHash = 0x60;         // DlcEntry -> DWORD name hash (the RunPackGroup key)
-constexpr uint32_t kOffEntryPath = 0xb8;         // DlcEntry -> const char* path (Mount loads it as a QWORD ptr)
-constexpr uint32_t kOffEntryPathLen = 0xc0;      // DlcEntry -> WORD length of the +0xb8 atString (capacity WORD at +0xc2);
-                                                 // Mount ignores +0xb8 while it is 0
-constexpr uint32_t kOffEntryType = 0xc8;         // DlcEntry -> DWORD device type: 2 = packfile, 1 = relative/folder
-constexpr uint32_t kOffEntryState= 0xd0;         // DlcEntry -> DWORD setup state (0 fresh, 1 parsed, 2 mounted)
-constexpr uint32_t kTypePackfile = 2;            // Mount 0x94307c: +0xc8==2 -> fiPackfile::Open (the crypto path)
-constexpr uint32_t kTypeRelative = 1;            // Mount 0x94307c: +0xc8==1 -> fiDeviceRelative over +0xb8 (loose folder)
-
-// Diagnostic probe (pack_probe=1): the fiAssetManager global and its mount/file-exists calls, used to mount
-// the pack under "extra:/" WITHOUT DlcSetup2's teardown and ask the game which pack files are visible.
-constexpr uint32_t kAssetGlobalRva = 0x1e2ee90u; // &ASSET; DlcSetup2 lea's it before PushFolder/Exists/PopFolder
+// Everything build-specific (patterns, the manager / DlcEntry layout, single RVAs) is in pack_profile.h, selected
+// by the main module's file name (BuildProfile's rule). This file's mount chain only runs on the Legacy profile
+// (Enabled() refuses any other exe), whose values are the ones this file used to hold inline:
+//   mgr vtable RVA 0x1a9c508 (from the manager ctor, p2 section 5); mgr -> array +0x28, WORD count +0x30, DWORD
+//   generation +0x178 (edx to Setup2/MountGate); DlcEntry stride 0xf0, DWORD name hash +0x60 (the RunPackGroup key),
+//   path atString +0xb8 (Mount loads it as a QWORD ptr; length WORD +0xc0, capacity WORD +0xc2; Mount ignores +0xb8
+//   while the length is 0), DWORD device type +0xc8 (2 = packfile, Mount 0x94307c -> fiPackfile::Open, the crypto
+//   path; 1 = relative/folder, fiDeviceRelative over +0xb8), DWORD setup state +0xd0 (0 fresh, 1 parsed, 2 mounted).
+// Diagnostic probe (pack_probe=1): &ASSET (RVA 0x1e2ee90) and its mount/file-exists calls, used to mount the pack
+// under "extra:/" WITHOUT DlcSetup2's teardown and ask the game which pack files are visible.
 
 // 3889 hash of IS_MODEL_IN_CDIMAGE; World::CallNative maps public hashes and falls back to the hash as given.
 constexpr uint64_t kNativeIsModelInCdimage = 0x35B9E0803292B641ULL;
@@ -70,47 +66,49 @@ constexpr ULONGLONG kModelWaitMs = 15000;        // after the change set, how lo
 constexpr ULONGLONG kMgrWaitMs   = 10000;        // how long to wait for the manager singleton to appear
 
 // ---------------------------------------------------------------------------------------------
-// Signatures. Each pattern is a function entry (address = the match itself). The singleton global is
-// read out of the RunPackGroup body (a "48 8B 0D disp32" at match+13), not hard-coded.
+// Signatures (pack_profile.h). Each pattern is a function entry (address = the match itself). The singleton
+// global is read out of the RunPackGroup body (a "48 8B 0D disp32" at match+13), not hard-coded.
 // ---------------------------------------------------------------------------------------------
+using scan::Run;
+using scan::ParsePat;
+using scan::CountPat;
+using win::Image;
+using win::GameImage;
+using win::ProtReadable;
+using win::IsReadable;
+using win::ReadableRuns;
+
+// The profile of the running exe, picked once by the main module's file name (the BuildProfile rule). The mount
+// chain below only ever runs on the Legacy profile: Enabled() refuses every other exe.
+const PackProfile& Prof() {
+    static const PackProfile* p = [] {
+        wchar_t path[MAX_PATH] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        const wchar_t* base = path;
+        if (n && n < MAX_PATH)
+            for (const wchar_t* s = path; *s; ++s)
+                if (*s == L'\\' || *s == L'/') base = s + 1;
+        return &SelectPackProfile(base);
+    }();
+    return *p;
+}
+
 enum SigId : int { kAddDlcPack, kSetup2, kMountGate, kRunPackGroup, kSigCount };
 
-struct Sig { const char* name; const char* pat; const char* source; };
-
-const Sig kSigs[kSigCount] = {
-    { "AddDlcPack",   // RVA 0x916734: bool(mgr /*rcx*/, const char* path /*rdx, narrow, ends '/'*/)
-      "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 55 48 8D A8 E8 FE FF FF 48 81 EC 10 02 00 00 48 8B F9 48 8B DA 48 8D 4D 11",
-      "recon-3889 1.2 / p2 section 1" },
-    { "DlcSetup2",    // RVA 0x958290: bool(entry /*rcx*/, uint32 gen /*edx, forwarded*/)
-      "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 8B 89 D0 00 00 00",
-      "recon-3889 2.2 / p2 section 3" },
-    { "MountGate",    // RVA 0x94301c: bool(entry /*rcx*/, uint32 gen /*edx, forwarded to Mount*/)
-      "48 89 5C 24 08 57 48 83 EC 20 8B 81 D0 00 00 00 48 8B D9 83 F8 02 75 04",
-      "recon-3889 2.4 / p2 section 3" },
-    { "RunPackGroup", // RVA 0x92a9ac: void(mgr /*rcx*/, uint32 packHash /*edx*/, uint32 groupHash /*r8d*/)
-      "48 89 5C 24 08 57 48 83 EC 20 48 8B F9 48 8B 0D ?? ?? ?? ?? 41 8B D8 E8 ?? ?? ?? ?? 48 85 C0 74 14 4C 8D 44 24 48 48 8B",
-      "recon-3889 2.5 / p2 section 4" },
-};
+const PackSig& SigOf(int i) {
+    const PackProfile& p = Prof();
+    return i == kAddDlcPack ? p.addDlcPack : i == kSetup2 ? p.dlcSetup2 : i == kMountGate ? p.mountGate : p.runPackGroup;
+}
 
 // Diagnostic-only signatures, resolved lazily and independently of the four above (a probe-sig miss must
 // never disable the normal mount). Mount(entry, gen, mountPoint) opens+mounts the archive and returns 0 on
 // success; PushFolder/Exists/PopFolder are the fiAssetManager calls DlcSetup2 itself uses to test setup2.xml.
 enum ProbeSigId : int { kMount, kPushFolder, kExists, kPopFolder, kProbeSigCount };
 
-const Sig kProbeSigs[kProbeSigCount] = {
-    { "Mount",       // RVA 0x94307c: int(entry /*rcx*/, uint32 gen /*edx*/, const char* mountPoint /*r8*/); 0=ok
-      "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 45 33 FF 49 8B F0 48 8B D9 4C 39 39",
-      "recon-3889 2.3 / p2 section 3" },
-    { "PushFolder",  // RVA 0x1367bb8: void(asset /*rcx*/, const char* folder /*rdx*/)
-      "48 89 5C 24 18 48 89 54 24 10 57 48 81 EC 20 01 00 00 48 8B D9 48 8D 0D ?? ?? ?? ?? 48 8B FA E8 ?? ?? ?? ?? 80 3F 24 74",
-      "fiAssetManager::PushFolder (3889)" },
-    { "Exists",      // RVA 0x1362be8: uint8(asset /*rcx*/, const char* name /*rdx*/, uint64 flags /*r8=0*/)
-      "48 81 EC 38 01 00 00 4C 8B CA 4C 89 44 24 20 48 8D 54 24 30 41 B8 00 01 00 00 E8 ?? ?? ?? ?? 48 81 C4 38 01 00 00 C3",
-      "fiAssetManager::Exists (3889)" },
-    { "PopFolder",   // RVA 0x13679b4: void(asset /*rcx*/)
-      "FF 89 00 0C 00 00 48 8D 0D ?? ?? ?? ?? E9 ?? ?? ?? ??",
-      "fiAssetManager::PopFolder (3889)" },
-};
+const PackSig& ProbeSigOf(int i) {
+    const PackProfile& p = Prof();
+    return i == kMount ? p.mount : i == kPushFolder ? p.pushFolder : i == kExists ? p.exists : p.popFolder;
+}
 
 uintptr_t g_probeAddr[kProbeSigCount] = {};
 bool      g_probeResolvedOnce = false;
@@ -129,140 +127,17 @@ bool      g_probeReady        = false;
 //        game callers pass 1*/, const char* name /*r9: "jesko.yft"; null = path*/,
 //        bool fatalIfMissing /*[rsp+0x28]: 1 = the game's fatal error, so always 0 here*/,
 //        bool allowOverride /*[rsp+0x30]: re-point an object that already has a handle*/)
-const Sig kRegStreamSig = {
-    "RegStreamFile",  // RVA 0x169e4d4 (unique in both 3889 dumps)
-    "48 89 5C 24 08 48 89 6C 24 18 48 89 7C 24 20 41 54 41 56 41 57 48 83 EC 50 48 8B EA 4C 8B FA 48 8B D9 "
-    "4D 85 C9 B2 01 48 8B CD 45 8A E0 4D 0F 45 F9 E8",
-    "3889 RE 2026-11-05: device -> RawStreamer +0x1a8 -> streaming-info register 0x169e5e0" };
+// The pattern is Prof().regStream (RVA 0x169e4d4, unique in both 3889 dumps).
 using RegStreamFileFn = int* (*)(int* out, const char* path, uint8_t one, const char* name,
                                  uint8_t fatalIfMissing, uint8_t allowOverride);
-constexpr uint32_t kStreamInfoMgrRva = 0x2ea23d0u;  // strStreamingInfoManager: [+0] 8-byte (handle, flags) array, [+8] count
-constexpr uint32_t kImageRegistryRva = 0x2c67400u;  // fiCollection* per image index
-constexpr uint32_t kRawStreamerVtRva = 0x1b7d5e0u;  // image 0's collection (live fidiag 2026-11-02)
+// Prof().streamInfoMgrRva: strStreamingInfoManager, [+0] 8-byte (handle, flags) array, [+8] count (0x2ea23d0).
+// Prof().imageRegistryRva: fiCollection* per image index (0x2c67400).
+// Prof().rawStreamerVtRva: image 0's collection (0x1b7d5e0, live fidiag 2026-11-02).
 
 // ---------------------------------------------------------------------------------------------
-// Image bounds, readable-page runs, pattern scan (self-contained; mirrors dlc_mount.cpp).
+// Image bounds, readable-page runs and the pattern scan live in pack_win.h / pack_scan.h (shared with pack_enh.cpp
+// and tests/pack_profile_test.cpp); the old inline copies were moved there unchanged.
 // ---------------------------------------------------------------------------------------------
-struct Image { const uint8_t* base = nullptr; size_t size = 0; };
-
-Image GameImage() {
-    Image im;
-    HMODULE m = GetModuleHandleW(nullptr);   // the game exe: this DLL runs inside its process
-    if (!m) return im;
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(m);
-    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(b);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return im;
-    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(b + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return im;
-    im.base = b;
-    im.size = nt->OptionalHeader.SizeOfImage;
-    return im;
-}
-
-bool ProtReadable(DWORD prot) {
-    if (prot & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-    return (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
-                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-}
-
-bool IsReadable(const void* p, size_t n) {
-    const uint8_t* a = static_cast<const uint8_t*>(p);
-    const uint8_t* end = a + n;
-    while (a < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || !ProtReadable(mbi.Protect))
-            return false;
-        a = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-    }
-    return true;
-}
-
-struct Run { const uint8_t* p; size_t n; };
-
-// The committed, readable stretches of [base, base+size), adjacent ones merged: the Arxan-packed image
-// can hold guard/reserved pages, and a scan that walks into one faults the game.
-std::vector<Run> ReadableRuns(const Image& im) {
-    std::vector<Run> runs;
-    const uint8_t* a = im.base;
-    const uint8_t* end = im.base + im.size;
-    while (a < end) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(a, &mbi, sizeof(mbi))) break;
-        const uint8_t* rb = static_cast<const uint8_t*>(mbi.BaseAddress);
-        const uint8_t* re = rb + mbi.RegionSize;
-        if (re > end) re = end;
-        if (mbi.State == MEM_COMMIT && ProtReadable(mbi.Protect) && re > a) {
-            if (!runs.empty() && runs.back().p + runs.back().n == a)
-                runs.back().n += (size_t)(re - a);
-            else
-                runs.push_back({ a, (size_t)(re - a) });
-        }
-        if (re <= a) break;
-        a = re;
-    }
-    return runs;
-}
-
-bool ParsePat(const char* s, std::vector<uint8_t>& bytes, std::vector<uint8_t>& mask) {
-    bytes.clear();
-    mask.clear();
-    auto hexv = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        return -1;
-    };
-    while (*s) {
-        while (*s == ' ') ++s;
-        if (!*s) break;
-        const char* tok = s;
-        while (*tok && *tok != ' ') ++tok;
-        const int len = (int)(tok - s);
-        if (len == 2 && s[0] == '?' && s[1] == '?') {
-            bytes.push_back(0);
-            mask.push_back(0);
-        } else if (len == 2 && hexv(s[0]) >= 0 && hexv(s[1]) >= 0) {
-            bytes.push_back((uint8_t)(hexv(s[0]) * 16 + hexv(s[1])));
-            mask.push_back(1);
-        } else {
-            return false;
-        }
-        s = tok;
-    }
-    return !bytes.empty();
-}
-
-// Count matches (capped at 1000); `first` receives the lowest-address one. -1 = malformed pattern.
-int CountPat(const std::vector<Run>& runs, const char* sig, const uint8_t** first) {
-    std::vector<uint8_t> bytes, mask;
-    if (first) *first = nullptr;
-    if (!ParsePat(sig, bytes, mask)) return -1;
-    const size_t L = bytes.size();
-    size_t lead = 0;
-    while (lead < L && !mask[lead]) ++lead;
-    if (lead == L) return -1;              // all wildcards
-    int count = 0;
-    for (const Run& r : runs) {
-        if (r.n < L) continue;
-        const uint8_t* p = r.p + lead;
-        const uint8_t* last = r.p + r.n - (L - lead);
-        while (p <= last) {
-            p = static_cast<const uint8_t*>(memchr(p, bytes[lead], (size_t)(last - p) + 1));
-            if (!p) break;
-            const uint8_t* s = p - lead;
-            bool ok = true;
-            for (size_t i = 0; i < L; ++i)
-                if (mask[i] && s[i] != bytes[i]) { ok = false; break; }
-            if (ok) {
-                if (first && !*first) *first = s;
-                if (++count >= 1000) return count;
-            }
-            ++p;
-        }
-    }
-    return count;
-}
-
 void DumpHex(const char* label, const uint8_t* p, size_t n) {
     static const char H[] = "0123456789ABCDEF";
     for (size_t off = 0; off < n; off += 32) {
@@ -310,22 +185,27 @@ bool ResolveAll() {
     bool all = true;
     for (int i = 0; i < kSigCount; ++i) {
         const uint8_t* first = nullptr;
-        const int c = CountPat(runs, kSigs[i].pat, &first);
+        if (!SigOf(i).pat) {   // a profile without this pattern (never the Legacy one): nothing to scan with
+            GLOGW("hook: [packstream]   %-14s no pattern for this build", SigOf(i).name ? SigOf(i).name : "?");
+            all = false;
+            continue;
+        }
+        const int c = CountPat(runs, SigOf(i).pat, &first);
         if (c < 0) {
-            GLOGW("hook: [packstream]   %-14s BAD PATTERN", kSigs[i].name);
+            GLOGW("hook: [packstream]   %-14s BAD PATTERN", SigOf(i).name);
             all = false;
         } else if (c == 0) {
-            GLOGW("hook: [packstream]   %-14s missing (0)   (%s)", kSigs[i].name, kSigs[i].source);
+            GLOGW("hook: [packstream]   %-14s missing (0)   (%s)", SigOf(i).name, SigOf(i).source);
             all = false;
         } else if (c > 1) {
-            GLOGW("hook: [packstream]   %-14s ambiguous (%d, first @ +0x%llx); not used", kSigs[i].name, c,
+            GLOGW("hook: [packstream]   %-14s ambiguous (%d, first @ +0x%llx); not used", SigOf(i).name, c,
                   (unsigned long long)(uintptr_t)(first - im.base));
             all = false;
         } else {
             g_addr[i] = (uintptr_t)first;
             g_ok[i] = true;
-            GLOGI("hook: [packstream]   %-14s UNIQUE @ +0x%llx   (%s)", kSigs[i].name,
-                  (unsigned long long)(uintptr_t)(first - im.base), kSigs[i].source);
+            GLOGI("hook: [packstream]   %-14s UNIQUE @ +0x%llx   (%s)", SigOf(i).name,
+                  (unsigned long long)(uintptr_t)(first - im.base), SigOf(i).source);
             if (IsReadable(first, 16)) DumpHex("entry", first, 16);
         }
     }
@@ -395,11 +275,8 @@ bool ResolveAll() {
 constexpr uint32_t kDlcStoreKey = 0xf000u;       // the DLC key 0x64191c passes to the vehicles.meta loader
 constexpr long     kVehStoreExtraDefault = 256;  // extra slots (x 0x5a0 bytes = 360 KB); veh_store_extra overrides
 
-const Sig kVehStoreSig = {
-    "VehStoreInit",   // RVA 0x632610, inside the model-info init (0x631f24) case 8: the three key-0xf000 stores
-    "48 8B 05 ?? ?? ?? ?? BF 00 F0 00 00 48 8B 58 18 48 8B 05 ?? ?? ?? ?? 8B D7 48 8B 48 20 44 8B 83 ?? ?? ?? ?? "
-    "48 8B 01 FF 50 20 48 8B 05 ?? ?? ?? ?? 44 8B 83 ?? ?? ?? ?? 48 8B 48 28",
-    "3889 RE 2026-11-05: cfg=[[+3]]+0x18, factories=[+19], vehicle limit disp @+52, vehicle factory slot @+59" };
+// The pattern is Prof().vehStore (RVA 0x632610, inside the model-info init 0x631f24 case 8: the three key-0xf000
+// stores); its operand positions are Prof().vsCfg / vsTbl / vsLimitAt / vsSlotAt.
 
 // The array header the factory map points at: 0x64ffac writes base and capacity, 0x605794 bumps the count.
 struct StoreHdr { char* base; uint16_t count; uint16_t cap; };
@@ -434,27 +311,28 @@ bool ResolveVehStore() {
     const Image im = GameImage();
     if (!im.base || !im.size) return false;
     const uint8_t* m = nullptr;
-    const int c = CountPat(ReadableRuns(im), kVehStoreSig.pat, &m);
+    const int c = CountPat(ReadableRuns(im), Prof().vehStore.pat, &m);
     if (c != g_vehSigLogged) {
         g_vehSigLogged = c;
         if (c != 1)
-            GLOGW("hook: [packstream] %s %s (%d hits)%s", kVehStoreSig.name, c == 0 ? "missing" : "ambiguous", c,
+            GLOGW("hook: [packstream] %s %s (%d hits)%s", Prof().vehStore.name, c == 0 ? "missing" : "ambiguous", c,
                   c == 0 ? "; retried" : "; the DLC vehicle store is not guarded");
     }
     if (c == 0) return false;
-    if (c != 1 || !m || !IsReadable(m, 60)) { g_vehStoreSig = -1; return false; }
+    const PackProfile& pp = Prof();
+    if (c != 1 || !m || !IsReadable(m, pp.vsReadLen)) { g_vehStoreSig = -1; return false; }
     int32_t d1 = 0, d2 = 0;
-    memcpy(&d1, m + 3, 4);
-    memcpy(&d2, m + 19, 4);
-    const uintptr_t cfg = (uintptr_t)(m + 7) + (intptr_t)d1;
-    const uintptr_t tbl = (uintptr_t)(m + 23) + (intptr_t)d2;
+    memcpy(&d1, m + pp.vsCfg.dispAt, 4);
+    memcpy(&d2, m + pp.vsTbl.dispAt, 4);
+    const uintptr_t cfg = (uintptr_t)(m + pp.vsCfg.endAt) + (intptr_t)d1;
+    const uintptr_t tbl = (uintptr_t)(m + pp.vsTbl.endAt) + (intptr_t)d2;
     uint32_t off = 0;
-    memcpy(&off, m + 52, 4);
-    const uint32_t slot = m[59];
+    memcpy(&off, m + pp.vsLimitAt, 4);
+    const uint32_t slot = m[pp.vsSlotAt];
     const uintptr_t lo = (uintptr_t)im.base, hi = lo + im.size;
     if (cfg < lo || cfg >= hi || tbl < lo || tbl >= hi || off == 0 || off > 0x1000 || (off & 3) || slot == 0 || (slot & 7)) {
         GLOGW("hook: [packstream] %s operands implausible (cfg +0x%llx, table +0x%llx, limit +0x%x, slot 0x%x); not used",
-              kVehStoreSig.name, (unsigned long long)(cfg - lo), (unsigned long long)(tbl - lo), (unsigned)off, (unsigned)slot);
+              Prof().vehStore.name, (unsigned long long)(cfg - lo), (unsigned long long)(tbl - lo), (unsigned)off, (unsigned)slot);
         g_vehStoreSig = -1;
         return false;
     }
@@ -465,7 +343,7 @@ bool ResolveVehStore() {
     g_vehStoreSig = 1;
     GLOGI("hook: [packstream] %s UNIQUE @ +0x%llx: config global +0x%llx (expect 0x2e9e508), factory table +0x%llx "
           "(expect 0x1ec11f0), MaxExtraVehicleModelInfos at +0x%x (expect 0x324), vehicle factory slot 0x%x (expect 0x28)",
-          kVehStoreSig.name, (unsigned long long)(m - im.base), (unsigned long long)(cfg - lo), (unsigned long long)(tbl - lo),
+          Prof().vehStore.name, (unsigned long long)(m - im.base), (unsigned long long)(cfg - lo), (unsigned long long)(tbl - lo),
           (unsigned)off, (unsigned)slot);
     return true;
 }
@@ -521,18 +399,18 @@ void*    Manager()          { return IsReadable((void*)g_singleton, 8) ? *reinte
 bool     VtableOk(void* mgr) {
     const Image im = GameImage();
     if (!IsReadable(mgr, 8)) return false;
-    return *reinterpret_cast<uintptr_t*>(mgr) == (uintptr_t)im.base + kVtableRva;
+    return *reinterpret_cast<uintptr_t*>(mgr) == (uintptr_t)im.base + Prof().mgrVtableRva;
 }
-uint16_t Count(void* mgr)   { return IsReadable((char*)mgr + kOffCount, 2) ? *reinterpret_cast<uint16_t*>((char*)mgr + kOffCount) : 0; }
-uint32_t Gen(void* mgr)     { return IsReadable((char*)mgr + kOffGen, 4) ? *reinterpret_cast<uint32_t*>((char*)mgr + kOffGen) : 0; }
+uint16_t Count(void* mgr)   { return IsReadable((char*)mgr + Prof().mgrCount, 2) ? *reinterpret_cast<uint16_t*>((char*)mgr + Prof().mgrCount) : 0; }
+uint32_t Gen(void* mgr)     { return IsReadable((char*)mgr + Prof().mgrGen, 4) ? *reinterpret_cast<uint32_t*>((char*)mgr + Prof().mgrGen) : 0; }
 char*    Entry(void* mgr, int i) {
-    if (i < 0 || !IsReadable((char*)mgr + kOffArray, 8)) return nullptr;
-    char* arr = *reinterpret_cast<char**>((char*)mgr + kOffArray);
-    char* e = arr + (size_t)i * kEntryStride;
-    return IsReadable(e, kEntryStride) ? e : nullptr;
+    if (i < 0 || !IsReadable((char*)mgr + Prof().mgrArray, 8)) return nullptr;
+    char* arr = *reinterpret_cast<char**>((char*)mgr + Prof().mgrArray);
+    char* e = arr + (size_t)i * Prof().entryStride;
+    return IsReadable(e, Prof().entryStride) ? e : nullptr;
 }
-uint32_t EntryHash(char* e)  { return (e && IsReadable(e + kOffEntryHash, 4)) ? *reinterpret_cast<uint32_t*>(e + kOffEntryHash) : 0; }
-uint32_t EntryState(char* e) { return (e && IsReadable(e + kOffEntryState, 4)) ? *reinterpret_cast<uint32_t*>(e + kOffEntryState) : 0xffffffffu; }
+uint32_t EntryHash(char* e)  { return (e && IsReadable(e + Prof().entryHash, 4)) ? *reinterpret_cast<uint32_t*>(e + Prof().entryHash) : 0; }
+uint32_t EntryState(char* e) { return (e && IsReadable(e + Prof().entryState, 4)) ? *reinterpret_cast<uint32_t*>(e + Prof().entryState) : 0xffffffffu; }
 
 // ---------------------------------------------------------------------------------------------
 // State
@@ -752,13 +630,13 @@ bool ResolveProbe() {
     bool all = true;
     for (int i = 0; i < kProbeSigCount; ++i) {
         const uint8_t* first = nullptr;
-        const int c = CountPat(runs, kProbeSigs[i].pat, &first);
+        const int c = CountPat(runs, ProbeSigOf(i).pat, &first);
         if (c == 1) {
             g_probeAddr[i] = (uintptr_t)first;
-            GLOGI("hook: [packstream] probe-sig %-11s UNIQUE @ +0x%llx   (%s)", kProbeSigs[i].name,
-                  (unsigned long long)(uintptr_t)(first - im.base), kProbeSigs[i].source);
+            GLOGI("hook: [packstream] probe-sig %-11s UNIQUE @ +0x%llx   (%s)", ProbeSigOf(i).name,
+                  (unsigned long long)(uintptr_t)(first - im.base), ProbeSigOf(i).source);
         } else {
-            GLOGW("hook: [packstream] probe-sig %-11s %s", kProbeSigs[i].name,
+            GLOGW("hook: [packstream] probe-sig %-11s %s", ProbeSigOf(i).name,
                   c < 0 ? "BAD PATTERN" : (c == 0 ? "missing" : "ambiguous"));
             all = false;
         }
@@ -776,7 +654,7 @@ bool ResolveProbe() {
 void Probe(void* mgr, char* entry) {
     if (!ResolveProbe()) { GLOGW("hook: [packstream] probe: not all probe signatures resolved; skipping"); return; }
     const Image im = GameImage();
-    void* asset = reinterpret_cast<void*>((uintptr_t)im.base + kAssetGlobalRva);
+    void* asset = reinterpret_cast<void*>((uintptr_t)im.base + Prof().assetGlobalRva);
     const uint32_t gen = Gen(mgr);
     void* dev0 = IsReadable(entry, 8) ? *reinterpret_cast<void**>(entry) : nullptr;
     GLOGI("hook: [packstream] probe: ASSET @0x%llx; Mount(entry @0x%llx, gen %u, \"extra:/\"); entry.device was 0x%llx",
@@ -812,10 +690,8 @@ void Probe(void* mgr, char* entry) {
 //                  +0x60 Close(this, handle), +0xb0 GetFileSize(this, name) -> bytes. (The bulk calls at +0x10 / +0x38 /
 //                  +0x68 are what the RSC7 header reader 0x1364d20 uses; the plain ones sit one slot before each, and
 //                  fiPackfile's +0xb0 0x1364a4c returns an entry's uncompressed size, so Read hands back the real text.)
-const Sig kGetDeviceSig = {
-    "GetDevice",      // RVA 0x1364150 (the jmp target of 0x1364148, which every device-for-path caller uses)
-    "48 89 5C 24 08 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 20 48 8D 15 ?? ?? ?? ?? 41 B8 07 00 00 00 48 8B F1 E8",
-    "3889 RE 2026-11-05: fiDevice::GetDevice(path, readOnly)" };
+// (The GetDevice pattern is Prof().getDevice: RVA 0x1364150, the jmp target of 0x1364148, which every device-for-path
+// caller uses.)
 constexpr size_t kMaxMetaBytes = 4u << 20;   // a vehicles.meta is a few KB; anything this big is not one
 
 bool ReadGameFile(const std::string& path, std::string& out) {
@@ -825,9 +701,9 @@ bool ReadGameFile(const std::string& path, std::string& out) {
         s_tried = true;
         const Image im = GameImage();
         const uint8_t* first = nullptr;
-        const int c = (im.base && im.size) ? CountPat(ReadableRuns(im), kGetDeviceSig.pat, &first) : 0;
+        const int c = (im.base && im.size) ? CountPat(ReadableRuns(im), Prof().getDevice.pat, &first) : 0;
         if (c == 1) s_fn = (uintptr_t)first;
-        GLOGI("hook: [packstream] %s %s", kGetDeviceSig.name, c == 1 ? "UNIQUE" : (c == 0 ? "missing" : "ambiguous"));
+        GLOGI("hook: [packstream] %s %s", Prof().getDevice.name, c == 1 ? "UNIQUE" : (c == 0 ? "missing" : "ambiguous"));
     }
     if (!s_fn) return false;
     using GetDeviceFn = void* (*)(const char*, uint8_t);
@@ -953,26 +829,26 @@ bool RegisterLooseStream(const Paths& paths) {
     const Image im = GameImage();
     if (!im.base || !im.size) { Fail("stream: game image bounds unavailable"); return false; }
     const uint8_t* fn = nullptr;
-    const int hits = CountPat(ReadableRuns(im), kRegStreamSig.pat, &fn);
+    const int hits = CountPat(ReadableRuns(im), Prof().regStream.pat, &fn);
     if (hits != 1 || !fn) {
-        Fail("stream: %s signature %s (%d hits); not registering %u model files", kRegStreamSig.name,
+        Fail("stream: %s signature %s (%d hits); not registering %u model files", Prof().regStream.name,
              hits == 0 ? "missing" : "ambiguous", hits, (unsigned)files.size());
         return false;
     }
     const uintptr_t base = (uintptr_t)im.base;
-    void* const* registry = reinterpret_cast<void* const*>(base + kImageRegistryRva);
+    void* const* registry = reinterpret_cast<void* const*>(base + Prof().imageRegistryRva);
     void* raw = IsReadable(registry, 8) ? registry[0] : nullptr;
     const uintptr_t rawVt = (raw && IsReadable(raw, 8)) ? *reinterpret_cast<const uintptr_t*>(raw) : 0;
     GLOGI("hook: [packstream] stream: %s UNIQUE @ +0x%llx; image 0 collection @0x%llx vtable +0x%llx (%s)",
-          kRegStreamSig.name, (unsigned long long)(fn - im.base), (unsigned long long)(uintptr_t)raw,
+          Prof().regStream.name, (unsigned long long)(fn - im.base), (unsigned long long)(uintptr_t)raw,
           (unsigned long long)(rawVt ? rawVt - base : 0),
-          rawVt == base + kRawStreamerVtRva ? "RawStreamer, as expected" : "NOT the RawStreamer");
-    if (rawVt != base + kRawStreamerVtRva) {
+          rawVt == base + Prof().rawStreamerVtRva ? "RawStreamer, as expected" : "NOT the RawStreamer");
+    if (rawVt != base + Prof().rawStreamerVtRva) {
         Fail("stream: image 0 is not the RawStreamer collection on this image; not registering loose files");
         return false;
     }
 
-    const auto* mgr = reinterpret_cast<const uint8_t*>(base + kStreamInfoMgrRva);
+    const auto* mgr = reinterpret_cast<const uint8_t*>(base + Prof().streamInfoMgrRva);
     int ok = 0;
     for (const std::wstring& f : files) {
         bool ascii = true;
@@ -1192,25 +1068,25 @@ bool MountSequence(World& world, Pack& p) {
         // game's allocator when the folder path is longer than the capacity).
         const std::string& folder = paths.device;          // "<folder>/" forward-slash, trailing '/'
         if (!g_strAppend) { Fail("folder-mode: the game's atString append was not resolved; not overriding the entry"); return false; }
-        if (!IsReadable(e + kOffEntryType, 4) || !IsReadable(e + kOffEntryPath, 12)) {
+        if (!IsReadable(e + Prof().entryType, 4) || !IsReadable(e + Prof().entryPath, 12)) {
             Fail("folder-mode: DLC entry device fields (+0xb8/+0xc0/+0xc8) are not writable"); return false;
         }
-        const uint32_t oldType = *reinterpret_cast<uint32_t*>(e + kOffEntryType);
-        const uint16_t oldLen = *reinterpret_cast<uint16_t*>(e + kOffEntryPathLen);
-        const char* oldPath = *reinterpret_cast<const char* const*>(e + kOffEntryPath);
+        const uint32_t oldType = *reinterpret_cast<uint32_t*>(e + Prof().entryType);
+        const uint16_t oldLen = *reinterpret_cast<uint16_t*>(e + Prof().entryPathLen);
+        const char* oldPath = *reinterpret_cast<const char* const*>(e + Prof().entryPath);
         GLOGI("hook: [packstream] folder-mode: pre-override type(+0xc8)=%u length(+0xc0)=%u capacity(+0xc2)=%u path(+0xb8)=\"%s\"",
-              (unsigned)oldType, (unsigned)oldLen, (unsigned)*reinterpret_cast<uint16_t*>(e + kOffEntryPathLen + 2),
+              (unsigned)oldType, (unsigned)oldLen, (unsigned)*reinterpret_cast<uint16_t*>(e + Prof().entryPathLen + 2),
               (oldPath && IsReadable(oldPath, 1)) ? oldPath : "<null>");
-        *reinterpret_cast<uint16_t*>(e + kOffEntryPathLen) = 0;
-        reinterpret_cast<AtStrAppendFn>(g_strAppend)(e + kOffEntryPath, folder.c_str(), (int)folder.size());
-        const char* newPath = *reinterpret_cast<const char* const*>(e + kOffEntryPath);
-        const uint16_t newLen = *reinterpret_cast<uint16_t*>(e + kOffEntryPathLen);
+        *reinterpret_cast<uint16_t*>(e + Prof().entryPathLen) = 0;
+        reinterpret_cast<AtStrAppendFn>(g_strAppend)(e + Prof().entryPath, folder.c_str(), (int)folder.size());
+        const char* newPath = *reinterpret_cast<const char* const*>(e + Prof().entryPath);
+        const uint16_t newLen = *reinterpret_cast<uint16_t*>(e + Prof().entryPathLen);
         if (newLen != folder.size() || !newPath || !IsReadable(newPath, folder.size() + 1) ||
             memcmp(newPath, folder.c_str(), folder.size() + 1) != 0) {
             Fail("folder-mode: the entry path did not read back as the folder after the game's append (length %u)", (unsigned)newLen);
             return false;
         }
-        *reinterpret_cast<uint32_t*>(e + kOffEntryType) = kTypeRelative;
+        *reinterpret_cast<uint32_t*>(e + Prof().entryType) = Prof().typeRelative;
         GLOGI("hook: [packstream] folder-mode: overrode entry to relative device (type=1) over \"%s\" (game-owned string, "
               "length %u; nameHash set from setup2.xml by DlcSetup2)", newPath, (unsigned)newLen);
     } else if (!packHash) {

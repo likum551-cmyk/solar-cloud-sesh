@@ -150,6 +150,7 @@ std::atomic<bool>     g_vitShowFuel{false};
 std::atomic<bool>     g_radarDock{false};
 std::atomic<float>    g_radarSafeZone{1.0f};
 std::atomic<bool>     g_radarSafeZoneOk{false};
+std::atomic<float>    g_radarScale{1.0f};   // 0.4.25 minimap_scale: the factor the game's radar was shrunk by (1 = the game's own size)
 // 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
 // one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown.
 std::atomic<unsigned>  g_vehKeys{0};
@@ -757,7 +758,7 @@ Cluster ClusterLayout(float W, float H)
     c.vw = c.w;
     if (g_radarDock.load()) {
         const gage::sync::ScreenRect radar =
-            gage::sync::RadarKeepOut(W, H, g_radarSafeZone.load(), g_radarSafeZoneOk.load(), 0.0f);
+            gage::sync::RadarKeepOut(W, H, g_radarSafeZone.load(), g_radarSafeZoneOk.load(), 0.0f, g_radarScale.load());
         c.radarX = radar.x0; c.radarY = radar.y0; c.radarW = radar.x1 - radar.x0; c.radarH = radar.y1 - radar.y0;
         // The strip is kStripFrac of the radar's height (never under kStripMinH px: 720p's 8 px held no 7 px glyph and a 5 px bar), the radar's
         // width (held to 120..400 px at 1080p). It sits flush under the radar's bottom edge (gap 0), like GTA's own bars.
@@ -2853,10 +2854,11 @@ void SetStats(bool inVehicle, float speedKmh)
     g_speedKmh.store(speedKmh == speedKmh && speedKmh > 0.0f ? speedKmh : 0.0f);   // NaN and negatives show 0
 }
 
-void SetRadarDock(bool dock, float safeZone, bool safeZoneOk)
+void SetRadarDock(bool dock, float safeZone, bool safeZoneOk, float scale)
 {
     g_radarSafeZone.store(safeZone == safeZone ? safeZone : 1.0f);   // NaN reads as unknown (the layout also checks safeZoneOk)
     g_radarSafeZoneOk.store(safeZoneOk);
+    g_radarScale.store(gage::sync::ClampRadarScale(scale));          // NaN / out of range: 1 = the game's own size, or the nearest end
     g_radarDock.store(dock);
 }
 

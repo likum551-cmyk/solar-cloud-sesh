@@ -700,6 +700,11 @@ namespace gage::game {
         // only) and, after the entry, samples the NETWORK_IS_* getters every 10 s for 60 s.
         // With net_host=1 the same hooks run as the ROS guard instead (net_guard.h).
         int       netProbe = 1;
+        // Set before Init: the car-pack port to GTA V Enhanced (HKCU\Software\GAGE-MP pack_enh, pack_enh.h).
+        // 0 = off (default; Enhanced behaves exactly as before), 1 = Round A: a READ-ONLY diagnostic of the game's
+        // DLC manager / image registry / vehicle store, stepped by the code-patch poller (nothing is mounted,
+        // written or called), 2 and 3 = reserved for the mount rounds ("not built yet").
+        int       packEnh = 0;
         // kill_sp_hijack: after the entry, terminate the story-character scripts every tick
         // (SuppressPedHijackers). 1 = on (default), 0 = off.
         int       killSpHijack = 1;

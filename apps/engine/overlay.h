@@ -60,7 +60,9 @@ namespace gage::game::Overlay {
     // (GET_SAFE_ZONE_SIZE, as the engine reads it; safeZoneOk false = unreadable, the widest margin is assumed). Where the margin under
     // the radar is too small the strip tucks up into the radar's bottom edge, at most 8 % of its height; past that the plate stays in
     // the bottom-right (UiState::vitalsDockWhy says why). dock = false is the pre-0.4.22 layout. Any thread.
-    void SetRadarDock(bool dock, float safeZone, bool safeZoneOk);
+    // 0.4.25 scale (0.5..1, default 1): the factor the game's radar was shrunk by (minimap_scale; the engine passes the one its table holds, read back,
+    // never the one asked for). The radar rectangle loses width and height about its bottom-left corner, so the strip stays flush under the smaller map.
+    void SetRadarDock(bool dock, float safeZone, bool safeZoneOk, float scale = 1.0f);
 
     // 0.4.22 vehicle controls (libs/sync/vehicle_controls.h). The keys are read in UiFrame from ImGui's key events, the same source as Tab / T /
     // Enter: Left / Right Arrow (indicators), Down Arrow (hazards), Y (engine), B (seatbelt); H is GTA's own headlight control and is not read here.

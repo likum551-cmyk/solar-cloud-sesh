@@ -223,6 +223,19 @@ namespace {
         world.noSpKnownRva = (reg::Get(L"nosp_known_rva") == L"0") ? 0 : 1;
         GLOGI("gage_mp: nosp_known_rva=%d (0.4.21: an ambiguous GtaThread::Tick signature %s)", world.noSpKnownRva,
               world.noSpKnownRva ? "uses the hit at the RVA proven live for this build" : "is refused, as before");
+        // Car packs on GTA V Enhanced (pack_enh.h): 0 = off (default; Enhanced behaves exactly as before), 1 = Round A,
+        // a READ-ONLY diagnostic of the game's DLC manager / image registry / vehicle store (mounts nothing, writes no
+        // game memory), 2 and 3 = reserved for the mount rounds. Legacy ignores it (its switch is pack_mount).
+        {
+            const std::wstring pe = reg::Get(L"pack_enh");
+            world.packEnh = (pe == L"1") ? 1 : (pe == L"2") ? 2 : (pe == L"3") ? 3 : 0;
+            if (!pe.empty() && pe != L"0" && world.packEnh == 0)
+                GLOGW("gage_mp: pack_enh=\"%s\" is not 0..3; treated as 0 (off)", Narrow(pe).c_str());
+            GLOGI("gage_mp: pack_enh=%d (%s)", world.packEnh,
+                  world.packEnh == 0 ? "off: Enhanced car packs untouched"
+                  : world.packEnh == 1 ? "Round A: read-only diagnostic of the DLC manager, image registry and vehicle store, Enhanced only"
+                                       : "reserved for the mount rounds, not built yet");
+        }
         // Before game::Init (which arms skip_landing): the DLC vehicle array is sized when the Story session starts.
         // Undecided (gameconfig not parsed or the code still packed): retry off-thread every 100 ms for up to 2 min;
         // pack_stream's Tick ends the retry once the player is in the world.

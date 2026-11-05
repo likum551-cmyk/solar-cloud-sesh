@@ -4,6 +4,7 @@
 #pragma once
 
 #include "sync/minimap.h"
+#include "minimap_size_tests.h"   // 0.4.25 minimap_scale: the registry value, the component scaling, the write gate, the table pattern (needs Check above)
 
 #include <cmath>
 #include <cstdint>
@@ -12,7 +13,9 @@
 
 namespace minimaptest {
 
-    constexpr int kChecks = 28;
+    // 28 for 0.4.22, 8 for the 0.4.25 radar scale (rectangle, vitals strip, flip request), then minimap_size_tests.h's own.
+    constexpr int kScaleChecks = 8;
+    constexpr int kChecks = 28 + kScaleChecks + minimapsizetest::kChecks;
 
     // The engine's scale (overlay_ui.cpp: S(v) = round(v * scale), scale = displayH / 1080 clamped to 0.75..3).
     inline float UiScale(float displayH) { return std::fmin(3.0f, std::fmax(0.75f, displayH / 1080.0f)); }
@@ -294,6 +297,133 @@ namespace minimaptest {
             Check("minimap: the padded keep-out grows the radar by 2 % of the height (21.6 px) on every side",
                   Near(a.x0 - p.x0, 21.6f, 0.1f) && Near(p.x1 - a.x1, 21.6f, 0.1f) && Near(a.y0 - p.y0, 21.6f, 0.1f) && Near(p.y1 - a.y1, 21.6f, 0.1f));
         }
+
+        // ---- 0.4.25 minimap_scale: the radar rectangle, the strip under it, the flip request ----
+        std::printf("-- 0.4.25 minimap_scale: radar rectangle at a scale, vitals strip flush under it, big-radar flip request\n");
+        {
+            const ScreenRect full = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f), s8 = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f, 0.8f);
+            const ScreenRect pad = RadarKeepOut(1920, 1080, 0.9f, true, 0.02f, 0.8f);
+            Check("minimap scale 0.8 at 1920x1080, safe zone 0.9: the radar keeps its left edge (96) and bottom edge (1026) and shrinks to 216 x 152 px; the 2 % gutter is added after the shrink",
+                  Near(s8.x0, full.x0, 0.01f) && Near(s8.y1, full.y1, 0.01f) && Near(s8.x1 - s8.x0, 0.8f * (full.x1 - full.x0), 0.01f) && Near(s8.x1 - s8.x0, 216.0f, 0.01f)
+                      && Near(s8.y1 - s8.y0, 0.8f * (full.y1 - full.y0), 0.01f) && Near(s8.y1 - s8.y0, 152.3f, 0.6f) && Near(s8.x0 - pad.x0, 21.6f, 0.1f)
+                      && Near(pad.x1 - s8.x1, 21.6f, 0.1f) && Near(s8.y0 - pad.y0, 21.6f, 0.1f) && Near(pad.y1 - s8.y1, 21.6f, 0.1f),
+                  std::to_string(s8.x0) + "," + std::to_string(s8.y0) + "," + std::to_string(s8.x1) + "," + std::to_string(s8.y1));
+        }
+        {
+            const ScreenRect full = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f), def = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f, 1.0f);
+            const ScreenRect low = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f, 0.2f), half = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f, 0.5f);
+            const ScreenRect high = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f, 3.0f), nan = RadarKeepOut(1920, 1080, 0.9f, true, 0.0f, std::nanf(""));
+            auto same = [](const ScreenRect& a, const ScreenRect& b) { return Near(a.x0, b.x0, 0.01f) && Near(a.y0, b.y0, 0.01f) && Near(a.x1, b.x1, 0.01f) && Near(a.y1, b.y1, 0.01f); };
+            Check("minimap scale: the default is the game's own size; below 0.5 is held to 0.5, above 1 and NaN count as 1 (the rectangle never grows past the game's)",
+                  same(full, def) && same(low, half) && Near(half.x1 - half.x0, 0.5f * (full.x1 - full.x0), 0.01f) && same(high, full) && same(nan, full));
+        }
+        // The strip's size and place, as ClusterLayout (apps/engine/overlay_ui.cpp) computes them: a 7 % strip (never under 11 px) that shrinks to the free margin under
+        // the radar, resting 2 px or more above the screen edge, never covering the map.
+        struct Strip { VitalsDock d; ScreenRect radar; };
+        auto stripFor = [](float W, float H, float safe, float scale) {
+            Strip s;
+            s.radar = RadarKeepOut(W, H, safe, true, 0.0f, scale);
+            const float edge = std::fmax(2.0f, std::floor(S(2.0f, H)));
+            const float room = std::floor(H - edge - s.radar.y1);
+            const float stripH = std::fmax(11.0f, std::fmin(std::floor((s.radar.y1 - s.radar.y0) * 0.07f), room));
+            s.d = DockVitals(W, H, s.radar, stripH, S(120.0f, H), S(400.0f, H), 0.0f, edge, 0.0f);
+            return s;
+        };
+        {
+            const Strip a = stripFor(1920, 1080, 0.9f, 0.8f), b = stripFor(1920, 1080, 0.9f, 1.0f);
+            Check("minimap scale 0.8 at 1080p: the vitals strip stays flush under the smaller map (top = the radar's bottom edge, 0 px into it), takes its left edge and its 216 px width",
+                  a.d.docked && Near(a.d.y, a.radar.y1, 0.01f) && a.d.coverPx == 0.0f && Near(a.d.x, a.radar.x0, 0.01f) && Near(a.d.w, 216.0f, 0.5f) && Near(a.d.y, b.d.y, 0.01f)
+                      && a.d.w < b.d.w && a.d.h >= 11.0f,
+                  std::to_string(a.d.y) + " vs radar bottom " + std::to_string(a.radar.y1) + ", w " + std::to_string(a.d.w));
+        }
+        {
+            struct Disp { float w, h; };
+            const Disp displays[] = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}, {1920, 1200}, {1024, 768}, {2560, 1080}, {3440, 1440}};
+            int good = 0;
+            std::string bad;
+            for (float scale : {0.8f, 0.5f})
+                for (const Disp& d : displays)
+                {
+                    const Strip s = stripFor(d.w, d.h, 0.9f, scale);
+                    const float rw = s.radar.x1 - s.radar.x0;
+                    const float want = std::fmax(S(120.0f, d.h), std::fmin(rw, S(400.0f, d.h)));
+                    const bool fine = s.d.docked && s.d.coverPx == 0.0f && Near(s.d.y, s.radar.y1, 0.01f) && Near(s.d.x, s.radar.x0, 0.01f) && Near(s.d.w, want, 0.01f)
+                                      && s.d.y + s.d.h <= d.h - 1.0f;
+                    good += fine ? 1 : 0;
+                    if (!fine)
+                        bad += std::to_string((int)d.w) + "x" + std::to_string((int)d.h) + "@" + std::to_string(scale) + " ";
+                }
+            Check("minimap scale 0.8 and 0.5 on 10 common displays (720p to 4K, 4:3, 16:10, 21:9): the strip is docked flush under the shrunken radar, aligned to its left edge, on screen",
+                  good == 20, bad);
+        }
+        {
+            // The big-radar flip a size change asks for.
+            auto drive = [](BarsGate& g, int ticks, double& t, const BarsInputs& in) { return Drive(g, ticks, t, in); };
+            BarsInputs on;
+            on.radarOn = true;
+            on.haveHandle = true;
+            on.loaded = true;
+            BarsInputs off = on;
+            off.radarOn = false;
+            BarsGate g;
+            g.SetMode(BarsMode::Off);
+            double t = 0;
+            g.RequestFlip();
+            const auto hidden = drive(g, 10, t, off);       // the radar is not shown: the flip waits
+            const bool waiting = Count(hidden, BarsAction::None) == 10 && g.FlipAsked();
+            const auto shown = drive(g, 10, t, on);
+            Check("minimap scale: a flip asked for in bars-off mode waits for the radar to show, then is exactly one big-radar on, off pair (and no SETUP_HEALTH_ARMOUR)",
+                  waiting && shown[0] == BarsAction::RefreshOn && shown[1] == BarsAction::RefreshOff && Count(shown, BarsAction::None) == 8 && g.Counters().refreshOn == 1
+                      && g.Counters().refreshOff == 1 && !g.FlipAsked() && !g.BigmapOn(),
+                  Names(shown));
+        }
+        {
+            // Default mode, per-entry flip still owed (the sizes are written before the entry): the ask is absorbed, one flip in total.
+            BarsGate g;
+            BarsInputs on;
+            on.radarOn = true;
+            on.haveHandle = true;
+            on.loaded = true;
+            g.RequestFlip();
+            double t = 0;
+            const auto v = Drive(g, 30, t, on);
+            Check("minimap scale: in the default mode the ask made before the per-entry flip is absorbed by it (one flip, not two), SETUP_HEALTH_ARMOUR follows as before",
+                  !g.FlipAsked() && Count(v, BarsAction::RefreshOn) == 1 && Count(v, BarsAction::RefreshOff) == 1 && Count(v, BarsAction::Setup) == 28, Names(v));
+        }
+        {
+            // Default mode, the entry's flip done: a later change (the game reset the table and we wrote it again) asks for one more.
+            BarsGate g;
+            BarsInputs on;
+            on.radarOn = true;
+            on.haveHandle = true;
+            on.loaded = true;
+            double t = 0;
+            Drive(g, 20, t, on);
+            g.RequestFlip();
+            const auto v = Drive(g, 5, t, on);
+            Check("minimap scale: in the default mode a later ask (the table was written again) is one more flip, then SETUP_HEALTH_ARMOUR resumes",
+                  g.FlipAsked() == false && v[0] == BarsAction::RefreshOn && v[1] == BarsAction::RefreshOff && v[2] == BarsAction::Setup && g.Counters().refreshOn == 2
+                      && g.Counters().refreshOff == 2,
+                  Names(v));
+        }
+        {
+            // Bars setup-only mode (minimap_bars=2): no per-entry flip, so the ask is honoured.
+            BarsGate g;
+            g.SetMode(BarsMode::Setup);
+            BarsInputs on;
+            on.radarOn = true;
+            on.haveHandle = true;
+            on.loaded = true;
+            double t = 0;
+            Drive(g, 5, t, on);
+            g.RequestFlip();
+            const auto v = Drive(g, 5, t, on);
+            Check("minimap scale: in bars setup-only mode the ask is honoured: one flip pair, the setup calls go on", v[0] == BarsAction::RefreshOn && v[1] == BarsAction::RefreshOff
+                  && Count(v, BarsAction::Setup) == 3 && g.Counters().refreshOn == 1, Names(v));
+        }
+
+        minimapsizetest::RunPure();
+        minimapsizetest::RunDump();
     }
 
 } // namespace minimaptest

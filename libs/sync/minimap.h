@@ -119,6 +119,17 @@ namespace gage::sync {
             lastRequestMs_ = -1e18;
         }
 
+        // 0.4.25: the radar's component sizes changed under the movie (minimap_scale): the "minimap" component is only re-read by the movie on a
+        // big-radar flip. In the default mode the per-entry flip (after the movie loads, which is after the sizes are written) does it, so the ask is
+        // absorbed while that flip is still owed; in every other mode one flip is issued as soon as the radar shows. Independent of Reset().
+        void RequestFlip()
+        {
+            if (mode_ == BarsMode::SetupRefresh && !refreshDone_)
+                return;
+            flipAsked_ = true;
+        }
+        bool FlipAsked() const { return flipAsked_; }
+
         BarsAction Next(const BarsInputs& in, double nowMs)
         {
             // The flip's second half is not optional: a radar left in big mode is worse than a bar left on screen.
@@ -127,6 +138,13 @@ namespace gage::sync {
                 bigmapOn_ = false;
                 ++stats_.refreshOff;
                 return BarsAction::RefreshOff;
+            }
+            if (flipAsked_ && in.radarOn)
+            {
+                flipAsked_ = false;
+                bigmapOn_ = true;
+                ++stats_.refreshOn;
+                return BarsAction::RefreshOn;
             }
             if (mode_ == BarsMode::Off || !in.radarOn)
                 return BarsAction::None;
@@ -157,6 +175,7 @@ namespace gage::sync {
     private:
         BarsMode mode_ = BarsMode::SetupRefresh;
         bool bigmapOn_ = false;     // SET_BIGMAP_ACTIVE(true) issued, the OFF not yet
+        bool flipAsked_ = false;    // RequestFlip(): one flip owed as soon as the radar shows (any mode)
         bool refreshDone_ = false;  // the flip finished for this entry
         double lastRequestMs_ = -1e18;
         Stats stats_;
@@ -187,17 +206,30 @@ namespace gage::sync {
         return safeZone;
     }
 
+    // 0.4.25 minimap_scale (libs/sync/minimap_size.h): the radar's three components are shrunk about the safe-zone's bottom-left corner,
+    // so the rectangle below keeps its left edge and bottom edge and loses width and height by the factor. The factor the engine passes is the
+    // one the game's table really holds (1.0 until the write was read back), never the one asked for.
+    constexpr float kRadarScaleMin = 0.5f, kRadarScaleMax = 1.0f;
+    inline float ClampRadarScale(float s)
+    {
+        if (!(s == s))
+            return 1.0f;                        // NaN: untouched
+        return s < kRadarScaleMin ? kRadarScaleMin : (s > kRadarScaleMax ? kRadarScaleMax : s);
+    }
+
     // The radar's rectangle (the FiveM "minimap anchor" formula): its width is a quarter of the screen HEIGHT, its height
     // 1 / 5.674 of it, and it sits at the bottom-left, inset by 5 % of the screen per tenth of safe-zone shrink. padFrac grows
-    // the rectangle on every side by that fraction of the screen height (the gutter we keep clear).
-    inline ScreenRect RadarKeepOut(float displayW, float displayH, float safeZone, bool safeZoneOk, float padFrac)
+    // the rectangle on every side by that fraction of the screen height (the gutter we keep clear). scale (0.5..1, default 1 = the
+    // game's own size) shrinks width and height about the bottom-left corner; the padding is added after the shrink.
+    inline ScreenRect RadarKeepOut(float displayW, float displayH, float safeZone, bool safeZoneOk, float padFrac, float scale = 1.0f)
     {
         ScreenRect r;
         if (!(displayW > 0.0f) || !(displayH > 0.0f))
             return r;
         const float sz = SafeZoneClamped(safeZone, safeZoneOk);
+        const float sc = ClampRadarScale(scale);
         const float inset = 0.05f * std::fabs(sz - 1.0f) * 10.0f;   // fraction of the width / height
-        const float w = displayH / 4.0f, h = displayH / 5.674f;
+        const float w = displayH / 4.0f * sc, h = displayH / 5.674f * sc;
         const float left = displayW * inset, bottom = displayH - displayH * inset;
         const float pad = displayH * padFrac;
         r.x0 = left - pad;
