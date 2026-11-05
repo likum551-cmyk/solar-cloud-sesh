@@ -668,6 +668,9 @@ namespace gage::game {
         // no_sp_scripts: FiveM JustNoScript -- GtaThread::Tick becomes a no-op so no stock
         // (singleplayer) script ever executes. 1 = on (default), 0 = off.
         int       noSpScripts = 1;
+        // nosp_known_rva (0.4.21): when the Tick signature matches more than once, hook the hit at the RVA proven
+        // live for this build (apps/engine/nosp_pick.h). 1 = on (default), 0 = the old unique-only rule.
+        int       noSpKnownRva = 1;
 
         // -- per-frame hook --------------------------------------------------
         // Hook D3D11 Present so `onTick` runs every frame on the main/render

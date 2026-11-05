@@ -220,6 +220,9 @@ namespace {
         world.noSpScripts = (reg::Get(L"no_sp_scripts") == L"0") ? 0 : 1;
         GLOGI("gage_mp: stock scripts %s", world.noSpScripts ? "OFF (no_sp_scripts=1, FiveM JustNoScript)"
                                                              : "on (no_sp_scripts=0)");
+        world.noSpKnownRva = (reg::Get(L"nosp_known_rva") == L"0") ? 0 : 1;
+        GLOGI("gage_mp: nosp_known_rva=%d (0.4.21: an ambiguous GtaThread::Tick signature %s)", world.noSpKnownRva,
+              world.noSpKnownRva ? "uses the hit at the RVA proven live for this build" : "is refused, as before");
         // Before game::Init (which arms skip_landing): the DLC vehicle array is sized when the Story session starts.
         // Undecided (gameconfig not parsed or the code still packed): retry off-thread every 100 ms for up to 2 min;
         // pack_stream's Tick ends the retry once the player is in the world.

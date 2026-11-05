@@ -20,6 +20,7 @@
 #include "sp_scripts.h"
 #include "net_guard.h"
 #include "present_hook.h"
+#include "nosp_pick.h"
 
 #include <windows.h>
 #include <cmath>
@@ -1003,6 +1004,10 @@ struct BuildProfile {
     // moment its code decrypts. 0.4.11 hooked it 3 s into the process, before one script had ticked, and the game
     // died with 0xC0000005 a few seconds after its first frame (twice). Legacy keeps the early hook (false).
     bool               noSpAfterBoot;
+    // The RVA GtaThread::Tick was PROVEN at in a live run of this build (0 = none). When the signature matches more
+    // than once (0.4.20 Legacy: 3 hits for whole sessions), the hit at this RVA is hooked (nosp_pick.h); otherwise
+    // an ambiguous signature is still refused.
+    uint64_t           gtaThreadTickRva;
 };
 
 const BuildProfile kProfile3889 = {
@@ -1018,6 +1023,7 @@ const BuildProfile kProfile3889 = {
     0, 0, 0, 0,                                                        // Enhanced-only fields: unused on Legacy (bucketed path)
     nullptr, 0, 0,                                                     // gtaThreadTickSig / fn offset / state offset: Legacy uses its own pattern in noSpInstall
     false,                                                             // noSpAfterBoot: Legacy hooks Tick as soon as it decrypts (proven live)
+    0xa64738,                                                          // gtaThreadTickRva: gage.log 2026-11-05 08:35:22, unique hit, "stock scripts OFF"
 };
 
 // Enhanced build 1158.13, DX12. Every value here was derived from the friend's
@@ -1067,6 +1073,7 @@ const BuildProfile kProfile1158 = {
     // the game died with 0xC0000005 a few seconds after its first frame, twice; 0.4.10 (no hook, engine attached at
     // ~26 s) ran 144 s. The no-op now lands once main_persistent is live, i.e. after the stock boot created the player.
     true,
+    0,                                                                 // gtaThreadTickRva: none proven live on Enhanced yet
 };
 
 // Selected in Init() by main-module file name; defaults to Legacy so the live
@@ -1142,6 +1149,7 @@ static int  g_netProbe = 0;
 static bool g_buildMatched = false;
 static int  g_noSpScripts = 0;           // no_sp_scripts=1: FiveM JustNoScript (GtaThread::Tick no-op)
 static bool g_noSpInstalled = false;     // installer finished (hooked, or gave up)
+static bool g_noSpKnownRva = true;       // nosp_known_rva (default on): an ambiguous Tick signature may use the proven RVA
 static bool g_noSpActive = false;        // GtaThread::Tick is actually hooked
 // Set in Init from World::enhDump: write the decrypted image on an unported
 // build (see tryDumpDecryptedImage). Defined here so Init (above the dump code)
@@ -1371,6 +1379,26 @@ int countPat(const uint8_t* base, size_t size, const char* sig, const uint8_t** 
         bool ok = true;
         for (size_t i = 0; i < L; ++i) if (mask[i] && p[i] != bytes[i]) { ok = false; break; }
         if (ok) { if (firstOut && !*firstOut) *firstOut = p; if (++count >= 1000) break; }
+    }
+    return count;
+}
+
+// Every hit of a pattern in one pass: keeps the first `cap` in `out` (address order), returns how many there are in
+// all (at most 1000, like countPat; -1 = malformed pattern). noSpInstall uses it to choose among several Tick hits.
+int findAllPat(const uint8_t* base, size_t size, const char* sig, const uint8_t** out, size_t cap, size_t* kept) {
+    std::vector<uint8_t> bytes, mask;
+    *kept = 0;
+    if (!parsePat(sig, bytes, mask)) return -1;
+    size_t L = bytes.size();
+    if (L == 0 || L > size) return 0;
+    const uint8_t* end = base + size - L;
+    int count = 0;
+    for (const uint8_t* p = base; p <= end; ++p) {
+        bool ok = true;
+        for (size_t i = 0; i < L; ++i) if (mask[i] && p[i] != bytes[i]) { ok = false; break; }
+        if (!ok) continue;
+        if (*kept < cap) out[(*kept)++] = p;
+        if (++count >= 1000) break;
     }
     return count;
 }
@@ -2825,23 +2853,59 @@ bool noSpInstall() {
         }
         return false;
     }
-    uint8_t* m = netFindUnique("gtaThreadTick", sig);
-    if (!m) {
+    // Every hit, then nosp_pick.h decides: one hit = the old rule; several = only the one at the RVA proven live for
+    // this build (0.4.20: 3 hits for whole Legacy sessions, so the unique-only rule never hooked and the stock scripts
+    // took the spawn over); anything else is refused and waited on as before.
+    const uint8_t* hits[gage::nosp::kMaxTickCandidates] = {};
+    size_t kept = 0;
+    const int total = findAllPat(g_imageBase, g_imageSize, sig, hits, gage::nosp::kMaxTickCandidates, &kept);
+    uint64_t rvas[gage::nosp::kMaxTickCandidates] = {};
+    for (size_t i = 0; i < kept; ++i) rvas[i] = (uint64_t)((hits[i] + fnOffset) - g_imageBase);
+    const gage::nosp::TickChoice pick = gage::nosp::ChooseTick(rvas, kept, total > 0 ? (size_t)total : 0,
+                                                               g_build->gtaThreadTickRva, g_noSpKnownRva);
+    if (total > 1) {
+        // Once per launch: what every hit looks like, so a log says what the other matches are.
+        static bool listed = false;
+        if (!listed) {
+            listed = true;
+            GLOGW("hook: [nosp] GtaThread::Tick signature: %d hits (proven RVA +0x%llx, nosp_known_rva=%d) -> %s",
+                  total, (unsigned long long)g_build->gtaThreadTickRva, g_noSpKnownRva ? 1 : 0,
+                  gage::nosp::TickPickName(pick.how));
+            for (size_t i = 0; i < kept; ++i) {
+                const uint8_t* f = hits[i] + fnOffset;
+                char hx[24 * 3 + 1] = {};
+                for (int b = 0; b < 24; ++b) snprintf(hx + b * 3, 4, "%02x ", f[b]);
+                GLOGW("hook: [nosp]   hit %zu: fn +0x%llx%s: %s", i + 1, (unsigned long long)rvas[i],
+                      (int)i == pick.index ? " (hooked)" : "", hx);
+            }
+        }
+    }
+    if (pick.how != gage::nosp::TickPick::Unique && pick.how != gage::nosp::TickPick::KnownRva) {
         const ULONGLONG now = GetTickCount64();
         switch (codeWaitStep(g_noSpWait, now)) {
         case CodeWait::GiveUp:
-            GLOGW("hook: [nosp] GtaThread::Tick pattern not found after 120 s; stock scripts keep running");
+            if (total > 1)
+                GLOGW("hook: [nosp] GtaThread::Tick signature still has %d hits and none at the proven RVA after 120 s; "
+                      "stock scripts keep running (the hits are listed above)", total);
+            else
+                GLOGW("hook: [nosp] GtaThread::Tick pattern not found after 120 s; stock scripts keep running");
             return true;
         case CodeWait::WaitLog:
-            GLOGW("hook: [nosp] waiting for GtaThread::Tick to decrypt (%llu s)",
-                  (unsigned long long)((now - g_noSpWait.first) / 1000));
+            if (total > 1)
+                GLOGW("hook: [nosp] GtaThread::Tick signature ambiguous (%d hits, none at the proven RVA) (%llu s)",
+                      total, (unsigned long long)((now - g_noSpWait.first) / 1000));
+            else
+                GLOGW("hook: [nosp] waiting for GtaThread::Tick to decrypt (%llu s)",
+                      (unsigned long long)((now - g_noSpWait.first) / 1000));
             break;
         case CodeWait::Wait:
             break;
         }
         return false;
     }
-    uint8_t* fn = m + fnOffset;
+    uint8_t* fn = (uint8_t*)hits[pick.index] + fnOffset;
+    GLOGI("hook: [nosp] GtaThread::Tick chosen by %s (%d hit(s)): fn +0x%llx",
+          gage::nosp::TickPickName(pick.how), total, (unsigned long long)rvas[pick.index]);
     g_threadStateOff = g_build->threadStateOff ? g_build->threadStateOff : g_build->threadId + 8;
     char hex[16 * 3 + 1] = {};
     for (int i = 0; i < 16; ++i) snprintf(hex + i * 3, 4, "%02x ", fn[i]);
@@ -2864,7 +2928,10 @@ bool noSpInstall() {
 // scripts OFF" is never a claim about the wrong function. Runs from the poller until it has looked once or 120 s
 // have passed; nothing here touches the game thread.
 void noSpVerifyTick() {
-    if (!g_noSpActive || g_noSpVerified || !g_build->gtaThreadTickSig) return;
+    // Legacy (no profile signature) runs it too, LOG ONLY: run_script_threads' slot index is derived on Enhanced, so on
+    // Legacy a mismatch is evidence for the next round, never a reason to patch another function.
+    if (!g_noSpActive || g_noSpVerified) return;
+    const bool mayHookSlot = g_build->gtaThreadTickSig != nullptr;
     static ULONGLONG firstTry = 0;
     const ULONGLONG now = GetTickCount64();
     if (!firstTry) firstTry = now;
@@ -2893,6 +2960,10 @@ void noSpVerifyTick() {
           (unsigned long long)(g_noSpTickFn - g_imageBase), tick == g_noSpTickFn ? "MATCH" : "MISMATCH");
     if (tick == g_noSpTickFn) return;
     if (!inImage) return;
+    if (!mayHookSlot) {
+        GLOGW("hook: [nosp] vtable cross-check (Legacy, log only): slot 3 is not the hooked Tick; nothing else patched");
+        return;
+    }
     if (netJump(tick, (void*)&noScriptTick))
         GLOGW("hook: [nosp] the signature hooked the wrong function; the vtable's slot 3 is hooked as well");
     else
@@ -6244,6 +6315,7 @@ void gage::game::Init(World& w) {
     g_netHost = w.netHost;
     g_netProbe = w.netProbe;
     g_noSpScripts = w.noSpScripts;
+    g_noSpKnownRva = w.noSpKnownRva != 0;
 
     // Import-table hooks on the game's own ws2_32/wininet imports (net_guard.h), as early as
     // possible. net_host=1 -> GUARD (S0: Rockstar hosts resolve to loopback, unknown non-loopback
@@ -7174,7 +7246,7 @@ static void pollCodePatches() {
 
 static bool codePatchesPending() {
     return (g_noSpScripts && !g_noSpInstalled) ||
-           (g_noSpActive && !g_noSpVerified && g_build->gtaThreadTickSig) ||
+           (g_noSpActive && !g_noSpVerified) ||
            (g_skipLanding && !g_landingPatched && g_build->landingPageSig) ||
            (g_netHost && !g_netHostInstalled);
 }

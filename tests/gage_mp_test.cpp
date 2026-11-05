@@ -5,6 +5,7 @@
 #include "../apps/engine/gage_mp.cpp"  // the TU itself, so its internals are reachable
 
 #include "../apps/engine/quit_gate.h"
+#include "../apps/engine/nosp_pick.h"
 #define T5_WITH_WORLD
 #include "t5_ambient_tests.h"   // T5 ambient: the World wrappers' counters and the hash-0 sentinels
 
@@ -147,7 +148,35 @@ int main() {
         Check("T5: the world checks ran", ran == t5::kWorldChecks, std::to_string(ran).c_str());
     }
 
-    const int expected = 18 + t5::kWorldChecks + 1;   // + T5 ambient (RunWorld and its own count check)
+    // no_sp_scripts: which GtaThread::Tick hit gets hooked (apps/engine/nosp_pick.h; 0.4.20 Legacy: 3 hits, never hooked)
+    {
+        using namespace gage::nosp;
+        const uint64_t kProven = 0xa64738;
+        const uint64_t three[3] = {0x512340, kProven, 0x1c0de00};
+        const uint64_t threeNoProven[3] = {0x512340, 0x800000, 0x1c0de00};
+        const uint64_t one[1] = {0x777000};
+        const uint64_t twice[2] = {kProven, kProven};
+        TickChoice c = ChooseTick(three, 0, 0, kProven, true);
+        Check("nosp: no hit -> none", c.how == TickPick::None && c.index == -1);
+        c = ChooseTick(one, 1, 1, kProven, true);
+        Check("nosp: one hit -> unique, hooked even off the proven RVA (the old rule)", c.how == TickPick::Unique && c.index == 0);
+        c = ChooseTick(three, 3, 3, kProven, true);
+        Check("nosp: 3 hits, one at the proven RVA -> that one", c.how == TickPick::KnownRva && c.index == 1);
+        c = ChooseTick(threeNoProven, 3, 3, kProven, true);
+        Check("nosp: 3 hits, none at the proven RVA -> refused", c.how == TickPick::Ambiguous && c.index == -1);
+        c = ChooseTick(three, 3, 3, kProven, false);
+        Check("nosp: nosp_known_rva=0 -> 3 hits refused (old rule)", c.how == TickPick::Ambiguous && c.index == -1);
+        c = ChooseTick(three, 3, 3, 0, true);
+        Check("nosp: no proven RVA for the build (Enhanced) -> refused", c.how == TickPick::Ambiguous && c.index == -1);
+        c = ChooseTick(three, 3, 12, kProven, true);
+        Check("nosp: more hits than kept -> refused even with the proven one kept", c.how == TickPick::Ambiguous);
+        c = ChooseTick(twice, 2, 2, kProven, true);
+        Check("nosp: the proven RVA twice -> refused", c.how == TickPick::Ambiguous && c.index == -1);
+        c = ChooseTick(one, 1, 2, kProven, true);
+        Check("nosp: one kept of two counted -> not unique", c.how == TickPick::Ambiguous);
+    }
+
+    const int expected = 18 + t5::kWorldChecks + 1 + 9;   // + T5 ambient (RunWorld and its own count check) + nosp pick
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
