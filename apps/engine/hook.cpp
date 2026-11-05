@@ -842,6 +842,12 @@ const HashMapping kCrossmap3889[] = {
     {native::SET_VEHICLE_CHEAT_POWER_INCREASE,            0xF1C985BBEC6B6321},
     {native::SET_VEHICLE_MAX_SPEED,                       0x8E9B5F00B41A9F8C},
     {native::GET_VEHICLE_ESTIMATED_MAX_SPEED,             0x66C1D6E6DBF7AC9B},
+    // Hyper tune handling (the Dubsta, 2026-11-04): YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced by name; public hashes in hook.h.
+    {native::SET_VEHICLE_STRONG,                          0xD05AF216D970F274},
+    {native::SET_VEHICLE_HAS_STRONG_AXLES,                0x5FE0938FDE9B0958},
+    {native::SET_VEHICLE_TYRES_CAN_BURST,                 0x439C904840715871},
+    {native::SET_VEHICLE_WHEELS_CAN_BREAK,                0x72241E9BCAEB0F8B},
+    {native::IS_ENTITY_IN_AIR,                            0x3F18810075C77D41},
     // 0.4.4 (W11): lookup tool, public and 3889 agree.
     {native::TASK_GO_TO_ENTITY,                           0xAB3658A740EED98E},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
@@ -5605,6 +5611,32 @@ float World::GetVehicleEstimatedMaxSpeed(int32_t veh) {
     return f;
 }
 
+// Hyper tune handling (the Dubsta, libs/sync/hypertune.h): four (vehicle, BOOL) setters and one BOOL getter.
+bool World::SetVehicleStrong(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_STRONG, veh, on);
+}
+
+bool World::SetVehicleHasStrongAxles(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_HAS_STRONG_AXLES, veh, on);
+}
+
+bool World::SetVehicleTyresCanBurst(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_TYRES_CAN_BURST, veh, on);
+}
+
+bool World::SetVehicleWheelsCanBreak(int32_t veh, bool on) {
+    return callPedToggle(*this, native::SET_VEHICLE_WHEELS_CAN_BREAK, veh, on);
+}
+
+bool World::IsEntityInAir(int32_t handle, bool& inAir) {
+    if (!handle) return false;
+    uint64_t arg[] = { (uint64_t)(uint32_t)handle };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_ENTITY_IN_AIR, arg, 1, r)) return false;   // false here is "could not call", not "on the ground"
+    inAir = (uint32_t)r[0] != 0;
+    return true;
+}
+
 bool World::GetVehicleLightsState(int32_t veh, bool& lightsOn, bool& highbeamsOn) {
     if (!veh) return false;
     // GET_VEHICLE_LIGHTS_STATE(vehicle, BOOL* lightsOn, BOOL* highbeamsOn): zeroed 8-byte slots, low
@@ -6224,6 +6256,11 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_VEHICLE_CHEAT_POWER_INCREASE),
         GAGE_NEW_NATIVE(SET_VEHICLE_MAX_SPEED),
         GAGE_NEW_NATIVE(GET_VEHICLE_ESTIMATED_MAX_SPEED),
+        GAGE_NEW_NATIVE(SET_VEHICLE_STRONG),
+        GAGE_NEW_NATIVE(SET_VEHICLE_HAS_STRONG_AXLES),
+        GAGE_NEW_NATIVE(SET_VEHICLE_TYRES_CAN_BURST),
+        GAGE_NEW_NATIVE(SET_VEHICLE_WHEELS_CAN_BREAK),
+        GAGE_NEW_NATIVE(IS_ENTITY_IN_AIR),
         GAGE_NEW_NATIVE(GET_VEHICLE_LIGHTS_STATE),
         GAGE_NEW_NATIVE(SET_VEHICLE_FULLBEAM),
         GAGE_NEW_NATIVE(SET_VEHICLE_INTERIORLIGHT),

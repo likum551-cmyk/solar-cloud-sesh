@@ -70,10 +70,12 @@
 #include "vehsim.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -916,6 +918,463 @@ static void TestW6() {
     }
 }
 
+// ---- hyper tune, part 2: the per-model profiles and the driving assists (GI 2026-11-04: /car dubsta) -----------
+// Pure numbers: HyperAssistStep is the whole of what the engine writes each frame. The engine's native calls (strong body,
+// the velocity read-back) are not testable here; the log lines in apps/engine/engine.cpp are their proof in a live run.
+namespace hypertest {
+    // A level car going `speedMs` along its nose (+y), a wheel on the road, no slide, no yaw, nothing pressed.
+    static HyperAssistIn Level(double speedMs, uint32_t mask, double dt = 1.0 / 60.0) {
+        HyperAssistIn in;
+        in.vel = { 0.0f, (float)speedMs, 0.0f };
+        in.fwd = { 0.0f, 1.0f, 0.0f };
+        in.right = { 1.0f, 0.0f, 0.0f };
+        in.up = { 0.0f, 0.0f, 1.0f };
+        in.angVel = { 0.0f, 0.0f, 0.0f };
+        in.dt = (float)dt;
+        in.grounded = true;
+        in.mask = mask;
+        return in;
+    }
+    // Rolled by `deg` about the nose: right and up tilt in the x-z plane (up.x = -sin, up.z = cos).
+    static void Bank(HyperAssistIn& in, double deg) {
+        const double s = std::sin(deg * kPi / 180.0), c = std::cos(deg * kPi / 180.0);
+        in.right = { (float)c, 0.0f, (float)s };
+        in.up = { (float)-s, 0.0f, (float)c };
+    }
+    static HyperVec Sub(const HyperVec& a, const HyperVec& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+    static double Norm3(const HyperVec& a) { return std::sqrt((double)a.x * a.x + (double)a.y * a.y + (double)a.z * a.z); }
+    static bool Same(const HyperVec& a, const HyperVec& b) { return std::memcmp(&a, &b, sizeof(HyperVec)) == 0; }   // bit for bit (NaN included)
+    static bool Unchanged(const HyperAssistIn& in, const HyperAssistOut& o) {
+        return Same(o.vel, in.vel) && Same(o.angVel, in.angVel) && !o.velChanged && !o.angChanged && !o.yawClamped;
+    }
+
+    // A slide: the car goes `fwd` m/s along its nose with `side` m/s sideways, fed back frame by frame at `fps`.
+    struct SlideRun { double sec = -1.0, endSide = 0.0; int frames = 0; };
+    static SlideRun Slide(const HyperAssist& a, double fwd, double side, double fps, uint32_t mask, double seconds) {
+        SlideRun r;
+        HyperVec vel = { (float)side, (float)fwd, 0.0f };
+        const int n = (int)std::lround(seconds * fps);
+        for (int i = 0; i < n; ++i) {
+            HyperAssistIn in = Level(0.0, mask, 1.0 / fps);
+            in.vel = vel;
+            vel = HyperAssistStep(a, in).vel;
+            ++r.frames;
+            if (r.sec < 0.0 && std::fabs(vel.x) < 1.0) r.sec = (i + 1) / fps;
+        }
+        r.endSide = vel.x;
+        return r;
+    }
+    // Full brake from `v0` m/s (nothing else pressed) for `seconds`; the speed at the end and the number of frames.
+    static double BrakeRun(const HyperAssist& a, double v0, double fps, double seconds, int& frames) {
+        HyperVec vel = { 0.0f, (float)v0, 0.0f };
+        frames = 0;
+        const int n = (int)std::lround(seconds * fps);
+        for (int i = 0; i < n; ++i) {
+            HyperAssistIn in = Level(0.0, kHyperAssistBrake, 1.0 / fps);
+            in.vel = vel;
+            in.brake = 1.0f;
+            vel = HyperAssistStep(a, in).vel;
+            ++frames;
+        }
+        return Norm3(vel);
+    }
+    // A roll rate of `roll` rad/s (about the world y axis, the level car's nose) and a yaw rate of `yaw`, damped at 100 m/s.
+    static HyperVec TiltRun(const HyperAssist& a, double roll, double yaw, double fps, double seconds, int& frames) {
+        HyperVec w = { 0.0f, (float)roll, (float)yaw };
+        frames = 0;
+        const int n = (int)std::lround(seconds * fps);
+        for (int i = 0; i < n; ++i) {
+            HyperAssistIn in = Level(100.0, kHyperAssistTilt, 1.0 / fps);
+            in.angVel = w;
+            w = HyperAssistStep(a, in).angVel;
+            ++frames;
+        }
+        return w;
+    }
+}
+
+static void TestHyperProfiles() {
+    using namespace hypertest;
+    const HyperProfile* jesko = HyperProfileFor("jesko");
+    const HyperProfile* dubsta = HyperProfileFor("dubsta");
+    if (!jesko || !dubsta) {
+        Check("hyper profile: the jesko and dubsta rows exist", false);
+        return;
+    }
+    const HyperAssist& A = dubsta->assist;
+
+    // -- the Jesko row, pinned: nothing may change in how it drives --
+    Check("hyper profile: the Jesko row is exactly the pre-profile numbers (500 km/h, power x4, +400 % cap, no toughness, no assists)",
+          kHyperTargetKmh == 500.0f && kHyperPower == 4.0f && kHyperMaxPercent == 400.0f && jesko->targetKmh == 500.0f &&
+              jesko->power == 4.0f && !jesko->tough && !jesko->assist.Any() && HyperTargetMs(*jesko) == kHyperTargetMs &&
+              std::fabs(HyperTopSpeedPercent(100.0f) - 38.88889f) < 1e-3f && std::fabs(HyperTopSpeedPercent(50.0f) - 177.7778f) < 1e-2f &&
+              HyperTopSpeedPercent(10.0f) == 400.0f && HyperTopSpeedPercent(150.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f,
+          F("pct(100) %.4f pct(50) %.4f", HyperTopSpeedPercent(100.0f), HyperTopSpeedPercent(50.0f)));
+    HyperAssistIn rich = Level(100.0, kHyperAssistAll);   // a car that every assist would act on: a slide, the pedal, a spin, a roll rate
+    rich.vel.x = 5.0f;
+    rich.brake = 1.0f;
+    rich.angVel = { 2.0f, 1.0f, 1.0f };
+    const HyperAssistOut jo = HyperAssistStep(jesko->assist, rich);
+    const HyperAssistOut dout = HyperAssistStep(A, rich);
+    Check("hyper profile: the Jesko is not touched by any assist (a sliding, braking, spinning car comes back bit for bit), the Dubsta is",
+          Unchanged(rich, jo) && dout.velChanged && dout.angChanged, F("dubsta vel %d ang %d", (int)dout.velChanged, (int)dout.angChanged));
+
+    // -- lookup and table invariants --
+    Check("hyper profile: lookup by /car name finds the row (lower case), nothing for an unknown, mixed-case or empty name or null",
+          HyperProfileFor("jesko") == &kHyperProfiles[0] && HyperProfileFor("dubsta") == &kHyperProfiles[1] && !HyperProfileFor("adder") &&
+              !HyperProfileFor("Dubsta") && !HyperProfileFor("") && !HyperProfileFor(nullptr),
+          "");
+    size_t looked = 0;
+    bool tableOk = kHyperProfileCount == 2;
+    for (size_t i = 0; i < kHyperProfileCount; ++i) {
+        ++looked;
+        const HyperProfile& p = kHyperProfiles[i];
+        tableOk = tableOk && p.model && *p.model && HyperTargetMs(p) > 0.0f && HyperTargetMs(p) <= 150.0f && p.power >= 1.0f;   // 150 m/s: the shipped vehicleMaxSpeed
+        for (const char* c = p.model; c && *c; ++c) tableOk = tableOk && !(*c >= 'A' && *c <= 'Z');
+        for (size_t j = i + 1; j < kHyperProfileCount; ++j) tableOk = tableOk && std::strcmp(p.model, kHyperProfiles[j].model) != 0;
+    }
+    Check("hyper profile: every row has a unique lower-case name, power >= 1 and a target within the server's default 150 m/s cap",
+          tableOk && looked == kHyperProfileCount, F("%zu rows", looked));
+    Check("hyper profile: the Dubsta has the Jesko's acceleration (power) and top speed (500 km/h, inside 400..540), toughness and assists",
+          dubsta->power == jesko->power && dubsta->targetKmh == jesko->targetKmh && dubsta->targetKmh >= 400.0f && dubsta->targetKmh <= 540.0f &&
+              dubsta->tough && dubsta->assist.Any(),
+          F("power %.1f target %.0f", dubsta->power, dubsta->targetKmh));
+    bool pctOk = true;
+    int pcts = 0;
+    for (float est : { 40.0f, 45.0f, 50.0f, 55.0f, 60.0f }) {   // the stock Dubsta is about 45 m/s (160 km/h)
+        const float pct = HyperTopSpeedPercent(est, HyperTargetMs(*dubsta));
+        pctOk = pctOk && pct > 0.0f && pct < kHyperMaxPercent && std::fabs(est * (1.0f + pct / 100.0f) - HyperTargetMs(*dubsta)) < 0.01f;
+        ++pcts;
+    }
+    Check("hyper profile: a stock Dubsta estimate of 40..60 m/s is lifted exactly to the target, not held by the +400 % cap (it binds below 27.8 m/s)",
+          pctOk && pcts == 5 && HyperTopSpeedPercent(27.0f, HyperTargetMs(*dubsta)) == kHyperMaxPercent && HyperTopSpeedPercent(28.5f, HyperTargetMs(*dubsta)) < kHyperMaxPercent,
+          F("%d estimates", pcts));
+
+    // -- downforce --
+    const HyperAssistOut dRef = HyperAssistStep(A, Level(kHyperTargetMs, kHyperAssistDownforce));
+    const HyperAssistOut dHalf = HyperAssistStep(A, Level(kHyperTargetMs * 0.5, kHyperAssistDownforce));
+    const HyperAssistOut dOver = HyperAssistStep(A, Level(kHyperTargetMs * 1.5, kHyperAssistDownforce));
+    Check("hyper assist: downforce is k v^2 (10 m/s^2 at 500 km/h, 2.5 at half the speed), capped at 13, a pull of a*dt along -up",
+          std::fabs(dRef.downMs2 - 10.0f) < 0.01f && std::fabs(dHalf.downMs2 - 2.5f) < 0.01f && std::fabs(dOver.downMs2 - 13.0f) < 0.01f &&
+              std::fabs(dRef.vel.z - (-10.0f / 60.0f)) < 1e-4f && dRef.vel.x == 0.0f && std::fabs(dRef.vel.y - kHyperTargetMs) < 1e-3f,
+          F("ref %.3f half %.3f over %.3f vz %.5f", dRef.downMs2, dHalf.downMs2, dOver.downMs2, dRef.vel.z));
+    HyperAssistIn tilted = Level(100.0, kHyperAssistDownforce);
+    Bank(tilted, 25.0);
+    const HyperAssistOut tOut = HyperAssistStep(A, tilted);
+    const double tAd = 10.0 * std::pow(100.0 / kHyperTargetMs, 2.0);
+    const HyperVec tD = Sub(tOut.vel, tilted.vel);
+    Check("hyper assist: on a banked car the downforce pulls along the car's own -up, not the world's",
+          std::fabs(tD.x - (-tilted.up.x * tAd / 60.0)) < 1e-4 && std::fabs(tD.z - (-tilted.up.z * tAd / 60.0)) < 1e-4 && std::fabs(tD.y) < 1e-5 &&
+              std::fabs(tD.x) > 0.01,
+          F("d (%.5f %.5f %.5f) want x %.5f", tD.x, tD.y, tD.z, -tilted.up.x * tAd / 60.0));
+    HyperAssistIn air = Level(kHyperTargetMs, kHyperAssistDownforce);
+    air.grounded = false;
+    HyperAssistIn inverted = Level(kHyperTargetMs, kHyperAssistDownforce);
+    inverted.right = { -1.0f, 0.0f, 0.0f };
+    inverted.up = { 0.0f, 0.0f, -1.0f };
+    HyperAssistIn onSide = Level(kHyperTargetMs, kHyperAssistDownforce);
+    Bank(onSide, 70.0);
+    HyperAssistIn banked50 = Level(kHyperTargetMs, kHyperAssistDownforce);
+    Bank(banked50, 50.0);
+    const HyperAssistIn maskedOut = Level(kHyperTargetMs, kHyperAssistAll & ~kHyperAssistDownforce);
+    Check("hyper assist: no downforce in the air, upside down, on its side (up.z < 0.5) or with the bit off; still on at 50 degrees of bank",
+          Unchanged(air, HyperAssistStep(A, air)) && Unchanged(inverted, HyperAssistStep(A, inverted)) && Unchanged(onSide, HyperAssistStep(A, onSide)) &&
+              Unchanged(maskedOut, HyperAssistStep(A, maskedOut)) && HyperAssistStep(A, banked50).downMs2 > 9.0f,
+          "");
+
+    // -- lateral grip --
+    HyperAssistIn gp = Level(0.0, kHyperAssistGrip);
+    gp.vel = { 6.0f, 60.0f, 0.0f };
+    HyperAssistIn gn = gp;
+    gn.vel.x = -6.0f;
+    HyperAssistIn gs = gp;
+    gs.vel.x = 2.0f;
+    const HyperAssistOut go = HyperAssistStep(A, gp), gno = HyperAssistStep(A, gn), gso = HyperAssistStep(A, gs);
+    Check("hyper assist: grip removes the slide at 22 m/s^2 when that is the limit (6 m/s), at 5 /s below it (2 m/s), either side, the nose speed untouched",
+          std::fabs(go.vel.x - (6.0f - 22.0f / 60.0f)) < 1e-4f && std::fabs(gno.vel.x + (6.0f - 22.0f / 60.0f)) < 1e-4f &&
+              go.vel.y == 60.0f && go.vel.z == 0.0f && std::fabs(go.gripMs2 - 22.0f) < 1e-3f &&
+              std::fabs(gso.vel.x - (2.0f - 10.0f / 60.0f)) < 1e-4f && std::fabs(gso.gripMs2 - 10.0f) < 1e-3f,
+          F("+6 -> %.4f, -6 -> %.4f, +2 -> %.4f", go.vel.x, gno.vel.x, gso.vel.x));
+    const double v30 = 30.0, v9 = 9.0;
+    HyperAssistIn r30 = Level(0.0, kHyperAssistGrip);
+    r30.vel = { 6.0f, (float)std::sqrt(v30 * v30 - 36.0), 0.0f };
+    HyperAssistIn r9 = Level(0.0, kHyperAssistGrip);
+    r9.vel = { 6.0f, (float)std::sqrt(v9 * v9 - 36.0), 0.0f };
+    const HyperAssistOut r30o = HyperAssistStep(A, r30);
+    Check("hyper assist: grip fades in with speed (half the cap at 30 m/s, nothing at 9 m/s)",
+          std::fabs(r30o.gripMs2 - 11.0f) < 0.05f && Unchanged(r9, HyperAssistStep(A, r9)), F("30 m/s %.3f", r30o.gripMs2));
+    HyperAssist hardGrip = A;
+    hardGrip.gripRate = 100.0f;                               // a rate that would overshoot zero in a single frame
+    HyperAssistIn os = Level(0.0, kHyperAssistGrip, 1.0 / 30.0);
+    os.vel = { 0.5f, 60.0f, 0.0f };
+    HyperAssistIn osn = os;
+    osn.vel.x = -0.5f;
+    const HyperAssistOut oso = HyperAssistStep(hardGrip, os), osno = HyperAssistStep(hardGrip, osn);
+    Check("hyper assist: grip never overshoots past zero slide (a 0.5 m/s slide ends at 0, not on the other side), either sign",
+          std::fabs(oso.vel.x) < 1e-6f && std::fabs(osno.vel.x) < 1e-6f, F("%.5f / %.5f", oso.vel.x, osno.vel.x));
+    const SlideRun s30 = Slide(A, 100.0, 8.0, 30.0, kHyperAssistGrip, 1.0);
+    const SlideRun s60 = Slide(A, 100.0, 8.0, 60.0, kHyperAssistGrip, 1.0);
+    const SlideRun s144 = Slide(A, 100.0, 8.0, 144.0, kHyperAssistGrip, 1.0);
+    const SlideRun sOff = Slide(A, 100.0, 8.0, 60.0, 0, 1.0);
+    const double sMax = std::max(s30.sec, std::max(s60.sec, s144.sec)), sMin = std::min(s30.sec, std::min(s60.sec, s144.sec));
+    Check("hyper assist: an 8 m/s slide at 100 m/s is gone (<1 m/s) in 0.35..0.6 s at 30, 60 and 144 fps within 0.08 s of each other; assists off, it stays",
+          s30.frames == 30 && s60.frames == 60 && s144.frames == 144 && sMin > 0.35 && sMax < 0.6 && sMax - sMin < 0.08 &&
+              sOff.frames == 60 && sOff.sec < 0.0 && sOff.endSide == 8.0,
+          F("30 fps %.3f s, 60 fps %.3f s, 144 fps %.3f s, off end %.2f", s30.sec, s60.sec, s144.sec, sOff.endSide));
+
+    // -- brake assist --
+    HyperAssistIn br = Level(80.0, kHyperAssistBrake);
+    br.brake = 1.0f;
+    HyperAssistIn brHalf = br;
+    brHalf.brake = 0.5f;
+    HyperAssistIn brDiag = br;
+    const float diag = std::sqrt(0.5f);
+    brDiag.fwd = { diag, diag, 0.0f };
+    brDiag.right = { diag, -diag, 0.0f };
+    brDiag.vel = { 80.0f * diag, 80.0f * diag, 0.0f };
+    const HyperAssistOut bo = HyperAssistStep(A, br), bHalf = HyperAssistStep(A, brHalf), bDiag = HyperAssistStep(A, brDiag);
+    Check("hyper assist: the brake assist is 12 m/s^2 at full pedal, 6 at half, along the direction of travel (a diagonal car keeps its heading)",
+          std::fabs(bo.vel.y - (80.0f - 0.2f)) < 1e-4f && std::fabs(bo.brakeMs2 - 12.0f) < 1e-3f && std::fabs(bHalf.brakeMs2 - 6.0f) < 1e-3f &&
+              std::fabs(Norm3(bDiag.vel) - 79.8) < 1e-3 && std::fabs(bDiag.vel.x - bDiag.vel.y) < 1e-4f && bo.vel.x == 0.0f,
+          F("vy %.4f, 12/6 -> %.3f/%.3f, diag |v| %.4f", bo.vel.y, bo.brakeMs2, bHalf.brakeMs2, Norm3(bDiag.vel)));
+    std::string bad;
+    {
+        HyperAssistIn x = br;
+        if (HyperAssistStep(A, x).brakeMs2 <= 0.0f) bad += " control";
+        x = br; x.accel = 0.6f;
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " throttle";
+        x = br; x.brake = 0.03f;
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " light-pedal";
+        x = br; x.vel = { 0.0f, -30.0f, 0.0f };
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " reversing";
+        x = Level(0.0, kHyperAssistBrake); x.brake = 1.0f; x.vel = { 30.0f, 3.0f, 0.0f };   // sliding sideways: 3 m/s along the nose
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " sideways";
+        x = Level(9.0, kHyperAssistBrake); x.brake = 1.0f;
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " no-ramp";
+        x = br; x.grounded = false;
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " airborne";
+        x = br; x.mask = kHyperAssistAll & ~kHyperAssistBrake;
+        if (HyperAssistStep(A, x).brakeMs2 > 0.0f) bad += " bit-off";
+    }
+    Check("hyper assist: no brake assist on the throttle, on a light pedal, reversing, under 5 m/s along the nose, under 10 m/s, airborne or with the bit off",
+          bad.empty(), bad);
+    HyperAssist hardBrake = A;
+    hardBrake.brakeMs2 = 1000.0f;
+    hardBrake.rampFromMs = 0.0f;
+    hardBrake.rampToMs = 1.0f;
+    HyperAssistIn stop = Level(6.0, kHyperAssistBrake, 1.0 / 30.0);
+    stop.brake = 1.0f;
+    const HyperAssistOut stopO = HyperAssistStep(hardBrake, stop);
+    Check("hyper assist: the brake assist stops the car and never reverses it (a 33 m/s^2 shove on a 6 m/s car ends at 0, not -27)",
+          stopO.vel.y >= 0.0f && stopO.vel.y < 1e-5f && stopO.vel.x == 0.0f, F("vy %.6f", stopO.vel.y));
+    int bf30 = 0, bf144 = 0;
+    const double b30 = BrakeRun(A, 80.0, 30.0, 1.0, bf30), b144 = BrakeRun(A, 80.0, 144.0, 1.0, bf144);
+    Check("hyper assist: a second of full brake from 80 m/s costs 12 m/s at 30 and at 144 fps alike",
+          bf30 == 30 && bf144 == 144 && std::fabs(b30 - 68.0) < 0.05 && std::fabs(b144 - 68.0) < 0.05 && std::fabs(b30 - b144) < 0.02,
+          F("30 fps %.4f, 144 fps %.4f", b30, b144));
+
+    // -- the yaw-rate cap --
+    HyperAssistIn yw = Level(100.0, kHyperAssistYaw);
+    yw.angVel = { 0.3f, 0.0f, 0.5f };
+    HyperAssistIn ywn = yw;
+    ywn.angVel.z = -0.5f;
+    HyperAssistIn ywLow = yw;
+    ywLow.angVel.z = 0.1f;
+    const HyperAssistOut yo = HyperAssistStep(A, yw), yno = HyperAssistStep(A, ywn), ylo = HyperAssistStep(A, ywLow);
+    Check("hyper assist: the yaw rate is cut to 22 m/s^2 / speed (0.22 rad/s at 100 m/s), either way; pitch kept; a turn under it is left alone",
+          std::fabs(yo.angVel.z - 0.22f) < 1e-5f && std::fabs(yno.angVel.z + 0.22f) < 1e-5f && yo.angVel.x == 0.3f && yo.yawClamped && yno.yawClamped &&
+              Unchanged(ywLow, ylo),
+          F("+0.5 -> %.4f, -0.5 -> %.4f", yo.angVel.z, yno.angVel.z));
+    HyperAssistIn ywSlow = Level(15.0, kHyperAssistYaw);
+    ywSlow.angVel = { 0.0f, 0.0f, 2.0f };
+    HyperAssistIn ywAir = yw;
+    ywAir.grounded = false;
+    HyperAssistIn ywInv = yw;
+    ywInv.right = { -1.0f, 0.0f, 0.0f };
+    ywInv.up = { 0.0f, 0.0f, -1.0f };
+    HyperAssistIn ywOff = yw;
+    ywOff.mask = kHyperAssistTilt;                             // every bit but the yaw cap
+    ywOff.angVel = { 0.0f, 0.0f, 2.0f };                       // pure yaw: the anti-roll must not touch it either
+    HyperAssistIn ywBank = Level(100.0, kHyperAssistYaw);
+    Bank(ywBank, 20.0);
+    ywBank.angVel = { ywBank.up.x * 0.5f, 0.0f, ywBank.up.z * 0.5f };
+    const HyperAssistOut ywBankO = HyperAssistStep(A, ywBank);
+    Check("hyper assist: no yaw cap under 20 m/s, in the air, upside down or with the bit off; on a banked car the cap is about the car's up axis",
+          Unchanged(ywSlow, HyperAssistStep(A, ywSlow)) && Unchanged(ywAir, HyperAssistStep(A, ywAir)) && Unchanged(ywInv, HyperAssistStep(A, ywInv)) &&
+              Unchanged(ywOff, HyperAssistStep(A, ywOff)) && ywBankO.yawClamped &&
+              std::fabs(ywBankO.angVel.x - ywBank.up.x * 0.22f) < 1e-4f && std::fabs(ywBankO.angVel.z - ywBank.up.z * 0.22f) < 1e-4f,
+          F("banked (%.4f %.4f) want (%.4f %.4f)", ywBankO.angVel.x, ywBankO.angVel.z, ywBank.up.x * 0.22f, ywBank.up.z * 0.22f));
+    int latN = 0;
+    bool latOk = true;
+    for (int speed = 20; speed <= 150; ++speed)                  // 20 m/s (the cap's start) to the server's 150 m/s
+        for (float w : { -3.0f, -1.0f, -0.4f, 0.0f, 0.4f, 1.0f, 3.0f }) {
+            HyperAssistIn in = Level((double)speed, kHyperAssistYaw);
+            in.angVel = { 0.0f, 0.0f, w };
+            const HyperAssistOut o = HyperAssistStep(A, in);
+            const double lat = (double)speed * std::fabs(o.angVel.z);
+            latOk = latOk && lat <= 22.0 + 1e-3 && (std::fabs((double)speed * w) > 22.0 || o.angVel.z == w);
+            ++latN;
+        }
+    Check("hyper assist: from 20 to 150 m/s a full-lock spin (3 rad/s) never exceeds 22 m/s^2 of lateral acceleration, a gentle turn is untouched",
+          latOk && latN == 131 * 7, F("%d cases", latN));
+
+    // -- anti-roll --
+    HyperAssistIn ti = Level(100.0, kHyperAssistTilt);
+    ti.angVel = { 2.0f, 1.0f, 0.3f };
+    HyperAssistIn ti30 = Level(30.0, kHyperAssistTilt);
+    ti30.angVel = ti.angVel;
+    HyperAssistIn ti5 = Level(5.0, kHyperAssistTilt);
+    ti5.angVel = ti.angVel;
+    const HyperAssistOut tio = HyperAssistStep(A, ti), ti30o = HyperAssistStep(A, ti30);
+    const float f100 = std::exp(-3.0f / 60.0f), f30 = std::exp(-3.0f * 0.5f / 60.0f);
+    Check("hyper assist: anti-roll damps pitch and roll by exp(-3 ramp dt) and leaves the yaw rate alone; half strength at 30 m/s, none at 5 m/s",
+          std::fabs(tio.angVel.x - 2.0f * f100) < 1e-4f && std::fabs(tio.angVel.y - 1.0f * f100) < 1e-4f && std::fabs(tio.angVel.z - 0.3f) < 1e-6f &&
+              std::fabs(ti30o.angVel.x - 2.0f * f30) < 1e-4f && Unchanged(ti5, HyperAssistStep(A, ti5)),
+          F("x %.5f (want %.5f) y %.5f z %.6f", tio.angVel.x, 2.0f * f100, tio.angVel.y, tio.angVel.z));
+    int tf30 = 0, tf144 = 0;
+    const HyperVec t30 = TiltRun(A, 4.0, 0.3, 30.0, 0.5, tf30), t144 = TiltRun(A, 4.0, 0.3, 144.0, 0.5, tf144);
+    Check("hyper assist: a 4 rad/s roll is down to 0.89 rad/s in half a second at 30 and at 144 fps alike, the yaw rate unchanged throughout",
+          tf30 == 15 && tf144 == 72 && t30.y > 0.85f && t30.y < 0.93f && t144.y > 0.85f && t144.y < 0.93f && std::fabs(t30.y - t144.y) < 0.01f &&
+              std::fabs(t30.z - 0.3f) < 1e-5f && std::fabs(t144.z - 0.3f) < 1e-5f,
+          F("30 fps %.4f, 144 fps %.4f", t30.y, t144.y));
+
+    // -- bad input, the frame clamp, the mask --
+    HyperAssistIn base = rich;
+    base.dt = 1.0f / 60.0f;
+    std::string badIn;
+    {
+        const float nan = std::nanf(""), inf = INFINITY;
+        if (!HyperAssistStep(A, base).velChanged) badIn += " control";
+        HyperAssistIn x = base; x.vel.y = nan;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " nan-vel";
+        x = base; x.vel.x = inf;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " inf-vel";
+        x = base; x.fwd.y = nan;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " nan-fwd";
+        x = base; x.up.z = inf;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " inf-up";
+        x = base; x.right = { 0.0f, 0.0f, 0.0f };
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " zero-axis";
+        x = base; x.dt = nan;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " nan-dt";
+        x = base; x.dt = 0.0f;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " zero-dt";
+        x = base; x.dt = -0.02f;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " negative-dt";
+        x = base; x.mask = 0;
+        if (!Unchanged(x, HyperAssistStep(A, x))) badIn += " mask-0";
+        x = base; x.angVel.y = nan;                              // a failed angular read: the velocity assists keep working
+        const HyperAssistOut o = HyperAssistStep(A, x);
+        if (!(o.velChanged && !o.angChanged && std::isfinite(o.vel.x) && std::isfinite(o.vel.y) && std::isfinite(o.vel.z))) badIn += " nan-ang";
+    }
+    Check("hyper assist: a NaN or infinite velocity, axis or frame time, a zero axis, dt <= 0 or mask 0 returns the input untouched; a NaN angular read keeps the velocity assists",
+          badIn.empty(), badIn);
+    HyperAssistIn longFrame = base;
+    longFrame.dt = 0.2f;
+    HyperAssistIn clampedFrame = base;
+    clampedFrame.dt = kHyperMaxDt;
+    HyperAssistIn shortFrame = base;
+    const HyperAssistOut lf = HyperAssistStep(A, longFrame), cf = HyperAssistStep(A, clampedFrame), sf = HyperAssistStep(A, shortFrame);
+    Check("hyper assist: a 200 ms hitch is treated as a 33 ms frame (the same result bit for bit), and a 17 ms frame is a smaller step",
+          Same(lf.vel, cf.vel) && Same(lf.angVel, cf.angVel) && lf.velChanged && !Same(sf.vel, cf.vel) &&
+              std::fabs(cf.vel.y - rich.vel.y) > std::fabs(sf.vel.y - rich.vel.y),
+          F("hitch vy %.4f, 33 ms vy %.4f, 17 ms vy %.4f", lf.vel.y, cf.vel.y, sf.vel.y));
+    struct MaskCase { uint32_t bit; const char* name; };
+    std::string maskBad;
+    int maskCases = 0;
+    for (const MaskCase& mc : { MaskCase{ kHyperAssistDownforce, "down" }, MaskCase{ kHyperAssistGrip, "grip" }, MaskCase{ kHyperAssistBrake, "brake" },
+                                MaskCase{ kHyperAssistYaw, "yaw" }, MaskCase{ kHyperAssistTilt, "tilt" } }) {
+        HyperAssistIn x = rich;
+        x.mask = mc.bit;
+        const HyperAssistOut o = HyperAssistStep(A, x);
+        const bool d = o.downMs2 > 0.0f, g = o.gripMs2 > 0.0f, b = o.brakeMs2 > 0.0f;
+        bool ok = false;
+        if (mc.bit == kHyperAssistDownforce) ok = d && !g && !b && !o.angChanged;
+        if (mc.bit == kHyperAssistGrip) ok = !d && g && !b && !o.angChanged;
+        if (mc.bit == kHyperAssistBrake) ok = !d && !g && b && !o.angChanged;
+        if (mc.bit == kHyperAssistYaw) ok = !o.velChanged && o.yawClamped && o.angChanged;
+        if (mc.bit == kHyperAssistTilt) ok = !o.velChanged && !o.yawClamped && o.angChanged;
+        if (!ok) maskBad += std::string(" ") + mc.name;
+        ++maskCases;
+    }
+    Check("hyper assist: each mask bit switches on exactly its own assist (downforce, grip, brake, yaw cap, anti-roll)", maskBad.empty() && maskCases == 5, maskBad);
+
+    // -- bounds: what the engine writes in one frame, over random cars --
+    Rng rng(0x48595045525455ull);
+    int fuzzN = 0, fuzzChanged = 0, fuzzClamped = 0;
+    bool fuzzOk = true;
+    const double dvBound = (13.0 + 22.0 + 12.0) / 30.0 + 1e-3;   // down cap + grip cap + brake, at the 1/30 s frame clamp
+    for (int i = 0; i < 20000; ++i) {
+        auto unit = [&]() {
+            double x, y, z, l;
+            do { x = rng.Range(-1, 1); y = rng.Range(-1, 1); z = rng.Range(-1, 1); l = std::sqrt(x * x + y * y + z * z); } while (l < 0.1);
+            return std::array<double, 3>{ x / l, y / l, z / l };
+        };
+        const auto u = unit();
+        auto r0 = unit();
+        const double d = r0[0] * u[0] + r0[1] * u[1] + r0[2] * u[2];
+        std::array<double, 3> f = { r0[0] - d * u[0], r0[1] - d * u[1], r0[2] - d * u[2] };
+        const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+        if (fl < 1e-3) continue;
+        for (double& c : f) c /= fl;
+        const std::array<double, 3> rt = { f[1] * u[2] - f[2] * u[1], f[2] * u[0] - f[0] * u[2], f[0] * u[1] - f[1] * u[0] };   // right = fwd x up
+        const auto vd = unit();
+        const double speed = rng.Range(0.0, 300.0);
+        HyperAssistIn in;
+        in.vel = { (float)(vd[0] * speed), (float)(vd[1] * speed), (float)(vd[2] * speed) };
+        in.fwd = { (float)f[0], (float)f[1], (float)f[2] };
+        in.right = { (float)rt[0], (float)rt[1], (float)rt[2] };
+        in.up = { (float)u[0], (float)u[1], (float)u[2] };
+        in.angVel = { (float)rng.Range(-5, 5), (float)rng.Range(-5, 5), (float)rng.Range(-5, 5) };
+        in.brake = (float)rng.Range(0, 1);
+        in.accel = (float)rng.Range(0, 1);
+        in.dt = (float)rng.Range(0.0, 0.2);
+        in.grounded = rng.Uniform() < 0.8;
+        in.mask = (uint32_t)(rng.Next() % 32);
+        const HyperAssistOut o = HyperAssistStep(A, in);
+        ++fuzzN;
+        const bool fin = std::isfinite(o.vel.x) && std::isfinite(o.vel.y) && std::isfinite(o.vel.z) && std::isfinite(o.angVel.x) &&
+                         std::isfinite(o.angVel.y) && std::isfinite(o.angVel.z);
+        fuzzOk = fuzzOk && fin && Norm3(Sub(o.vel, in.vel)) <= dvBound;
+        if (o.velChanged || o.angChanged) ++fuzzChanged;
+        if (o.yawClamped) {
+            ++fuzzClamped;
+            const double wUp = (double)o.angVel.x * in.up.x + (double)o.angVel.y * in.up.y + (double)o.angVel.z * in.up.z;
+            fuzzOk = fuzzOk && std::fabs(wUp) <= 22.0 / o.speed + 1e-3;
+        }
+    }
+    Check("hyper assist: over 20000 random cars, speeds, frames and masks the output is finite, one frame changes the velocity by at most 1.57 m/s, a clamped yaw obeys its limit",
+          fuzzOk && fuzzN > 19900 && fuzzChanged > 5000 && fuzzClamped > 500, F("%d cars, %d changed, %d yaw-clamped", fuzzN, fuzzChanged, fuzzClamped));
+    int levelN = 0;
+    double levelWorst = 0.0;
+    for (int s2 = 0; s2 <= 400; ++s2)
+        for (float slide : { 0.0f, 3.0f, 8.0f, 30.0f })
+            for (float pedal : { 0.0f, 1.0f })
+                for (double dt : { 1.0 / 30.0, 1.0 / 60.0, 0.2 }) {
+                    HyperAssistIn in = Level(0.0, kHyperAssistAll, dt);
+                    in.vel = { slide, (float)(s2 * 0.5), 0.0f };
+                    in.brake = pedal;
+                    const HyperAssistOut o = HyperAssistStep(A, in);
+                    levelWorst = std::max(levelWorst, std::sqrt((double)(o.vel.x - in.vel.x) * (o.vel.x - in.vel.x) + (double)(o.vel.y - in.vel.y) * (o.vel.y - in.vel.y)));
+                    ++levelN;
+                }
+    Check("hyper assist: on the road a frame never changes the horizontal velocity by 1.5 m/s (the impact tracker's hit threshold): bounded by 1.13 m/s",
+          levelN == 401 * 4 * 2 * 3 && levelWorst <= (A.gripCapMs2 + A.brakeMs2) * kHyperMaxDt + 1e-3 && (A.gripCapMs2 + A.brakeMs2) * kHyperMaxDt < 1.5f,
+          F("%d cases, worst %.4f m/s", levelN, levelWorst));
+
+    // -- the registry mask and the health top-up --
+    Check("hyper assist: hyper_assist parses decimal and 0x hex (010 is ten), keeps the five bits, and falls back to all on empty, null or garbage",
+          ParseHyperAssistMask(nullptr) == kHyperAssistAll && ParseHyperAssistMask("") == kHyperAssistAll && ParseHyperAssistMask("0") == 0u &&
+              ParseHyperAssistMask("5") == 5u && ParseHyperAssistMask("0x1F") == 31u && ParseHyperAssistMask("0X0a") == 10u && ParseHyperAssistMask("010") == 10u &&
+              ParseHyperAssistMask("99") == (99u & kHyperAssistAll) && ParseHyperAssistMask("abc") == kHyperAssistAll && ParseHyperAssistMask("7x") == kHyperAssistAll,
+          F("010 -> %u, 99 -> %u", ParseHyperAssistMask("010"), ParseHyperAssistMask("99")));
+    Check("hyper tune: health is low below 999.5 (damaged, zero, negative), not at 1000 or above, and a failed (NaN) read is not low",
+          HyperHealthLow(999.0f) && HyperHealthLow(0.0f) && HyperHealthLow(-50.0f) && HyperHealthLow(500.0f) && !HyperHealthLow(1000.0f) &&
+              !HyperHealthLow(999.6f) && !HyperHealthLow(1200.0f) && !HyperHealthLow(std::nanf("")) && !HyperHealthLow(INFINITY),
+          "");
+}
+constexpr int kHyperTuneChecks = 4 + 29;   // TestHyperTune's own four + TestHyperProfiles (keep in step: the run asserts the total)
+
 // ---- hyper tune (libs/sync/hypertune.h, GI 2026-11-02: the Jesko at 500 km/h) ------------------------------
 static void TestHyperTune() {
     using namespace gage::sync;
@@ -929,6 +1388,7 @@ static void TestHyperTune() {
           HyperTopSpeedPercent(150.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f && HyperTopSpeedPercent(-5.0f) == 100.0f);
     Check("hyper: the target stays under the server's default vehicleMaxSpeed (150 m/s), so no update is dropped",
           kHyperTargetMs < 150.0f, std::to_string(kHyperTargetMs));
+    TestHyperProfiles();   // GI 2026-11-04: the per-model profiles and the driving assists
 }
 
 // ---- 10. W9: contact grace, present-time lead, bike lean ---------------------------------------------------
@@ -1677,8 +2137,8 @@ int main() {
     r4t2::TestR4T2();
 
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
-    // + hyper tune 4 + W9 11 + Sync B 8 (kSyncBChecks as listed in its header) + Sync D kSyncDChecks
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + 4 + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks;
+    // + hyper tune kHyperTuneChecks (4 + the profiles and assists) + W9 11 + Sync B 8 (kSyncBChecks as listed in its header) + Sync D kSyncDChecks
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

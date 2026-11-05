@@ -395,6 +395,19 @@ namespace gage::game {
         constexpr uint64_t SET_VEHICLE_CHEAT_POWER_INCREASE            = 0xB59E4BD37AE292DB;
         constexpr uint64_t SET_VEHICLE_MAX_SPEED                       = 0xBAA045B4E42F3C06;
         constexpr uint64_t GET_VEHICLE_ESTIMATED_MAX_SPEED             = 0x53AF99BAA671CA47;
+        // Hyper tune handling (GI 2026-11-04, the Dubsta; libs/sync/hypertune.h). Public hashes from alloc8or natives.json; each 3889 hash is
+        // Mr-X-GTA/YimMenu b3889 src/invoker/crossmap.hpp at the natives.hpp index AND agrees by name with YimMenuV2 `enhanced`
+        // Crossmap.hpp (and sits in that crossmap, the set InitNativeTables is fed):
+        //   SET_VEHICLE_STRONG                   public 0x3E8C8727991A8A0B  3889 0xD05AF216D970F274  void (Vehicle, BOOL toggle)  no crash damage
+        //   SET_VEHICLE_HAS_STRONG_AXLES         public 0x92F0CF722BC4202F  3889 0x5FE0938FDE9B0958  void (Vehicle, BOOL toggle)  axles do not bend
+        //   SET_VEHICLE_TYRES_CAN_BURST          public 0xEB9DC3C7D8596C46  3889 0x439C904840715871  void (Vehicle, BOOL toggle)  false = bulletproof tyres
+        //   SET_VEHICLE_WHEELS_CAN_BREAK         public 0x29B18B4FD460CA8F  3889 0x72241E9BCAEB0F8B  void (Vehicle, BOOL enabled)
+        //   IS_ENTITY_IN_AIR                     public 0x886E37EC497200B6  3889 0x3F18810075C77D41  BOOL (Entity)
+        constexpr uint64_t SET_VEHICLE_STRONG                          = 0x3E8C8727991A8A0B;
+        constexpr uint64_t SET_VEHICLE_HAS_STRONG_AXLES                = 0x92F0CF722BC4202F;
+        constexpr uint64_t SET_VEHICLE_TYRES_CAN_BURST                 = 0xEB9DC3C7D8596C46;
+        constexpr uint64_t SET_VEHICLE_WHEELS_CAN_BREAK                = 0x29B18B4FD460CA8F;
+        constexpr uint64_t IS_ENTITY_IN_AIR                            = 0x886E37EC497200B6;
         // 0.4.4 (W11, anchor steering). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
         //   TASK_GO_TO_ENTITY  public 0x6A071245EB0D1882  3889 0xAB3658A740EED98E
         //                      void (Entity entity, Entity target, int duration, float distance, float moveBlendRatio,
@@ -1091,6 +1104,12 @@ namespace gage::game {
         bool     SetVehicleCheatPowerIncrease(int32_t veh, float value);   // every frame
         bool     SetVehicleMaxSpeed(int32_t veh, float metresPerSecond);
         float    GetVehicleEstimatedMaxSpeed(int32_t veh);
+        // Hyper tune handling (GI 2026-11-04, libs/sync/hypertune.h). True = could be called (IsEntityInAir: `inAir` is only set then).
+        bool     SetVehicleStrong(int32_t veh, bool on);            // true: no crash damage
+        bool     SetVehicleHasStrongAxles(int32_t veh, bool on);    // true: axles do not bend
+        bool     SetVehicleTyresCanBurst(int32_t veh, bool on);     // false: bulletproof tyres
+        bool     SetVehicleWheelsCanBreak(int32_t veh, bool on);
+        bool     IsEntityInAir(int32_t handle, bool& inAir);        // a vehicle: no wheel on the ground
         // Both outs are BOOL* slots. The native's own BOOL return has no documented meaning and is
         // not used: true here is "could be called", and then lightsOn / highbeamsOn are valid.
         bool     GetVehicleLightsState(int32_t veh, bool& lightsOn, bool& highbeamsOn);

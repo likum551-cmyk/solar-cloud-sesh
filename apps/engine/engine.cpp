@@ -3813,6 +3813,156 @@ namespace {
         }
     }
 
+    // ---- 0.4.13 diagnostics: WHY a puppet's clip / ragdoll / vehicle exit does not show (reads only, nothing here changes the game) ----
+    // The 0.4.12 logs: every swing and every full-body emote read "playing" on the first frame after the task (IS_ENTITY_PLAYING_ANIM) and
+    // the player saw nothing; the arbiter then logged "no longer playing" at +1.0 s (its 600 ms grace + 400 ms), on our own ped too. A one-frame
+    // read cannot tell a clip that stays from one that is gone a frame later. A trace follows ONE issue on every script tick and logs: the first
+    // frame the probe flips (playing -> not playing, "gone at +N ms": the same few ms for every clip = something cancels it; the clip's own
+    // length = it finished), the task types GET_IS_TASK_ACTIVE reports right after the issue, at the marks and at the moment it is gone (what
+    // replaced it), and the ped's ragdoll / falling / speed / distance moved and distance to the sender's pose. Probe: the clip (anim), the melee
+    // task, a ragdoll, or an exit from a vehicle (3 s). At most 6 at once and 48 per run; anim_trace=0 (HKCU\Software\GAGE-MP) switches it off.
+    enum class TraceProbe : uint8_t { Anim, Melee, Ragdoll, Exit };
+    struct ClipTrace
+    {
+        bool used = false;
+        TraceProbe probe = TraceProbe::Anim;
+        int32_t ped = 0;
+        std::string tag, dict, clip;
+        double startMs = 0, seenMs = -1, goneMs = -1;
+        size_t mark = 0;
+        int last = -2;                                 // the probe's last read (-2 = none yet)
+        uint32_t no = 0, frames = 0, flips = 0;
+        float x0 = 0, y0 = 0, z0 = 0;
+    };
+    constexpr size_t kTraceSlots = 6;
+    constexpr uint32_t kTraceRunMax = 48;
+    constexpr double kTraceClipMarks[] = { 20.0, 100.0, 250.0, 600.0, 1300.0 };
+    constexpr double kTraceExitMarks[] = { 100.0, 500.0, 1000.0, 1500.0, 2000.0, 3000.0 };
+    ClipTrace g_clipTraces[kTraceSlots];
+    uint32_t g_clipTraceCount = 0;
+    int g_clipTraceOn = -1;                            // -1: the registry was not read yet
+    std::string ActiveTaskTypes(int32_t ped);          // defined with the gait line below
+
+    void BeginTrace(TraceProbe probe, int32_t ped, const std::string& tag, const char* dict = "", const char* clip = "")
+    {
+        if (!ped)
+            return;
+        if (g_clipTraceOn < 0)
+            g_clipTraceOn = reg::Get(L"anim_trace") != L"0" ? 1 : 0;
+        if (!g_clipTraceOn || g_clipTraceCount >= kTraceRunMax)
+            return;
+        ClipTrace* t = nullptr;
+        for (ClipTrace& s : g_clipTraces)
+            if (!s.used)
+            {
+                t = &s;
+                break;
+            }
+        if (!t)
+            return;                                    // every slot is busy: this issue is not traced
+        *t = ClipTrace();
+        t->used = true;
+        t->probe = probe;
+        t->ped = ped;
+        t->tag = tag;
+        t->dict = dict ? dict : "";
+        t->clip = clip ? clip : "";
+        t->startMs = NowMs();
+        t->no = ++g_clipTraceCount;
+        g_world->GetEntityCoords(ped, t->x0, t->y0, t->z0);
+        GLOGI("engine: trace #%u begins: %s; task types right after the issue [%s]%s", t->no, tag.c_str(), ActiveTaskTypes(ped).c_str(),
+              g_clipTraceCount == kTraceRunMax ? " (the last trace of this run)" : "");
+    }
+
+    // The probe's read: 1 / 0, -1 unreadable. An exit reads "still in a vehicle".
+    int TraceRead(const ClipTrace& t)
+    {
+        switch (t.probe)
+        {
+        case TraceProbe::Anim:    return g_world->IsEntityPlayingAnim(t.ped, t.dict.c_str(), t.clip.c_str());
+        case TraceProbe::Melee:   return g_world->IsPedInMeleeCombat(t.ped);
+        case TraceProbe::Ragdoll: return g_world->IsPedRagdoll(t.ped) ? 1 : 0;
+        case TraceProbe::Exit:    return g_world->IsPedInVehicle(t.ped) ? 1 : 0;
+        }
+        return -1;
+    }
+
+    const char* TraceProbeName(TraceProbe p)
+    {
+        switch (p)
+        {
+        case TraceProbe::Anim:    return "IS_ENTITY_PLAYING_ANIM";
+        case TraceProbe::Melee:   return "IS_PED_IN_MELEE_COMBAT";
+        case TraceProbe::Ragdoll: return "IS_PED_RAGDOLL";
+        case TraceProbe::Exit:    return "IS_PED_IN_ANY_VEHICLE";
+        }
+        return "?";
+    }
+
+    // Script tick, once per frame (a few natives per active trace; the task-type scan only at marks and at the flip).
+    void TickClipTraces(double nowMs)
+    {
+        for (ClipTrace& t : g_clipTraces)
+        {
+            if (!t.used)
+                continue;
+            if (!g_world->EntityExists(t.ped))
+            {
+                GLOGI("engine: trace #%u (%s): the ped no longer exists at +%.0f ms", t.no, t.tag.c_str(), nowMs - t.startMs);
+                t.used = false;
+                continue;
+            }
+            const double el = nowMs - t.startMs;
+            ++t.frames;
+            const int now = TraceRead(t);
+            if (now != t.last)
+            {
+                const bool firstRead = t.last == -2;
+                if (now == 1 && t.seenMs < 0)
+                    t.seenMs = el;
+                const bool gone = !firstRead && t.last == 1 && now == 0 && t.goneMs < 0 && t.probe != TraceProbe::Exit;
+                if (gone)
+                    t.goneMs = el;
+                if (t.flips++ < 10)
+                    GLOGI("engine: trace #%u (%s): %s %s -> %d at +%.0f ms (frame %u)%s%s%s", t.no, t.tag.c_str(), TraceProbeName(t.probe),
+                          firstRead ? "first read" : (t.last == 1 ? "1" : t.last == 0 ? "0" : "-1"), now, el, t.frames,
+                          gone ? "; GONE, task types now [" : "", gone ? ActiveTaskTypes(t.ped).c_str() : "", gone ? "]" : "");
+                t.last = now;
+            }
+            const bool exitKind = t.probe == TraceProbe::Exit;
+            const double* marks = exitKind ? kTraceExitMarks : kTraceClipMarks;
+            const size_t nMarks = exitKind ? sizeof kTraceExitMarks / sizeof kTraceExitMarks[0] : sizeof kTraceClipMarks / sizeof kTraceClipMarks[0];
+            while (t.mark < nMarks && el >= marks[t.mark])
+            {
+                float x = 0, y = 0, z = 0;
+                const bool haveXyz = g_world->GetEntityCoords(t.ped, x, y, z);
+                float toPose = -1.0f;
+                for (const auto& kv : g_peers)
+                    if (kv.second.ped == t.ped && kv.second.poseOk && haveXyz)
+                    {
+                        const float dx = x - kv.second.pose.k.x, dy = y - kv.second.pose.k.y, dz = z - kv.second.pose.k.z;
+                        toPose = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    }
+                GLOGI("engine: trace #%u (%s) +%.0f ms (mark %.0f, frame %u): %s %d, ragdoll %d, falling %d, speed %.2f m/s, moved %.2f m (z %+.2f), "
+                      "%s%.2f m from the sender's pose; task types [%s]", t.no, t.tag.c_str(), el, marks[t.mark], t.frames, TraceProbeName(t.probe), now,
+                      g_world->IsPedRagdoll(t.ped) ? 1 : 0, g_world->IsPedFalling(t.ped) ? 1 : 0, (double)g_world->GetEntitySpeed(t.ped),
+                      haveXyz ? std::sqrt((x - t.x0) * (x - t.x0) + (y - t.y0) * (y - t.y0) + (z - t.z0) * (z - t.z0)) : -1.0, haveXyz ? (double)(z - t.z0) : 0.0,
+                      toPose < 0.0f ? "no pose: " : "", (double)toPose, ActiveTaskTypes(t.ped).c_str());
+                ++t.mark;
+            }
+            if (t.mark >= nMarks)
+            {
+                GLOGI("engine: trace #%u (%s) done: %s first read 1 at %s, %s; %u frames in %.0f ms (%.1f ms a frame)", t.no, t.tag.c_str(),
+                      TraceProbeName(t.probe), t.seenMs >= 0 ? (std::to_string((int)t.seenMs) + " ms").c_str() : "never",
+                      t.goneMs >= 0 ? ("GONE at +" + std::to_string((int)t.goneMs) + " ms").c_str()
+                              : (exitKind ? (t.last == 1 ? "still in a vehicle at the end" : "out of the vehicle at the end")
+                                          : (t.last == 1 ? "still 1 at the end" : "never went 1 -> 0")),
+                      t.frames, el, t.frames ? el / t.frames : 0.0);
+                t.used = false;
+            }
+        }
+    }
+
     // TASK_PLAY_ANIM of the swing (or the melee task); the probe follows it (PeerSwingService). `retry`: the one bounded re-issue after a
     // locomotion task replaced it. R4 T3: while the survey is on, the attempt (variant + duration) is the survey's next plan entry, otherwise the
     // ladder's rung with the current duration; the probe now FOLLOWS the swing (+100 / +250 / +450 ms) so SwingProbe::Active() covers the window.
@@ -3871,6 +4021,16 @@ namespace {
                 }
             }
             pe.swingAttempt = att;
+            {
+                char tg[200];
+                std::snprintf(tg, sizeof(tg), "peer %s swing '%s', TASK_PLAY_ANIM flags %u, duration %d ms%s", pe.name.c_str(),
+                              sync::SurveyAttemptName(att).c_str(), var == sync::SwingVariant::MeleeTask ? 0u : (unsigned)sync::SwingVariantFlags(var),
+                              att.durationMs, retry ? " (retry)" : "");
+                if (var == sync::SwingVariant::MeleeTask)
+                    BeginTrace(TraceProbe::Melee, pe.ped, tg);
+                else
+                    BeginTrace(TraceProbe::Anim, pe.ped, tg, c.dict, c.clip);
+            }
             // the window the locomotion controller stays away: the swing's duration (the melee task's own end, 150 ms past kSwingMs, for that rung)
             pe.swingProbe.Begin(nowMs, idx, g_meleeFollowWanted.load(std::memory_order_relaxed), att.durationMs,
                                 var == sync::SwingVariant::MeleeTask ? kSwingMs + 200.0 : -1.0);
@@ -4750,6 +4910,8 @@ namespace {
         {
             g_world->SetPedCanRagdoll(ped, true);
             g_world->SetPedToRagdoll(ped, r.ragdollMs, r.ragdollMs);
+            BeginTrace(TraceProbe::Ragdoll, ped, std::string("puppet hit reaction '") + ReactName(r.kind) + "', SET_PED_TO_RAGDOLL " +
+                                                     std::to_string((int)r.ragdollMs) + " ms");
             float px, py, pz, dx, dy;
             const float push = r.kind == sync::ReactKind::Stagger ? kStaggerPushScale : 1.0f;
             if (haveAttacker && g_world->GetEntityCoords(ped, px, py, pz) && AwayFrom(ax, ay, px, py, dx, dy))
@@ -5043,6 +5205,13 @@ namespace {
             pe.aimTask = false;
             ++g_v4.emotesStarted;
             ++(called ? dk.issued : dk.failed);
+            if (called)
+            {
+                char tg[200];
+                std::snprintf(tg, sizeof(tg), "peer %s emote %s/%s, TASK_PLAY_ANIM flags %u, duration %d ms", pe.name.c_str(), a.dict.c_str(), a.name.c_str(),
+                              (unsigned)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), (int)sync::EmoteArbiter::GtaDuration(a.durationMs));
+                BeginTrace(TraceProbe::Anim, pe.ped, tg, a.dict.c_str(), a.name.c_str());
+            }
             NoteDictReady(sync::AnimKind::PeerEmote, o.waitedMs);
             if (g_animFirstUse.Note("emote:" + a.dict + "/" + a.name))
                 PeerLog(!called, "engine: anim first use: remote peer id=%d emote %s / %s: DOES_ANIM_DICT_EXIST yes, HAS_ANIM_DICT_LOADED after %.0f ms, "
@@ -6913,6 +7082,13 @@ namespace {
             if (left)
             {
                 const double now = NowMs();
+                {
+                    char tg[200];
+                    std::snprintf(tg, sizeof(tg), "peer %s exit by %s (TASK_LEAVE_VEHICLE flags %d), vehicle %.1f m/s, locomotion paused %.0f ms",
+                                  pe.name.c_str(), plan.mode == sync::UnseatMode::Bail ? "bail-out" : "climb-out", plan.leaveFlags,
+                                  (double)ui.vehSpeedMps, plan.pauseMs);
+                    BeginTrace(TraceProbe::Exit, pe.ped, tg);
+                }
                 // Sync D: which exit was used (counted per 10 s: normal climb-out / bail-out, and a bail-out that had to fall back to the warp)
                 if (plan.mode == sync::UnseatMode::Bail)
                     ++g_syncD.unseatBail;
@@ -9452,42 +9628,324 @@ namespace {
     // peds firing real shots, hurt nobody on this machine: damage is the server's. The two natives are global, are
     // re-asserted every 5 s (a revive or a game state change may restore them) and RESET when the session ends. Up to 5 tries
     // when a native cannot be called, then given up for the session (the clear-line check of PlayPeerShots then stays).
-    // Hyper tune (GI 2026-11-02): the cars in kHyperModels get giga acceleration and a 500 km/h top speed while the
-    // LOCAL player drives them (libs/sync/hypertune.h has the numbers). The owner's client is the authority for its
-    // car, so the other players see the speed through the normal vehicle sync. Script tick only.
+    // Hyper tune (GI 2026-11-02; the Dubsta 2026-11-04): the cars in sync::kHyperProfiles (libs/sync/hypertune.h has every number and the
+    // pure assist math) get giga acceleration and a 500 km/h top speed while the LOCAL player drives them. A profile with `tough` also
+    // gets the toughness natives (strong body and axles, tyres that do not burst, wheels that do not break, health kept at 1000), and one
+    // with assists gets the per-frame handling assists (downforce, lateral grip, brake assist, a yaw-rate cap, anti-roll damping) as ONE
+    // velocity write and at most one angular velocity write per frame. The owner's client is the authority for its car, so the other
+    // players see all of it through the normal vehicle sync. Script tick only.
+    // HKCU\Software\GAGE-MP, read when a hyper car is first driven: hyper_tune=0 switches the whole tune off (the Jesko too);
+    // hyper_assist=<bit mask: 1 downforce, 2 lateral grip, 4 brake assist, 8 yaw cap, 16 anti-roll> (0 = none; default all 31) switches
+    // single assists off. Nothing here is a guess the game cannot correct: every velocity / angular write is read back in the same tick
+    // and the assists drop out (one WARN line) when it does not hold.
+    struct HyperState                                  // the vehicle being driven and what the tune has seen of it
+    {
+        int32_t veh = 0;
+        uint32_t mask = 0;                             // the assists in force: the registry's mask minus what a read-back dropped
+        double lastMs = 0, flagsMs = 0, healthMs = 0, logMs = 0;
+        bool velDead = false, angDead = false;
+        uint32_t velWrites = 0, angWrites = 0;         // for the read-back schedule (the first 12 writes, then one in 120)
+        uint32_t velOk = 0, velBad = 0, angOk = 0, angBad = 0;
+        // the 10 s window
+        uint32_t frames = 0, grounded = 0, brakeDown = 0, downN = 0, gripN = 0, brakeN = 0, yawN = 0, velN = 0, angN = 0;
+        uint32_t readFail = 0, velFail = 0, angFail = 0, healthFixed = 0;
+        double downSum = 0, gripSum = 0, brakeSum = 0;
+        float peakMs = 0;
+    };
+    struct HyperTough { bool strong = false, axles = false, tyres = false, wheels = false, degrade = false, tank = false; };
+    constexpr float kHyperGroundedHeightM = 1.6f;      // the fallback when IS_ENTITY_IN_AIR cannot be called: the origin this close to the ground
+
+    HyperTough HyperApplyTough(int32_t veh)
+    {
+        HyperTough t;
+        t.strong = g_world->SetVehicleStrong(veh, true);
+        t.axles = g_world->SetVehicleHasStrongAxles(veh, true);
+        t.tyres = g_world->SetVehicleTyresCanBurst(veh, false);
+        t.wheels = g_world->SetVehicleWheelsCanBreak(veh, false);
+        t.degrade = g_world->SetVehicleEngineCanDegrade(veh, false);
+        t.tank = g_world->SetDisableVehiclePetrolTankDamage(veh, true);
+        return t;
+    }
+
+    // A write read back in the same tick (nothing has stepped the physics in between): the first 12 writes of a drive, then one in 120.
+    // A write the game did not take, or took in another unit or frame, drops the assists that depend on it (4 bad reads, more bad than good).
+    void HyperVerifyVelocity(HyperState& st, int32_t veh, const sync::HyperVec& wrote)
+    {
+        const uint32_t n = st.velWrites++;
+        if (!(n < 12 || n % 120 == 0))
+            return;
+        float x = 0, y = 0, z = 0;
+        const auto close = [](float a, float b) { return std::fabs(a - b) <= 0.02f + 0.002f * std::fabs(b); };
+        if (g_world->GetEntityVelocity(veh, x, y, z) && close(x, wrote.x) && close(y, wrote.y) && close(z, wrote.z))
+        {
+            ++st.velOk;
+            return;
+        }
+        ++st.velBad;
+        static int logged = 0;
+        if (logged < 4)
+        {
+            ++logged;
+            GLOGW("engine: hyper assist: SET_ENTITY_VELOCITY wrote %.2f %.2f %.2f and the same-tick read says %.2f %.2f %.2f (bad %u, ok %u)",
+                  (double)wrote.x, (double)wrote.y, (double)wrote.z, (double)x, (double)y, (double)z, st.velBad, st.velOk);
+        }
+        if (st.velBad >= 4 && st.velBad > st.velOk)
+        {
+            st.velDead = true;
+            st.mask = 0;
+            GLOGW("engine: hyper assist: the velocity write does not read back (bad %u, ok %u): ALL handling assists are OFF for this session "
+                  "(the toughness natives and the power / top speed stay)", st.velBad, st.velOk);
+        }
+    }
+
+    void HyperVerifyAngular(HyperState& st, int32_t veh, const sync::HyperVec& wrote)
+    {
+        const uint32_t n = st.angWrites++;
+        if (!(n < 12 || n % 120 == 0))
+            return;
+        float x = 0, y = 0, z = 0;
+        const auto close = [](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.01f * std::fabs(b); };
+        if (g_world->GetEntityRotationVelocity(veh, x, y, z) && close(x, wrote.x) && close(y, wrote.y) && close(z, wrote.z))
+        {
+            ++st.angOk;
+            return;
+        }
+        ++st.angBad;
+        static int logged = 0;
+        if (logged < 4)
+        {
+            ++logged;
+            GLOGW("engine: hyper assist: SET_ENTITY_ANGULAR_VELOCITY wrote %.3f %.3f %.3f and the same-tick GET_ENTITY_ROTATION_VELOCITY says "
+                  "%.3f %.3f %.3f (bad %u, ok %u)", (double)wrote.x, (double)wrote.y, (double)wrote.z, (double)x, (double)y, (double)z,
+                  st.angBad, st.angOk);
+        }
+        if (st.angBad >= 4 && st.angBad > st.angOk)
+        {
+            st.angDead = true;
+            st.mask &= ~sync::kHyperAssistAngular;
+            GLOGW("engine: hyper assist: the angular velocity write does not read back (bad %u, ok %u): the yaw cap and the anti-roll damping "
+                  "are OFF for this session", st.angBad, st.angOk);
+        }
+    }
+
+    // One frame of the assists on the car the local player drives: read the car, ask the pure step, write what changed.
+    void HyperAssistFrame(HyperState& st, const sync::HyperProfile& p, int32_t veh, double now)
+    {
+        const double dtMs = st.lastMs > 0.0 ? now - st.lastMs : 0.0;
+        st.lastMs = now;
+        float vx = 0, vy = 0, vz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
+        if (!g_world->GetEntityVelocity(veh, vx, vy, vz))
+        {
+            ++st.readFail;
+            return;
+        }
+        {
+            const float sp = std::sqrt(vx * vx + vy * vy + vz * vz);   // the peak speed is logged with the assists switched off too
+            ++st.frames;
+            if (sp > st.peakMs) st.peakMs = sp;
+        }
+        if (st.mask == 0 || !(dtMs >= 1.0 && dtMs <= 100.0))
+            return;                                    // assists off, the first frame of a drive, a pause or a hitch: no write
+        if (!g_world->GetEntityQuaternion(veh, qx, qy, qz, qw))
+        {
+            ++st.readFail;
+            return;
+        }
+        const sync::DriveQuat q = sync::vq::Normalize({ qx, qy, qz, qw });
+        const sync::DriveVec f = sync::vq::Rotate(q, { 0.0f, 1.0f, 0.0f });
+        const sync::DriveVec r = sync::vq::Rotate(q, { 1.0f, 0.0f, 0.0f });
+        const sync::DriveVec u = sync::vq::Rotate(q, { 0.0f, 0.0f, 1.0f });
+        sync::HyperAssistIn in;
+        in.vel = { vx, vy, vz };
+        in.fwd = { f.x, f.y, f.z };
+        in.right = { r.x, r.y, r.z };
+        in.up = { u.x, u.y, u.z };
+        float wx = 0, wy = 0, wz = 0;
+        in.angVel = g_world->GetEntityRotationVelocity(veh, wx, wy, wz) ? sync::HyperVec{ wx, wy, wz }
+                                                                        : sync::HyperVec{ NAN, NAN, NAN };   // no read: the angular part stays out
+        float brake = 0, accel = 0;                    // left at 0 when the control native cannot be called: no brake assist then
+        g_world->GetControlNormal(0, kCtlVehBrake, brake);
+        g_world->GetControlNormal(0, kCtlVehAccelerate, accel);
+        bool inAir = false;
+        if (g_world->IsEntityInAir(veh, inAir))
+            in.grounded = !inAir;
+        else
+        {
+            const float h = g_world->GetEntityHeightAboveGround(veh);   // 0 when it cannot be called: unknown, not "on the ground"
+            in.grounded = h > 0.05f && h < kHyperGroundedHeightM;
+        }
+        in.brake = brake;
+        in.accel = accel;
+        in.dt = (float)(dtMs / 1000.0);
+        in.mask = st.mask;
+        const sync::HyperAssistOut out = sync::HyperAssistStep(p.assist, in);
+        if (in.grounded) ++st.grounded;
+        if (brake > 0.05f) ++st.brakeDown;
+        if (out.downMs2 > 0) { ++st.downN; st.downSum += out.downMs2; }
+        if (out.gripMs2 > 0) { ++st.gripN; st.gripSum += out.gripMs2; }
+        if (out.brakeMs2 > 0) { ++st.brakeN; st.brakeSum += out.brakeMs2; }
+        if (out.yawClamped) ++st.yawN;
+        if (out.velChanged)
+        {
+            if (g_world->SetEntityVelocity(veh, out.vel.x, out.vel.y, out.vel.z))
+            {
+                ++st.velN;
+                HyperVerifyVelocity(st, veh, out.vel);
+            }
+            else if (++st.velFail >= 30 && st.velN == 0)
+            {
+                st.velDead = true;
+                st.mask = 0;
+                GLOGW("engine: hyper assist: SET_ENTITY_VELOCITY cannot be called: the handling assists are OFF for this session");
+            }
+        }
+        if (out.angChanged && !st.angDead && st.mask != 0)
+        {
+            if (g_world->SetEntityAngularVelocity(veh, out.angVel.x, out.angVel.y, out.angVel.z))
+            {
+                ++st.angN;
+                HyperVerifyAngular(st, veh, out.angVel);
+            }
+            else if (++st.angFail >= 30 && st.angN == 0)
+            {
+                st.angDead = true;
+                st.mask &= ~sync::kHyperAssistAngular;
+                GLOGW("engine: hyper assist: SET_ENTITY_ANGULAR_VELOCITY cannot be called: the yaw cap and the anti-roll damping are OFF");
+            }
+        }
+    }
+
+    void HyperLogWindow(HyperState& st, const sync::HyperProfile& p, double now)
+    {
+        if (st.logMs <= 0.0)
+        {
+            st.logMs = now;
+            return;
+        }
+        if (now - st.logMs < 10000.0)
+            return;
+        if (st.frames > 0)
+            GLOGI("engine: hyper assist (%s, vehicle %d), last %.0f s: %u frames (%u on the ground, brake pedal down in %u), peak speed %.0f km/h of %.0f; "
+                  "applied: downforce %u frames (mean %.1f m/s^2), lateral grip %u (mean %.1f), brake assist %u (mean %.1f), yaw cap %u; "
+                  "writes: velocity %u, angular %u; failures: reads %u, velocity writes %u, angular writes %u; read-back: velocity ok %u / bad %u, "
+                  "angular ok %u / bad %u; health top-ups %u; mask 0x%x%s%s", p.model, st.veh, (now - st.logMs) / 1000.0, st.frames, st.grounded,
+                  st.brakeDown, (double)st.peakMs * 3.6, (double)p.targetKmh, st.downN, st.downN ? st.downSum / st.downN : 0.0, st.gripN,
+                  st.gripN ? st.gripSum / st.gripN : 0.0, st.brakeN, st.brakeN ? st.brakeSum / st.brakeN : 0.0, st.yawN, st.velN, st.angN,
+                  st.readFail, st.velFail, st.angFail, st.velOk, st.velBad, st.angOk, st.angBad, st.healthFixed, st.mask,
+                  st.velDead ? " (velocity write dropped)" : "", st.angDead ? " (angular write dropped)" : "");
+        st.logMs = now;
+        st.frames = st.grounded = st.brakeDown = st.downN = st.gripN = st.brakeN = st.yawN = st.velN = st.angN = 0;
+        st.readFail = st.velFail = st.angFail = st.healthFixed = 0;
+        st.downSum = st.gripSum = st.brakeSum = 0;
+        st.peakMs = 0;
+    }
+
     void TickHyperTune(int32_t lp)
     {
-        static const char* const kHyperModels[] = {"jesko"};
-        static uint32_t hashes[sizeof kHyperModels / sizeof kHyperModels[0]] = {};
+        static uint32_t hashes[sync::kHyperProfileCount] = {};
         static bool hashed = false;
-        static int32_t tunedVeh = 0;                   // the vehicle whose top speed is already raised
+        static bool cfgRead = false, tuneOn = true;
+        static uint32_t assistMask = sync::kHyperAssistAll;
+        static int32_t tuned[8] = {};                  // the vehicles whose top speed is already raised (a ring: swapping between hyper cars must not re-apply it)
+        static size_t tunedNext = 0;
+        static HyperState st;
         if (!hashed)
         {
-            for (size_t i = 0; i < sizeof kHyperModels / sizeof kHyperModels[0]; ++i)
-                hashes[i] = g_world->HashKey(kHyperModels[i]);
+            for (size_t i = 0; i < sync::kHyperProfileCount; ++i)
+                hashes[i] = g_world->HashKey(sync::kHyperProfiles[i].model);
             hashed = true;
         }
         const int32_t veh = lp ? g_world->GetVehiclePedIsIn(lp) : 0;
         if (!veh || g_world->GetPedInVehicleSeat(veh, -1) != lp)
+        {
+            st.lastMs = 0;                             // the next drive starts without a frame length
             return;                                    // only the driver tunes (passengers see the owner's result)
+        }
         const uint32_t model = g_world->GetEntityModel(veh);
-        bool hyper = false;
-        for (uint32_t h : hashes)
-            if (h && h == model) hyper = true;
-        if (!hyper)
+        const sync::HyperProfile* prof = nullptr;
+        for (size_t i = 0; i < sync::kHyperProfileCount; ++i)
+            if (hashes[i] && hashes[i] == model) prof = &sync::kHyperProfiles[i];
+        if (!prof)
+        {
+            st.lastMs = 0;
             return;
-        g_world->SetVehicleCheatPowerIncrease(veh, sync::kHyperPower);   // the game clears it every frame
-        if (veh != tunedVeh)
+        }
+        if (!cfgRead)
+        {
+            cfgRead = true;
+            tuneOn = reg::Get(L"hyper_tune") != L"0";
+            const std::wstring maskReg = reg::Get(L"hyper_assist");
+            std::string narrow;
+            for (wchar_t ch : maskReg)
+                narrow.push_back(ch < 128 ? (char)ch : '?');
+            assistMask = sync::ParseHyperAssistMask(narrow.c_str());
+            GLOGI("engine: hyper tune switches: hyper_tune=%s, hyper_assist mask 0x%x (hyper_tune=0 turns the tune off; hyper_assist=<bits: 1 downforce, "
+                  "2 lateral grip, 4 brake assist, 8 yaw cap, 16 anti-roll; 0 = none> turns the handling assists off)", tuneOn ? "on" : "OFF",
+                  assistMask);
+        }
+        if (!tuneOn)
+            return;
+        g_world->SetVehicleCheatPowerIncrease(veh, prof->power);   // the game clears it every frame
+        if (st.veh != veh)
+        {
+            st = HyperState();                         // a new car: its own window, read-back record and mask
+            st.veh = veh;
+            st.mask = prof->assist.Any() ? assistMask : 0;
+        }
+        bool isTuned = false;
+        for (int32_t t : tuned)
+            if (t == veh) isTuned = true;
+        if (!isTuned)
         {
             const float est = g_world->GetVehicleEstimatedMaxSpeed(veh);
-            const float pct = sync::HyperTopSpeedPercent(est);
+            const float pct = sync::HyperTopSpeedPercent(est, sync::HyperTargetMs(*prof));
             const bool topOk = g_world->ModifyVehicleTopSpeed(veh, pct);
-            const bool capOk = g_world->SetVehicleMaxSpeed(veh, sync::kHyperTargetMs);
-            tunedVeh = veh;
+            const bool capOk = g_world->SetVehicleMaxSpeed(veh, sync::HyperTargetMs(*prof));
+            tuned[tunedNext] = veh;
+            tunedNext = (tunedNext + 1) % (sizeof tuned / sizeof tuned[0]);
             GLOGI("engine: hyper tune on vehicle %d (model 0x%08x): stock estimate %.1f m/s, top speed +%.0f%% (%s), "
                   "cap %.0f km/h (%s), power x%.1f every frame", veh, model, est, pct, topOk ? "set" : "NOT callable",
-                  sync::kHyperTargetKmh, capOk ? "set" : "NOT callable", sync::kHyperPower);
+                  prof->targetKmh, capOk ? "set" : "NOT callable", prof->power);
+            if (prof->tough || prof->assist.Any())
+            {
+                const HyperTough t = prof->tough ? HyperApplyTough(veh) : HyperTough();
+                st.flagsMs = NowMs();                  // applied just now: the 2 s re-assert starts from here
+                const sync::HyperAssist& a = prof->assist;
+                GLOGI("engine: hyper tune (%s) vehicle %d handling: toughness %s [strong body %s, strong axles %s, tyres cannot burst %s, wheels cannot "
+                      "break %s, engine cannot degrade %s, tank damage off %s; health back to 1000 when it reads lower]; assists mask 0x%x of "
+                      "downforce %.1f m/s^2 at %.0f km/h (cap %.1f), lateral grip rate %.1f /s up to %.1f m/s^2, brake assist +%.1f m/s^2, yaw cap "
+                      "%.1f m/s^2 / speed from %.0f m/s, anti-roll %.1f /s (grip, brake and anti-roll fade in over %.0f..%.0f m/s)", prof->model, veh,
+                      prof->tough ? "ON" : "off", t.strong ? "set" : "NOT callable", t.axles ? "set" : "NOT callable", t.tyres ? "set" : "NOT callable",
+                      t.wheels ? "set" : "NOT callable", t.degrade ? "set" : "NOT callable", t.tank ? "set" : "NOT callable", st.mask,
+                      (double)a.downAtRefMs2, (double)a.downRefMs * 3.6, (double)a.downCapMs2, (double)a.gripRate, (double)a.gripCapMs2,
+                      (double)a.brakeMs2, (double)a.yawLatMs2, (double)a.yawFromMs, (double)a.tiltRate, (double)a.rampFromMs, (double)a.rampToMs);
+            }
         }
+        if (!prof->tough && !prof->assist.Any())
+            return;                                    // the Jesko: power and top speed only
+        const double now = NowMs();
+        if (prof->tough)
+        {
+            if (now - st.flagsMs >= 2000.0)            // the game's own damage-guard code resets some of these when a car changes hands
+            {
+                st.flagsMs = now;
+                HyperApplyTough(veh);
+            }
+            if (now - st.healthMs >= 250.0)
+            {
+                st.healthMs = now;
+                float h = 0;
+                if (g_world->GetVehicleBodyHealth(veh, h) && sync::HyperHealthLow(h))
+                    st.healthFixed += g_world->SetVehicleBodyHealth(veh, sync::kHyperHealthFull) ? 1u : 0u;
+                if (g_world->GetVehicleEngineHealth(veh, h) && sync::HyperHealthLow(h))
+                    st.healthFixed += g_world->SetVehicleEngineHealth(veh, sync::kHyperHealthFull) ? 1u : 0u;
+                if (g_world->GetVehiclePetrolTankHealth(veh, h) && sync::HyperHealthLow(h))
+                    st.healthFixed += g_world->SetVehiclePetrolTankHealth(veh, sync::kHyperHealthFull) ? 1u : 0u;
+            }
+        }
+        if (prof->assist.Any())
+            HyperAssistFrame(st, *prof, veh, now);
+        HyperLogWindow(st, *prof, now);
     }
 
     // W10 (docs/sync-specs/live-0.4.2-fixes.md, libs/sync/nametag.h has every rule): the name above each remote ped's head.
@@ -9925,6 +10383,13 @@ namespace {
                                                       sync::EmoteArbiter::GtaDuration(a.durationMs),
                                                       (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
             const bool sent = join::SendAnim(a);
+            if (called)
+            {
+                char tg[200];
+                std::snprintf(tg, sizeof(tg), "local emote %s/%s, TASK_PLAY_ANIM flags %u, duration %d ms", a.dict.c_str(), a.name.c_str(),
+                              (unsigned)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), (int)sync::EmoteArbiter::GtaDuration(a.durationMs));
+                BeginTrace(TraceProbe::Anim, lp, tg, a.dict.c_str(), a.name.c_str());
+            }
             ++(called ? dk.issued : dk.failed);
             NoteDictReady(sync::AnimKind::LocalEmote, o.waitedMs);
             GLOGI("engine: anims: playing %s/%s%s; DOES_ANIM_DICT_EXIST yes, HAS_ANIM_DICT_LOADED after %.0f ms, TASK_PLAY_ANIM %s "
@@ -10865,6 +11330,8 @@ namespace {
         const bool mayChange = inScript ? mode != 0 : mode == 1;
         if (inScript && mayChange)
             TickAiDamage(NowMs());                     // W8 item 6: the AI damage modifiers follow the session (also after it ends)
+        if (inScript)
+            TickClipTraces(NowMs());                   // 0.4.13: follows the issued clips / ragdolls / exits frame by frame (reads only)
         if (inScript && mayChange)
             TickHyperTune(lp);                         // the hyper cars (libs/sync/hypertune.h): power every frame, top speed once
         if (inScript && mayChange && lp)
