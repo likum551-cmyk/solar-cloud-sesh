@@ -58,7 +58,7 @@ cd "$ROOT"
 find . \
   \( -type d \( -name node_modules -o -name .git -o -name .gage-keys -o -path ./build -o -path ./logs \
        -o -path './enhanced EXE' -o -name .impeccable \
-       -o -path './DLC PACKS' -o -path ./fresh_images -o -path ./fresh_videos \
+       -o -path './DLC PACKS' -o -path ./fresh_images -o -path ./fresh_videos -o -path ./.claude/worktrees \
        -o \( -path './.toolchain/*' ! -path './.toolchain/innosetup-6.7.3' ! -path './.toolchain/innosetup-6.7.3/*' \) \) -prune \) \
   -o \( \( -type f -o -type l \) \
         ! -name '.env*' ! -name '*.pem' ! -name '*.key' ! -name 'update-signing-key*' ! -name '*.log' \
