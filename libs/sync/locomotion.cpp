@@ -76,6 +76,35 @@ void LocomotionController::Reset()
     mismatchMs_ = 0;
     steadyMs_ = 0;
     ++stats_.resets;
+    OpenGrace();   // R5: the task list was replaced by someone else: the new task's start clip is not the writes failing (Blend only)
+}
+
+// R5: a task-changing event (Reset() from any caller, the end of a ragdoll, a landing): in Blend the self-check accrues no failure for blendGraceMs
+// and its fight statistics start afresh. A chain of events re-arms the window but never extends it past blendGraceMaxMs from its first opening.
+void LocomotionController::OpenGrace()
+{
+    if (cfg_.mode != LocoMode::Blend || !cfg_.selfCheck || cfg_.blendGraceMs <= 0.0f || !started_) return;
+    if (graceCooldownMs_ > 0.0)
+    {
+        ++stats_.graceChainCapped;
+        return;
+    }
+    if (graceLeftMs_ > 0.0 && graceChainMs_ >= cfg_.blendGraceMaxMs)
+    {
+        ++stats_.graceChainCapped;
+        graceCooldownMs_ = cfg_.blendGraceMaxMs;
+        return;
+    }
+    if (graceLeftMs_ <= 0.0) graceChainMs_ = 0.0;
+    graceLeftMs_ = cfg_.blendGraceMs;
+    graceEnded_ = false;
+    sinceGraceMs_ = 0.0;
+    ++stats_.graceWindows;
+    // what the old task did to the writes is not evidence about the new one
+    fightF_ = fightN_ = fightShare_ = 0.0;
+    blendFailMs_ = 0.0;
+    closeRate_ = 0.0;
+    havePrevErr_ = false;
 }
 
 void LocomotionController::SoftReset()
@@ -87,8 +116,10 @@ void LocomotionController::SoftReset()
 
 void LocomotionController::ResetHard()
 {
+    started_ = false;                     // (before Reset(): a hard reset snaps onto the pose, there is no error to wait out, so no grace window opens)
     Reset();
-    started_ = false;
+    graceLeftMs_ = graceChainMs_ = graceCooldownMs_ = 0.0;   // R5: ... and one that was open is dropped
+    graceEnded_ = false;
     haveVf_ = false;
     pauseMs_ = 0;
     gait_ = inferred_ = pendingGait_ = gaitShown_ = Gait::Still;
@@ -192,6 +223,16 @@ LocoOutput LocomotionController::Update(const LocoInput& in)
     {
         o.levelChanged = true;
         o.levelWhy = static_cast<int>(cur) < static_cast<int>(level_) ? LocoLevelWhy::Recovered : pendingWhy_;
+        if (cfg_.mode == LocoMode::Blend && level_ == LocoLevel::Placed && cur != LocoLevel::Placed && cfg_.blendProbationMs > 0.0f)
+        {
+            // R5: the way back up from the rigid follow is a probe: a short leash and fresh evidence
+            probationLeftMs_ = cfg_.blendProbationMs;
+            ++stats_.probations;
+            fightF_ = fightN_ = fightShare_ = 0.0;
+            blendFailMs_ = 0.0;
+            closeRate_ = 0.0;
+            havePrevErr_ = false;
+        }
         ++stats_.levelChanges;
         ++stats_.levelWhy[static_cast<int>(o.levelWhy)];
         level_ = cur;
@@ -260,6 +301,9 @@ void LocomotionController::Degrade(LocoLevel to, LocoLevelWhy why, double ms)
     else if (to == LocoLevel::Placed && cfg_.mode == LocoMode::Blend)
     {
         // R4 T1: two puppets found that the velocity writes do not carry a ped here: the rigid follow, without finding out again
+        // R5: ... for no longer than this controller's own doubling cap for falls nobody explained (the witness imposes 45 s; the cap is 300 s, so nothing changes there)
+        const double capMs = cfg_.placedUnexplainedMaxMs > 0.0f ? double(cfg_.placedUnexplainedMaxMs) : double(cfg_.placedDurMaxMs);
+        if (ms > capMs) ms = capMs;
         if (placedLeftMs_ < ms) placedLeftMs_ = ms;
         pendingWhy_ = why;
     }
@@ -303,6 +347,48 @@ LocoConfig ShippedLocoConfig(LocoMode mode)
     c.leadS = 8.0f;
     c.leadMinM = 12.0f;
     c.leadMaxM = 40.0f;
+    // R5 (locomotion.h "11. R5"): a grace window after a task-changing event, and a rigid follow that lasts seconds, not half a minute
+    c.blendGraceMs = 2000.0f;
+    c.blendGracePlaceM = 1.0f;
+    c.blendGraceMaxMs = 6000.0f;
+    c.blendProbationMs = 4000.0f;
+    c.blendProbationFailMs = 300.0f;
+    c.blendProbationErrScale = 0.6f;
+    c.blendAttributeMs = 4000.0f;
+    c.blendTrimGateM = 1.0f;
+    c.placedExplainedResetMs = 30000.0f;
+    c = WithPlacedHold(c, 6000);
+    c.maxLevelChanges = 60;
+    return c;
+}
+
+LocoConfig WithPlacedHold(LocoConfig c, int ms)
+{
+    if (ms <= 0)
+    {
+        c.placedMs = 30000.0f;
+        c.placedDurMaxMs = 300000.0f;
+        c.levelHoldMs = 8000.0f;
+        c.placedUnexplainedMs = 0.0f;
+        c.placedUnexplainedMaxMs = 0.0f;
+        return c;
+    }
+    c.placedMs = static_cast<float>(ms);
+    c.placedDurMaxMs = 4.0f * static_cast<float>(ms);
+    c.placedUnexplainedMs = 30000.0f;
+    c.placedUnexplainedMaxMs = 300000.0f;
+    c.levelHoldMs = std::fmin(8000.0f, 0.6f * static_cast<float>(ms));
+    return c;
+}
+
+LocoConfig Round4SelfCheck(LocoConfig c)
+{
+    c.blendGraceMs = 0.0f;
+    c.blendProbationMs = 0.0f;
+    c.blendTrimGateM = 0.0f;
+    c.placedExplainedResetMs = 0.0f;
+    c = WithPlacedHold(c, 0);
+    c.maxLevelChanges = 12;
     return c;
 }
 
@@ -406,6 +492,22 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         Reset();            // re-issue the gait task; the ped keeps where it is (a real divergence still snaps)
         haveVf_ = false;    // the velocity filter is stale after the pause
     }
+
+    // R5: the grace window after a task-changing event runs down (not during a Pause: the ped is not being judged then)
+    if (graceLeftMs_ > 0.0)
+    {
+        graceChainMs_ += dt;
+        graceLeftMs_ -= dt;
+        sinceGraceMs_ = 0.0;
+        if (graceLeftMs_ <= 0.0)
+        {
+            graceLeftMs_ = 0.0;
+            graceEnded_ = true;
+        }
+    }
+    else sinceGraceMs_ += dt;
+    if (graceCooldownMs_ > 0.0) graceCooldownMs_ = graceCooldownMs_ > dt ? graceCooldownMs_ - dt : 0.0;
+    if (probationLeftMs_ > 0.0) probationLeftMs_ = probationLeftMs_ > dt ? probationLeftMs_ - dt : 0.0;
 
     // ---- pose velocity, low-passed ----
     // The sender's GET_ENTITY_VELOCITY carries the stride ripple; the steer and the lead target use a
@@ -521,11 +623,11 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         lastJumpSeq_ = in.jumpSeq;
     }
     const bool jumping = in.jumping || sinceJumpMs_ < cfg_.jumpGraceMs;
-    if (wasJumping_ && !jumping) forceIssue_ = true; // landed: the jump replaced the walk task
+    if (wasJumping_ && !jumping) { forceIssue_ = true; OpenGrace(); } // landed: the jump replaced the walk task (R5: its start clip is not the writes failing)
     wasJumping_ = jumping;
 
     if (in.ragdoll && !ragdollActive_) { o.ragdollStart = true; ragdollActive_ = true; }
-    else if (!in.ragdoll && ragdollActive_) { o.ragdollEnd = true; ragdollActive_ = false; forceIssue_ = true; }
+    else if (!in.ragdoll && ragdollActive_) { o.ragdollEnd = true; ragdollActive_ = false; forceIssue_ = true; OpenGrace(); }
 
     // ---- snap ----
     LocoVec ped = in.pedPos;
@@ -533,6 +635,18 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     const double dist = std::sqrt(ex * ex + ey * ey + ez * ez);
     const double speed3 = std::sqrt(double(in.vel.x) * in.vel.x + double(in.vel.y) * in.vel.y + double(in.vel.z) * in.vel.z);
     bool snap = !started_ || in.teleported || dist > (blendCfg ? double(cfg_.blendSnapM) : cfg_.snapBaseM + cfg_.snapPerSpeedS * speed3);
+    // R5: the grace window closed this frame with the ped still well off the pose: placed ONCE (a coordinate set; the gait task keeps running and
+    // the blend goes on). Not a failure snap: it is neither a hard snap nor a count toward a snap storm.
+    bool gracePlace = false;
+    if (graceEnded_)
+    {
+        graceEnded_ = false;
+        if (blendCfg && started_ && !snap && !jumping && !ragdollActive_ && !in.swimming && pedErrH > double(cfg_.blendGracePlaceM))
+        {
+            snap = true;
+            gracePlace = true;
+        }
+    }
     bool persistentSnap = false;
     if (!snap && !blendCfg)   // R4 T1: Blend has no persistent-error snap (the capped velocity and the self-check answer a lasting error)
     {
@@ -560,7 +674,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
             quietLeftMs_ = 0.0;
         }
     }
-    if (snap && wasStarted && !in.teleported && cfg_.selfCheck)
+    if (snap && wasStarted && !in.teleported && cfg_.selfCheck && !gracePlace)
     {
         // a snap that is neither the first nor a teleport: the ped was not carried to the pose. Three within 6 s are a stall.
         if (sinceFailSnapMs_ > 6000.0) failSnaps_ = 0;
@@ -568,14 +682,15 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         sinceFailSnapMs_ = 0.0;
         if (failSnaps_ >= cfg_.snapStormN) { snapStorm_ = writeVerdict_ != WriteVerdict::Harm; failSnaps_ = 0; }   // (with Harm our own writes make the snaps)
     }
-    if (snap && wasStarted && !in.teleported) ++stats_.hardSnaps;   // R4 T1: a snap that was neither the first nor a teleport
+    if (snap && wasStarted && !in.teleported && !gracePlace) ++stats_.hardSnaps;   // R4 T1: a snap that was neither the first nor a teleport
+    if (gracePlace) ++stats_.gracePlaced;
     if (snap)
     {
         o.snap = true;
         o.snapPos = in.pos;
         ped = in.pos;
         offAcc_ = 0;
-        forceIssue_ = true;
+        if (!gracePlace) forceIssue_ = true;   // (R5: the placement after a grace window keeps the task that runs)
         vf_.x = in.vel.x;   // a snap restarts the ped at the pose's own velocity
         vf_.y = in.vel.y;
         ++stats_.snaps;
@@ -594,7 +709,12 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     }
 
     // R4 T1: the Blend's read-backs and self-check (before the drive: this frame's decision may already be Placed)
-    if (blendCfg) BlendWatch(in, dt, snap, !jumping && !ragdollActive_ && !in.swimming && !placedNow);
+    if (blendCfg)
+    {
+        const bool judged = !jumping && !ragdollActive_ && !in.swimming && !placedNow;
+        const bool graceNow = graceLeftMs_ > 0.0;   // R5: a task-changing event opened a window: nothing accrues in it
+        BlendWatch(in, dt, snap, judged && !graceNow, judged && graceNow);
+    }
 
     // ---- the ped's animation velocity (Sync A) ----
     // GET_ENTITY_VELOCITY is the base of the residual push (the push is that velocity plus a correction). If the game keeps
@@ -735,7 +855,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
                 {
                     // (the part of the pose's velocity the ped does not carry itself, along the track: negative = it runs ahead of the pose)
                     const double ca = haveSelf_ ? ((double(vf_.x) - selfV_.x) * vf_.x + (double(vf_.y) - selfV_.y) * vf_.y) / spdP : 0.0;
-                    BlendTrimStep(Clamp(ca, -double(cfg_.blendMaxDiffMs), double(cfg_.blendMaxDiffMs)), dt);
+                    BlendTrimStep(Clamp(ca, -double(cfg_.blendMaxDiffMs), double(cfg_.blendMaxDiffMs)), dt, 0.0);
                 }
             }
             const double nm = HLen(dx, dy);
@@ -1425,7 +1545,7 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
 
 // R4 T1: what the ped did against the velocity written the frame before, how fast the error closes, the self-check that sends the blend to
 // the rigid follow when the writes do not carry the ped, and (BlendDrive) the velocity itself.
-void LocomotionController::BlendWatch(const LocoInput& in, double dt, bool snapped, bool active)
+void LocomotionController::BlendWatch(const LocoInput& in, double dt, bool snapped, bool active, bool graceHeld)
 {
     const double dtS = dt / 1000.0;
     const double errH = HLen(double(in.pos.x) - in.pedPos.x, double(in.pos.y) - in.pedPos.y);
@@ -1459,23 +1579,35 @@ void LocomotionController::BlendWatch(const LocoInput& in, double dt, bool snapp
     snapStorm_ = false;                      // (a snap storm in Blend is a tracking failure, not a stalled task)
     // two ways to a failure: a big error that does not close, or a moderate one that does not close while nearly every frame shows the ped
     // doing other than the velocity written (the writes are ignored: no reason to wait for the error to grow)
-    const bool slowFail = errH > cfg_.blendFailErrM && closeRate_ < cfg_.blendFailCloseMs;
-    const bool fightFail = errH > cfg_.blendFightErrM && fightShare_ > cfg_.blendFightShare && closeRate_ < 0.3;
+    const bool probation = probationLeftMs_ > 0.0;   // R5: the first seconds after a way back up from the rigid follow
+    const double es = probation ? double(cfg_.blendProbationErrScale) : 1.0;
+    const bool slowFail = errH > cfg_.blendFailErrM * es && closeRate_ < cfg_.blendFailCloseMs;
+    const bool fightFail = errH > cfg_.blendFightErrM * es && fightShare_ > cfg_.blendFightShare && closeRate_ < 0.3;
+    const double budgetMs = probation ? double(cfg_.blendProbationFailMs) : double(cfg_.blendFailMs);
+    if (graceHeld && !snapped && (slowFail || fightFail)) ++stats_.graceHeldFrames;   // R5: a frame of a fall that a grace window did not let happen
     if (active && !snapped && (slowFail || fightFail)) blendFailMs_ += dt * (fightFail ? 2.0 : 1.0);
     else blendFailMs_ = blendFailMs_ > 2.0 * dt ? blendFailMs_ - 2.0 * dt : 0.0;
-    if (active && (blendFailMs_ >= cfg_.blendFailMs || storm) && LadderMayChange(true))
+    if (active && (blendFailMs_ >= budgetMs || storm) && LadderMayChange(true))
     {
         // the writes do not carry the ped (or something holds it): the rigid follow, whose per-frame step is capped at the pose's speed +
         // blendHardCapMs, never a bigger push. It is tried again after the timer (doubling per failure in a row).
-        if (sincePlacedMs_ > 300000.0) placedFailStreak_ = 0;
-        double dur = cfg_.placedMs;
-        for (int i = 0; i < placedFailStreak_ && dur < cfg_.placedDurMaxMs; ++i) dur *= 2.0;
-        if (dur > cfg_.placedDurMaxMs) dur = cfg_.placedDurMaxMs;
+        // R5: a fall soon after a task-changing event is the event's (the short hold, the probation retry); any other is the writes' own (the long one)
+        const bool explained = stats_.graceWindows > 0 && sinceGraceMs_ < cfg_.blendAttributeMs;
+        const double streakResetMs = explained && cfg_.placedExplainedResetMs > 0.0f ? double(cfg_.placedExplainedResetMs) : 300000.0;
+        if (sincePlacedMs_ > streakResetMs) placedFailStreak_ = 0;
+        const bool longHold = !explained && cfg_.placedUnexplainedMs > 0.0f;
+        double dur = longHold ? double(cfg_.placedUnexplainedMs) : double(cfg_.placedMs);
+        const double durMax = longHold ? double(cfg_.placedUnexplainedMaxMs) : double(cfg_.placedDurMaxMs);
+        for (int i = 0; i < placedFailStreak_ && dur < durMax; ++i) dur *= 2.0;
+        if (dur > durMax) dur = durMax;
         ++placedFailStreak_;
         sincePlacedMs_ = 0.0;
         placedLeftMs_ = dur;
         pendingWhy_ = fightShare_ >= 0.3 ? LocoLevelWhy::BlendFighting : LocoLevelWhy::BlendNoTrack;
         ++stats_.blendDegrades;
+        if (probation) ++stats_.probationFalls;
+        if (explained) ++stats_.fallsAfterGrace;   // R5: the failure outlasted the window (or a new one began right after)
+        else ++stats_.fallsUnexplained;
         blendFailMs_ = 0.0;
         corrAlongLp_ = 0.0;
         closeRate_ = 0.0;
@@ -1531,17 +1663,19 @@ void LocomotionController::BlendDrive(const LocoInput& in, const LocoVec& ped, d
     }
     o.velocity.z = static_cast<float>(vz);
     o.corrMs = static_cast<float>(HLen(vx - in.vel.x, vy - in.vel.y));
-    if (moving && spd >= 1.0) BlendTrimStep((cx * vf_.x + cy * vf_.y) / spd, dt);
+    if (moving && spd >= 1.0) BlendTrimStep((cx * vf_.x + cy * vf_.y) / spd, dt, he);
     else corrAlongLp_ *= 0.95;
 }
 
 // The trim of the move blend ratio: a task that runs faster than the pose is braked by the writes (the mean correction along the track is
 // negative) and its blend ratio falls until the writes need not brake it; one that is slower is the mirror image. `along` is the correction
 // along the pose's direction (m/s) this frame: the blend's own, or at the Placed level the error that the rigid follow closes.
-void LocomotionController::BlendTrimStep(double along, double dt)
+void LocomotionController::BlendTrimStep(double along, double dt, double errM)
 {
     corrAlongLp_ += (along - corrAlongLp_) * (1.0 - std::exp(-dt / 400.0));
-    if (accLp_ < cfg_.steadyAccMs2 && sinceMoveStartMs_ >= 600.0)
+    // R5: a grace window, or a catch-up of a big error, is no evidence about the speed knob (the average still follows, the integral waits)
+    const bool holdTrim = cfg_.blendTrimGateM > 0.0f && (graceLeftMs_ > 0.0 || errM >= double(cfg_.blendTrimGateM));
+    if (!holdTrim && accLp_ < cfg_.steadyAccMs2 && sinceMoveStartMs_ >= 600.0)
     {
         const double ex = std::fabs(corrAlongLp_) - cfg_.blendTrimDeadMs;
         if (ex > 0.0)
@@ -1573,6 +1707,20 @@ void LocoDiag::Observe(const LocoDiagFrame& f)
     const bool had = havePrev_ && gapMs > 0.0 && gapMs <= 250.0;
     if (had)
         derived = HLen(double(f.pedPos.x) - prevPed_.x, double(f.pedPos.y) - prevPed_.y) / (gapMs / 1000.0);
+    // R5 telemetry: headings (GTA: 0 = +y, counter-clockwise, so a direction (vx, vy) points at heading atan2(-vx, vy)). A frame that snapped moved the ped
+    // by the snap, not by walking: no own-velocity sample from it.
+    if (f.haveHeading && f.poseSpeed > 1.0f)
+    {
+        headErr_.Add(std::fabs(WrapDeg180(double(f.pedHeading) - double(f.poseHeadingDeg))));
+        const double pa = std::atan2(-double(f.poseVel.x), double(f.poseVel.y)) * 180.0 / kPi;
+        poseVelHead_.Add(std::fabs(WrapDeg180(pa - double(f.pedHeading))));
+    }
+    if (f.haveHeading && had && !f.snapped && !prevSnapped_ && derived > 1.0)
+    {
+        const double dvx = (double(f.pedPos.x) - prevPed_.x) / (gapMs / 1000.0), dvy = (double(f.pedPos.y) - prevPed_.y) / (gapMs / 1000.0);
+        const double va = std::atan2(-dvx, dvy) * 180.0 / kPi;
+        pedVelHead_.Add(std::fabs(WrapDeg180(va - double(f.pedHeading))));
+    }
     // R4 T1: what the ped did against the velocity written the frame before (the read-back and the position-derived velocity)
     if (prevPushed_ && !f.snapped && had)
     {
@@ -1582,6 +1730,7 @@ void LocoDiag::Observe(const LocoDiagFrame& f)
         if (HLen(ivx - prevPush_.x, ivy - prevPush_.y) > 1.0) ++fightPos_;
     }
     prevPushed_ = f.pushed && f.blend && !f.snapped;
+    prevSnapped_ = f.snapped;
     prevPush_ = f.push;
     prevPed_ = f.pedPos;
     prevNowMs_ = f.nowMs;
@@ -1682,6 +1831,15 @@ LocoDiagSummary LocoDiag::Summary() const
     s.fightVelFrames = fightVel_;
     s.fightPosFrames = fightPos_;
     s.fightCmpFrames = fightCmp_;
+    s.headFrames = headErr_.Count();
+    s.headErrMeanDeg = headErr_.Mean();
+    s.headErrP95Deg = headErr_.Percentile(0.95);
+    s.poseVelHeadFrames = poseVelHead_.Count();
+    s.poseVelHeadMeanDeg = poseVelHead_.Mean();
+    s.poseVelHeadP95Deg = poseVelHead_.Percentile(0.95);
+    s.pedVelHeadFrames = pedVelHead_.Count();
+    s.pedVelHeadMeanDeg = pedVelHead_.Mean();
+    s.pedVelHeadP95Deg = pedVelHead_.Percentile(0.95);
     if (frames_)
     {
         const uint32_t n50 = (frames_ + 1) / 2, n95 = static_cast<uint32_t>(frames_ * 0.95 + 0.999);

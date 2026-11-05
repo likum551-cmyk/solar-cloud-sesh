@@ -32,6 +32,7 @@
 #include "common/logger.h"
 #include "protocol/protocol.h"
 #include "sync/minimap.h"     // RadarKeepOut / DockVitals: where GTA's radar is, and where the vitals plate goes under it
+#include "sync/vehicle_state_row.h"   // 0.4.27 the vehicle state row: where it goes, its cells, the change pulse
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImGuiContext::ConfigNavWindowingKey* (UiInit)
@@ -152,7 +153,8 @@ std::atomic<float>    g_radarSafeZone{1.0f};
 std::atomic<bool>     g_radarSafeZoneOk{false};
 std::atomic<float>    g_radarScale{1.0f};   // 0.4.25 minimap_scale: the factor the game's radar was shrunk by (1 = the game's own size)
 // 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
-// one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown.
+// one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown;
+// 0.4.27 state row: 8 lock known, 9 locked, 10 the on-foot lock flash.
 std::atomic<unsigned>  g_vehKeys{0};
 std::atomic<ULONGLONG> g_vehKeysAt{0};
 std::atomic<unsigned>  g_vehHud{0};
@@ -246,6 +248,9 @@ struct Ui {
     float    speedSm = 0.0f;                // displayed speed, km/h
     float    vitalsA = 0.0f, fuelA = 0.0f;  // cluster / fuel row visibility
     float    stripA = 0.0f;                 // the speedometer plate's status strip (0.4.22): eased so the plate never jumps in height
+    float    rowA = 0.0f;                   // 0.4.27 the vehicle state row's visibility
+    float    rowOn[3] = {};                 // its toggles' knobs, eased 0 (off, left) .. 1 (on, right)
+    gage::sync::RowTracker rowTrack;        // when each cell last flipped (the change pulse)
     struct Vital {
         float fill = 1.0f;                  // the bar's level as drawn
         float trail = 1.0f;                 // lags above fill after a loss, so damage reads
@@ -717,7 +722,7 @@ void DrawLogo(ImDrawList* dl, float W, float a, UiState& L)
 // Where the margin under the radar is too small for the strip (a safe zone past about
 // 0.95 at 1080p) it tucks up into the radar's bottom edge, at most kStripMaxCover of the radar's height, which is where
 // GTA's bars sit; beyond that the plate returns to the bottom-right, as with the radar off.
-constexpr float kStripFrac = 0.07f;        // strip height / radar height (GTA's bars are about as thin)
+constexpr float kStripFrac = 0.0875f;      // strip height / the game's unscaled radar height (0.4.27: GI asked for 25 % over 0.07; capped by the free margin under the radar)
 constexpr float kStripMinH = 11.0f;        // and never thinner than this: 11 px holds the 7 px glyph class (2 px above and below) and a 5 px bar
 constexpr float kStripMaxCover = 0.0f;     // 0.4.23: the strip never tucks into the map (GI saw the 0.4.22 tuck overlap it)
 struct Cluster {
@@ -767,7 +772,9 @@ Cluster ClusterLayout(float W, float H)
         // bottom-right plate returns.
         const float edge = std::fmax(2.0f, std::floor(S(2.0f)));
         const float room = std::floor(H - edge - radar.y1);
-        const float stripH = std::fmax(kStripMinH, std::fmin(std::floor(c.radarH * kStripFrac), room));
+        // 0.4.27: the strip's height follows the game's UNSCALED radar (a smaller map must not shrink the bars; GI asked for them 25 % bigger).
+        const float fullRadarH = c.radarH / std::fmax(0.5f, g_radarScale.load());
+        const float stripH = std::fmax(kStripMinH, std::fmin(std::floor(fullRadarH * kStripFrac), room));
         const gage::sync::VitalsDock d = gage::sync::DockVitals(W, H, radar, stripH, S(120.0f), S(400.0f), 0.0f, edge,
                                                                 kStripMaxCover);
         c.dockWhy = (int)d.why;
@@ -1422,6 +1429,139 @@ void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
     L.vitalsRows = 2;
     L.healthShown = pct[0]; L.satietyShown = pct[1];
     L.healthLow = u.vit[0].low; L.satietyLow = u.vit[1].low;
+}
+
+// ---- 0.4.27 the vehicle state row (libs/sync/vehicle_state_row.h): lock, belt, engine ---------------------------------------------------------
+// The padlock, closed and open, in square classes of 7, 9 and 13 px (the 9 px class scaled by a whole factor from an 18 px box up, like the heart). The
+// open lock's shackle stands one row (two at 13 px) higher with its left leg out of the body: the two read apart by shape, not only by colour.
+constexpr const char* const kLockC7[7] = {"..XXX..", ".X...X.", ".X...X.", "XXXXXXX", "XXX.XXX", "XXX.XXX", "XXXXXXX"};
+constexpr const char* const kLockO7[7] = {"..XXX..", ".X...X.", ".....X.", ".....X.", "XXXXXXX", "XXX.XXX", "XXXXXXX"};
+constexpr const char* const kLockC9[9] = {"..XXXXX..", ".XX...XX.", ".X.....X.", ".X.....X.", "XXXXXXXXX", "XXXX.XXXX", "XXXX.XXXX", "XXXXXXXXX", "XXXXXXXXX"};
+constexpr const char* const kLockO9[9] = {"..XXXXX..", ".XX...XX.", ".X.....X.", ".......X.", ".......X.", "XXXXXXXXX", "XXXX.XXXX", "XXXX.XXXX", "XXXXXXXXX"};
+constexpr const char* const kLockC13[13] = {"...XXXXXXX...", "..XXXXXXXXX..", "..XX.....XX..", "..XX.....XX..", "..XX.....XX..", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX",
+                                            "XXXXXX.XXXXXX", "XXXXX...XXXXX", "XXXXXX.XXXXXX", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX"};
+constexpr const char* const kLockO13[13] = {"...XXXXXXX...", "..XXXXXXXXX..", "..XX.....XX..", ".........XX..", ".........XX..", ".........XX..", "XXXXXXXXXXXXX",
+                                            "XXXXXXXXXXXXX", "XXXXXX.XXXXXX", "XXXXX...XXXXX", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX"};
+// The belt and the engine of the speedometer strip, each with a 7 px class in front: the row is the vitals strip's height (11 px at its smallest:
+// a 7 px glyph box), which the strip's 9 / 10 px classes do not fit.
+constexpr const char* const kBelt7[7] = {"..XX...", "..XX...", ".......", ".X.XX..", ".XX.X..", ".XXX.XX", ".....XX"};
+constexpr const char* const kEngine7[7] = {"...XXX....", "....X.....", ".XXXXXXX..", "XXXXXXXXXX", "XXX....XXX", "XXXXXXXXXX", ".XXXXXXX.."};
+constexpr Bmp kLockCCls[3] = {{7, 7, kLockC7}, {9, 9, kLockC9}, {13, 13, kLockC13}};
+constexpr Bmp kLockOCls[3] = {{7, 7, kLockO7}, {9, 9, kLockO9}, {13, 13, kLockO13}};
+constexpr Bmp kBeltRowCls[4] = {{7, 7, kBelt7}, {9, 10, kBelt10}, {12, 14, kBelt14}, {15, 18, kBelt18}};
+constexpr Bmp kEngineRowCls[4] = {{10, 7, kEngine7}, {13, 9, kEngine9}, {18, 13, kEngine13}, {23, 17, kEngine17}};
+static_assert(ClassesOk(kLockCCls, 3) && ClassesOk(kLockOCls, 3) && ClassesOk(kBeltRowCls, 4) && ClassesOk(kEngineRowCls, 4),
+              "state row bitmaps: a row is not w wide / a class is not h rows / an unknown character");
+constexpr PixelSet kLockCSet = {kLockCCls, 3, 1, 9, 18};
+constexpr PixelSet kLockOSet = {kLockOCls, 3, 1, 9, 18};
+constexpr PixelSet kBeltRowSet = {kBeltRowCls, 4, 2, 14, 28};
+constexpr PixelSet kEngineRowSet = {kEngineRowCls, 4, 2, 14, 28};
+
+// The row's rect and cells come from libs/sync/vehicle_state_row.h (PlaceStateRow / LayoutStateRow) against the vitals strip's rect as ClusterLayout
+// computes it (never its own sizing): the strip's left edge, width and height; under it when the margin allows, else above the radar. Opaque plate with
+// the strip's cut corner. Per cell: the glyph (ghost when the state is not known or not live), then a toggle: gold track with the dark knob at its right =
+// on, ghost track with an ink knob at its left = off; the knob slides (eased) when the state flips, and the cell flashes gold for kRowPulseMs. An
+// unbuckled belt at speed is the strip's alarm: ember glyph and an ember-tinted track on the alarm beat.
+void DrawStateRow(ImDrawList* dl, float W, float H, float a, unsigned hud, double nowMs, UiState& L)
+{
+    const Cluster c = ClusterLayout(W, H);
+    gage::sync::RowAnchor an;
+    an.screenH = H;
+    an.docked = c.docked;
+    an.edge = std::fmax(2.0f, std::floor(S(2.0f)));
+    if (c.docked) {
+        an.x = c.vx;
+        an.w = c.vw;
+        an.rowH = c.vH;                                             // the strip's own height: one family
+        an.stripBottom = c.dockY + c.vH;                            // its resting edge (the row does not ride the strip's slide)
+        an.radarTop = c.radarY;
+        an.gap = std::fmax(2.0f, std::floor(S(4.0f)));
+    } else {
+        an.x = c.x;
+        an.w = c.w;
+        an.rowH = std::fmax(kStripMinH, std::floor(S(14.0f)));
+        an.plateTop = L.speedoVisible ? L.speedoY : (L.vitalsVisible ? L.vitalsY : H - c.gut);
+        an.gap = c.gap;
+    }
+    const gage::sync::RowRect r = gage::sync::PlaceStateRow(an);
+    if (r.where == gage::sync::RowWhere::None)
+        return;
+    const float padX = std::fmax(2.0f, std::floor(S(5.0f)));
+    const float sep = std::fmax(4.0f, std::floor(S(10.0f)));
+    const float gGap = std::fmax(2.0f, std::floor(S(4.0f)));
+    const gage::sync::RowLayout lay = gage::sync::LayoutStateRow(r.x, r.y, r.w, r.h, padX, sep, gGap);
+    if (!lay.ok)
+        return;
+
+    const bool lockKnown = (hud & 256u) != 0, locked = (hud & 512u) != 0, flash = (hud & 1024u) != 0;
+    const bool beltOn = (hud & 16u) != 0, beltWarn = (hud & 32u) != 0, engOn = (hud & 64u) == 0;
+    const ImVec2 hull[5] = {{r.x, r.y}, {r.x + r.w, r.y}, {r.x + r.w, r.y + r.h - lay.cut}, {r.x + r.w - lay.cut, r.y + r.h}, {r.x, r.y + r.h}};
+    dl->AddConvexPolyFilled(hull, 5, Col(kPanel, a));
+
+    const int gn = (int)std::floor(lay.gs);
+    int k[3] = {1, 1, 1};
+    const Bmp* bmp[3] = {PixelPick((lockKnown && !locked) ? kLockOSet : kLockCSet, gn, &k[0]), PixelPick(kBeltRowSet, gn, &k[1]),
+                         PixelPick(kEngineRowSet, gn, &k[2])};
+    // The toggles only when every cell has room for its glyph's real width, the gap and the track (a wide engine glyph in a 7 px box is 10 px).
+    float glyphW = 0.0f;
+    for (int i = 0; i < 3; ++i)
+        glyphW = std::fmax(glyphW, bmp[i] ? (float)(bmp[i]->w * k[i]) : lay.gs);
+    const float cellW = lay.cell[0].x1 - lay.cell[0].x0;
+    const bool toggles = lay.toggles && glyphW + gGap + (lay.cell[0].tx1 - lay.cell[0].tx0) <= cellW;
+    const float alarm = AlarmPulse(HudPhase());
+
+    const bool live[3] = {lockKnown, !flash, !flash};
+    const bool on[3] = {locked, beltOn, engOn};
+    for (int i = 0; i < 3; ++i) {
+        const gage::sync::RowCellBox& cb = lay.cell[i];
+        const float p = u.rowTrack.Pulse(i, nowMs);
+        if (p > 0.003f)                                             // the change flash: the cell lights gold and fades
+            dl->AddRectFilled(ImVec2(cb.x0 - 2.0f, r.y), ImVec2(cb.x1 + 2.0f, r.y + r.h), Col(kGold, 0.30f * p * a));
+        const bool warn = i == 1 && live[i] && beltWarn;
+        ImU32 gcol;
+        if (!live[i])
+            gcol = Col(kInk, 0.12f * a);                             // the idle ghost of every HUD glyph
+        else if (warn)
+            gcol = Col(kEmber, a * (0.55f + 0.45f * alarm));
+        else
+            gcol = Col(Mix(kInk2, kGold, p), a * (on[i] ? 0.95f : 0.45f + 0.50f * p));
+        if (bmp[i])
+            PixelDraw(dl, cb.gx, lay.gy + (float)((gn - bmp[i]->h * k[i]) / 2), *bmp[i], k[i], gcol, false);
+        else
+            dl->AddRectFilled(ImVec2(cb.gx, lay.gy), ImVec2(cb.gx + lay.gs, lay.gy + lay.gs), gcol);
+        if (!toggles)
+            continue;
+        const float tx0 = cb.tx0, ty0 = cb.ty0, tx1 = cb.tx1, ty1 = cb.ty1;
+        if (!live[i]) {
+            dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), Col(kInk, 0.10f * a));   // not known: an empty track, no knob
+            continue;
+        }
+        const float e = u.rowOn[i] * u.rowOn[i] * (3.0f - 2.0f * u.rowOn[i]);
+        dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), Col(kInk, 0.18f * a));       // the track (the vitals track's lift)
+        if (e > 0.003f)
+            dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), Col(kGold, 0.95f * a * e));
+        if (warn)
+            dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), Col(kEmber, 0.30f * a * (0.35f + 0.65f * alarm)));
+        const float kx = std::floor(cb.kOff + (cb.kOn - cb.kOff) * e);
+        dl->AddRectFilled(ImVec2(kx, ty0 + 1.0f), ImVec2(kx + lay.knob, ty0 + 1.0f + lay.knob), Col(Mix(kInk2, kPanel, e), a * 0.95f));
+    }
+
+    L.rowVisible = true;
+    L.rowWhere = (int)r.where;
+    L.rowX = r.x; L.rowY = r.y; L.rowW = r.w; L.rowH = r.h;
+    L.rowLock = lockKnown ? (locked ? 1 : 0) : -1;
+    L.rowBelt = beltOn; L.rowEngine = engOn; L.rowToggles = toggles;
+    for (int i = 0; i < 3; ++i)
+        L.rowPulse[i] = u.rowTrack.Pulse(i, nowMs);
+
+    // Once per change of place, where the row went (the strip's own line names the strip and the radar).
+    static int s_where = -1;
+    if ((int)r.where != s_where) {
+        s_where = (int)r.where;
+        GLOGI("overlay: vehicle state row %s: x %.0f-%.0f y %.0f-%.0f (%s); lock / belt / engine, toggles %s",
+              gage::sync::RowWhereName(r.where), (double)r.x, (double)(r.x + r.w), (double)r.y, (double)(r.y + r.h),
+              c.docked ? "the docked strip's left edge, width and height" : "the bottom-right cluster's edge and width", toggles ? "drawn" : "left out (cells too narrow)");
+    }
 }
 
 // Chat, top-left: the plate's top edge is fixed 100 px (1080p design) from the top of the screen and the
@@ -2689,6 +2829,26 @@ void UiFrame()
         u.speedSm = Ease(u.speedSm, speed, 12.0f, dt, 0.15f);
     u.speedA = Approach(u.speedA, (inVeh && !loading) ? 1.0f : 0.0f, dt / 0.18f);
     u.stripA = Approach(u.stripA, (inVeh && !loading && (g_vehHud.load() & 128u) != 0) ? 1.0f : 0.0f, dt / 0.18f);
+    // 0.4.27 the vehicle state row: in a vehicle (the strip's own condition), or on foot while the lock flash lasts. Its knobs ease toward the state
+    // (snapped while the row is hidden, so getting in never slides them), and the tracker stamps each flip for the change pulse.
+    const unsigned rowHud = g_vehHud.load();
+    const double rowNowMs = ImGui::GetTime() * 1000.0;
+    {
+        const bool flash = (rowHud & 1024u) != 0;
+        const bool wanted = !loading && ((inVeh && (rowHud & 128u) != 0) || flash);
+        const bool wasHidden = u.rowA <= 0.003f;
+        u.rowA = Approach(u.rowA, wanted ? 1.0f : 0.0f, dt / 0.18f);
+        gage::sync::RowState rs;
+        rs.visible = wanted && live;
+        rs.lockOnly = flash;
+        rs.lock = (rowHud & 256u) ? ((rowHud & 512u) ? 1 : 0) : -1;
+        rs.belt = (rowHud & 16u) != 0;
+        rs.engine = (rowHud & 64u) == 0;
+        u.rowTrack.Update(rs, rowNowMs);
+        const float want[3] = {rs.lock > 0 ? 1.0f : 0.0f, rs.belt ? 1.0f : 0.0f, rs.engine ? 1.0f : 0.0f};
+        for (int i = 0; i < 3; ++i)
+            u.rowOn[i] = wasHidden ? want[i] : Approach(u.rowOn[i], want[i], dt / 0.12f);
+    }
     TickVitals(dt, loading);
     u.chatA = Approach(u.chatA, u.chatOpen ? 1.0f : 0.0f, dt / 0.12f);
     u.invA = Approach(u.invA, u.invOpen ? 1.0f : 0.0f, dt / 0.14f);
@@ -2811,6 +2971,8 @@ void UiFrame()
             DrawSpeedo(bg, W, H, u.speedA * u.hudA, u.speedSm, L);
         if (u.vitalsA > 0.003f)
             DrawVitals(bg, W, H, u.vitalsA * u.hudA, L);
+        if (u.rowA > 0.003f)
+            DrawStateRow(bg, W, H, u.rowA * u.hudA, rowHud, rowNowMs, L);   // after both: it is placed against their rects
         DrawChat(bg, W, H, now, u.hudA, L);
         if (u.invA > 0.003f)
             bg->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Col(kGround, 0.52f * u.invA * u.hudA));
@@ -2899,7 +3061,8 @@ void SetVehicleHud(const VehicleHud& h)
 {
     const int lights = h.lights < 0 ? 0 : (h.lights > 2 ? 2 : h.lights);
     const unsigned w = (h.indLeft ? 1u : 0u) | (h.indRight ? 2u : 0u) | ((unsigned)lights << 2) | (h.beltOn ? 16u : 0u) |
-                       (h.beltWarn ? 32u : 0u) | (h.engineOff ? 64u : 0u) | (h.show ? 128u : 0u);
+                       (h.beltWarn ? 32u : 0u) | (h.engineOff ? 64u : 0u) | (h.show ? 128u : 0u) |
+                       (h.lock >= 0 ? 256u : 0u) | (h.lock > 0 ? 512u : 0u) | (h.lockFlash ? 1024u : 0u);
     g_vehHud.store(w);
 }
 

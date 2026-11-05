@@ -3061,6 +3061,9 @@ static void TestSyncD()
 #include "noclip_tests.h"   // 0.4.22 noclip: movement math, state machine, saved flags, ground placement (needs Check and F above)
 #include "doors_seats_tests.h"   // 0.4.22 doors and seats: rear-seat choice, the lock rules, the lock keeper (needs Check / F above)
 #include "vehcontrols_pure_tests.h"   // 0.4.22 vehicle controls: keys -> indicators / engine / belt, auto-cancel, fuel gauge, wire helpers
+#include "r5_edges_tests.h"   // R5 on-foot telemetry: swim / ragdoll edges, the sender's flag against the puppet's read-back (libs/sync/state_mirror.h)
+#include "r5_swing_tests.h"   // R5 punches: the looped swing plan / ladder order, the explicit stop, the survey with 7 entries, under switchable GTA models
+#include "vehstate_row_tests.h"   // 0.4.27 vehicle state row (lock / belt / engine) and the indicator fallback (needs Check / F above)
 
 int main()
 {
@@ -3116,6 +3119,11 @@ int main()
     noclipt::RunPure();                             // 0.4.22 noclip (tests/noclip_tests.h)
     doorsseats::RunPure();                          // 0.4.22 doors and seats (tests/doors_seats_tests.h)
     vehctl::RunPure();                              // 0.4.22 vehicle controls (tests/vehcontrols_pure_tests.h)
+    std::printf("-- R5: swim / ragdoll edges (sender flag against the puppet's read-back)\n");
+    r5edge::RunPure();
+    std::printf("-- R5: looped punches (plan order, explicit stop, survey of 7, under switchable GTA models)\n");
+    r5swing::RunPure();
+    vehrow::RunPure();                              // 0.4.27 vehicle state row + indicator fallback (tests/vehstate_row_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3129,7 +3137,10 @@ int main()
                        + minimaptest::kChecks // + 0.4.22 minimap 28
                        + noclipt::kChecks     // + 0.4.22 noclip 31
                        + doorsseats::kPureChecks    // + 0.4.22 doors and seats 19
-                       + vehctl::kPureChecks; // + 0.4.22 vehicle controls 38
+                       + vehctl::kPureChecks  // + 0.4.22 vehicle controls 38
+                       + r5edge::kChecks      // + R5 swim / ragdoll edge telemetry
+                       + r5swing::kChecks    // + R5 looped punches
+                       + vehrow::kChecks;     // + 0.4.27 vehicle state row + indicator fallback 31
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

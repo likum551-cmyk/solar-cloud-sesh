@@ -235,7 +235,7 @@ namespace {
             GLOGI("gage_mp: pack_enh=%d (%s)", world.packEnh,
                   world.packEnh == 0 ? "off: Enhanced car packs untouched"
                   : world.packEnh == 1 ? "Round A: read-only diagnostic of the DLC manager, image registry and vehicle store, Enhanced only"
-                  : world.packEnh == 2 ? "Round B: Round A first, then every pack under %LOCALAPPDATA%\\GAGE-MP\\packs is mounted, Enhanced only"
+                  : world.packEnh == 2 ? "Round B: Round A first, then every pack under %LOCALAPPDATA%\\GAGE-MP\\packs-gen9 (the gen9-converted set) is mounted, Enhanced only"
                                        : "reserved for the next mount round, not built yet");
         }
         // Before game::Init (which arms skip_landing): the DLC vehicle array is sized when the Story session starts.

@@ -11,6 +11,20 @@ using gage::game::content::packenh::MountAbi;
 using gage::game::content::packenh::MountOut;
 using gage::game::content::packenh::Mounter;
 
+// ---- 0. the Legacy-asset guard (0.4.27): the real headers of the shipped jesko.yft / jesko.ytd, and a gen9 one --------------------
+static void TestLegacyResourceGuard() {
+    using gage::game::content::packenh::IsLegacyResource;
+    const uint8_t yft[] = { 0x52, 0x53, 0x43, 0x37, 0xa2, 0x00, 0x00, 0x00 };   // jesko.yft: RSC7, version 162
+    const uint8_t ytd[] = { 0x52, 0x53, 0x43, 0x37, 0x0d, 0x00, 0x00, 0x00 };   // jesko.ytd: RSC7, version 13
+    const uint8_t yft9[] = { 0x52, 0x53, 0x43, 0x37, 0xab, 0x00, 0x00, 0x00 };  // CodeWalker dev48's gen9 jesko.yft: RSC7, version 171
+    const uint8_t ytd9[] = { 0x52, 0x53, 0x43, 0x37, 0x05, 0x00, 0x00, 0x00 };  // its gen9 jesko.ytd: RSC7, version 5
+    CHECK(IsLegacyResource(yft, sizeof yft, "yft"), "guard: a Legacy yft header is Legacy");
+    CHECK(IsLegacyResource(ytd, sizeof ytd, "ytd"), "guard: a Legacy ytd header is Legacy");
+    CHECK(!IsLegacyResource(yft9, sizeof yft9, "yft"), "guard: a gen9 yft (v171) is not Legacy");
+    CHECK(!IsLegacyResource(ytd9, sizeof ytd9, "ytd"), "guard: a gen9 ytd (v5) is not Legacy");
+    CHECK(!IsLegacyResource(yft, 7, "yft"), "guard: a short read is not called Legacy");
+}
+
 // ---- 1. the profile (no image needed) ------------------------------------------------------------------------------------
 static void TestMountProfile() {
     const PackProfile& L = kPackLegacy;

@@ -171,6 +171,27 @@
 //     not close sends the puppet to the rigid follow (LocoLevel::Placed, reasons BlendFighting / BlendNoTrack), never to a bigger push.
 //     LocoInput::swingActive (all modes) holds every task issue and repair while a melee swing animation plays.
 //
+// 11. R5 (on-foot round 5; live 0.4.26 two-player log, 17:36-17:43): the Blend self-check fell to the rigid follow (LocoLevel::Placed) three times
+//     in seven minutes and STAYED there 30 s each (6 of 16 moving windows at level 3: skate 50-100 %, pose-ped error p95 2.0-3.9 m, the legs idle
+//     while coordinates dragged the ped). Every fall followed a task-changing Reset(): the end of a vault (climb-end), of an aim, of a hit
+//     reaction, the car exit (Pause, then Reset). The new task's start clip does not honour velocity writes for a second or so, the error sits at
+//     0.7-1.2 m, over 75 % of the frames "fight" the writes and BlendWatch calls that a failure of the WRITES. Two rules (switchable, off = round 4):
+//     (a) blendGraceMs (2 s): a task-changing event (Reset() from any caller, so the car exit's Pause end too, the end of a ragdoll, a landing)
+//         opens a grace window in which BlendWatch accrues no failure and the fight statistics start afresh. When the window closes with the ped
+//         still more than blendGracePlaceM (1.0 m, under the 1.2 m failure error so no error escapes both) from the pose it is PLACED ONCE (one coordinate set, the gait task kept running) and the blend
+//         goes on; a failure that outlasts the window is judged as before. A chain of Resets re-arms the window but never extends it past
+//         blendGraceMaxMs (6 s) from its first opening, and after a chain hit the cap no window opens for blendGraceMaxMs more (a Reset storm must
+//         not switch the self-check off, neither by one long window nor by a new one every 0.5 s).
+//     (b) a fall within blendAttributeMs (4 s) of such an event is put down to the event, not to the writes: placedMs 6 s with a doubling cap of
+//         24 s (was 30 s / 300 s), and the way back up is a PROBATION (blendProbationMs 4 s: error thresholds x 0.6, failure budget 300 ms,
+//         fresh fight statistics), so a retry in a world where the writes really are ignored costs a short excursion, not a long one. A fall with
+//         no recent event (nothing to blame but the writes) keeps the round-4 hold: placedUnexplainedMs 30 s doubling to 300 s. levelHoldMs
+//         3.6 s (was 8 s: it also gates the way back up, so Placed lasted max(placedMs, levelHoldMs)), maxLevelChanges 60 (was 12: a shorter
+//         hold means more changes, and the cap FREEZES the ladder in whatever level it is at, Placed included, for the session).
+//         Round4SelfCheck(cfg) puts the old numbers back (engine: loco_blend_grace=0, loco_placed_ms=0); loco_placed_ms=N picks N ms (cap 4 N)
+//         for the explained falls.
+//     The imposed Placed of LevelWitness (45 s) is capped at the unexplained cap by Degrade() (nothing changes there).
+//
 // CONSTANTS (LocoConfig defaults)
 //   idleUp/Down        0.50 / 0.25 m/s  old GTAN GetPedSpeed: walk from 0.5; band below
 //   walkRunUp/Down     3.10 / 2.10 m/s  W11: was 2.90 / 2.40; around 2.6, walk max 1.8 .. run min 3.5
@@ -434,6 +455,24 @@ namespace gage::sync {
         bool blendGaitClip = true;
         float blendFightErrM = 0.7f, blendFightShare = 0.75f;   // ... or this error with this share of frames fighting: twice as fast to Placed
         float blendTrimGain = 0.25f, blendTrimDeadMs = 0.15f, blendTrimMin = -1.2f, blendTrimMax = 0.6f, blendSetStep = 0.08f;
+        // R5 (see "11. R5" above). Blend only, only with selfCheck. blendGraceMs 0 = off (the round-4 self-check). The library default is OFF like the other
+        // round rules; ShippedLocoConfig(Blend) turns it on (2 s).
+        float blendGraceMs = 0.0f;         // no failure accrues this long after a task-changing event (Reset(), ragdoll end, landing)
+        float blendGracePlaceM = 1.0f;     // the window closes with the ped this far from the pose (horizontal): placed once, the blend goes on
+        float blendGraceMaxMs = 6000.0f;   // a chain of re-arms ends this long after its first opening
+        // R5 probation: the way back up from the rigid follow is a probe, and in a world where the writes really are ignored every probe costs an excursion.
+        // For blendProbationMs after it the self-check is on a short leash (the error thresholds scaled by blendProbationErrScale, the failure budget
+        // blendProbationFailMs instead of blendFailMs) and starts with fresh fight statistics. 0 = off (the round-4 retry).
+        float blendProbationMs = 0.0f, blendProbationFailMs = 300.0f, blendProbationErrScale = 0.6f;
+        // A fall this soon after a grace window opened is the event's (placedMs applies); any other fall is the writes' own (placedUnexplainedMs
+        // doubling to placedUnexplainedMaxMs; 0 = placedMs / placedDurMaxMs for every fall, the round-4 and the library default).
+        float blendAttributeMs = 4000.0f, placedUnexplainedMs = 0.0f, placedUnexplainedMaxMs = 0.0f;
+        // The speed trim does not integrate inside a grace window or while the error is at or over this (the catch-up after a stun is not the
+        // speed knob's bias: it wound the trim up and the ped then overshot the pose by a metre). 0 = integrates always (round 4).
+        float blendTrimGateM = 0.0f;
+        // "in a row" for the doubling of the Placed hold: a fall explained by an event that comes this long after the previous fall started (the hold
+        // and a clean stretch of blending in between) is a first fall again. 0 = the round-4 300 s for every fall.
+        float placedExplainedResetMs = 0.0f;
         float gaitMinHoldMs = 0.0f;
         int   blendStallLimit = 3;
         float blendDeadRetryMs = 15000.0f;
@@ -464,6 +503,12 @@ namespace gage::sync {
     // gait natives alone, 500 ms re-issue spacing, no first-gait window or forced-issue gap, no hold or cap on the ladder, no repair, the
     // short dead timers. The registry switch loco_r3=0 (engine) and the before / after tables of the tests use this one definition.
     LocoConfig Round2Behaviour(LocoConfig c);
+    // R5: `c` with the round-5 Blend self-check rules off = the 0.4.26 one: no grace window after a task-changing event, Placed 30 s with a doubling
+    // cap of 300 s, the level hold 8 s and the cap of 12 level changes per session. (engine: loco_blend_grace=0 and loco_placed_ms=0 each undo their half.)
+    LocoConfig Round4SelfCheck(LocoConfig c);
+    // R5: the Placed hold of the Blend after a fall put down to a task-changing event: placedMs = `ms` (doubling, capped at 4 x ms), the way back up gated
+    // by at most 0.6 x ms; a fall with no such event keeps 30 s / 300 s. ms <= 0: the round-4 numbers for every fall.
+    LocoConfig WithPlacedHold(LocoConfig c, int ms);
 
     struct LocoInput
     {
@@ -622,6 +667,13 @@ namespace gage::sync {
         uint32_t blendFrames = 0, fightVelFrames = 0, fightPosFrames = 0, fightCmpFrames = 0, satFrames = 0, hardSnaps = 0, swingHeld = 0;
         uint32_t blendDegrades = 0, deadStalls = 0;
         double maxCorrMs = 0;
+        // R5: grace windows opened (a task-changing event in Blend), frames inside one on which the round-4 self-check WOULD have accrued failure
+        // (the error was up and not closing / the writes were fought: each is a frame of a fall to the rigid follow that was not taken), windows
+        // that closed with the ped placed once, Resets that did not re-arm a window (a chain past blendGraceMaxMs), falls to the rigid follow
+        // that came after a window had been open within the last 4 s (the failure outlasted it or a new one began)
+        uint32_t graceWindows = 0, graceHeldFrames = 0, gracePlaced = 0, graceChainCapped = 0, fallsAfterGrace = 0;
+        // R5 probation: ways back up from the rigid follow, and falls inside the probation that followed one
+        uint32_t probations = 0, probationFalls = 0, fallsUnexplained = 0;
     };
 
     class LocomotionController
@@ -682,6 +734,9 @@ namespace gage::sync {
         float BlendTrim() const { return blendTrim_; }
         bool NoGaitSource() const { return noGaitSource_; }
         float FightShare() const { return static_cast<float>(fightShare_); }
+        // R5: ms left of the grace window (0 = none open), and ms left of the Placed level (0 = not placed)
+        float GraceLeftMs() const { return static_cast<float>(graceLeftMs_); }
+        float PlacedLeftMs() const { return static_cast<float>(placedLeftMs_); }
         float SelfSpeed() const { return haveSelf_ ? static_cast<float>(std::sqrt(double(selfV_.x) * selfV_.x + double(selfV_.y) * selfV_.y)) : -1.0f; }
 
         // Gait inference with hysteresis: the gait after `current` sees `speed` (m/s).
@@ -695,8 +750,9 @@ namespace gage::sync {
         // R4 T1: the Blend velocity drive of one frame (`ped` = where the ped is, after any snap), and its bookkeeping: the comparison of what the
         // ped did against the velocity written the frame before, the closing rate of the error, the self-check and the trim of the move blend ratio
         void BlendDrive(const LocoInput& in, const LocoVec& ped, double dt, LocoOutput& o);
-        void BlendWatch(const LocoInput& in, double dt, bool snapped, bool active);
-        void BlendTrimStep(double along, double dt);
+        void BlendWatch(const LocoInput& in, double dt, bool snapped, bool active, bool graceHeld);
+        void BlendTrimStep(double along, double dt, double errM);
+        void OpenGrace();                     // R5: a task-changing event happened (Blend with blendGraceMs only)
         LocoConfig cfg_;
         bool started_ = false;
         Gait gait_ = Gait::Still;           // the gait being shown (debounced)
@@ -796,6 +852,12 @@ namespace gage::sync {
         bool havePrevDir_ = false;
         bool lastBlendWrite_ = false;         // last frame's output was a blend velocity write (the read-back / position comparison has a reference)
 
+        // R5: the grace window after a task-changing event (see "11. R5")
+        double graceLeftMs_ = 0, graceChainMs_ = 0, sinceGraceMs_ = 1e9;
+        double graceCooldownMs_ = 0;          // after a chain hit its cap: no window opens for blendGraceMaxMs (a storm of Resets is judged, not forgiven for ever)
+        bool graceEnded_ = false;             // the window closed this frame: the one-time placement is decided in the snap section
+        double probationLeftMs_ = 0;          // R5: > 0 after a way back up from the rigid follow
+
         bool ragdollActive_ = false;
         bool haveJumpSeq_ = false;
         int32_t lastJumpSeq_ = 0;
@@ -841,6 +903,46 @@ namespace gage::sync {
         bool snapped = false;        // LocoOutput::snap
         bool blend = false;          // LocoOutput::blend
         bool blendPlaced = false;    // the Placed level of the blend (the push counters are then nudges)
+        // R5 telemetry: the puppet's heading as read this frame (GET_ENTITY_HEADING, degrees, any range) and the pose's (the sender's heading);
+        // haveHeading false = not read (the heading statistics skip the frame)
+        float pedHeading = 0, poseHeadingDeg = 0;
+        bool haveHeading = false;
+    };
+
+    // R5 telemetry: an angle in 0..180 degrees, 1-degree bins (the last bin is "180"), mean and 95th percentile. Pure, no allocation.
+    class AngleStat
+    {
+    public:
+        void Add(double deg)
+        {
+            if (!(deg >= 0.0)) deg = 0.0;
+            if (deg > 180.0) deg = 180.0;
+            int bin = static_cast<int>(deg);
+            if (bin >= kBins) bin = kBins - 1;
+            ++hist_[bin];
+            ++n_;
+            sum_ += deg;
+        }
+        uint32_t Count() const { return n_; }
+        double Mean() const { return n_ ? sum_ / n_ : 0.0; }
+        // upper edge of the bin holding the p-th fraction (0 < p <= 1)
+        double Percentile(double p) const
+        {
+            if (!n_) return 0.0;
+            const uint32_t target = static_cast<uint32_t>(std::ceil(p * n_));
+            uint32_t acc = 0;
+            for (int i = 0; i < kBins; ++i)
+            {
+                acc += hist_[i];
+                if (acc >= target) return i + 1.0 > 180.0 ? 180.0 : i + 1.0;
+            }
+            return 180.0;
+        }
+    private:
+        static constexpr int kBins = 181;
+        uint32_t hist_[kBins] = {};
+        uint32_t n_ = 0;
+        double sum_ = 0;
     };
 
     struct LocoDiagSummary
@@ -865,6 +967,14 @@ namespace gage::sync {
         double errP50M = 0, errP95M = 0;
         double maxCorrMs = 0;
         uint32_t blendFrames = 0, snapFrames = 0, fightVelFrames = 0, fightPosFrames = 0, fightCmpFrames = 0;
+        // R5 telemetry (frames where the pose moves over 1 m/s and the heading was read): the puppet's heading against the pose's (the sender's)
+        // heading; the angle between the pose's velocity and the puppet's heading (0 = it faces where the pose goes); and the angle between the
+        // puppet's OWN velocity (from its positions, over 1 m/s) and its heading (0 = it moves the way it faces, 90 = sideways, 180 = backwards).
+        // All in degrees, 0..180.
+        uint32_t headFrames = 0, poseVelHeadFrames = 0, pedVelHeadFrames = 0;
+        double headErrMeanDeg = 0, headErrP95Deg = 0;
+        double poseVelHeadMeanDeg = 0, poseVelHeadP95Deg = 0;
+        double pedVelHeadMeanDeg = 0, pedVelHeadP95Deg = 0;
     };
 
     class LocoDiag
@@ -893,6 +1003,9 @@ namespace gage::sync {
         uint32_t blendFrames_ = 0, snapFrames_ = 0, fightVel_ = 0, fightPos_ = 0, fightCmp_ = 0;
         bool prevPushed_ = false;
         LocoVec prevPush_;
+        // R5
+        AngleStat headErr_, poseVelHead_, pedVelHead_;
+        bool prevSnapped_ = false;
     };
 
     // R3 T2 (desync round 3): the gait DIAGNOSTIC. "The task ran but the ped showed no gait" was all the 0.4.7 log could say; this puts

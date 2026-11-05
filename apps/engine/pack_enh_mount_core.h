@@ -50,6 +50,22 @@ inline const char* ExtraName(int id) {
 // The mount needs these four; PushFolder / Exists / PopFolder are only the diagnostic probe's calls (a miss is logged, never fatal).
 inline bool ExtraCritical(int id) { return id == kXRunPackGroup || id == kXRegStream || id == kXGetDevice || id == kXStreamInfo; }
 
+// 0.4.27: the first 4 bytes of a model / texture resource. Legacy (gen8) resources start "RSC7"; Enhanced's resource loader parses
+// them as its own (gen9) layout and hits its fatal-error INT3 in the resource-map lookup (friend's 0.4.26 log: GTA5_Enhanced.exe+0x127c32f,
+// the chunk table held 0x50000000..0x50002000 and the pointer fixup read 0x800001). A pack is refused on Enhanced while any of its
+// stream files is Legacy-format; CodeWalker's Gen9 asset converter makes the Enhanced copy. Both formats start "RSC7": the resource
+// VERSION (bytes 4..7) tells them apart (Legacy yft 162 / ytd 13 / ydr 165 / ydd 165; CodeWalker dev48's gen9 output: yft 171, ytd 5).
+// ext = the lower-case extension without the dot.
+inline bool IsLegacyResource(const uint8_t* head, size_t n, const char* ext) {
+    if (n < 8 || head[0] != 'R' || head[1] != 'S' || head[2] != 'C' || head[3] != '7' || !ext) return false;
+    const uint32_t ver = (uint32_t)head[4] | ((uint32_t)head[5] << 8) | ((uint32_t)head[6] << 16) | ((uint32_t)head[7] << 24);
+    auto is = [ext](const char* e) { for (size_t i = 0;; ++i) { if (ext[i] != e[i]) return false; if (!e[i]) return true; } };
+    if (is("yft")) return ver == 162;
+    if (is("ytd")) return ver == 13;
+    if (is("ydr") || is("ydd")) return ver == 165;
+    return false;
+}
+
 class Extras {
 public:
     Extras(const PackProfile& prof, const Env& env) : P_(prof), E_(env) {

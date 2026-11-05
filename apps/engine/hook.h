@@ -459,6 +459,10 @@ namespace gage::game {
         constexpr uint64_t GET_ENTITY_ANIM_TOTAL_TIME                  = 0x50BD2730B191E360;
         constexpr uint64_t GET_ANIM_DURATION                           = 0xFEDDF04D62B8D790;
         constexpr uint64_t GET_SCRIPT_TASK_STATUS                      = 0x77F1BEB8863288D5;
+        // R5 (melee_loop): the explicit end of a looped swing clip. Public hash and signature from alloc8or natives.json; the 3889 hash is YimMenu b3889
+        // crossmap.hpp at the natives.hpp index AND agrees with YimMenuV2 `enhanced` (and legacy) Crossmap.hpp (lookup tool natlookup.mjs, 2026-11-05):
+        //   STOP_ANIM_TASK  public 0x97FF36A1D40EA00A  3889 0x08D8528BA8E43641  void (Entity, const char* dict, const char* name, float blendDelta)
+        constexpr uint64_t STOP_ANIM_TASK                              = 0x97FF36A1D40EA00A;
         // 0.4.19 radio off (libs/sync/radio_off.h). Public hashes and signatures from alloc8or natives.json; each 3889 hash is
         // YimMenu b3889 crossmap.hpp at the natives.hpp index AND agrees with YimMenuV2 `enhanced` Crossmap.hpp by name (and with
         // YimMenuV2 legacy; lookup tool natlookup.mjs, 2026-11-05):
@@ -502,6 +506,15 @@ namespace gage::game {
         //   GET_TIMECYCLE_MODIFIER_INDEX   public 0xFDF3D97C674AFB66  3889 0x8960847E5FD7B48F  int (); -1 = none
         constexpr uint64_t CLEAR_TIMECYCLE_MODIFIER                    = 0x0F07E7745A236711;
         constexpr uint64_t GET_TIMECYCLE_MODIFIER_INDEX                = 0xFDF3D97C674AFB66;
+        // 0.4.27 indicator fallback (libs/sync/indicator_fallback.h). Lookup tool natlookup.mjs 2026-11-05: YimMenu b3889 crossmap and YimMenuV2
+        // enhanced AGREE by name and signature (and legacy has the same 3889 hash); public hashes and signatures from alloc8or natives.json:
+        //   DRAW_LIGHT_WITH_RANGE                   public 0xF2A1B2771A01DBD4  3889 0x748651DF4DA0A890  void (float x, y, z, int r, g, b, float range, float intensity)
+        //   GET_MODEL_DIMENSIONS                    public 0x03E8D3D5F549087A  3889 0xC93BAF616F1C680F  void (Hash model, Vector3* min, Vector3* max)
+        //   GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS  public 0x1899F328B0E12848  3889 0x0D1381B6E0F3987D  Vector3 (Entity, float x, float y, float z)
+        // (GET_VEHICLE_INDICATOR_LIGHTS is in neither crossmap nor in alloc8or: there is still no read-back of the indicator state.)
+        constexpr uint64_t DRAW_LIGHT_WITH_RANGE                       = 0xF2A1B2771A01DBD4;
+        constexpr uint64_t GET_MODEL_DIMENSIONS                        = 0x03E8D3D5F549087A;
+        constexpr uint64_t GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS      = 0x1899F328B0E12848;
         // 0.4.4 (W11, anchor steering). Public hash here; 3889 hash in kCrossmap3889. Looked up on the PC, both sources agree:
         //   TASK_GO_TO_ENTITY  public 0x6A071245EB0D1882  3889 0xAB3658A740EED98E
         //                      void (Entity entity, Entity target, int duration, float distance, float moveBlendRatio,
@@ -1151,6 +1164,12 @@ namespace gage::game {
         int32_t  GetCurrentPedWeaponEntity(int32_t ped);       // the weapon object; 0 = none / uncallable
         int      GetEntityBoneIndexByName(int32_t entity, const char* bone);  // -1 = no such bone / uncallable
         bool     GetWorldPositionOfEntityBone(int32_t entity, int boneIndex, float& x, float& y, float& z);
+        // 0.4.27 indicator fallback. GetModelDimensions: the model's bounding box in model space (x right, y forward, z up); true = callable
+        // (the box may still be zero for a model that is not loaded: check it). GetOffsetInWorld: a model-space offset of an entity in world
+        // coordinates (follows pitch and roll). DrawLightWithRange: a point light for THIS frame only (call it every frame).
+        bool     GetModelDimensions(uint32_t model, float mn[3], float mx[3]);
+        bool     GetOffsetInWorld(int32_t entity, float ox, float oy, float oz, float& x, float& y, float& z);
+        bool     DrawLightWithRange(float x, float y, float z, int r, int g, int b, float range, float intensity);
         // The muzzle ("gun_muzzle" bone of the current weapon object). False when the ped holds
         // no weapon object (unarmed, melee) or the weapon has no such bone.
         bool     GetWeaponMuzzlePos(int32_t ped, float& x, float& y, float& z);
@@ -1182,6 +1201,9 @@ namespace gage::game {
         // looped with flag 1), flags eAnimationFlags, rate 1.0 normal; no axis locks.
         bool     TaskPlayAnim(int32_t ped, const char* dict, const char* name, float blendIn, float blendOut,
                               int durationMs, int flags, float playbackRate);
+        // R5: STOP_ANIM_TASK(entity, dict, name, blendDelta): ends THAT clip on the entity (a looped swing). blendDelta is the exit speed (-8 normal,
+        // as TASK_PLAY_ANIM's blend out). False when the native cannot be called.
+        bool     StopAnimTask(int32_t entity, const char* dict, const char* name, float blendDelta);
         // TASK_START_SCENARIO_IN_PLACE(ped, name, 0, playEnterAnim true).
         bool     TaskStartScenarioInPlace(int32_t ped, const char* scenario);
         int      IsEntityPlayingAnim(int32_t entity, const char* dict, const char* name);  // taskFlag 3

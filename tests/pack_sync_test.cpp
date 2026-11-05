@@ -261,6 +261,10 @@ void TestUrls() {
           "the bare-IP feed, query dropped");
     Check(packsync::ManifestUrlFor("https://host") == "https://host/packs.json", "a host with no path");
     Check(packsync::ManifestUrlFor("not a url").empty(), "garbage gives no URL");
+    Check(packsync::ManifestUrlFor(kUpdateUrl, packsync::kGen9Manifest) == std::string(kPacksUrl).substr(0, std::string(kPacksUrl).rfind('/') + 1) + "packs-gen9.json",
+          "the Enhanced set (packs-gen9.json) sits next to version.json", packsync::ManifestUrlFor(kUpdateUrl, packsync::kGen9Manifest));
+    Check(packsync::DefaultRoot(true).size() > 11 && packsync::DefaultRoot(true).substr(packsync::DefaultRoot(true).size() - 11) == L"\\packs-gen9",
+          "the Enhanced set lands in %LOCALAPPDATA%\\GAGE-MP\\packs-gen9");
     Check(packsync::BlobUrl(kPacksUrl, std::string(64, 'a')) == "https://solar-rp.com/update/packs/" + std::string(64, 'a'),
           "blobs live under packs/<sha256>");
 }

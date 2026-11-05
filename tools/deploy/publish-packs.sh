@@ -2,7 +2,11 @@
 # Publish the car packs every launcher downloads before the game starts (apps/launcher/pack_sync.h,
 # docs/UPDATES.md "Car packs"). Run on the VPS.
 #
-#   publish-packs.sh <packs folder | packs .tar> [--no-http-check] [--dry-run]
+#   publish-packs.sh <packs folder | packs .tar> [--manifest packs.json|packs-gen9.json] [--no-http-check] [--dry-run]
+#
+#   --manifest       packs.json (default: the Legacy set) or packs-gen9.json (the GTA V Enhanced set, made by
+#                    `stage_packs.mjs --gen9`; Enhanced launchers sync it into %LOCALAPPDATA%\GAGE-MP\packs-gen9).
+#                    Both share the content-addressed blob folder update/packs/.
 #
 #   <packs folder>   one folder per pack, each with a dlc.rpf at its top (tools/packs/stage_packs.mjs output; on the PC
 #                    that is %LOCALAPPDATA%\GAGE-MP\packs). A .tar of it (top level "packs/<name>/..." or "<name>/...")
@@ -25,8 +29,10 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'
 
 SRC=''
 HTTP_CHECK=1
+MANIFEST=packs.json
 while [ $# -gt 0 ]; do
   case $1 in
+    --manifest) [ $# -ge 2 ] || usage_die "--manifest needs a name"; MANIFEST=$2; shift 2 ;;
     --no-http-check) HTTP_CHECK=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -35,6 +41,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$SRC" ] || usage_die "a packs folder or .tar is required"
+case $MANIFEST in packs.json|packs-gen9.json) ;; *) usage_die "--manifest must be packs.json or packs-gen9.json (got '$MANIFEST')" ;; esac
+MBASE=${MANIFEST%.json}
 [ -e "$SRC" ] || die "$SRC does not exist"
 
 deploy_config
@@ -48,7 +56,7 @@ KEY="$GAGE_KEY_DIR/update-signing-key.pem"
 PUB="$GAGE_KEY_DIR/update-signing-pub.txt"
 SIGN="$GAGE_SRC/tools/packs/sign_packs.mjs"
 LOCAL_HTTP="${GAGE_LOCAL_HTTP:-http://127.0.0.1}"
-CUR="$UPD/packs.json"
+CUR="$UPD/$MANIFEST"
 
 [ -f "$SIGN" ] || die "missing $SIGN (unpack the 0.4.14+ source first)"
 [ -f "$KEY" ] || die "signing key not found at $KEY"
@@ -70,12 +78,12 @@ fi
 log "packs from $ROOT: $(find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | wc -l) folder(s)"
 
 run mkdir -p "$UPD/packs" "$STAGE" "$GAGE_RELEASES/manifests"
-NEW="$STAGE/packs.json.$$"
+NEW="$STAGE/$MANIFEST.$$"
 defer "rm -f -- $(printf '%q' "$NEW") $(printf '%q' "$NEW.tmp")"
 
 if [ "$DRY_RUN" = 1 ]; then
   node "$SIGN" --key "$KEY" --pub "$PUB" --root "$ROOT" --blobs "$UPD/packs" --out "$NEW" --dry-run
-  log "[dry-run] mv -f $NEW $CUR   (atomic; the previous packs.json is first copied to $GAGE_RELEASES/manifests/)"
+  log "[dry-run] mv -f $NEW $CUR   (atomic; the previous $MANIFEST is first copied to $GAGE_RELEASES/manifests/)"
   log "dry-run OK"
   exit 0
 fi
@@ -86,7 +94,7 @@ chmod 755 "$UPD/packs"
 
 # ---- 3: atomic switch ------------------------------------------------------------------------------------------
 if [ -f "$CUR" ]; then
-  cp -- "$CUR" "$GAGE_RELEASES/manifests/packs-$(date -u +%Y%m%dT%H%M%SZ).json"
+  cp -- "$CUR" "$GAGE_RELEASES/manifests/$MBASE-$(date -u +%Y%m%dT%H%M%SZ).json"
 fi
 mv -f -- "$NEW" "$CUR"
 log "published $CUR"
@@ -99,12 +107,12 @@ if [ "$HTTP_CHECK" = 1 ]; then
   bases=("$LOCAL_HTTP")
   [ -z "$DOMAIN" ] || bases+=("https://$DOMAIN")
   for base in "${bases[@]}"; do
-    curl -fsS --max-time 15 -o "$served" -- "$base/update/packs.json" || die "published, but $base/update/packs.json does not answer"
+    curl -fsS --max-time 15 -o "$served" -- "$base/update/$MANIFEST" || die "published, but $base/update/$MANIFEST does not answer"
     cmp -s "$served" "$CUR" || die "published, but $base serves different bytes than $CUR"
     if [ -n "$blob" ]; then
       curl -fsSI --max-time 15 -o /dev/null -- "$base/update/packs/$(basename "$blob")" || die "published, but $base does not serve $(basename "$blob")"
     fi
-    log "HTTP check ok: $base serves packs.json and the files"
+    log "HTTP check ok: $base serves $MANIFEST and the files"
   done
 fi
-log "done. Launchers pick the packs up on their next PLAY (Legacy GTA5.exe only)."
+log "done. Launchers pick $MANIFEST up on their next PLAY ($([ "$MANIFEST" = packs.json ] && echo "GTA V Legacy" || echo "GTA V Enhanced at pack_enh>=2"))."

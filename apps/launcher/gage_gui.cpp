@@ -64,7 +64,7 @@ using net::ServerInfo;
 // Constants
 // ---------------------------------------------------------------------------
 
-static const wchar_t* kClientVersion = L"0.4.26";
+static const wchar_t* kClientVersion = L"0.4.27";
 static const wchar_t* kClass = L"GAGE_MP_Launcher";
 static const wchar_t* kTitle = L"Solar Launcher";
 static const int kAppIconId = 1;  // gage_gui.rc
@@ -679,13 +679,17 @@ static std::vector<std::string> UpdateUrls();  // with the update code below
 // could not be checked or installed; pack_required=0 in gage_mp.cfg restores the old "start without them".
 // mayRefuse=false (GTA V Enhanced with pack_enh >= 2, 0.4.26): the sync is best effort; a failure is logged and the game starts
 // with the packs already on this PC, whatever pack_required says.
-static bool SyncCarPacks(bool mayRefuse) {
+// gen9 (0.4.27, GTA V Enhanced): the gen9-converted set, packs-gen9.json -> %LOCALAPPDATA%\GAGE-MP\packs-gen9 (Legacy-format models
+// crash Enhanced's resource loader; tools/packs/stage_packs.mjs --gen9 makes the set).
+static bool SyncCarPacks(bool mayRefuse, bool gen9) {
     if (cfg::Get(L"pack_sync", L"1") == L"0") { GLOGI("packs: pack_sync=0 in gage_mp.cfg, not syncing"); return true; }
     if (!kUpdatePubKey || !*kUpdatePubKey) { GLOGW("packs: no update key baked into this build, not syncing"); return true; }
     const bool required = mayRefuse && cfg::Get(L"pack_required", L"1") != L"0";
     PostStatusFromWorker(L"Checking cars…");
     ULONGLONG last = 0;
-    const packsync::Result r = packsync::Sync(packsync::DefaultRoot(), UpdateUrls(), kUpdatePubKey, packsync::DefaultIo(),
+    const std::string manifestName = gen9 ? packsync::kGen9Manifest : "packs.json";
+    GLOGI("packs: syncing %s into %s", manifestName.c_str(), gen9 ? "packs-gen9 (GTA V Enhanced)" : "packs");
+    const packsync::Result r = packsync::Sync(packsync::DefaultRoot(gen9), UpdateUrls(), kUpdatePubKey, packsync::DefaultIo(),
         [&last](const packsync::Progress& p) {
             const ULONGLONG now = GetTickCount64();
             if (p.totalBytes == 0 || (now - last < 400 && p.doneBytes < p.totalBytes)) return;
@@ -694,7 +698,7 @@ static bool SyncCarPacks(bool mayRefuse) {
             swprintf(b, 160, L"Downloading cars: %llu of %llu MB (%d%%)…", p.doneBytes >> 20, (p.totalBytes + (1u << 20) - 1) >> 20,
                      (int)(p.doneBytes * 100 / p.totalBytes));
             PostStatusFromWorker(b);
-        });
+        }, manifestName);
     if (!r.published) {
         // No error = the server publishes no packs (nothing to require); an error = packs.json was not reachable.
         if (r.error.empty() || !required) {
@@ -777,7 +781,7 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
         if (launch::FindGame().pid) GLOGI("packs: the game is already running; not syncing car packs now");
         else {
             if (syncMode == packsync::SyncMode::BestEffort) GLOGI("packs: GTA V Enhanced with pack_enh>=2: syncing the car packs (best effort, never refuses)");
-            if (!SyncCarPacks(syncMode == packsync::SyncMode::Enforced)) {
+            if (!SyncCarPacks(syncMode == packsync::SyncMode::Enforced, syncMode == packsync::SyncMode::BestEffort)) {
                 PostLaunch({ false, 16, L"The server's cars could not be downloaded. Check your connection and press Play again." });
                 return;
             }

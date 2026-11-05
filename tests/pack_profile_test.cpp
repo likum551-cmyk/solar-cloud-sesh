@@ -541,6 +541,7 @@ int main(int argc, char** argv) {
     TestLegacy();
     const int legacyChecks = g_pass + g_fail;
     TestMountProfile();
+    TestLegacyResourceGuard();
     const int profileChecks = g_pass + g_fail - legacyChecks;
 
     std::vector<uint8_t> img;
@@ -567,7 +568,7 @@ int main(int argc, char** argv) {
     }
 
     // the count itself is asserted: a section that silently stopped running cannot pass
-    const int kExpectLegacy = 105, kExpectProfile = 28, kExpectImage = 204;
+    const int kExpectLegacy = 105, kExpectProfile = 33, kExpectImage = 204;   // profile: 28 + 5 Legacy-asset guard (0.4.27)
     std::printf("legacy-profile checks run: %d (expected %d)\n", legacyChecks, kExpectLegacy);
     if (legacyChecks != kExpectLegacy) { ++g_fail; std::printf("FAIL  legacy check count changed (%d != %d): update the test deliberately\n", legacyChecks, kExpectLegacy); }
     std::printf("round-B profile checks run: %d (expected %d)\n", profileChecks, kExpectProfile);

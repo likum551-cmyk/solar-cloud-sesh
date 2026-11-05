@@ -319,15 +319,15 @@ bool VerifyManifest(const std::string& bodyIn, const std::string& pubKeyB64, Man
     return true;
 }
 
-std::string ManifestUrlFor(const std::string& updateManifestUrl) {
+std::string ManifestUrlFor(const std::string& updateManifestUrl, const std::string& name) {
     std::string u = updateManifestUrl.substr(0, updateManifestUrl.find_first_of("?#"));
     const size_t scheme = u.find("://");
     const size_t slash = u.find_last_of('/');
     if (scheme == std::string::npos || slash == std::string::npos || u.size() <= scheme + 3) return "";
     // "https://host" with no path at all: the manifest sits at the root.
-    if (slash == scheme + 2) return u + "/packs.json";
+    if (slash == scheme + 2) return u + "/" + name;
     if (slash < scheme + 3) return "";
-    return u.substr(0, slash + 1) + "packs.json";
+    return u.substr(0, slash + 1) + name;
 }
 
 std::string BlobUrl(const std::string& packsManifestUrl, const std::string& sha256) {
@@ -335,11 +335,11 @@ std::string BlobUrl(const std::string& packsManifestUrl, const std::string& sha2
     return packsManifestUrl.substr(0, slash + 1) + "packs/" + sha256;
 }
 
-std::wstring DefaultRoot() {
+std::wstring DefaultRoot(bool gen9) {
     wchar_t la[MAX_PATH] = L"";
     const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return L"";
-    return std::wstring(la) + L"\\GAGE-MP\\packs";
+    return std::wstring(la) + (gen9 ? L"\\GAGE-MP\\packs-gen9" : L"\\GAGE-MP\\packs");
 }
 
 Io DefaultIo() {
@@ -368,7 +368,7 @@ Io DefaultIo() {
 // ---------------------------------------------------------------------------------------------------------------
 
 Result Sync(const std::wstring& root, const std::vector<std::string>& updateUrls, const std::string& pubKeyB64,
-            const Io& io, const std::function<void(const Progress&)>& progress) {
+            const Io& io, const std::function<void(const Progress&)>& progress, const std::string& manifestName) {
     Result r;
     if (root.empty()) { r.error = "no folder for the packs (LOCALAPPDATA is not set)"; return r; }
 
@@ -377,7 +377,7 @@ Result Sync(const std::wstring& root, const std::vector<std::string>& updateUrls
     bool have = false;
     std::vector<std::string> tried;
     for (const std::string& up : updateUrls) {
-        const std::string url = ManifestUrlFor(up);
+        const std::string url = ManifestUrlFor(up, manifestName);
         if (url.empty() || std::find(tried.begin(), tried.end(), url) != tried.end()) continue;
         tried.push_back(url);
         std::string body, err;

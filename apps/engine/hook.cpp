@@ -884,6 +884,8 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_ENTITY_ANIM_TOTAL_TIME,                  0x58C2315AA20FAF06},
     {native::GET_ANIM_DURATION,                           0x6CEF2D1ADD6A5E7F},
     {native::GET_SCRIPT_TASK_STATUS,                      0x9B5C1660CCDF7189},
+    // R5 melee_loop: YimMenu b3889 crossmap, AGREEING with YimMenuV2 enhanced by name; public hash in hook.h.
+    {native::STOP_ANIM_TASK,                              0x08D8528BA8E43641},
     // 0.4.19 radio off: YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced (and legacy) by name; public hashes in hook.h.
     {native::SET_USER_RADIO_CONTROL_ENABLED,              0x938C85923AD6778A},
     {native::SET_VEHICLE_RADIO_ENABLED,                   0x4DC72C4B884A6C59},
@@ -903,6 +905,9 @@ const HashMapping kCrossmap3889[] = {
     // 0.4.19 spawn reveal: lookup tool, YimMenu b3889 and YimMenuV2 enhanced agree by name.
     {native::CLEAR_TIMECYCLE_MODIFIER,                    0x80F87A4A3B930613},
     {native::GET_TIMECYCLE_MODIFIER_INDEX,                0x8960847E5FD7B48F},
+    {native::DRAW_LIGHT_WITH_RANGE,                       0x748651DF4DA0A890},   // 0.4.27 indicator fallback
+    {native::GET_MODEL_DIMENSIONS,                        0xC93BAF616F1C680F},
+    {native::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS,      0x0D1381B6E0F3987D},
     // 0.4.4 (W11): lookup tool, public and 3889 agree.
     {native::TASK_GO_TO_ENTITY,                           0xAB3658A740EED98E},
     {native::GET_VEHICLE_LIGHTS_STATE,                    0x9FFEA38DBCE391EC},
@@ -5571,6 +5576,32 @@ bool World::GetWorldPositionOfEntityBone(int32_t entity, int boneIndex, float& x
     return true;
 }
 
+bool World::GetModelDimensions(uint32_t model, float mn[3], float mx[3]) {
+    if (!model || !mn || !mx) return false;
+    // GET_MODEL_DIMENSIONS(Hash, Vector3* min, Vector3* max): two Vector3* outs, ScrVectors filled by CallNative's vector fix-up.
+    ScrVector a{}, b{};
+    uint64_t args[] = { (uint64_t)model, ptrArg(&a), ptrArg(&b) };
+    if (!CallNative(native::GET_MODEL_DIMENSIONS, args, 3, nullptr)) return false;
+    mn[0] = a.x; mn[1] = a.y; mn[2] = a.z;
+    mx[0] = b.x; mx[1] = b.y; mx[2] = b.z;
+    return true;
+}
+
+bool World::GetOffsetInWorld(int32_t entity, float ox, float oy, float oz, float& x, float& y, float& z) {
+    if (!entity) return false;
+    uint64_t args[] = { entArg(entity), FloatArg(ox), FloatArg(oy), FloatArg(oz) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS, args, 4, r)) return false;
+    vec3Of(r, x, y, z);
+    return true;
+}
+
+bool World::DrawLightWithRange(float x, float y, float z, int r, int g, int b, float range, float intensity) {
+    uint64_t args[] = { FloatArg(x), FloatArg(y), FloatArg(z), (uint64_t)(uint32_t)r, (uint64_t)(uint32_t)g, (uint64_t)(uint32_t)b,
+                        FloatArg(range), FloatArg(intensity) };
+    return CallNative(native::DRAW_LIGHT_WITH_RANGE, args, 8, nullptr);
+}
+
 bool World::GetWeaponMuzzlePos(int32_t ped, float& x, float& y, float& z) {
     const int32_t weapon = GetCurrentPedWeaponEntity(ped);
     if (!weapon) return false;
@@ -5697,6 +5728,13 @@ bool World::TaskPlayAnim(int32_t ped, const char* dict, const char* name, float 
                         (uint64_t)(uint32_t)durationMs, (uint64_t)(uint32_t)flags, FloatArg(playbackRate),
                         0, 0, 0 };
     return CallNative(native::TASK_PLAY_ANIM, args, 11, nullptr);
+}
+
+bool World::StopAnimTask(int32_t entity, const char* dict, const char* name, float blendDelta) {
+    if (!entity || !dict || !name) return false;
+    // STOP_ANIM_TASK(entity, animDictionary, animationName, blendDelta)
+    uint64_t args[] = { entArg(entity), ptrArg(dict), ptrArg(name), FloatArg(blendDelta) };
+    return CallNative(native::STOP_ANIM_TASK, args, 4, nullptr);
 }
 
 bool World::TaskStartScenarioInPlace(int32_t ped, const char* scenario) {
@@ -6790,6 +6828,7 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_ENTITY_ANIM_TOTAL_TIME),
         GAGE_NEW_NATIVE(GET_ANIM_DURATION),
         GAGE_NEW_NATIVE(GET_SCRIPT_TASK_STATUS),
+        GAGE_NEW_NATIVE(STOP_ANIM_TASK),
         GAGE_NEW_NATIVE(SET_USER_RADIO_CONTROL_ENABLED),
         GAGE_NEW_NATIVE(SET_VEHICLE_RADIO_ENABLED),
         GAGE_NEW_NATIVE(SET_VEH_RADIO_STATION),
@@ -6806,6 +6845,9 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_PLAYER_INVINCIBLE),
         GAGE_NEW_NATIVE(CLEAR_TIMECYCLE_MODIFIER),
         GAGE_NEW_NATIVE(GET_TIMECYCLE_MODIFIER_INDEX),
+        GAGE_NEW_NATIVE(DRAW_LIGHT_WITH_RANGE),
+        GAGE_NEW_NATIVE(GET_MODEL_DIMENSIONS),
+        GAGE_NEW_NATIVE(GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS),
         GAGE_NEW_NATIVE(GET_VEHICLE_LIGHTS_STATE),
         GAGE_NEW_NATIVE(SET_VEHICLE_FULLBEAM),
         GAGE_NEW_NATIVE(SET_VEHICLE_INTERIORLIGHT),

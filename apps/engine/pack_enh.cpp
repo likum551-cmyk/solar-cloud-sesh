@@ -84,7 +84,7 @@ bool PackEnhArm(int mode, const wchar_t* exeBaseName) {
     } else {
         g_extras = std::make_unique<packenh::Extras>(prof, env);
         GLOGI("[packenh] pack_enh=2: Round B armed for %s. Round A (22 read-only checks) runs first; only if ALL pass are the mount patterns "
-              "resolved and the packs under %%LOCALAPPDATA%%\\GAGE-MP\\packs mounted (every step is logged before it runs; the last "
+              "resolved and the packs under %%LOCALAPPDATA%%\\GAGE-MP\\packs-gen9 mounted (every step is logged before it runs; the last "
               "[packenh] line before a crash names the step). pack_enh=0 turns it off.",
               prof.label);
     }

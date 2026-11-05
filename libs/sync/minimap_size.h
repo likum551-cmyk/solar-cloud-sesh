@@ -37,7 +37,7 @@ namespace gage::sync {
 
     constexpr float kMinimapScaleMin = kRadarScaleMin;   // 0.5
     constexpr float kMinimapScaleMax = kRadarScaleMax;   // 1.0 = the game's own size (untouched)
-    constexpr float kMinimapScaleDefault = 0.80f;        // GI asked for a smaller map: unset means 0.80
+    constexpr float kMinimapScaleDefault = 0.50f;        // GI asked for a smaller map: unset means 0.50 (0.4.27: "50 % smaller"; 0.4.25 had 0.80)
 
     enum class ScaleSource
     {

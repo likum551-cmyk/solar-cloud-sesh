@@ -23,12 +23,15 @@
 #include "sync/smoother.h"
 #include "sync/locomotion.h"
 #include "sync/oneshot.h"
+#include "sync/state_mirror.h"
 #include "sync/vehicle_drive.h"
 #include "sync/vehicle_link.h"
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_visual.h"
 #include "sync/vehicle_signals.h"
 #include "sync/vehicle_controls.h"
+#include "sync/indicator_fallback.h"
+#include "sync/vehicle_state_row.h"
 #include "sync/vehicle_damage.h"
 #include "sync/pedstate.h"
 #include "sync/cover.h"
@@ -174,6 +177,12 @@ namespace {
     std::atomic<bool> g_locoR3{true};
     std::atomic<bool> g_locoRepair{true};
     std::atomic<bool> g_locoGaitClip{true};   // 0.4.17: loco_gait_clip=0 = the 0.4.15 speed-derived blend ratio
+    // R5 (on-foot sync): loco_blend_grace = 0 puts the round-4 Blend rules back whole (no grace window after a task-changing Reset, no probation, no trim gate,
+    // the 30 s / 300 s Placed hold, the 8 s ladder hold, 12 level changes: sync::Round4SelfCheck). loco_placed_ms = N sets the Placed hold after a
+    // blend fall that a task-changing event explains to N ms (cap 4 N; a fall nothing explains keeps 30 s / 300 s); 0 = the old 30 s hold for every fall;
+    // unset = the shipped 6 s. Both re-read at every Welcome. Blend only (the anchor and straight configs never had a grace).
+    std::atomic<bool> g_locoBlendGrace{true};
+    std::atomic<int>  g_locoPlacedMs{-1};     // -1 = unset (shipped); 0 = the round-4 30 s; N > 0 = N ms
     sync::LevelWitness g_locoDegrade;     // script tick only
     std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
@@ -182,6 +191,13 @@ namespace {
         if (!g_locoBlend.load() && !g_locoPushNudge.load())
             c.push = sync::PushMode::Velocity;
         c.selfCheck = g_locoSelfCheck.load();
+        if (g_locoBlend.load())
+        {
+            if (!g_locoBlendGrace.load())
+                c = sync::Round4SelfCheck(c);
+            if (g_locoPlacedMs.load() >= 0)
+                c = sync::WithPlacedHold(c, g_locoPlacedMs.load());
+        }
         if (!g_locoR3.load())
             c = sync::Round2Behaviour(c);
         if (!g_locoRepair.load())
@@ -220,6 +236,9 @@ namespace {
         // since then), the sender's swimming edges (item 4) and its climb / vault as one TASK_CLIMB window (item 5).
         sync::LocoStats locoSeen;
         sync::LocoDiag slide;    // Sync A: the slide metric of the last 10 s ("engine: loco slide"); script tick only
+        // R5 telemetry: the sender's swim / ragdoll flag against what IS_PED_SWIMMING / IS_PED_RAGDOLL say the puppet does ("engine: edges"); script tick only
+        sync::StateMirror swimMirror, ragMirror;
+        int32_t mirrorPed = 0;   // the ped the two mirrors were last based on (a new ped re-bases them)
         sync::SiteTally<kLocoSites> hardSites, softSites;
         sync::WaterEdge water;
         sync::ClimbWindow climb;
@@ -324,6 +343,13 @@ namespace {
         bool poseKnown = false;
         int swingLocalHp = 0;            // melee-task rung: the local player's health + armour at the issue (harm breaker)
         double swingMeleeUntilMs = 0;    // melee-task rung: when the puppet's melee task is ended again (0 = none running)
+        // R5 melee_loop: a looped swing clip (flags 49) is ended by us (STOP_ANIM_TASK, then a read-back); the melee-task rung of a puppet without a
+        // locomotion anchor (Blend / Straight) borrows a short-lived anchor ped in front of it
+        sync::SwingLoopStop loopStop;
+        const char* loopDict = nullptr;  // ... the clip being looped (the swing tables are static: the pointers stay valid)
+        const char* loopClip = nullptr;
+        int32_t swingAnchor = 0;         // ... the borrowed anchor ped (0 = none)
+        double swingAnchorUntilMs = 0;   // ... and when it is removed again
         sync::MeleeEventGate meleeEvents; // 0.4.5: the damage event of THIS puppet is cleared on the first frame of a swing window (stale ones)
         bool infiniteAmmo = false;       // real peer fire: SET_PED_INFINITE_AMMO_CLIP is on this ped
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
@@ -558,6 +584,84 @@ namespace {
         c.autoCancel = g_vcAutoCancel.load(std::memory_order_relaxed);
         c.fuelUse = g_vcFuelUse.load(std::memory_order_relaxed);
         return c;
+    }
+
+    // ---- 0.4.27 indicator fallback (libs/sync/indicator_fallback.h; script tick) ----
+    // veh_ind_fallback in HKCU\Software\GAGE-MP (read at every Welcome): unset / 1 = pack cars get our own blinking amber light at each lit corner,
+    // 0 = off, 2 = every car. Per model (cached by hash): the four indicator bones as the GAME resolves them on an entity of that model, the
+    // model's box, whether a pack carries it, and one log line the first time an indicator is applied to a car of that model.
+    std::atomic<int> g_indFallbackMode{(int)sync::IndFallbackMode::PackCars};
+    struct IndModelInfo
+    {
+        uint32_t model = 0;
+        int bone[sync::kIndCorners] = {-1, -1, -1, -1};
+        bool dimsCallable = false, dimsOk = false;
+        sync::V3 mn, mx;
+        std::string pack;                    // empty = not a pack model (a stock car)
+        bool logged = false;
+    };
+    std::vector<IndModelInfo> g_indModels;   // script tick; grows by one per model seen with an indicator (a few dozen at most)
+    sync::IndPhaseTable g_indPhase;
+    struct IndFallbackStats
+    {
+        uint32_t frames = 0, carFrames = 0, litFrames = 0, lights = 0, lightFailed = 0, fromBone = 0, fromDims = 0, noCorner = 0, posFailed = 0;
+        uint32_t skippedStock = 0, skippedFar = 0;
+    };
+    IndFallbackStats g_indx;
+    double g_indReportMs = 0;
+    // The on-foot lock flash (the vehicle state row): set by HandleLockResult on an Ok, shown by TickVehicleControls while we are not seated.
+    double g_lockFlashUntilMs = -1e18;
+    bool g_lockFlashLocked = false;
+
+    IndModelInfo& IndInfoFor(int32_t veh, uint32_t model)
+    {
+        for (IndModelInfo& m : g_indModels)
+            if (m.model == model)
+                return m;
+        IndModelInfo m;
+        m.model = model;
+        for (int i = 0; i < sync::kIndCorners; ++i)
+            m.bone[i] = g_world->GetEntityBoneIndexByName(veh, sync::kIndBoneNames[i]);
+        float a[3] = {}, b[3] = {};
+        m.dimsCallable = g_world->GetModelDimensions(model, a, b);
+        m.mn = sync::V3{a[0], a[1], a[2]};
+        m.mx = sync::V3{b[0], b[1], b[2]};
+        m.dimsOk = m.dimsCallable && sync::IndDimsOk(m.mn, m.mx);
+        if (const char* p = game::content::PackOfModel(model))
+            m.pack = p;
+        g_indModels.push_back(m);
+        return g_indModels.back();
+    }
+
+    // Once per model, the first time SET_VEHICLE_INDICATOR_LIGHTS is applied to a car of it (ours or a copy): the bones as the game resolves them,
+    // the box, the calls' results and what the fallback does with that model. The line that proves the live picture of a custom car's indicators.
+    void IndNoteCalls(int32_t veh, const char* who, uint8_t ind, int callsOk, int callsFailed)
+    {
+        if (!veh)
+            return;
+        const uint32_t model = g_world->GetEntityModel(veh);
+        if (!model)
+            return;
+        IndModelInfo& m = IndInfoFor(veh, model);
+        if (m.logged)
+            return;
+        m.logged = true;
+        const sync::IndFallbackMode mode = (sync::IndFallbackMode)g_indFallbackMode.load(std::memory_order_relaxed);
+        const bool use = sync::UseIndFallback(mode, !m.pack.empty());
+        int bones = 0;
+        for (const int b : m.bone)
+            bones += b >= 0 ? 1 : 0;
+        GLOGI("engine: indicators: model 0x%08X (%s%s%s) first indicator call on %s vehicle %d (state %s): SET_VEHICLE_INDICATOR_LIGHTS %d ok / %d failed; "
+              "GET_ENTITY_BONE_INDEX_BY_NAME indicator_lf=%d indicator_lr=%d indicator_rf=%d indicator_rr=%d (%d of 4 present, -1 = the game has no such bone); "
+              "GET_MODEL_DIMENSIONS %s min (%.2f %.2f %.2f) max (%.2f %.2f %.2f); fallback light (veh_ind_fallback=%s): %s",
+              (unsigned)model, m.pack.empty() ? "stock" : "pack '", m.pack.c_str(), m.pack.empty() ? "" : "'", who, veh,
+              ind == sync::kVcIndBoth ? "hazards" : (ind == proto::kVeh2IndicatorL ? "left" : (ind == proto::kVeh2IndicatorR ? "right" : "off")),
+              callsOk, callsFailed, m.bone[0], m.bone[1], m.bone[2], m.bone[3], bones,
+              m.dimsCallable ? (m.dimsOk ? "ok" : "REFUSED (not a car-sized box)") : "not callable", (double)m.mn.x, (double)m.mn.y, (double)m.mn.z,
+              (double)m.mx.x, (double)m.mx.y, (double)m.mx.z, sync::IndFallbackModeName(mode),
+              use ? (bones == 4 ? "ON, at the 4 bones" : (m.dimsOk ? "ON, at the bones the game has and the box corners for the rest"
+                                                                     : "ON, at the bones the game has only (no usable box)"))
+                  : (mode == sync::IndFallbackMode::Off ? "off (switched off)" : "off (a stock car: the game's own indicators)"));
     }
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
     // tick * tickMs - ageMs on its timeline and drawn at its RenderT(now) minus the car's class extra (VehNet::extra).
@@ -816,6 +920,9 @@ namespace {
     // turns the +100 / +250 / +450 ms progress check off (the 0e first-sighting probe alone). Both re-read at Welcome.
     std::atomic<int> g_meleeSurveyWanted{1};
     std::atomic<bool> g_meleeFollowWanted{true};
+    // R5: melee_loop (default on; 0 = the round-4 survey plan, ladder and melee task exactly as they were): the plan and the ladder start with the LOOPED clip (flags 49,
+    // ended by us with STOP_ANIM_TASK) and the plain one (flags 0), and the melee-task rung borrows an anchor ped where the puppet has none. Re-read at Welcome.
+    std::atomic<bool> g_meleeLoopWanted{true};
     sync::SwingSurvey g_swingSurvey;
     uint32_t g_swingNo = 0, g_ownSwingNo = 0;
     int g_swingDurationMs = 400;                       // the duration of a non-survey swing (a survey winner may set it to the clip's length)
@@ -1827,6 +1934,30 @@ namespace {
         g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
         g_locoGaitClip.store(reg::Get(L"loco_gait_clip") != L"0");
         GLOGI("engine: on-foot clip (0.4.17): loco_gait_clip=%s", g_locoGaitClip.load() ? "on (blend ratio = the sender's gait 1/2/3)" : "OFF (0.4.15 speed knob)");
+        {
+            // R5: the grace window after a task-changing Reset and the shorter Placed hold (Blend only)
+            g_locoBlendGrace.store(reg::Get(L"loco_blend_grace") != L"0");
+            const std::wstring placedReg = reg::Get(L"loco_placed_ms");
+            long placedMs = -1;
+            if (!placedReg.empty())
+            {
+                wchar_t* endp = nullptr;
+                const long v = std::wcstol(placedReg.c_str(), &endp, 10);
+                if (endp && *endp == 0 && v >= 0 && v <= 600000)
+                    placedMs = v;
+                else
+                    GLOGW("engine: loco_placed_ms=\"%ls\" is not a number of milliseconds (0..600000): ignored, the shipped hold stays", placedReg.c_str());
+            }
+            g_locoPlacedMs.store((int)placedMs);
+            const sync::LocoConfig rc = LocoCfg();
+            GLOGI("engine: remote on-foot Blend grace (R5): loco_blend_grace=%s, loco_placed_ms=%s -> grace %.0f ms (place-once if the error is over %.1f m, chain cap %.0f ms), "
+                  "probation %.0f ms, Placed hold after an explained fall %.0f ms (cap %.0f), after an unexplained one %.0f ms (cap %.0f), ladder hold %.0f ms, %d level changes%s",
+                  g_locoBlendGrace.load() ? "on" : "OFF (round-4 Blend)", placedMs < 0 ? "unset" : std::to_string(placedMs).c_str(),
+                  (double)rc.blendGraceMs, (double)rc.blendGracePlaceM, (double)rc.blendGraceMaxMs, (double)rc.blendProbationMs,
+                  (double)rc.placedMs, (double)rc.placedDurMaxMs, (double)(rc.placedUnexplainedMs > 0.0f ? rc.placedUnexplainedMs : rc.placedMs),
+                  (double)(rc.placedUnexplainedMaxMs > 0.0f ? rc.placedUnexplainedMaxMs : rc.placedDurMaxMs), (double)rc.levelHoldMs, (int)rc.maxLevelChanges,
+                  g_locoBlend.load() ? "" : " (not Blend: no effect)");
+        }
         GLOGI("engine: remote on-foot round-3 rules %s (loco_r3): quiet window + write verdict, re-issue spacing, ladder hold / cap; repairs of a puppet "
               "no task moves %s (loco_repair)", g_locoR3.load() ? "ON" : "OFF (round-2 controller)", g_locoRepair.load() ? "ON" : "OFF");
         GLOGI("engine: remote on-foot position error closed by %s (loco_push, %s), self-checks / degradation ladder %s (loco_selfcheck)",
@@ -1904,6 +2035,14 @@ namespace {
               g_vcAutoCancel.load() ? "on (45 degrees of turn, the wheel centred 0.4 s)" : "OFF",
               g_vcIndSync.load() ? "on (kVeh2IndicatorL / R sent and applied on copies)" : "OFF (the bits are neither sent nor applied)",
               g_vcFuelUse.load() ? "ON (an empty tank cuts the engine of our own car and it will not start)" : "off (the gauge only shows the level)");
+        {
+            const sync::IndFallbackMode im = sync::IndFallbackModeFrom(reg::Get(L"veh_ind_fallback").c_str());   // 0.4.27
+            g_indFallbackMode.store((int)im);
+            GLOGI("engine: indicator fallback (0.4.27): veh_ind_fallback=%s (our own blinking amber light, DRAW_LIGHT_WITH_RANGE every frame at the "
+                  "indicator bones the game resolves, else the model box's corners, on %s); one 'engine: indicators: model' line per model at its first "
+                  "indicator call names its bones and the calls' results",
+                  sync::IndFallbackModeName(im), im == sync::IndFallbackMode::Off ? "no car" : (im == sync::IndFallbackMode::AllCars ? "every car" : "the cars a content pack carries"));
+        }
         MapReadSwitches();                                           // 0.4.20: map_clear_blips / map_reveal
         MinimapReadSwitches();                                       // 0.4.22: minimap / minimap_bars
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
@@ -1949,6 +2088,11 @@ namespace {
                     cycles = sv[0] - L'0';
                 g_meleeSurveyWanted.store(cycles > 3 ? 3 : cycles);
                 g_meleeFollowWanted.store(reg::Get(L"melee_follow") != L"0");
+                g_meleeLoopWanted.store(reg::Get(L"melee_loop") != L"0");
+                GLOGI("engine: melee swing (R5): melee_loop=%s (%s); melee_survey=%d, melee_follow=%s", g_meleeLoopWanted.load() ? "ON" : "off",
+                      g_meleeLoopWanted.load() ? "plan: looped clip flags 49 ended by STOP_ANIM_TASK, plain flags 0, then the round-4 attempts; melee task may borrow an anchor ped"
+                                               : "the round-4 plan and ladder, the melee task only with a locomotion anchor", g_meleeSurveyWanted.load(),
+                      g_meleeFollowWanted.load() ? "on" : "off");
             }
             GLOGI("engine: combat client: hit reactions %s (a melee blow: a short stagger), muzzle flash %s, remote shots via %s "
                   "(hit_react / peer_muzzle / peer_shoot); AI weapon damage modifier 0.0 once the tick sets it, AI melee modifier %s "
@@ -2564,6 +2708,7 @@ namespace {
         {
             g_ambExempt.Add(kv.second.ped);            // the puppet
             g_ambExempt.Add(kv.second.anchor);         // its go-to-entity anchor (a real mission ped)
+            g_ambExempt.Add(kv.second.swingAnchor);    // R5: ... and the melee task's borrowed one
         }
         for (const auto& kv : g_vehs)
             g_ambExempt.Add(kv.second.handle);         // server vehicles (their occupants are the puppets above)
@@ -3895,6 +4040,13 @@ namespace {
         if (g_barsReset.exchange(false))
         {
             g_barsGate.SetMode((sync::BarsMode)g_barsMode.load());
+            {
+                // 0.4.27: the big-radar flip is held this long so the radar re-lays out the resized table (minimap_flip_ms, 0 = one tick as before).
+                const std::wstring v = reg::Get(L"minimap_flip_ms");
+                const double ms = v.empty() ? 500.0 : _wtof(v.c_str());
+                g_barsGate.SetFlipHoldMs(ms);
+                GLOGI("engine: minimap size (0.4.27): big-radar flip held %.0f ms (minimap_flip_ms%s)", ms, v.empty() ? " unset, default" : "");
+            }
             g_barsGate.Reset();
         }
         TickMinimapSize(nowMs);
@@ -4317,6 +4469,14 @@ namespace {
     void AbandonPeerSwing(Peer& pe)
     {
         pe.swingProbe.Cancel();
+        if (pe.loopStop.Armed())
+        {
+            // R5: a looped clip in flight never ends by itself: end it now (the next swing, if any, replaces it anyway)
+            if (g_world && pe.ped && pe.loopDict && pe.loopClip)
+                g_world->StopAnimTask(pe.ped, pe.loopDict, pe.loopClip, -8.0f);
+            pe.loopStop.Cancel();
+            ++g_swingDiag.loopAbandoned;
+        }
         if (pe.swingPlanIdx >= 0)
         {
             g_swingSurvey.OnResult((size_t)pe.swingPlanIdx, false, sync::SwingProbe::Progress::None, true);
@@ -4425,6 +4585,37 @@ namespace {
                 TallyOneShot(k, ev, pe.audit.LastShowMs());
         }
     }
+    // R5 telemetry: every frame, the sender's swim / ragdoll flag (the pose's, at the render time) against the game's own read-back of the puppet. The reads happen
+    // only when StateMirror::WantRead says so (a flag on, an edge being judged, otherwise twice a second), so an upright puppet on land costs 4 native calls a second.
+    // Counts only: nothing here acts on the result. Script tick, ped valid.
+    void ObservePeerEdges(Peer& pe, const proto::PedState& ps, double nowMs)
+    {
+        if (pe.mirrorPed != pe.ped)
+        {
+            pe.swimMirror.Rebase();
+            pe.ragMirror.Rebase();
+            pe.mirrorPed = pe.ped;
+        }
+        int swimRead = -2, ragRead = -2;
+        if (pe.swimMirror.WantRead(nowMs))
+            swimRead = g_world->IsPedSwimming(pe.ped) ? 1 : 0;
+        if (pe.ragMirror.WantRead(nowMs))
+            ragRead = g_world->IsPedRagdoll(pe.ped) ? 1 : 0;
+        pe.swimMirror.Update(nowMs, (ps.flags & proto::kPfSwimming) != 0, swimRead);
+        pe.ragMirror.Update(nowMs, (ps.flags & proto::kPfRagdoll) != 0, ragRead);
+    }
+    // The 10 s line of the two mirrors; empty when neither had an edge or an unasked rise in the window (the window is taken either way).
+    std::string EdgeLine(int id, Peer& pe)
+    {
+        const std::string sw = sync::StateMirrorLine("swim", pe.swimMirror.TakeWindow());
+        const std::string rg = sync::StateMirrorLine("ragdoll", pe.ragMirror.TakeWindow());
+        if (sw.empty() && rg.empty())
+            return std::string();
+        char head[160];
+        std::snprintf(head, sizeof(head), "engine: edges id=%d (%s), last 10 s (sender flag against IS_PED_SWIMMING / IS_PED_RAGDOLL on the puppet): ", id, pe.name.c_str());
+        return std::string(head) + (sw.empty() ? "swim: no edge" : sw) + " | " + (rg.empty() ? "ragdoll: no edge" : rg);
+    }
+
     std::string OneShotLine()
     {
         std::string out;
@@ -4468,6 +4659,12 @@ namespace {
         if (pe.anchor && g_world)
             g_world->DeleteEntity(pe.anchor);          // zeroes the handle
         pe.anchor = 0;
+        if (pe.swingAnchor && g_world)
+        {
+            g_world->DeleteEntity(pe.swingAnchor);     // R5: the melee task's borrowed anchor goes with the puppet
+            ++g_swingDiag.anchorlessRemoved;
+        }
+        pe.swingAnchor = 0;
     }
     bool EnsureAnchor(Peer& pe, const sync::Pose& pose, double nowMs)
     {
@@ -4618,11 +4815,46 @@ namespace {
     // The melee-task rung: TASK_PUT_PED_DIRECTLY_INTO_MELEE against the puppet's own invisible, invincible, collision-less anchor ped, so
     // its blows can land on nobody that matters; the AI melee damage modifier is held at 0 for the window as well (the puppet's fists cannot
     // hurt the local player even if its AI picks a new target), and PeerSwingService trips the breaker if our health moves meanwhile.
+    // R5 melee_loop: the melee-task rung needs a ped to fight. A puppet in Anchor mode has its locomotion anchor; one in Blend / Straight mode has none, so the
+    // rung used to be impossible there (blend mode never has an anchor). A short-lived one is made in front of it (the locomotion anchor's recipe: not
+    // networked, mission ped, invincible, frozen, invisible, no collision; never registered anywhere) and removed kSwingAnchorKeepMs after the last melee task.
+    // 0 = none could be had (melee_loop=0, no model in memory, the pool is full): the rung is skipped and counted, never forced.
+    constexpr double kSwingAnchorKeepMs = 3000.0;
+    int32_t SwingTargetFor(Peer& pe, double nowMs)
+    {
+        if (pe.anchor && g_world->EntityExists(pe.anchor))
+            return pe.anchor;
+        if (!g_meleeLoopWanted.load(std::memory_order_relaxed))
+            return 0;
+        if (pe.swingAnchor && !g_world->EntityExists(pe.swingAnchor))
+            pe.swingAnchor = 0;                        // deleted under us (a game clean-up)
+        if (!pe.swingAnchor)
+        {
+            float x = 0, y = 0, z = 0;
+            if (!pe.ped || !g_world->GetEntityCoords(pe.ped, x, y, z))
+                return 0;
+            const float h = g_world->GetEntityHeading(pe.ped) * 0.0174532925f;      // GTA heading: 0 = +y, counter-clockwise
+            const int32_t a = g_world->SpawnPed(kCompanionModel, x - std::sin(h) * 1.5f, y + std::cos(h) * 1.5f, z);
+            if (!a)
+            {
+                ++g_swingDiag.anchorlessFailed;
+                return 0;
+            }
+            g_world->SetEntityVisible(a, false);
+            g_world->SetEntityCollision(a, false);
+            pe.swingAnchor = a;
+            ++g_swingDiag.anchorlessSpawned;
+        }
+        pe.swingAnchorUntilMs = nowMs + kSwingAnchorKeepMs;
+        return pe.swingAnchor;
+    }
+
     bool IssuePeerMeleeTask(Peer& pe, double nowMs)
     {
-        if (!pe.anchor || !g_world->EntityExists(pe.anchor))
+        const int32_t target = SwingTargetFor(pe, nowMs);
+        if (!target)
         {
-            ++g_swingDiag.meleeTaskNoTarget;           // straight locomotion mode, or the anchor is not there yet: nothing safe to aim at
+            ++g_swingDiag.meleeTaskNoTarget;           // no anchor ped, and none could be made: nothing safe to aim at
             return false;
         }
         const int32_t lp = g_localPed.load();
@@ -4632,7 +4864,7 @@ namespace {
             g_meleeTaskModSet = g_world->SetAiMeleeWeaponDamageModifier(0.0f);
             g_meleeTaskModUntilMs = nowMs + 1200.0;
         }
-        if (!g_world->TaskPutPedDirectlyIntoMelee(pe.ped, pe.anchor, 0.2f, 0.6f, 0.0f, 0))
+        if (!g_world->TaskPutPedDirectlyIntoMelee(pe.ped, target, 0.2f, 0.6f, 0.0f, 0))
             return false;
         pe.swingMeleeUntilMs = nowMs + kSwingMs + 150.0;
         return true;
@@ -4642,7 +4874,8 @@ namespace {
     // (not in loco_mode=straight, the 0.4.9 default: the entry is then skipped and counted).
     bool SurveyMeleeTaskOk(const Peer& pe)
     {
-        return g_swingLadder.Mode() == sync::SwingMode::Auto && !g_swingLadder.MeleeTripped() && pe.anchor && g_world->EntityExists(pe.anchor);
+        return g_swingLadder.Mode() == sync::SwingMode::Auto && !g_swingLadder.MeleeTripped() &&
+               ((pe.anchor && g_world->EntityExists(pe.anchor)) || g_meleeLoopWanted.load(std::memory_order_relaxed));   // R5: or one can be borrowed
     }
 
     // R4 T3. Once the survey plan is done and every attempt has reported: pin the ladder to the attempt whose swings PROGRESSED best and log the table.
@@ -4652,17 +4885,17 @@ namespace {
         if (w == -2)
             return;
         std::string tab;
-        for (size_t i = 0; i < sync::kSurveyPlan; ++i)
+        for (size_t i = 0; i < g_swingSurvey.PlanSize(); ++i)
         {
             char t[200];
             std::snprintf(t, sizeof(t), "%s[%s: issued %u, progressed %u, blended out / flicker / frozen %u, not seen %u]", tab.empty() ? "" : " ",
-                          sync::SurveyAttemptName(sync::SurveyPlanAt(i)).c_str(), g_swingSurvey.Issued(i), g_swingSurvey.Progressed(i),
+                          sync::SurveyAttemptName(g_swingSurvey.PlanAt(i)).c_str(), g_swingSurvey.Issued(i), g_swingSurvey.Progressed(i),
                           g_swingSurvey.Failed(i), g_swingSurvey.Unseen(i));
             tab += t;
         }
         if (w >= 0)
         {
-            const sync::SwingAttempt win = sync::SurveyPlanAt((size_t)w);
+            const sync::SwingAttempt win = g_swingSurvey.PlanAt((size_t)w);
             g_swingLadder.PinTo(win.variant);
             g_swingDurationMs = win.durationMs;
             char line[1600];
@@ -4878,7 +5111,7 @@ namespace {
             att = pe.swingAttempt;
         else
         {
-            if (pe.swingProbe.Active())
+            if (pe.swingProbe.Active() || pe.loopStop.Armed())
                 AbandonPeerSwing(pe);                  // the previous swing's follow was not over: it is overtaken (a survey entry of it is queued again)
             att.variant = g_swingLadder.Current();
             att.durationMs = g_swingDurationMs;
@@ -4892,6 +5125,14 @@ namespace {
                     SurveyFinishCheck();               // only skipped entries were left: the survey is over
             }
         }
+        // R5: the looped clip runs for the clip's length and is ended by us; the plain one plays its whole length (the survey plan says the same; the ladder's rung does not)
+        if (att.variant == sync::SwingVariant::Looped)
+        {
+            att.durationMs = sync::kSwingClipLength;
+            att.stopAfterMs = sync::kLoopStopAfterMs;
+        }
+        else if (att.variant == sync::SwingVariant::Plain)
+            att.durationMs = sync::kSwingClipLength;
         const sync::SwingVariant var = att.variant;
         const bool ok = var == sync::SwingVariant::MeleeTask
                             ? IssuePeerMeleeTask(pe, nowMs)
@@ -4935,8 +5176,16 @@ namespace {
             }
             // the window the locomotion controller stays away: the swing's duration (the melee task's own end, 150 ms past kSwingMs, for that rung)
             pe.swingProbe.Begin(nowMs, idx, g_meleeFollowWanted.load(std::memory_order_relaxed), att.durationMs,
-                                var == sync::SwingVariant::MeleeTask ? kSwingMs + 200.0 : -1.0);
-            pe.swingResetPending = var == sync::SwingVariant::FullBody;   // a whole-body clip replaced the gait task: the controller re-issues it when the swing is over
+                                var == sync::SwingVariant::MeleeTask ? kSwingMs + 200.0 : att.stopAfterMs > 0 ? att.stopAfterMs + 60.0 : -1.0);
+            pe.swingResetPending = sync::SwingVariantReplacesGait(var);   // a whole-body clip replaced the gait task: the controller re-issues it when the swing is over
+            if (att.stopAfterMs > 0 && var != sync::SwingVariant::MeleeTask)
+            {
+                pe.loopStop.Arm(nowMs, att.stopAfterMs);   // R5: a looped clip is ended by us (PeerSwingService)
+                pe.loopDict = c.dict;
+                pe.loopClip = c.clip;
+            }
+            else
+                pe.loopStop.Cancel();
             pe.swingProbeArmed = &set == &g_swingSetArmed;
             pe.swingVariant = var;
             pe.swingLocoMark = LocoTaskCount(pe);
@@ -4967,7 +5216,7 @@ namespace {
             const sync::SwingMode want = (sync::SwingMode)g_meleeAnimWanted.load(std::memory_order_relaxed);
             if (want != g_swingLadder.Mode() && !(want == sync::SwingMode::MeleeTask && g_swingLadder.Mode() == sync::SwingMode::Play && g_swingLadder.MeleeTripped()))
             {
-                g_swingLadder.SetMode(want);
+                g_swingLadder.SetMode(want, g_meleeLoopWanted.load(std::memory_order_relaxed));
                 PeerLog(false, "engine: melee swing: melee_anim=%s (auto: upper-body clip, then not-interruptable, full body, the melee task, each rung only "
                         "after the read-back says the swing was not seen playing)", sync::SwingModeName(want));
             }
@@ -5062,6 +5311,40 @@ namespace {
                 pe.loco.Reset();                       // ... and the locomotion controller issues its gait task again
             }
         }
+        if (pe.swingAnchor && pe.swingMeleeUntilMs <= 0.0 && nowMs >= pe.swingAnchorUntilMs)
+        {
+            g_world->DeleteEntity(pe.swingAnchor);     // R5: the melee task is over: the borrowed anchor ped goes
+            pe.swingAnchor = 0;
+            ++g_swingDiag.anchorlessRemoved;
+        }
+        if (pe.loopStop.Armed())
+        {
+            // R5: a looped swing clip never ends by itself. At the swing's end STOP_ANIM_TASK ends THAT clip; the next frames read it back: gone = done; still
+            // playing or unreadable = the puppet's tasks are cleared instead and the locomotion controller issues its gait task again (a loop must not run on)
+            if (pe.loopStop.Due(nowMs))
+            {
+                ++g_swingDiag.loopStops;
+                g_world->StopAnimTask(pe.ped, pe.loopDict, pe.loopClip, -8.0f);
+                pe.loopStop.Stopped(nowMs);
+            }
+            else if (pe.loopStop.Awaiting())
+            {
+                const sync::SwingLoopStop::Outcome lo = pe.loopStop.Check(nowMs, g_world->IsEntityPlayingAnim(pe.ped, pe.loopDict, pe.loopClip));
+                if (lo == sync::SwingLoopStop::Outcome::Gone)
+                    ++g_swingDiag.loopGone;
+                else if (lo == sync::SwingLoopStop::Outcome::StillPlaying || lo == sync::SwingLoopStop::Outcome::Unread)
+                {
+                    const bool still = lo == sync::SwingLoopStop::Outcome::StillPlaying;
+                    ++(still ? g_swingDiag.loopStill : g_swingDiag.loopUnread);
+                    g_world->ClearPedTasks(pe.ped);
+                    pe.loco.Reset();
+                    if (g_animFirstUse.Note(still ? "loop-stop-still" : "loop-stop-unread"))
+                        PeerLog(true, "engine: melee swing: the looped clip %s / %s on peer id=%d was %s %d ms after STOP_ANIM_TASK: its tasks were cleared instead "
+                                "(melee_loop=0 puts the round-4 plan back)", pe.loopDict ? pe.loopDict : "?", pe.loopClip ? pe.loopClip : "?", id,
+                                still ? "STILL PLAYING" : "unreadable", (int)sync::SwingLoopStop::kCheckAfterMs);
+                }
+            }
+        }
         if (pe.swingPending.Armed())
         {
             if (!meleeWeapon || pe.seatedVeh >= 0 || pe.collisionOff || pe.hitReact.Active() || pe.emote.Active())
@@ -5145,6 +5428,7 @@ namespace {
             li.variant = pe.swingVariant;
             li.flags = sync::SwingVariantFlags(pe.swingVariant);
             li.durationMs = pe.swingAttempt.durationMs;
+            li.stopAfterMs = pe.swingAttempt.stopAfterMs;
             li.dict = viaMelee ? "(melee task, no clip)" : c.dict;
             li.clip = viaMelee ? "-" : c.clip;
             li.startMs = pe.swingIssuedMs;
@@ -5300,7 +5584,7 @@ namespace {
         }
         const sync::SwingMode sm = g_swingLadder.Mode();
         if ((sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play) && !g_swingSurvey.Active() && g_swingLadder.Enabled())
-            g_swingSurvey.Start(1);                    // a finished survey: a new pass
+            g_swingSurvey.Start(1, g_swingLadder.Loop());   // a finished survey: a new pass
         g_swingTestForce = true;
         PlayPeerSwing(*best, bestId, UnarmedHash(), NowMs());
         g_swingTestForce = false;
@@ -6355,6 +6639,22 @@ namespace {
                           BlendVerdict(pe, d).c_str());
             line += r4;
         }
+        {
+            // R5: the grace window after a task-changing Reset (how often it opened, frames it held the verdict, places it did, chain caps), the falls
+            // into the rigid follow split into explained (a window was open in the last blendAttributeMs) and unexplained, the probation after the way
+            // back up, and the heading numbers (degrees; frames with the pose over 1 m/s): the puppet's heading against the sender's, the angle
+            // between the pose's velocity and the puppet's heading, and between the puppet's OWN velocity and its heading (90 = it slides sideways)
+            char r5[900];
+            std::snprintf(r5, sizeof(r5),
+                          " | R5: grace windows %u (%u frames held, %u places, %u chain caps), falls to the rigid follow %u explained / %u unexplained, probations %u (%u fell again), "
+                          "heading error mean %.1f p95 %.1f deg (%u frames), pose velocity vs puppet heading mean %.1f p95 %.1f deg, puppet's own velocity vs its heading mean %.1f p95 %.1f deg (%u frames)",
+                          (unsigned)(a.graceWindows - b.graceWindows), (unsigned)(a.graceHeldFrames - b.graceHeldFrames), (unsigned)(a.gracePlaced - b.gracePlaced),
+                          (unsigned)(a.graceChainCapped - b.graceChainCapped), (unsigned)(a.fallsAfterGrace - b.fallsAfterGrace),
+                          (unsigned)(a.fallsUnexplained - b.fallsUnexplained), (unsigned)(a.probations - b.probations), (unsigned)(a.probationFalls - b.probationFalls),
+                          d.headErrMeanDeg, d.headErrP95Deg, (unsigned)d.headFrames, d.poseVelHeadMeanDeg, d.poseVelHeadP95Deg, d.pedVelHeadMeanDeg, d.pedVelHeadP95Deg,
+                          (unsigned)d.pedVelHeadFrames);
+            line += r5;
+        }
         return line;
     }
 
@@ -6929,6 +7229,7 @@ namespace {
             return;                                    // playing dead (UpdatePeerDeath): no tasks, no placing
         }
         ObservePeerOneShots(pe, nowMs);                // T2: the game's readback of the one-shots asked for (only while one is armed)
+        ObservePeerEdges(pe, ps, nowMs);               // R5 telemetry: the sender's swim / ragdoll flag against the puppet's read-back (counts only)
         const bool tierBHolds = !reactHolds && TickPeerTierB(pe, id, pose, nowMs);   // W6: reload / stealth / cover / enter / exit
         if (pe.seatedVeh >= 0)
         {
@@ -7199,6 +7500,9 @@ namespace {
             df.snapped = o.snap;
             df.blend = o.blend;
             df.blendPlaced = o.level == sync::LocoLevel::Placed;
+            df.pedHeading = in.pedHeading;                 // R5 telemetry: GET_ENTITY_HEADING of the puppet against the sender's heading
+            df.poseHeadingDeg = in.heading;
+            df.haveHeading = true;
             pe.slide.Observe(df);
         }
 
@@ -7884,6 +8188,11 @@ namespace {
                         if (!cl.empty())
                             report.emplace_back(cl);
                     }
+                    {
+                        const std::string el = EdgeLine(it->first, pe);   // R5: swim / ragdoll edges (empty when quiet; the window is taken either way)
+                        if (!el.empty())
+                            report.emplace_back(el);
+                    }
                     pe.slide.Reset();
                     pe.gaitDiag.Reset();
                     pe.shootingFrames = 0;
@@ -8425,10 +8734,18 @@ namespace {
             g_world->SetVehicleFullbeam(h, (st.flags2 & proto::kVeh2HighBeam) != 0);
         if (d.flags2 & proto::kVeh2Interior)
             g_world->SetVehicleInteriorLight(h, (st.flags2 & proto::kVeh2Interior) != 0);
-        if (d.flags2 & proto::kVeh2IndicatorL)
-            ++(g_world->SetVehicleIndicatorLights(h, 1, (st.flags2 & proto::kVeh2IndicatorL) != 0) ? g_vcx.copyIndApplied : g_vcx.copyIndFailed);
-        if (d.flags2 & proto::kVeh2IndicatorR)
-            ++(g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0) ? g_vcx.copyIndApplied : g_vcx.copyIndFailed);
+        if (d.flags2 & sync::kVcIndBoth)
+        {
+            int ok = 0, failed = 0;
+            if (d.flags2 & proto::kVeh2IndicatorL)
+                ++(g_world->SetVehicleIndicatorLights(h, 1, (st.flags2 & proto::kVeh2IndicatorL) != 0) ? ok : failed);
+            if (d.flags2 & proto::kVeh2IndicatorR)
+                ++(g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0) ? ok : failed);
+            g_vcx.copyIndApplied += (uint32_t)ok;
+            g_vcx.copyIndFailed += (uint32_t)failed;
+            if (st.flags2 & sync::kVcIndBoth)                        // 0.4.27: the per-model line, at the first call that switches one on
+                IndNoteCalls(h, "the copy (another player's car)", (uint8_t)(st.flags2 & sync::kVcIndBoth), ok, failed);
+        }
         if (d.flags2 & proto::kVeh2Brake)
             ++(g_world->SetVehicleBrakeLights(h, (st.flags2 & proto::kVeh2Brake) != 0) ? g_vis.brakeSet : g_vis.brakeFail);
         // The first sight applies "released" too: a copy must not keep a handbrake of its own. With the sanity layer on (R3 T4) the handbrake is
@@ -10444,6 +10761,8 @@ namespace {
         ++(g_world->PlaySoundFrontend(snd.name, snd.set) ? g_ds.soundOk : g_ds.soundFail);
         if (code == 0)
         {
+            g_lockFlashUntilMs = nowMs + sync::kLockFlashMs;           // 0.4.27: the state row shows the new lock (on foot too)
+            g_lockFlashLocked = want;
             ++g_ds.lockOk;
             ++(want ? g_ds.lockOkLocked : g_ds.lockOkUnlocked);
             g_dsState.keys.Note((int)r.vehId);                 // an Ok means the server counts us as the key's holder
@@ -10848,6 +11167,8 @@ namespace {
         const bool r = g_world->SetVehicleIndicatorLights(veh, 0, (ind & proto::kVeh2IndicatorR) != 0);
         g_vcx.indCalls += 2;
         g_vcx.indFailed += (l ? 0u : 1u) + (r ? 0u : 1u);
+        if (ind & sync::kVcIndBoth)                                   // 0.4.27: the per-model line, at the first call that switches one on
+            IndNoteCalls(veh, "our car", (uint8_t)(ind & sync::kVcIndBoth), (l ? 1 : 0) + (r ? 1 : 0), (l ? 0 : 1) + (r ? 0 : 1));
         return l && r;
     }
     NetVeh* VcNetVehOf(int32_t handle)
@@ -11028,6 +11349,12 @@ namespace {
             hud.beltOn = g_vc.Belt();
             hud.beltWarn = sync::HudBeltWarn(g_vc.Belt(), in.speedMps, g_vc.Config().beltWarnMps);
             hud.engineOff = g_vc.EngineOffHud(nowMs);
+            hud.lock = (nv && nv->haveState) ? ((nv->st.flags & proto::kVehLocked) ? 1 : 0) : -1;   // 0.4.27 state row: the server's flag
+        }
+        else if (keysOn && !veh && nowMs < g_lockFlashUntilMs)
+        {
+            hud.lockFlash = true;                                    // 0.4.27: on foot, the lock the server just confirmed
+            hud.lock = g_lockFlashLocked ? 1 : 0;
         }
         game::Overlay::SetVehicleHud(hud);
         g_fuelHud = sync::FuelHudFor(veh != 0, nv != nullptr, nv && nv->haveState, nv ? (unsigned)nv->st.fuelPermille : 1000u);
@@ -11078,6 +11405,109 @@ namespace {
         const uint32_t keyLines = g_vcx.keyLines;
         g_vcx = VcExtraStats();
         g_vcx.keyLines = keyLines;
+    }
+
+    // 0.4.27 indicator fallback: every frame, our own blinking amber light at each lit corner of a car whose indicators the game does not show
+    // (veh_ind_fallback: pack cars by default). The car we sit in takes the state the HUD shows (the machine's for the driver, the controller's bits
+    // for a passenger); every other networked car the controller's flags2 bits, so remote viewers see it too. Script tick, after TickVehicleControls.
+    void TickIndicatorFallback(int32_t lp, int32_t lpVeh, double nowMs)
+    {
+        const sync::IndFallbackMode mode = (sync::IndFallbackMode)g_indFallbackMode.load(std::memory_order_relaxed);
+        const bool indSync = g_vcIndSync.load(std::memory_order_relaxed);
+        float px = 0, py = 0, pz = 0;
+        const bool havePos = lp && g_world->GetEntityCoords(lp, px, py, pz);
+        if (mode != sync::IndFallbackMode::Off && havePos)
+        {
+            ++g_indx.frames;
+            auto drawCar = [&](int32_t h, uint8_t ind) {
+                ind = (uint8_t)(ind & sync::kVcIndBoth);
+                if (!h || !ind)
+                    return;
+                const uint32_t model = g_world->GetEntityModel(h);
+                if (!model)
+                    return;
+                IndModelInfo& m = IndInfoFor(h, model);
+                if (!sync::UseIndFallback(mode, !m.pack.empty()))
+                {
+                    ++g_indx.skippedStock;
+                    return;
+                }
+                float cx = 0, cy = 0, cz = 0;
+                if (!g_world->GetEntityCoords(h, cx, cy, cz))
+                    return;
+                const float dx = cx - px, dy = cy - py, dz = cz - pz;
+                if (dx * dx + dy * dy + dz * dz > sync::kIndDrawRangeM * sync::kIndDrawRangeM)
+                {
+                    ++g_indx.skippedFar;
+                    return;
+                }
+                const double since = g_indPhase.Touch(h, ind, nowMs);
+                if (since < 0.0)
+                    return;                                          // the table is full (counted)
+                ++g_indx.carFrames;
+                if (!sync::IndBlinkLit(nowMs, since))
+                    return;
+                ++g_indx.litFrames;
+                const unsigned mask = sync::IndCornerMask(ind);
+                const sync::V3 centre{cx, cy, cz};
+                for (int i = 0; i < sync::kIndCorners; ++i)
+                {
+                    if (!(mask & (1u << i)))
+                        continue;
+                    sync::V3 p;
+                    bool have = false;
+                    if (m.bone[i] >= 0 && g_world->GetWorldPositionOfEntityBone(h, m.bone[i], p.x, p.y, p.z) && (p.x != 0.0f || p.y != 0.0f))
+                    {
+                        p = sync::IndPushOut(p, centre);
+                        have = true;
+                        ++g_indx.fromBone;
+                    }
+                    else if (m.dimsOk)
+                    {
+                        const sync::V3 o = sync::IndCornerFromDims(i, m.mn, m.mx);
+                        have = g_world->GetOffsetInWorld(h, o.x, o.y, o.z, p.x, p.y, p.z);
+                        ++(have ? g_indx.fromDims : g_indx.posFailed);
+                    }
+                    else
+                        ++g_indx.noCorner;
+                    if (!have)
+                        continue;
+                    ++(g_world->DrawLightWithRange(p.x, p.y, p.z, sync::kIndR, sync::kIndG, sync::kIndB, sync::kIndRangeM, sync::kIndIntensity)
+                           ? g_indx.lights : g_indx.lightFailed);
+                }
+            };
+            // The car we sit in.
+            NetVeh* own = VcNetVehOf(lpVeh);
+            if (lpVeh)
+            {
+                const bool driver = g_vc.Vehicle() == (uint32_t)lpVeh && g_vc.Seat() == 0;
+                drawCar(lpVeh, sync::HudIndicators(driver, g_vc.Indicators(), own && own->haveState ? own->st.flags2 : (uint8_t)0, indSync));
+            }
+            // Every other networked car: the controller's bits (a parked car we left with the hazards on is one of these).
+            if (indSync)
+                for (auto& kv : g_vehs)
+                {
+                    const NetVeh& v = kv.second;
+                    if (!v.handle || v.removed || !v.present || !v.haveState || v.handle == lpVeh)
+                        continue;
+                    drawCar(v.handle, v.st.flags2);
+                }
+        }
+        g_indPhase.Sweep();
+
+        if (nowMs - g_indReportMs < 10000.0)
+            return;
+        g_indReportMs = nowMs;
+        const unsigned full = g_indPhase.TakeFull();
+        if (g_indx.carFrames || g_indx.lightFailed || full)
+            GLOGI("engine: indicator fallback (0.4.27), last 10 s: veh_ind_fallback=%s; %u frames, %u car-frames with an indicator on (%u in the lit half), "
+                  "DRAW_LIGHT_WITH_RANGE %u (%u failed; range %.1f m, intensity %.1f, rgb %d %d %d, blink %.0f ms), corners from bones %u / from the model box %u "
+                  "(%u box offsets failed, %u corners with neither); skipped: stock cars %u, beyond %.0f m %u, phase table full %u; models probed %zu",
+                  sync::IndFallbackModeName(mode), g_indx.frames, g_indx.carFrames, g_indx.litFrames, g_indx.lights, g_indx.lightFailed,
+                  (double)sync::kIndRangeM, (double)sync::kIndIntensity, sync::kIndR, sync::kIndG, sync::kIndB, sync::kIndPeriodMs,
+                  g_indx.fromBone, g_indx.fromDims, g_indx.posFailed, g_indx.noCorner, g_indx.skippedStock, (double)sync::kIndDrawRangeM,
+                  g_indx.skippedFar, full, g_indModels.size());
+        g_indx = IndFallbackStats();
     }
 
     // Front axle to rear axle of the vehicle's model, from the wheel bones wheel_lf and wheel_lr (names
@@ -12211,11 +12641,11 @@ namespace {
         SyncLocalEmoteDict();
         g_localReact.Clear();
         g_meleeGate.Reset();
-        g_swingLadder.SetMode((sync::SwingMode)g_meleeAnimWanted.load());   // R3 T6: a new session starts the ladder from the registry mode again
+        g_swingLadder.SetMode((sync::SwingMode)g_meleeAnimWanted.load(), g_meleeLoopWanted.load());   // R3 T6: a new session starts the ladder from the registry mode again (R5: and its loop switch)
         {
             // R4 T3: ... and the survey from its first attempt (only where animations are tried at all: auto / play)
             const sync::SwingMode sm = g_swingLadder.Mode();
-            g_swingSurvey.Start(sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play ? (uint32_t)g_meleeSurveyWanted.load() : 0u);
+            g_swingSurvey.Start(sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play ? (uint32_t)g_meleeSurveyWanted.load() : 0u, g_meleeLoopWanted.load());
             g_swingDurationMs = 400;
             g_swingNo = 0;
             g_ownSwingNo = 0;
@@ -13731,6 +14161,7 @@ namespace {
                     TickDoorsSeats(lp, lpVeh, dead, nowMs);     // 0.4.22: the L key, the lock read-back on the copies, the seat read-back of a pick
                 }
                 TickVehicleControls(lp, lpVeh, dead, nowMs);    // 0.4.22: indicators, engine, belt keys + the strip and the fuel gauge (server or not)
+                TickIndicatorFallback(lp, lpVeh, nowMs);        // 0.4.27: our own blinking light on cars whose indicators the game does not show
             }
             if (lp)
             {

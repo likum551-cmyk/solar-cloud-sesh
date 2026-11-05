@@ -182,7 +182,13 @@ static Scn HoverIdle() {
 
 // ---- one run -----------------------------------------------------------------------------------------------------------------
 
+// R5 (tests/r5_onfoot_tests.h): a task-changing event the engine reports with Reset() (a vault / an aim / a hit reaction ended) or Pause() then
+// Reset() (a car exit). The ped's task list was replaced: its task is gone, and for stunMs after the event (after the pause, for an exit) the
+// new task's start clip does not honour velocity writes: the ped moves at stunK x the pose's velocity whatever is written.
+struct Event { double atMs = 0, pauseMs = 0, stunMs = 0, stunK = 0.7; };
+
 struct Opt {
+    std::vector<Event> events;
     double loss = 0.02, jitterMs = 80.0, delayMs = 130.0, fps = 60.0;
     uint64_t seed = 7;
     double warmupMs = 2500;
@@ -221,6 +227,8 @@ struct Res {
     std::vector<std::pair<double, LocoRepair>> repairs;   // (time, step) the controller asked for
     std::vector<double> issueAtMs;                         // every gait / stand-still task issue
     int tasksInSwing = 0;                                  // task issues inside the swing window
+    double msPlaced = 0;                                   // R5: time spent at the rigid follow (level 3)
+    double errMaxAfterEvent = 0;                           // R5: the largest pose-ped error in the 8 s after an event
 };
 
 static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& op, bool gaitRead = true) {
@@ -255,6 +263,8 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
     double lastPoseTeleMs = -1e9;
     int teleUsedIdx = -1;
     LocoVec prevPed = V(0, 0, 30); bool havePrevPed = false;
+    std::vector<bool> evDone(op.events.size(), false);
+    double standUntil = -1.0, stunFrom = 1e18, stunUntil = -1.0, stunK = 0.7, lastEventMs = -1e18;
     while (now < sc.durMs) {
         const double dt = first ? dtBase : now - lastNow;
         while (tSub < now) {
@@ -324,6 +334,16 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
         in.noAnchor = true;       // no anchor entity: R4 compares straight and blend (the anchor task never moved a puppet live)
         in.repairsDone = repairs;
         in.swingActive = op.swingFromMs >= 0 && now >= op.swingFromMs && now < op.swingToMs;
+        for (size_t ei = 0; ei < op.events.size(); ++ei) {
+            const Event& ev = op.events[ei];
+            if (evDone[ei] || now < ev.atMs) continue;
+            evDone[ei] = true;
+            ped.task = 0; ped.taskSpeed = 0; ped.lost = false;      // the old task is gone
+            if (ev.pauseMs > 0.0) { lc.Pause(ev.pauseMs); standUntil = now + ev.pauseMs; stunFrom = standUntil; stunUntil = standUntil + ev.stunMs; }
+            else { lc.Reset(); standUntil = -1.0; stunFrom = now; stunUntil = now + ev.stunMs; }
+            stunK = ev.stunK;
+            lastEventMs = now;
+        }
         const LocoOutput o = lc.Update(in);
         if (o.repair != LocoRepair::None) {
             res.repairs.push_back({now, o.repair});
@@ -341,6 +361,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
             if (o.level == LocoLevel::Placed && res.firstPlacedMs < 0) res.firstPlacedMs = now;
         }
         res.finalLevel = o.level;
+        if (o.level == LocoLevel::Placed) res.msPlaced += dt;
         // ---- apply as DrivePeer does ----
         const LocoVec pedBefore = ped.pos;
         if (o.snap) { ped.pos = o.snapPos; ped.facing = o.heading; ped.taskSpeed = 0; ped.lost = false; ++res.hardSnaps; }
@@ -361,6 +382,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
         }
         ped.rate = o.setMoveRate ? o.moveRate : 1.0f;
         ped.Step(dt, o, true);
+        if (now >= stunFrom && now < stunUntil && now >= standUntil) ped.vReal = V(pvel.x * stunK, pvel.y * stunK, 0);   // R5: the start clip of the new task
         if (o.setVelocity && !o.snap) {
             ++res.velWrites;
             const double over = std::hypot(double(o.velocity.x) - pvel.x, double(o.velocity.y) - pvel.y);
@@ -395,6 +417,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
         (void)pedBefore;
         const double err = std::hypot(double(ppos.x) - in.pedPos.x, double(ppos.y) - in.pedPos.y);
         res.maxErrAny = std::max(res.maxErrAny, err);
+        if (now >= lastEventMs && now < lastEventMs + 8000.0) res.errMaxAfterEvent = std::max(res.errMaxAfterEvent, err);
         bool disturbed = false;
         for (double dtm : disturbAt) if (now >= dtm - 200.0 && now < dtm + op.disturbMs) disturbed = true;
         if (now >= op.warmupMs) {
@@ -748,7 +771,7 @@ static void TestSelfCheck() {
           F("read-back fights %u, position fights %u, rigid follow at %.0f ms", li.st.fightVelFrames, li.st.fightPosFrames, li.firstPlacedMs));
     // a blocked ped (a wall): the error grows with nothing fighting the write beyond the block; the same fallback, reason NoTrack or Fighting, never a snap before 6 m
     // the recovery: the rigid follow is left after placedMs and the blend is tried again (the level changes up, with the hold)
-    LocoConfig shortP = CfgBlend(); shortP.placedMs = 3000.0f; shortP.levelHoldMs = 1000.0f;
+    LocoConfig shortP = CfgBlend(); shortP.placedMs = 3000.0f; shortP.levelHoldMs = 1000.0f; shortP.placedUnexplainedMs = 0.0f;   // (R5: every fall on the short timer)
     const Res rec = Run(Scn{"run 4.5 for 40 s", [](double) { return 4.5; }, [](double) { return 0.0; }, 40000}, e, shortP, op);
     Check("R4 T1 selfcheck: the rigid follow is left after its timer and the blend is tried again; a world that keeps ignoring the writes goes back each time with a doubled timer (3, 6, 12 s ...): "
           ">= 3 level changes in 40 s, the number of degrades equals the number of falls, the error p95 stays <= 0.5 m, no hard snap",

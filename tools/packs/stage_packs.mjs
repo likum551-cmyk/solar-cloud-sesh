@@ -13,6 +13,11 @@
 //   --tex-limit-mib  texture budget (tools/packs/ytd_budget.mjs): a stream\*.ytd whose compressed size is at or above
 //              this loses top mips of its largest textures until it fits (default 15)
 //   --tex-max-dim    ... and so does one with a texture larger than this on a side (default 2048; 0 = no size cap)
+//   --gen9     the GTA V Enhanced set (default --dest %LOCALAPPDATA%\GAGE-MP\packs-gen9; published as packs-gen9.json):
+//              EVERY pack becomes a loose folder (an NG/AES dlc.rpf is decrypted by CodeWalker with the keys of the
+//              local game, held in that process only) and every model is converted to the gen9 resource format by
+//              tools/packs/cw_gen9.ps1. Needs --codewalker=<CodeWalker30_dev48+ folder> --game-dir=<GTA V Legacy folder>.
+//              Legacy-format models crash Enhanced's resource loader (0.4.26: INT3 at GTA5_Enhanced.exe+0x127c32f).
 //
 // A loose model file of 0xFFFFFF bytes (16 MiB) or more fails the pack: the game's loose path crashed on one
 // (valkyrietp.ytd, 28 MB); only .ytd files are budgeted, so a .yft that big has to be fixed by hand.
@@ -45,7 +50,7 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   if (!m) { console.error(`unknown argument ${a}`); process.exit(2); }
   return [m[1], m[2] ?? true];
 }));
-const known = new Set(["src", "dest", "only", "force", "dry-run", "keep-ng-nested", "tex-limit-mib", "tex-max-dim"]);
+const known = new Set(["src", "dest", "only", "force", "dry-run", "keep-ng-nested", "tex-limit-mib", "tex-max-dim", "gen9", "codewalker", "game-dir"]);
 for (const k of Object.keys(args)) if (!known.has(k)) { console.error(`unknown option --${k}`); process.exit(2); }
 const texLimit = Number(args["tex-limit-mib"] ?? 15) * MiB, texMaxDim = Number(args["tex-max-dim"] ?? 2048);
 if (!(texLimit > 0 && texLimit < TOC_SIZE_MARKER)) { console.error("--tex-limit-mib must be above 0 and below 16"); process.exit(2); }
@@ -54,8 +59,14 @@ if (!(Number.isInteger(texMaxDim) && (texMaxDim === 0 || texMaxDim >= 4))) { con
 const src = path.resolve(String(args.src ?? path.join(repo, "DLC PACKS")));
 const local = process.env.LOCALAPPDATA;
 if (!args.dest && !local) { console.error("LOCALAPPDATA is not set; pass --dest"); process.exit(2); }
-const dest = path.resolve(String(args.dest ?? path.join(local, "GAGE-MP", "packs")));
+const gen9 = !!args.gen9;
+const dest = path.resolve(String(args.dest ?? path.join(local, "GAGE-MP", gen9 ? "packs-gen9" : "packs")));
 const dry = !!args["dry-run"], force = !!args.force, keepNgNested = !!args["keep-ng-nested"];
+const cwDir = args.codewalker ? path.resolve(String(args.codewalker)) : "";
+const gameDir = args["game-dir"] ? path.resolve(String(args["game-dir"])) : "";
+if (gen9 && (!cwDir || !existsSync(path.join(cwDir, "CodeWalker.Core.dll")))) { console.error("--gen9 needs --codewalker=<folder with CodeWalker.Core.dll (CodeWalker30_dev48 or newer)>"); process.exit(2); }
+if (gen9 && (!gameDir || !existsSync(gameDir))) { console.error("--gen9 needs --game-dir=<GTA V Legacy folder> (CodeWalker reads the archive keys from it)"); process.exit(2); }
+if (gen9 && keepNgNested) { console.error("--gen9 decrypts NG archives itself; --keep-ng-nested does not apply"); process.exit(2); }
 
 const ENC_NONE = 0, ENC_OPEN = 0x4e45504f, ENC_AES = 0x0ffffff9, ENC_NG = 0x0fefffff, RPF7 = 0x52504637, RSC7 = 0x37435352;
 // The data-file types the game takes from a loose folder mid-session (the Jesko run, 2026-11-05: handling, vehicles,
@@ -86,6 +97,29 @@ function isRsc7(file) {
   const fd = openSync(file, "r");
   try { const b = Buffer.alloc(4); return readSync(fd, b, 0, 4, 0) === 4 && b.readUInt32LE(0) === RSC7; }
   finally { closeSync(fd); }
+}
+
+// A Legacy (gen8) resource: RSC7 with the Legacy version for its type. Gen9 output keeps RSC7 and changes the version
+// (CodeWalker dev48: yft 162 -> 171, ytd 13 -> 5). Mirrors apps/engine/pack_enh_mount_core.h IsLegacyResource.
+const LEGACY_VER = { ".yft": 162, ".ytd": 13, ".ydr": 165, ".ydd": 165 };
+function isLegacyResource(file) {
+  const fd = openSync(file, "r");
+  try {
+    const b = Buffer.alloc(8);
+    if (readSync(fd, b, 0, 8, 0) !== 8 || b.readUInt32LE(0) !== RSC7) return false;
+    return b.readUInt32LE(4) === LEGACY_VER[path.extname(file).toLowerCase()];
+  } finally { closeSync(fd); }
+}
+
+// --gen9: run tools/packs/cw_gen9.ps1 (CodeWalker.Core, no window). Throws with the script's last lines on failure.
+function codeWalker(mode, inPath, outPath) {
+  const a = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path.join(here, "cw_gen9.ps1"),
+    "-Mode", mode, "-CodeWalker", cwDir, "-In", inPath, "-Out", outPath];
+  if (mode === "extract") a.push("-GameDir", gameDir);
+  const r = spawnSync("powershell.exe", a, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  const lines = `${r.stdout || ""}${r.stderr || ""}`.trim().split(/\r?\n/);
+  if (r.status !== 0) throw new Error(`CodeWalker ${mode} failed (exit ${r.status}): ${lines.filter((l) => /FAIL|error|problem/i.test(l)).slice(0, 3).join(" | ") || lines.slice(-2).join(" | ")}`);
+  return lines;
 }
 
 function models(vehiclesMeta) {
@@ -135,12 +169,16 @@ function tuneHandling(xml, report) {
   });
 }
 
-function stageLoose(name, rpf, staging, report) {
+function stageLoose(name, rpf, staging, report, encrypted) {
   const x = path.join(staging, ".extract");
-  const r = spawnSync(process.execPath, [packTool, `--extract=${rpf}`, `--out=${x}`], { encoding: "utf8" });
-  if (r.status !== 0) throw new Error(`extract failed (exit ${r.status}): ${(r.stderr || r.stdout || "").trim().split("\n").slice(-2).join(" | ")}`);
-  // A TOC problem means a file came out wrong or not at all (valkyrietp.ytd before the 16 MiB fix): never stage that.
-  if (/TOC problem/.test(r.stderr || "")) throw new Error(`extract reported problems: ${r.stderr.trim().split(/\r?\n/).slice(0, 3).join(" | ")}`);
+  if (encrypted) {
+    codeWalker("extract", rpf, x);   // --gen9 only: an NG/AES pack, decrypted by CodeWalker with the local game's keys
+  } else {
+    const r = spawnSync(process.execPath, [packTool, `--extract=${rpf}`, `--out=${x}`], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error(`extract failed (exit ${r.status}): ${(r.stderr || r.stdout || "").trim().split("\n").slice(-2).join(" | ")}`);
+    // A TOC problem means a file came out wrong or not at all (valkyrietp.ytd before the 16 MiB fix): never stage that.
+    if (/TOC problem/.test(r.stderr || "")) throw new Error(`extract reported problems: ${r.stderr.trim().split(/\r?\n/).slice(0, 3).join(" | ")}`);
+  }
   for (const f of ["setup2.xml", "content.xml"])
     if (!existsSync(path.join(x, f))) throw new Error(`${f} is missing at the archive root`);
   const content = readFileSync(path.join(x, "content.xml"), "utf8");
@@ -200,6 +238,20 @@ function stageLoose(name, rpf, staging, report) {
     if (size >= TOC_SIZE_MARKER)
       throw new Error(`${base} is ${size} bytes compressed (16 MiB or more): the game's loose path cannot take it${isYtd ? "" : " (only .ytd files are budgeted)"}`);
   }
+  if (gen9 && seen.size) {
+    // GTA V Enhanced: every model converted to the gen9 resource format (the Legacy one crashes Enhanced's resource loader).
+    const stream9 = path.join(staging, "stream.gen9");
+    codeWalker("convert", stream, stream9);
+    for (const f of walk(stream9)) {
+      if (!MODEL_EXT.has(path.extname(f).toLowerCase())) continue;
+      if (isLegacyResource(f)) throw new Error(`${path.basename(f)} is still Legacy-format after the gen9 conversion`);
+      if (statSync(f).size >= TOC_SIZE_MARKER) throw new Error(`${path.basename(f)} is 16 MiB or more after the gen9 conversion`);
+    }
+    if (walk(stream9).length !== walk(stream).length) throw new Error("the gen9 conversion lost files");
+    rmSync(stream, { recursive: true, force: true });
+    renameSync(stream9, stream);
+    report.gen9 = seen.size;
+  }
   report.stream = seen.size;
   report.dropped = dropped;
   copyFileSync(rpf, path.join(staging, "dlc.rpf"));
@@ -226,7 +278,8 @@ for (const name of packs) {
     if (!existsSync(rpf)) throw new Error("no dlc.rpf");
     const h = header(rpf);
     if (!h || h.magic !== RPF7) throw new Error(`not an RPF7 archive${h ? ` (magic 0x${h.magic.toString(16)})` : ""}`);
-    const mode = h.enc === ENC_OPEN || h.enc === ENC_NONE ? "loose" : h.enc === ENC_NG || h.enc === ENC_AES ? "rpf" : null;
+    // --gen9: every pack becomes a loose folder (an encrypted one is decrypted by CodeWalker), its models converted.
+    const mode = h.enc === ENC_OPEN || h.enc === ENC_NONE ? "loose" : h.enc === ENC_NG || h.enc === ENC_AES ? (gen9 ? "loose" : "rpf") : null;
     if (!mode) throw new Error(`unknown encryption word 0x${h.enc.toString(16)}`);
     const encName = h.enc === ENC_OPEN ? "OPEN" : h.enc === ENC_NONE ? "NONE" : h.enc === ENC_NG ? "NG" : "AES";
     if (existsSync(target) && !force) { console.log(`= ${name}: already staged (${encName}); --force restages it`); skipped++; continue; }
@@ -234,7 +287,7 @@ for (const name of packs) {
     const staging = target + ".staging";
     rmSync(staging, { recursive: true, force: true });
     mkdirSync(staging, { recursive: true });
-    if (mode === "loose") stageLoose(name, rpf, staging, report);
+    if (mode === "loose") stageLoose(name, rpf, staging, report, h.enc === ENC_NG || h.enc === ENC_AES);
     else {
       copyFileSync(rpf, path.join(staging, "dlc.rpf"));
       copyFileSync(path.join(here, "handling_tune.json"), path.join(staging, "gage_tune.json"));

@@ -174,8 +174,8 @@ namespace minimapsizetest {
         {
             const ParsedScale unset = ParseMinimapScale(L""), blank = ParseMinimapScale(L"  "), p08 = ParseMinimapScale(L"0.8"), dot = ParseMinimapScale(L".7");
             const ParsedScale one = ParseMinimapScale(L"1"), one0 = ParseMinimapScale(L"1.0"), padded = ParseMinimapScale(L" 0.65\t"), half = ParseMinimapScale(L"0.5");
-            Check("minimap_scale: unset or blank = 0.80 (GI asked for smaller); 0.8, .7, 0.65 (padded), 0.5 read as numbers; 1 and 1.0 = 1 (untouched)",
-                  Near(unset.scale, 0.80f) && unset.src == ScaleSource::Unset && Near(blank.scale, 0.80f) && blank.src == ScaleSource::Unset && Near(p08.scale, 0.8f)
+            Check("minimap_scale: unset or blank = the default (0.50 since 0.4.27); 0.8, .7, 0.65 (padded), 0.5 read as numbers; 1 and 1.0 = 1 (untouched)",
+                  Near(unset.scale, kMinimapScaleDefault) && unset.src == ScaleSource::Unset && Near(blank.scale, kMinimapScaleDefault) && blank.src == ScaleSource::Unset && Near(p08.scale, 0.8f)
                       && p08.src == ScaleSource::Set && Near(dot.scale, 0.7f) && Near(padded.scale, 0.65f) && Near(half.scale, 0.5f) && half.src == ScaleSource::Set
                       && one.scale == 1.0f && one0.scale == 1.0f && one.src == ScaleSource::Set,
                   std::to_string(unset.scale) + " " + std::to_string(p08.scale) + " " + std::to_string(one.scale));
@@ -192,7 +192,7 @@ namespace minimapsizetest {
             for (const wchar_t* j : junk)
             {
                 const ParsedScale p = ParseMinimapScale(j);
-                good += (p.src == ScaleSource::Junk && Near(p.scale, 0.80f)) ? 1 : 0;
+                good += (p.src == ScaleSource::Junk && Near(p.scale, kMinimapScaleDefault)) ? 1 : 0;
             }
             Check("minimap_scale: anything that is not a plain decimal (letters, comma, sign, exponent, two dots, too many digits) falls back to 0.80 as junk",
                   good == 10, std::to_string(good) + " of 10");

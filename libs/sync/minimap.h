@@ -110,6 +110,7 @@ namespace gage::sync {
         };
 
         void SetMode(BarsMode m) { mode_ = m; }
+        void SetFlipHoldMs(double ms) { flipHoldMs_ = ms < 0.0 ? 0.0 : ms; }   // 0 = the one-tick flip of 0.4.22-0.4.26
         BarsMode Mode() const { return mode_; }
 
         // A new session / entry: the refresh is owed again. A big radar left ON stays owed its OFF (bigmapOn_ is not cleared).
@@ -133,8 +134,11 @@ namespace gage::sync {
         BarsAction Next(const BarsInputs& in, double nowMs)
         {
             // The flip's second half is not optional: a radar left in big mode is worse than a bar left on screen.
+            // 0.4.27: held flipHoldMs_ first (live 0.4.26: a one-tick flip left the resized table unread; the big radar needs frames to lay out).
             if (bigmapOn_)
             {
+                if (nowMs - bigmapOnMs_ < flipHoldMs_)
+                    return BarsAction::None;
                 bigmapOn_ = false;
                 ++stats_.refreshOff;
                 return BarsAction::RefreshOff;
@@ -143,6 +147,7 @@ namespace gage::sync {
             {
                 flipAsked_ = false;
                 bigmapOn_ = true;
+                bigmapOnMs_ = nowMs;
                 ++stats_.refreshOn;
                 return BarsAction::RefreshOn;
             }
@@ -159,6 +164,7 @@ namespace gage::sync {
             if (mode_ == BarsMode::SetupRefresh && !refreshDone_)
             {
                 bigmapOn_ = true;
+                bigmapOnMs_ = nowMs;
                 refreshDone_ = true;   // the flip is under way: its OFF is owed on the next call whatever happens
                 ++stats_.refreshOn;
                 return BarsAction::RefreshOn;
@@ -178,6 +184,8 @@ namespace gage::sync {
         bool flipAsked_ = false;    // RequestFlip(): one flip owed as soon as the radar shows (any mode)
         bool refreshDone_ = false;  // the flip finished for this entry
         double lastRequestMs_ = -1e18;
+        double bigmapOnMs_ = 0.0;
+        double flipHoldMs_ = 0.0;
         Stats stats_;
     };
 

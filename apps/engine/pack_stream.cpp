@@ -471,11 +471,18 @@ bool IsLegacyGameExe() {
     return _wcsicmp(base ? base + 1 : path, L"GTA5.exe") == 0;
 }
 
-// Any pack folder (one holding a dlc.rpf) under %LOCALAPPDATA%\GAGE-MP\packs\.
-bool AnyPackFolder() {
+// The packs folder: %LOCALAPPDATA%\GAGE-MP\packs\ on Legacy, ...\packs-gen9\ on Enhanced (0.4.27: the launcher's gen9-converted set,
+// packs-gen9.json; Legacy-format models crash Enhanced's resource loader). "" when LOCALAPPDATA is not set.
+std::wstring PacksRoot() {
     const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
-    if (!local || !*local) return false;
-    const std::wstring root = std::wstring(local) + L"\\GAGE-MP\\packs\\";
+    if (!local || !*local) return std::wstring();
+    return std::wstring(local) + (IsLegacyGameExe() ? L"\\GAGE-MP\\packs\\" : L"\\GAGE-MP\\packs-gen9\\");
+}
+
+// Any pack folder (one holding a dlc.rpf) under PacksRoot().
+bool AnyPackFolder() {
+    const std::wstring root = PacksRoot();
+    if (root.empty()) return false;
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return false;
@@ -519,9 +526,8 @@ bool Enabled() {
 // (the game takes narrow paths), as are "*.old" / "*.staging" leftovers of a restage.
 void EnumeratePacks() {
     g_packs.clear();
-    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
-    if (!local || !*local) { GLOGW("hook: [packstream] LOCALAPPDATA is not set; no packs"); return; }
-    const std::wstring root = std::wstring(local) + L"\\GAGE-MP\\packs\\";
+    const std::wstring root = PacksRoot();
+    if (root.empty()) { GLOGW("hook: [packstream] LOCALAPPDATA is not set; no packs"); return; }
     const std::wstring only = reg::Get(L"pack_name");
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW((root + L"*").c_str(), &fd);
@@ -820,6 +826,34 @@ StreamAddrs g_enhStream;
 // before the change set, so CVehicleModelInfo::Init (vehicles.meta) finds the "jesko" fragment and txd
 // slots by name, already bound to the files. Returns false (after Fail) only when files are present but
 // none registered; a pack without a stream/ folder is logged and left to its content.xml.
+// 0.4.27 (Enhanced): the first stream file of a loose pack whose header is a Legacy (RSC7) resource, or "" when none is.
+std::string FirstLegacyStreamFile(const Paths& paths) {
+    std::wstring folderW = paths.file;
+    const size_t slash = folderW.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) folderW.resize(slash + 1);
+    const std::wstring streamW = folderW + L"stream\\";
+    for (const wchar_t* ext : { L"ytd", L"yft", L"ydr", L"ydd" }) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((streamW + L"*." + ext).c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        const std::string extA = Narrow(ext);
+        std::string hit;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            HANDLE f = CreateFileW((streamW + fd.cFileName).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (f == INVALID_HANDLE_VALUE) continue;
+            uint8_t head[8] = {};
+            DWORD got = 0;
+            const BOOL ok = ReadFile(f, head, sizeof head, &got, nullptr);
+            CloseHandle(f);
+            if (ok && packenh::IsLegacyResource(head, got, extA.c_str())) hit = Narrow(fd.cFileName);
+        } while (hit.empty() && FindNextFileW(h, &fd));
+        FindClose(h);
+        if (!hit.empty()) return hit;
+    }
+    return std::string();
+}
+
 bool RegisterLooseStream(const Paths& paths) {
     std::wstring folderW = paths.file;
     const size_t slash = folderW.find_last_of(L"\\/");
@@ -1367,6 +1401,20 @@ bool EnhMountPack(Pack& p, size_t index, size_t total) {
     } else if (!Preflight(p.paths.file)) {
         return false;
     }
+    // 0.4.27: Legacy-format models crash Enhanced's resource loader the moment the car streams in (0.4.26, friend's log: INT3 at
+    // +0x127c32f on the first request of jesko), so such a pack is never mounted here. pack_enh_legacy=1 lifts the guard (crash test only).
+    if (reg::Get(L"pack_enh_legacy") != L"1") {
+        if (!p.folder) {
+            Fail("a dlc.rpf pack holds Legacy-format (RSC7) models that crash Enhanced's resource loader; it needs a Gen9-converted loose copy");
+            return false;
+        }
+        const std::string legacyFile = FirstLegacyStreamFile(p.paths);
+        if (!legacyFile.empty()) {
+            Fail("stream/%s is a Legacy-format (RSC7) resource that crashes Enhanced's resource loader; the pack needs its Gen9-converted copy",
+                 legacyFile.c_str());
+            return false;
+        }
+    }
     packenh::Mounter m(Prof(), EnhAbi(), mgr, g_enh.vtableVa);
     packenh::MountOut mo;
     if (!m.Add(p.name, p.paths.device, p.folder, mo)) {
@@ -1490,7 +1538,7 @@ Status EnhTick(World& world) {
         if (g_packs.empty()) {
             g_curPack = "*";
             Fail("no pack folders to mount");
-            GLOGW("[packenh] FAILED: no pack folders under %%LOCALAPPDATA%%\\GAGE-MP\\packs");
+            GLOGW("[packenh] FAILED: no pack folders under %%LOCALAPPDATA%%\\GAGE-MP\\packs-gen9 (the launcher syncs packs-gen9.json there at pack_enh>=2)");
             g_status = Status::Failed;
             return g_status;
         }
@@ -1535,14 +1583,8 @@ void PrepareVehicleStoreLocked() {
         g_vehStoreDone = true;
         return;
     }
-    if (v.empty() && &Prof() == &kPackEnhanced) {
-        // Enhanced (Round B): the live limit is already 640 (round A, 0.4.25) with 0 used; a raise is one more unproven write into a
-        // game structure for room the packs do not need. veh_store_extra=N raises it anyway; a pack that does not fit is refused.
-        GLOGI("[packenh] DLC vehicle store: MaxExtraVehicleModelInfos is not raised by default on Enhanced (set veh_store_extra=N to raise it); "
-              "a pack that does not fit is refused before its change set runs");
-        g_vehStoreDone = true;
-        return;
-    }
+    // Enhanced is raised like Legacy since 0.4.27: the 0 of 640 round A read was before the game's own DLC loaded; the friend's 0.4.26
+    // log had 637 of 640 used when the packs came, so only 3 of 15 fit.
     if (!ResolveVehStore()) {
         if (g_vehStoreSig < 0) g_vehStoreDone = true;   // final: logged by ResolveVehStore
         return;                                         // not found yet: the next call retries

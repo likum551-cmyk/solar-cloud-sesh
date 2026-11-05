@@ -66,7 +66,9 @@ namespace gage::packsync {
     bool VerifyManifest(const std::string& body, const std::string& pubKeyB64, Manifest& out, std::string* why);
 
     // ".../update/version.json" -> ".../update/packs.json" (the last path segment replaced; query dropped).
-    std::string ManifestUrlFor(const std::string& updateManifestUrl);
+    // name: "packs.json" (Legacy) or kGen9Manifest (Enhanced: the same cars, models converted to the gen9 resource format).
+    std::string ManifestUrlFor(const std::string& updateManifestUrl, const std::string& name = "packs.json");
+    inline constexpr const char* kGen9Manifest = "packs-gen9.json";
     // ".../update/packs.json" + sha -> ".../update/packs/<sha>".
     std::string BlobUrl(const std::string& packsManifestUrl, const std::string& sha256);
 
@@ -101,10 +103,11 @@ namespace gage::packsync {
     // Bring `root` (no trailing backslash; %LOCALAPPDATA%\GAGE-MP\packs for real) in line with the first packs.json
     // among ManifestUrlFor(each of updateUrls) that verifies. `progress` is called often (throttle at the caller).
     Result Sync(const std::wstring& root, const std::vector<std::string>& updateUrls, const std::string& pubKeyB64,
-                const Io& io, const std::function<void(const Progress&)>& progress);
+                const Io& io, const std::function<void(const Progress&)>& progress,
+                const std::string& manifestName = "packs.json");
 
-    // %LOCALAPPDATA%\GAGE-MP\packs, "" if LOCALAPPDATA is missing.
-    std::wstring DefaultRoot();
+    // %LOCALAPPDATA%\GAGE-MP\packs (gen9: ...\packs-gen9, where the Enhanced engine mounts from), "" if LOCALAPPDATA is missing.
+    std::wstring DefaultRoot(bool gen9 = false);
 
     // Which games the launcher syncs the car packs for (gage_gui.cpp DoLaunch step 1c). Pure, so the gate is tested.
     enum class SyncMode {

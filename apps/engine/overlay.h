@@ -74,11 +74,16 @@ namespace gage::game::Overlay {
     // The small status strip along the foot of the speedometer plate (vehicle only): the two turn arrows (blinking at about 1.5 Hz while on;
     // the blink is the overlay's), the headlights (off / low / high), the seatbelt (beltOn buckled; beltWarn = unbuckled and moving, the warning
     // colour) and the engine (engineOff, the warning colour). show false removes the strip and the plate returns to its old height.
+    // 0.4.27 the vehicle state row (libs/sync/vehicle_state_row.h): lock, belt and engine, each a pixel glyph and a toggle, next to the vitals (under the
+    // docked strip when the margin allows, else above the radar; above the bottom-right plates with the radar off), shown while `show`, and on foot
+    // for a few seconds after the server confirmed a lock (lockFlash: only the lock cell is live). A cell pulses gold when its state flips.
     struct VehicleHud {
         bool show = false;
         bool indLeft = false, indRight = false;
         int  lights = 0;                          // 0 off, 1 low beam, 2 high beam
         bool beltOn = false, beltWarn = false, engineOff = false;
+        int  lock = -1;                           // -1 not known (not a networked car), 0 unlocked, 1 locked
+        bool lockFlash = false;                   // on foot: show the row for the lock the server just confirmed
     };
     void SetVehicleHud(const VehicleHud& h);
 
@@ -258,6 +263,13 @@ namespace gage::game::Overlay {
         float stripLampX = 0, fuelBarX = 0;       // the headlamp's left edge and the fuel bar's first pixel above it (equal when an even gap allows)
         int   stripLights = 0;
         bool  stripBeltOn = false, stripBeltWarn = false, stripEngineOff = false;
+        // 0.4.27 the vehicle state row: its box, where it went (sync::RowWhere as an int), and what each cell showed (lock -1 / 0 / 1)
+        bool  rowVisible = false;
+        int   rowWhere = 0;
+        float rowX = 0, rowY = 0, rowW = 0, rowH = 0;
+        int   rowLock = -1;
+        bool  rowBelt = false, rowEngine = false, rowToggles = false;
+        float rowPulse[3] = {};
         // name tags (W10): how many were drawn last frame (alpha > 0.01), and the first one's box, for the capture proof
         int   nameTagsShown = 0;
         float nameTagX = 0, nameTagY = 0, nameTagW = 0, nameTagH = 0;
