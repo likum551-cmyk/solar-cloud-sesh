@@ -588,6 +588,13 @@ namespace gage::sync {
     // is issued as the next entry of a fixed plan, whatever was seen before, and every attempt is followed by the progress check
     // (SwingProbe, +100 / +250 / +450 ms). The log has one line per swing naming the attempt and its read-backs; the overlay names it
     // while it plays so GI can say which attempts he saw. Afterwards the ladder is pinned to the attempt whose swings PROGRESSED.
+    //
+    // 0.4.30: TASK_PLAY_ANIM's 8th argument is the clip's START PHASE (0..1; ox_lib / the R* header: startPhase), not a playback rate. 1.0
+    // started every clip at its END: a one-shot read "playing" for one frame and was gone the next (0.4.12-0.4.29 traces: 1 -> 0 at frame 2,
+    // "phase never read"), a looped one wrapped round and was the only variant that showed. anim_phase_fix=0 = 1.0 again.
+    constexpr float kAnimStartPhase = 0.0f;
+    constexpr float kAnimStartPhase0429 = 1.0f;
+    inline float AnimStartPhase(bool phaseFix) { return phaseFix ? kAnimStartPhase : kAnimStartPhase0429; }
     struct SwingAttempt
     {
         SwingVariant variant = SwingVariant::Upper;

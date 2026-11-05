@@ -826,16 +826,7 @@ void IconFood(ImDrawList* dl, float x, float y, float s, ImU32 col)
     dl->AddRectFilled(ImVec2(R(x + s * 0.08f), botY0), ImVec2(R(x + s * 0.92f), botY1), col, s * 0.09f,
                       ImDrawFlags_RoundCornersBottom);
 }
-void IconFuel(ImDrawList* dl, float x, float y, float s, ImU32 col)   // a gas pump: body + nozzle hooked over the top
-{
-    const float bx0 = x + s * 0.08f, by0 = y + s * 0.08f, bx1 = x + s * 0.50f, by1 = y + s * 0.96f;
-    dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), col, s * 0.06f);
-    const float th = std::fmax(1.6f, s * 0.11f);
-    // The nozzle: up the right side and hooked back over the pump's head, so it can't read as a "1".
-    dl->AddLine(ImVec2(bx1, by1 - s * 0.06f), ImVec2(bx1 + s * 0.26f, by1 - s * 0.06f), col, th);  // foot out
-    dl->AddLine(ImVec2(bx1 + s * 0.26f, by1 - s * 0.06f), ImVec2(bx1 + s * 0.26f, by0 + s * 0.16f), col, th);  // riser
-    dl->AddLine(ImVec2(bx1 + s * 0.26f, by0 + s * 0.16f), ImVec2(bx1 + s * 0.02f, by0 + s * 0.16f), col, th);  // hook over head
-}
+// (IconFuel, the petrol pump, is a pixel glyph since 0.4.30: below PixelGlyph)
 
 // ---- Pixel glyphs (0.4.22) ---------------------------------------------------------------------------------------------------------------------
 // The vitals strip and the speedometer's status strip draw hand-authored bitmaps, not primitives: IconHeart's anti-aliased circles blur to a blob in a
@@ -931,6 +922,22 @@ void PixelGlyph(ImDrawList* dl, float x, float y, float s, const PixelSet& g, Im
     }
     PixelDraw(dl, x0 + (float)((n - b->w * k) / 2), y0 + (float)((n - b->h * k) / 2), *b, k, col, false);
 }
+
+// 0.4.30 the fuel gauge's petrol pump (GI: the old primitive pump read as a battery / a bracket): a pump body with its display window cut out, a
+// wide base, and the hose looping out of the body's side up to the nozzle hung on top, in classes of 10, 14 and 20 rows (14 scaled from 28 up).
+constexpr const char* const kFuel10[10] = {".XXXX..X..", ".X..X..XX.", ".XXXX...X.", ".XXXX...X.", ".XXXXX..X.",
+                                           ".XXXX.X.X.", ".XXXX.XXX.", ".XXXX.....", "XXXXXX....", "XXXXXX...."};
+constexpr const char* const kFuel14[14] = {".XXXXXX..XX...", ".X....X..XXX..", ".X....X...XX..", ".X....X....X..", ".XXXXXX....X..", ".XXXXXX....X..",
+                                           ".XXXXXX....X..", ".XXXXXXXX..X..", ".XXXXXX.X..X..", ".XXXXXX.XXXX..", ".XXXXXX.......", ".XXXXXX.......",
+                                           "XXXXXXXX......", "XXXXXXXX......"};
+constexpr const char* const kFuel20[20] = {".XXXXXXXXX....XXX...", ".XXXXXXXXX....XXXX..", ".XX.....XX.....XXX..", ".XX.....XX......XX..", ".XX.....XX......XX..",
+                                           ".XX.....XX......XX..", ".XX.....XX......XX..", ".XXXXXXXXX......XX..", ".XXXXXXXXX......XX..", ".XXXXXXXXX......XX..",
+                                           ".XXXXXXXXXXX....XX..", ".XXXXXXXXXXX....XX..", ".XXXXXXXXX.XX...XX..", ".XXXXXXXXX.XXXXXXX..", ".XXXXXXXXX..XXXXX...",
+                                           ".XXXXXXXXX..........", ".XXXXXXXXX..........", ".XXXXXXXXX..........", "XXXXXXXXXXXX........", "XXXXXXXXXXXX........"};
+constexpr Bmp kFuelCls[3] = {{10, 10, kFuel10}, {14, 14, kFuel14}, {20, 20, kFuel20}};
+static_assert(ClassesOk(kFuelCls, 3), "fuel pump bitmaps: a row is not w wide / a class is not h rows / an unknown character");
+constexpr PixelSet kFuelSet = {kFuelCls, 3, 1, 14, 28};
+void IconFuel(ImDrawList* dl, float x, float y, float s, ImU32 col) { PixelGlyph(dl, x, y, s, kFuelSet, col); }
 
 // ---- the vitals strip's glyphs: square classes of 5, 7, 9 and 13 px, the 9 px class scaled by a whole factor from an 18 px box up. Both glyphs sit at
 // the same offset in a box, so they span the same rows (one baseline).

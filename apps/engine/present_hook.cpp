@@ -32,6 +32,8 @@ int                 g_retakes = 0;
 bool                g_inlineOn = false;
 bool                g_inlineTried = false;
 uint64_t            g_lastStallLog = 0;
+uint64_t            g_intactLoggedFor = 0;   // the lastTick whose "our slot went quiet" line was written
+uint64_t            g_lastRetakeMs = 0;      // when Poll last took the slot back (0 = never)
 void* volatile      g_sc = nullptr;          // IDXGISwapChain* of the latest Present
 DWORD               g_tls = TLS_OUT_OF_INDEXES;  // per-thread "inside PresentDetour" flag; never freed (one DWORD)
 HANDLE              g_thread = nullptr;
@@ -154,7 +156,7 @@ bool Install(void** slot, void* inlineTarget, const Callbacks& cb, const Options
     g_orig.store((PresentFn)cur);
     g_pristine.store((PresentFn)cur);
     g_ticks = 0; g_loops = 0; g_lastTick = 0; g_retakes = 0;
-    g_inlineOn = false; g_inlineTried = false; g_lastStallLog = 0;
+    g_inlineOn = false; g_inlineTried = false; g_lastStallLog = 0; g_intactLoggedFor = 0; g_lastRetakeMs = 0;
     g_windowStart = GetTickCount64();
 
     const EntryInfo entry = DescribeEntry(cur);
@@ -251,6 +253,19 @@ PollResult Poll(uint64_t nowMs) {
 
     void* cur = *(void* volatile*)g_slot;
     const bool ours = cur == (void*)&PresentDetour;
+    // Our slot carried frames, then they stopped: the game stopped presenting (a GPU hang, a load, minimised) far
+    // more often than its swap chain got re-wrapped. Wait intactStalledMs before patching code; one line per quiet period.
+    // Frames before a re-take do not count: they came through the slot before someone replaced it, not through the slot as it is now.
+    if (ours && last != 0 && last >= g_lastRetakeMs && !g_inlineOn && !g_inlineTried && nowMs < ref + g_opt.intactStalledMs) {
+        if (g_intactLoggedFor != last) {
+            g_intactLoggedFor = last;
+            GLOGW("presenthook: no Present for %llu ms after %llu frames through OUR slot: the game stopped presenting "
+                  "(a GPU hang, a load, minimised); the inline fallback waits until %llu ms of quiet",
+                  (unsigned long long)(nowMs - ref), (unsigned long long)g_ticks.load(),
+                  (unsigned long long)g_opt.intactStalledMs);
+        }
+        return PollResult::Stalled;
+    }
     const EntryInfo curInfo = DescribeEntry(cur);
     GLOGW("presenthook: no Present reached us for %llu ms (%llu ticks so far); slot holds %s %s",
           (unsigned long long)(nowMs - ref), (unsigned long long)g_ticks.load(),
@@ -262,6 +277,8 @@ PollResult Poll(uint64_t nowMs) {
         void* prev = nullptr;
         if (writeSlot(g_slot, (void*)&PresentDetour, &prev)) {
             g_windowStart = nowMs;
+            g_lastRetakeMs = nowMs;
+            g_intactLoggedFor = 0;
             GLOGW("presenthook: took the Present slot back (%d of %d), chaining to %s; overlays: %s", g_retakes,
                   g_opt.maxRetakes, curInfo.text.c_str(), LoadedOverlayModules().c_str());
             return PollResult::Retaken;

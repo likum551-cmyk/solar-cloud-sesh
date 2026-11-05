@@ -18,7 +18,7 @@ namespace r5swing {
 
 using namespace gage::sync;
 
-constexpr int kChecks = 11;   // asserted by gameplay_test's total
+constexpr int kChecks = 12;   // asserted by gameplay_test's total
 
 struct Model
 {
@@ -404,6 +404,12 @@ inline void RunPure()
         Check("R5 log: the per-swing line says 'flags 49, duration the clip's whole length (looped, ended by us at +480 ms)' (and nothing about a loop for a timed swing); the 10 s line has the LOOP (R5) "
               "segment: looped 3/3/3, STOP_ANIM_TASK called 3, GONE 3, STILL PLAYING 0",
               lineOk && diagOk, std::string("line ") + (lineOk ? "ok" : "WRONG: " + a.substr(0, 260)) + ", diag " + (diagOk ? "ok" : "WRONG"));
+    }
+    {
+        // 0.4.30: TASK_PLAY_ANIM's 8th argument is the START PHASE: every swing / emote starts at 0 (anim_phase_fix=0: 1.0, 0.4.29)
+        Check("0.4.30 anim: TASK_PLAY_ANIM starts a clip at phase 0 (not 1.0, its end); anim_phase_fix=0 restores 1.0",
+              AnimStartPhase(true) == 0.0f && AnimStartPhase(false) == 1.0f && kAnimStartPhase == 0.0f,
+              std::to_string(AnimStartPhase(true)) + " / " + std::to_string(AnimStartPhase(false)));
     }
 }
 

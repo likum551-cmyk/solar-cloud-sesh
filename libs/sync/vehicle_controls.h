@@ -30,6 +30,7 @@
 #pragma once
 
 #include "protocol/protocol.h"
+#include "sync/vehicle_body.h"
 
 #include <cmath>
 #include <cstdint>
@@ -532,10 +533,10 @@ namespace gage::sync {
         return indicatorSync ? (uint8_t)(serverFlags2 & kVcIndBoth) : (uint8_t)0;
     }
 
-    // 0 off, 1 low beam, 2 high beam (GET_VEHICLE_LIGHTS_STATE: a high beam with the lights off is not a state of its own).
-    inline int HudLights(bool readOk, bool on, bool high)
+    // 0 off, 1 low beam, 2 high beam. Lit = LightsLit (a high beam reads lightsOn 0 / highbeamsOn 1); highIsLit false = 0.4.29.
+    inline int HudLights(bool readOk, bool on, bool high, bool highIsLit = true)
     {
-        if (!readOk || !on)
+        if (!readOk || !LightsLit(on, high, highIsLit))
             return 0;
         return high ? 2 : 1;
     }

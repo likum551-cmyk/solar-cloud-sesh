@@ -20,7 +20,7 @@
 #include <chrono>
 #include <functional>
 
-constexpr int kVehSignalsChecks = 13;   // the number of Check() calls RunVehSignalsTests makes (a skipped section fails main's count)
+constexpr int kVehSignalsChecks = 18;   // the number of Check() calls RunVehSignalsTests makes (a skipped section fails main's count)
 
 // ---------------------------------------------------------------------------------------------------------------------------
 // fakes
@@ -62,12 +62,13 @@ struct FakeLights
 {
     bool on = false, high = false;
     bool readable = true, callable = true, inert = false;
+    bool highReportsOff = false;   // 0.4.30 the live game's read: a lit high beam reads lightsOn 0 / highbeamsOn 1
     int reads = 0, setLights = 0, setHigh = 0;
     bool ReadLights(bool& o, bool& h)
     {
         ++reads;
         if (!readable) return false;
-        o = on;
+        o = on && !(highReportsOff && high);
         h = high;
         return true;
     }
@@ -249,6 +250,47 @@ static void VS_Horn()
                   s.riseSilent == 0 && s.heldSilent == 0,
               F("attempts %d, suspends %u, probe fails %u", attempts, s.suspends, s.probeFails));
     }
+    {
+        // 0.4.30: a police car with the siren on, E held: IS_HORN_ACTIVE reads false (the siren's second tone), the held key is the signal.
+        using sync::HornBitToSend;
+        const bool tone = HornBitToSend(false, true, true, true, 1.0f, true);
+        const bool guards = !HornBitToSend(false, false, true, true, 1.0f, true) &&   // siren off: the read-back rules
+                            !HornBitToSend(false, true, true, true, 0.0f, true) &&    // E not held
+                            !HornBitToSend(false, true, false, true, 1.0f, true) &&   // a passenger
+                            !HornBitToSend(false, true, true, false, 1.0f, true) &&   // the axis could not be read
+                            !HornBitToSend(false, true, true, true, 1.0f, false) &&   // veh_siren_horn=0 (0.4.29)
+                            HornBitToSend(true, false, false, false, 0.0f, false);    // a sounding horn is always sent
+        // the bit through a copy's HornSync: E held 2 s => the copy's horn starts and is renewed while held; the 0.4.29 rule sends nothing
+        auto copyCalls = [](bool sirenHornOn) {
+            sync::HornSync hs;
+            FakeHorn car;
+            for (int f = 0; f * kFrameMs <= 3000.0; ++f)
+            {
+                const double t = f * kFrameMs;
+                car.now = t;
+                car.frame = f;
+                const bool held = t >= 100.0 && t < 2100.0;
+                sync::StepHorn(hs, car, HornBitToSend(false, true, true, true, held ? 1.0f : 0.0f, sirenHornOn), t, t);
+            }
+            return car.longCalls;
+        };
+        const int calls = copyCalls(true), oldCalls = copyCalls(false);
+        {
+            // a 100 ms tap (GTA's siren-mode switch) is never sent; a hold is, from 150 ms; a sounding horn is never delayed
+            sync::SirenHornHold tap, hold, horn;
+            bool tapSent = false, holdAt149 = true, holdAt150 = false;
+            for (double t = 0.0; t <= 100.0; t += kFrameMs) tapSent |= tap.Step(false, true, t);
+            tapSent |= tap.Step(false, false, 116.0);
+            for (double t = 0.0; t < 149.0; t += 1.0) holdAt149 = hold.Step(false, true, t);
+            holdAt150 = hold.Step(false, true, 150.0);
+            const bool hornNow = horn.Step(true, false, 0.0);
+            Check("horn (0.4.30): the siren-on key bit counts only after a 150 ms hold (a tap of E is the siren-mode switch), a sounding horn at once",
+                  !tapSent && !holdAt149 && holdAt150 && hornNow, F("tap sent %d, held 148 ms %d, held 150 ms %d, horn %d", (int)tapSent, (int)holdAt149, (int)holdAt150, (int)hornNow));
+        }
+        Check("horn (0.4.30): siren on + E held + IS_HORN_ACTIVE false sends the horn bit (the siren tone), never with the siren off, E up, a "
+              "passenger, an unreadable axis or veh_siren_horn=0; a copy fed that bit for 2 s starts its horn and renews it, the 0.4.29 rule sends none",
+              tone && guards && calls >= 2 && oldCalls == 0, F("tone %d guards %d, copy calls %d (0.4.29 rule %d)", (int)tone, (int)guards, calls, oldCalls));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -334,6 +376,41 @@ static void VS_Lights()
                   blindCar.setLights == 0 && blindCar.setHigh == 0 && blind.Stats().readFails >= 8 && blind.Stats().reads == 0,
               F("reissued %u, stuck %u, set calls %d; blind read fails %u", s.reissued, s.stuck, car.setLights, blind.Stats().readFails));
     }
+    {
+        // 0.4.30: under the live read (highReportsOff) a copy forced on with the high beam is kept, never fought; the 0.4.29 rule (highIsLit false) fights it.
+        sync::LightsKeeper lk;
+        FakeLights car;
+        car.highReportsOff = true;
+        car.on = car.high = true;
+        LightsFrames(lk, car, onHigh, true, 0.0, 10000.0);
+        sync::LightsConfig oldCfg;
+        oldCfg.highIsLit = false;
+        sync::LightsKeeper oldKeeper(oldCfg);
+        FakeLights oldCar;
+        oldCar.highReportsOff = true;
+        oldCar.on = oldCar.high = true;
+        LightsFrames(oldKeeper, oldCar, onHigh, true, 0.0, 10000.0);
+        const sync::LightsStats& s = lk.Stats();
+        Check("lights (0.4.30): a copy whose game reads its lit high beam as lightsOn 0 / highbeamsOn 1 is only read (no mismatch, no re-issue in 10 s); "
+              "the 0.4.29 rule (veh_lights_beam_lit=0) re-issues it and ends stuck",
+              s.reads >= 16 && s.mismatch == 0 && s.reissued == 0 && car.setLights == 0 && car.setHigh == 0 && oldKeeper.Stats().reissued >= 3 &&
+                  oldKeeper.Stats().stuck >= 1,
+              F("new: reads %u mismatch %u reissued %u; old: reissued %u stuck %u", s.reads, s.mismatch, s.reissued, oldKeeper.Stats().reissued,
+                oldKeeper.Stats().stuck));
+    }
+    {
+        // 0.4.30 review M4: a copy that should be dark but still carries the full-beam flag reads "lit" under LightsLit; the keeper must clear
+        // the flag too (SET_VEHICLE_LIGHTS(1) alone never changes the read, it would end stuck and loop every back-off)
+        sync::LightsKeeper lk;
+        FakeLights car;
+        car.on = false;
+        car.high = true;
+        LightsFrames(lk, car, off, true, 0.0, 5000.0);
+        const sync::LightsStats& s = lk.Stats();
+        Check("lights (0.4.30): a copy wanted dark with its full-beam flag left set is put dark (the flag cleared in the first re-issue), never stuck",
+              !car.on && !car.high && s.stuck == 0 && s.reissued == 1 && s.restored == 1 && car.setHigh == 1,
+              F("on %d high %d, reissued %u restored %u stuck %u, fullbeam calls %d", (int)car.on, (int)car.high, s.reissued, s.restored, s.stuck, car.setHigh));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -390,7 +467,13 @@ static void VS_RealServer()
 {
     std::printf("-- 0.4.18 D. the real server (controller A, observer B)\n");
     Rig rig;
-    if (!rig.Start()) { Check("signals real server: starts", false); Check("signals real server: lights", false); return; }
+    if (!rig.Start())
+    {
+        Check("signals real server: starts", false);
+        Check("signals real server: lights", false);
+        Check("signals real server (0.4.30): high beam read as 0 / 1", false);
+        return;
+    }
     Probe alice(rig), bob(rig);
     const bool joined = alice.Join("Alice") && bob.Join("Bob");
     const bool placed = joined && PlaceAt(rig, alice, Kin(100, 100, 30)) && PlaceAt(rig, bob, Kin(104, 100, 30));
@@ -402,6 +485,7 @@ static void VS_RealServer()
     {
         Check("signals real server: A drives a car B sees", false);
         Check("signals real server: lights", false);
+        Check("signals real server (0.4.30): high beam read as 0 / 1", false);
         return;
     }
 
@@ -535,6 +619,30 @@ static void VS_RealServer()
               bSeesOff >= 0.0 && bSeesOff - lightsOff < 300.0 && !bLights.on && !bLights.high,
           F("on after %.0f ms, restored after %.0f ms (reissued %u, restored %u), off after %.0f ms, B car on %d high %d", bSeesOn - lightsOn,
             restored - dropped, ls.reissued, ls.restored, bSeesOff - lightsOff, (int)bLights.on, (int)bLights.high));
+
+    // ---- 0.4.30: A's game reads its high beam as lightsOn 0 / highbeamsOn 1; A's flags2 comes from ReadVehicleBody's rule ----
+    FakeLights aCar;
+    aCar.highReportsOff = true;
+    aCar.on = aCar.high = true;
+    bool rOn = true, rHigh = false;
+    aCar.ReadLights(rOn, rHigh);
+    lights2 = sync::Flags2FromState(sync::LightsLit(rOn, rHigh), rHigh, false, false, false, false);
+    bLights.highReportsOff = true;                                  // B's game reads its copy the same way
+    const sync::LightsStats before = bKeep.Stats();
+    const double beamOn = ms();
+    double bLit = -1.0;
+    run(2500.0, [&](double now) {
+        if (bLights.on && bLights.high && bLit < 0.0) bLit = now;
+        return false;
+    });
+    const sync::LightsStats& after = bKeep.Stats();
+    Check("signals real server (0.4.30): A's high beam, read by A's game as lightsOn 0 / highbeamsOn 1, reaches B as headlights + high beam within 300 ms "
+          "and B's copy (read the same way) stays lit, never fought (no mismatch, no re-issue in 2.5 s)",
+          !rOn && rHigh && (lights2 & proto::kVeh2Headlights) && bLit >= 0.0 && bLit - beamOn < 300.0 && bLights.on && bLights.high &&
+              after.mismatch == before.mismatch && after.reissued == before.reissued && after.reads > before.reads,
+          F("read %d/%d, flags2 %02x, lit after %.0f ms, B on %d high %d, mismatch +%u reissued +%u", (int)rOn, (int)rHigh, lights2, bLit - beamOn,
+            (int)bLights.on, (int)bLights.high, after.mismatch - before.mismatch, after.reissued - before.reissued));
+    lights2 = 0;
 }
 
 static void RunVehSignalsTests()

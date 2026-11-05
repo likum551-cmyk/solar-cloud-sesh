@@ -163,6 +163,7 @@ void VehicleInterpolator::ReplaceFrom(const VehicleSnapshot& in, double guardMs,
     VehicleSnapshot s = in;
     s.rot = vq::Normalize(in.rot);
     if (!s.hasAngVel) s.angVel = DriveVec{};
+    s.src = kSnapSrcCopy;                     // 0.4.30: our own pose, never paired with the owner's for a derived omega
     while (count_ > 0 && !(At(count_ - 1).tMs < s.tMs))
         --count_;
     ring_[(head_ + count_) % kVehicleRing] = s;
@@ -208,6 +209,24 @@ DriveVec VehicleInterpolator::OmegaOf(int i) const
         const VehicleSnapshot &sa = At(a), &sb = At(b);
         const double dt = (sb.tMs - sa.tMs) / 1000.0;
         if (!(dt > 0.0) || sb.tMs - sa.tMs > cfg_.maxBridgeMs) return false;
+        if (cfg_.omegaGuard)
+        {
+            // two machines' poses (the copy's adopted bounce, then a standing owner): the gap between them is not a rate, and a parked car has
+            // none. Only when the later one stands: a MOVING owner after an adoption keeps the derived rate (the 2-machine sims lose 0.5 m on a
+            // T-bone without it, R3 T5 / R4 T2).
+            if (sa.src != sb.src && Len(ToD(sb.vel)) < cfg_.omegaStillMs)
+            {
+                ++stats_.omegaCross;
+                w = DriveVec{};
+                return true;
+            }
+            if (Len(ToD(sa.vel)) < cfg_.omegaStillMs && Len(ToD(sb.vel)) < cfg_.omegaStillMs)
+            {
+                ++stats_.omegaStill;                               // a standing pair: quantisation / settling only
+                w = DriveVec{};
+                return true;
+            }
+        }
         w = ToF(SafeV(Scale(LogD(MulD(ToDQ(sb.rot), ConjD(ToDQ(sa.rot)))), 1.0 / dt)));
         return true;
     };
@@ -651,14 +670,26 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
     }
 
     // ---- velocity: target v + discrete-exact gain * error, capped; no correction in the deadband ----
+    // 0.4.30 ride freedom: the vertical error the copy's own suspension may keep (rideTolM) is not corrected, only its excess. The bands
+    // are for a body resting on its wheels: they fade to nothing (continuously, no step in the command) as the owner's or the copy's
+    // vertical speed goes from rideVzFullMs to rideVzZeroMs (a jump, a fall), and the tilt band also as the target leans past upright.
+    const double vzMax = std::fmax(std::fabs(tv.z), std::fabs((double)in.localVel.z));
+    const double rideW = vzMax <= kRideVzFullMs ? 1.0 : (vzMax >= kRideVzZeroMs ? 0.0 : (kRideVzZeroMs - vzMax) / (kRideVzZeroMs - kRideVzFullMs));
+    D3 eC = e;
+    if (cfg_.rideTolM > 0.0f && rideW > 0.0)
+    {
+        const double tol = cfg_.rideTolM * rideW;
+        eC.z = e.z > 0.0 ? std::fmax(0.0, e.z - tol) : std::fmin(0.0, e.z + tol);
+    }
+    const double distC = Len(eC);
     o.setVelocity = true;
     o.velocity = tg.vel;
-    if (dist > cfg_.deadbandM)
+    if (distC > cfg_.deadbandM)
     {
-        double g = cfg_.corrGainBase + cfg_.corrGainPerM * dist;
+        double g = cfg_.corrGainBase + cfg_.corrGainPerM * distC;
         if (speed < cfg_.stillSpeedMs) g *= cfg_.stillGainMul;
         const double gEff = dtS > 0.0 ? (1.0 - std::exp(-g * dtS)) / dtS : g;
-        D3 c = Scale(e, gEff);
+        D3 c = Scale(eC, gEff);
         const double cl = Len(c), cap = cfg_.corrMaxBaseMs + cfg_.corrMaxPerSpeed * speed;
         if (cl > cap && cl > 0.0) c = Scale(c, cap / cl);
         o.velocity = ToF(SafeV(Add(tv, c)));
@@ -675,6 +706,25 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
     // ---- rotation: angular velocity steering, quaternion blend for big errors / a flipped car ----
     const bool flipped = RotateD(tq, {0, 0, 1}).z < 0.0;
     D3 w = tw;
+    // 0.4.30 ride freedom: the pitch / roll error the suspension may keep (tiltTolDeg) is not corrected, only its excess; yaw as before. Yaw
+    // is the part of the rotation error along the TARGET's up axis (on a slope or a bank the world vertical is not the body's yaw axis), the
+    // tilt is the rest. The band fades out with rideW (airborne) and as the target leans from 30 to 37 deg off upright (a car on its side:
+    // its heading would sit in the "tilt"). The large-error blend below still uses the full error.
+    D3 rC = rErr;
+    if (cfg_.tiltTolDeg > 0.0f && rideW > 0.0)
+    {
+        const D3 u = RotateD(tq, {0, 0, 1});
+        const double upW = u.z >= 0.866 ? 1.0 : (u.z <= 0.8 ? 0.0 : (u.z - 0.8) / 0.066);
+        const double tol = cfg_.tiltTolDeg * kPi / 180.0 * rideW * upW;
+        if (tol > 0.0)
+        {
+            const D3 yawPart = Scale(u, DotV(rErr, u));
+            const D3 tiltPart = Sub(rErr, yawPart);
+            const double tilt = Len(tiltPart);
+            const double s = tilt > tol ? (tilt - tol) / tilt : 0.0;
+            rC = Add(yawPart, Scale(tiltPart, s));
+        }
+    }
     if (graceOn_ && graceW < 0.5)
     {
         // the crash plays out: rotation is physics' own until the weight passes a half
@@ -687,7 +737,7 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
         // no quaternion blend inside a grace; angular velocity steering only (below)
         const double k = cfg_.rotGain;
         const double kEff = dtS > 0.0 ? (1.0 - std::exp(-k * dtS)) / dtS : k;
-        D3 c = Scale(rErr, kEff * graceW);
+        D3 c = Scale(rC, kEff * graceW);
         const double cl = Len(c);
         if (cl > cfg_.rotCorrMaxRadS && cl > 0.0) c = Scale(c, cfg_.rotCorrMaxRadS / cl);
         w = SafeV(Add(tw, c));
@@ -706,7 +756,7 @@ VehicleDriveOutput VehicleDriveController::Update(const VehicleDriveInput& in)
     {
         const double k = cfg_.rotGain;
         const double kEff = dtS > 0.0 ? (1.0 - std::exp(-k * dtS)) / dtS : k;
-        D3 c = Scale(rErr, kEff);
+        D3 c = Scale(rC, kEff);
         const double cl = Len(c);
         if (cl > cfg_.rotCorrMaxRadS && cl > 0.0) c = Scale(c, cfg_.rotCorrMaxRadS / cl);
         w = SafeV(Add(tw, c));

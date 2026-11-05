@@ -135,6 +135,7 @@ namespace gage::sync {
         bool velChanged = false, angChanged = false, yawClamped = false;
         float speed = 0;                // |vel| of the input, m/s
         float downMs2 = 0, gripMs2 = 0, brakeMs2 = 0;   // the accelerations applied this frame, for the statistics
+        float yawCut = 0;               // rad/s of yaw rate the cap removed this frame (0.4.30 statistics)
     };
 
     namespace hyperdetail {
@@ -231,6 +232,7 @@ namespace gage::sync {
                     const double excess = wUp - (wUp > 0.0 ? lim : -lim);
                     for (int i = 0; i < 3; ++i) w[i] -= excess * up[i];
                     o.yawClamped = true;
+                    o.yawCut = (float)std::fabs(excess);
                 }
             }
         }
@@ -285,7 +287,11 @@ namespace gage::sync {
         a.gripRate = 6.9f;
         a.gripCapMs2 = 30.0f;
         a.brakeMs2 = 14.0f;
-        a.yawLatMs2 = 30.0f;
+        // 0.4.30 (GI live on 0.4.29: "legit no turning leverage"): the cap was cutting ordinary corners (1.0 rad/s at 108 km/h; the log's
+        // "yaw cap" fired in every cornering stretch). It is a SPIN guard now: 50 m/s^2 from 45 m/s (1.11 rad/s at 162 km/h, 0.30 at 600),
+        // still well under a full-lock spin's 2-3 rad/s. hyper_yaw=0 restores 30 m/s^2 from 20 m/s.
+        a.yawLatMs2 = 50.0f;
+        a.yawFromMs = 45.0f;
         a.tiltRate = 4.6f;
         return a;
     }
@@ -309,9 +315,20 @@ namespace gage::sync {
         a.gripRate = 3.45f;
         a.gripCapMs2 = 13.8f;
         a.brakeMs2 = 6.0f;
-        a.yawLatMs2 = 18.4f;
+        // 0.4.30: a spin guard, not a cornering limit (see MakeHyperAssist): 32 m/s^2 from 35 m/s (0.91 rad/s at 126 km/h, 0.44 at 260 km/h;
+        // 18.4 from 20 m/s took a Taycan down to 0.61 rad/s at 108 km/h). hyper_yaw=0 restores 18.4 from 20 m/s.
+        a.yawLatMs2 = 32.0f;
+        a.yawFromMs = 35.0f;
         a.tiltRate = 2.3f;
         return a;
+    }
+    // hyper_yaw=0: the 0.4.29 yaw cap (a profile is a hyper one when it carries downforce).
+    inline void RestoreYawCap0429(HyperAssist& a)
+    {
+        if (a.yawLatMs2 <= 0.0f)
+            return;
+        a.yawFromMs = 20.0f;
+        a.yawLatMs2 = a.downAtRefMs2 > 0.0f ? 30.0f : 18.4f;
     }
 
     // GI 2026-11-05: the tune is the Jesko's (unchanged since); the Dubsta still carries the same one as the old stand-in.

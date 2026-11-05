@@ -238,6 +238,12 @@ namespace {
                   : world.packEnh == 2 ? "Round B: Round A first, then every pack under %LOCALAPPDATA%\\GAGE-MP\\packs-gen9 (the gen9-converted set) is mounted, Enhanced only"
                                        : "reserved for the next mount round, not built yet");
         }
+        // 0.4.30 veh_steer_field: 0 = no scan for the CVehicle steering field, copies keep SET_VEHICLE_STEER_BIAS (0.4.29); 1 = on for
+        // every build; unset = auto (Enhanced on: its patterns are proven on the dump; Legacy off until a live run proves them there).
+        {
+            const std::wstring v = reg::Get(L"veh_steer_field");
+            world.vehFields = v == L"0" ? 0 : v == L"1" ? 1 : -1;
+        }
         // Before game::Init (which arms skip_landing): the DLC vehicle array is sized when the Story session starts.
         // Undecided (gameconfig not parsed or the code still packed): retry off-thread every 100 ms for up to 2 min;
         // pack_stream's Tick ends the retry once the player is in the world.

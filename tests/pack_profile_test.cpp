@@ -535,6 +535,21 @@ static void TestRoundA(std::vector<uint8_t>& img) {
 }
 
 #include "pack_enh_mount_tests.h"
+#include "../apps/engine/veh_fields.h"
+
+// 0.4.30 veh_steer_field: the Enhanced profile resolves on the dump to the offsets checked by hand (steering 0x9DC, handle->pointer RVA
+// 0x1494b0); the Legacy profile finds nothing there (no false positive across editions). 4 checks, image section.
+static void TestVehFields(const std::vector<uint8_t>& img) {
+    namespace vf = gage::game::vehfields;
+    const vf::Result e = vf::Resolve({ img.data(), img.size() }, vf::kEnhanced);
+    CHECK(e.ok, "Enhanced steering field did not resolve: %s", e.why);
+    CHECK(e.steerOff == 0x9DC, "steering offset 0x%x, expected 0x9DC", (unsigned)e.steerOff);
+    CHECK(e.htp && (uint64_t)(e.htp - img.data()) == 0x1494b0ull, "handle->pointer at RVA 0x%llx, expected 0x1494b0",
+          (unsigned long long)(e.htp ? e.htp - img.data() : 0));
+    const vf::Result l = vf::Resolve({ img.data(), img.size() }, vf::kLegacy);
+    CHECK(!l.ok, "the Legacy profile resolved on the Enhanced dump (%s)", l.why);
+    std::printf("veh fields: %s | legacy on this dump: %s\n", e.why, l.why);
+}
 
 int main(int argc, char** argv) {
     std::printf("pack_profile_test\n");
@@ -555,6 +570,7 @@ int main(int argc, char** argv) {
         TestRoundA(img);
         TestMountPatterns(img);   // round B (pack_enh=2): the mount patterns, the Extras resolver
         TestMounter(img);         // round B: the Mounter against a fake game
+        TestVehFields(img);       // 0.4.30 veh_steer_field: the steering field and handle->pointer on Enhanced
         imageChecks = g_pass + g_fail - before;
     } else {
         ++g_skip;
@@ -568,7 +584,7 @@ int main(int argc, char** argv) {
     }
 
     // the count itself is asserted: a section that silently stopped running cannot pass
-    const int kExpectLegacy = 105, kExpectProfile = 33, kExpectImage = 204;   // profile: 28 + 5 Legacy-asset guard (0.4.27)
+    const int kExpectLegacy = 105, kExpectProfile = 33, kExpectImage = 208;   // profile: 28 + 5 Legacy-asset guard (0.4.27)
     std::printf("legacy-profile checks run: %d (expected %d)\n", legacyChecks, kExpectLegacy);
     if (legacyChecks != kExpectLegacy) { ++g_fail; std::printf("FAIL  legacy check count changed (%d != %d): update the test deliberately\n", legacyChecks, kExpectLegacy); }
     std::printf("round-B profile checks run: %d (expected %d)\n", profileChecks, kExpectProfile);

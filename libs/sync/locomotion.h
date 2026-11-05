@@ -908,6 +908,9 @@ namespace gage::sync {
         float pedHeading = 0, poseHeadingDeg = 0;
         bool haveHeading = false;
     };
+    // 0.4.30: which frames feed the heading statistics: not while the sender ragdolls, jumps, swims or aims (the controller writes no heading
+    // then, or the aim task owns it). The 0.4.29 log's "heading error 128 deg" window was a ragdoll (297 of 297 frames), not a moonwalk.
+    inline bool HeadingTelemetryFrame(bool ragdoll, bool jumping, bool swimming, bool aiming) { return !ragdoll && !jumping && !swimming && !aiming; }
 
     // R5 telemetry: an angle in 0..180 degrees, 1-degree bins (the last bin is "180"), mean and 95th percentile. Pure, no allocation.
     class AngleStat
@@ -975,6 +978,10 @@ namespace gage::sync {
         double headErrMeanDeg = 0, headErrP95Deg = 0;
         double poseVelHeadMeanDeg = 0, poseVelHeadP95Deg = 0;
         double pedVelHeadMeanDeg = 0, pedVelHeadP95Deg = 0;
+        // 0.4.30: the SENDER's own off-axis angle (its pose velocity against its own heading; 0 = forward, 90 = strafing, 180 = backpedalling) and
+        // the frames over 60 deg: whether unaimed strafing / backpedalling happens at all (the moonwalk case of the go-straight task).
+        uint32_t senderOffFrames = 0, senderOffOver60 = 0;
+        double senderOffMeanDeg = 0, senderOffP95Deg = 0;
     };
 
     class LocoDiag
@@ -1005,6 +1012,8 @@ namespace gage::sync {
         LocoVec prevPush_;
         // R5
         AngleStat headErr_, poseVelHead_, pedVelHead_;
+        AngleStat senderOff_;           // 0.4.30
+        uint32_t senderOff60_ = 0;
         bool prevSnapped_ = false;
     };
 

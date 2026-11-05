@@ -177,7 +177,9 @@ namespace gage::sync {
         DriveVec angVel;         // world rad/s, used when hasAngVel
         bool hasAngVel = false;  // false: derived from successive quaternions
         float steering = 0;
+        uint16_t src = 0;        // 0.4.30: who produced it (the controller's player id; kSnapSrcCopy for ReplaceFrom); omega is derived within one src only
     };
+    constexpr uint16_t kSnapSrcCopy = 0xFFFE;   // the copy's own adopted response (never a player id; kNoPlayer is 0xFFFF)
 
     enum class VehMode : uint8_t { Buffering, Interpolating, Extrapolating, Holding };
 
@@ -216,9 +218,19 @@ namespace gage::sync {
         double accelMaxSpanMs = 400.0;    // ... and no further (a stale pair says nothing about now)
         float accelMaxMs2 = 10.0f;        // clamp of the estimate (a car brakes at ~1 g)
         float accelRejectMs2 = 14.0f;     // above this the speed change is a hit, not a pedal: no acceleration extrapolation
+        // 0.4.30 veh_omega_guard (false = 0.4.29): a derived angular velocity is 0 for a standing pair (both slower than omegaStillMs:
+        // quantisation / settling) and for a pair across two sources whose later snapshot stands (the copy's adopted bounce, or another
+        // controller, then a parked owner: the gap between two machines' poses, not a rate; a MOVING owner keeps the derived rate). A held parked copy is drawn at its newest pose rotated by w * (500 ms + lead); a poisoned w drew
+        // parked copies 45-54 deg off and the quaternion blends made them jump (0.4.29 live log).
+        bool omegaGuard = true;
+        float omegaStillMs = 0.2f;
     };
 
-    struct VehicleInterpStats { uint32_t accepted = 0, teleports = 0, stale = 0, invalid = 0, bridgeResets = 0, repeats = 0, injected = 0, guarded = 0; };
+    struct VehicleInterpStats
+    {
+        uint32_t accepted = 0, teleports = 0, stale = 0, invalid = 0, bridgeResets = 0, repeats = 0, injected = 0, guarded = 0;
+        uint32_t omegaStill = 0, omegaCross = 0;   // 0.4.30: omega derivations (per call) answered 0 for a standing pair / refused across sources
+    };
 
     // The snapshot time of a vehicle in a server frame (sync plan W6): the frame's own time (tick * tickMs)
     // minus VehicleState.ageMs (how long before the frame the controller's sample reached the server), so a
@@ -249,6 +261,7 @@ namespace gage::sync {
         // i.e. that much further past its newest snapshot: the cap then has to grow by the lead or a network hole of (cap - lead) ms freezes it. Clamped to
         // [100, 2000]; a non-finite value is ignored. Not part of the buffer: Clear() keeps it.
         void SetAccelExtrapolation(bool on) { cfg_.accelExtrapolation = on; }
+        void SetOmegaGuard(bool on) { cfg_.omegaGuard = on; }
         // R4 T2: the tangential acceleration (m/s^2, + = speeding up) the next Sample past the newest snapshot extrapolates with; 0 when off, with one snapshot or without a pair 40..accelMaxSpanMs apart.
         double TangentialAccel() const;
         void SetExtrapolateMaxMs(double ms) { if (std::isfinite(ms)) cfg_.extrapolateMaxMs = ms < 100.0 ? 100.0 : (ms > 2000.0 ? 2000.0 : ms); }
@@ -286,7 +299,7 @@ namespace gage::sync {
         uint32_t session_ = 0;
         double gaps_[kGapRing] = {};
         int gapHead_ = 0, gapCount_ = 0;
-        VehicleInterpStats stats_;
+        mutable VehicleInterpStats stats_;   // mutable: OmegaOf (const) counts its omega-guard answers
     };
 
     // ---- per-frame controller ----
@@ -333,7 +346,24 @@ namespace gage::sync {
         float contactCooldownMs = 800.0f;   // after a grace, no new contact is looked for for this long
         float contactMaxFrameMs = 150.0f;   // a frame gap longer than this: the deceleration test is skipped (a hitch)
         float contactHardSnapMul = 4.0f;    // inside a grace a snap needs this many times the usual distance
+
+        // 0.4.30 ride freedom (engine switch veh_ride_free). A copy rests on ITS OWN suspension: the owner's ride height and pitch / roll at rest
+        // differ from the copy's whenever the model differs between the machines (a car pack converted for Enhanced, a Legacy owner), by a
+        // few cm and a few degrees. The full 3D correction above pushed the body toward the owner's height and tilt every frame, against the
+        // suspension (a friend's Enhanced log, 2026-11-05: GI's rs6 copy standing still, the ground-contact flag rising 22 times in 2 s at
+        // 0.5-1.8 m/s, rotation jitter 176 mdeg rms / 2.2 deg max and growing). Within these tolerances the vertical correction and the
+        // pitch / roll part of the rotation correction are left out; beyond them only the EXCESS is corrected (continuous at the edge). Yaw,
+        // the horizontal correction, the feed-forward, snaps and graces are untouched. 0 = off (the full correction, as before).
+        float rideTolM = 0.0f;              // vertical position error left to the suspension, m
+        float tiltTolDeg = 0.0f;            // pitch / roll error (the world-horizontal part of the rotation error) left to the suspension, deg
     };
+    constexpr float kRideTolM = 0.25f, kTiltTolDeg = 6.0f;   // what veh_ride_free=1 (the default) puts into VehicleDriveConfig
+    // The bands are for a body on its wheels: full while both the owner's and the copy's vertical speed stay under kRideVzFullMs, none
+    // above kRideVzZeroMs (a jump, a fall), linear between (no step in the command).
+    constexpr double kRideVzFullMs = 1.5, kRideVzZeroMs = 2.5;
+    // Classes the bands are for (GET_VEHICLE_CLASS): wheeled ground vehicles resting on a suspension. Not bikes / cycles (8 / 13: roll is
+    // the lean, not a rest pose), boats (14), helicopters (15), planes (16), trains (21); not an unknown class (-1 / -2).
+    inline bool RideFreeClass(int cls) { return cls >= 0 && cls <= 22 && cls != 8 && cls != 13 && cls != 14 && cls != 15 && cls != 16 && cls != 21; }
 
     struct VehicleDriveInput
     {
@@ -412,6 +442,28 @@ namespace gage::sync {
     float EstimateSteer(float vFwd, float yawRate, float wheelbase, float prev,
                         float lock = kSteerLockRad, float holdBelowMps = 1.0f);
 
+    // ---- receiver steering (0.4.30 veh_steer_field) ----
+
+    // The wire (-1 full left .. +1 full right) as the CVehicle steering angle (radians, + = left, the bias's sign); 0 when not finite.
+    inline float SteerAngleFromWire(float wire, float lock = kSteerLockRad)
+    {
+        if (!std::isfinite(wire)) return 0.0f;
+        const float c = wire < -1.0f ? -1.0f : (wire > 1.0f ? 1.0f : wire);
+        return -c * lock;
+    }
+    enum class CopySteer : uint8_t { Field, Bias, Failed };
+    // A copy's wheels: SET_VEHICLE_STEER_BIAS only acts on a car a PLAYER drives (a copy's driver is a script ped: 0.4.29's 2600 calls a
+    // window turned nothing), so the steering-angle field is written when it resolved (fieldOn); the bias is the fallback. `Game`:
+    // bool SetVehicleSteerAngle(int32_t, float rad), bool SetVehicleSteerBias(int32_t, float bias).
+    template <class Game>
+    inline CopySteer ApplyCopySteer(Game& g, int32_t h, float wire, bool fieldOn)
+    {
+        if (fieldOn && g.SetVehicleSteerAngle(h, SteerAngleFromWire(wire)))
+            return CopySteer::Field;
+        const float w = std::isfinite(wire) ? wire : 0.0f;
+        return g.SetVehicleSteerBias(h, -w) ? CopySteer::Bias : CopySteer::Failed;
+    }
+
     // ---- sender cadence (sync plan W6, one controlling client per vehicle) ----
 
     // Whether a controlled vehicle moves enough to be sent at the full rate: linear speed above 0.2 m/s or
@@ -445,6 +497,8 @@ namespace gage::sync {
         // T4: the caller handled the contact itself (VehicleInterpolator::ReplaceFrom with the copy's own response): end the soft
         // correction the contact opened, and look for the next contact only after cooldownMs. No snap, no other state touched.
         void EndGrace(double cooldownMs);
+        // 0.4.30: the ride-freedom tolerances (VehicleDriveConfig::rideTolM / tiltTolDeg) from a switch that can change at any Welcome.
+        void SetRideFreedom(float tolM, float tiltDeg) { cfg_.rideTolM = tolM; cfg_.tiltTolDeg = tiltDeg; }
         float OffAccumulator() const { return offAcc_; }
         const VehicleDriveStats& Stats() const { return stats_; }
 

@@ -344,6 +344,28 @@ static void TestHeadingStats() {
     for (int i = 0; i < 50; ++i) { LocoDiagFrame f; f.dtMs = 16; f.nowMs = 16.0 * i; f.pose = V(0, 0, 30); f.pedPos = V(0, 0, 30); f.poseSpeed = 4.0f; f.poseVel = V(4, 0, 0); e.Observe(f); }
     Check("R5 heading telemetry: frames without a heading read count nothing", e.Summary().headFrames == 0 && e.Summary().poseVelHeadFrames == 0 && e.Summary().pedVelHeadFrames == 0,
           F("%u/%u/%u", e.Summary().headFrames, e.Summary().poseVelHeadFrames, e.Summary().pedVelHeadFrames));
+    // 0.4.30: a sender backpedalling (moving -y while facing +y, heading 0) reads 180 deg off-axis on every frame; the forward walk above reads 0;
+    // ragdoll / jump / swim / aim frames are not heading frames (the 0.4.29 '128 deg' window was a ragdoll)
+    LocoDiag bp;
+    double y = 0, t = 0;
+    for (int i = 0; i < 120; ++i) {
+        LocoDiagFrame f;
+        f.dtMs = 16.0; t += 16.0; f.nowMs = t;
+        y -= 1.5 * 0.016;
+        f.pose = V(0, y, 30); f.pedPos = V(0, y, 30); f.poseSpeed = 1.5f; f.poseVel = V(0, -1.5, 0);
+        f.haveHeading = HeadingTelemetryFrame(false, false, false, false);
+        f.poseHeadingDeg = 0.0f; f.pedHeading = 0.0f; f.gait = Gait::Walk;
+        bp.Observe(f);
+    }
+    const LocoDiagSummary b = bp.Summary();
+    const bool gate = HeadingTelemetryFrame(false, false, false, false) && !HeadingTelemetryFrame(true, false, false, false) &&
+                      !HeadingTelemetryFrame(false, true, false, false) && !HeadingTelemetryFrame(false, false, true, false) && !HeadingTelemetryFrame(false, false, false, true);
+    Check("0.4.30 heading telemetry: a backpedalling sender reads 180 deg off-axis on 120 of 120 frames (all over 60), the forward walk 0 (none over 60); "
+          "ragdoll, jump, swim and aim frames are not heading frames",
+          b.senderOffFrames == 120 && b.senderOffOver60 == 120 && std::fabs(b.senderOffMeanDeg - 180.0) < 0.5 && s.senderOffFrames == 240 && s.senderOffOver60 == 0 &&
+              s.senderOffMeanDeg < 0.5 && gate,
+          F("backpedal %u/%u mean %.1f, forward %u/%u mean %.1f, gate %d", b.senderOffOver60, b.senderOffFrames, b.senderOffMeanDeg, s.senderOffOver60, s.senderOffFrames,
+            s.senderOffMeanDeg, (int)gate));
 }
 
 static void R5Tests() {

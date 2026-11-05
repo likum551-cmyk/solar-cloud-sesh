@@ -16,10 +16,17 @@
 // Supervision (Poll, run by a small watchdog thread; tests call it directly):
 //   * the slot no longer holds our detour and frames stopped: someone restored or replaced it and did not chain
 //     to us. Take it again (at most Options::maxRetakes times), chaining to whatever is there now;
-//   * the slot is ours and no frame ever arrived (Options::neverTickedMs) or frames stopped (stalledMs): the
-//     game's swap chain does not go through this vtable (a wrapper object). Install the last-resort inline hook
-//     (the caller's installInline), once. Both paths then run, and a per-thread guard makes the tick run exactly
-//     once per Present.
+//   * the slot is ours and no frame ever arrived (Options::neverTickedMs), or the re-takes ran out: the game's
+//     swap chain does not go through this vtable (a wrapper object). Install the last-resort inline hook (the
+//     caller's installInline), once. Both paths then run, and a per-thread guard makes the tick run exactly once
+//     per Present.
+//   * the slot is ours and frames HAD come through it (since the last re-take), then stopped: almost always the
+//     game itself stopped presenting (a GPU hang on its way to ERR_GFX_*, a long load, minimised). 0.4.30: no code
+//     patch for intactStalledMs (a friend's Enhanced log, 2026-11-05: the 8 s fallback patched dxgi's already-hooked
+//     Present in the middle of the hang before the crash); after that a recreated, wrapped swap chain is the likelier
+//     cause and the inline hook goes in as before. Known limit: a game minimised (or alt-tabbed out of exclusive
+//     fullscreen) for longer than that still gets the inline hook, once, as every quiet spell did before 0.4.30.
+//     After a re-take, the frames that came before it do not count: stalledMs applies until a frame comes through.
 // Every decision is logged with the module that owns the foreign hook (DescribeEntry) and the overlay modules
 // loaded (LoadedOverlayModules), so a stalled log names the culprit.
 #pragma once
@@ -42,6 +49,7 @@ struct Options {
     uint64_t pollMs = 500;
     uint64_t neverTickedMs = 45000;     // vtable hook installed, not one frame seen: the game's chain bypasses it
     uint64_t stalledMs = 8000;          // frames were seen, then none for this long
+    uint64_t intactStalledMs = 60000;   // ... and the slot still holds our detour: the inline fallback waits this long
     int      maxRetakes = 8;            // re-take attempts before only the inline fallback is left
 };
 Options& DefaultOptions();              // what Install(...) without Options uses

@@ -1899,6 +1899,29 @@ static void TestW8()
         Check("W8 melee react: hit_react=both/ragdoll show a stagger as a ragdoll, bullet as a flinch bullet, off nothing; knockdown and flinch as before",
               ok, got);
     }
+    {   // 0.4.30: a punch (Stagger) is a clip on the feet, never a ragdoll (live 0.4.29: SET_PED_TO_RAGDOLL type 0 = NMRelax, tasks 389 -> 16 GetUp)
+        HitReaction sg, kn;
+        sg.kind = ReactKind::Stagger;
+        sg.ragdollMs = 350;
+        kn.kind = ReactKind::Knockdown;
+        bool rg = true, bu = true, cl = false;
+        ReactionToShow(kHitReactBoth, sg, rg, bu, cl, true);
+        const bool both = cl && !rg && !bu;
+        ReactionToShow(kHitReactRagdoll, sg, rg, bu, cl, true);
+        const bool rag = cl && !rg && !bu;
+        ReactionToShow(kHitReactBullet, sg, rg, bu, cl, true);
+        const bool bulletMode = !cl && !rg && bu;                      // bullet mode: still the flinch
+        ReactionToShow(kHitReactOff, sg, rg, bu, cl, true);
+        const bool off = !cl && !rg && !bu;
+        ReactionToShow(kHitReactBoth, sg, rg, bu, cl, false);
+        const bool oldWay = !cl && rg && !bu;                           // stagger_clip=0
+        ReactionToShow(kHitReactBoth, kn, rg, bu, cl, true);
+        const bool kdSame = !cl && rg && !bu;
+        Check("0.4.30 punch: a melee stagger is a clip, never a ragdoll (bullet mode a flinch, off nothing; stagger_clip=0 restores the ragdoll); a "
+              "knockdown still ragdolls",
+              both && rag && bulletMode && off && oldWay && kdSame,
+              F("both %d rag %d bullet %d off %d old %d kd %d", both, rag, bulletMode, off, oldWay, kdSame));
+    }
     // Item 7: a puppet that GTA killed with a melee takedown reports at most the melee ceiling, not the pool.
     {
         const PeerDamageOut melee0 = ProbePeerDamage(0, 1000, true, true, kDeadMeleeCapDamage);
@@ -3137,10 +3160,11 @@ int main()
                        + minimaptest::kChecks // + 0.4.22 minimap 28
                        + noclipt::kChecks     // + 0.4.22 noclip 31
                        + doorsseats::kPureChecks    // + 0.4.22 doors and seats 19
-                       + vehctl::kPureChecks  // + 0.4.22 vehicle controls 38
+                       + vehctl::kPureChecks  // + 0.4.22 vehicle controls 39
                        + r5edge::kChecks      // + R5 swim / ragdoll edge telemetry
                        + r5swing::kChecks    // + R5 looped punches
-                       + vehrow::kChecks;     // + 0.4.27 vehicle state row + indicator fallback 31
+                       + vehrow::kChecks      // + 0.4.27 vehicle state row + indicator fallback 31
+                       + 1;                   // + 0.4.30 punch: a melee stagger is a clip (tests W8 block)
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

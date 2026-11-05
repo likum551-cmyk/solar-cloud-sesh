@@ -110,6 +110,7 @@ ph::Options TestOptions() {
     o.watchdog = false;
     o.neverTickedMs = 1000;
     o.stalledMs = 500;
+    o.intactStalledMs = 3000;
     o.maxRetakes = 2;
     return o;
 }
@@ -260,6 +261,51 @@ void PartOne() {
         ResetCounters();
         ph::OnInlineEntry();
         Checkf("inline entry after uninstall ticks nothing", g_ticks == 0, "%lld", g_ticks.load());
+    }
+
+    // 0.4.30: frames came through OUR slot, then the game stopped presenting (a friend's Enhanced GPU hang before
+    // ERR_GFX_STATE): no code patch for intactStalledMs (3000 here), then the inline fallback as before
+    {
+        ResetCounters();
+        void** vt = MakeRoVtable((void*)&FakeOrig);
+        void** slot = &vt[8];
+        ph::Install(slot, (void*)0x7000, TestCallbacks(true), TestOptions());
+        for (int i = 0; i < 5; ++i) GameCall(slot, (void*)1, 0, 0);
+        const uint64_t t0 = Now();
+        Check("intact slot, quiet past stalledMs: stalled, NO inline hook", ph::Poll(t0 + 600) == ph::PollResult::Stalled && g_inlineInstalls == 0);
+        Check("intact slot, quiet 2.9 s: still no inline hook", ph::Poll(t0 + 2900) == ph::PollResult::Stalled && g_inlineInstalls == 0);
+        Check("intact slot, quiet past intactStalledMs: inline fallback", ph::Poll(t0 + 3100) == ph::PollResult::InlineInstalled && g_inlineInstalls == 1);
+        ph::Uninstall();
+        // frames resume inside the window: healthy again, and the window starts over from the newest frame
+        ResetCounters();
+        vt = MakeRoVtable((void*)&FakeOrig);
+        slot = &vt[8];
+        ph::Install(slot, (void*)0x7000, TestCallbacks(true), TestOptions());
+        GameCall(slot, (void*)1, 0, 0);
+        Check("hang then recovery: stalled first", ph::Poll(Now() + 600) == ph::PollResult::Stalled);
+        GameCall(slot, (void*)1, 0, 0);
+        const uint64_t f2 = Now();
+        Check("hang then recovery: healthy after a frame", ph::Poll(f2) == ph::PollResult::Healthy && g_inlineInstalls == 0);
+        // the window restarts at the newest frame: quiet 0.6 s after it is not yet 3 s, so no inline hook; 3.1 s is
+        Check("recovery: the 3 s window counts from the newest frame (0.6 s: stalled, no hook)",
+              ph::Poll(f2 + 600) == ph::PollResult::Stalled && g_inlineInstalls == 0);
+        Check("recovery: 3.1 s after the newest frame: inline fallback", ph::Poll(f2 + 3100) == ph::PollResult::InlineInstalled && g_inlineInstalls == 1);
+        ph::Uninstall();
+
+        // after a re-take the frames from before it do not count: silence then gets stalledMs (0.5 s), not the 3 s window
+        ResetCounters();
+        vt = MakeRoVtable((void*)&FakeOrig);
+        slot = &vt[8];
+        ph::Install(slot, (void*)0x7000, TestCallbacks(true), TestOptions());
+        GameCall(slot, (void*)1, 0, 0);
+        uint64_t t = Now();
+        ForceSlot(slot, (void*)&FakeOrig);
+        t += 600;
+        Check("re-take after frames", ph::Poll(t) == ph::PollResult::Retaken);
+        t += 600;
+        Check("re-take then silence: stalledMs applies, the inline fallback goes in (no 3 s wait)",
+              ph::Poll(t) == ph::PollResult::InlineInstalled && g_inlineInstalls == 1);
+        ph::Uninstall();
     }
 
     // two threads presenting at once: the per-thread guard keeps every Present's tick

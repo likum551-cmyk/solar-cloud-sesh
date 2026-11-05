@@ -65,6 +65,12 @@ namespace gage::sync {
     // Whether this copy's headlights are lit: the server's override or the controller's own state.
     inline bool HeadlightsShown(bool serverOverride, bool controllerActual) { return serverOverride || controllerActual; }
 
+    // 0.4.30: whether GET_VEHICLE_LIGHTS_STATE(car, &lightsOn, &highbeamsOn) says the lamps are lit. The game reports a high beam as
+    // lightsOn 0 / highbeamsOn 1 (0.4.29 live log: 0 sends "with the headlights", 44-435 "with the high beam"; FiveM HUDs read the pair
+    // the same way), so either bit = lit. highIsLit false (veh_lights_beam_lit=0) = 0.4.29: lightsOn alone. The kVeh2Headlights bit
+    // sent, the HUD lamp and the copies' keeper all use this rule.
+    inline bool LightsLit(bool lightsOn, bool highbeamsOn, bool highIsLit = true) { return lightsOn || (highIsLit && highbeamsOn); }
+
     // What a local copy of a vehicle shows of the above; `valid` is false until something was applied.
     struct BodyShown
     {

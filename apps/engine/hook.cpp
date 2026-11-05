@@ -22,6 +22,7 @@
 #include "present_hook.h"
 #include "nosp_pick.h"
 #include "pack_enh.h"
+#include "veh_fields.h"
 
 #include <windows.h>
 #include <cmath>
@@ -2488,6 +2489,15 @@ CodeWaitClock g_noSpWait, g_landingWait, g_netHostWait;
 bool g_packEnh = false;
 bool g_packEnhDone = true;
 CodeWaitClock g_packEnhWait;
+// 0.4.30 veh_steer_field (veh_fields.h): stepped by pollCodePatches (one image pass per 2 s) until resolved or the 120 s budget runs out.
+// The resolved function / offset are published atomically for the game thread (World::SetVehicleSteerAngle).
+bool g_vehFieldsArmed = false;
+bool g_vehFieldsDone = true;
+CodeWaitClock g_vehFieldsWait;
+ULONGLONG g_vehFieldsLastScan = 0;
+using HandleToPtrFn = uint8_t* (*)(int32_t);
+std::atomic<HandleToPtrFn> g_vehHtp{nullptr};
+std::atomic<int32_t> g_vehSteerOff{0};
 
 CodeWait codeWaitStep(CodeWaitClock& c, ULONGLONG now) {
     if (!c.started) {
@@ -5285,6 +5295,57 @@ bool World::SetVehicleSteerBias(int32_t veh, float bias) {
     return callHandleFloat(*this, native::SET_VEHICLE_STEER_BIAS, veh, bias);
 }
 
+// 0.4.30 veh_steer_field: the CVehicle fields of veh_fields.h. Game thread only (the handle -> pointer function is the game's own).
+bool World::VehicleFieldsReady() const {
+    return g_vehHtp.load() != nullptr && g_vehSteerOff.load() != 0;
+}
+
+static uint8_t* vehFieldPtr(int32_t veh, int32_t add, size_t len) {
+    const HandleToPtrFn htp = g_vehHtp.load();
+    const int32_t off = g_vehSteerOff.load();
+    if (!htp || !off || veh <= 0) return nullptr;
+    uint8_t* p = htp(veh);
+    // a CVehicle's first qword is its vtable, inside the game image: anything else is not the object we resolved the offset for
+    if (!p || !isReadable(p, 8)) return nullptr;
+    uintptr_t vt = 0;
+    memcpy(&vt, p, 8);
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(g_imageBase);
+    if (vt < lo || vt >= lo + g_imageSize) return nullptr;
+    if (!isReadable(p + off + add, len)) return nullptr;
+    return p + off + add;
+}
+
+bool World::GetVehicleSteerAngle(int32_t veh, float& rad) {
+    const uint8_t* f = vehFieldPtr(veh, 0, 4);
+    if (!f) return false;
+    memcpy(&rad, f, 4);
+    return true;
+}
+
+bool World::SetVehicleSteerAngle(int32_t veh, float rad) {
+    if (!std::isfinite(rad)) return false;
+    uint8_t* f = vehFieldPtr(veh, 0, 4);
+    if (!f) return false;
+    float cur = 0.0f;
+    memcpy(&cur, f, 4);
+    if (!gage::game::vehfields::PlausibleAngle(cur)) return false;   // not a steering angle: never write it
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(f, &mbi, sizeof mbi) != sizeof mbi) return false;
+    const DWORD prot = mbi.Protect & 0xFF;
+    if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) return false;   // heap memory of a live vehicle, nothing else
+    memcpy(f, &rad, 4);
+    return true;
+}
+
+bool World::GetVehicleCopyControls(int32_t veh, float& brake, bool& handbrake) {
+    const uint8_t* b = vehFieldPtr(veh, gage::game::vehfields::kBrakeFromAngle, 4);
+    const uint8_t* h = vehFieldPtr(veh, gage::game::vehfields::kHandbrakeFromAngle, 1);
+    if (!b || !h) return false;
+    memcpy(&brake, b, 4);
+    handbrake = *h != 0;
+    return true;
+}
+
 bool World::GetVehicleEngineHealth(int32_t veh, float& health) {
     return callHandleGetFloat(*this, native::GET_VEHICLE_ENGINE_HEALTH, veh, health);
 }
@@ -6498,6 +6559,14 @@ void gage::game::Init(World& w) {
         // pack_enh=0 (default) nothing below runs and g_packEnhDone stays true.
         g_packEnh = gage::game::content::PackEnhArm(w.packEnh, baseName);
         g_packEnhDone = !g_packEnh;
+        // veh_steer_field (0.4.30): the read-only scan for the CVehicle steering field, stepped by pollCodePatches like pack_enh.
+        // Only on a build we have a profile for (Legacy 3889, Enhanced); anything else keeps the steer bias.
+        // Auto (-1): Enhanced only (dump-proven); Legacy's patterns are unproven until a live run with veh_steer_field=1.
+        g_vehFieldsArmed = g_buildMatched && (w.vehFields == 1 || (w.vehFields == -1 && g_build != &kProfile3889));
+        g_vehFieldsDone = !g_vehFieldsArmed;
+        GLOGI("hook: veh_steer_field=%d%s: %s", w.vehFields, w.vehFields == -1 ? " (auto)" : "",
+              g_vehFieldsArmed ? "the steering field is resolved once the code decrypts (read-only scan, two agreeing scans)"
+                               : "off (copies steer with SET_VEHICLE_STEER_BIAS, 0.4.29; Legacy: set veh_steer_field=1 to try the field)");
     }
 
     // ---- Native registration table ------------------------------------------
@@ -7489,6 +7558,35 @@ static void pollCodePatches() {
         if (gage::game::content::PackEnhStep(now, w == CodeWait::WaitLog, w == CodeWait::GiveUp))
             g_packEnhDone = true;
     }
+    // veh_steer_field (0.4.30): read-only; unique patterns + a cross-check or nothing.
+    if (g_vehFieldsArmed && !g_vehFieldsDone) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_vehFieldsLastScan >= 2000) {
+            g_vehFieldsLastScan = now;
+            const CodeWait w = codeWaitStep(g_vehFieldsWait, now);
+            namespace vf = gage::game::vehfields;
+            const vf::Result r = vf::Resolve({ g_imageBase, g_imageSize }, g_build == &kProfile3889 ? vf::kLegacy : vf::kEnhanced);
+            // publish only when two consecutive scans (2 s apart) agree: a scan during decryption can see a half-written run
+            static const uint8_t* s_prevHtp = nullptr;
+            static int32_t s_prevOff = 0;
+            const bool agreed = r.ok && r.htp == s_prevHtp && r.steerOff == s_prevOff;
+            s_prevHtp = r.ok ? r.htp : nullptr;
+            s_prevOff = r.ok ? r.steerOff : 0;
+            if (r.ok && !agreed) {
+                GLOGI("hook: [vehfields] first match, confirming with the next scan: %s", r.why);
+            } else if (r.ok) {
+                g_vehSteerOff.store(r.steerOff);
+                g_vehHtp.store(reinterpret_cast<HandleToPtrFn>(const_cast<uint8_t*>(r.htp)));
+                g_vehFieldsDone = true;
+                GLOGI("hook: [vehfields] %s (handle->pointer +0x%llx)", r.why, (unsigned long long)(uintptr_t)(r.htp - g_imageBase));
+            } else if (w == CodeWait::GiveUp) {
+                g_vehFieldsDone = true;
+                GLOGW("hook: [vehfields] NOT resolved after 120 s, copies keep SET_VEHICLE_STEER_BIAS: %s", r.why);
+            } else if (w == CodeWait::WaitLog) {
+                GLOGI("hook: [vehfields] waiting for the code to decrypt: %s", r.why);
+            }
+        }
+    }
 }
 
 static bool codePatchesPending() {
@@ -7496,7 +7594,8 @@ static bool codePatchesPending() {
            (g_noSpActive && !g_noSpVerified) ||
            (g_skipLanding && !g_landingPatched && g_build->landingPageSig) ||
            (g_netHost && !g_netHostInstalled) ||
-           (g_packEnh && !g_packEnhDone);
+           (g_packEnh && !g_packEnhDone) ||
+           (g_vehFieldsArmed && !g_vehFieldsDone);
 }
 
 DWORD WINAPI nativeTablePollerThread(LPVOID) {

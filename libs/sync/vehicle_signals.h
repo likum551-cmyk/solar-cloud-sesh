@@ -22,6 +22,8 @@
 //   backoffMs, so a wrong assumption costs a few calls, never a stream.
 #pragma once
 
+#include "sync/vehicle_body.h"
+
 #include <cstdint>
 
 namespace gage::sync {
@@ -215,6 +217,32 @@ namespace gage::sync {
         return o;
     }
 
+    // 0.4.30: the horn bit a controller sends. With the siren on, GTA turns a held INPUT_VEH_HORN (E) into the siren's second tone and
+    // IS_HORN_ACTIVE stays false (0.4.29 live log: a police car driven 2.5 min, ~2640 updates, 0 with the horn), so there the driver's held
+    // key is the signal; siren off, the read-back rules as before. sirenHornOn false (veh_siren_horn=0) = 0.4.29: the read-back alone.
+    inline bool HornBitToSend(bool hornActive, bool sirenOn, bool driver, bool axisOk, float hornAxis, bool sirenHornOn)
+    {
+        if (hornActive)
+            return true;
+        return sirenHornOn && sirenOn && driver && axisOk && hornAxis >= 0.5f;
+    }
+
+    // The held-key half of HornBitToSend must be HELD: a tap of E with the siren on is GTA's siren-mode switch, not the second tone,
+    // so the key counts only after kSirenHornHoldMs of continuous hold (per vehicle). A sounding horn (IS_HORN_ACTIVE) is never delayed.
+    constexpr double kSirenHornHoldMs = 150.0;
+    struct SirenHornHold
+    {
+        double since = -1.0;    // when the current hold began (-1 = not held)
+        bool Step(bool hornActive, bool keyBit, double nowMs)
+        {
+            if (hornActive)
+                return true;
+            if (!keyBit) { since = -1.0; return false; }
+            if (since < 0.0) since = nowMs;
+            return nowMs - since >= kSirenHornHoldMs;
+        }
+    };
+
     // ---- headlights / high beam --------------------------------------------------------------------------------------
 
     struct LightsWant
@@ -241,6 +269,7 @@ namespace gage::sync {
         int    confirmReads = 2;            // reads in a row that must disagree before anything is re-issued (one read can land mid-transition)
         int    failLimit = 3;               // re-issues that did not take before the car is "stuck"...
         double backoffMs = 10000.0;         // ... and left alone for this long
+        bool   highIsLit = true;            // 0.4.30 veh_lights_beam_lit: a read of lightsOn 0 / highbeamsOn 1 is lit (LightsLit)
     };
 
     struct LightsStats
@@ -262,6 +291,7 @@ namespace gage::sync {
     {
     public:
         explicit LightsKeeper(const LightsConfig& cfg = LightsConfig()) : cfg_(cfg) {}
+        void Configure(const LightsConfig& c) { cfg_ = c; }
 
         void Reset()
         {
@@ -304,7 +334,7 @@ namespace gage::sync {
                 return c;
             }
             ++stats_.reads;
-            const bool onOk = on == want.on;
+            const bool onOk = LightsLit(on, high, cfg_.highIsLit) == want.on;
             const bool highOk = !want.on || high == want.high;     // a high beam with the lights off is not a state of its own
             if (onOk && highOk)
             {
@@ -341,6 +371,11 @@ namespace gage::sync {
             {
                 c.setHigh = true;                                  // forced on again: the high beam is said again with it
                 c.high = want.high;
+            }
+            else if (!want.on && !onOk && high)
+            {
+                c.setHigh = true;                                  // 0.4.30: "lit" may be the full-beam flag alone (LightsLit): clear it too,
+                c.high = false;                                    // or a copy that should be dark is re-issued SET_VEHICLE_LIGHTS(1) forever
             }
             ++stats_.reissued;
             reissuedLast_ = true;

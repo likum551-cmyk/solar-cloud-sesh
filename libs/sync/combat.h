@@ -495,11 +495,21 @@ namespace gage::sync {
     constexpr int kHitReactOff = 0, kHitReactBullet = 1, kHitReactRagdoll = 2, kHitReactBoth = 3;
     // What a mode lets a decision show: a knockdown or a stagger ("ragdoll"/"both") as a ragdoll, a flinch bullet
     // ("bullet"/"both"; in "bullet" a knockdown or a stagger is shown as a flinch). Neither = nothing is shown.
+    // 0.4.30 staggerClip (stagger_clip, default on): a melee Stagger is a stumble CLIP on the feet (`clip`), never a ragdoll: SET_PED_TO_RAGDOLL
+    // type 0 is CTaskNMRelax, so a punch dropped the ped (live 0.4.29 trace: tasks 389 NMRelax -> 16 GetUp). Off = the W8 ragdoll stagger.
+    inline void ReactionToShow(int mode, const HitReaction& r, bool& ragdoll, bool& bullet, bool& clip, bool staggerClip)
+    {
+        const bool body = mode == kHitReactRagdoll || mode == kHitReactBoth;
+        const bool stagger = r.kind == ReactKind::Stagger;
+        clip = stagger && body && staggerClip;
+        ragdoll = !clip && body && (r.kind == ReactKind::Knockdown || stagger);
+        bullet = !ragdoll && !clip && r.kind != ReactKind::None && (mode == kHitReactBullet || mode == kHitReactBoth);
+    }
+    // The W8 rule (no clip): a stagger is a ragdoll.
     inline void ReactionToShow(int mode, const HitReaction& r, bool& ragdoll, bool& bullet)
     {
-        const bool ragdollKind = r.kind == ReactKind::Knockdown || r.kind == ReactKind::Stagger;
-        ragdoll = ragdollKind && (mode == kHitReactRagdoll || mode == kHitReactBoth);
-        bullet = !ragdoll && r.kind != ReactKind::None && (mode == kHitReactBullet || mode == kHitReactBoth);
+        bool clip = false;
+        ReactionToShow(mode, r, ragdoll, bullet, clip, false);
     }
 
     // What the reacting ped is doing. sinceKnockdownMs is the time since THIS ped's last Knockdown

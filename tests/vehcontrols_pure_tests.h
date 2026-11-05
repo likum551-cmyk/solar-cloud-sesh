@@ -26,7 +26,7 @@ namespace vehctl {
 using namespace gage::sync;
 namespace proto = gage::proto;
 
-constexpr int kPureChecks = 38;  // asserted by gameplay_test's total
+constexpr int kPureChecks = 39;  // asserted by gameplay_test's total
 
 // The game, as far as the controls care.
 struct SimGame
@@ -731,9 +731,20 @@ inline void Helpers()
                   HudIndicators(false, 0, kVcIndBoth, false) == 0 && HudIndicators(true, 0, kVcIndBoth, true) == 0);
     }
     {
-        Check("HUD: headlights read 0 off / 1 low / 2 high (a high beam with the lights off is off; an unreadable state is off); the belt warns only unbuckled above 20 km/h",
-              HudLights(true, false, true) == 0 && HudLights(true, true, false) == 1 && HudLights(true, true, true) == 2 && HudLights(false, true, true) == 0 &&
+        Check("HUD: headlights read 0 off / 1 low / 2 high (a high beam read as lightsOn 0 / highbeamsOn 1 is the high beam, veh_lights_beam_lit=0 "
+              "shows it off; an unreadable state is off); the belt warns only unbuckled above 20 km/h",
+              HudLights(true, false, true) == 2 && HudLights(true, false, true, false) == 0 && HudLights(true, true, false) == 1 &&
+                  HudLights(true, true, true) == 2 && HudLights(false, true, true) == 0 && HudLights(true, false, false) == 0 &&
                   HudBeltWarn(false, 8.0f, 5.56f) && !HudBeltWarn(false, 3.0f, 5.56f) && !HudBeltWarn(true, 30.0f, 5.56f));
+    }
+    {
+        // 0.4.30: the 0.4.29 live log: GET_VEHICLE_LIGHTS_STATE reads a high beam as lightsOn 0 / highbeamsOn 1.
+        const uint8_t f2 = Flags2FromState(LightsLit(false, true), true, false, false, false, false);
+        Check("lights (0.4.30): a high beam read as lightsOn 0 / highbeamsOn 1 is lit: the controller sends kVeh2Headlights with kVeh2HighBeam and a copy "
+              "shows it; veh_lights_beam_lit=0 keeps 0.4.29 (lightsOn alone); off reads off",
+              (f2 & proto::kVeh2Headlights) && (f2 & proto::kVeh2HighBeam) && HeadlightsShown(false, (f2 & proto::kVeh2Headlights) != 0) &&
+                  !LightsLit(false, true, false) && LightsLit(true, false) && !LightsLit(false, false),
+              F("flags2 %02x", f2));
     }
     {
         bool has[8] = {};

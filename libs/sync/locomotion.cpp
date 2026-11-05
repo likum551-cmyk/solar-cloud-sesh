@@ -1714,6 +1714,9 @@ void LocoDiag::Observe(const LocoDiagFrame& f)
         headErr_.Add(std::fabs(WrapDeg180(double(f.pedHeading) - double(f.poseHeadingDeg))));
         const double pa = std::atan2(-double(f.poseVel.x), double(f.poseVel.y)) * 180.0 / kPi;
         poseVelHead_.Add(std::fabs(WrapDeg180(pa - double(f.pedHeading))));
+        const double off = std::fabs(WrapDeg180(pa - double(f.poseHeadingDeg)));   // 0.4.30: the sender's own off-axis movement
+        senderOff_.Add(off);
+        if (off > 60.0) ++senderOff60_;
     }
     if (f.haveHeading && had && !f.snapped && !prevSnapped_ && derived > 1.0)
     {
@@ -1840,6 +1843,10 @@ LocoDiagSummary LocoDiag::Summary() const
     s.pedVelHeadFrames = pedVelHead_.Count();
     s.pedVelHeadMeanDeg = pedVelHead_.Mean();
     s.pedVelHeadP95Deg = pedVelHead_.Percentile(0.95);
+    s.senderOffFrames = senderOff_.Count();
+    s.senderOffOver60 = senderOff60_;
+    s.senderOffMeanDeg = senderOff_.Mean();
+    s.senderOffP95Deg = senderOff_.Percentile(0.95);
     if (frames_)
     {
         const uint32_t n50 = (frames_ + 1) / 2, n95 = static_cast<uint32_t>(frames_ * 0.95 + 0.999);

@@ -1021,7 +1021,7 @@ static void TestHyperProfiles() {
           kHyperTargetKmh == 600.0f && kHyperPower == 2.35f && kHyperMaxPercent == 400.0f && jesko->targetKmh == 600.0f &&
               jesko->power == 2.35f && jesko->tough && HyperTargetMs(*jesko) == kHyperTargetMs &&
               P.downRefMs == kHyperTargetMs && P.downAtRefMs2 == 14.0f && P.downCapMs2 == 17.0f && P.gripRate == 6.9f && P.gripCapMs2 == 30.0f &&
-              P.brakeMs2 == 14.0f && P.yawLatMs2 == 30.0f && P.tiltRate == 4.6f &&
+              P.brakeMs2 == 14.0f && P.yawLatMs2 == 50.0f && P.yawFromMs == 45.0f && P.tiltRate == 4.6f &&
               std::fabs(HyperTopSpeedPercent(100.0f) - 66.66667f) < 1e-3f && std::fabs(HyperTopSpeedPercent(50.0f) - 233.3333f) < 1e-2f &&
               HyperTopSpeedPercent(10.0f) == 400.0f && HyperTopSpeedPercent(170.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f,
           F("pct(100) %.4f pct(50) %.4f", HyperTopSpeedPercent(100.0f), HyperTopSpeedPercent(50.0f)));
@@ -1079,7 +1079,7 @@ static void TestHyperProfiles() {
             if (p.tough || p.targetKmh >= 400.0f) continue;
             ++roadRows;
             roadOk = roadOk && p.power == 1.0f && p.assist.downAtRefMs2 == 0.0f && p.assist.gripCapMs2 == 13.8f &&
-                     p.assist.yawLatMs2 == 18.4f && p.assist.Any();
+                     p.assist.yawLatMs2 == 32.0f && p.assist.yawFromMs == 35.0f && p.assist.Any();
         }
         const HyperProfile* regera = HyperProfileFor("regera");
         HyperAssistIn fast = Level(80.0, kHyperAssistAll);
@@ -1272,6 +1272,34 @@ static void TestHyperProfiles() {
     Check("hyper assist: from 20 to 150 m/s a full-lock spin (3 rad/s) never exceeds 22 m/s^2 of lateral acceleration, a gentle turn is untouched",
           latOk && latN == 131 * 7, F("%d cases", latN));
 
+    // -- 0.4.30 (GI: "no turning leverage"): the production yaw caps are spin guards, ordinary corners pass untouched --
+    {
+        const HyperAssist hyper = HyperProfileFor("dubsta")->assist, street = HyperProfileFor("taycan")->assist;
+        auto Turn = [](const HyperAssist& a, double speed, float w) {
+            HyperAssistIn in = Level(speed, kHyperAssistYaw);
+            in.angVel = { 0.0f, 0.0f, w };
+            return HyperAssistStep(a, in);
+        };
+        // a hard corner: 108 km/h at 1.0 rad/s (30 m/s^2), 144 km/h at 0.75 (30 m/s^2); the 0.4.29 caps cut both (18.4 / 30 m/s^2 from 20 m/s)
+        const HyperAssistOut s30 = Turn(street, 30.0, 1.0f), s40 = Turn(street, 40.0, 0.75f), h30 = Turn(hyper, 30.0, 1.0f), h40 = Turn(hyper, 40.0, 0.75f);
+        // a spin: 3 rad/s at 60 m/s is still cut to the cap (50/60 hyper, 32/60 street)
+        const HyperAssistOut hs = Turn(hyper, 60.0, 3.0f), ss = Turn(street, 60.0, -3.0f);
+        HyperAssist oldH = hyper, oldS = street, none = HyperAssist();
+        RestoreYawCap0429(oldH);
+        RestoreYawCap0429(oldS);
+        RestoreYawCap0429(none);
+        const HyperAssistOut os30 = Turn(oldS, 30.0, 1.0f), oh30 = Turn(oldH, 30.0, 1.2f), nh30 = Turn(hyper, 30.0, 1.2f);   // 36 m/s^2: the old hyper cap cuts it to 1.0, the new one does not
+        Check("hyper assist (0.4.30): a 108 km/h / 1.0 rad/s and a 144 km/h / 0.75 rad/s corner pass the hyper and street caps untouched; a 3 rad/s spin at "
+              "60 m/s is still cut to 50/60 and -32/60 with the cut reported; hyper_yaw=0 restores 30 / 18.4 from 20 m/s (and cuts the corner again)",
+              !s30.yawClamped && !s40.yawClamped && !h30.yawClamped && !h40.yawClamped && s30.angVel.z == 1.0f && h40.angVel.z == 0.75f && s40.angVel.z == 0.75f && h30.angVel.z == 1.0f &&
+                  hs.yawClamped && std::fabs(hs.angVel.z - 50.0f / 60.0f) < 1e-4f && std::fabs(hs.yawCut - (3.0f - 50.0f / 60.0f)) < 1e-4f &&
+                  ss.yawClamped && std::fabs(ss.angVel.z + 32.0f / 60.0f) < 1e-4f && std::fabs(ss.yawCut - (3.0f - 32.0f / 60.0f)) < 1e-4f &&
+                  oldH.yawLatMs2 == 30.0f && oldH.yawFromMs == 20.0f && oldS.yawLatMs2 == 18.4f && oldS.yawFromMs == 20.0f && none.yawLatMs2 == 0.0f &&
+                  os30.yawClamped && std::fabs(os30.angVel.z - 18.4f / 30.0f) < 1e-4f && oh30.yawClamped && std::fabs(oh30.angVel.z - 1.0f) < 1e-4f && !nh30.yawClamped && nh30.angVel.z == 1.2f,
+              F("street 30: %.3f, hyper 40: %.3f, hyper spin %.4f cut %.4f, street spin %.4f, old street 30 %.4f, old hyper 30 %.4f",
+                s30.angVel.z, h40.angVel.z, hs.angVel.z, hs.yawCut, ss.angVel.z, os30.angVel.z, oh30.angVel.z));
+    }
+
     // -- anti-roll --
     HyperAssistIn ti = Level(100.0, kHyperAssistTilt);
     ti.angVel = { 2.0f, 1.0f, 0.3f };
@@ -1427,7 +1455,7 @@ static void TestHyperProfiles() {
               !HyperHealthLow(999.6f) && !HyperHealthLow(1200.0f) && !HyperHealthLow(std::nanf("")) && !HyperHealthLow(INFINITY),
           "");
 }
-constexpr int kHyperTuneChecks = 4 + 31;   // TestHyperTune's own four + TestHyperProfiles (keep in step: the run asserts the total)
+constexpr int kHyperTuneChecks = 4 + 32;  // TestHyperTune's own four + TestHyperProfiles (keep in step: the run asserts the total)
 
 // ---- hyper tune (libs/sync/hypertune.h, GI 2026-11-02: the Jesko at 500 km/h; 2026-11-05: 600 km/h) ----------------
 static void TestHyperTune() {
@@ -2155,6 +2183,102 @@ static void TestSyncD() {
 #include "r3_t5_tests.h"
 #include "r4_t2_tests.h"
 #include "vehicle_shake_tests.h"   // 0.4.22 cars shake: the angular velocity frame, the anti-roll / copy loops, the meters
+#include "ride_free_tests.h"       // 0.4.30 ride freedom: a copy rests on its own suspension
+
+// 0.4.30 omega guard (veh_omega_guard): a held parked copy is drawn at its newest pose rotated by the derived omega x (500 ms + lead).
+constexpr int kOmegaChecks = 2;
+static void TestOmegaGuard()
+{
+    std::printf("-- 0.4.30 omega guard: parked copies hold their pose\n");
+    {   // 1: a standing pair (one 0.28 deg step over 33 ms) holds its own pose
+        auto run = [](bool guard) {
+            VehicleInterpolator ip;
+            ip.SetOmegaGuard(guard);
+            VehicleSnapshot a;
+            a.tMs = 1000;
+            a.pos = V(0, 0, 30);
+            a.rot = vq::FromHeadingDeg(90);
+            VehicleSnapshot b = a;
+            b.tMs = 1033;
+            b.rot = vq::Mul(vq::Exp(V(0.0049, 0, 0)), a.rot);
+            ip.Push(a);
+            ip.Push(b);
+            ip.SetExtrapolateMaxMs(850);
+            VehicleSample s;
+            ip.Sample(4033, s);
+            return AngDeg(s.rot, b.rot);
+        };
+        const double on = run(true), off = run(false);
+        Check("omega guard: a standing pair holds its pose (guard on < 0.05 deg; off reproduces the 0.4.29 drift > 5 deg)", on < 0.05 && off > 5.0,
+              F("on %.2f off %.2f deg", on, off));
+    }
+    {   // 2: the copy's adopted bounce, then the parked owner's pose: the cross-source pair must not become a rate
+        auto run = [](bool guard) {
+            VehicleInterpolator ip;
+            ip.SetOmegaGuard(guard);
+            const DriveQuat q0 = vq::FromHeadingDeg(0);
+            for (int k = 0; k < 5; ++k) {
+                VehicleSnapshot s;
+                s.tMs = 1000 + 200 * k;
+                s.pos = V(0, 0, 30);
+                s.rot = q0;
+                s.src = 1;
+                ip.Push(s);
+            }
+            VehicleSnapshot ad;
+            ad.tMs = 2000;
+            ad.pos = V(0.3, 0, 30);
+            ad.vel = V(2.9, 0, 0);
+            ad.hasAngVel = true;
+            ad.angVel = V(0, 0, 0.35);
+            ad.rot = vq::Mul(vq::Exp(V(-20 * kPi / 180, 0, 10 * kPi / 180)), q0);
+            const DriveVec pre = V(0, 0, 0);
+            ip.ReplaceFrom(ad, 300.0, &pre);
+            VehicleSnapshot own;
+            own.tMs = 2350;
+            own.pos = V(0, 0, 30);
+            own.rot = q0;
+            own.src = 1;
+            ip.Push(own);                      // the owner's first pose after the adoption; later ones are bit-identical Repeats (not stored)
+            ip.SetExtrapolateMaxMs(850);
+            VehicleSample s;
+            ip.Sample(7000, s);
+            return std::make_pair(AngDeg(s.rot, q0), s.mode);
+        };
+        const auto on = run(true), off = run(false);
+        Check("omega guard: after an adopted bounce a parked copy holds the owner's pose (on < 0.5 deg; off > 30 deg, the live 45-54 deg)",
+              on.second == VehMode::Holding && on.first < 0.5 && off.first > 30.0, F("on %.2f off %.2f deg", on.first, off.first));
+    }
+}
+
+// 0.4.30 veh_steer_field: a copy's wheels. The fake models the live finding: the steer bias turns the wheels only when a PLAYER drives the car.
+constexpr int kCopySteerChecks = 1;
+struct SteerCar {
+    bool playerDriver = false, fieldWritable = true;
+    float angle = 0.0f;
+    int biasCalls = 0, fieldCalls = 0;
+    bool SetVehicleSteerAngle(int32_t, float rad) { ++fieldCalls; if (!fieldWritable) return false; angle = rad; return true; }
+    bool SetVehicleSteerBias(int32_t, float bias) { ++biasCalls; if (playerDriver) angle = bias * kSteerLockRad; return true; }
+};
+static void TestCopySteer()
+{
+    std::printf("-- 0.4.30 copy steering: the CVehicle field, the bias as the fallback\n");
+    SteerCar fieldCar, oldCar, playerCar, refusing, nanCar;
+    const CopySteer a = ApplyCopySteer(fieldCar, 1, 0.5f, true);          // wire +0.5 = half right = -0.30 rad
+    const CopySteer b = ApplyCopySteer(oldCar, 1, 0.5f, false);           // 0.4.29: the bias on a script-ped copy
+    playerCar.playerDriver = true;
+    const CopySteer c = ApplyCopySteer(playerCar, 1, 0.5f, false);        // control: the bias does turn a player's car
+    refusing.fieldWritable = false;
+    const CopySteer d = ApplyCopySteer(refusing, 1, 0.5f, true);          // the field refused (not a plausible angle): the bias
+    nanCar.angle = 0.2f;
+    const CopySteer e = ApplyCopySteer(nanCar, 1, NAN, true);
+    Check("copy steering (0.4.30): wire +0.5 turns a script-driven copy's wheels to -0.30 rad through the field; the 0.4.29 bias leaves them at 0 "
+          "(and does turn a player's car: the fake separates the cases); a refused field falls back to the bias; a NaN wire writes 0",
+          a == CopySteer::Field && std::fabs(fieldCar.angle + 0.30f) < 1e-5f && fieldCar.biasCalls == 0 && b == CopySteer::Bias && oldCar.angle == 0.0f &&
+              c == CopySteer::Bias && std::fabs(playerCar.angle + 0.30f) < 1e-5f && d == CopySteer::Bias && refusing.biasCalls == 1 &&
+              e == CopySteer::Field && nanCar.angle == 0.0f && SteerAngleFromWire(3.0f) == -kSteerLockRad,
+          F("field %.3f, old %.3f, player %.3f, refused -> %d, nan %.3f", fieldCar.angle, oldCar.angle, playerCar.angle, (int)d, nanCar.angle));
+}
 
 int main() {
     if (std::getenv("R4T2_REPORT")) { r4t2::Report(); return 0; }   // R4 T2: the scratch report (no checks)
@@ -2193,9 +2317,14 @@ int main() {
 
     shaketests::TestShake();
 
+    ridefree::TestRideFreedom();
+
+    TestOmegaGuard();
+    TestCopySteer();
+
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
     // + hyper tune kHyperTuneChecks (4 + the profiles and assists) + W9 11 + Sync B 8 (kSyncBChecks as listed in its header) + Sync D kSyncDChecks
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks + shaketests::kShakeChecks;
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks + shaketests::kShakeChecks + ridefree::kRideChecks + kOmegaChecks + kCopySteerChecks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

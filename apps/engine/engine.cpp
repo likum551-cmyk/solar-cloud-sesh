@@ -360,6 +360,7 @@ namespace {
         sync::HitReactArbiter hitReact;  // a cosmetic reaction owns the ped for its window (DrivePeer holds the gait)
         bool reactLifted = false;        // PCF 188 (DisableHurt) and the ragdoll block are lifted for the reaction
         bool reactRagdolled = false;     // ... and the reaction is a knockdown (the end clears the ped's tasks)
+        bool reactClip = false;          // 0.4.30: the reaction is the stagger clip (a full-body TASK_PLAY_ANIM replaced the gait: re-issue it at the end)
         // Damage the server reported on this player (our own Hit confirmed, or protocol v5's onlooker Damage:
         // attacker and victim both other players), not yet reacted to. PeerNet::react* are added here by SyncNet:
         // the damage sum, the OR of the Damage.flags (HitReact::kFlag*), the newest bone and the newest attacker.
@@ -511,6 +512,8 @@ namespace {
         uint8_t sentFlags = 0, sentFlags2 = 0, sentDoors = 0;
         bool sentOnce = false;
         float steerPrev = 0.0f;       // the steering estimate's held value (below 1 m/s)
+        sync::SirenHornHold sirenHornHold;   // 0.4.30: siren on + E counts as the horn only after a 150 ms hold (a tap switches the siren mode)
+        float steerFieldWritten = NAN; // 0.4.30: the steering angle written to this copy last frame (NaN = none), for the held / overwritten read-back
         // ---- T3 (vehicle visual state, protocol v6) ----
         sync::VisualSync vis;         // tyres / windows: the controller's edge apply and a copy's level apply (libs/sync/vehicle_visual.h)
         sync::DriveQuat steerPrevRot; // the rotation of the previous steering sample (the yaw rate comes from successive rotations)
@@ -578,6 +581,8 @@ namespace {
         uint32_t indCalls = 0, indFailed = 0, engineCalls = 0, engineFailed = 0, beltCalls = 0, beltFailed = 0;   // our own car's natives
         uint32_t ticksInVeh = 0, ticksBlocked = 0, beltReads = 0, beltReadFail = 0, beltFlagTrue = 0, lightsLow = 0, lightsHigh = 0, engineStopped = 0;
         uint32_t keyLines = 0;                               // per-key log lines written in this session (capped)
+        uint32_t lightsRaw[4] = {};                          // 0.4.30: raw GET_VEHICLE_LIGHTS_STATE (lightsOn | highbeamsOn << 1): 0/0, 1/0, 0/1, 1/1
+        uint32_t headlightPresses = 0;                       // 0.4.30: H (INPUT_VEH_HEADLIGHT 74), IS_DISABLED_CONTROL_JUST_PRESSED
     };
     VcExtraStats g_vcx;
     double g_vcReportMs = 0, g_vcBeltReadMs = -1e9;
@@ -719,6 +724,11 @@ namespace {
     // R4 T2 (docs/sync-specs/vehicle-collision-authority.md). veh_contact_gate=0: a copy's flag / speed loss / kick opens the contact grace whatever it touched (round 3);
     // default on = only with a vehicle we control within kContactNearM. veh_accel_extrap=0: constant-velocity extrapolation of the copies (round 3). Re-read at every Welcome.
     std::atomic<bool> g_contactGate{true}, g_accelExtrap{true};
+    std::atomic<bool> g_omegaGuard{true};   // veh_omega_guard=0 (0.4.30): derive a copy's omega across sources / from a standing pair again (0.4.29)
+    // 0.4.30 veh_ride_free (default on): a copy's own suspension keeps its ride height and pitch / roll within sync::kRideTolM / kTiltTolDeg of the
+    // owner's (libs/sync/vehicle_drive.h, VehicleDriveConfig::rideTolM); 0 = the full 3D correction of 0.4.29. Re-read at every Welcome.
+    std::atomic<bool> g_rideFree{true};
+    std::atomic<bool> g_hyperYaw0430{true};   // hyper_yaw=0: the 0.4.29 yaw cap (30 / 18.4 m/s^2 from 20 m/s), see sync::RestoreYawCap0429
     // 0.4.17 passenger ride (GI: "desync is crazy when sitting on the passenger seat"). veh_ride_gate=0: the car we ride in as a passenger counts as a
     // vehicle we control for the R4 T2 contact gate (0.4.15: its distance to itself is 0 m, so every kerb / brake jolt of the copy we sit in opened the
     // 400 ms soft-correction grace and the own-physics adoption: rubber-banding every ~1.2 s). veh_ride_lead=0: the car we ride in gets the near-car
@@ -774,7 +784,9 @@ namespace {
     //   veh_horn_stop=0   no release call (a 1 ms START_VEHICLE_HORN): the last 300 ms hold runs out by itself
     //   veh_lights_keep=0 the headlights / high beam of a copy are set on a change only (0.4.17), with no GET_VEHICLE_LIGHTS_STATE read-back and
     //                     no re-issue of a state the game dropped
-    std::atomic<bool> g_hornSync{true}, g_hornHeld{true}, g_hornStop{true}, g_lightsKeep{true};
+    // veh_lights_beam_lit=0 (0.4.30): lightsOn alone says "lit" (0.4.29); default lightsOn OR highbeamsOn (the game reads a high beam as 0 / 1)
+    std::atomic<bool> g_hornSync{true}, g_hornHeld{true}, g_hornStop{true}, g_lightsKeep{true}, g_lightsBeamLit{true},
+        g_sirenHorn{true};   // veh_siren_horn=0 (0.4.30): the horn bit from IS_HORN_ACTIVE only (0.4.29); default: siren on + E held also sends it
     constexpr uint32_t kHornModeHeldDown = sync::Joaat("HELDDOWN");
     sync::HornConfig HornConfigNow()
     {
@@ -783,12 +795,19 @@ namespace {
             c.stopMs = 0;
         return c;
     }
+    sync::LightsConfig LightsConfigNow()
+    {
+        sync::LightsConfig c;
+        c.highIsLit = g_lightsBeamLit.load(std::memory_order_relaxed);
+        return c;
+    }
     // The 10 s line "engine: vehicle signals (0.4.19)" (ReportVehSignals): this window's counters (script tick).
     struct SigStats
     {
         uint32_t hornStates = 0;                 // copies: states applied with the horn bit (0.4.17 made one START_VEHICLE_HORN of each)
         uint32_t oldHornCalls = 0;               // veh_horn_sync=0: those calls
         uint32_t sentUpdates = 0, sentHorn = 0, sentHeadlights = 0, sentHighBeam = 0;   // as controller: VehicleUpdates, and those with each bit
+        uint32_t sentSiren = 0, sentSirenHorn = 0;     // 0.4.30: with the siren on, and horn bits from E held with the siren (IS_HORN_ACTIVE false)
         uint32_t lightsChanged = 0;              // copies: SET_VEHICLE_LIGHTS issued on a change (ApplyVehicleFields)
         uint32_t lightsReissueCalls = 0, lightsReissueFail = 0;   // the keeper's SET_VEHICLE_LIGHTS / SET_VEHICLE_FULLBEAM calls (issued, could not be called)
         sync::HornStats horn;                    // every copy's HornSync counters of this window (drained each tick)
@@ -923,14 +942,25 @@ namespace {
     // R4 T3: melee_survey = N (default 1): the first N passes over the survey plan (libs/sync/swing.h SwingSurvey) issue each swing as the next
     // attempt whatever was seen before, then the ladder is pinned to the attempt that PROGRESSED; 0 = off (the R3 ladder alone). melee_follow = 0
     // turns the +100 / +250 / +450 ms progress check off (the 0e first-sighting probe alone). Both re-read at Welcome.
-    std::atomic<int> g_meleeSurveyWanted{1};
+    // 0.4.30: the survey is off by default (melee_survey=N restores it): with the start phase fixed every variant progresses, and the tie-break
+    // would pin the first entry (the 480 ms loop = the wind-up only).
+    std::atomic<int> g_meleeSurveyWanted{0};
     std::atomic<bool> g_meleeFollowWanted{true};
+    // 0.4.30 anim_phase_fix (default on; 0 = 0.4.29): TASK_PLAY_ANIM's 8th argument is the START PHASE; swings and emotes start at 0, not 1.0
+    // (their end). stagger_clip (default on; 0 = the W8 ragdoll): a melee stagger is a stumble clip on the feet (sync::ReactionToShow).
+    std::atomic<bool> g_animPhaseFix{true}, g_staggerClip{true};
+    float AnimPhase() { return sync::AnimStartPhase(g_animPhaseFix.load(std::memory_order_relaxed)); }
+    // an emote's 8th argument: the start phase, or with anim_phase_fix=0 what 0.4.29 passed there (the wire's playback rate / 100)
+    float EmotePhase(const proto::Anim& a) { return g_animPhaseFix.load(std::memory_order_relaxed) ? AnimPhase() : a.playbackRate / 100.0f; }
+    // a non-survey swing's duration: the whole clip, or with anim_phase_fix=0 the 0.4.29 400 ms
+    int SwingDurationDefault() { return g_animPhaseFix.load(std::memory_order_relaxed) ? sync::kSwingClipLength : 400; }
     // R5: melee_loop (default on; 0 = the round-4 survey plan, ladder and melee task exactly as they were): the plan and the ladder start with the LOOPED clip (flags 49,
     // ended by us with STOP_ANIM_TASK) and the plain one (flags 0), and the melee-task rung borrows an anchor ped where the puppet has none. Re-read at Welcome.
-    std::atomic<bool> g_meleeLoopWanted{true};
+    // 0.4.30: default OFF (melee_loop=1 restores it): the loop was the only variant that showed because of the start phase, and it is ended at 480 ms.
+    std::atomic<bool> g_meleeLoopWanted{false};
     sync::SwingSurvey g_swingSurvey;
     uint32_t g_swingNo = 0, g_ownSwingNo = 0;
-    int g_swingDurationMs = 400;                       // the duration of a non-survey swing (a survey winner may set it to the clip's length)
+    int g_swingDurationMs = sync::kSwingClipLength;    // the duration of a non-survey swing (0.4.30: the whole clip; was 400 ms = the wind-up)
     bool g_swingTestForce = false;                     // a /swing test: the overlay names the attempt
     double g_meleeTaskModUntilMs = 0;                  // the AI melee modifier is held at 0 until then (the melee-task rung), 0 = not held
     bool g_meleeTaskModSet = false;
@@ -1067,6 +1097,8 @@ namespace {
         // capped, puppets that died of a takedown, the local health losses a puppet ped caused, AI modifier sets
         uint32_t reactStagger = 0, puppetStagger = 0, climbTasks = 0, climbFallbacks = 0, deadCapped = 0, takedownKills = 0,
                  puppetFireLoss = 0, aiModSets = 0;
+        // 0.4.30 stagger_clip: a stagger NOT shown because the clip's dictionary does not exist / was still streaming / TASK_PLAY_ANIM failed
+        uint32_t staggerNoDict = 0, staggerStreaming = 0, staggerFailed = 0;
         // 0c: melee Hits reported by the damage event / by the pool drop; damage events read in a swing window; swing
         // steps seen on puppets and why one was not shown (the ped was owned by something else, the dictionary was
         // still streaming or missing, the anim task failed)
@@ -2005,6 +2037,14 @@ namespace {
         g_proxContact.store(reg::Get(L"veh_prox_contact") != L"0"); // R3 T5: the proximity contact path (0 = the flag / speed loss / kick triggers only)
         g_contactGate.store(reg::Get(L"veh_contact_gate") != L"0"); // R4 T2: a copy's contact counts only with a vehicle we control near (0 = any contact, round 3)
         g_accelExtrap.store(reg::Get(L"veh_accel_extrap") != L"0"); // R4 T2: acceleration-aware extrapolation of copies (0 = constant velocity, round 3)
+        g_rideFree.store(reg::Get(L"veh_ride_free") != L"0");       // 0.4.30: copies keep their own ride height / tilt within tolerance (0 = 0.4.29)
+        g_omegaGuard.store(reg::Get(L"veh_omega_guard") != L"0");   // 0.4.30: no derived omega across sources or from a standing pair (0 = 0.4.29)
+        GLOGI("engine: vehicle omega guard (0.4.30): veh_omega_guard=%s", g_omegaGuard.load()
+              ? "on (a copy's derived angular velocity never pairs two machines' poses and is 0 for a standing pair: parked copies hold their pose)"
+              : "OFF (0.4.29: derived from any neighbour pair)");
+        GLOGI("engine: vehicle ride freedom (0.4.30): veh_ride_free=%s (copies of wheeled ground vehicles, not airborne: vertical error up to %.2f m and "
+              "pitch / roll up to %.0f deg left to the copy's own suspension, only the excess corrected)", g_rideFree.load() ? "on" : "OFF (0.4.29: full 3D correction)",
+              (double)sync::kRideTolM, (double)sync::kTiltTolDeg);
         g_rideGate.store(reg::Get(L"veh_ride_gate") != L"0");       // 0.4.17: a car we only ride in is not "a vehicle we control" (0 = 0.4.15)
         g_rideLead.store(reg::Get(L"veh_ride_lead") != L"0");       // 0.4.17: no near-car lead on the car we ride in (0 = 0.4.15)
         GLOGI("engine: passenger ride (0.4.17): veh_ride_gate=%s veh_ride_lead=%s", g_rideGate.load() ? "on" : "OFF (0.4.15)",
@@ -2019,12 +2059,19 @@ namespace {
         g_hornHeld.store(reg::Get(L"veh_horn_held") != L"0");       // 0.4.19: mode "HELDDOWN" (0 = mode 0)
         g_hornStop.store(reg::Get(L"veh_horn_stop") != L"0");       // 0.4.19: the release call (0 = the hold runs out)
         g_lightsKeep.store(reg::Get(L"veh_lights_keep") != L"0");   // 0.4.19: the lights read-back and re-issue (0 = on change only)
+        g_lightsBeamLit.store(reg::Get(L"veh_lights_beam_lit") != L"0");   // 0.4.30: a high beam read as lightsOn 0 / highbeamsOn 1 is lit
+        g_sirenHorn.store(reg::Get(L"veh_siren_horn") != L"0");    // 0.4.30: siren on + E held sends the horn bit (0 = IS_HORN_ACTIVE only)
+        GLOGI("engine: vehicle signals (0.4.30): veh_lights_beam_lit=%s; veh_siren_horn=%s", g_lightsBeamLit.load()
+              ? "on (GET_VEHICLE_LIGHTS_STATE lightsOn OR highbeamsOn = lit: the HUD lamp, the headlights bit sent, the copies' keeper)"
+              : "OFF (0.4.29: lightsOn alone; a high beam read as lightsOn 0 is off)",
+              g_sirenHorn.load() ? "on (siren on + E held by the driver = the horn bit; the siren's second tone leaves IS_HORN_ACTIVE false)"
+                                 : "OFF (0.4.29: IS_HORN_ACTIVE alone)");
         {
             const sync::HornConfig hc = HornConfigNow();
             GLOGI("engine: vehicle signals (0.4.19): veh_horn_sync=%s, veh_horn_held=%s, veh_horn_stop=%s, veh_lights_keep=%s; indicators: the 3889 "
                   "script API has no getter (GET_VEHICLE_INDICATOR_LIGHTS is in neither crossmap), so since 0.4.22 the controller's own key state "
-                  "machine is what goes in the flags2 bits (veh_keys / veh_indicator_sync, below); wheel spin: a copy moves by SET_ENTITY_VELOCITY every frame (its wheels roll on the road; no "
-                  "script read-back of a wheel's speed exists); steering: SET_VEHICLE_STEER_BIAS every frame (no read-back of the wheel angle exists)",
+                  "machine is what goes in the flags2 bits (veh_keys / veh_indicator_sync, below); wheel spin: a copy moves by SET_ENTITY_VELOCITY every frame (whether its wheels turn is UNPROVEN: 0.4.30 logs the brake / handbrake fields of moving copies; no "
+                  "script read-back of a wheel's speed exists); steering: the CVehicle steering-angle field when veh_steer_field resolved it (hook: [vehfields]), else SET_VEHICLE_STEER_BIAS (0.4.29; it does not turn a script-driven copy)",
                   g_hornSync.load() ? "on (a rise starts the horn at once, renewed while held)" : "OFF (0.4.17: START_VEHICLE_HORN 400 ms per received state)",
                   g_hornHeld.load() ? "on (mode HELDDOWN)" : "OFF (mode 0)",
                   g_hornStop.load() ? "on (a 1 ms call at the release)" : "OFF (the hold runs out)",
@@ -2092,12 +2139,18 @@ namespace {
                                                                                   : ma == L"off" ? sync::SwingMode::Off : sync::SwingMode::Auto));
                 // R4 T3: melee_survey (cycles over the survey plan, default 1, 0 = off) and melee_follow (0 = no progress check)
                 const std::wstring sv = reg::Get(L"melee_survey");
-                int cycles = 1;
+                int cycles = 0;                        // 0.4.30: off by default
                 if (!sv.empty() && sv[0] >= L'0' && sv[0] <= L'9')
                     cycles = sv[0] - L'0';
                 g_meleeSurveyWanted.store(cycles > 3 ? 3 : cycles);
                 g_meleeFollowWanted.store(reg::Get(L"melee_follow") != L"0");
-                g_meleeLoopWanted.store(reg::Get(L"melee_loop") != L"0");
+                g_meleeLoopWanted.store(reg::Get(L"melee_loop") == L"1");   // 0.4.30: off by default
+                g_animPhaseFix.store(reg::Get(L"anim_phase_fix") != L"0");
+                g_swingDurationMs = SwingDurationDefault();
+                g_staggerClip.store(reg::Get(L"stagger_clip") != L"0");
+                GLOGI("engine: punches (0.4.30): anim_phase_fix=%s, stagger_clip=%s; swing duration the whole clip, melee_survey default 0, melee_loop default off",
+                      g_animPhaseFix.load() ? "on (TASK_PLAY_ANIM start phase 0)" : "OFF (start phase 1.0, 0.4.29)",
+                      g_staggerClip.load() ? "on (a melee stagger is the reaction@shove clip, never a ragdoll)" : "OFF (the W8 ragdoll stagger)");
                 GLOGI("engine: melee swing (R5): melee_loop=%s (%s); melee_survey=%d, melee_follow=%s", g_meleeLoopWanted.load() ? "ON" : "off",
                       g_meleeLoopWanted.load() ? "plan: looped clip flags 49 ended by STOP_ANIM_TASK, plain flags 0, then the round-4 attempts; melee task may borrow an anchor ped"
                                                : "the round-4 plan and ladder, the melee task only with a locomotion anchor", g_meleeSurveyWanted.load(),
@@ -2387,6 +2440,7 @@ namespace {
             s.angVel = { st.avx, st.avy, st.avz };
             s.hasAngVel = g_vehUseAngVel.load(std::memory_order_relaxed);
             s.steering = st.steer;
+            s.src = st.ctrl;                           // 0.4.30: omega is derived within one controller's stream only
             // Only a sample that was new information asks the shared clock for delay (as for peds).
             const sync::VehPush pushed = v.interp.Push(s);
             if (pushed == sync::VehPush::Accepted || pushed == sync::VehPush::Teleported)
@@ -4511,6 +4565,7 @@ namespace {
         pe.hitReact.Clear();
         pe.reactLifted = false;
         pe.reactRagdolled = false;
+        pe.reactClip = false;
         pe.reactDamage = 0;
         pe.reactFlags = 0;
         pe.edges.Reset();                              // W6: a fresh ped has done no reload / stealth / cover / entering yet
@@ -5145,7 +5200,7 @@ namespace {
         const sync::SwingVariant var = att.variant;
         const bool ok = var == sync::SwingVariant::MeleeTask
                             ? IssuePeerMeleeTask(pe, nowMs)
-                            : g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, att.durationMs, sync::SwingVariantFlags(var), 1.0f);
+                            : g_world->TaskPlayAnim(pe.ped, c.dict, c.clip, 8.0f, -8.0f, att.durationMs, sync::SwingVariantFlags(var), AnimPhase());
         if (ok)
         {
             ++g_v4.peerSwings;
@@ -6088,16 +6143,50 @@ namespace {
     // known) or a flinch bullet (from the attacker's position; with no attacker known there is nothing to shoot
     // from, so only a knockdown shows). Script tick, no lock, pe.ped != 0. Called by TickPeerHitReact for the
     // Damage the server confirmed on a Hit of ours and for the onlooker Damage of protocol v5.
+    // 0.4.30 stagger_clip: the stumble clip of a melee stagger. INFERRED names: DOES_ANIM_DICT_EXIST decides, the trace reads the clip back.
+    constexpr const char* kStaggerDict = "reaction@shove";
+    constexpr const char* kStaggerClip = "shoved_back";
+    // 0 = playing, 1 = no such dictionary, 2 = still streaming (requested now), 3 = the call failed. Counted when not 0.
+    int PlayStaggerClip(int32_t ped, const char* who)
+    {
+        int rc = 0;
+        if (g_world->AnimDictExists(kStaggerDict) == 0)
+            rc = 1;
+        else if (!g_world->HasAnimDictLoaded(kStaggerDict))
+        {
+            g_world->RequestAnimDict(kStaggerDict);
+            rc = 2;
+        }
+        else if (!g_world->TaskPlayAnim(ped, kStaggerDict, kStaggerClip, 8.0f, -8.0f, -1, 0, AnimPhase()))
+            rc = 3;
+        if (rc == 1) ++g_v4.staggerNoDict;
+        else if (rc == 2) ++g_v4.staggerStreaming;
+        else if (rc == 3) ++g_v4.staggerFailed;
+        else
+            BeginTrace(TraceProbe::Anim, ped, std::string(who) + " hit reaction 'melee stagger' clip", kStaggerDict, kStaggerClip);
+        return rc;
+    }
+
     void ApplyPuppetHitReact(Peer& pe, int peerId, const sync::HitReaction& r, double nowMs, bool haveAttacker, float ax,
                              float ay, float az, uint32_t attackerWeapon)
     {
-        bool ragdoll = false, bullet = false;
-        sync::ReactionToShow(g_hitReact.load(std::memory_order_relaxed), r, ragdoll, bullet);
+        bool ragdoll = false, bullet = false, clip = false;
+        sync::ReactionToShow(g_hitReact.load(std::memory_order_relaxed), r, ragdoll, bullet, clip, g_staggerClip.load(std::memory_order_relaxed));
         if (bullet && !haveAttacker)
             bullet = false;
-        if (!pe.ped || (!ragdoll && !bullet))
+        if (!pe.ped || (!ragdoll && !bullet && !clip))
             return;
         const int32_t ped = pe.ped;
+        if (clip)
+        {
+            // on its feet: PCF 188 and the ragdoll block stay as they are, so GTA's own fist cannot ragdoll it either
+            if (PlayStaggerClip(ped, "puppet") != 0)
+                return;                                // nothing shown rather than the ragdoll GI complained about (counted)
+            pe.hitReact.Start(nowMs, r);
+            pe.reactClip = true;                       // the window's end re-issues the gait the clip replaced
+            ++g_v4.puppetStagger;
+            return;
+        }
         g_world->SetPedConfigFlag(ped, 188, false);
         pe.reactLifted = true;
         sync::HitReaction shown;
@@ -6150,10 +6239,12 @@ namespace {
             g_world->SetPedCanRagdoll(pe.ped, false);
             g_world->SetPedConfigFlag(pe.ped, 188, true);
         }
+        const bool clip = pe.reactClip && pe.ped;
         pe.reactLifted = false;
         pe.reactRagdolled = false;
+        pe.reactClip = false;
         pe.aimTask = false;
-        if (cleared)
+        if (cleared || clip)
             LocoReset(pe, kSiteHitReact);              // the controller re-issues its gait (a real drift still snaps)
         else
             LocoSoft(pe, kSiteHitReact);
@@ -6205,7 +6296,7 @@ namespace {
         {
             // The death display owns the ped (it has enabled the ragdoll itself): nothing to put back.
             pe.hitReact.Clear();
-            pe.reactLifted = pe.reactRagdolled = false;
+            pe.reactLifted = pe.reactRagdolled = pe.reactClip = false;
             pe.reactDamage = 0;
             pe.reactFlags = 0;
             return false;
@@ -6271,10 +6362,19 @@ namespace {
         // names where it landed: the flags already carry what the reaction depends on).
         const sync::HitReaction r = sync::HitReact::Decide((int)(ds.otherDamage > 100000u ? 100000u : ds.otherDamage),
                                                            ServerMaxHp(lp), ds.otherFlags, g_localReact.SinceLastMs(nowMs), st);
-        bool ragdoll = false, bullet = false;
-        sync::ReactionToShow(mode, r, ragdoll, bullet);
-        if (!ragdoll && !bullet)
+        bool ragdoll = false, bullet = false, clip = false;
+        sync::ReactionToShow(mode, r, ragdoll, bullet, clip, g_staggerClip.load(std::memory_order_relaxed));
+        if (!ragdoll && !bullet && !clip)
             return;
+        if (clip)
+        {
+            // 0.4.30: a stumble on our feet, no SetPedCanRagdoll and no push, so we send no ragdoll flag either (no mirrored fall on the attacker's screen)
+            if (PlayStaggerClip(lp, "local") != 0)
+                return;
+            g_localReact.Start(nowMs, r);
+            ++g_v4.reactStagger;
+            return;
+        }
         int32_t attPed = 0;
         float qx = 0, qy = 0, qz = 0;
         {
@@ -6394,7 +6494,7 @@ namespace {
                 ClearPedTasksNow(pe.ped);
             const bool called = g_world->TaskPlayAnim(pe.ped, a.dict.c_str(), a.name.c_str(), a.blendIn, a.blendOut,
                                                       sync::EmoteArbiter::GtaDuration(a.durationMs),
-                                                      (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
+                                                      (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), EmotePhase(a));   // 0.4.30: the start phase (the wire rate has no setter here)
             if (o.resetLoco)
                 LocoReset(pe, kSiteEmoteEnd);          // the gait was cleared under an upper-body anim: the controller re-issues it
             pe.aimTask = false;
@@ -6653,15 +6753,17 @@ namespace {
             // into the rigid follow split into explained (a window was open in the last blendAttributeMs) and unexplained, the probation after the way
             // back up, and the heading numbers (degrees; frames with the pose over 1 m/s): the puppet's heading against the sender's, the angle
             // between the pose's velocity and the puppet's heading, and between the puppet's OWN velocity and its heading (90 = it slides sideways)
-            char r5[900];
+            char r5[1100];
             std::snprintf(r5, sizeof(r5),
                           " | R5: grace windows %u (%u frames held, %u places, %u chain caps), falls to the rigid follow %u explained / %u unexplained, probations %u (%u fell again), "
-                          "heading error mean %.1f p95 %.1f deg (%u frames), pose velocity vs puppet heading mean %.1f p95 %.1f deg, puppet's own velocity vs its heading mean %.1f p95 %.1f deg (%u frames)",
+                          "heading error mean %.1f p95 %.1f deg (%u frames; 0.4.30: no ragdoll / jump / swim / aim frames), pose velocity vs puppet heading mean %.1f p95 %.1f deg, "
+                          "puppet's own velocity vs its heading mean %.1f p95 %.1f deg (%u frames), SENDER off-axis (velocity vs its own heading) mean %.1f p95 %.1f deg, "
+                          "%u of %u frames over 60 deg (strafe / backpedal)",
                           (unsigned)(a.graceWindows - b.graceWindows), (unsigned)(a.graceHeldFrames - b.graceHeldFrames), (unsigned)(a.gracePlaced - b.gracePlaced),
                           (unsigned)(a.graceChainCapped - b.graceChainCapped), (unsigned)(a.fallsAfterGrace - b.fallsAfterGrace),
                           (unsigned)(a.fallsUnexplained - b.fallsUnexplained), (unsigned)(a.probations - b.probations), (unsigned)(a.probationFalls - b.probationFalls),
                           d.headErrMeanDeg, d.headErrP95Deg, (unsigned)d.headFrames, d.poseVelHeadMeanDeg, d.poseVelHeadP95Deg, d.pedVelHeadMeanDeg, d.pedVelHeadP95Deg,
-                          (unsigned)d.pedVelHeadFrames);
+                          (unsigned)d.pedVelHeadFrames, d.senderOffMeanDeg, d.senderOffP95Deg, (unsigned)d.senderOffOver60, (unsigned)d.senderOffFrames);
             line += r5;
         }
         return line;
@@ -7511,7 +7613,7 @@ namespace {
             df.blendPlaced = o.level == sync::LocoLevel::Placed;
             df.pedHeading = in.pedHeading;                 // R5 telemetry: GET_ENTITY_HEADING of the puppet against the sender's heading
             df.poseHeadingDeg = in.heading;
-            df.haveHeading = true;
+            df.haveHeading = sync::HeadingTelemetryFrame(in.ragdoll, in.jumping, in.swimming, aiming);   // 0.4.30: was always true
             pe.slide.Observe(df);
         }
 
@@ -7889,6 +7991,7 @@ namespace {
             *leadMs = add;
         v.interp.SetExtrapolateMaxMs(sync::VehicleInterpConfig().extrapolateMaxMs + (nearOn ? add : 0.0));   // R3 T5: the cap grows with the lead
         v.interp.SetAccelExtrapolation(g_accelExtrap.load(std::memory_order_relaxed));                         // R4 T2
+        v.interp.SetOmegaGuard(g_omegaGuard.load(std::memory_order_relaxed));                                 // 0.4.30
         const double disp = renderT - extra + add;
         if (dispOut)
             *dispOut = disp;
@@ -7917,9 +8020,9 @@ namespace {
     }
     // R3 T5: the vehicles' interpolator totals over every copy (session totals; the position line prints the 10 s deltas): snapshots stored, identical or
     // earlier-placed resends dropped, stale ones, teleports.
-    void VehInterpTotals(uint32_t& accepted, uint32_t& repeats, uint32_t& stale, uint32_t& teleports)
+    void VehInterpTotals(uint32_t& accepted, uint32_t& repeats, uint32_t& stale, uint32_t& teleports, uint32_t& omegaStill, uint32_t& omegaCross)
     {
-        accepted = repeats = stale = teleports = 0;
+        accepted = repeats = stale = teleports = omegaStill = omegaCross = 0;
         PeersLock lk(g_peersMtx, true);
         for (const auto& kv : g_vehNet)
         {
@@ -7928,6 +8031,8 @@ namespace {
             repeats += s.repeats;
             stale += s.stale;
             teleports += s.teleports;
+            omegaStill += s.omegaStill;
+            omegaCross += s.omegaCross;
         }
     }
     void ClearVehInterp(uint16_t id)
@@ -8394,7 +8499,7 @@ namespace {
     // treats that as "no information / not done", and nothing below changes behaviour until GI adds the hashes.
     // Control ids (INFERRED, GET_CONTROL_NORMAL(0, id)): INPUT_VEH_MOVE_LR 59 (-1 left .. +1 right), INPUT_VEH_ACCELERATE 71,
     // INPUT_VEH_BRAKE 72, INPUT_VEH_HANDBRAKE 76. The steering-axis agreement counters in the 10 s line show a wrong id or sign.
-    constexpr int kCtlVehMoveLR = 59, kCtlVehAccelerate = 71, kCtlVehBrake = 72, kCtlVehHandbrake = 76;
+    constexpr int kCtlVehMoveLR = 59, kCtlVehAccelerate = 71, kCtlVehBrake = 72, kCtlVehHandbrake = 76, kCtlVehHeadlight = 74, kCtlVehHorn = 86;
     constexpr double kVisReadMs = 250.0;          // the controller reads its car's tyres / windows this often
     constexpr double kVisNearM = 150.0;           // a copy within this distance of us is re-checked and scanned after our shots
     struct VisStats
@@ -8406,6 +8511,11 @@ namespace {
         // brake lights / handbrake / steering
         uint32_t brakeSet = 0, brakeFail = 0, handSet = 0, handFail = 0, brakeBitsSent = 0, handBitsSent = 0, pedalReadFail = 0;
         uint32_t steerApplied = 0, steerApplyFail = 0;
+        // 0.4.30 veh_steer_field: frames written through the field / refused by it (not a plausible angle: the bias took over), read-backs of
+        // the last write (held = the game kept it a frame), our own car's field against the steering axis (sign proof), and on moving copies
+        // (> 3 m/s) the brake float / handbrake byte next to the field (is the script driver holding the wheels?)
+        uint32_t steerField = 0, steerFieldRefused = 0, steerFieldHeld = 0, steerFieldOverwritten = 0, signAgree = 0, signDisagree = 0;
+        uint32_t copyMoving = 0, copyBrake = 0, copyHandbrake = 0;
         float steerAppliedMin = 0.0f, steerAppliedMax = 0.0f;
         double steerAppliedSum = 0.0;
         sync::SteerStats steerSent;
@@ -8911,6 +9021,7 @@ namespace {
         {
             const sync::LightsWant want{ sync::HeadlightsShown((st.flags & proto::kVehLights) != 0, (st.flags2 & proto::kVeh2Headlights) != 0),
                                          (st.flags2 & proto::kVeh2HighBeam) != 0 };
+            v.lightsKeep.Configure(LightsConfigNow());
             const sync::LightsCmd c = sync::StepLights(v.lightsKeep, g, want, nearUs, nowMs);
             if (c.setMode)
                 v.appliedLights = c.mode;
@@ -9275,7 +9386,9 @@ namespace {
                     v.moving = false;
                     v.lastReadMs = v.bodyReadMs = -1e9;
                     v.steerPrev = 0.0f;
-                    v.vis.Reset();                     // T3: the new controller's tyres / windows are read and applied afresh
+                    v.sirenHornHold = sync::SirenHornHold();
+                    v.steerFieldWritten = NAN;         // 0.4.30: no read-back of a write made under the previous role
+                    v.vis.Reset();                    // T3: the new controller's tyres / windows are read and applied afresh
                     v.visReadMs = -1e9;
                     v.sentVis = sync::VisualMask();
                     v.steerPrevRotMs = -1e9;
@@ -9434,6 +9547,10 @@ namespace {
                                 if (r4OwnDist < 3.0)
                                     ++g_r4.ownUnder3m;
                             }
+                            if (g_rideFree.load(std::memory_order_relaxed) && sync::RideFreeClass(v.vehClass))   // wheeled ground classes only
+                                v.drive.SetRideFreedom(sync::kRideTolM, sync::kTiltTolDeg);
+                            else
+                                v.drive.SetRideFreedom(0.0f, 0.0f);
                             sync::VehicleDriveOutput o = v.drive.Update(in);
                             {
                                 // 0.4.22 shake meter: the error vectors the controller worked from (target - local, and the rotation that takes the local
@@ -9650,7 +9767,32 @@ namespace {
                             // called. Whether it turns a puppet's visible wheels is INFERRED (verify live).
                             if (o.setSteering)
                             {
-                                const bool steerOk = g_world->SetVehicleSteerBias(h, -o.steering);
+                                // 0.4.30 veh_steer_field: the CVehicle steering angle when it resolved (the bias does nothing on a
+                                // script-ped-driven copy); first the read-back of last frame's write: held, or overwritten by the game
+                                const bool fieldOn = g_world->VehicleFieldsReady();
+                                if (fieldOn && std::isfinite(v.steerFieldWritten))
+                                {
+                                    float before = 0.0f;
+                                    if (g_world->GetVehicleSteerAngle(h, before))
+                                        ++(std::fabs(before - v.steerFieldWritten) < 0.01f ? g_vis.steerFieldHeld : g_vis.steerFieldOverwritten);
+                                }
+                                const sync::CopySteer how = sync::ApplyCopySteer(*g_world, h, o.steering, fieldOn);
+                                v.steerFieldWritten = how == sync::CopySteer::Field ? sync::SteerAngleFromWire(o.steering) : NAN;
+                                if (how == sync::CopySteer::Field) ++g_vis.steerField;
+                                else if (fieldOn && how == sync::CopySteer::Bias) ++g_vis.steerFieldRefused;
+                                if (fieldOn)
+                                {
+                                    float brake = 0.0f;
+                                    bool hand = false;
+                                    const float sp = std::sqrt(in.localVel.x * in.localVel.x + in.localVel.y * in.localVel.y);
+                                    if (sp > 3.0f && g_world->GetVehicleCopyControls(h, brake, hand))
+                                    {
+                                        ++g_vis.copyMoving;
+                                        if (brake > 0.5f) ++g_vis.copyBrake;
+                                        if (hand) ++g_vis.copyHandbrake;
+                                    }
+                                }
+                                const bool steerOk = how != sync::CopySteer::Failed;
                                 if (steerOk)
                                 {
                                     const float w = -o.steering;
@@ -9662,6 +9804,8 @@ namespace {
                                 else
                                     ++g_vis.steerApplyFail;
                             }
+                            else
+                                v.steerFieldWritten = NAN;     // no write this frame: the next read-back has nothing to compare
                             v.lastDriveMs = nowMs;
                         }
                     }
@@ -11354,7 +11498,11 @@ namespace {
             const uint8_t ind = sync::HudIndicators(driver, g_vc.Indicators(), nv && nv->haveState ? nv->st.flags2 : (uint8_t)0, indSync);
             bool lightsOn = false, highBeam = false;
             lastLightsOk = g_world->GetVehicleLightsState(veh, lightsOn, highBeam);
-            lastLights = sync::HudLights(lastLightsOk, lightsOn, highBeam);
+            lastLights = sync::HudLights(lastLightsOk, lightsOn, highBeam, g_lightsBeamLit.load(std::memory_order_relaxed));
+            if (lastLightsOk)
+                ++g_vcx.lightsRaw[(lightsOn ? 1 : 0) | (highBeam ? 2 : 0)];
+            if (g_world->IsDisabledControlJustPressed(0, kCtlVehHeadlight))
+                ++g_vcx.headlightPresses;
             if (lastLights == 1) ++g_vcx.lightsLow;
             else if (lastLights == 2) ++g_vcx.lightsHigh;
             hud.show = true;
@@ -11407,12 +11555,13 @@ namespace {
                   s.rejNoFuel, s.rejOff, s.indicatorChanges, s.autoCancels, VcIndName(g_vc.Indicators()), x.indCalls, x.indFailed, s.engineOff, s.engineOn,
                   s.engineGuards, s.fuelCuts, x.engineCalls, x.engineFailed, lastEngineOk ? (lastEngineRunning ? "running" : "stopped") : "not readable",
                   x.engineStopped, x.ticksInVeh);
-            GLOGI("engine: vehicle controls (0.4.22), last 10 s, continued: READ-BACK GET_VEHICLE_LIGHTS_STATE %s, low beam %u / high beam %u ticks; "
+            GLOGI("engine: vehicle controls (0.4.22), last 10 s, continued: READ-BACK GET_VEHICLE_LIGHTS_STATE %s, low beam %u / high beam %u ticks "
+                  "(raw lightsOn/highbeamsOn 0/0 %u, 1/0 %u, 0/1 %u, 1/1 %u; H pressed %u); "
                   "belt: on %u / off %u, unbuckled by F %u, flag re-asserted %u, SET_PED_CONFIG_FLAG(32) calls %u (%u failed), READ-BACK flag 32 %s "
                   "(%u reads, %u failed, true on %u) while the belt is %s; COPIES: SET_VEHICLE_INDICATOR_LIGHTS %u (%u failed) and SET_VEHICLE_ENGINE_ON %u "
                   "applied from the controllers' bits; fuel gauge %s (%u permille)",
                   lastLightsOk ? (lastLights == 0 ? "lights off" : (lastLights == 1 ? "low beam" : "high beam")) : "not readable",
-                  x.lightsLow, x.lightsHigh, s.beltOn, s.beltOff, s.beltAuto, s.beltReasserts, x.beltCalls, x.beltFailed,
+                  x.lightsLow, x.lightsHigh, x.lightsRaw[0], x.lightsRaw[1], x.lightsRaw[2], x.lightsRaw[3], x.headlightPresses, s.beltOn, s.beltOff, s.beltAuto, s.beltReasserts, x.beltCalls, x.beltFailed,
                   lastBeltOk ? (lastBeltFlag ? "true (flies through the windscreen)" : "false (held)") : "not read", x.beltReads, x.beltReadFail, x.beltFlagTrue,
                   g_vc.Belt() ? "buckled" : "off", x.copyIndApplied, x.copyIndFailed, x.copyEngineApplied,
                   g_fuelHud.show ? "shown" : "hidden", (unsigned)(g_fuelHud.frac * 1000.0f + 0.5f));
@@ -11576,7 +11725,7 @@ namespace {
         }
         int roof = 0;
         const bool haveRoof = g_world->GetConvertibleRoofState(veh, roof);
-        flags2 = sync::Flags2FromState(lightsOn, highBeam, false, false, false, haveRoof && sync::RoofDownFromState(roof));
+        flags2 = sync::Flags2FromState(sync::LightsLit(lightsOn, highBeam, g_lightsBeamLit.load(std::memory_order_relaxed)), highBeam, false, false, false, haveRoof && sync::RoofDownFromState(roof));
         doors = sync::DoorsFromRatios(ratios);
     }
 
@@ -11663,10 +11812,28 @@ namespace {
                 u.steer = sc.steer;
                 v.steerPrev = u.steer;
                 g_vis.steerSent.Add(sc, axisOk, axis, sync::EstimateSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), 0.0f), vFwd);
+                // 0.4.30 sign proof of the steering field: our own car's angle against the axis held over half (axis + = right, angle + = left)
+                float ownAngle = 0.0f;
+                if (axisOk && std::fabs(axis) > 0.5f && g_world->VehicleFieldsReady() && g_world->GetVehicleSteerAngle(v.handle, ownAngle) &&
+                    std::fabs(ownAngle) > 0.05f)
+                    ++((ownAngle > 0.0f) == (axis < 0.0f) ? g_vis.signAgree : g_vis.signDisagree);
             }
             if (g_world->IsVehicleEngineRunning(v.handle)) u.flags |= proto::kVehEngine;
             if (g_world->IsVehicleSirenOn(v.handle))      u.flags |= proto::kVehSiren;
-            if (g_world->IsHornActive(v.handle))          u.flags |= proto::kVehHorn;
+            {
+                // 0.4.30: with the siren on, a held E is the siren's second tone and IS_HORN_ACTIVE stays false: send the held key
+                const bool hornActive = g_world->IsHornActive(v.handle);
+                const bool sirenOn = (u.flags & proto::kVehSiren) != 0;
+                float hornAxis = 0.0f;
+                const bool hornAxisOk = !hornActive && sirenOn && drivenByMe && g_world->GetControlNormal(0, kCtlVehHorn, hornAxis);
+                if (v.sirenHornHold.Step(hornActive, sync::HornBitToSend(hornActive, sirenOn, drivenByMe, hornAxisOk, hornAxis,
+                                                                         g_sirenHorn.load(std::memory_order_relaxed)), nowMs))
+                {
+                    u.flags |= proto::kVehHorn;
+                    if (!hornActive) ++g_sig.sentSirenHorn;
+                }
+                if (sirenOn) ++g_sig.sentSiren;
+            }
             // The body (lights, doors, roof): at most every kBodyReadMs, the last read in between.
             if (nowMs - v.bodyReadMs >= kBodyReadMs)
             {
@@ -12037,7 +12204,7 @@ namespace {
         // the 10 s window
         uint32_t frames = 0, grounded = 0, brakeDown = 0, downN = 0, gripN = 0, brakeN = 0, yawN = 0, velN = 0, angN = 0;
         uint32_t readFail = 0, velFail = 0, angFail = 0, healthFixed = 0;
-        double downSum = 0, gripSum = 0, brakeSum = 0;
+        double downSum = 0, gripSum = 0, brakeSum = 0, yawCutSum = 0, yawCutMax = 0;
         float peakMs = 0;
     };
     struct HyperTough { bool strong = false, axles = false, tyres = false, wheels = false, degrade = false, tank = false; };
@@ -12193,13 +12360,21 @@ namespace {
         in.accel = accel;
         in.dt = (float)(dtMs / 1000.0);
         in.mask = st.mask;
-        const sync::HyperAssistOut out = sync::HyperAssistStep(p.assist, in);
+        sync::HyperAssist a = p.assist;
+        if (!g_hyperYaw0430.load(std::memory_order_relaxed))
+            sync::RestoreYawCap0429(a);
+        const sync::HyperAssistOut out = sync::HyperAssistStep(a, in);
         if (in.grounded) ++st.grounded;
         if (brake > 0.05f) ++st.brakeDown;
         if (out.downMs2 > 0) { ++st.downN; st.downSum += out.downMs2; }
         if (out.gripMs2 > 0) { ++st.gripN; st.gripSum += out.gripMs2; }
         if (out.brakeMs2 > 0) { ++st.brakeN; st.brakeSum += out.brakeMs2; }
-        if (out.yawClamped) ++st.yawN;
+        if (out.yawClamped)
+        {
+            ++st.yawN;
+            st.yawCutSum += out.yawCut;
+            st.yawCutMax = std::max(st.yawCutMax, (double)out.yawCut);
+        }
         if (out.velChanged)
         {
             if (g_world->SetEntityVelocity(veh, out.vel.x, out.vel.y, out.vel.z))
@@ -12257,17 +12432,18 @@ namespace {
             return;
         if (st.frames > 0)
             GLOGI("engine: hyper assist (%s, vehicle %d), last %.0f s: %u frames (%u on the ground, brake pedal down in %u), peak speed %.0f km/h of %.0f; "
-                  "applied: downforce %u frames (mean %.1f m/s^2), lateral grip %u (mean %.1f), brake assist %u (mean %.1f), yaw cap %u; "
+                  "applied: downforce %u frames (mean %.1f m/s^2), lateral grip %u (mean %.1f), brake assist %u (mean %.1f), yaw cap %u (cut mean %.2f / max %.2f rad/s, %s); "
                   "writes: velocity %u, angular %u; failures: reads %u, velocity writes %u, angular writes %u; read-back: velocity ok %u / bad %u, "
                   "angular ok %u / bad %u; health top-ups %u; mask 0x%x%s%s", sync::HyperProfileName(p), st.veh, (now - st.logMs) / 1000.0, st.frames, st.grounded,
                   st.brakeDown, (double)st.peakMs * 3.6, (double)p.targetKmh, st.downN, st.downN ? st.downSum / st.downN : 0.0, st.gripN,
-                  st.gripN ? st.gripSum / st.gripN : 0.0, st.brakeN, st.brakeN ? st.brakeSum / st.brakeN : 0.0, st.yawN, st.velN, st.angN,
+                  st.gripN ? st.gripSum / st.gripN : 0.0, st.brakeN, st.brakeN ? st.brakeSum / st.brakeN : 0.0, st.yawN,
+                  st.yawN ? st.yawCutSum / st.yawN : 0.0, st.yawCutMax, g_hyperYaw0430.load() ? "0.4.30 spin guard" : "0.4.29 cap, hyper_yaw=0", st.velN, st.angN,
                   st.readFail, st.velFail, st.angFail, st.velOk, st.velBad, st.angOk, st.angBad, st.healthFixed, st.mask,
                   st.velDead ? " (velocity write dropped)" : "", st.angDead ? " (angular write dropped)" : "");
         st.logMs = now;
         st.frames = st.grounded = st.brakeDown = st.downN = st.gripN = st.brakeN = st.yawN = st.velN = st.angN = 0;
         st.readFail = st.velFail = st.angFail = st.healthFixed = 0;
-        st.downSum = st.gripSum = st.brakeSum = 0;
+        st.downSum = st.gripSum = st.brakeSum = st.yawCutSum = st.yawCutMax = 0;
         st.peakMs = 0;
     }
 
@@ -12341,9 +12517,11 @@ namespace {
             for (wchar_t ch : maskReg)
                 narrow.push_back(ch < 128 ? (char)ch : '?');
             assistMask = sync::ParseHyperAssistMask(narrow.c_str());
+            g_hyperYaw0430.store(reg::Get(L"hyper_yaw") != L"0");
             GLOGI("engine: hyper tune switches: hyper_tune=%s, hyper_assist mask 0x%x (hyper_tune=0 turns the tune off; hyper_assist=<bits: 1 downforce, "
-                  "2 lateral grip, 4 brake assist, 8 yaw cap, 16 anti-roll; 0 = none> turns the handling assists off)", tuneOn ? "on" : "OFF",
-                  assistMask);
+                  "2 lateral grip, 4 brake assist, 8 yaw cap, 16 anti-roll; 0 = none> turns the handling assists off), yaw cap %s", tuneOn ? "on" : "OFF",
+                  assistMask, g_hyperYaw0430.load() ? "0.4.30 spin guard (hyper: 50 m/s^2 from 45 m/s, street: 32 from 35; hyper_yaw=0 = 0.4.29)"
+                                                    : "0.4.29 (30 / 18.4 m/s^2 from 20 m/s, hyper_yaw=0)");
         }
         if (!tuneOn)
             return;
@@ -12661,11 +12839,12 @@ namespace {
             // R4 T3: ... and the survey from its first attempt (only where animations are tried at all: auto / play)
             const sync::SwingMode sm = g_swingLadder.Mode();
             g_swingSurvey.Start(sm == sync::SwingMode::Auto || sm == sync::SwingMode::Play ? (uint32_t)g_meleeSurveyWanted.load() : 0u, g_meleeLoopWanted.load());
-            g_swingDurationMs = 400;
+            g_swingDurationMs = SwingDurationDefault();
             g_swingNo = 0;
             g_ownSwingNo = 0;
         }
         ReleaseSwingDicts();
+        g_world->RequestAnimDict(kStaggerDict);        // 0.4.30: the stagger clip is ready for the first punch
         g_haveRespawnOk = false;
         g_localSeat = -1;
         g_lastMarkedVeh = 0;
@@ -12870,7 +13049,7 @@ namespace {
                 g_world->ClearPedTasks(lp);            // 0e: an earlier emote of ours is still on the ped (a restart): blended out first
             const bool called = g_world->TaskPlayAnim(lp, a.dict.c_str(), a.name.c_str(), a.blendIn, a.blendOut,
                                                       sync::EmoteArbiter::GtaDuration(a.durationMs),
-                                                      (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), a.playbackRate / 100.0f);
+                                                      (int)sync::EmoteArbiter::GtaFlags(a.durationMs, a.flags), EmotePhase(a));   // 0.4.30: the start phase (the wire rate has no setter here)
             const bool sent = join::SendAnim(a);
             if (called)
             {
@@ -13143,19 +13322,24 @@ namespace {
                   "Hits (%u refused locally); since each car's first sight: %u reads, %u tyres burst / %u off the rim / %u fixed, %u windows smashed / %u fixed, "
                   "%u pops reported of which %u confirmed and %u expired, %u divergent reads of which %u stuck, %u failed command rounds (%u back-offs); steering "
                   "sent: n=%u min %.2f mean %.2f max %.2f (axis %u, held %u, estimate %u; axis agrees %u / disagrees %u with the estimate above 3 m/s); steering "
-                  "applied: n=%u (failed %u) min %.2f mean %.2f max %.2f; sender yaw rate, GET_ENTITY_ROTATION_VELOCITY / rotation-derived: mean %.2f over %u samples",
+                  "applied: n=%u (failed %u) min %.2f mean %.2f max %.2f; sender yaw rate, GET_ENTITY_ROTATION_VELOCITY / rotation-derived: mean %.2f over %u samples; "
+                  "0.4.30 steering field %s: written %u, refused or unreachable %u (bias instead), read-back held %u / overwritten %u, own-car sign agrees %u / disagrees %u; "
+                  "moving copies %u frames: brake > 0.5 on %u, handbrake on %u",
                   c.tyreReadOk, c.tyreReadFail, c.winReadOk, c.winReadFail, c.brakeSet, c.brakeFail, c.handSet, c.handFail, c.pedalReadFail, c.sentUpdates,
                   c.sentWithTyres, c.sentWithWindows, c.brakeBitsSent, c.handBitsSent, carsTyres, tyreBits, carsWindows, c.partHits, c.partHitsRefused, tot.reads,
                   tot.burstsApplied, tot.rimsApplied, tot.tyresFixed, tot.windowsSmashed, tot.windowsFixed, tot.reported, tot.confirmed, tot.expired, tot.divergent,
                   tot.stuck, tot.cmdFailures, tot.suspends, c.steerSent.n, (double)c.steerSent.min, c.steerSent.Mean(), (double)c.steerSent.max, c.steerSent.axis,
                   c.steerSent.held, c.steerSent.estimate, c.steerSent.agree, c.steerSent.disagree, c.steerApplied, c.steerApplyFail, (double)g_vis.steerAppliedMin,
                   c.steerApplied ? g_vis.steerAppliedSum / c.steerApplied : 0.0, (double)g_vis.steerAppliedMax, c.yawRatioN ? c.yawRatioSum / c.yawRatioN : 0.0,
-                  c.yawRatioN);
+                  c.yawRatioN, g_world->VehicleFieldsReady() ? "ready" : "NOT resolved (bias only; see hook: [vehfields])", c.steerField, c.steerFieldRefused,
+                  c.steerFieldHeld, c.steerFieldOverwritten, c.signAgree, c.signDisagree, c.copyMoving, c.copyBrake, c.copyHandbrake);
         // The window counters start over; the sync::VisualSync totals above run on.
         g_vis.reads = g_vis.tyreReadOk = g_vis.tyreReadFail = g_vis.winReadOk = g_vis.winReadFail = 0;
         g_vis.sentUpdates = g_vis.sentWithTyres = g_vis.sentWithWindows = g_vis.partHits = g_vis.partHitsRefused = 0;
         g_vis.brakeSet = g_vis.brakeFail = g_vis.handSet = g_vis.handFail = g_vis.brakeBitsSent = g_vis.handBitsSent = g_vis.pedalReadFail = 0;
         g_vis.steerApplied = g_vis.steerApplyFail = 0;
+        g_vis.steerField = g_vis.steerFieldRefused = g_vis.steerFieldHeld = g_vis.steerFieldOverwritten = g_vis.signAgree = g_vis.signDisagree = 0;
+        g_vis.copyMoving = g_vis.copyBrake = g_vis.copyHandbrake = 0;
         g_vis.steerAppliedMin = g_vis.steerAppliedMax = 0.0f;
         g_vis.steerAppliedSum = 0.0;
         g_vis.steerSent.Reset();
@@ -13177,12 +13361,13 @@ namespace {
             GLOGI("engine: vehicle signals (0.4.19), last 10 s: horn on copies: %u states with the horn bit; %s: %u rises, %u releases (%u let go without "
                   "states), START_VEHICLE_HORN issued %u (+%u release calls, %u could not be called, %u back-offs); IS_HORN_ACTIVE read-back (%u asked, "
                   "%u unreadable): after a rise heard %u / silent %u, while held sounding %u / silent %u, after a release quiet %u / still sounding %u; "
-                  "0.4.17 per-state calls %u; as controller: %u updates sent, %u with the horn, %u with the headlights, %u with the high beam; lights on "
+                  "0.4.17 per-state calls %u; as controller: %u updates sent, %u with the horn (%u of them E held with the siren on, 0.4.30), %u with the siren, %u with the headlights, "
+                  "%u with the high beam; lights on "
                   "copies: SET_VEHICLE_LIGHTS on a change %u; %s: read-backs %u (unreadable %u), match %u / differ %u, re-issued %u rounds (%u calls, %u "
                   "could not be called), restored %u, stuck %u",
                   s.hornStates, g_hornSync.load() ? "veh_horn_sync on" : "veh_horn_sync OFF", h.rises, h.releases, h.staleReleases, h.startsIssued,
                   h.stopsIssued, h.callFails, h.suspends, h.probes, h.probeFails, h.riseHeard, h.riseSilent, h.heldHeard, h.heldSilent, h.releaseQuiet,
-                  h.releaseSounding, s.oldHornCalls, s.sentUpdates, s.sentHorn, s.sentHeadlights, s.sentHighBeam, s.lightsChanged,
+                  h.releaseSounding, s.oldHornCalls, s.sentUpdates, s.sentHorn, s.sentSirenHorn, s.sentSiren, s.sentHeadlights, s.sentHighBeam, s.lightsChanged,
                   g_lightsKeep.load() ? "veh_lights_keep on" : "veh_lights_keep OFF", l.reads, l.readFails, l.match, l.mismatch, l.reissued,
                   s.lightsReissueCalls, s.lightsReissueFail, l.restored, l.stuck);
         g_sig = SigStats();
@@ -13463,9 +13648,9 @@ namespace {
                 // with the terms behind it, and the controller's side (how fast the cars we send were going), so ONE log has both views. Read with
                 // docs/sync-specs/vehicle-position.md: a mean of metres at 15-30 m/s with "aim N ms behind" ~ 0 = the lag is the network (check the link lag line);
                 // "aim" large = the lead is not closing the render delay; "tracking" large = the drive controller / physics.
-                static uint32_t lastLinkIn = 0, lastAcc = 0, lastRep = 0, lastStale = 0, lastTele = 0;
-                uint32_t acc = 0, rep = 0, stl = 0, tel = 0;
-                VehInterpTotals(acc, rep, stl, tel);
+                static uint32_t lastLinkIn = 0, lastAcc = 0, lastRep = 0, lastStale = 0, lastTele = 0, lastOmStill = 0, lastOmCross = 0;
+                uint32_t acc = 0, rep = 0, stl = 0, tel = 0, omStill = 0, omCross = 0;
+                VehInterpTotals(acc, rep, stl, tel, omStill, omCross);
                 const sync::PositionDiag::Window pw = g_t5.pos.Take();
                 const uint32_t linkIn = g_linkInfoIn.load(std::memory_order_relaxed);
                 if (pw.frames > 0 || g_t5.sentN > 0 || linkIn != lastLinkIn)
@@ -13480,15 +13665,16 @@ namespace {
                     GLOGI("engine: vehicle position (R3 T5), last 10 s: near clock %s, proximity contact %s; our round trip %u ms, controllers' (server's view) [%s], %u LinkInfo in, "
                           "owner's round trip unknown on %u frames; link lag used mean %.0f max %.0f ms; shared delay %.0f ms; copies: %s; proximity: %u frames predicted an overlap, "
                           "%u graces opened, %u upgraded to a real contact; snapshots in 10 s: %u stored, %u resends dropped, %u stale, %u teleports; "
-                          "as controller: %u updates sent (mean speed %.1f m/s; speed bands 0-5/5-15/15-30/over 30: %u/%u/%u/%u)",
+                          "omega guard (0.4.30, veh_omega_guard %s): omega calls held still %u, refused across sources %u; as controller: %u updates sent (mean speed %.1f m/s; speed bands 0-5/5-15/15-30/over 30: %u/%u/%u/%u)",
                           g_nearClock.load() ? "on" : "OFF", g_proxContact.load() ? "on" : "OFF", (unsigned)join::RttMs(), owners.c_str(), linkIn - lastLinkIn,
                           g_t5.ownerRttUnknown, g_t5.lagN ? g_t5.lagSum / g_t5.lagN : 0.0, g_t5.lagMax, clk5.DelayMs(), sync::PositionDiag::Format(pw).c_str(),
                           g_t5.proxFrames, g_t5.proxOpened, g_t5.proxUpgraded, (acc >= lastAcc ? acc - lastAcc : 0u), (rep >= lastRep ? rep - lastRep : 0u), (stl >= lastStale ? stl - lastStale : 0u), (tel >= lastTele ? tel - lastTele : 0u),
+                          g_omegaGuard.load() ? "on" : "OFF", (omStill >= lastOmStill ? omStill - lastOmStill : 0u), (omCross >= lastOmCross ? omCross - lastOmCross : 0u),
                           g_t5.sentN, g_t5.sentN ? g_t5.sentSpeedSum / g_t5.sentN : 0.0,
                           g_t5.sentFrames[0], g_t5.sentFrames[1], g_t5.sentFrames[2], g_t5.sentFrames[3]);
                 }
                 lastLinkIn = linkIn;
-                lastAcc = acc; lastRep = rep; lastStale = stl; lastTele = tel;
+                lastAcc = acc; lastRep = rep; lastStale = stl; lastTele = tel; lastOmStill = omStill; lastOmCross = omCross;
                 g_t5.proxFrames = g_t5.proxOpened = g_t5.proxUpgraded = 0;
                 g_t5.lagSum = g_t5.lagMax = 0.0;
                 g_t5.lagN = g_t5.ownerRttUnknown = 0;
@@ -13589,11 +13775,12 @@ namespace {
             GLOGI("engine: combat client (W3), last 10 s: %u melee swings counted, %u peer swing tasks ISSUED (not proof anything was seen: see the "
                   "'engine: melee swings (R3 T6)' line for the read-back), %u real peer shots, "
                   "%u muzzle flashes; reactions on us %u flinch / %u knockdown / %u melee stagger, on puppets %u flinch / %u "
-                  "knockdown / %u melee stagger",
+                  "knockdown / %u melee stagger; stagger clips NOT shown (0.4.30): no dictionary %u, streaming %u, call failed %u",
                   c.meleeSwings - last.meleeSwings, c.peerSwings - last.peerSwings, c.peerShotsReal - last.peerShotsReal,
                   c.muzzleFlashes - last.muzzleFlashes, c.reactFlinch - last.reactFlinch, c.reactKnock - last.reactKnock,
                   c.reactStagger - last.reactStagger, c.puppetFlinch - last.puppetFlinch, c.puppetKnock - last.puppetKnock,
-                  c.puppetStagger - last.puppetStagger);
+                  c.puppetStagger - last.puppetStagger, c.staggerNoDict - last.staggerNoDict, c.staggerStreaming - last.staggerStreaming,
+                  c.staggerFailed - last.staggerFailed);
             GLOGI("engine: melee (0c), last 10 s: hits sent (all weapons) %u; melee hits detected by the damage EVENT %u / by the pool drop %u (event read "
                   "%u times in swing windows); swings counted %u; on puppets %u swing steps seen, %u swing tasks issued (NOT proof they played), %u not issued (ped owned "
                   "%u, dictionary missing/streaming %u, anim task failed %u); AI melee damage modifier %s; audit (0.4.5): swing windows "

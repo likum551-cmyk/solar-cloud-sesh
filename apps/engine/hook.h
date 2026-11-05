@@ -718,6 +718,10 @@ namespace gage::game {
         // DLC manager / image registry / vehicle store, stepped by the code-patch poller (nothing is mounted,
         // written or called), 2 and 3 = reserved for the mount rounds ("not built yet").
         int       packEnh = 0;
+        // Set before Init: veh_steer_field (HKCU\Software\GAGE-MP). 1 = resolve the CVehicle steering field once the code decrypts
+        // (read-only scan, veh_fields.h); 0 = no scan, copies keep SET_VEHICLE_STEER_BIAS (0.4.29); -1 (unset, default) = auto:
+        // Enhanced on (patterns proven on the dump), Legacy off until a live run with veh_steer_field=1 proves its patterns.
+        int       vehFields = -1;
         // kill_sp_hijack: after the entry, terminate the story-character scripts every tick
         // (SuppressPedHijackers). 1 = on (default), 0 = off.
         int       killSpHijack = 1;
@@ -1096,6 +1100,14 @@ namespace gage::game {
         bool     TaskLeaveVehicle(int32_t ped, int32_t veh, int flags);
         bool     TaskWarpPedIntoVehicle(int32_t ped, int32_t veh, int seat);
         bool     SetVehicleSteerBias(int32_t veh, float bias);  // -1 full right .. 1 full left; EVERY frame
+        // 0.4.30 veh_steer_field (veh_fields.h): the CVehicle steering-angle field (radians, + = left), found by pattern once the code
+        // decrypts. Ready = both the field and the handle -> pointer function resolved uniquely and cross-checked. Set refuses a field
+        // that does not currently read as a plausible angle. GetVehicleCopyControls reads the brake float / handbrake byte next to it
+        // (diagnostic only: those offsets are a layout match, not proven).
+        bool     VehicleFieldsReady() const;
+        bool     GetVehicleSteerAngle(int32_t veh, float& rad);
+        bool     SetVehicleSteerAngle(int32_t veh, float rad);
+        bool     GetVehicleCopyControls(int32_t veh, float& brake, bool& handbrake);
         bool     GetVehicleEngineHealth(int32_t veh, float& health);  // 1000 new .. 0 broken .. -4000 fire
         bool     SetVehicleEngineHealth(int32_t veh, float health);
         bool     GetVehicleBodyHealth(int32_t veh, float& health);
