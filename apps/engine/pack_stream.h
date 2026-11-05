@@ -100,6 +100,13 @@ namespace gage::game::content {
     // once and begins polling; later calls poll until Ready or a timeout. Cheap once settled.
     Status Tick(World& world);
 
+    // Raise the game's in-memory MaxExtraVehicleModelInfos (gameconfig) before it creates the fixed DLC vehicle
+    // array, so the served packs' cars fit next to Rockstar's DLC cars (0.4.15 overflowed it on the 4th pack).
+    // Call at engine attach and retry (any thread) until it returns true = decided (raised, already created, off, or
+    // unresolvable). veh_store_extra (HKCU\Software\GAGE-MP) = extra slots, default 256, 0 = off. Packs that do not
+    // fit are refused in the mount, never written past.
+    bool PrepareVehicleStore();
+
     // Why Failed (static buffer, valid until the next failure). "" when not Failed.
     const char* FailReason();
 

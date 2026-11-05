@@ -378,6 +378,132 @@ bool ResolveAll() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The DLC vehicle model-info store (0.4.16; 3889 static RE 2026-11-05, clean code).
+//
+// Every vehicles.meta item that is not yet a model takes the next CVehicleModelInfo (0x5a0 bytes) from a
+// FIXED array: 0x605794 looks the array up by key (0xf000 for DLC content) in the vehicle factory's map and
+// does `slot = base + count++ * 0x5a0` with no bounds check, then calls the slot's vtable. The array is
+// created once, at session init (0x632610), with capacity = gameconfig MaxExtraVehicleModelInfos (CGameConfig
+// +0x324), the only reader of that field. Rockstar's own DLC cars almost fill it, so the 4th served pack
+// (veh_diablosv after jesko, rs6, bmwm5) wrote past the end: live 0.4.15, access violation at +0x6057e1
+// `call [rax+0x38]` on a page-aligned slot just past the array. Single-player add-on cars need a modded
+// gameconfig.xml for the same reason; we never write to the game install, so PrepareVehicleStore raises the
+// in-memory limit before the game creates the array (the engine attaches before the Story session it boots
+// with skip_landing), and MountSequence refuses a pack that would not fit instead of letting it crash.
+// ---------------------------------------------------------------------------------------------
+constexpr uint32_t kDlcStoreKey = 0xf000u;       // the DLC key 0x64191c passes to the vehicles.meta loader
+constexpr long     kVehStoreExtraDefault = 256;  // extra slots (x 0x5a0 bytes = 360 KB); veh_store_extra overrides
+
+const Sig kVehStoreSig = {
+    "VehStoreInit",   // RVA 0x632610, inside the model-info init (0x631f24) case 8: the three key-0xf000 stores
+    "48 8B 05 ?? ?? ?? ?? BF 00 F0 00 00 48 8B 58 18 48 8B 05 ?? ?? ?? ?? 8B D7 48 8B 48 20 44 8B 83 ?? ?? ?? ?? "
+    "48 8B 01 FF 50 20 48 8B 05 ?? ?? ?? ?? 44 8B 83 ?? ?? ?? ?? 48 8B 48 28",
+    "3889 RE 2026-11-05: cfg=[[+3]]+0x18, factories=[+19], vehicle limit disp @+52, vehicle factory slot @+59" };
+
+// The array header the factory map points at: 0x64ffac writes base and capacity, 0x605794 bumps the count.
+struct StoreHdr { char* base; uint16_t count; uint16_t cap; };
+
+std::mutex g_vehStoreMu;
+uintptr_t  g_cfgGlobal   = 0;      // &(CGameConfig*), base + 0x2e9e508; the model-info limits are in *(+0x18)
+uintptr_t  g_miGlobal    = 0;      // &(model-info factory table), base + 0x1ec11f0
+uint32_t   g_vehCapOff   = 0;      // limits block -> DWORD MaxExtraVehicleModelInfos (0x324)
+uint32_t   g_vehSlot     = 0;      // factory table -> the vehicle factory (0x28)
+int        g_vehStoreSig = 0;      // 0 = not found yet (retried), 1 = resolved, -1 = refused for good
+int        g_vehSigLogged = -2;    // the last hit count logged, so a retry loop logs each outcome once
+bool       g_vehStoreDone = false; // PrepareVehicleStore made its decision (raised, too late, off or refused)
+bool       g_vehStoreSeen = false; // Tick logged the created store once
+
+bool IsWritable(const void* p, size_t n) {
+    const uint8_t* a = static_cast<const uint8_t*>(p);
+    const uint8_t* end = a + n;
+    while (a < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            return false;
+        a = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+}
+
+// Resolve kVehStoreSig and read its operands. A miss is retried on the next call (the code may still be packed
+// when the engine attaches); a malformed or ambiguous match is final.
+bool ResolveVehStore() {
+    if (g_vehStoreSig) return g_vehStoreSig > 0;
+    const Image im = GameImage();
+    if (!im.base || !im.size) return false;
+    const uint8_t* m = nullptr;
+    const int c = CountPat(ReadableRuns(im), kVehStoreSig.pat, &m);
+    if (c != g_vehSigLogged) {
+        g_vehSigLogged = c;
+        if (c != 1)
+            GLOGW("hook: [packstream] %s %s (%d hits)%s", kVehStoreSig.name, c == 0 ? "missing" : "ambiguous", c,
+                  c == 0 ? "; retried" : "; the DLC vehicle store is not guarded");
+    }
+    if (c == 0) return false;
+    if (c != 1 || !m || !IsReadable(m, 60)) { g_vehStoreSig = -1; return false; }
+    int32_t d1 = 0, d2 = 0;
+    memcpy(&d1, m + 3, 4);
+    memcpy(&d2, m + 19, 4);
+    const uintptr_t cfg = (uintptr_t)(m + 7) + (intptr_t)d1;
+    const uintptr_t tbl = (uintptr_t)(m + 23) + (intptr_t)d2;
+    uint32_t off = 0;
+    memcpy(&off, m + 52, 4);
+    const uint32_t slot = m[59];
+    const uintptr_t lo = (uintptr_t)im.base, hi = lo + im.size;
+    if (cfg < lo || cfg >= hi || tbl < lo || tbl >= hi || off == 0 || off > 0x1000 || (off & 3) || slot == 0 || (slot & 7)) {
+        GLOGW("hook: [packstream] %s operands implausible (cfg +0x%llx, table +0x%llx, limit +0x%x, slot 0x%x); not used",
+              kVehStoreSig.name, (unsigned long long)(cfg - lo), (unsigned long long)(tbl - lo), (unsigned)off, (unsigned)slot);
+        g_vehStoreSig = -1;
+        return false;
+    }
+    g_cfgGlobal = cfg;
+    g_miGlobal = tbl;
+    g_vehCapOff = off;
+    g_vehSlot = slot;
+    g_vehStoreSig = 1;
+    GLOGI("hook: [packstream] %s UNIQUE @ +0x%llx: config global +0x%llx (expect 0x2e9e508), factory table +0x%llx "
+          "(expect 0x1ec11f0), MaxExtraVehicleModelInfos at +0x%x (expect 0x324), vehicle factory slot 0x%x (expect 0x28)",
+          kVehStoreSig.name, (unsigned long long)(m - im.base), (unsigned long long)(cfg - lo), (unsigned long long)(tbl - lo),
+          (unsigned)off, (unsigned)slot);
+    return true;
+}
+
+// The key-0xf000 vehicle array, or null when the factory or the array does not exist (yet) or is unreadable.
+// The factory's map: buckets at +8, WORD bucket count at +0x10; node = {DWORD key, StoreHdr* +8, next +0x10}
+// (the lookup 0x62e830: bucket = key % count).
+StoreHdr* DlcVehStore() {
+    if (g_vehStoreSig <= 0) return nullptr;
+    char* const* tbl = reinterpret_cast<char* const*>(g_miGlobal);
+    if (!IsReadable(tbl, 8) || !*tbl || !IsReadable(*tbl + g_vehSlot, 8)) return nullptr;
+    char* fac = *reinterpret_cast<char* const*>(*tbl + g_vehSlot);
+    if (!fac || !IsReadable(fac, 0x18)) return nullptr;
+    char* const* buckets = *reinterpret_cast<char* const* const*>(fac + 8);
+    const uint16_t nb = *reinterpret_cast<const uint16_t*>(fac + 0x10);
+    if (!nb || !buckets || !IsReadable(buckets, (size_t)nb * 8)) return nullptr;
+    const char* node = buckets[kDlcStoreKey % nb];
+    for (int hops = 0; node && hops < 4096; ++hops) {
+        if (!IsReadable(node, 0x18)) return nullptr;
+        if (*reinterpret_cast<const uint32_t*>(node) == kDlcStoreKey) {
+            StoreHdr* h = *reinterpret_cast<StoreHdr* const*>(node + 8);
+            return (h && IsReadable(h, sizeof(StoreHdr))) ? h : nullptr;
+        }
+        node = *reinterpret_cast<const char* const*>(node + 0x10);
+    }
+    return nullptr;
+}
+
+// The DWORD MaxExtraVehicleModelInfos inside the game's parsed gameconfig, or null while it is not loaded.
+uint32_t* VehStoreLimit() {
+    if (g_vehStoreSig <= 0 || !IsReadable((void*)g_cfgGlobal, 8)) return nullptr;
+    char* gc = *reinterpret_cast<char* const*>(g_cfgGlobal);
+    if (!gc || !IsReadable(gc + 0x18, 8)) return nullptr;
+    char* lim = *reinterpret_cast<char* const*>(gc + 0x18);
+    if (!lim || !IsReadable(lim + g_vehCapOff, 4)) return nullptr;
+    return reinterpret_cast<uint32_t*>(lim + g_vehCapOff);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Function-pointer views of the resolved addresses (Windows x64 ABI: rcx, rdx, r8).
 // ---------------------------------------------------------------------------------------------
 using AddDlcPackFn   = uint8_t (*)(void* mgr, const char* path);
@@ -984,6 +1110,27 @@ bool MountSequence(World& world, Pack& p) {
     if (!folderMode) GLOGI("hook: [packstream] pack %s: mounted at \"%s\"", p.name.c_str(), mount.empty() ? "<unknown>" : mount.c_str());
     ReadPackModels(p, mount);
 
+    // The change set takes one DLC vehicle slot per new car and the game never checks the array's end (see
+    // kVehStoreSig): refuse a pack that does not fit rather than let it write past the array (0.4.15's crash).
+    {
+        std::lock_guard<std::mutex> lk(g_vehStoreMu);
+        StoreHdr* h = ResolveVehStore() ? DlcVehStore() : nullptr;
+        if (h) {
+            const unsigned used = h->count, cap = h->cap, need = (unsigned)p.models.size();
+            const unsigned left = cap > used ? cap - used : 0;
+            GLOGI("hook: [packstream] pack %s: DLC vehicle store %u of %u used, %u free; the pack defines %u car(s)",
+                  p.name.c_str(), used, cap, left, need);
+            if (need > left || (need == 0 && left == 0)) {
+                Fail("the DLC vehicle store is full (%u of %u used) and the pack defines %u car(s); its change set "
+                     "would write past the end of the array. Raise veh_store_extra (HKCU\\Software\\GAGE-MP)", used, cap, need);
+                return false;
+            }
+        } else {
+            GLOGW("hook: [packstream] pack %s: the DLC vehicle store is not readable; running the change set without the "
+                  "capacity check", p.name.c_str());
+        }
+    }
+
     reinterpret_cast<RunPackGroupFn>(g_addr[kRunPackGroup])(mgr, packHash, kGroupEarlyOn);
     reinterpret_cast<RunPackGroupFn>(g_addr[kRunPackGroup])(mgr, packHash, kGroupStartup);
     GLOGI("hook: [packstream] pack %s: ran EARLY_ON + STARTUP change-set groups (0x%08x)", p.name.c_str(), (unsigned)packHash);
@@ -1014,11 +1161,79 @@ void PublishVehicles() {
 // =============================================================================================
 // Public API
 // =============================================================================================
+namespace {
+void PrepareVehicleStoreLocked() {
+    if (g_vehStoreDone) return;
+    if (!Enabled()) { g_vehStoreDone = true; return; }   // Enabled() logged why
+
+    long extra = kVehStoreExtraDefault;
+    const std::wstring v = reg::Get(L"veh_store_extra");
+    if (!v.empty()) {
+        wchar_t* stop = nullptr;
+        const long n = wcstol(v.c_str(), &stop, 10);
+        if (stop && *stop == L'\0' && n >= 0 && n <= 8192) extra = n;
+        else GLOGW("hook: [packstream] veh_store_extra=\"%s\" is not a number 0..8192; using %ld", Narrow(v).c_str(), extra);
+    }
+    if (extra == 0) {
+        GLOGW("hook: [packstream] DLC vehicle store: not raised (veh_store_extra=0); packs that do not fit are refused");
+        g_vehStoreDone = true;
+        return;
+    }
+    if (!ResolveVehStore()) {
+        if (g_vehStoreSig < 0) g_vehStoreDone = true;   // final: logged by ResolveVehStore
+        return;                                         // not found yet: the next call retries
+    }
+    if (StoreHdr* h = DlcVehStore()) {
+        GLOGW("hook: [packstream] DLC vehicle store already created (%u of %u used) before the engine could raise it; "
+              "packs that do not fit are refused", (unsigned)h->count, (unsigned)h->cap);
+        g_vehStoreDone = true;
+        return;
+    }
+    uint32_t* lim = VehStoreLimit();
+    if (!lim) return;                                   // gameconfig not parsed yet: the next call retries
+    const uint32_t cur = *lim;
+    if (cur == 0 || cur > 0xFFFF) {
+        GLOGW("hook: [packstream] DLC vehicle store: MaxExtraVehicleModelInfos reads %u (implausible); not raised", (unsigned)cur);
+        g_vehStoreDone = true;
+        return;
+    }
+    if (!IsWritable(lim, 4)) {
+        GLOGW("hook: [packstream] DLC vehicle store: the gameconfig limit is not writable; not raised");
+        g_vehStoreDone = true;
+        return;
+    }
+    const uint32_t want = (cur + (uint32_t)extra > 0xFFFFu) ? 0xFFFFu : cur + (uint32_t)extra;   // the capacity is a WORD
+    *lim = want;
+    GLOGI("hook: [packstream] DLC vehicle store: MaxExtraVehicleModelInfos %u -> %u (+%ld, veh_store_extra) before the "
+          "game creates the array", (unsigned)cur, (unsigned)*lim, extra);
+    g_vehStoreDone = true;
+}
+}  // namespace
+
+bool PrepareVehicleStore() {
+    std::lock_guard<std::mutex> lk(g_vehStoreMu);
+    PrepareVehicleStoreLocked();
+    return g_vehStoreDone;
+}
+
 Status Tick(World& world) {
     if (g_status == Status::Ready || g_status == Status::Failed)
         return g_status;
     if (!Enabled())
         return Status::Idle;
+    if (!g_vehStoreSeen) {
+        std::lock_guard<std::mutex> lk(g_vehStoreMu);
+        if (!g_vehStoreDone)
+            GLOGW("hook: [packstream] DLC vehicle store: still undecided when the player is in the world (gameconfig "
+                  "or signature never became readable); packs that do not fit are refused");
+        g_vehStoreDone = true;   // too late to raise now; stop the attach-time retry
+        g_vehStoreSeen = true;
+        if (StoreHdr* h = ResolveVehStore() ? DlcVehStore() : nullptr)
+            GLOGI("hook: [packstream] DLC vehicle store in the world: %u of %u used before our packs", (unsigned)h->count,
+                  (unsigned)h->cap);
+        else
+            GLOGW("hook: [packstream] DLC vehicle store not found in the world (signature %d)", g_vehStoreSig);
+    }
 
     // One-time: resolve and log the signatures + the manager global. Even with no pack present this is
     // a complete live validation of the 3889 recon.

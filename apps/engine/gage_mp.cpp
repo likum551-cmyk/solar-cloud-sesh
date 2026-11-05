@@ -11,6 +11,7 @@
 #include "join.h"
 #include "hook.h"
 #include "engine.h"
+#include "pack_stream.h"
 // #include "loading_screen.h"  // TODO: D3D11 in-game overlay (separate task)
 
 #include <windows.h>
@@ -219,6 +220,21 @@ namespace {
         world.noSpScripts = (reg::Get(L"no_sp_scripts") == L"0") ? 0 : 1;
         GLOGI("gage_mp: stock scripts %s", world.noSpScripts ? "OFF (no_sp_scripts=1, FiveM JustNoScript)"
                                                              : "on (no_sp_scripts=0)");
+        // Before game::Init (which arms skip_landing): the DLC vehicle array is sized when the Story session starts.
+        // Undecided (gameconfig not parsed or the code still packed): retry off-thread every 100 ms for up to 2 min;
+        // pack_stream's Tick ends the retry once the player is in the world.
+        if (!game::content::PrepareVehicleStore()) {
+            HANDLE t = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                for (int i = 0; i < 1200; ++i) {
+                    Sleep(100);
+                    if (game::content::PrepareVehicleStore()) return 0;
+                }
+                GLOGW("gage_mp: DLC vehicle store still undecided after 2 min; giving up the raise");
+                return 0;
+            }, nullptr, 0, nullptr);
+            if (t) CloseHandle(t);
+            else GLOGW("gage_mp: could not start the DLC vehicle store retry (error %lu)", GetLastError());
+        }
         game::Init(world);
         GLOGI("gage_mp: game world ready=%d image@0x%llx size=%u resolved=0x%x %s",
             (int)world.ready, (unsigned long long)(uintptr_t)world.module,
