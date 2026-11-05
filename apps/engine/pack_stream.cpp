@@ -21,7 +21,6 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cwchar>
-#include <list>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +51,8 @@ constexpr uint32_t kOffGen       = 0x178;        // mgr -> DWORD generation coun
 constexpr uint32_t kEntryStride  = 0xf0;
 constexpr uint32_t kOffEntryHash = 0x60;         // DlcEntry -> DWORD name hash (the RunPackGroup key)
 constexpr uint32_t kOffEntryPath = 0xb8;         // DlcEntry -> const char* path (Mount loads it as a QWORD ptr)
-constexpr uint32_t kOffEntryFlag = 0xc0;         // DlcEntry -> WORD; must be nonzero or Mount ignores +0xb8
+constexpr uint32_t kOffEntryPathLen = 0xc0;      // DlcEntry -> WORD length of the +0xb8 atString (capacity WORD at +0xc2);
+                                                 // Mount ignores +0xb8 while it is 0
 constexpr uint32_t kOffEntryType = 0xc8;         // DlcEntry -> DWORD device type: 2 = packfile, 1 = relative/folder
 constexpr uint32_t kOffEntryState= 0xd0;         // DlcEntry -> DWORD setup state (0 fresh, 1 parsed, 2 mounted)
 constexpr uint32_t kTypePackfile = 2;            // Mount 0x94307c: +0xc8==2 -> fiPackfile::Open (the crypto path)
@@ -286,6 +286,7 @@ std::mutex        g_mu;
 uintptr_t         g_addr[kSigCount] = {};
 bool              g_ok[kSigCount]   = {};
 uintptr_t         g_singleton       = 0;   // &(ExtraContentManager*) : base + 0x1ec1eb0
+uintptr_t         g_strAppend       = 0;   // atString::Append(atString*, const char*, int) : base + 0x137aed8 on 3889
 bool              g_resolvedOnce    = false;
 bool              g_resolveReady    = false;  // every signature + the singleton pointer resolved
 
@@ -351,6 +352,26 @@ bool ResolveAll() {
         all = false;
     }
 
+    // The game's atString append (0x137aed8 on 3889), read from AddDlcPack's own call to it at +0xa3:
+    // "48 8D 4D D8" (lea rcx,[rbp-0x28]) then "E8 rel32"; its body starts "45 85 C0 0F 84" (test r8d,r8d; je).
+    // Folder mode rewrites the entry's path with it, so the string stays in game-owned memory (see MountSequence).
+    if (g_ok[kAddDlcPack]) {
+        const uint8_t* fn = reinterpret_cast<const uint8_t*>(g_addr[kAddDlcPack]);
+        const uint8_t* site = fn + 0xa3;
+        if (IsReadable(site, 9) && site[0] == 0x48 && site[1] == 0x8D && site[2] == 0x4D && site[3] == 0xD8 && site[4] == 0xE8) {
+            int32_t rel = 0;
+            memcpy(&rel, site + 5, 4);
+            const uint8_t* t = site + 9 + rel;
+            if ((uintptr_t)t >= (uintptr_t)im.base && (uintptr_t)t < (uintptr_t)im.base + im.size && IsReadable(t, 5) &&
+                t[0] == 0x45 && t[1] == 0x85 && t[2] == 0xC0 && t[3] == 0x0F && t[4] == 0x84) {
+                g_strAppend = (uintptr_t)t;
+                GLOGI("hook: [packstream]   atString append @ +0x%llx (from AddDlcPack+0xa3; expect 0x137aed8)",
+                      (unsigned long long)(g_strAppend - (uintptr_t)im.base));
+            }
+        }
+        if (!g_strAppend) GLOGW("hook: [packstream]   atString append not found at AddDlcPack+0xa3; folder-mode packs are refused");
+    }
+
     g_resolveReady = all;
     GLOGI("hook: [packstream] signature resolution %s", all ? "COMPLETE" : "INCOMPLETE (mount will not run)");
     return all;
@@ -360,6 +381,7 @@ bool ResolveAll() {
 // Function-pointer views of the resolved addresses (Windows x64 ABI: rcx, rdx, r8).
 // ---------------------------------------------------------------------------------------------
 using AddDlcPackFn   = uint8_t (*)(void* mgr, const char* path);
+using AtStrAppendFn  = void (*)(void* atString, const char* src, int len);  // 0x137aed8: append len bytes, keep NUL
 using Setup2Fn       = uint8_t (*)(void* entry, uint32_t gen);
 using MountGateFn    = uint8_t (*)(void* entry, uint32_t gen);
 using RunPackGroupFn = void    (*)(void* mgr, uint32_t packHash, uint32_t groupHash);
@@ -887,24 +909,37 @@ bool MountSequence(World& world, Pack& p) {
         // Override the packfile entry AddDlcPack built into a relative/folder device: Mount 0x94307c takes
         // its folder branch (0x943144) only when +0xc8 == 1 (==2 is packfile = the crypto path), it loads
         // +0xb8 as a const char* (the loose base folder) and ignores it unless the +0xc0 WORD is nonzero.
-        // The device ctor 0x13659c8 copies the path; each pack's string is still kept for the process's life (a
-        // list: its nodes never move), in case the entry's +0xb8 is read again after this call.
-        static std::list<std::string> s_folders;
-        s_folders.push_back(paths.device);                // "<folder>/" forward-slash, trailing '/'
-        const std::string& s_folder = s_folders.back();
-        if (!IsReadable(e + kOffEntryType, 4) || !IsReadable(e + kOffEntryPath, 8) || !IsReadable(e + kOffEntryFlag, 2)) {
+        //
+        // +0xb8 is a GAME-OWNED atString {char* +0xb8, WORD length +0xc0, WORD capacity +0xc2}: the entry's
+        // destructor 0x911d6c frees the pointer with the game's allocator, which happens whenever the pack array
+        // grows (the next AddDlcPack moves the entries) and at shutdown. 0.4.13 pointed it at our own std::string:
+        // harmless with one pack, but the second pack's AddDlcPack freed our pointer and the game's allocator raised
+        // its fatal error (live 2026-11-05, INT3 at +0x136af5b, rs6 after jesko). So the path is rewritten IN the
+        // game's buffer through the game's own append: length := 0, then Append(folder) (it reallocates with the
+        // game's allocator when the folder path is longer than the capacity).
+        const std::string& folder = paths.device;          // "<folder>/" forward-slash, trailing '/'
+        if (!g_strAppend) { Fail("folder-mode: the game's atString append was not resolved; not overriding the entry"); return false; }
+        if (!IsReadable(e + kOffEntryType, 4) || !IsReadable(e + kOffEntryPath, 12)) {
             Fail("folder-mode: DLC entry device fields (+0xb8/+0xc0/+0xc8) are not writable"); return false;
         }
         const uint32_t oldType = *reinterpret_cast<uint32_t*>(e + kOffEntryType);
-        const uint16_t oldFlag = *reinterpret_cast<uint16_t*>(e + kOffEntryFlag);
+        const uint16_t oldLen = *reinterpret_cast<uint16_t*>(e + kOffEntryPathLen);
         const char* oldPath = *reinterpret_cast<const char* const*>(e + kOffEntryPath);
-        GLOGI("hook: [packstream] folder-mode: pre-override type(+0xc8)=%u flag(+0xc0)=%u path(+0xb8)=\"%s\"",
-              (unsigned)oldType, (unsigned)oldFlag, (oldPath && IsReadable(oldPath, 1)) ? oldPath : "<null>");
+        GLOGI("hook: [packstream] folder-mode: pre-override type(+0xc8)=%u length(+0xc0)=%u capacity(+0xc2)=%u path(+0xb8)=\"%s\"",
+              (unsigned)oldType, (unsigned)oldLen, (unsigned)*reinterpret_cast<uint16_t*>(e + kOffEntryPathLen + 2),
+              (oldPath && IsReadable(oldPath, 1)) ? oldPath : "<null>");
+        *reinterpret_cast<uint16_t*>(e + kOffEntryPathLen) = 0;
+        reinterpret_cast<AtStrAppendFn>(g_strAppend)(e + kOffEntryPath, folder.c_str(), (int)folder.size());
+        const char* newPath = *reinterpret_cast<const char* const*>(e + kOffEntryPath);
+        const uint16_t newLen = *reinterpret_cast<uint16_t*>(e + kOffEntryPathLen);
+        if (newLen != folder.size() || !newPath || !IsReadable(newPath, folder.size() + 1) ||
+            memcmp(newPath, folder.c_str(), folder.size() + 1) != 0) {
+            Fail("folder-mode: the entry path did not read back as the folder after the game's append (length %u)", (unsigned)newLen);
+            return false;
+        }
         *reinterpret_cast<uint32_t*>(e + kOffEntryType) = kTypeRelative;
-        *reinterpret_cast<const char**>(e + kOffEntryPath) = s_folder.c_str();
-        if (oldFlag == 0) *reinterpret_cast<uint16_t*>(e + kOffEntryFlag) = 1;
-        GLOGI("hook: [packstream] folder-mode: overrode entry to relative device (type=1) over \"%s\" "
-              "(nameHash set from setup2.xml by DlcSetup2)", s_folder.c_str());
+        GLOGI("hook: [packstream] folder-mode: overrode entry to relative device (type=1) over \"%s\" (game-owned string, "
+              "length %u; nameHash set from setup2.xml by DlcSetup2)", newPath, (unsigned)newLen);
     } else if (!packHash) {
         Fail("the new DLC entry has a zero name hash; AddDlcPack did not populate it"); return false;
     }
