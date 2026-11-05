@@ -52,7 +52,8 @@
 //
 // Registry (all under HKCU\Software\GAGE-MP, strings):
 //   pack_mount  = "1" arms it, "0" keeps it off; unset = armed when a pack folder is present (0.4.14). Never on a game
-//                 that is not Legacy GTA5.exe (Enhanced is a different binary: none of these signatures apply).
+//                 that is not Legacy GTA5.exe, EXCEPT GTA5_Enhanced.exe with HKCU pack_enh=2 (Round B, pack_enh.h: its own profile,
+//                 addresses and flow, pack_stream.cpp EnhTick; pack_enh below 2 leaves Enhanced exactly as before).
 //   pack_name   = <folder>  mount only that pack (default: all of them).
 //   pack_probe  = "1"  diagnostic: mount under extra:/ and list the visible files instead of running the change set.
 //   pack_ng_tune = "0" an NG pack's gage_tune.json is ignored (default on, 0.4.18): otherwise its HANDLING_FILEs are read

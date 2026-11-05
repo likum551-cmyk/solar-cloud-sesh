@@ -534,10 +534,14 @@ static void TestRoundA(std::vector<uint8_t>& img) {
     }
 }
 
+#include "pack_enh_mount_tests.h"
+
 int main(int argc, char** argv) {
     std::printf("pack_profile_test\n");
     TestLegacy();
     const int legacyChecks = g_pass + g_fail;
+    TestMountProfile();
+    const int profileChecks = g_pass + g_fail - legacyChecks;
 
     std::vector<uint8_t> img;
     std::string where;
@@ -548,6 +552,8 @@ int main(int argc, char** argv) {
         const int before = g_pass + g_fail;
         TestEnhancedPatterns(img);
         TestRoundA(img);
+        TestMountPatterns(img);   // round B (pack_enh=2): the mount patterns, the Extras resolver
+        TestMounter(img);         // round B: the Mounter against a fake game
         imageChecks = g_pass + g_fail - before;
     } else {
         ++g_skip;
@@ -561,9 +567,11 @@ int main(int argc, char** argv) {
     }
 
     // the count itself is asserted: a section that silently stopped running cannot pass
-    const int kExpectLegacy = 105, kExpectImage = 120;
+    const int kExpectLegacy = 105, kExpectProfile = 28, kExpectImage = 204;
     std::printf("legacy-profile checks run: %d (expected %d)\n", legacyChecks, kExpectLegacy);
     if (legacyChecks != kExpectLegacy) { ++g_fail; std::printf("FAIL  legacy check count changed (%d != %d): update the test deliberately\n", legacyChecks, kExpectLegacy); }
+    std::printf("round-B profile checks run: %d (expected %d)\n", profileChecks, kExpectProfile);
+    if (profileChecks != kExpectProfile) { ++g_fail; std::printf("FAIL  round-B profile check count changed (%d != %d): update the test deliberately\n", profileChecks, kExpectProfile); }
     if (have) {
         std::printf("image checks run: %d (expected %d)\n", imageChecks, kExpectImage);
         if (imageChecks != kExpectImage) { ++g_fail; std::printf("FAIL  image check count changed (%d != %d): update the test deliberately\n", imageChecks, kExpectImage); }

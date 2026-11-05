@@ -18,7 +18,7 @@
 
 namespace minimapsizetest {
 
-    constexpr int kChecks = 23;
+    constexpr int kChecks = 30;   // 23 for 0.4.25 + 7 for the Enhanced layout (0.4.26)
 
     using namespace gage::sync;
 
@@ -132,6 +132,38 @@ namespace minimapsizetest {
             std::memcpy(&img[hit - 0x13], &rd, 4);
         }
         TableResolve Resolve() const { return ResolveMinimapTable(&img[hit], img.data(), img.size()); }
+    };
+
+    // The same for the Enhanced layout (0.4.26): the pattern (wildcards filled with 0xA5, the table disp32 computed) and the reader's instructions at their offsets.
+    struct SynthImageEnh
+    {
+        std::vector<uint8_t> img = std::vector<uint8_t>(0x20000, 0);
+        size_t hit = 0x4000, table = 0x10000;
+
+        void Build()
+        {
+            const MinimapLayout& L = kMinimapLayoutEnhanced;
+            std::fill(img.begin(), img.end(), (uint8_t)0);
+            for (int i = 0; i < L.sigLen; ++i)
+            {
+                const int t = PatTokenAt(L.sig, i);
+                img[hit + (size_t)i] = t >= 0 ? (uint8_t)t : (uint8_t)0xA5;
+            }
+            const int32_t disp = (int32_t)((int64_t)table - ((int64_t)hit + L.endAt));
+            std::memcpy(&img[hit + (size_t)L.dispAt], &disp, 4);
+            for (int k = 0; k < L.nChecks; ++k)
+            {
+                const int m = HexByteCount(L.checks[k].bytes);
+                for (int i = 0; i < m; ++i)
+                    img[hit + (size_t)L.checks[k].off + (size_t)i] = (uint8_t)HexByteAt(L.checks[k].bytes, i);
+            }
+        }
+        TableResolve Resolve() const { return ResolveMinimapTableFor(kMinimapLayoutEnhanced, &img[hit], img.data(), img.size()); }
+        int Hits(const MinimapLayout& L) const
+        {
+            const uint8_t* h[4] = {};
+            return FindLayoutHits(L, img.data(), img.size(), h, 4, 0);
+        }
     };
 
     inline void RunPure()
@@ -533,6 +565,127 @@ namespace minimapsizetest {
                   "edge of the image are each refused",
                   !a.Resolve().ok && !b.Resolve().ok && b.Resolve().why.find("table + 104") != std::string::npos && !c.Resolve().ok && !edge.ok && !tail.ok);
         }
+
+        // 7. the Enhanced layout (0.4.26): same table, its own pattern and reader instructions.
+        {
+            int wild = 0;
+            for (int i = 0; i < kMinimapLayoutEnhanced.sigLen; ++i)
+                wild += PatTokenAt(kMinimapLayoutEnhanced.sig, i) == -2 ? 1 : 0;
+            // every byte a layout reads (its checks, the Legacy reader lea 0x16 before the hit, the pattern itself, the disp32) lies inside the span the resolver demands
+            bool spans = true;
+            for (const MinimapLayout* L : {&kMinimapLayoutLegacy, &kMinimapLayoutEnhanced})
+            {
+                for (int k = 0; k < L->nChecks; ++k)
+                    spans = spans && L->checks[k].off >= -L->spanBefore && L->checks[k].off + HexByteCount(L->checks[k].bytes) <= L->spanAfter;
+                spans = spans && L->sigLen <= L->spanAfter && L->dispAt + 4 == L->endAt && L->endAt <= L->spanAfter && (!L->readerLea || L->spanBefore >= 0x16);
+            }
+            Check("minimap_scale Enhanced layout: the pattern is 24 tokens with 8 wildcards (the two rip-relative disp32), Legacy's is 18 with none, both lead on a fixed byte, "
+                  "a malformed token is -1, and every byte either layout reads lies inside its span",
+                  spans &&
+                  PatTokenCount(kMinimapLayoutEnhanced.sig) == 24 && kMinimapLayoutEnhanced.sigLen == 24 && wild == 8 && PatTokenCount(kMinimapLayoutLegacy.sig) == 18 &&
+                      kMinimapLayoutLegacy.sigLen == 18 && PatTokenAt(kMinimapLayoutEnhanced.sig, kMinimapLayoutEnhanced.leadTok) >= 0 &&
+                      PatTokenAt(kMinimapLayoutLegacy.sig, kMinimapLayoutLegacy.leadTok) >= 0 && PatTokenAt("48 ?x", 1) == -1 && PatTokenCount("48 ?x") == -1 &&
+                      PatTokenAt("48 ?? 1", 2) == -1);
+        }
+        {
+            SynthImageEnh s;
+            s.Build();
+            const uint8_t* h[4] = {};
+            const int n = FindLayoutHits(kMinimapLayoutEnhanced, s.img.data(), s.img.size(), h, 4, 0);
+            const TableResolve r = s.Resolve();
+            Check("minimap_scale Enhanced pattern: on an image laid out like the Enhanced dump (pattern, the reader's stores around it, the table) the pattern hits once and "
+                  "resolves to the table, with no `lea rsi` before the hit required",
+                  n == 1 && h[0] == &s.img[s.hit] && r.ok && r.tableOff == s.table, r.why);
+        }
+        {
+            int rejected = 0, total = 0;
+            std::string missed;
+            for (int k = 0; k < kMinimapLayoutEnhanced.nChecks; ++k)
+            {
+                SynthImageEnh s;
+                s.Build();
+                s.img[s.hit + (size_t)kMinimapLayoutEnhanced.checks[k].off] ^= 0x01;
+                const TableResolve r = s.Resolve();
+                ++total;
+                if (!r.ok && r.why.find("differs") != std::string::npos)
+                    ++rejected;
+                else
+                    missed += std::string(kMinimapLayoutEnhanced.checks[k].what) + "; ";
+            }
+            Check("minimap_scale Enhanced pattern: changing one byte of any of the 9 pinned reader instructions (the five float / char stores, alignY, the element counter, "
+                  "the name cursor, the stride) refuses the table with the reason",
+                  rejected == total && total == 9, missed);
+        }
+        {
+            // Wildcards match anything, fixed tokens match exactly: flip every byte of the pattern in turn.
+            int wildHit = 0, wildN = 0, fixedMiss = 0, fixedN = 0;
+            for (int i = 0; i < kMinimapLayoutEnhanced.sigLen; ++i)
+            {
+                SynthImageEnh s;
+                s.Build();
+                s.img[s.hit + (size_t)i] ^= 0x5A;
+                const bool hit = s.Hits(kMinimapLayoutEnhanced) == 1;
+                if (PatTokenAt(kMinimapLayoutEnhanced.sig, i) == -2)
+                {
+                    ++wildN;
+                    wildHit += hit ? 1 : 0;
+                }
+                else
+                {
+                    ++fixedN;
+                    fixedMiss += hit ? 0 : 1;
+                }
+            }
+            Check("minimap_scale Enhanced pattern: altering any wildcard byte still hits, altering any of the 16 fixed bytes loses the hit",
+                  wildN == 8 && wildHit == 8 && fixedN == 16 && fixedMiss == 16, std::to_string(wildHit) + "/" + std::to_string(wildN) + " wildcards, " + std::to_string(fixedMiss) + "/" + std::to_string(fixedN) + " fixed");
+        }
+        {
+            SynthImageEnh a, b, c, d, e, two;
+            a.Build(); b.Build(); c.Build(); d.Build(); e.Build(); two.Build();
+            const int32_t beyond = 0x7ff00000;
+            std::memcpy(&a.img[a.hit + (size_t)kMinimapLayoutEnhanced.dispAt], &beyond, 4);                  // the table address leaves the image
+            const TableResolve nearStart = ResolveMinimapTableFor(kMinimapLayoutEnhanced, &d.img[0x8], d.img.data(), d.img.size());
+            const TableResolve nearEnd = ResolveMinimapTableFor(kMinimapLayoutEnhanced, &e.img[e.img.size() - 0x40], e.img.data(), e.img.size());   // the reader would run off the image
+            // a second copy of the pattern further on: two hits (the engine refuses an ambiguous match)
+            std::memcpy(&two.img[0x9000], &two.img[two.hit], (size_t)kMinimapLayoutEnhanced.sigLen);
+            Check("minimap_scale Enhanced pattern: a table address outside the image and a hit at either edge are refused; a second copy of the pattern makes 2 hits",
+                  !a.Resolve().ok && a.Resolve().why.find("outside the image") != std::string::npos && !nearStart.ok && !nearEnd.ok && two.Hits(kMinimapLayoutEnhanced) == 2);
+        }
+        {
+            // The two layouts do not find each other, and the generic matcher agrees with the byte-exact search on the Legacy image.
+            SynthImage leg;
+            leg.Build();
+            SynthImageEnh enh;
+            enh.Build();
+            const uint8_t* h[4] = {};
+            const int legInLeg = FindLayoutHits(kMinimapLayoutLegacy, leg.img.data(), leg.img.size(), h, 4, 0);
+            const std::vector<size_t> exact = FindAll(leg.img.data(), leg.img.size(), kMinimapTableSig);
+            const bool same = legInLeg == (int)exact.size() && legInLeg == 1 && h[0] == &leg.img[exact[0]];
+            Check("minimap_scale layouts: the Legacy pattern finds only the Legacy image (the same single hit as the byte-exact search), the Enhanced pattern only the Enhanced image",
+                  same && FindLayoutHits(kMinimapLayoutLegacy, enh.img.data(), enh.img.size(), h, 4, 0) == 0 &&
+                      FindLayoutHits(kMinimapLayoutEnhanced, leg.img.data(), leg.img.size(), h, 4, 0) == 0 && enh.Hits(kMinimapLayoutEnhanced) == 1);
+        }
+        {
+            // Several runs: hits accumulate across calls and stop at the cap.
+            SynthImageEnh a, b;
+            a.Build();
+            b.Build();
+            const uint8_t* h[4] = {};
+            int have = FindLayoutHits(kMinimapLayoutEnhanced, a.img.data(), a.img.size(), h, 4, 0);
+            have = FindLayoutHits(kMinimapLayoutEnhanced, b.img.data(), b.img.size(), h, 4, have);
+            const uint8_t* g[2] = {};
+            const int capped = FindLayoutHits(kMinimapLayoutEnhanced, a.img.data(), a.img.size(), g, 1, 1);
+            // a run that is exactly the pattern is a hit (the last byte counts); one byte shorter is not
+            std::vector<uint8_t> exact((size_t)kMinimapLayoutEnhanced.sigLen);
+            for (int i = 0; i < kMinimapLayoutEnhanced.sigLen; ++i)
+                exact[(size_t)i] = PatTokenAt(kMinimapLayoutEnhanced.sig, i) >= 0 ? (uint8_t)PatTokenAt(kMinimapLayoutEnhanced.sig, i) : (uint8_t)0xA5;
+            const uint8_t* e1[4] = {};
+            const uint8_t* e2[4] = {};
+            const int atEnd = FindLayoutHits(kMinimapLayoutEnhanced, exact.data(), exact.size(), e1, 4, 0);
+            const int tooShort = FindLayoutHits(kMinimapLayoutEnhanced, exact.data(), exact.size() - 1, e2, 4, 0);
+            Check("minimap_scale layouts: hits found in separate runs add up (2), a full hit buffer is left alone, a run that is exactly the pattern hits and one byte shorter does not",
+                  have == 2 && h[0] == &a.img[a.hit] && h[1] == &b.img[b.hit] && capped == 1 && atEnd == 1 && e1[0] == exact.data() && tooShort == 0);
+        }
     }
 
     // ---- the real thing: the decrypted 3889 dump (skipped loudly when this machine has none) --------------------------------------------------
@@ -576,6 +729,78 @@ namespace minimapsizetest {
     {
         std::printf("FAIL  minimap_scale dump: %s%s%s\n", what, got.empty() ? "" : "  got: ", got.c_str());
         ++g_failed;
+    }
+
+    // The Enhanced dump: $GAGE_ENH_DUMP, $GAGE_ENH_IMG, else the repo-relative default searched from the working directory upwards (as pack_profile_test does).
+    inline std::string FindEnhancedDump()
+    {
+        for (const char* v : {"GAGE_ENH_DUMP", "GAGE_ENH_IMG"})
+            if (const char* e = std::getenv(v))
+                return e;
+        const char* rel = "enhanced EXE/dump and bin/GTA5_Enhanced.exe-95703552-959889125.img";
+        std::error_code ec;
+        std::filesystem::path dir = std::filesystem::current_path(ec);
+        for (int up = 0; !ec && up < 8 && !dir.empty(); ++up, dir = dir.parent_path())
+        {
+            const std::filesystem::path cand = dir / rel;
+            if (std::filesystem::exists(cand, ec))
+                return cand.string();
+            if (dir == dir.parent_path())
+                break;
+        }
+        return "";
+    }
+
+    // The Enhanced image (95703552 bytes): the layout's pattern is unique and resolves to the table; the reader's instructions match; the table holds the three
+    // components with stock-looking values; the Legacy pattern has no hit (the negative check is paired with the positive one above it).
+    inline void RunEnhancedDump()
+    {
+        const std::string path = FindEnhancedDump();
+        std::vector<uint8_t> img;
+        if (path.empty() || !ReadFileBytes(path, img) || img.size() != 95703552)
+        {
+            std::printf("SKIP  minimap_scale dump (Enhanced): no readable 95703552-byte GTA5_Enhanced image (GAGE_ENH_DUMP / GAGE_ENH_IMG / the repo's \"enhanced EXE\" folder); the "
+                        "Enhanced pattern and reader checks were NOT run against the real image\n");
+            return;
+        }
+        const MinimapLayout& L = kMinimapLayoutEnhanced;
+        const uint8_t* h[4] = {};
+        const int n = FindLayoutHits(L, img.data(), img.size(), h, 4, 0);
+        if (n != 1)
+        {
+            DumpFail("Enhanced: the pattern must hit exactly once", std::to_string(n) + " hits in " + path);
+            return;
+        }
+        const size_t hitRva = (size_t)(h[0] - img.data());
+        const TableResolve r = ResolveMinimapTableFor(L, h[0], img.data(), img.size());
+        if (!r.ok)
+        {
+            DumpFail("Enhanced: the reader / layout check", r.why);
+            return;
+        }
+        if (hitRva != L.expectHit || r.tableOff != L.expectTable)
+            DumpFail("Enhanced: RVAs differ from the ones the layout was analysed at", std::to_string(hitRva) + " / " + std::to_string(r.tableOff));
+        MinimapComp all[kMinimapEntries];
+        for (int i = 0; i < kMinimapEntries; ++i)
+            all[i] = DecodeMinimapComp(&img[r.tableOff + (size_t)i * kMinimapStride]);
+        const MinimapTrio t = PickTrio(all, kMinimapEntries);
+        std::string why = t.AllFound() ? "" : "minimap / minimap_mask / minimap_blur not all named in the image";
+        bool plausible = t.AllFound();
+        for (int k = 0; k < 3 && plausible; ++k)
+            plausible = PlausibleComp(t.c[k], &why);
+        if (!plausible)
+        {
+            DumpFail("Enhanced: the table in the image does not hold three plausible minimap components", why);
+            return;
+        }
+        const bool stock = Near(t.c[0].posX, -0.0045f) && Near(t.c[0].posY, 0.002f) && Near(t.c[0].sizeX, 0.150f) && Near(t.c[0].sizeY, 0.188888f, 1e-4f);
+        if (!stock)
+            DumpFail("Enhanced: the minimap component is not the stock frontend.xml one", FormatComp(t.c[0]));
+        const bool legacyAbsent = FindAll(img.data(), img.size(), kMinimapTableSig).empty();
+        if (!legacyAbsent)
+            DumpFail("Enhanced: FiveM's Legacy pattern must have no hit here (the layouts would be ambiguous)");
+        std::printf("ok    minimap_scale dump (Enhanced %s): pattern unique at RVA 0x%zx, reader pinned (9 instructions), table at RVA 0x%zx; %s | %s | %s; Legacy pattern absent: %s\n", path.c_str(),
+                    hitRva, r.tableOff, FormatComp(t.c[0]).c_str(), FormatComp(t.c[1]).c_str(), FormatComp(t.c[2]).c_str(), legacyAbsent ? "yes" : "NO");
     }
 
     // Not counted in kChecks (the dump is not in the repo). A failure is a failure; an absent dump is a loud SKIP, never a pass.
@@ -622,22 +847,7 @@ namespace minimapsizetest {
         }
         if (!dumps.empty() && ran == 0)
             DumpFail("a Legacy dump was found but none could be read");
-        // Enhanced: its frontend.xml reader fills a local struct, so the Legacy pattern has no hit and minimap_scale stays off there.
-        if (const char* enh = std::getenv("GAGE_ENH_DUMP"))
-        {
-            std::vector<uint8_t> img;
-            if (ReadFileBytes(enh, img))
-            {
-                const std::vector<size_t> hits = FindAll(img.data(), img.size(), kMinimapTableSig);
-                std::printf("%s  minimap_scale dump (Enhanced %s): the Legacy pattern has %zu hits (expected 0: Enhanced stays off)\n", hits.empty() ? "ok  " : "FAIL", enh, hits.size());
-                if (!hits.empty())
-                    ++g_failed;
-            }
-            else
-                std::printf("SKIP  minimap_scale dump (Enhanced): GAGE_ENH_DUMP=%s is not readable\n", enh);
-        }
-        else
-            std::printf("SKIP  minimap_scale dump (Enhanced): GAGE_ENH_DUMP not set (the Legacy pattern's absence from the Enhanced image was NOT re-checked)\n");
+        RunEnhancedDump();
     }
 
 } // namespace minimapsizetest

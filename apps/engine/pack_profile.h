@@ -11,7 +11,8 @@
 //    (FNV-1a of every pattern, taken from git HEAD before the move). Do not edit them without a live Legacy run.
 //  * Enhanced values come from the friend's decrypted dump (`enhanced EXE/dump and bin/GTA5_Enhanced.exe-95703552-
 //    959889125.img`, file offset = RVA); pack_profile_test asserts each pattern is a UNIQUE hit at its expectRva there.
-//    Nothing Enhanced is live-proven yet (Round A is the first live read).
+//    Round A (pack_enh=1) read-only checks passed live on a friend's PC (22 of 22, 0.4.25); the Round B mount patterns
+//    (runPackGroup .. regStreamInfo, marked "Round B") are offline reads only until pack_enh=2 has run.
 //
 // Pure data, C++17, no OS headers.
 #pragma once
@@ -34,12 +35,12 @@ struct RipOp { int dispAt = 0; int endAt = 0; };
 struct PackProfile {
     const wchar_t* exeName = nullptr;   // main-module file name, compared lower-cased
     const char*    label   = nullptr;
-    bool           mountable = false;   // pack_stream.cpp's mount chain is valid for this build (Legacy only)
+    bool           mountable = false;   // pack_stream.cpp's LEGACY mount chain (MountGate etc.) is valid for this build; Enhanced mounts through packenh::Mounter
 
     // ---- the DLC loader's functions -------------------------------------------------------------------------
     // Legacy: AddDlcPack, DlcSetup2, MountGate and RunPackGroup are the four the mount needs; mount .. popFolder are
     // diagnostic-only probes; regStream registers a loose file; vehStore is the DLC vehicle store init.
-    // Enhanced (Round A): addDlcPack, dlcSetup2, mount and vehStore only; the rest stay null until a later round.
+    // Enhanced: addDlcPack, dlcSetup2, mount, vehStore (Round A) and runPackGroup .. popFolder, regStream (Round B); no mountGate (inlined in the game's loop).
     PackSig addDlcPack, dlcSetup2, mountGate, runPackGroup;
     PackSig mount, pushFolder, exists, popFolder;
     PackSig regStream, vehStore, getDevice;
@@ -64,6 +65,18 @@ struct PackProfile {
     uint32_t vsReadLen = 0;       // bytes of the match that must be readable before the operands are used
     uint32_t vsLimitOffExpect = 0, vsSlotExpect = 0;   // 0x324 / 0x28 on both builds: the operands must agree
 
+    // ---- the Enhanced mount (pack_enh=2, Round B) ---------------------------------------------------------------------
+    // RunPackGroup's ABI differs: Legacy (mgr, uint32 packHash, uint32 groupHash); Enhanced (mgr, DlcEntry* entry,
+    // uint32_t* groupHash). The streaming-info manager (`this` of the game's register-a-file routine) is read out of
+    // RegStreamFile's own call to that routine (a pattern searched inside regStream only); Legacy keeps the offline
+    // streamInfoMgrRva below. regStreamInfoCountAt = where the manager keeps its entry count (0 = not read on this build:
+    // the register routine's returned index is then only range-checked).
+    bool     runGroupByEntry = false;
+    PackSig  regStreamInfo;
+    RipOp    regStreamInfoOp;
+    uint32_t regStreamInfoScanLen = 0;
+    uint32_t regStreamInfoCountAt = 0;
+
     // ---- ExtraContentManager layout ----------------------------------------------------------------------------
     uint32_t mgrVtableRva = 0;    // *mgr == base + this (Legacy: from the ctor; Enhanced: ctor pattern gives it too)
     uint32_t mgrArray = 0;        // mgr -> DlcEntry* array
@@ -77,6 +90,8 @@ struct PackProfile {
     uint32_t entryPath = 0;       // atString: char* path (Mount loads it as a QWORD ptr)
     uint32_t entryPathLen = 0;    // atString: WORD length (capacity WORD follows)
     uint32_t entryType = 0;       // DWORD device type
+    uint32_t entryMountPoint = 0;     // atString: char* mount point ("dlc_x:/"), set by DlcSetup2 from setup2.xml
+    uint32_t entryMountPointLen = 0;  // atString: WORD length (Mount is given the pointer only while this is nonzero)
     uint32_t entryState = 0;      // DWORD setup state
     uint32_t typePackfile = 0;    // entryType value: fiPackfile::Open (the crypto path)
     uint32_t typeRelative = 0;    // entryType value: fiDeviceRelative over the path (loose folder)
@@ -163,12 +178,15 @@ constexpr PackProfile MakeLegacyPackProfile() {
     p.entryPath = 0xb8;
     p.entryPathLen = 0xc0;         // capacity WORD at +0xc2; Mount ignores +0xb8 while the length is 0
     p.entryType = 0xc8;
+    p.entryMountPoint = 0x30;      // atString {char* +0x30, WORD length +0x38}: MountGate 0x94301c hands it to Mount when the length is nonzero
+    p.entryMountPointLen = 0x38;
     p.entryState = 0xd0;           // 0 fresh, 1 parsed, 2 mounted
     p.typePackfile = 2;            // Mount 0x94307c: +0xc8==2 -> fiPackfile::Open
     p.typeRelative = 1;            // Mount 0x94307c: +0xc8==1 -> fiDeviceRelative over +0xb8
 
     p.assetGlobalRva = 0x1e2ee90u;
     p.streamInfoMgrRva = 0x2ea23d0u;
+    p.regStreamInfoCountAt = 8;    // strStreamingInfoManager [+8] = entry count (pack_stream.cpp RegisterLooseStream's read-back)
     p.imageRegistryRva = 0x2c67400u;
     p.rawStreamerVtRva = 0x1b7d5e0u;
     return p;
@@ -176,7 +194,7 @@ constexpr PackProfile MakeLegacyPackProfile() {
 
 // ---------------------------------------------------------------------------------------------------------------
 // Enhanced build 1158 (GTA5_Enhanced.exe). Derived offline from the friend's decrypted dump; every pattern is a UNIQUE
-// hit at its expectRva there (tests/pack_profile_test.cpp). Round A reads only; nothing here is live-proven.
+// hit at its expectRva there (tests/pack_profile_test.cpp). Round A (read-only) passed live; Round B (mount) is offline-derived.
 // ---------------------------------------------------------------------------------------------------------------
 constexpr PackProfile MakeEnhancedPackProfile() {
     PackProfile p{};
@@ -263,12 +281,61 @@ constexpr PackProfile MakeEnhancedPackProfile() {
     p.entryPath = 0xd8;
     p.entryPathLen = 0xe0;
     p.entryType = 0xf8;
+    p.entryMountPoint = 0x40;      // atString {char* +0x40, WORD length +0x48}: the mount loop at 0xc28c18 passes it to Mount when the length is nonzero
+    p.entryMountPointLen = 0x48;
     p.entryState = 0x100;
     p.typePackfile = 2;
     p.typeRelative = 1;
 
     p.imageRegistryRva = 0x2c075b0u;   // offline read; the live address comes from imageReg
     p.rawStreamerVtRva = 0x2665bb0u;   // registry[0]'s vtable in the dump's process (the 0x7b8-byte object made at 0x1275b1c)
+
+    // ---- Round B (pack_enh=2): the rest of what the Legacy mount path calls, found in the same dump ------------------
+    // RunPackGroup(mgr rcx, DlcEntry* rdx, uint32_t* groupHash r8): the manager's loop at 0xc28b18 calls it with
+    // r8 = &[rsp+0x38] holding 0x6f8bd408 (early_on, set at 0xc28d1d) or 0x5bf6578f (startup, set at 0xc28ae5), and
+    // rdx = the entry whose hash [+0x80] matches, found in the manager's own array.
+    p.runGroupByEntry = true;
+    p.runPackGroup = { "RunPackGroup",
+      "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 48 85 D2 0F 84 ?? ?? ?? ?? 4D 89 C5 48 89 D7 49 89 CC "
+      "48 C7 44 24 38 00 00 00 00 C7 44 24 40 00 00 00 00 41 8B 10 4C 8D 44 24 38 48 89 F9 E8 ?? ?? ?? ??",
+      "Enhanced dump 2026-11-05: (mgr, entry*, uint32_t* group); six callers, 0xc28af5 (startup) and 0xc28d1d (early_on) are the mount loop's", 0xc26f00 };
+    // fiDevice::GetDevice(path, readOnly): the thunk 0x101810 every device-for-path caller uses is a jmp to this.
+    // Vtable of the device it returns (the packfile device 0x2488e90): +0x08 Open 0x110580, +0x30 Read 0x110d50,
+    // +0x60 Close 0x110ce0, +0xb0 GetFileSize 0x111250: the same slots Legacy's ReadGameFile calls.
+    p.getDevice = { "GetDevice",
+      "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC 88 05 00 00 89 D6 49 89 CE BA 3A 00 00 00 E8 ?? ?? ?? ??",
+      "Enhanced dump 2026-11-05: fiDevice::GetDevice(path, readOnly); first call is strchr(path, ':')", 0x10caf0 };
+    // fiAssetManager (ASSET = 0x2bc3fe0), the calls DlcSetup2 makes on it to test setup2.xml: PushFolder / Exists / PopFolder.
+    p.pushFolder = { "PushFolder",
+      "41 57 41 56 56 57 53 48 81 EC 20 01 00 00 48 89 D7 49 89 CE 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? "
+      "0F B6 07 83 F8 24 74 24 83 F8 2F 74 1B 83 F8 5C 74 16",
+      "Enhanced dump 2026-11-05: fiAssetManager::PushFolder(asset, folder)", 0x102720 };
+    p.exists = { "Exists",
+      "48 81 EC 38 01 00 00 49 89 D1 4C 89 44 24 20 48 8D 54 24 30 41 B8 00 01 00 00 E8 ?? ?? ?? ?? 90 "
+      "48 81 C4 38 01 00 00 C3",
+      "Enhanced dump 2026-11-05: fiAssetManager::Exists(asset, name, flags)", 0x101e00 };
+    // The same machine code as Legacy's PopFolder (pack_profile_test pins that this text is also unique here).
+    p.popFolder = { "PopFolder",
+      "FF 89 00 0C 00 00 48 8D 0D ?? ?? ?? ?? E9 ?? ?? ?? ??",
+      "Enhanced dump 2026-11-05: fiAssetManager::PopFolder(asset), identical to Legacy's", 0x102ab0 };
+    p.assetGlobalRva = 0x2bc3fe0u;
+    // RegisterStreamFile(int* out rcx, const char* path rdx, bool one r8 (unread), const char* name r9 (null = path),
+    // bool fatalIfMissing [rsp+0x28], bool allowOverride [rsp+0x30]): the same routine Legacy's 0x169e4d4 is. Device ->
+    // vt+0x170 image index, vt+0x150 isCollection; a plain OS path lands on the RawStreamer (accessor 0x1279990 ->
+    // singleton 0x4681bc0, vtable 0x2665bb0), whose +0x208 (0x127a110, lower-cases the path) appends it to its file list.
+    p.regStream = { "RegStreamFile",
+      "41 57 41 56 56 57 55 53 48 83 EC 58 4C 89 CF 48 89 D6 49 89 CE 44 0F B6 BC 24 B0 00 00 00 4D 85 C9 48 0F 44 FA "
+      "48 89 D1 B2 01 E8 ?? ?? ?? ?? 48 89 C3 48 85 C0",
+      "Enhanced dump 2026-11-05: loose-file registration, device -> RawStreamer +0x208 -> streaming-info register 0xce3320", 0xce46d0 };
+    // Inside it: `lea rcx,[strStreamingInfoManager]; mov rdx,r14; mov r8,rdi; mov r9d,eax; call 0xce3320` (the register
+    // routine's `this`). 0xce3320 reads the handle array through [this+0] (8-byte entries); the count's offset is not read.
+    p.regStreamInfo = { "StreamInfoMgr",
+      "48 8D 0D ?? ?? ?? ?? 4C 89 F2 49 89 F8 41 89 C1 E8 ?? ?? ?? ??",
+      "Enhanced dump 2026-11-05: the register call inside RegStreamFile (searched there only)", 0xce4793 };
+    p.regStreamInfoOp = { 3, 7 };
+    p.regStreamInfoScanLen = 0x100;
+    p.regStreamInfoCountAt = 0;
+    p.streamInfoMgrRva = 0x42f9e48u;   // offline read; the live address comes from regStreamInfo
     return p;
 }
 

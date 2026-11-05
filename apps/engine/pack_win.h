@@ -81,4 +81,12 @@ inline bool SafeRead(const void* p, void* out, size_t n) {
     return ReadProcessMemory(GetCurrentProcess(), p, out, n, &got) && got == n;
 }
 
+// Write n bytes into this process's memory, or fail without faulting (the counterpart of SafeRead; WriteProcessMemory on our
+// own handle). Round B writes only plain WORD / DWORD fields of the game's heap structures through it.
+inline bool SafeWrite(void* p, const void* in, size_t n) {
+    if (!p || !in || !n) return false;
+    SIZE_T put = 0;
+    return WriteProcessMemory(GetCurrentProcess(), p, in, n, &put) && put == n;
+}
+
 }  // namespace gage::game::content::win

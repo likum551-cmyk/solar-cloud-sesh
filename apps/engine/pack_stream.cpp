@@ -15,6 +15,8 @@
 #include <windows.h>
 
 #include "handling_tune.h"
+#include "pack_enh.h"
+#include "pack_enh_mount_core.h"
 #include "pack_meta.h"
 #include "pack_profile.h"
 #include "pack_scan.h"
@@ -494,6 +496,15 @@ bool Enabled() {
         const std::wstring v = reg::Get(L"pack_mount");
         const bool legacy = IsLegacyGameExe();
         const bool present = AnyPackFolder();
+        // GTA V Enhanced (0.4.26): armed only by pack_enh=2 (Round B, pack_enh.h), with packs present; pack_mount=0 still turns it off.
+        const int enhMode = ParsePackEnh(reg::Get(L"pack_enh").c_str());
+        const bool enh = !legacy && &Prof() == &kPackEnhanced && enhMode >= 2;
+        if (enh) {
+            g_enabled = (present && v != L"0") ? 1 : 0;
+            GLOGI("[packenh] pack mount %s (pack_enh=%d, pack_mount=%s, pack folders %s)", g_enabled ? "ARMED: Round B mounts the packs once Round A passes" : "off",
+                  enhMode, v.empty() ? "unset" : Narrow(v).c_str(), present ? "present" : "none");
+            return g_enabled == 1;
+        }
         const bool want = v == L"1" || (v.empty() && present);
         g_enabled = (want && legacy) ? 1 : 0;
         GLOGI("hook: [packstream] pack mount %s (pack_mount=%s, pack folders %s, game %s)", g_enabled ? "ARMED" : "off",
@@ -787,10 +798,11 @@ void ReadPackModels(Pack& p, const std::string& mount) {
 
 // The pack's mount point ("dlc_supra:/"): DlcEntry +0x30 is an atString (char* +0x30, WORD length +0x38), which
 // MountGate 0x94301c hands to Mount when the length is nonzero. "" when unreadable or implausible.
+// (The offsets are Prof().entryMountPoint / entryMountPointLen: 0x30 / 0x38 on Legacy.)
 std::string EntryMountPoint(char* e) {
-    if (!e || !IsReadable(e + 0x30, 10)) return "";
-    const char* s = *reinterpret_cast<const char* const*>(e + 0x30);
-    const uint16_t n = *reinterpret_cast<const uint16_t*>(e + 0x38);
+    if (!e || !IsReadable(e + Prof().entryMountPoint, Prof().entryMountPointLen - Prof().entryMountPoint + 2)) return "";
+    const char* s = *reinterpret_cast<const char* const*>(e + Prof().entryMountPoint);
+    const uint16_t n = *reinterpret_cast<const uint16_t*>(e + Prof().entryMountPointLen);
     if (!s || n == 0 || n > 120 || !IsReadable(s, n)) return "";
     std::string m(s, n);
     for (char c : m) if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7e) return "";
@@ -798,6 +810,11 @@ std::string EntryMountPoint(char* e) {
     if (m.back() != '/') m.push_back('/');
     return m;
 }
+
+// Enhanced (pack_enh=2): the image registry and the streaming-info manager are the ones the patterns resolved in THIS process
+// (pack_enh_mount_core.h Extras, RegStreamFile's own register call); 0 = use the profile's offline constants (Legacy).
+struct StreamAddrs { uint32_t registryRva = 0, streamInfoRva = 0; };
+StreamAddrs g_enhStream;
 
 // Register every model file in <pack>/stream/ with the game's streaming system (see kRegStreamSig). Runs
 // before the change set, so CVehicleModelInfo::Init (vehicles.meta) finds the "jesko" fragment and txd
@@ -836,7 +853,7 @@ bool RegisterLooseStream(const Paths& paths) {
         return false;
     }
     const uintptr_t base = (uintptr_t)im.base;
-    void* const* registry = reinterpret_cast<void* const*>(base + Prof().imageRegistryRva);
+    void* const* registry = reinterpret_cast<void* const*>(base + (g_enhStream.registryRva ? g_enhStream.registryRva : Prof().imageRegistryRva));
     void* raw = IsReadable(registry, 8) ? registry[0] : nullptr;
     const uintptr_t rawVt = (raw && IsReadable(raw, 8)) ? *reinterpret_cast<const uintptr_t*>(raw) : 0;
     GLOGI("hook: [packstream] stream: %s UNIQUE @ +0x%llx; image 0 collection @0x%llx vtable +0x%llx (%s)",
@@ -848,7 +865,8 @@ bool RegisterLooseStream(const Paths& paths) {
         return false;
     }
 
-    const auto* mgr = reinterpret_cast<const uint8_t*>(base + Prof().streamInfoMgrRva);
+    const auto* mgr = reinterpret_cast<const uint8_t*>(base + (g_enhStream.streamInfoRva ? g_enhStream.streamInfoRva : Prof().streamInfoMgrRva));
+    const uint32_t countAt = Prof().regStreamInfoCountAt;   // Legacy 8; Enhanced 0 = the count's offset was not read: only the array is bounds-checked
     int ok = 0;
     for (const std::wstring& f : files) {
         bool ascii = true;
@@ -860,7 +878,7 @@ bool RegisterLooseStream(const Paths& paths) {
         reinterpret_cast<RegStreamFileFn>(fn)(&out, path.c_str(), 1, name.c_str(), 0, 0);
         uint32_t handle = 0, flags = 0;
         const uint8_t* arr = IsReadable(mgr, 16) ? *reinterpret_cast<uint8_t* const*>(mgr) : nullptr;
-        const uint32_t count = IsReadable(mgr + 8, 4) ? *reinterpret_cast<const uint32_t*>(mgr + 8) : 0;
+        const uint32_t count = countAt ? (IsReadable(mgr + countAt, 4) ? *reinterpret_cast<const uint32_t*>(mgr + countAt) : 0) : 0x100000u;
         if (out >= 0 && (uint32_t)out < count && arr && IsReadable(arr + (size_t)out * 8, 8)) {
             handle = *reinterpret_cast<const uint32_t*>(arr + (size_t)out * 8);
             flags  = *reinterpret_cast<const uint32_t*>(arr + (size_t)out * 8 + 4);
@@ -1204,6 +1222,296 @@ void PublishVehicles() {
     ++g_vehGen;
 }
 
+// The last phase of both builds: poll the cars into the cdimage (2 passes a second), until all are in or the wait runs out.
+// enh only changes the log prefix and the READY line (`[packenh] READY P of P ...`); Legacy's text is unchanged.
+Status PollCdimage(World& world, bool enh) {
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_pollAt) return g_status;
+    g_pollAt = now + 500;
+    size_t total = 0, in = 0, mounted = 0, packs = 0;
+    bool changed = false;
+    for (Pack& p : g_packs) {
+        if (p.tune) continue;   // the handling override is not a content pack (logged on its own line)
+        ++packs;
+        if (!p.mounted) continue;
+        ++mounted;
+        for (PackModel& m : p.models) {
+            ++total;
+            if (!m.inCdimage && m.hash && ModelInCdimage(world, m.hash)) { m.inCdimage = true; changed = true; }
+            if (m.inCdimage) ++in;
+        }
+    }
+    if (changed) PublishVehicles();
+    if (in == total || now - g_mountAt > kModelWaitMs) {
+        for (const Pack& p : g_packs)
+            for (const PackModel& m : p.models)
+                if (p.mounted && !m.inCdimage)
+                    GLOGW("%s pack %s: car '%s' (0x%08x) is NOT in the cdimage %llu ms after its change set "
+                          "(its vehicles.meta did not register it)", enh ? "[packenh]" : "hook: [packstream]", p.name.c_str(), m.v.model.c_str(),
+                          (unsigned)m.hash, (unsigned long long)(now - g_mountAt));
+        g_status = mounted ? Status::Ready : Status::Failed;
+        if (enh)
+            GLOGI("[packenh] %s %u of %u pack(s) mounted, %u of %u car(s) in the cdimage", mounted ? "READY" : "FAILED", (unsigned)mounted, (unsigned)packs,
+                  (unsigned)in, (unsigned)total);
+        else
+            GLOGI("hook: [packstream] %s: %u of %u pack(s) mounted, %u of %u car(s) in the cdimage", mounted ? "READY" : "FAILED",
+                  (unsigned)mounted, (unsigned)packs, (unsigned)in, (unsigned)total);
+    }
+    return g_status;
+}
+
+// =============================================================================================
+// GTA V Enhanced (pack_enh=2, Round B). The same flow as MountSequence with the Enhanced profile. The sequencing of the game
+// calls is packenh::Mounter (pack_enh_mount_core.h, tested against a fake game in tests/pack_profile_test.cpp); this section
+// wires it to the live game and does the parts around it (preflight, the loose stream files, the car list, the vehicle store
+// check, the cdimage poll, the streaming probe). Game thread only, like Tick.
+// Not ported: the NG handling tune (pack_ng_tune is ignored on Enhanced).
+// =============================================================================================
+using EnhRunGroupFn = void (*)(void* mgr, void* entry, uint32_t* groupHash);
+
+struct EnhLive {
+    bool inited = false;
+    PackEnhMountInfo info;
+    uintptr_t base = 0;
+    uintptr_t addDlc = 0, setup2 = 0, mount = 0, atStr = 0, runGroup = 0;
+    uint64_t vtableVa = 0;
+};
+EnhLive g_enh;
+
+bool EnhRead(void*, uint64_t va, void* out, size_t n) { return win::SafeRead(reinterpret_cast<const void*>(static_cast<uintptr_t>(va)), out, n); }
+bool EnhWrite(void*, uint64_t va, const void* in, size_t n) { return win::SafeWrite(reinterpret_cast<void*>(static_cast<uintptr_t>(va)), in, n); }
+uint8_t EnhAdd(void*, uint64_t mgr, const char* path) {
+    return reinterpret_cast<AddDlcPackFn>(g_enh.addDlc)(reinterpret_cast<void*>(static_cast<uintptr_t>(mgr)), path);
+}
+uint8_t EnhSetup2(void*, uint64_t entry, uint32_t gen) {
+    return reinterpret_cast<Setup2Fn>(g_enh.setup2)(reinterpret_cast<void*>(static_cast<uintptr_t>(entry)), gen);
+}
+int EnhMount(void*, uint64_t entry, uint32_t gen, uint64_t mountPointVa) {
+    const char* mp = mountPointVa ? reinterpret_cast<const char*>(static_cast<uintptr_t>(mountPointVa)) : "";
+    return reinterpret_cast<MountFn>(g_enh.mount)(reinterpret_cast<void*>(static_cast<uintptr_t>(entry)), gen, mp);
+}
+void EnhAppend(void*, uint64_t atString, const char* src, int len) {
+    reinterpret_cast<AtStrAppendFn>(g_enh.atStr)(reinterpret_cast<void*>(static_cast<uintptr_t>(atString)), src, len);
+}
+void EnhGroup(void*, uint64_t mgr, uint64_t entry, uint32_t group) {
+    uint32_t g = group;   // the game wants a pointer to the group hash
+    reinterpret_cast<EnhRunGroupFn>(g_enh.runGroup)(reinterpret_cast<void*>(static_cast<uintptr_t>(mgr)), reinterpret_cast<void*>(static_cast<uintptr_t>(entry)), &g);
+}
+void EnhLog(void*, bool warn, const char* line) {
+    if (warn) GLOGW("%s", line);
+    else GLOGI("%s", line);
+}
+
+packenh::MountAbi EnhAbi() {
+    packenh::MountAbi a;
+    a.read = EnhRead;
+    a.write = EnhWrite;
+    a.addDlcPack = EnhAdd;
+    a.dlcSetup2 = EnhSetup2;
+    a.mount = EnhMount;
+    a.atAppend = EnhAppend;
+    a.runGroup = EnhGroup;
+    a.log = EnhLog;
+    return a;
+}
+
+uint64_t EnhManager() {
+    uint64_t m = 0;
+    return win::SafeRead(reinterpret_cast<const void*>(g_enh.base + g_enh.info.mgrGlobal), &m, 8) ? m : 0;
+}
+
+void EnhInit(const PackEnhMountInfo& info) {
+    const Image im = GameImage();
+    g_enh.info = info;
+    g_enh.base = (uintptr_t)im.base;
+    g_enh.addDlc = g_enh.base + info.addDlcPack;
+    g_enh.setup2 = g_enh.base + info.dlcSetup2;
+    g_enh.mount = g_enh.base + info.mount;
+    g_enh.atStr = g_enh.base + info.atStr;
+    g_enh.runGroup = g_enh.base + info.runPackGroup;
+    g_enh.vtableVa = (uint64_t)g_enh.base + info.mgrVtable;
+    g_enhStream.registryRva = (uint32_t)info.registry;
+    g_enhStream.streamInfoRva = (uint32_t)info.streamInfo;
+    g_enh.inited = true;
+}
+
+// The DLC vehicle store must have room for the pack's cars: its change set takes one slot per car and the game never checks the
+// array's end (see PrepareVehicleStore). False (after Fail) when it would not fit.
+bool EnhStoreCheck(const Pack& p) {
+    std::lock_guard<std::mutex> lk(g_vehStoreMu);
+    StoreHdr* h = ResolveVehStore() ? DlcVehStore() : nullptr;
+    if (!h) {
+        GLOGW("[packenh] pack %s: the DLC vehicle store is not readable; running the change set without the capacity check", p.name.c_str());
+        return true;
+    }
+    const unsigned used = h->count, cap = h->cap, need = (unsigned)p.models.size();
+    const unsigned left = cap > used ? cap - used : 0;
+    GLOGI("[packenh] pack %s: DLC vehicle store %u of %u used, %u free; the pack defines %u car(s)", p.name.c_str(), used, cap, left, need);
+    if (need > left || (need == 0 && left == 0)) {
+        Fail("the DLC vehicle store is full (%u of %u used) and the pack defines %u car(s); its change set would write past the end of the "
+             "array. Raise veh_store_extra (HKCU\\Software\\GAGE-MP)", used, cap, need);
+        return false;
+    }
+    return true;
+}
+
+// One pack, start to finish. Every step logs before it runs ([packenh] lines); a failure is logged by the Mounter or by Fail.
+bool EnhMountPack(Pack& p, size_t index, size_t total) {
+    g_curPack = p.name;
+    const uint64_t mgr = EnhManager();
+    if (!mgr) { Fail("the ExtraContentManager singleton is null"); return false; }
+    GLOGI("[packenh] pack %s (%u of %u): %s", p.name.c_str(), (unsigned)(index + 1), (unsigned)total,
+          p.folder ? "loose folder (setup2.xml + stream/)" : "dlc.rpf, opened by the game's own loader");
+    if (p.folder) {
+        if (!FolderPreflight(p.paths)) return false;       // Fail() already logged
+    } else if (!Preflight(p.paths.file)) {
+        return false;
+    }
+    packenh::Mounter m(Prof(), EnhAbi(), mgr, g_enh.vtableVa);
+    packenh::MountOut mo;
+    if (!m.Add(p.name, p.paths.device, p.folder, mo)) {
+        Fail("step %d/%d (%s): %s", mo.step, packenh::Mounter::kSteps, mo.stepName.c_str(), mo.why.c_str());
+        return false;
+    }
+    // 5. the loose stream files, the car list, the vehicle store
+    if (p.folder) {
+        GLOGI("[packenh] pack %s: step 5/%d register the loose model files in %sstream/ with the game's streaming system", p.name.c_str(), packenh::Mounter::kSteps,
+              p.paths.device.c_str());
+        if (!RegisterLooseStream(p.paths)) return false;   // Fail() already logged
+    } else {
+        GLOGI("[packenh] pack %s: step 5/%d stream files: skipped (a dlc.rpf pack streams from its own archive)", p.name.c_str(), packenh::Mounter::kSteps);
+    }
+    const std::string mount = p.folder ? std::string() : m.MountPointOf(mo.entry);
+    ReadPackModels(p, mount);
+    if (!EnhStoreCheck(p)) return false;
+    if (!m.RunChangeSets(p.name, mo)) {
+        Fail("step %d/%d (%s): %s", mo.step, packenh::Mounter::kSteps, mo.stepName.c_str(), mo.why.c_str());
+        return false;
+    }
+    std::string cars;
+    for (const PackModel& pm : p.models) { if (!cars.empty()) cars += ", "; cars += pm.v.model; }
+    GLOGI("[packenh] pack %s: MOUNTED, %u car(s) to find in the cdimage: %s", p.name.c_str(), (unsigned)p.models.size(), cars.empty() ? "-" : cars.c_str());
+    return true;
+}
+
+// ---- the streaming probe ------------------------------------------------------------------------------------------------------
+// After READY, every car model of every mounted pack is requested once, ONE AT A TIME, and released again, to answer the
+// question this round exists for: do Legacy-built (gen8) vehicle assets stream on gen9 Enhanced. Each request is logged before
+// it is made (a crash names the model). pack_enh_stream=0 switches the probe off.
+struct ProbeItem { std::string pack, model; uint32_t hash = 0; };
+struct StreamProbe {
+    bool inited = false, on = false, done = false, requested = false;
+    std::vector<ProbeItem> items;
+    size_t next = 0;
+    ULONGLONG startAt = 0, t0 = 0;
+    unsigned loaded = 0, timeouts = 0;
+};
+StreamProbe g_probe;
+constexpr ULONGLONG kProbeSettleMs = 4000;   // after READY: let the world reveal finish first
+constexpr ULONGLONG kProbeMaxMs = 8000;      // per model
+
+void EnhProbeTick(World& world) {
+    StreamProbe& pr = g_probe;
+    if (pr.done || g_status != Status::Ready) return;
+    const ULONGLONG now = GetTickCount64();
+    if (!pr.inited) {
+        pr.inited = true;
+        const std::wstring v = reg::Get(L"pack_enh_stream");
+        pr.on = v != L"0";
+        unsigned skipped = 0;
+        for (const Pack& p : g_packs) {
+            if (p.tune || !p.mounted) continue;
+            for (const PackModel& m : p.models) {
+                if (m.inCdimage && m.hash) pr.items.push_back({ p.name, m.v.model, m.hash });
+                else ++skipped;
+            }
+        }
+        pr.startAt = now + kProbeSettleMs;
+        if (pr.on)
+            GLOGI("[packenh] stream probe: %u car model(s) will be requested one at a time (%u not in the cdimage are skipped), %llu ms each at most, starting in %llu ms. "
+                  "This answers whether Legacy-built vehicle assets stream on Enhanced; the last [packenh] stream line before a crash names the model. "
+                  "pack_enh_stream=0 skips the probe.",
+                  (unsigned)pr.items.size(), skipped, (unsigned long long)kProbeMaxMs, (unsigned long long)kProbeSettleMs);
+        else
+            GLOGI("[packenh] stream probe: off (pack_enh_stream=0)");
+    }
+    if (!pr.on) { pr.done = true; return; }
+    if (now < pr.startAt) return;
+    if (pr.next >= pr.items.size()) {
+        pr.done = true;
+        GLOGI("[packenh] stream probe finished: %u of %u car model(s) loaded, %u timed out", pr.loaded, (unsigned)pr.items.size(), pr.timeouts);
+        return;
+    }
+    const ProbeItem& it = pr.items[pr.next];
+    if (!pr.requested) {
+        GLOGI("[packenh] stream: requesting '%s' (0x%08x) of pack %s (%u of %u)", it.model.c_str(), (unsigned)it.hash, it.pack.c_str(), (unsigned)(pr.next + 1),
+              (unsigned)pr.items.size());
+        world.RequestModel(it.hash);
+        pr.requested = true;
+        pr.t0 = now;
+        return;
+    }
+    const bool ok = world.HasModelLoaded(it.hash);
+    if (!ok && now - pr.t0 <= kProbeMaxMs) return;
+    if (ok) {
+        ++pr.loaded;
+        GLOGI("[packenh] stream: '%s' LOADED after %llu ms", it.model.c_str(), (unsigned long long)(now - pr.t0));
+    } else {
+        ++pr.timeouts;
+        GLOGW("[packenh] stream: '%s' NOT loaded after %llu ms (timeout); the model is released again", it.model.c_str(), (unsigned long long)(now - pr.t0));
+    }
+    world.ModelNoLongerNeeded(it.hash);
+    pr.requested = false;
+    ++pr.next;
+}
+
+// The Enhanced Tick: wait for the patterns phase, then one pack per tick, then the cdimage poll.
+Status EnhTick(World& world) {
+    if (!g_enh.inited) {
+        PackEnhMountInfo info;
+        const PackEnhGate gate = PackEnhMountGate(&info);
+        if (gate == PackEnhGate::Pending) {
+            g_status = Status::Pending;   // the world reveal waits (bounded) for the packs
+            return g_status;
+        }
+        if (gate != PackEnhGate::Ready) {
+            g_curPack = "*";
+            if (gate == PackEnhGate::Refused) Fail("round B refused: %s", info.why);
+            else Fail("pack_enh=2 but Round B was never armed (see the earlier [packenh] lines)");
+            GLOGW("[packenh] FAILED: no pack was mounted and nothing was written: %s", g_fail);
+            g_status = Status::Failed;
+            return g_status;
+        }
+        EnhInit(info);
+    }
+    if (!g_listed) {
+        g_listed = true;
+        EnumeratePacks();
+        if (g_packs.empty()) {
+            g_curPack = "*";
+            Fail("no pack folders to mount");
+            GLOGW("[packenh] FAILED: no pack folders under %%LOCALAPPDATA%%\\GAGE-MP\\packs");
+            g_status = Status::Failed;
+            return g_status;
+        }
+        GLOGI("[packenh] mounting %u pack(s), one per script tick; NG handling tune is not ported to Enhanced (pack_ng_tune is ignored)", (unsigned)g_packs.size());
+        g_status = Status::Pending;
+        return g_status;
+    }
+    if (g_next < g_packs.size()) {
+        const size_t idx = g_next++;
+        Pack& p = g_packs[idx];
+        p.mounted = EnhMountPack(p, idx, g_packs.size());
+        if (!p.mounted) GLOGW("[packenh] pack %s FAILED (%s); the next pack is tried", p.name.c_str(), g_fail);
+        for (PackModel& m : p.models) m.hash = world.HashKey(m.v.model.c_str());
+        g_mountAt = GetTickCount64();
+        g_pollAt = 0;
+        PublishVehicles();
+        return g_status;
+    }
+    return PollCdimage(world, true);
+}
+
 }  // namespace
 
 // =============================================================================================
@@ -1224,6 +1532,14 @@ void PrepareVehicleStoreLocked() {
     }
     if (extra == 0) {
         GLOGW("hook: [packstream] DLC vehicle store: not raised (veh_store_extra=0); packs that do not fit are refused");
+        g_vehStoreDone = true;
+        return;
+    }
+    if (v.empty() && &Prof() == &kPackEnhanced) {
+        // Enhanced (Round B): the live limit is already 640 (round A, 0.4.25) with 0 used; a raise is one more unproven write into a
+        // game structure for room the packs do not need. veh_store_extra=N raises it anyway; a pack that does not fit is refused.
+        GLOGI("[packenh] DLC vehicle store: MaxExtraVehicleModelInfos is not raised by default on Enhanced (set veh_store_extra=N to raise it); "
+              "a pack that does not fit is refused before its change set runs");
         g_vehStoreDone = true;
         return;
     }
@@ -1265,8 +1581,10 @@ bool PrepareVehicleStore() {
 }
 
 Status Tick(World& world) {
-    if (g_status == Status::Ready || g_status == Status::Failed)
+    if (g_status == Status::Ready || g_status == Status::Failed) {
+        if (g_enh.inited) EnhProbeTick(world);   // Enhanced only: the streaming probe, after the packs settled
         return g_status;
+    }
     if (!Enabled())
         return Status::Idle;
     if (!g_vehStoreSeen) {
@@ -1282,6 +1600,10 @@ Status Tick(World& world) {
         else
             GLOGW("hook: [packstream] DLC vehicle store not found in the world (signature %d)", g_vehStoreSig);
     }
+
+    // GTA V Enhanced (pack_enh=2): its own flow with the addresses Round A and the extra patterns resolved (EnhTick).
+    if (&Prof() == &kPackEnhanced)
+        return EnhTick(world);
 
     // One-time: resolve and log the signatures + the manager global. Even with no pack present this is
     // a complete live validation of the 3889 recon.
@@ -1350,35 +1672,7 @@ Status Tick(World& world) {
     }
 
     // Every pack ran: poll the cars into the cdimage (2 passes a second), until all are in or the wait runs out.
-    const ULONGLONG now = GetTickCount64();
-    if (now < g_pollAt) return g_status;
-    g_pollAt = now + 500;
-    size_t total = 0, in = 0, mounted = 0, packs = 0;
-    bool changed = false;
-    for (Pack& p : g_packs) {
-        if (p.tune) continue;   // the handling override is not a content pack (logged on its own line)
-        ++packs;
-        if (!p.mounted) continue;
-        ++mounted;
-        for (PackModel& m : p.models) {
-            ++total;
-            if (!m.inCdimage && m.hash && ModelInCdimage(world, m.hash)) { m.inCdimage = true; changed = true; }
-            if (m.inCdimage) ++in;
-        }
-    }
-    if (changed) PublishVehicles();
-    if (in == total || now - g_mountAt > kModelWaitMs) {
-        for (const Pack& p : g_packs)
-            for (const PackModel& m : p.models)
-                if (p.mounted && !m.inCdimage)
-                    GLOGW("hook: [packstream] pack %s: car '%s' (0x%08x) is NOT in the cdimage %llu ms after its change set "
-                          "(its vehicles.meta did not register it)", p.name.c_str(), m.v.model.c_str(), (unsigned)m.hash,
-                          (unsigned long long)(now - g_mountAt));
-        g_status = mounted ? Status::Ready : Status::Failed;
-        GLOGI("hook: [packstream] %s: %u of %u pack(s) mounted, %u of %u car(s) in the cdimage", mounted ? "READY" : "FAILED",
-              (unsigned)mounted, (unsigned)packs, (unsigned)in, (unsigned)total);
-    }
-    return g_status;
+    return PollCdimage(world, false);
 }
 
 const char* FailReason() {

@@ -87,40 +87,27 @@ std::vector<Run> ReadableRuns(const Image& im) {
     return runs;
 }
 
-// The main module is Legacy's GTA5.exe (kMinimapTableSig is a Legacy 3889 pattern; Enhanced's dump has no hit for it).
-bool IsLegacyGameExe() {
+// The layout for the main module: Legacy's GTA5.exe (FiveM's pattern, 3889) or GTA5_Enhanced.exe (its own pattern, minimap_size.h); null for anything else.
+const MinimapLayout* LayoutForExe() {
     wchar_t path[MAX_PATH] = {};
     const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    if (!n || n >= MAX_PATH) return false;
+    if (!n || n >= MAX_PATH) return nullptr;
     const wchar_t* base = wcsrchr(path, L'\\');
-    return _wcsicmp(base ? base + 1 : path, L"GTA5.exe") == 0;
+    const wchar_t* name = base ? base + 1 : path;
+    if (_wcsicmp(name, L"GTA5.exe") == 0) return &kMinimapLayoutLegacy;
+    if (_wcsicmp(name, L"GTA5_Enhanced.exe") == 0) return &kMinimapLayoutEnhanced;
+    return nullptr;
 }
 
-// Every position (up to 4) where the pattern's bytes occur in the readable runs. The pattern has no wildcards.
-std::vector<const uint8_t*> FindHits(const std::vector<Run>& runs) {
-    std::vector<const uint8_t*> hits;
-    std::vector<uint8_t> pat;
-    const int n = HexByteCount(kMinimapTableSig);
-    for (int i = 0; i < n; ++i) pat.push_back((uint8_t)HexByteAt(kMinimapTableSig, i));
-    const size_t L = pat.size();
-    const size_t lead = 6;   // 0xB8 (mov r8d, imm32's opcode): a better skip byte than the REX prefix at 0
-    if (L != (size_t)kMinimapTableSigLen || lead >= L) return hits;
+// Every position (up to 4) where the layout's pattern occurs in the readable runs (the matching itself is sync/minimap_size.h FindLayoutHits).
+std::vector<const uint8_t*> FindHits(const MinimapLayout& lay, const std::vector<Run>& runs) {
+    const uint8_t* hits[4] = {};
+    int have = 0;
     for (const Run& r : runs) {
-        if (r.n < L) continue;
-        const uint8_t* p = r.p + lead;
-        const uint8_t* last = r.p + r.n - (L - lead);
-        while (p <= last) {
-            p = static_cast<const uint8_t*>(memchr(p, pat[lead], (size_t)(last - p) + 1));
-            if (!p) break;
-            const uint8_t* s = p - lead;
-            if (memcmp(s, pat.data(), L) == 0) {
-                hits.push_back(s);
-                if (hits.size() >= 4) return hits;
-            }
-            ++p;
-        }
+        have = FindLayoutHits(lay, r.p, r.n, hits, 4, have);
+        if (have >= 4) break;
     }
-    return hits;
+    return std::vector<const uint8_t*>(hits, hits + have);
 }
 
 // A write into the game's data: VirtualQuery first (committed, not guarded, inside one region), VirtualProtect only when the page is not writable.
@@ -150,6 +137,7 @@ enum class Res { Idle, Searching, Ready, Refused };
 
 Res          g_res = Res::Idle;
 std::string  g_refusedWhy;
+const MinimapLayout* g_layout = nullptr; // which build family's pattern found the table
 uint8_t*     g_table = nullptr;          // element 0 of the game's table
 size_t       g_tableRva = 0;
 MinimapSizeGate g_gate;
@@ -187,13 +175,15 @@ std::string Geo(const MinimapComp& c) {
 void Resolve(double nowMs) {
     const Image im = GameImage();
     if (!im.base || !im.size) { g_res = Res::Refused; g_refusedWhy = "the game image could not be read"; return; }
-    if (!IsLegacyGameExe()) {
+    const MinimapLayout* layout = LayoutForExe();
+    if (!layout) {
         g_res = Res::Refused;
-        g_refusedWhy = "not Legacy GTA5.exe: the pattern and layout are Legacy 1.0.3889 (Enhanced fills a local struct, no global table; the radar stays as the game draws it)";
+        g_refusedWhy = "the game exe is neither GTA5.exe nor GTA5_Enhanced.exe: no minimap table layout for it (the radar stays as the game draws it)";
         return;
     }
+    g_layout = layout;
     const ULONGLONG t0 = GetTickCount64();
-    const std::vector<const uint8_t*> hits = FindHits(ReadableRuns(im));
+    const std::vector<const uint8_t*> hits = FindHits(*layout, ReadableRuns(im));
     const unsigned long ms = (unsigned long)(GetTickCount64() - t0);
     if (hits.empty()) {
         ++g_attempts;
@@ -214,12 +204,12 @@ void Resolve(double nowMs) {
         return;
     }
     const uint8_t* hit = hits[0];
-    if (!IsReadable(hit - kLoaderSpanBefore, (size_t)(kLoaderSpanBefore + kLoaderSpanAfter))) {
+    if (hit < im.base + layout->spanBefore || !IsReadable(hit - layout->spanBefore, (size_t)(layout->spanBefore + layout->spanAfter))) {
         g_res = Res::Refused;
         g_refusedWhy = "the code around the pattern hit is not readable";
         return;
     }
-    const TableResolve r = ResolveMinimapTable(hit, im.base, im.size);
+    const TableResolve r = ResolveMinimapTableFor(*layout, hit, im.base, im.size);
     if (!r.ok) { g_res = Res::Refused; g_refusedWhy = r.why; return; }
     uint8_t* table = const_cast<uint8_t*>(im.base) + r.tableOff;
     if (!IsReadable(table, (size_t)kMinimapEntries * (size_t)kMinimapStride)) {
@@ -231,9 +221,15 @@ void Resolve(double nowMs) {
     g_tableRva = r.tableOff;
     g_res = Res::Ready;
     const unsigned long hitRva = (unsigned long)(hit - im.base);
-    GLOGI("engine: minimap size (0.4.25): table found by FiveM's pattern, unique: pattern at GTA5.exe+0x%lx (3889 dumps: 0x%lx), table at +0x%lx (3889 dumps: 0x%lx), "
-          "the game's frontend.xml reader checked (%d instructions: stride 0x78, posX +100, posY +104, sizeX +108, sizeY +112, alignX +116, alignY +117); scan %lu ms",
-          hitRva, (unsigned long)kMinimapHit3889, (unsigned long)r.tableOff, (unsigned long)kMinimapTable3889, (int)(sizeof(kLoaderChecks) / sizeof(kLoaderChecks[0])) + 1, ms);
+    if (layout == &kMinimapLayoutLegacy)
+        GLOGI("engine: minimap size (0.4.25): table found by FiveM's pattern, unique: pattern at GTA5.exe+0x%lx (3889 dumps: 0x%lx), table at +0x%lx (3889 dumps: 0x%lx), "
+              "the game's frontend.xml reader checked (%d instructions: stride 0x78, posX +100, posY +104, sizeX +108, sizeY +112, alignX +116, alignY +117); scan %lu ms",
+              hitRva, (unsigned long)kMinimapHit3889, (unsigned long)r.tableOff, (unsigned long)kMinimapTable3889, (int)(sizeof(kLoaderChecks) / sizeof(kLoaderChecks[0])) + 1, ms);
+    else
+        GLOGI("engine: minimap size (0.4.26): table found by the %s loader pattern, unique: pattern at GTA5_Enhanced.exe+0x%lx (dump: 0x%lx), table at +0x%lx (dump: 0x%lx), "
+              "the game's frontend.xml reader checked (%d instructions: stride 0x78, posX +100, posY +104, sizeX +108, sizeY +112, alignX +116, alignY +117); scan %lu ms",
+              layout->label, hitRva, (unsigned long)layout->expectHit, (unsigned long)r.tableOff, (unsigned long)layout->expectTable,
+              layout->nChecks + (layout->readerLea ? 1 : 0), ms);
 }
 
 // The whole table, once, the first time it holds names: the next iteration (other components, the real stock values) starts from this line.

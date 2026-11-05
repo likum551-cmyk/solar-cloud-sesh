@@ -64,7 +64,7 @@ using net::ServerInfo;
 // Constants
 // ---------------------------------------------------------------------------
 
-static const wchar_t* kClientVersion = L"0.4.25";
+static const wchar_t* kClientVersion = L"0.4.26";
 static const wchar_t* kClass = L"GAGE_MP_Launcher";
 static const wchar_t* kTitle = L"Solar Launcher";
 static const int kAppIconId = 1;  // gage_gui.rc
@@ -677,10 +677,12 @@ static std::vector<std::string> UpdateUrls();  // with the update code below
 // gage_mp.cfg pack_sync=0 switches it off (an operator staging packs by hand).
 // 0.4.24 (GI: a friend joined with no packs and saw no Jesko): returns false = refuse the launch when the server's packs
 // could not be checked or installed; pack_required=0 in gage_mp.cfg restores the old "start without them".
-static bool SyncCarPacks() {
+// mayRefuse=false (GTA V Enhanced with pack_enh >= 2, 0.4.26): the sync is best effort; a failure is logged and the game starts
+// with the packs already on this PC, whatever pack_required says.
+static bool SyncCarPacks(bool mayRefuse) {
     if (cfg::Get(L"pack_sync", L"1") == L"0") { GLOGI("packs: pack_sync=0 in gage_mp.cfg, not syncing"); return true; }
     if (!kUpdatePubKey || !*kUpdatePubKey) { GLOGW("packs: no update key baked into this build, not syncing"); return true; }
-    const bool required = cfg::Get(L"pack_required", L"1") != L"0";
+    const bool required = mayRefuse && cfg::Get(L"pack_required", L"1") != L"0";
     PostStatusFromWorker(L"Checking cars…");
     ULONGLONG last = 0;
     const packsync::Result r = packsync::Sync(packsync::DefaultRoot(), UpdateUrls(), kUpdatePubKey, packsync::DefaultIo(),
@@ -766,13 +768,19 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
         return;
     }
 
-    // 1c. The server's car packs (pack_sync.h): Legacy only (GTA5.exe; Enhanced cannot mount them), and only while the
-    //     game is not running (a running engine has its packs mounted). Never fatal: without them the game still starts.
-    if (_wcsicmp(baseName(game).c_str(), L"GTA5.exe") == 0) {
+    // 1c. The server's car packs (pack_sync.h PlanSync), only while the game is not running (a running engine has its packs
+    //     mounted). Legacy GTA5.exe: a failed sync refuses the launch (code 16, pack_required). GTA5_Enhanced.exe: synced into
+    //     the same folder only when HKCU\Software\GAGE-MP pack_enh is 2 or more (the Enhanced mount, apps/engine/pack_enh.h),
+    //     and a failure there only warns: the game starts with the packs already on this PC. Otherwise nothing is synced.
+    const packsync::SyncMode syncMode = packsync::PlanSync(baseName(game), reg::Get(L"pack_enh"));
+    if (syncMode != packsync::SyncMode::Skip) {
         if (launch::FindGame().pid) GLOGI("packs: the game is already running; not syncing car packs now");
-        else if (!SyncCarPacks()) {
-            PostLaunch({ false, 16, L"The server's cars could not be downloaded. Check your connection and press Play again." });
-            return;
+        else {
+            if (syncMode == packsync::SyncMode::BestEffort) GLOGI("packs: GTA V Enhanced with pack_enh>=2: syncing the car packs (best effort, never refuses)");
+            if (!SyncCarPacks(syncMode == packsync::SyncMode::Enforced)) {
+                PostLaunch({ false, 16, L"The server's cars could not be downloaded. Check your connection and press Play again." });
+                return;
+            }
         }
     }
 

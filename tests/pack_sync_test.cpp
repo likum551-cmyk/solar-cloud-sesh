@@ -21,7 +21,7 @@ using namespace gage;
 namespace {
 
 int g_checks = 0, g_failed = 0;
-constexpr int kMinChecks = 70;
+constexpr int kMinChecks = 96;   // 78 before the Enhanced gate (0.4.26) + 18 of TestSyncMode
 
 void Check(bool ok, const char* what, const std::string& got = "") {
     ++g_checks;
@@ -422,6 +422,34 @@ void TestSync() {
 // --e2e <update manifest URL> <public key base64> <root folder>: one real Sync (WinHTTP) against a served packs.json,
 // for checking tools/packs/sign_packs.mjs output with the launcher's own verifier. Exit 0 only if every pack is current
 // or installed. Run by hand with a THROWAWAY key, never the real one.
+// The launcher's step 1c gate (gage_gui.cpp DoLaunch): which game gets the car-pack sync. Legacy always, with a refusing failure;
+// Enhanced only with pack_enh >= 2, best effort; everything else not at all. Every "no" is paired with a "yes" built from the same
+// inputs one field away, so a gate that is always on or always off cannot pass.
+void TestSyncMode() {
+    using packsync::PlanSync;
+    using packsync::SyncMode;
+    Check(PlanSync(L"GTA5.exe", L"") == SyncMode::Enforced, "Legacy GTA5.exe: the sync is enforced (a failure refuses the launch)");
+    Check(PlanSync(L"gta5.EXE", L"") == SyncMode::Enforced, "the exe name is matched case-insensitively");
+    Check(PlanSync(L"GTA5.exe", L"2") == SyncMode::Enforced, "Legacy ignores pack_enh (still enforced)");
+    Check(PlanSync(L"GTA5.exe", L"0") == SyncMode::Enforced, "Legacy with pack_enh=0 is still enforced");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"") == SyncMode::Skip, "Enhanced with pack_enh unset: no sync (as 0.4.25)");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"0") == SyncMode::Skip, "Enhanced with pack_enh=0: no sync");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"1") == SyncMode::Skip, "Enhanced with pack_enh=1 (the read-only diagnostic): no sync");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"2") == SyncMode::BestEffort, "Enhanced with pack_enh=2: best-effort sync");
+    Check(PlanSync(L"gta5_enhanced.exe", L"2") == SyncMode::BestEffort, "Enhanced matched case-insensitively");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"3") == SyncMode::BestEffort, "Enhanced with pack_enh=3 (reserved, at least 2): best-effort sync");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"4") == SyncMode::Skip, "Enhanced with pack_enh=4 (not a mode): no sync");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"02") == SyncMode::Skip, "Enhanced with pack_enh=\"02\": parsed like the engine (one character only), no sync");
+    Check(PlanSync(L"GTA5_Enhanced.exe", L"two") == SyncMode::Skip, "Enhanced with a junk pack_enh: no sync");
+    Check(PlanSync(L"notepad.exe", L"2") == SyncMode::Skip, "another exe is never synced for");
+    Check(PlanSync(L"", L"2") == SyncMode::Skip, "an empty exe name is never synced for");
+    Check(PlanSync(L"GTA5_Enhanced.exe.bak", L"2") == SyncMode::Skip, "a longer name that merely starts with the exe name is not it");
+    Check(PlanSync(L"GTA5.ex", L"2") == SyncMode::Skip, "a shorter name is not it");
+    Check(packsync::PackEnhLevel(L"1") == 1 && packsync::PackEnhLevel(L"3") == 3 && packsync::PackEnhLevel(L"0") == 0 &&
+              packsync::PackEnhLevel(L"") == 0 && packsync::PackEnhLevel(L"22") == 0,
+          "pack_enh parses 1..3 and nothing else");
+}
+
 int E2e(int argc, char** argv) {
     if (argc != 5) { std::printf("usage: pack_sync_test --e2e <update url> <pub b64> <root>\n"); return 2; }
     const std::string root(argv[4]);
@@ -451,6 +479,7 @@ int main(int argc, char** argv) {
     TestUrls();
     TestVerify();
     TestSync();
+    TestSyncMode();
 
     Nuke(g_root);
     if (g_checks < kMinChecks) {

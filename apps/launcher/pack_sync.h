@@ -106,6 +106,34 @@ namespace gage::packsync {
     // %LOCALAPPDATA%\GAGE-MP\packs, "" if LOCALAPPDATA is missing.
     std::wstring DefaultRoot();
 
+    // Which games the launcher syncs the car packs for (gage_gui.cpp DoLaunch step 1c). Pure, so the gate is tested.
+    enum class SyncMode {
+        Skip,       // a game that does not mount the packs (or Enhanced with pack_enh below 2)
+        Enforced,   // Legacy GTA5.exe: a failed sync refuses the launch (code 16) unless pack_required=0
+        BestEffort, // GTA5_Enhanced.exe with pack_enh >= 2 (the Enhanced mount, apps/engine/pack_enh.h): a failed sync only
+                    // warns and the game starts with the packs already on the PC
+    };
+    // The HKCU\Software\GAGE-MP pack_enh value, parsed like the engine does (ParsePackEnh): exactly one character '1'..'3'
+    // is that number, anything else (empty, "0", "02", junk) is 0.
+    inline int PackEnhLevel(const std::wstring& v) {
+        return (v.size() == 1 && v[0] >= L'1' && v[0] <= L'3') ? (int)(v[0] - L'0') : 0;
+    }
+    inline bool BaseNameIs(const std::wstring& name, const wchar_t* want) {
+        size_t i = 0;
+        for (; i < name.size() && want[i]; ++i) {
+            wchar_t a = name[i], b = want[i];
+            if (a >= L'A' && a <= L'Z') a = (wchar_t)(a - L'A' + L'a');
+            if (b >= L'A' && b <= L'Z') b = (wchar_t)(b - L'A' + L'a');
+            if (a != b) return false;
+        }
+        return i == name.size() && want[i] == 0;
+    }
+    inline SyncMode PlanSync(const std::wstring& exeBaseName, const std::wstring& packEnhValue) {
+        if (BaseNameIs(exeBaseName, L"GTA5.exe")) return SyncMode::Enforced;
+        if (BaseNameIs(exeBaseName, L"GTA5_Enhanced.exe") && PackEnhLevel(packEnhValue) >= 2) return SyncMode::BestEffort;
+        return SyncMode::Skip;
+    }
+
     // SHA-256 of a file as lowercase hex, "" if it cannot be read. *size gets the bytes read.
     std::string HashFile(const std::wstring& path, unsigned long long* size);
 

@@ -18,6 +18,9 @@
 // is an offset from the same safe-zone corner (all three are aligned L / B), so a uniform factor is a scaled replica of the stock layout: the
 // corner stays put and the mask and the blur keep their place inside the minimap frame. Scaling the sizes alone would move the mask's top edge
 // out of the frame (the mask sits 0.0019 below the frame's top at the stock values).
+//
+// GTA V Enhanced (0.4.26, GI: every game version identical): the same table, found by its own pattern (MinimapLayout kMinimapLayoutEnhanced, below); the
+// shape and the rules are shared. Read from the Enhanced dump only, never run live yet (see the layout comment).
 #pragma once
 
 #include "sync/minimap.h"
@@ -509,6 +512,120 @@ namespace gage::sync {
         return n;
     }
 
+    // ---- one layout per game build family ----------------------------------------------------------------------------
+    // The table has the same 11 x 120-byte shape in Legacy 1.0.3889 and in GTA V Enhanced (the Enhanced dump, 2026-11-05: table at RVA 0x3deb800, filled by the
+    // frontend.xml reader at 0x567d60 with the same offsets: name 100 bytes, floats +100 / +104 / +108 / +112, align chars +116 / +117, stride 0x78; the radar
+    // placement code reads it live as `imul rcx, rcx, 0x78; movsd xmm, [rcx + table + 0x64 / 0x6c]`). Only the pattern that finds it and the instructions
+    // that prove the layout differ: Enhanced's reader is a different compile (it indexes [r14 + rbp + off] from the table itself, with no `lea rsi, [table + 104]`).
+
+    // One token of a pattern: two hex digits (the byte), "??" (any byte, -2), anything else -1 (also past the end).
+    inline int PatTokenAt(const char* s, int tok)
+    {
+        int n = 0;
+        for (const char* p = s; *p;)
+        {
+            while (*p == ' ') ++p;
+            if (!*p)
+                break;
+            const char* q = p;
+            while (*q && *q != ' ') ++q;
+            if (n == tok)
+            {
+                if (q - p == 2 && p[0] == '?' && p[1] == '?')
+                    return -2;
+                auto hv = [](char c) { return c >= '0' && c <= '9' ? c - '0' : (c >= 'A' && c <= 'F' ? c - 'A' + 10 : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1)); };
+                return (q - p == 2 && hv(p[0]) >= 0 && hv(p[1]) >= 0) ? hv(p[0]) * 16 + hv(p[1]) : -1;
+            }
+            ++n;
+            p = q;
+        }
+        return -1;
+    }
+
+    // The number of tokens, or -1 when one of them is not a token.
+    inline int PatTokenCount(const char* s)
+    {
+        int n = 0;
+        for (const char* p = s; *p;)
+        {
+            while (*p == ' ') ++p;
+            if (!*p)
+                break;
+            if (PatTokenAt(s, n) == -1)
+                return -1;
+            while (*p && *p != ' ') ++p;
+            ++n;
+        }
+        return n;
+    }
+
+    struct MinimapLayout
+    {
+        const char* label;          // for the log
+        const char* sig;            // hex tokens, "??" = any byte
+        int sigLen;                 // the token count (the tests check it against the text)
+        int leadTok;                // a fixed (non-wildcard) token the scan looks for first
+        int dispAt, endAt;          // the rip-relative disp32 that names the table, and the end of its instruction, from the hit's first byte
+        int spanBefore, spanAfter;  // bytes around the hit that must be inside the image (and readable)
+        const LoaderCheck* checks;  // the reader's instructions the layout was read from
+        int nChecks;
+        bool readerLea;             // Legacy only: the reader's `lea rsi, [table + 104]` 0x16 bytes before the hit
+        uint32_t expectHit, expectTable;   // the RVAs the layout was analysed at (diagnostics, not used to find it)
+    };
+
+    constexpr MinimapLayout kMinimapLayoutLegacy = {"Legacy 1.0.3889", kMinimapTableSig, kMinimapTableSigLen, 6, kMinimapTableDispAt, kMinimapTableDispAt + 4,
+                                                    kLoaderSpanBefore, kLoaderSpanAfter, kLoaderChecks, (int)(sizeof(kLoaderChecks) / sizeof(kLoaderChecks[0])), true,
+                                                    kMinimapHit3889, kMinimapTable3889};
+
+    // Enhanced: the start of the frontend.xml reader's table walk, `mov rdi, rax; lea rbp, [rip+table]; xor r13d, r13d; mov r15, [rip+...]; mov r12, rbp; jmp`.
+    // Unique in the Enhanced dump (one hit, RVA 0x567d8e). Offsets below are from that hit (the reader starts 0x1e earlier, at 0x567d60).
+    constexpr const char* kMinimapTableSigEnhanced = "48 89 C7 48 8D 2D ?? ?? ?? ?? 45 31 ED 4C 8B 3D ?? ?? ?? ?? 49 89 EC E9";
+    constexpr LoaderCheck kLoaderChecksEnhanced[] = {
+        {0x47, "F3 41 0F 11 44 2E 64", "posX  at element+100 (movss [r14+rbp+0x64], xmm0)"},
+        {0x68, "F3 41 0F 11 44 2E 68", "posY  at element+104 (movss [r14+rbp+0x68], xmm0)"},
+        {0x89, "F3 41 0F 11 44 2E 6C", "sizeX at element+108 (movss [r14+rbp+0x6c], xmm0)"},
+        {0xaa, "F3 41 0F 11 44 2E 70", "sizeY at element+112 (movss [r14+rbp+0x70], xmm0)"},
+        {0xc7, "41 88 44 2E 74", "alignX at element+116 (mov [r14+rbp+0x74], al)"},
+        {0xe2, "41 88 44 2E 75", "alignY at element+117 (mov [r14+rbp+0x75], al)"},
+        {0xe7, "49 FF C5", "next element (inc r13)"},
+        {0x102, "49 83 C4 78", "name cursor step (add r12, 0x78)"},
+        {0x122, "4D 6B F5 78", "stride 0x78 (imul r14, r13, 0x78)"},
+    };
+    constexpr uint32_t kMinimapHitEnhanced = 0x567d8e, kMinimapTableEnhanced = 0x3deb800;
+    constexpr MinimapLayout kMinimapLayoutEnhanced = {"Enhanced", kMinimapTableSigEnhanced, 24, 12, 6, 10, 0x10, 0x130, kLoaderChecksEnhanced,
+                                                      (int)(sizeof(kLoaderChecksEnhanced) / sizeof(kLoaderChecksEnhanced[0])), false, kMinimapHitEnhanced,
+                                                      kMinimapTableEnhanced};
+
+    // Appends to hits[have..cap) every place in data[0..n) where the layout's pattern matches; returns the new count. A pattern with a bad token matches nothing.
+    inline int FindLayoutHits(const MinimapLayout& L, const uint8_t* data, size_t n, const uint8_t** hits, int cap, int have)
+    {
+        const int len = L.sigLen;
+        int tok[64];
+        if (!data || len <= 0 || len > 64 || L.leadTok < 0 || L.leadTok >= len || PatTokenCount(L.sig) != len)
+            return have;
+        for (int i = 0; i < len; ++i)
+            tok[i] = PatTokenAt(L.sig, i);
+        if (tok[L.leadTok] < 0 || n < (size_t)len)
+            return have;
+        const uint8_t lead = (uint8_t)tok[L.leadTok];
+        const uint8_t* p = data + L.leadTok;
+        const uint8_t* last = data + n - (size_t)(len - L.leadTok);
+        while (p <= last && have < cap)
+        {
+            p = static_cast<const uint8_t*>(std::memchr(p, lead, (size_t)(last - p) + 1));
+            if (!p)
+                break;
+            const uint8_t* s = p - L.leadTok;
+            bool ok = true;
+            for (int i = 0; i < len && ok; ++i)
+                ok = tok[i] == -2 || s[i] == (uint8_t)tok[i];
+            if (ok)
+                hits[have++] = s;
+            ++p;
+        }
+        return have;
+    }
+
     struct TableResolve
     {
         bool ok = false;
@@ -516,27 +633,28 @@ namespace gage::sync {
         std::string why;
     };
 
-    // hit: where kMinimapTableSig matched (base <= hit - kLoaderSpanBefore and hit + kLoaderSpanAfter <= base + imageSize is checked here; the caller has
-    // proven the bytes readable). Returns the table when the pattern's disp32 points inside the image AND the loader's instructions are the ones the
-    // layout was read from; otherwise says which check failed.
-    inline TableResolve ResolveMinimapTable(const uint8_t* hit, const uint8_t* base, size_t imageSize)
+    // hit: where the layout's pattern matched (base <= hit - spanBefore and hit + spanAfter <= base + imageSize is checked here; the caller has proven the bytes
+    // readable). Returns the table when the pattern's disp32 points inside the image AND the loader's instructions are the ones the layout was read from;
+    // otherwise says which check failed.
+    inline TableResolve ResolveMinimapTableFor(const MinimapLayout& L, const uint8_t* hit, const uint8_t* base, size_t imageSize)
     {
         TableResolve r;
-        if (!hit || !base || hit < base + kLoaderSpanBefore || hit + kLoaderSpanAfter > base + imageSize)
+        if (!hit || !base || hit < base + L.spanBefore || hit + L.spanAfter > base + imageSize)
         {
             r.why = "the hit is too close to the image edge to check the loader";
             return r;
         }
         int32_t disp = 0;
-        std::memcpy(&disp, hit + kMinimapTableDispAt, 4);
-        const int64_t t = (int64_t)(hit - base) + kMinimapTableDispAt + 4 + (int64_t)disp;
+        std::memcpy(&disp, hit + L.dispAt, 4);
+        const int64_t t = (int64_t)(hit - base) + L.endAt + (int64_t)disp;
         if (t < 0 || (uint64_t)t + (uint64_t)kMinimapEntries * (uint64_t)kMinimapStride > (uint64_t)imageSize)
         {
             r.why = "the table address from the pattern is outside the image";
             return r;
         }
-        for (const LoaderCheck& c : kLoaderChecks)
+        for (int k = 0; k < L.nChecks; ++k)
         {
+            const LoaderCheck& c = L.checks[k];
             const int n = HexByteCount(c.bytes);
             for (int i = 0; i < n; ++i)
                 if (hit[c.off + i] != (uint8_t)HexByteAt(c.bytes, i))
@@ -545,23 +663,32 @@ namespace gage::sync {
                     return r;
                 }
         }
-        // The reader's `lea rsi, [rip+disp32]` (48 8D 35) 0x16 bytes before the hit must point at element 0 + 104.
-        if (hit[-0x16] != 0x48 || hit[-0x15] != 0x8D || hit[-0x14] != 0x35)
+        if (L.readerLea)
         {
-            r.why = "the reader does not start with lea rsi, [rip+disp32]";
-            return r;
-        }
-        int32_t rd = 0;
-        std::memcpy(&rd, hit - 0x13, 4);
-        const int64_t rsiTarget = (int64_t)(hit - base) - 0x16 + 7 + (int64_t)rd;
-        if (rsiTarget != t + kOffPosY)
-        {
-            r.why = "the reader's element pointer is not table + 104";
-            return r;
+            // The reader's `lea rsi, [rip+disp32]` (48 8D 35) 0x16 bytes before the hit must point at element 0 + 104.
+            if (hit[-0x16] != 0x48 || hit[-0x15] != 0x8D || hit[-0x14] != 0x35)
+            {
+                r.why = "the reader does not start with lea rsi, [rip+disp32]";
+                return r;
+            }
+            int32_t rd = 0;
+            std::memcpy(&rd, hit - 0x13, 4);
+            const int64_t rsiTarget = (int64_t)(hit - base) - 0x16 + 7 + (int64_t)rd;
+            if (rsiTarget != t + kOffPosY)
+            {
+                r.why = "the reader's element pointer is not table + 104";
+                return r;
+            }
         }
         r.ok = true;
         r.tableOff = (size_t)t;
         return r;
+    }
+
+    // The Legacy 1.0.3889 layout (what 0.4.25 shipped).
+    inline TableResolve ResolveMinimapTable(const uint8_t* hit, const uint8_t* base, size_t imageSize)
+    {
+        return ResolveMinimapTableFor(kMinimapLayoutLegacy, hit, base, imageSize);
     }
 
 } // namespace gage::sync
