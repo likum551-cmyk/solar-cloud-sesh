@@ -902,6 +902,48 @@ static void TestConfig() {
             b.maxRepairs, b.gaitMinHoldMs, b.leadMinM, b.leadMaxM));
 }
 
+static void TestSenderClip() {
+    // 9. 0.4.17 (live 0.4.15: a sender at 2.8-3.3 m/s showed WALKING on 38-86 % of frames, sprinting never): the blend ratio is the sender's gait.
+    //    3 s at 3.0 m/s with the sender running (moveState 2), then 3 s at 5.6 m/s sprinting (3); every blend ratio the controller hands the game
+    //    (issue or set) after the 400 ms gait hold of each phase must be 2.00, then 3.00. The 0.4.15 knob sends ~1.5 and ~2.4 (+ trim).
+    auto run = [](bool clip, double& mean1, double& mean2, int& bad, int& seen) {
+        LocoConfig c = ShippedLocoConfig(LocoMode::Blend);
+        c.blendGaitClip = clip;
+        LocomotionController lc(c);
+        const double dt = 1000.0 / 60;
+        double x = 0, sum1 = 0, sum2 = 0;
+        int n1 = 0, n2 = 0;
+        bad = 0; seen = 0;
+        for (int i = 0; i < 360; ++i) {
+            const bool second = i >= 180;
+            const double sp = second ? 5.6 : 3.0;
+            x += sp * dt / 1000.0;
+            LocoInput in;
+            in.pos = V(float(x), 0, 30); in.vel = V(float(sp), 0, 0); in.heading = 270;
+            in.pedPos = V(float(x), 0, 30); in.pedHeading = 270; in.pedGait = second ? Gait::Sprint : Gait::Run;   // writes honoured: the ped is on the pose
+            in.pedVel = V(float(sp), 0, 0); in.havePedVel = true;
+            in.dtMs = dt; in.noAnchor = true; in.moveState = second ? 3 : 2;
+            const LocoOutput o = lc.Update(in);
+            const int phaseFrame = second ? i - 180 : i;
+            if ((o.task != LocoTask::None || o.setBlend) && o.moveBlendRatio > 0 && (!second || phaseFrame >= 30)) {
+                ++seen;
+                const double want = second ? 3.0 : 2.0;
+                if (std::fabs(o.moveBlendRatio - want) > 0.01) ++bad;
+                if (second) { sum2 += o.moveBlendRatio; ++n2; } else { sum1 += o.moveBlendRatio; ++n1; }
+            }
+        }
+        mean1 = n1 ? sum1 / n1 : -1; mean2 = n2 ? sum2 / n2 : -1;
+    };
+    double a1, a2, b1, b2;
+    int badNew, seenNew, badOld, seenOld;
+    run(true, a1, a2, badNew, seenNew);
+    run(false, b1, b2, badOld, seenOld);
+    Check("R4 T1 sender clip (0.4.17): with blendGaitClip (shipped default) every blend ratio handed to the game is the sender's gait (2.00 running at 3.0 m/s, "
+          "3.00 sprinting at 5.6 m/s); with it off (0.4.15) the speed knob sends something else",
+          ShippedLocoConfig(LocoMode::Blend).blendGaitClip && seenNew >= 2 && badNew == 0 && a1 > 1.99 && a2 > 2.99 && seenOld >= 2 && badOld > 0 && b1 < 1.9,
+          F("new: %d of %d off, means %.2f / %.2f; old: %d of %d off, means %.2f / %.2f", badNew, seenNew, a1, a2, badOld, seenOld, b1, b2));
+}
+
 } // namespace r4
 
 static void R4T1Tests() {
@@ -916,4 +958,5 @@ static void R4T1Tests() {
     r4::TestSwing();
     r4::TestDiag();
     r4::TestConfig();
+    r4::TestSenderClip();
 }

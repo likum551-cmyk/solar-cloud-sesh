@@ -2073,7 +2073,7 @@ int main() {
     // gait 3 + task 6 + snap 4 + velocity 6 + heading 2 + jump/ragdoll 4 + closed loop 3 + 60 s circle 1
     // + authoritative gait / debounce 7 + move rate 3 + pause 1 + aim gate 3 + swimming 1
     // + W8: churn 2 + soft reset 2 + swim correction 1 + W11 14 + Sync A 14 + T2 21 (tests/t2_onfoot_tests.h) + R3 T2 21 (tests/r3_t2_tests.h) + R4 T1 33 (tests/r4_t1_blend_tests.h)
-    const int expected = 3 + 6 + 4 + 6 + 2 + 4 + 3 + 1 + 7 + 3 + 1 + 3 + 1 + 2 + 2 + 1 + 14 + 14 + 21 + 21 + 33;
+    const int expected = 3 + 6 + 4 + 6 + 2 + 4 + 3 + 1 + 7 + 3 + 1 + 3 + 1 + 2 + 2 + 1 + 14 + 14 + 21 + 21 + 34;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

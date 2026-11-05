@@ -29,6 +29,7 @@ namespace {
     double HLen(double x, double y) { return std::sqrt(x * x + y * y); }
 
     float BlendRatio(Gait g) { return static_cast<float>(static_cast<int>(g)); } // 1 walk, 2 run, 3 sprint
+    constexpr double kClipTrimMax = 0.25; // 0.4.17 blendGaitClip: the sender's clip only while the blend trim stays within this (writes honoured)
 
     double Clamp(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -958,7 +959,16 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     // gait's nominal speed, clamped); the task's blend ratio is then the plain gait. Without it the
     // blend ratio itself carries the speed, quantised so it changes rarely.
     float blend = BlendRatio(gait_);
-    if (blendCfg)
+    if (blendCfg && cfg_.blendGaitClip && gait_ != Gait::Still && !in.swimming && !settling && std::fabs(blendTrim_) <= kClipTrimMax &&
+        placedFailStreak_ == 0)   // a puppet whose writes were found not to carry it keeps the speed knob until the streak clears
+    {
+        // 0.4.17: the sender's clip (1 / 2 / 3), the velocity writes carry the exact speed. Only while the writes are honoured (the trim the
+        // corrections built up stays small: live 0.4.15 it was +0.05..0.2); a world whose task fights the writes (the trim grows) keeps the
+        // continuous speed knob below, which is what the R4 T1 matrix proved for it.
+        blend = BlendRatio(gait_);
+        rateIneffMs_ = 0.0;
+    }
+    else if (blendCfg)
     {
         // R4 T1: the move blend ratio is a continuous speed knob, the nominal speeds its integer points (1 walk .. 3 sprint), trimmed by what
         // the writes had to correct; no move rate override (it would scale the speed a second time)

@@ -427,6 +427,11 @@ namespace gage::sync {
         float blendSnapM = 6.0f;
         float blendFailErrM = 1.2f, blendFailMs = 1000.0f, blendFailCloseMs = 0.5f, blendFightMs = 1.0f;
         float blendTurnLeadS = 0.3f;      // a gait task issued during a turn aims blendTurnLeadS x the turn rate ahead (<= 70 degrees)
+        // 0.4.17 (GI "walk and run ... all shit"; live 0.4.15 gait lines: at 2.8-3.3 m/s the game showed WALKING on 38-86 % of frames, at 5.2 m/s
+        // sprinting 0 %, mean blend ratio 1.55-1.72): with blendGaitClip the move blend ratio is the gait's integer (1 walk, 2 run, 3 sprint; the
+        // higher of the sender's gait and the speed's, debounced), so the clip is the sender's and the velocity writes carry the speed. Swimming
+        // and settling keep the continuous speed knob. false = 0.4.15 (speed through the guessed nominal speeds + trim). Engine: loco_gait_clip.
+        bool blendGaitClip = true;
         float blendFightErrM = 0.7f, blendFightShare = 0.75f;   // ... or this error with this share of frames fighting: twice as fast to Placed
         float blendTrimGain = 0.25f, blendTrimDeadMs = 0.15f, blendTrimMin = -1.2f, blendTrimMax = 0.6f, blendSetStep = 0.08f;
         float gaitMinHoldMs = 0.0f;

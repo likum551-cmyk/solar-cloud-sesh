@@ -163,6 +163,7 @@ namespace {
     // puppet no task moves (ClearTasks, then the lean and the alt creation recipe). Re-read at every Welcome like loco_mode.
     std::atomic<bool> g_locoR3{true};
     std::atomic<bool> g_locoRepair{true};
+    std::atomic<bool> g_locoGaitClip{true};   // 0.4.17: loco_gait_clip=0 = the 0.4.15 speed-derived blend ratio
     sync::LevelWitness g_locoDegrade;     // script tick only
     std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
@@ -175,6 +176,7 @@ namespace {
             c = sync::Round2Behaviour(c);
         if (!g_locoRepair.load())
             c.maxRepairs = 0;
+        c.blendGaitClip = g_locoGaitClip.load();
         return c;
     }
 
@@ -540,6 +542,11 @@ namespace {
     // R4 T2 (docs/sync-specs/vehicle-collision-authority.md). veh_contact_gate=0: a copy's flag / speed loss / kick opens the contact grace whatever it touched (round 3);
     // default on = only with a vehicle we control within kContactNearM. veh_accel_extrap=0: constant-velocity extrapolation of the copies (round 3). Re-read at every Welcome.
     std::atomic<bool> g_contactGate{true}, g_accelExtrap{true};
+    // 0.4.17 passenger ride (GI: "desync is crazy when sitting on the passenger seat"). veh_ride_gate=0: the car we ride in as a passenger counts as a
+    // vehicle we control for the R4 T2 contact gate (0.4.15: its distance to itself is 0 m, so every kerb / brake jolt of the copy we sit in opened the
+    // 400 ms soft-correction grace and the own-physics adoption: rubber-banding every ~1.2 s). veh_ride_lead=0: the car we ride in gets the near-car
+    // lead (0.4.15: up to 450 ms of extrapolation ahead of the driver's last report, with the camera inside it). Default on = both fixes. Re-read at Welcome.
+    std::atomic<bool> g_rideGate{true}, g_rideLead{true};
     constexpr double kContactNearM = 10.0;       // origin to origin: a vehicle we control this close is the likely toucher of a copy
     // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
     std::mutex g_linkMtx;
@@ -1427,6 +1434,8 @@ namespace {
         g_locoSelfCheck.store(reg::Get(L"loco_selfcheck") != L"0");
         g_locoR3.store(reg::Get(L"loco_r3") != L"0");
         g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
+        g_locoGaitClip.store(reg::Get(L"loco_gait_clip") != L"0");
+        GLOGI("engine: on-foot clip (0.4.17): loco_gait_clip=%s", g_locoGaitClip.load() ? "on (blend ratio = the sender's gait 1/2/3)" : "OFF (0.4.15 speed knob)");
         GLOGI("engine: remote on-foot round-3 rules %s (loco_r3): quiet window + write verdict, re-issue spacing, ladder hold / cap; repairs of a puppet "
               "no task moves %s (loco_repair)", g_locoR3.load() ? "ON" : "OFF (round-2 controller)", g_locoRepair.load() ? "ON" : "OFF");
         GLOGI("engine: remote on-foot position error closed by %s (loco_push, %s), self-checks / degradation ladder %s (loco_selfcheck)",
@@ -1458,6 +1467,10 @@ namespace {
         g_proxContact.store(reg::Get(L"veh_prox_contact") != L"0"); // R3 T5: the proximity contact path (0 = the flag / speed loss / kick triggers only)
         g_contactGate.store(reg::Get(L"veh_contact_gate") != L"0"); // R4 T2: a copy's contact counts only with a vehicle we control near (0 = any contact, round 3)
         g_accelExtrap.store(reg::Get(L"veh_accel_extrap") != L"0"); // R4 T2: acceleration-aware extrapolation of copies (0 = constant velocity, round 3)
+        g_rideGate.store(reg::Get(L"veh_ride_gate") != L"0");       // 0.4.17: a car we only ride in is not "a vehicle we control" (0 = 0.4.15)
+        g_rideLead.store(reg::Get(L"veh_ride_lead") != L"0");       // 0.4.17: no near-car lead on the car we ride in (0 = 0.4.15)
+        GLOGI("engine: passenger ride (0.4.17): veh_ride_gate=%s veh_ride_lead=%s", g_rideGate.load() ? "on" : "OFF (0.4.15)",
+              g_rideLead.load() ? "on" : "OFF (0.4.15)");
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         {
@@ -7874,7 +7887,17 @@ namespace {
             struct OwnCar { float x, y; };
             static std::vector<OwnCar> r4Own;       // script tick only; reused
             r4Own.clear();
-            if (haveLc)
+            // The local player's vehicle counts only when we control it: a server car we ride in as a passenger is the driver's
+            // (0.4.17, veh_ride_gate); a car the server does not track is ours.
+            bool lpVehOurs = true;
+            if (g_rideGate.load())
+                for (const auto& okv : g_vehs)
+                    if (okv.second.handle && okv.second.handle == lpVeh && okv.second.haveState)
+                    {
+                        lpVehOurs = okv.second.st.ctrl == me || g_localSeat == 0;
+                        break;
+                    }
+            if (haveLc && lpVehOurs)
                 r4Own.push_back({ lcx, lcy });
             for (const auto& okv : g_vehs)
             {
@@ -8065,8 +8088,12 @@ namespace {
                     double dispT = 0.0;   // T4: the interpolation time of this frame (an adopted response is stored at it)
                     sync::VehicleSample t5Ideal;   // R3 T5: the owner's report sampled at (now + link lag): the diagnostic's reference
                     double t5Lag = 0.0, t5Unled = 0.0;
-                    const bool t5Diag = leadDist < 120.0;
-                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, leadDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT, st.ctrl,
+                    // 0.4.17 (veh_ride_lead): the car we ride in plays back the driver's real path, no lead (it eases to 0). The lead exists to
+                    // line copies up with OUR car for collisions; inside the copy it only shows every turn-in and brake as a correction.
+                    const bool rideNoLead = mine && g_rideLead.load();
+                    const double clockDist = rideNoLead ? 1e9 : leadDist;
+                    const bool t5Diag = !rideNoLead && leadDist < 120.0;
+                    if (SampleVehInterp(id, s_frameMs, s, &v.lead, clockDist, v.lastDriveMs > 0 ? nowMs - v.lastDriveMs : 0.0, &v.leadMs, &dispT, st.ctrl,
                                         t5Diag ? &t5Ideal : nullptr, &t5Lag, &t5Unled))
                     {
                         if (v.leadMs > 1.0)

@@ -59,7 +59,7 @@ namespace gage::sync {
 
     constexpr float kHyperTargetKmh = 600.0f;                   // GI 2026-11-05 (was 500)
     constexpr float kHyperTargetMs = kHyperTargetKmh / 3.6f;   // 166.7 m/s
-    constexpr float kHyperPower = 3.5f;                         // cheat power multiplier (1 = stock); GI 2026-11-05: 12.5 % below the old 4.0
+    constexpr float kHyperPower = 2.35f;                        // cheat power multiplier (1 = stock); GI 2026-11-05: 3.5 -> 2.35, acceleration -33 %
     constexpr float kHyperMaxPercent = 400.0f;                  // never more than 5x the stock top speed
 
     // MODIFY_VEHICLE_TOP_SPEED takes a percentage added to the handling's top speed (100 = double). From the game's
@@ -274,17 +274,19 @@ namespace gage::sync {
     //   steering    26 m/s^2 as a yaw cap (was 22): 0.16 rad/s at 600 km/h, 0.43 rad/s at 216 km/h; only a spin is cut
     //   anti-roll   4 /s (was 3): a 4 rad/s roll rate is below 1 rad/s in 0.35 s
     //   one frame:  (26 + 14) / 30 s = 1.33 m/s < the impact tracker's 1.5 m/s (the tests assert it)
+    // GI 2026-11-05 (after driving 0.4.15: "handling is a bit bad, raise it 10-15-20 %"): grip, its rate, the yaw cap and the
+    // anti-roll are 15 % firmer (30 m/s^2, 6.9 /s, 30 m/s^2, 4.6 /s); one frame is now (30 + 14) / 30 s = 1.47 m/s < 1.5.
     constexpr HyperAssist MakeHyperAssist()
     {
         HyperAssist a;
         a.downRefMs = kHyperTargetMs;
         a.downAtRefMs2 = 14.0f;
         a.downCapMs2 = 17.0f;
-        a.gripRate = 6.0f;
-        a.gripCapMs2 = 26.0f;
+        a.gripRate = 6.9f;
+        a.gripCapMs2 = 30.0f;
         a.brakeMs2 = 14.0f;
-        a.yawLatMs2 = 26.0f;
-        a.tiltRate = 4.0f;
+        a.yawLatMs2 = 30.0f;
+        a.tiltRate = 4.6f;
         return a;
     }
 
@@ -294,17 +296,21 @@ namespace gage::sync {
     //   downforce   4 m/s^2 at the car's own top speed (k v^2), cap 6
     //   grip        12 m/s^2 at most, rate 3 /s       brakes  +6 m/s^2       steering  16 m/s^2 yaw cap       anti-roll  2 /s
     //   one frame:  (12 + 6) / 30 s = 0.6 m/s < the impact tracker's 1.5 m/s
+    // GI 2026-11-05 after driving them: "m5 and rs6 keep hitting the ground and shaking". The downforce assist pushed a road car
+    // down by up to 6 m/s^2 (0.6 g on top of its weight) on a suspension with 7 cm of travel (rs6): it is OFF for the road cars
+    // now (their packs carry more ride height and travel, tools/packs/handling_tune.json). Grip, its rate, the yaw cap and
+    // the anti-roll are 15 % firmer ("handling +10-20 %"): 13.8 m/s^2, 3.45 /s, 18.4 m/s^2, 2.3 /s.
     constexpr HyperAssist MakeStreetAssist(float targetKmh)
     {
         HyperAssist a;
         a.downRefMs = targetKmh / 3.6f;
-        a.downAtRefMs2 = 4.0f;
-        a.downCapMs2 = 6.0f;
-        a.gripRate = 3.0f;
-        a.gripCapMs2 = 12.0f;
+        a.downAtRefMs2 = 0.0f;
+        a.downCapMs2 = 0.0f;
+        a.gripRate = 3.45f;
+        a.gripCapMs2 = 13.8f;
         a.brakeMs2 = 6.0f;
-        a.yawLatMs2 = 16.0f;
-        a.tiltRate = 2.0f;
+        a.yawLatMs2 = 18.4f;
+        a.tiltRate = 2.3f;
         return a;
     }
 
@@ -315,12 +321,26 @@ namespace gage::sync {
         { "dubsta",   kHyperTargetKmh, kHyperPower, true,  MakeHyperAssist() },
         // Koenigsegg Regera: 410 km/h, the one other hypercar: the hyper assists (downforce on the same k v^2 curve: 6.5 m/s^2
         // at 410 km/h), 2.4x power, no toughness. NG pack: "regera" is the expected model name, the pack row catches any other.
-        { "regera",   410.0f, 2.4f,  false, MakeHyperAssist(), "vehicle_regera" },
-        { "rs6",      305.0f, 1.5f,  false, MakeStreetAssist(305.0f) },   // Audi RS6 (C8): 305 km/h, 600 hp wagon
-        { "bmwm5",    305.0f, 1.45f, false, MakeStreetAssist(305.0f) },   // BMW M5 (F90): 305 km/h with the limiter off
-        { "diablosv", 300.0f, 1.35f, false, MakeStreetAssist(300.0f) },   // Lamborghini Diablo SV: 300 km/h
-        { nullptr,    250.0f, 1.25f, false, MakeStreetAssist(250.0f), "vehicle_nissan350z" },   // Nissan 350Z: 250 km/h (limited)
-        { nullptr,    285.0f, 1.35f, false, MakeStreetAssist(285.0f), "vehicle_supra" },        // Toyota Supra: ~285 km/h
+        // GI 2026-11-05 "accel on all cars is too much ... drop by about 33 %": every power below is 2/3 of 0.4.15's. The road
+        // cars' 1.35..1.5 would become < 1, which SET_VEHICLE_CHEAT_POWER_INCREASE is not known to honour, so they run at 1.0
+        // (stock) and the rest of the cut is in their pack's fInitialDriveForce (tools/packs/handling_tune.json; the NG packs'
+        // handling cannot be edited, so 350Z / Supra lose their 1.25 / 1.35 boost only: -20 % / -26 %).
+        { "regera",   410.0f, 1.6f,  false, MakeHyperAssist(), "vehicle_regera" },   // 2.4 -> 1.6
+        { "rs6",      305.0f, 1.0f,  false, MakeStreetAssist(305.0f) },   // Audi RS6 (C8): 305 km/h, 600 hp wagon; 1.5 -> 1.0 = -33 %
+        { "bmwm5",    305.0f, 1.0f,  false, MakeStreetAssist(305.0f) },   // BMW M5 (F90): 305 km/h; 1.45 -> 1.0, drive force x0.97
+        { "diablosv", 300.0f, 1.0f,  false, MakeStreetAssist(300.0f) },   // Lamborghini Diablo SV: 300 km/h; 1.35 -> 1.0, drive x0.905
+        { nullptr,    250.0f, 1.0f,  false, MakeStreetAssist(250.0f), "vehicle_nissan350z" },   // Nissan 350Z: 250 km/h (limited)
+        { nullptr,    285.0f, 1.0f,  false, MakeStreetAssist(285.0f), "vehicle_supra" },        // Toyota Supra: ~285 km/h
+        // 0.4.17 packs (GI added them 2026-11-05): stock power (their pack handling, outliers cut in handling_tune.json), real top speeds
+        // (m3gtr / teslas / w210: the variant is a guess). veh_VOLGA (no models) and veh_valkyrietp (its 152 MB ytd does not extract) are not served yet.
+        { "lp700r",   350.0f, 1.0f,  false, MakeStreetAssist(350.0f) },   // Lamborghini Aventador LP700-4: 350 km/h
+        { "m3gtr",    300.0f, 1.0f,  false, MakeStreetAssist(300.0f) },   // BMW M3 GTR (E46): ~300 km/h
+        { "mbc63s",   290.0f, 1.0f,  false, MakeStreetAssist(290.0f) },   // Mercedes-AMG C63 S: 290 km/h
+        { "mbe420",   250.0f, 1.0f,  false, MakeStreetAssist(250.0f) },   // Mercedes E420: 250 km/h (limited)
+        { "mbg63",    220.0f, 1.0f,  false, MakeStreetAssist(220.0f) },   // Mercedes-AMG G63: 220 km/h
+        { "taycan",   260.0f, 1.0f,  false, MakeStreetAssist(260.0f) },   // Porsche Taycan Turbo S: 260 km/h
+        { "teslas",   250.0f, 1.0f,  false, MakeStreetAssist(250.0f) },   // Tesla Model S P100D: 250 km/h
+        { nullptr,    250.0f, 1.0f,  false, MakeStreetAssist(250.0f), "vehicle_w210" },         // Mercedes E-Class W210: 250 km/h (limited)
     };
     inline constexpr size_t kHyperProfileCount = sizeof(kHyperProfiles) / sizeof(kHyperProfiles[0]);
 

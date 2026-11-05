@@ -1016,12 +1016,12 @@ static void TestHyperProfiles() {
     const HyperAssist& A = fix;
     const HyperAssist& P = jesko->assist;
 
-    // -- the production tune, pinned (GI 2026-11-05: Jesko, 600 km/h, power 3.5 = 12.5 % under the old 4.0, firmer handling) --
-    Check("hyper profile: the tune is 600 km/h, power x3.5, +400 % cap; the Jesko row has toughness and the firmer assists",
-          kHyperTargetKmh == 600.0f && kHyperPower == 3.5f && kHyperMaxPercent == 400.0f && jesko->targetKmh == 600.0f &&
-              jesko->power == 3.5f && jesko->tough && HyperTargetMs(*jesko) == kHyperTargetMs &&
-              P.downRefMs == kHyperTargetMs && P.downAtRefMs2 == 14.0f && P.downCapMs2 == 17.0f && P.gripRate == 6.0f && P.gripCapMs2 == 26.0f &&
-              P.brakeMs2 == 14.0f && P.yawLatMs2 == 26.0f && P.tiltRate == 4.0f &&
+    // -- the production tune, pinned (GI 2026-11-05: Jesko, 600 km/h, power 2.35 = 3.5 - 33 %, handling +15 %) --
+    Check("hyper profile: the tune is 600 km/h, power x2.35, +400 % cap; the Jesko row has toughness and the firmer assists",
+          kHyperTargetKmh == 600.0f && kHyperPower == 2.35f && kHyperMaxPercent == 400.0f && jesko->targetKmh == 600.0f &&
+              jesko->power == 2.35f && jesko->tough && HyperTargetMs(*jesko) == kHyperTargetMs &&
+              P.downRefMs == kHyperTargetMs && P.downAtRefMs2 == 14.0f && P.downCapMs2 == 17.0f && P.gripRate == 6.9f && P.gripCapMs2 == 30.0f &&
+              P.brakeMs2 == 14.0f && P.yawLatMs2 == 30.0f && P.tiltRate == 4.6f &&
               std::fabs(HyperTopSpeedPercent(100.0f) - 66.66667f) < 1e-3f && std::fabs(HyperTopSpeedPercent(50.0f) - 233.3333f) < 1e-2f &&
               HyperTopSpeedPercent(10.0f) == 400.0f && HyperTopSpeedPercent(170.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f,
           F("pct(100) %.4f pct(50) %.4f", HyperTopSpeedPercent(100.0f), HyperTopSpeedPercent(50.0f)));
@@ -1035,7 +1035,7 @@ static void TestHyperProfiles() {
           jo.velChanged && jo.angChanged && dout.vel.x == jo.vel.x && dout.vel.y == jo.vel.y && dout.vel.z == jo.vel.z &&
               dout.angVel.x == jo.angVel.x && dout.angVel.y == jo.angVel.y && dout.angVel.z == jo.angVel.z,
           F("jesko vel %d ang %d", (int)jo.velChanged, (int)jo.angChanged));
-    Check("hyper profile: the production grip + brake stay under the impact tracker's 1.5 m/s per frame ((26 + 14) / 30 = 1.33)",
+    Check("hyper profile: the production grip + brake stay under the impact tracker's 1.5 m/s per frame ((30 + 14) / 30 = 1.47)",
           (P.gripCapMs2 + P.brakeMs2) * kHyperMaxDt < 1.5f && (dubsta->assist.gripCapMs2 + dubsta->assist.brakeMs2) * kHyperMaxDt < 1.5f,
           F("%.3f m/s", (P.gripCapMs2 + P.brakeMs2) * kHyperMaxDt));
 
@@ -1048,7 +1048,7 @@ static void TestHyperProfiles() {
     // both), names are lower case and unique per kind, the target sits under the server cap, and every assist set keeps
     // one frame's grip + brake under the impact tracker's 1.5 m/s.
     size_t looked = 0, packRows = 0;
-    bool tableOk = kHyperProfileCount == 8;
+    bool tableOk = kHyperProfileCount == 16;
     const auto lower = [](const char* s) { for (; s && *s; ++s) if (*s >= 'A' && *s <= 'Z') return false; return true; };
     const auto same = [](const char* a, const char* b) { return a && b && std::strcmp(a, b) == 0; };
     for (size_t i = 0; i < kHyperProfileCount; ++i) {
@@ -1062,13 +1062,33 @@ static void TestHyperProfiles() {
         for (size_t j = i + 1; j < kHyperProfileCount; ++j)
             tableOk = tableOk && !same(p.model, kHyperProfiles[j].model) && !same(p.pack, kHyperProfiles[j].pack);
     }
-    tableOk = tableOk && packRows == 3 && !HyperProfileForPack("") && !HyperProfileForPack(nullptr) && !HyperProfileForPack("rs6") &&
+    tableOk = tableOk && packRows == 4 && !HyperProfileForPack("") && !HyperProfileForPack(nullptr) && !HyperProfileForPack("rs6") &&
               HyperProfileForPack("vehicle_supra") && !HyperProfileForPack("vehicle_supra")->model &&
               std::strcmp(HyperProfileName(*HyperProfileForPack("vehicle_supra")), "vehicle_supra") == 0 &&
               std::strcmp(HyperProfileName(kHyperProfiles[0]), "jesko") == 0 && !HyperProfileForPack("vehicle_supra")->tough;
     Check("hyper profile: every row names a model or a pack (lower case, unique), power >= 1, a target within the server's default 170 m/s "
           "cap and a frame-bounded assist; the pack rows resolve by pack name",
           tableOk && looked == kHyperProfileCount, F("%zu rows, %zu pack rows", looked, packRows));
+    {
+        // GI 2026-11-05: road cars bottomed out under the downforce assist and accelerated too hard: no downforce, power 1.0,
+        // the +15 % grip set; the Regera's power is 2/3 of the old 2.4.
+        bool roadOk = true;
+        int roadRows = 0;
+        for (size_t i = 0; i < kHyperProfileCount; ++i) {
+            const HyperProfile& p = kHyperProfiles[i];
+            if (p.tough || p.targetKmh >= 400.0f) continue;
+            ++roadRows;
+            roadOk = roadOk && p.power == 1.0f && p.assist.downAtRefMs2 == 0.0f && p.assist.gripCapMs2 == 13.8f &&
+                     p.assist.yawLatMs2 == 18.4f && p.assist.Any();
+        }
+        const HyperProfile* regera = HyperProfileFor("regera");
+        HyperAssistIn fast = Level(80.0, kHyperAssistAll);
+        const HyperAssistOut ro = HyperAssistStep(HyperProfileFor("rs6")->assist, fast);
+        Check("hyper profile: the road cars run at power 1.0 with no downforce (a level car at 80 m/s gets none) and the firmer grip set; "
+              "the Regera is at 1.6",
+              roadOk && roadRows == 13 && regera && regera->power == 1.6f && ro.downMs2 == 0.0f,
+              F("%d road rows, rs6 down %.2f", roadRows, (double)ro.downMs2));
+    }
     Check("hyper profile: the Dubsta stand-in has the Jesko's acceleration (power), top speed (600 km/h, inside 400..612), toughness and assists",
           dubsta->power == jesko->power && dubsta->targetKmh == jesko->targetKmh && dubsta->targetKmh >= 400.0f && dubsta->targetKmh <= 612.0f &&
               dubsta->tough && dubsta->assist.Any(),
@@ -1407,7 +1427,7 @@ static void TestHyperProfiles() {
               !HyperHealthLow(999.6f) && !HyperHealthLow(1200.0f) && !HyperHealthLow(std::nanf("")) && !HyperHealthLow(INFINITY),
           "");
 }
-constexpr int kHyperTuneChecks = 4 + 30;   // TestHyperTune's own four + TestHyperProfiles (keep in step: the run asserts the total)
+constexpr int kHyperTuneChecks = 4 + 31;   // TestHyperTune's own four + TestHyperProfiles (keep in step: the run asserts the total)
 
 // ---- hyper tune (libs/sync/hypertune.h, GI 2026-11-02: the Jesko at 500 km/h; 2026-11-05: 600 km/h) ----------------
 static void TestHyperTune() {

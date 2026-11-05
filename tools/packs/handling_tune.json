@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Applied by stage_packs.mjs to every loose (OPEN/NONE) pack's HANDLING_FILE, per <handlingName> (case-insensitive).",
+    "scale: value *= factor; set: value = number. Every listed field must exist exactly once in that handling item, or staging fails.",
+    "'*' applies to every handlingName in a loose pack, before the named entry (the named entry can override).",
+    "GI 2026-11-05: acceleration -33 % on every car (with the engine's power multiplier, libs/sync/hypertune.h), handling +15 %,",
+    "rs6 / bmwm5 hit the ground and shake: more ride height and compression travel, firmer springs and bump damping.",
+    "NG/AES packs keep their own handling.meta (the game reads it from the encrypted dlc.rpf); only the engine's power row tunes them."
+  ],
+  "*": {
+    "scale": { "fTractionCurveMax": 1.15, "fTractionCurveMin": 1.15 }
+  },
+  "rs6": {
+    "_why": "power 1.5 -> 1.0 in the engine = -33 %, drive force unchanged; travel 0.07 -> 0.11, raise +0.03 m",
+    "set": { "fSuspensionUpperLimit": 0.11, "fSuspensionRaise": 0.03 },
+    "scale": { "fSuspensionForce": 1.2, "fSuspensionCompDamp": 1.25 }
+  },
+  "bmwm5": {
+    "_why": "power 1.45 -> 1.0 (-31 %) and drive x0.97 = -33 %; raise +0.03 m, firmer springs and bump damping",
+    "set": { "fSuspensionRaise": 0.03 },
+    "scale": { "fInitialDriveForce": 0.97, "fSuspensionForce": 1.15, "fSuspensionCompDamp": 1.15 }
+  },
+  "diabloSV": {
+    "_why": "power 1.35 -> 1.0 (-26 %) and drive x0.905 = -33 %",
+    "scale": { "fInitialDriveForce": 0.905 }
+  },
+  "LP700R": {
+    "_why": "travel 0.062 -> 0.09 (rs6 bottomed out at 0.07), firmer bump damping",
+    "set": { "fSuspensionUpperLimit": 0.09 },
+    "scale": { "fSuspensionCompDamp": 1.15 }
+  },
+  "M3GTR": {
+    "_why": "travel 0.05 -> 0.09, raise +0.02 m; max flat vel 410 -> 300 (a road car); min traction above max (5.29 vs 4.08) -> 0.9 x max",
+    "set": { "fSuspensionUpperLimit": 0.09, "fSuspensionRaise": 0.02, "fInitialDriveMaxFlatVel": 300.0, "fTractionCurveMin": 3.674 },
+    "scale": { "fSuspensionCompDamp": 1.15 }
+  },
+  "mbc63s": {
+    "_why": "travel 0.06 -> 0.09; drive x0.85 (0.38 out-accelerated the RS6 at 0.35 and 1925 kg)",
+    "set": { "fSuspensionUpperLimit": 0.09 },
+    "scale": { "fInitialDriveForce": 0.85, "fSuspensionCompDamp": 1.15 }
+  },
+  "mbe420": {
+    "_why": "drive x0.67 = -33 % (0.30 at 1600 kg out-accelerated the RS6; a 279 hp E420)",
+    "scale": { "fInitialDriveForce": 0.67 }
+  },
+  "mbg63": {
+    "_why": "an SUV on 0.05 m of travel: 0.12 (Dubsta-like), raise +0.03 m, firmer bump damping",
+    "set": { "fSuspensionUpperLimit": 0.12, "fSuspensionRaise": 0.03 },
+    "scale": { "fSuspensionCompDamp": 1.15 }
+  },
+  "teslas": {
+    "_why": "drive 0.55 on one gear is the strongest street car in the set: x0.67 = -33 %",
+    "scale": { "fInitialDriveForce": 0.67 }
+  },
+  "valkyrietp": {
+    "_why": "travel 0.03 and raise -0.005 bottom out on any kerb: 0.08 and 0; max flat vel 430 -> 360 (350 km/h car)",
+    "set": { "fSuspensionUpperLimit": 0.08, "fSuspensionRaise": 0.0, "fInitialDriveMaxFlatVel": 360.0 },
+    "scale": { "fSuspensionForce": 1.15, "fSuspensionCompDamp": 1.15 }
+  }
+}

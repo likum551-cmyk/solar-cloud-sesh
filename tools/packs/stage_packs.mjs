@@ -89,6 +89,38 @@ function filterContent(xml, keepNames) {
   return out;
 }
 
+// tools/packs/handling_tune.json: per-handlingName scale/set rules for the loose packs' HANDLING_FILEs ('*' = every one).
+const tune = JSON.parse(readFileSync(path.join(here, "handling_tune.json"), "utf8"));
+const fmt = (v) => String(Math.round(v * 1e6) / 1e6);
+
+// Apply the tune to one handling.meta text. Each rule must hit exactly one <field value="..."> inside that item's block,
+// else this throws (a silent no-op patch is how a tune "applies" and changes nothing).
+function tuneHandling(xml, report) {
+  return xml.replace(/<Item type="CHandlingData">[\s\S]*?<\/Item>/g, (block) => {
+    const hname = field(block, "handlingName");
+    const named = Object.keys(tune).find((k) => k !== "*" && !k.startsWith("_") && k.toLowerCase() === hname.toLowerCase());
+    const rules = [tune["*"], named ? tune[named] : null].filter(Boolean);
+    let out = block;
+    const done = [];
+    for (const r of rules) {
+      for (const [op, fields] of [["scale", r.scale || {}], ["set", r.set || {}]]) {
+        for (const [f, n] of Object.entries(fields)) {
+          const rx = new RegExp(`(<${f}\\s+value=")([-0-9.eE+]+)(")`, "g");
+          const hits = [...out.matchAll(rx)];
+          if (hits.length !== 1) throw new Error(`handling ${hname}: ${f} found ${hits.length} times (want exactly 1)`);
+          out = out.replace(rx, (all, a, v, b) => {
+            const nv = op === "scale" ? Number(v) * n : n;
+            done.push(`${f} ${v}->${fmt(nv)}`);
+            return a + fmt(nv) + b;
+          });
+        }
+      }
+    }
+    if (done.length) report.tuned.push(`${hname}: ${done.join(", ")}`);
+    return out;
+  });
+}
+
 function stageLoose(name, rpf, staging, report) {
   const x = path.join(staging, ".extract");
   const r = spawnSync(process.execPath, [packTool, `--extract=${rpf}`, `--out=${x}`], { encoding: "utf8" });
@@ -107,7 +139,8 @@ function stageLoose(name, rpf, staging, report) {
     kept.add(fname.trim().toLowerCase());
     const to = path.join(staging, ...rel.split("/"));
     mkdirSync(path.dirname(to), { recursive: true });
-    copyFileSync(file, to);
+    if (type === "HANDLING_FILE") writeFileSync(to, tuneHandling(readFileSync(file, "utf8"), report));
+    else copyFileSync(file, to);
     if (type === "VEHICLE_METADATA_FILE") report.models.push(...models(readFileSync(file, "utf8")));
   }
   writeFileSync(path.join(staging, "content.xml"), filterContent(content, kept));
@@ -141,7 +174,7 @@ let failed = 0, staged = 0, skipped = 0;
 for (const name of packs) {
   const rpf = path.join(src, name, "dlc.rpf");
   const target = path.join(dest, name);
-  const report = { models: [], warnings: [], dropped: [], stream: 0 };
+  const report = { models: [], warnings: [], dropped: [], stream: 0, tuned: [] };
   try {
     if (!/^[\x20-\x7e]+$/.test(name)) throw new Error("the folder name is not plain ASCII (the game takes narrow paths)");
     if (!existsSync(rpf)) throw new Error("no dlc.rpf");
@@ -162,6 +195,7 @@ for (const name of packs) {
     rmSync(target + ".old", { recursive: true, force: true });
     staged++;
     console.log(`+ ${name}: ${encName} -> ${mode === "loose" ? `loose folder, ${report.stream} model file(s) in stream\\, cars: ${report.models.join(", ") || "-"}` : "dlc.rpf as is (the game reads it; its cars are listed in game)"}`);
+    for (const t of report.tuned) console.log(`    tuned: ${t}`);
     for (const d of report.dropped) console.log(`    dropped from content.xml: ${d}`);
     for (const w of report.warnings) console.log(`    WARNING: ${w}`);
   } catch (e) {
