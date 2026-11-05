@@ -33,6 +33,11 @@ namespace gage::game::Overlay::detail {
 
     void UiSetTextures(const UiTextures& t);
 
+    // Decode the brand marks, the lockup and the loader's pictures through Overlay::LoadPngTexture (which follows the
+    // active backend) into tx. Defined in overlay.cpp, called by both backends once they are ready. Returns how many
+    // images decoded; a failure is logged and leaves that slot null.
+    int LoadUiTextures(UiTextures& tx);
+
     // One UI frame, between ImGui::NewFrame and ImGui::Render, render thread.
     void UiFrame();
 

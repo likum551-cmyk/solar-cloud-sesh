@@ -64,7 +64,7 @@ using net::ServerInfo;
 // Constants
 // ---------------------------------------------------------------------------
 
-static const wchar_t* kClientVersion = L"0.4.23";
+static const wchar_t* kClientVersion = L"0.4.24";
 static const wchar_t* kClass = L"GAGE_MP_Launcher";
 static const wchar_t* kTitle = L"Solar Launcher";
 static const int kAppIconId = 1;  // gage_gui.rc
@@ -673,11 +673,14 @@ static std::string VersionText(uint32_t packed) {
 static std::vector<std::string> UpdateUrls();  // with the update code below
 
 // Download the car packs the server publishes (packs.json next to the update manifest) into
-// %LOCALAPPDATA%\GAGE-MP\packs, with progress as launch status lines. Launch worker thread; never fails the launch.
+// %LOCALAPPDATA%\GAGE-MP\packs, with progress as launch status lines. Launch worker thread.
 // gage_mp.cfg pack_sync=0 switches it off (an operator staging packs by hand).
-static void SyncCarPacks() {
-    if (cfg::Get(L"pack_sync", L"1") == L"0") { GLOGI("packs: pack_sync=0 in gage_mp.cfg, not syncing"); return; }
-    if (!kUpdatePubKey || !*kUpdatePubKey) { GLOGW("packs: no update key baked into this build, not syncing"); return; }
+// 0.4.24 (GI: a friend joined with no packs and saw no Jesko): returns false = refuse the launch when the server's packs
+// could not be checked or installed; pack_required=0 in gage_mp.cfg restores the old "start without them".
+static bool SyncCarPacks() {
+    if (cfg::Get(L"pack_sync", L"1") == L"0") { GLOGI("packs: pack_sync=0 in gage_mp.cfg, not syncing"); return true; }
+    if (!kUpdatePubKey || !*kUpdatePubKey) { GLOGW("packs: no update key baked into this build, not syncing"); return true; }
+    const bool required = cfg::Get(L"pack_required", L"1") != L"0";
     PostStatusFromWorker(L"Checking cars…");
     ULONGLONG last = 0;
     const packsync::Result r = packsync::Sync(packsync::DefaultRoot(), UpdateUrls(), kUpdatePubKey, packsync::DefaultIo(),
@@ -691,13 +694,21 @@ static void SyncCarPacks() {
             PostStatusFromWorker(b);
         });
     if (!r.published) {
-        GLOGI("packs: no packs.json reachable (%s); starting with the packs already on this PC", r.error.c_str());
-    } else if (!r.ok) {
-        GLOGW("packs: %s", r.error.c_str());
-        PostStatusFromWorker(L"Some cars could not be downloaded. Starting without them…");
-    } else if (r.packsInstalled > 0 || r.packsRemoved > 0) {
-        PostStatusFromWorker(L"Cars up to date.");
+        // No error = the server publishes no packs (nothing to require); an error = packs.json was not reachable.
+        if (r.error.empty() || !required) {
+            GLOGI("packs: no packs.json reachable (%s); starting with the packs already on this PC", r.error.c_str());
+            return true;
+        }
+        GLOGW("packs: packs.json unreachable (%s); launch refused (pack_required=1)", r.error.c_str());
+        return false;
     }
+    if (!r.ok) {
+        GLOGW("packs: %s%s", r.error.c_str(), required ? "; launch refused (pack_required=1)" : "");
+        if (!required) PostStatusFromWorker(L"Some cars could not be downloaded. Starting without them…");
+        return !required;
+    }
+    if (r.packsInstalled > 0 || r.packsRemoved > 0) PostStatusFromWorker(L"Cars up to date.");
+    return true;
 }
 
 static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const std::wstring& playerName) {
@@ -759,7 +770,10 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
     //     game is not running (a running engine has its packs mounted). Never fatal: without them the game still starts.
     if (_wcsicmp(baseName(game).c_str(), L"GTA5.exe") == 0) {
         if (launch::FindGame().pid) GLOGI("packs: the game is already running; not syncing car packs now");
-        else SyncCarPacks();
+        else if (!SyncCarPacks()) {
+            PostLaunch({ false, 16, L"The server's cars could not be downloaded. Check your connection and press Play again." });
+            return;
+        }
     }
 
     // 2. Server handoff (the injected chain reads these from the registry; the

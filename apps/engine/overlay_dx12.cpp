@@ -25,12 +25,16 @@
 // share. The ExecuteCommandLists hook runs on the game's render thread and touches only
 // static state, so it is installed once and left in place for the DLL's lifetime.
 //
-// v1 draws the full HUD (vitals, speedometer, chat, loader layout) with ImGui's own font;
-// custom brand textures (the corner mark, the loader's real GTA V stills) are not yet
-// uploaded on DX12, so the UI draws its designed fallbacks — see LoadPngTexture below.
+// Textures (the brand marks, the lockup and the loader's GTA V stills) go through LoadPngTexture
+// below: a WIC decode to 32bppRGBA, a default-heap texture filled through an upload buffer on a
+// one-shot command list submitted to the captured queue, and one SRV per texture in g.srvHeap
+// slots 1..63 (slot 0 is ImGui's font). The texture's ImTextureID is its GPU descriptor handle,
+// which is what imgui_impl_dx12 passes to SetGraphicsRootDescriptorTable. Any failure is logged
+// and the UI draws its designed fallback for that image.
 #include "overlay.h"
 #include "overlay_internal.h"
 #include "common/logger.h"
+#include "common/registry.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -39,8 +43,11 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <wincodec.h>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <new>
 
 // The backend header keeps this declaration in an '#if 0' block on purpose (as in overlay.cpp).
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -159,6 +166,14 @@ struct FrameCtx {
     UINT64                  fenceValue = 0;
 };
 
+constexpr UINT kSrvSlots = 64;     // the SRV heap's size: slot 0 = ImGui's font, 1..63 = user textures
+
+// A texture LoadPngTexture handed out: its resource and its GPU descriptor handle (the ImTextureID).
+struct UserTex {
+    ID3D12Resource* res = nullptr;
+    UINT64          gpuPtr = 0;
+};
+
 struct State {
     std::atomic<bool> ready{false};
     std::atomic<bool> disabled{false};
@@ -182,7 +197,9 @@ struct State {
     // DX12 render objects
     ID3D12DescriptorHeap*      rtvHeap = nullptr;
     UINT                       rtvStep = 0;
-    ID3D12DescriptorHeap*      srvHeap = nullptr;   // shader-visible: ImGui font at slot 0
+    ID3D12DescriptorHeap*      srvHeap = nullptr;   // shader-visible: ImGui font at slot 0, user textures at 1..63
+    UINT                       srvStep = 0;         // CBV/SRV/UAV descriptor increment
+    UserTex                    tex[kSrvSlots];      // user textures by SRV slot ([0] is the font and stays empty)
     ID3D12GraphicsCommandList* cmd = nullptr;       // one list, reset onto the current frame's allocator
     ID3D12Fence*               fence = nullptr;
     HANDLE                     fenceEvent = nullptr;
@@ -215,6 +232,30 @@ void WaitFence(UINT64 v)
     if (g.fence && g.fenceEvent && v && g.fence->GetCompletedValue() < v) {
         if (SUCCEEDED(g.fence->SetEventOnCompletion(v, g.fenceEvent)))
             WaitForSingleObject(g.fenceEvent, 1000);
+    }
+}
+
+// As WaitFence, but with the timeout chosen by the caller and the answer returned: true when the GPU has
+// passed v. A texture upload frees its staging memory only on true.
+bool WaitFenceFor(UINT64 v, DWORD ms)
+{
+    if (!g.fence || !g.fenceEvent || !v)
+        return false;
+    if (g.fence->GetCompletedValue() >= v)
+        return true;
+    if (FAILED(g.fence->SetEventOnCompletion(v, g.fenceEvent)))
+        return false;
+    WaitForSingleObject(g.fenceEvent, ms);
+    return g.fence->GetCompletedValue() >= v;
+}
+
+// Releases every user texture. The caller has already waited for the GPU to finish with them
+// (WaitFence(g.fenceCounter)); their SRV slots become free again.
+void ReleaseAllTextures()
+{
+    for (UINT i = 0; i < kSrvSlots; ++i) {
+        SafeRelease(g.tex[i].res);
+        g.tex[i].gpuPtr = 0;
     }
 }
 
@@ -330,7 +371,8 @@ void Teardown()
     }
     WaitFence(g.fenceCounter);     // our last submission must finish before its resources go
 
-    detail::UiReset();
+    detail::UiReset();                 // forgets the texture handles before the textures go
+    ReleaseAllTextures();
     if (g.imctx)
         ImGui::SetCurrentContext(g.imctx);
     if (g.dx12Init)  { ImGui_ImplDX12_Shutdown();  g.dx12Init = false; }
@@ -356,6 +398,7 @@ void Teardown()
     g.frameNo = 0;
     g.bufferCount = 0;
     g.rtvStep = 0;
+    g.srvStep = 0;
     g.fenceCounter = 0;
     g.rtvFormat = DXGI_FORMAT_UNKNOWN;
     g.initW = g.initH = 0;
@@ -417,14 +460,15 @@ bool InitNew(IDXGISwapChain* sc)
     }
     g.rtvStep = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    // SRV heap: shader-visible, ImGui's font SRV at slot 0 (slots 1.. reserved for future brand textures).
+    // SRV heap: shader-visible, ImGui's font SRV at slot 0, user textures (LoadPngTexture) at slots 1..63.
     D3D12_DESCRIPTOR_HEAP_DESC sh = {};
     sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    sh.NumDescriptors = 64;
+    sh.NumDescriptors = kSrvSlots;
     sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(dev->CreateDescriptorHeap(&sh, IID_ID3D12DescriptorHeap, (void**)&g.srvHeap))) {
         GLOGW("overlay[dx12]: CreateDescriptorHeap(SRV) failed"); Teardown(); return false;
     }
+    g.srvStep = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     for (UINT i = 0; i < bc; ++i) {
         if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_ID3D12CommandAllocator,
@@ -469,13 +513,20 @@ bool InitNew(IDXGISwapChain* sc)
 
     {
         Lock lk;
-        g.ready.store(true);
+        g.ready.store(true);   // LoadPngTexture needs a ready overlay
     }
-    // v1: no custom brand textures on DX12 yet; the UI draws its designed fallbacks.
-    detail::UiTextures tx;      // all null
+    // The marks, the lockup and the loader's pictures: the same list as the D3D11 backend (overlay.cpp). An image
+    // that fails is logged and left null; the UI draws its designed fallback for it.
+    // 0.4.24 switch: dx12_textures=0 (HKCU\Software\GAGE-MP) = no uploads, the pre-0.4.24 fallbacks (live-unverified on Enhanced).
+    detail::UiTextures tx;
+    const bool texOn = gage::reg::Get(L"dx12_textures") != L"0";
+    const int loaded = texOn ? detail::LoadUiTextures(tx) : 0;
+    if (!texOn) GLOGI("overlay[dx12]: dx12_textures=0, no image uploads (typeset fallbacks)");
     detail::UiSetTextures(tx);
-    GLOGI("overlay[dx12]: ready (sc %p dev %p queue %p hwnd %p %ux%u scale %.2f fmt %u) — brand textures: fallback (v1)",
-          (void*)sc, (void*)dev, (void*)g.queue, (void*)g.hwnd, g.initW, g.initH, g.uiScale, (unsigned)g.rtvFormat);
+    GLOGI("overlay[dx12]: ready (sc %p dev %p queue %p hwnd %p %ux%u scale %.2f fmt %u, %d/%d brand textures, brand art %s)",
+          (void*)sc, (void*)dev, (void*)g.queue, (void*)g.hwnd, g.initW, g.initH, g.uiScale, (unsigned)g.rtvFormat, loaded,
+          detail::kUseBrandArt ? 4 + detail::kLoaderScenes : detail::kLoaderScenes,
+          detail::kUseBrandArt ? "on" : "off (typeset fallbacks)");
     return true;
 }
 
@@ -646,6 +697,243 @@ void RenderFrame(IDXGISwapChain* scBase)
     sc->Release();
 }
 
+// ---------------------------------------------------------------------------
+// Textures: WIC decode, upload through the captured queue, one SRV per texture
+// ---------------------------------------------------------------------------
+// A straight-alpha texture is filtered bilinearly, so the RGB stored under fully transparent texels leaks
+// into the anti-aliased edge (exporters write black there: a dark fringe around a white mark). Give every
+// transparent texel the average colour of its already-coloured neighbours, `passes` rings deep. Alpha is
+// untouched. Allocation failure only skips the fix. Local copy of overlay.cpp's, so the D3D11 file is untouched.
+void BleedColorIntoTransparent(unsigned char* px, UINT w, UINT h, int passes)
+{
+    const size_t n = (size_t)w * h;
+    unsigned char* known = new (std::nothrow) unsigned char[n];
+    unsigned char* grown = new (std::nothrow) unsigned char[n];
+    if (!known || !grown) {
+        delete[] known;
+        delete[] grown;
+        return;
+    }
+    for (size_t i = 0; i < n; ++i)
+        known[i] = px[i * 4 + 3] != 0;
+    for (int pass = 0; pass < passes; ++pass) {
+        std::memcpy(grown, known, n);
+        for (UINT y = 0; y < h; ++y) {
+            for (UINT x = 0; x < w; ++x) {
+                const size_t i = (size_t)y * w + x;
+                if (known[i])
+                    continue;
+                unsigned sr = 0, sg = 0, sb = 0, cnt = 0;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = (int)x + dx, ny = (int)y + dy;
+                        if ((dx == 0 && dy == 0) || nx < 0 || ny < 0 || nx >= (int)w || ny >= (int)h)
+                            continue;
+                        const size_t j = (size_t)ny * w + (size_t)nx;
+                        if (!known[j])
+                            continue;
+                        sr += px[j * 4 + 0]; sg += px[j * 4 + 1]; sb += px[j * 4 + 2];
+                        ++cnt;
+                    }
+                }
+                if (cnt) {
+                    px[i * 4 + 0] = (unsigned char)(sr / cnt);
+                    px[i * 4 + 1] = (unsigned char)(sg / cnt);
+                    px[i * 4 + 2] = (unsigned char)(sb / cnt);
+                    grown[i] = 1;
+                }
+            }
+        }
+        unsigned char* t = known; known = grown; grown = t;
+    }
+    delete[] known;
+    delete[] grown;
+}
+
+// Decode a PNG/JPEG held in memory to straight-alpha 32bppRGBA. On success *outPx is a new[] block of
+// w * h * 4 bytes the caller frees; on failure *outPx is null and *what names the step that failed.
+bool DecodeToRgba(const unsigned char* bytes, size_t n, unsigned char** outPx, UINT* outW, UINT* outH,
+                  const char** what, HRESULT* outHr)
+{
+    // WIC needs COM on this thread. Balance only what we initialised; RPC_E_CHANGED_MODE
+    // means the thread already has an STA, which is just as good.
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool coInit = SUCCEEDED(hrCo);
+
+    IWICImagingFactory*     factory = nullptr;
+    IWICStream*             stream = nullptr;
+    IWICBitmapDecoder*      decoder = nullptr;
+    IWICBitmapFrameDecode*  frame = nullptr;
+    IWICFormatConverter*    conv = nullptr;
+    unsigned char*          px = nullptr;
+    UINT w = 0, h = 0;
+    HRESULT hr = S_OK;
+
+    do {
+        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
+                              (void**)&factory);
+        if (FAILED(hr)) { *what = "CoCreateInstance(WICImagingFactory)"; break; }
+        hr = factory->CreateStream(&stream);
+        if (FAILED(hr)) { *what = "CreateStream"; break; }
+        hr = stream->InitializeFromMemory(const_cast<BYTE*>(bytes), (DWORD)n);
+        if (FAILED(hr)) { *what = "InitializeFromMemory"; break; }
+        hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder);
+        if (FAILED(hr)) { *what = "CreateDecoderFromStream (not a decodable image)"; break; }
+        hr = decoder->GetFrame(0, &frame);
+        if (FAILED(hr)) { *what = "GetFrame"; break; }
+        hr = frame->GetSize(&w, &h);
+        if (FAILED(hr)) { *what = "GetSize"; break; }
+        if (w == 0 || h == 0 || w > 8192 || h > 8192) { *what = "image size out of range (1..8192)"; hr = E_INVALIDARG; break; }
+        hr = factory->CreateFormatConverter(&conv);
+        if (FAILED(hr)) { *what = "CreateFormatConverter"; break; }
+        // Straight (non-premultiplied) alpha: ImGui's blend is SRC_ALPHA / INV_SRC_ALPHA.
+        hr = conv->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
+                              WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) { *what = "format conversion to 32bppRGBA"; break; }
+        const size_t bytesTotal = (size_t)w * h * 4;
+        px = new (std::nothrow) unsigned char[bytesTotal];
+        if (!px) { *what = "out of memory"; hr = E_OUTOFMEMORY; break; }
+        hr = conv->CopyPixels(nullptr, w * 4, (UINT)bytesTotal, px);
+        if (FAILED(hr)) { *what = "CopyPixels"; break; }
+    } while (false);
+
+    SafeRelease(conv);
+    SafeRelease(frame);
+    SafeRelease(decoder);
+    SafeRelease(stream);
+    SafeRelease(factory);
+    if (coInit)
+        CoUninitialize();
+
+    *outHr = hr;
+    if (FAILED(hr)) {
+        delete[] px;
+        *outPx = nullptr;
+        return false;
+    }
+    *outPx = px;
+    *outW = w;
+    *outH = h;
+    return true;
+}
+
+// Create a default-heap RGBA8 texture and fill it from px (w * 4 bytes per row) through an upload buffer on a
+// one-shot list submitted to the captured queue. Returns the texture in PIXEL_SHADER_RESOURCE state only after the
+// fence has passed, so the upload buffer is never freed while the GPU can still read it. If the wait times out the
+// staging objects and the texture are deliberately leaked (the GPU may still be using them) and the call fails.
+bool UploadRgba(const unsigned char* px, UINT w, UINT h, ID3D12Resource** outTex, const char** what, HRESULT* outHr)
+{
+    ID3D12Resource*         tex = nullptr;
+    ID3D12Resource*         upload = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    HRESULT hr = S_OK;
+    bool leak = false;      // the GPU may still read these: do not release them
+    bool ok = false;
+
+    do {
+        D3D12_RESOURCE_DESC td = {};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hr = g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_ID3D12Resource, (void**)&tex);
+        if (FAILED(hr)) { *what = "CreateCommittedResource(texture)"; break; }
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT rows = 0;
+        UINT64 rowBytes = 0, total = 0;
+        g.dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &rowBytes, &total);
+        if (total == 0 || rows != h || rowBytes < (UINT64)w * 4) { *what = "GetCopyableFootprints"; hr = E_FAIL; break; }
+
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES up = {};
+        up.Type = D3D12_HEAP_TYPE_UPLOAD;
+        hr = g.dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                            IID_ID3D12Resource, (void**)&upload);
+        if (FAILED(hr)) { *what = "CreateCommittedResource(upload buffer)"; break; }
+        unsigned char* mapped = nullptr;
+        const D3D12_RANGE noRead = {0, 0};
+        hr = upload->Map(0, &noRead, (void**)&mapped);
+        if (FAILED(hr) || !mapped) { *what = "Map(upload buffer)"; if (SUCCEEDED(hr)) hr = E_FAIL; break; }
+        for (UINT y = 0; y < h; ++y)
+            std::memcpy(mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch, px + (size_t)y * w * 4, (size_t)w * 4);
+        upload->Unmap(0, nullptr);
+
+        hr = g.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_ID3D12CommandAllocator, (void**)&alloc);
+        if (FAILED(hr)) { *what = "CreateCommandAllocator(upload)"; break; }
+        hr = g.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_ID3D12GraphicsCommandList,
+                                      (void**)&list);
+        if (FAILED(hr)) { *what = "CreateCommandList(upload)"; break; }
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = tex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = upload;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = fp;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = tex;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        list->ResourceBarrier(1, &b);
+        hr = list->Close();
+        if (FAILED(hr)) { *what = "Close(upload list)"; break; }
+
+        ID3D12CommandList* lists[] = { list };
+        g.queue->ExecuteCommandLists(1, lists);
+        const UINT64 v = ++g.fenceCounter;
+        hr = g.queue->Signal(g.fence, v);
+        if (FAILED(hr)) { *what = "Signal(upload fence)"; leak = true; break; }
+        if (!WaitFenceFor(v, 3000)) {
+            *what = "the GPU did not finish the upload within 3 s";
+            hr = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+            leak = true;
+            break;
+        }
+        ok = true;
+    } while (false);
+
+    if (leak) {
+        // Submitted but not known to be finished: freeing now could free memory the GPU is reading.
+        GLOGW("overlay[dx12]: LoadPngTexture: leaking one upload's resources (the GPU may still be using them)");
+    } else {
+        SafeRelease(list);
+        SafeRelease(alloc);
+        SafeRelease(upload);
+    }
+    if (!ok) {
+        if (!leak)
+            SafeRelease(tex);
+        *outTex = nullptr;
+        *outHr = hr;
+        return false;
+    }
+    *outTex = tex;
+    *outHr = S_OK;
+    return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -698,23 +986,83 @@ bool Interactive()
     return g.ready.load() && detail::UiInteractive();
 }
 
-bool LoadPngTexture(const unsigned char* /*bytes*/, size_t /*n*/, void** outTexture, int* outW, int* outH)
+// Render thread only (see overlay.h). The returned handle is the texture's GPU descriptor handle in g.srvHeap,
+// which is exactly what imgui_impl_dx12 reads back from ImDrawCmd::GetTexID(). It stays valid until FreeTexture
+// or Shutdown / a rebuild (Teardown); the UI forgets it in the same step (UiReset).
+bool LoadPngTexture(const unsigned char* bytes, size_t n, void** outTexture, int* outW, int* outH)
 {
-    // v1: brand-texture upload is not yet wired on DX12 (needs a WIC decode + a DX12 default-heap
-    // texture uploaded through the captured queue, with its SRV in g.srvHeap slots 1..). Until then
-    // the UI gets null handles and draws its designed fallbacks. Returning false is the contract.
     if (outTexture) *outTexture = nullptr;
     if (outW) *outW = 0;
     if (outH) *outH = 0;
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true))
-        GLOGW("overlay[dx12]: LoadPngTexture is not implemented yet (v1); the UI uses its designed fallbacks");
-    return false;
+    if (!outTexture || !bytes || n == 0 || n > 0x7fffffffu) {
+        GLOGW("overlay[dx12]: LoadPngTexture: bad arguments (bytes %p, size %zu)", (const void*)bytes, n);
+        return false;
+    }
+    if (!g.ready.load() || !g.dev || !g.queue || !g.srvHeap || !g.fence || !g.fenceEvent || g.srvStep == 0) {
+        GLOGW("overlay[dx12]: LoadPngTexture: the overlay is not initialised");
+        return false;
+    }
+    UINT slot = 0;
+    for (UINT i = 1; i < kSrvSlots; ++i) {
+        if (!g.tex[i].res) { slot = i; break; }
+    }
+    if (slot == 0) {
+        GLOGW("overlay[dx12]: LoadPngTexture: all %u SRV slots are in use", kSrvSlots - 1);
+        return false;
+    }
+
+    unsigned char* px = nullptr;
+    UINT w = 0, h = 0;
+    const char* what = "unknown step";
+    HRESULT hr = S_OK;
+    if (!DecodeToRgba(bytes, n, &px, &w, &h, &what, &hr)) {
+        GLOGW("overlay[dx12]: LoadPngTexture: %s failed (0x%08lx)", what, (unsigned long)hr);
+        return false;
+    }
+    BleedColorIntoTransparent(px, w, h, 2);
+
+    ID3D12Resource* tex = nullptr;
+    const bool uploaded = UploadRgba(px, w, h, &tex, &what, &hr);
+    delete[] px;
+    if (!uploaded) {
+        GLOGW("overlay[dx12]: LoadPngTexture: %s failed (0x%08lx)", what, (unsigned long)hr);
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MostDetailedMip = 0;
+    sv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.srvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.srvHeap->GetGPUDescriptorHandleForHeapStart();
+    cpu.ptr += (SIZE_T)slot * g.srvStep;
+    gpu.ptr += (UINT64)slot * g.srvStep;
+    g.dev->CreateShaderResourceView(tex, &sv, cpu);
+
+    g.tex[slot].res = tex;       // the table owns the reference
+    g.tex[slot].gpuPtr = gpu.ptr;
+    *outTexture = reinterpret_cast<void*>(static_cast<uintptr_t>(gpu.ptr));
+    if (outW) *outW = (int)w;
+    if (outH) *outH = (int)h;
+    return true;
 }
 
-void FreeTexture(void* /*texture*/)
+void FreeTexture(void* texture)
 {
-    // No DX12 user textures exist yet (see LoadPngTexture); nothing to free.
+    if (!texture)
+        return;
+    const UINT64 key = static_cast<UINT64>(reinterpret_cast<uintptr_t>(texture));
+    for (UINT i = 1; i < kSrvSlots; ++i) {
+        if (g.tex[i].res && g.tex[i].gpuPtr == key) {
+            WaitFence(g.fenceCounter);     // a frame in flight may still sample it, and its descriptor slot is about to be reusable
+            SafeRelease(g.tex[i].res);
+            g.tex[i].gpuPtr = 0;
+            return;
+        }
+    }
+    GLOGW("overlay[dx12]: FreeTexture: %p is not a texture of this overlay", texture);
 }
 
 } // namespace gage::game::Overlay::dx12

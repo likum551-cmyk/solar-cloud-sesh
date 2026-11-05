@@ -469,43 +469,7 @@ bool InitNew(IDXGISwapChain* sc)
         g.ready.store(true);   // LoadPngTexture needs a ready overlay
     }
     detail::UiTextures tx;
-    int loaded = 0, w = 0, hgt = 0;
-    const auto load = [&](const unsigned char* bytes, unsigned long n, const char* what, void** out) {
-        if (LoadPngTexture(bytes, (size_t)n, out, &w, &hgt))
-            ++loaded;
-        else
-            GLOGW("overlay: %s failed to load; the UI draws its designed fallback", what);
-    };
-    // detail::kUseBrandArt (overlay_internal.h) is the one switch for the brand marks and the lockup;
-    // off, none is loaded and the UI draws its typeset fallbacks. The loader stills are not brand art.
-    if (detail::kUseBrandArt) {
-        load(kOverlayMark64Png, kOverlayMark64PngLen, "mark 64", &tx.mark64);
-        load(kOverlayMark256Png, kOverlayMark256PngLen, "mark 256", &tx.mark256);
-        load(kOverlayMark1024Png, kOverlayMark1024PngLen, "mark 1024", &tx.mark1024);
-        load(kOverlayLockupPng, kOverlayLockupPngLen, "lockup", &tx.lockup);
-        tx.lockupW = w;     // the lockup was loaded last; w/h are 0 when it failed
-        tx.lockupH = hgt;
-    }
-    // The loader's pictures: the ones that decode are packed to the front, so the loader cycles over sceneCount.
-    {
-        struct Scene { const unsigned char* bytes; unsigned long len; };
-        const Scene kScenes[detail::kLoaderScenes] = {
-            {kOverlayScene0Jpg, kOverlayScene0JpgLen}, {kOverlayScene1Jpg, kOverlayScene1JpgLen},
-            {kOverlayScene2Jpg, kOverlayScene2JpgLen}, {kOverlayScene3Jpg, kOverlayScene3JpgLen},
-            {kOverlayScene4Jpg, kOverlayScene4JpgLen}, {kOverlayScene5Jpg, kOverlayScene5JpgLen},
-            {kOverlayScene6Jpg, kOverlayScene6JpgLen}, {kOverlayScene7Jpg, kOverlayScene7JpgLen},
-            {kOverlayScene8Jpg, kOverlayScene8JpgLen}, {kOverlayScene9Jpg, kOverlayScene9JpgLen},
-        };
-        tx.sceneCount = 0;
-        for (int i = 0; i < detail::kLoaderScenes; ++i) {
-            char what[32];
-            std::snprintf(what, sizeof(what), "loader scene %d", i);
-            void* t = nullptr;
-            load(kScenes[i].bytes, kScenes[i].len, what, &t);
-            if (t) tx.scenes[tx.sceneCount++] = t;
-        }
-        GLOGI("overlay: loader pictures: %d of %d decoded", tx.sceneCount, detail::kLoaderScenes);
-    }
+    const int loaded = detail::LoadUiTextures(tx);   // shared with the D3D12 backend (defined below LoadPngTexture)
     detail::UiSetTextures(tx);
     GLOGI("overlay: ready (swap chain %p, device %p, hwnd %p, %ux%u, ui scale %.2f, %d/%d brand textures, brand art %s)",
           (void*)sc, (void*)dev, (void*)g.hwnd, desc.BufferDesc.Width, desc.BufferDesc.Height, g.uiScale, loaded,
@@ -830,6 +794,51 @@ void FreeTexture(void* texture)
         }
     }
     GLOGW("overlay: FreeTexture: %p is not a texture of this overlay", texture);
+}
+
+// The brand marks, the lockup and the loader's GTA V pictures, decoded through the public LoadPngTexture (which
+// dispatches to the active backend, so the D3D11 and D3D12 overlays share this one list). The overlay must be ready.
+// Returns how many of the images decoded (up to 4 + kLoaderScenes); a failed one is logged and left null.
+int detail::LoadUiTextures(detail::UiTextures& tx)
+{
+    int loaded = 0, w = 0, hgt = 0;
+    const auto load = [&](const unsigned char* bytes, unsigned long n, const char* what, void** out) {
+        if (LoadPngTexture(bytes, (size_t)n, out, &w, &hgt))
+            ++loaded;
+        else
+            GLOGW("overlay: %s failed to load; the UI draws its designed fallback", what);
+    };
+    // detail::kUseBrandArt (overlay_internal.h) is the one switch for the brand marks and the lockup;
+    // off, none is loaded and the UI draws its typeset fallbacks. The loader stills are not brand art.
+    if (detail::kUseBrandArt) {
+        load(kOverlayMark64Png, kOverlayMark64PngLen, "mark 64", &tx.mark64);
+        load(kOverlayMark256Png, kOverlayMark256PngLen, "mark 256", &tx.mark256);
+        load(kOverlayMark1024Png, kOverlayMark1024PngLen, "mark 1024", &tx.mark1024);
+        load(kOverlayLockupPng, kOverlayLockupPngLen, "lockup", &tx.lockup);
+        tx.lockupW = w;     // the lockup was loaded last; w/h are 0 when it failed
+        tx.lockupH = hgt;
+    }
+    // The loader's pictures: the ones that decode are packed to the front, so the loader cycles over sceneCount.
+    {
+        struct Scene { const unsigned char* bytes; unsigned long len; };
+        const Scene kScenes[detail::kLoaderScenes] = {
+            {kOverlayScene0Jpg, kOverlayScene0JpgLen}, {kOverlayScene1Jpg, kOverlayScene1JpgLen},
+            {kOverlayScene2Jpg, kOverlayScene2JpgLen}, {kOverlayScene3Jpg, kOverlayScene3JpgLen},
+            {kOverlayScene4Jpg, kOverlayScene4JpgLen}, {kOverlayScene5Jpg, kOverlayScene5JpgLen},
+            {kOverlayScene6Jpg, kOverlayScene6JpgLen}, {kOverlayScene7Jpg, kOverlayScene7JpgLen},
+            {kOverlayScene8Jpg, kOverlayScene8JpgLen}, {kOverlayScene9Jpg, kOverlayScene9JpgLen},
+        };
+        tx.sceneCount = 0;
+        for (int i = 0; i < detail::kLoaderScenes; ++i) {
+            char what[32];
+            std::snprintf(what, sizeof(what), "loader scene %d", i);
+            void* t = nullptr;
+            load(kScenes[i].bytes, kScenes[i].len, what, &t);
+            if (t) tx.scenes[tx.sceneCount++] = t;
+        }
+        GLOGI("overlay: loader pictures: %d of %d decoded", tx.sceneCount, detail::kLoaderScenes);
+    }
+    return loaded;
 }
 
 int AssertFailures()
