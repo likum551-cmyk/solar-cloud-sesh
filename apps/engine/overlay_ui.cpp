@@ -1091,6 +1091,54 @@ void TickVitals(float dt, bool loading)
 // The wedge lights bar by bar (the bar at the tip fades in with the remainder, so the gauge moves
 // continuously), the tip in ink; every bar is a neutral ghost at rest, and the last three light ember
 // only once speed reaches them (colour means wrong, never decoration). `speed` is the eased value.
+// The padlock, closed and open, in square classes of 7, 9 and 13 px (the 9 px class scaled by a whole factor from an 18 px box up, like the heart). The
+// open lock's shackle stands one row (two at 13 px) higher with its left leg out of the body: the two read apart by shape, not only by colour.
+constexpr const char* const kLockC7[7] = {"..XXX..", ".X...X.", ".X...X.", "XXXXXXX", "XXX.XXX", "XXX.XXX", "XXXXXXX"};
+constexpr const char* const kLockO7[7] = {"..XXX..", ".X...X.", ".....X.", ".....X.", "XXXXXXX", "XXX.XXX", "XXXXXXX"};
+constexpr const char* const kLockC9[9] = {"..XXXXX..", ".XX...XX.", ".X.....X.", ".X.....X.", "XXXXXXXXX", "XXXX.XXXX", "XXXX.XXXX", "XXXXXXXXX", "XXXXXXXXX"};
+constexpr const char* const kLockO9[9] = {"..XXXXX..", ".XX...XX.", ".X.....X.", ".......X.", ".......X.", "XXXXXXXXX", "XXXX.XXXX", "XXXX.XXXX", "XXXXXXXXX"};
+constexpr const char* const kLockC13[13] = {"...XXXXXXX...", "..XXXXXXXXX..", "..XX.....XX..", "..XX.....XX..", "..XX.....XX..", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX",
+                                            "XXXXXX.XXXXXX", "XXXXX...XXXXX", "XXXXXX.XXXXXX", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX"};
+constexpr const char* const kLockO13[13] = {"...XXXXXXX...", "..XXXXXXXXX..", "..XX.....XX..", ".........XX..", ".........XX..", ".........XX..", "XXXXXXXXXXXXX",
+                                            "XXXXXXXXXXXXX", "XXXXXX.XXXXXX", "XXXXX...XXXXX", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX"};
+constexpr Bmp kLockCCls[3] = {{7, 7, kLockC7}, {9, 9, kLockC9}, {13, 13, kLockC13}};
+constexpr Bmp kLockOCls[3] = {{7, 7, kLockO7}, {9, 9, kLockO9}, {13, 13, kLockO13}};
+static_assert(ClassesOk(kLockCCls, 3) && ClassesOk(kLockOCls, 3), "padlock bitmaps: a row is not w wide / a class is not h rows / an unknown character");
+constexpr PixelSet kLockCSet = {kLockCCls, 3, 1, 9, 18};
+constexpr PixelSet kLockOSet = {kLockOCls, 3, 1, 9, 18};
+// The speedometer strip's padlock, native in the strip's own classes (10, 14, 18 rows; 14 scaled by a whole factor from 28 up, like its neighbours).
+// Both states share one body on the bottom row (the strip's baseline) and one keyhole slot; the open shackle is lifted clear (its left leg ends at
+// least 2 rows above the body), so unlocked and unknown (= the closed shape, ghosted) read apart by outline, not by a 1-row nudge.
+constexpr const char* const kSLockC10[10] = {"........", "..XXXX..", ".X....X.", ".X....X.", ".X....X.", "XXXXXXXX", "XXX..XXX", "XXX..XXX", "XXXXXXXX", "XXXXXXXX"};
+constexpr const char* const kSLockO10[10] = {"..XXXX..", ".X....X.", ".X....X.", "......X.", "......X.", "XXXXXXXX", "XXX..XXX", "XXX..XXX", "XXXXXXXX", "XXXXXXXX"};
+constexpr const char* const kSLockC14[14] = {"...........", "...........", "...XXXXX...", "..XXXXXXX..", "..XX...XX..", "..XX...XX..", "..XX...XX..",
+                                             "XXXXXXXXXXX", "XXXXXXXXXXX", "XXXXX.XXXXX", "XXXXX.XXXXX", "XXXXX.XXXXX", "XXXXXXXXXXX", "XXXXXXXXXXX"};
+constexpr const char* const kSLockO14[14] = {"...XXXXX...", "..XXXXXXX..", "..XX...XX..", "..XX...XX..", ".......XX..", ".......XX..", ".......XX..",
+                                             "XXXXXXXXXXX", "XXXXXXXXXXX", "XXXXX.XXXXX", "XXXXX.XXXXX", "XXXXX.XXXXX", "XXXXXXXXXXX", "XXXXXXXXXXX"};
+constexpr const char* const kSLockC18[18] = {"..............", "..............", "..............", "....XXXXXX....", "...XXXXXXXX...", "...XX....XX...",
+                                             "...XX....XX...", "...XX....XX...", "...XX....XX...", "XXXXXXXXXXXXXX", "XXXXXXXXXXXXXX", "XXXXXX..XXXXXX",
+                                             "XXXXXX..XXXXXX", "XXXXXX..XXXXXX", "XXXXXX..XXXXXX", "XXXXXXXXXXXXXX", "XXXXXXXXXXXXXX", "XXXXXXXXXXXXXX"};
+constexpr const char* const kSLockO18[18] = {"....XXXXXX....", "...XXXXXXXX...", "...XX....XX...", "...XX....XX...", "...XX....XX...", "...XX....XX...",
+                                             ".........XX...", ".........XX...", ".........XX...", "XXXXXXXXXXXXXX", "XXXXXXXXXXXXXX", "XXXXXX..XXXXXX",
+                                             "XXXXXX..XXXXXX", "XXXXXX..XXXXXX", "XXXXXX..XXXXXX", "XXXXXXXXXXXXXX", "XXXXXXXXXXXXXX", "XXXXXXXXXXXXXX"};
+constexpr Bmp kSLockCCls[3] = {{8, 10, kSLockC10}, {11, 14, kSLockC14}, {14, 18, kSLockC18}};
+constexpr Bmp kSLockOCls[3] = {{8, 10, kSLockO10}, {11, 14, kSLockO14}, {14, 18, kSLockO18}};
+static_assert(ClassesOk(kSLockCCls, 3) && ClassesOk(kSLockOCls, 3), "strip padlock bitmaps: a row is not w wide / a class is not h rows / an unknown character");
+constexpr PixelSet kSLockCSet = {kSLockCCls, 3, 1, 14, 28};
+constexpr PixelSet kSLockOSet = {kSLockOCls, 3, 1, 14, 28};
+// The first and last inked column of a bitmap (the strip spaces its glyphs by ink, not by box: a box with blank columns crowds its neighbour).
+int InkCol(const Bmp& b, bool last)
+{
+    int lo = b.w, hi = -1;
+    for (int r = 0; r < b.h; ++r)
+        for (int c = 0; c < b.w; ++c)
+            if (b.rows[r][c] != '.') {
+                lo = c < lo ? c : lo;
+                hi = c > hi ? c : hi;
+            }
+    return hi < 0 ? 0 : (last ? hi : lo);
+}
+
 void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState& L)
 {
     const Cluster c = ClusterLayout(W, H);
@@ -1202,8 +1250,8 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
     // colour means something only when it is on or wrong: a turn arrow blinks gold (the HUD clock's phi < 0.5, both together for the hazards), the headlamp is
     // lit ink on low beam and gold on high beam, a buckled belt is lit ink, an unbuckled belt at speed pulses ember (the alarm beat, 2nd harmonic of the blink),
     // and a stopped engine is lit ink: it is a state, not an alarm (ember stays for alarms). The belt's strap is a hole in its bitmap, so it shows in every
-    // state. The outer edges stay on the KM/H caption's left edge and the fuel value's right edge; the centre group stays centred, and its gaps are chosen so
-    // the headlamp's left edge lands exactly on the fuel bar's first pixel above it (when no even gap does, the default gap and a clear offset).
+    // state. The outer edges stay on the KM/H caption's left edge and the fuel value's right edge; the centre group (lamp, belt, engine, lock) stays
+    // centred, spaced by ink, its first ink on the pump's left edge above it (when no gap in range does, the default gap, centred).
     if (u.stripA > 0.003f) {
         const unsigned hud = g_vehHud.load();
         const bool indL = (hud & 1u) != 0, indR = (hud & 2u) != 0;
@@ -1221,36 +1269,66 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
             const Bmp* b = PixelPick(s, gn, k);
             return b ? *b : s.cls[0];
         };
-        auto top = [&](const Bmp& b, int k) { return ay + (float)((gn - b.h * k) / 2); };
-        int kT = 1, kL = 1, kB = 1, kE = 1;
+        auto top = [&](const Bmp& b, int k) { return ay + (float)(gn - b.h * k); };   // 0.4.29: every glyph stands on the strip's bottom row
+        // 0.4.29 the padlock joins the centre group (GI: lock, belt and engine belong on the car cluster on the right): locked = lit ink closed, unlocked
+        // = ghost open, unknown = ghost closed. Bits 256 known, 512 locked. A lock flip seen while the strip is up flashes the lock gold (0.9 s).
+        const int lock = (hud & 256u) ? ((hud & 512u) ? 1 : 0) : -1;
+        const double nowS = ImGui::GetTime();
+        static int s_prevLock = -2;
+        static double s_lockFlipAt = -1e9, s_stripSeenAt = -1e9;
+        if (lock >= 0 && s_prevLock >= 0 && lock != s_prevLock && nowS - s_stripSeenAt < 0.25)
+            s_lockFlipAt = nowS;
+        s_prevLock = lock;
+        s_stripSeenAt = nowS;
+        const float lockFlash = std::fmax(0.0f, 1.0f - (float)(nowS - s_lockFlipAt) / 0.9f);
+        int kT = 1, kL = 1, kB = 1, kE = 1, kK = 1;
         const Bmp& bT = pick(kTurnSet, &kT);
         const Bmp& bL = pick(lights == 2 ? kHighSet : kLowSet, &kL);
         const Bmp& bB = pick(kBeltSet, &kB);
         const Bmp& bE = pick(kEngineSet, &kE);
-        const float wT = (float)(bT.w * kT), wL = (float)(bL.w * kL), wB = (float)(bB.w * kB), wE = (float)(bE.w * kE);
+        const Bmp& bK = pick(lock == 0 ? kSLockOSet : kSLockCSet, &kK);
+        const float wT = (float)(bT.w * kT);
 
         const ImU32 lit = Col(kGold, sa * 0.95f);
         PixelDraw(dl, px + padX, top(bT, kT), bT, kT, (indL && blinkOn) ? lit : gh, false);
         PixelDraw(dl, px + pw - padX - wT, top(bT, kT), bT, kT, (indR && blinkOn) ? lit : gh, true);
 
-        const float sum = wL + wB + wE;
-        const float want = pw - 2.0f * (fuelBarX0 - px);                 // the group width that puts its left edge on the fuel bar's first pixel
-        float gap1 = std::floor((want - sum) * 0.5f), gap2 = (want - sum) - gap1;
-        float gxL = fuelBarX0;
-        if (!(gap1 >= S(8.0f) && gap1 <= S(34.0f))) {
-            gap1 = gap2 = S(22.0f);
-            gxL = std::floor(px + (pw - (sum + gap1 + gap2)) * 0.5f);
+        // The centre group is spaced by INK (equal gaps between inked edges) and spans the pump's left edge to its mirror on the right, so the arrows and
+        // the four telltales read as one evenly spaced bar; when that gap is out of range (a narrow plate), the default gap, centred.
+        const Bmp* gb[4] = {&bL, &bB, &bE, &bK};
+        const int gk[4] = {kL, kB, kE, kK};
+        float inkW[4], inkL[4], sum = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            inkL[i] = (float)(InkCol(*gb[i], false) * gk[i]);
+            inkW[i] = (float)((InkCol(*gb[i], true) + 1) * gk[i]) - inkL[i];
+            sum += inkW[i];
         }
-        PixelDraw(dl, gxL, top(bL, kL), bL, kL, lights > 0 ? Col(lights == 2 ? kGold : kInk2, sa * litA) : gh, false);
-        const float gxB = gxL + wL + gap1;
-        PixelDraw(dl, gxB, top(bB, kB), bB, kB, beltWarn ? Col(kEmber, sa * (0.55f + 0.45f * pulse)) : (beltOn ? Col(kInk2, sa * litA) : gh), false);
-        PixelDraw(dl, gxB + wB + gap2, top(bE, kE), bE, kE, engOff ? Col(kInk2, sa * litA) : gh, false);
+        const float pumpX0 = std::floor(numX + Measure(u.small, "KM/H").x + S(14.0f));
+        const float want = pw - 2.0f * (pumpX0 - px);
+        float gap = std::floor((want - sum) / 3.0f);
+        float gx = pumpX0;
+        if (!(gap >= S(8.0f) && gap <= S(34.0f))) {
+            gap = std::floor(S(16.0f));
+            gx = std::floor(px + (pw - (sum + 3.0f * gap)) * 0.5f);
+        }
+        float gxs[4];
+        for (int i = 0; i < 4; ++i) {
+            gxs[i] = gx - inkL[i];                                        // the box's left edge that puts this ink at gx
+            gx += inkW[i] + gap;
+        }
+        const float gxL = gxs[0] + inkL[0];
+        PixelDraw(dl, gxs[0], top(bL, kL), bL, kL, lights > 0 ? Col(lights == 2 ? kGold : kInk2, sa * litA) : gh, false);
+        PixelDraw(dl, gxs[1], top(bB, kB), bB, kB, beltWarn ? Col(kEmber, sa * (0.55f + 0.45f * pulse)) : (beltOn ? Col(kInk2, sa * litA) : gh), false);
+        PixelDraw(dl, gxs[2], top(bE, kE), bE, kE, engOff ? Col(kInk2, sa * litA) : gh, false);
+        PixelDraw(dl, gxs[3], top(bK, kK), bK, kK, lock == 1 ? Col(kInk2, sa * litA) : gh, false);
+        if (lockFlash > 0.0f)
+            PixelDraw(dl, gxs[3], top(bK, kK), bK, kK, Col(kGold, sa * 0.95f * lockFlash), false);
 
         L.stripVisible = true;
         L.stripX = px; L.stripY = ay; L.stripW = pw; L.stripH = (float)gn;
         L.stripLampX = gxL; L.fuelBarX = fuelBarX0;
         L.stripIndLeftLit = indL && blinkOn; L.stripIndRightLit = indR && blinkOn;
-        L.stripLights = lights; L.stripBeltOn = beltOn; L.stripBeltWarn = beltWarn; L.stripEngineOff = engOff;
+        L.stripLights = lights; L.stripBeltOn = beltOn; L.stripBeltWarn = beltWarn; L.stripEngineOff = engOff; L.stripLock = lock;
     }
 
     L.speedoVisible = true;
@@ -1427,28 +1505,15 @@ void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
 }
 
 // ---- 0.4.27 the vehicle state row (libs/sync/vehicle_state_row.h): lock, belt, engine ---------------------------------------------------------
-// The padlock, closed and open, in square classes of 7, 9 and 13 px (the 9 px class scaled by a whole factor from an 18 px box up, like the heart). The
-// open lock's shackle stands one row (two at 13 px) higher with its left leg out of the body: the two read apart by shape, not only by colour.
-constexpr const char* const kLockC7[7] = {"..XXX..", ".X...X.", ".X...X.", "XXXXXXX", "XXX.XXX", "XXX.XXX", "XXXXXXX"};
-constexpr const char* const kLockO7[7] = {"..XXX..", ".X...X.", ".....X.", ".....X.", "XXXXXXX", "XXX.XXX", "XXXXXXX"};
-constexpr const char* const kLockC9[9] = {"..XXXXX..", ".XX...XX.", ".X.....X.", ".X.....X.", "XXXXXXXXX", "XXXX.XXXX", "XXXX.XXXX", "XXXXXXXXX", "XXXXXXXXX"};
-constexpr const char* const kLockO9[9] = {"..XXXXX..", ".XX...XX.", ".X.....X.", ".......X.", ".......X.", "XXXXXXXXX", "XXXX.XXXX", "XXXX.XXXX", "XXXXXXXXX"};
-constexpr const char* const kLockC13[13] = {"...XXXXXXX...", "..XXXXXXXXX..", "..XX.....XX..", "..XX.....XX..", "..XX.....XX..", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX",
-                                            "XXXXXX.XXXXXX", "XXXXX...XXXXX", "XXXXXX.XXXXXX", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX"};
-constexpr const char* const kLockO13[13] = {"...XXXXXXX...", "..XXXXXXXXX..", "..XX.....XX..", ".........XX..", ".........XX..", ".........XX..", "XXXXXXXXXXXXX",
-                                            "XXXXXXXXXXXXX", "XXXXXX.XXXXXX", "XXXXX...XXXXX", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX"};
+// (the padlock bitmaps sit above DrawSpeedo: 0.4.29 the speedometer strip draws the lock too)
 // The belt and the engine of the speedometer strip, each with a 7 px class in front: the row is the vitals strip's height (11 px at its smallest:
 // a 7 px glyph box), which the strip's 9 / 10 px classes do not fit.
 constexpr const char* const kBelt7[7] = {"..XX...", "..XX...", ".......", ".X.XX..", ".XX.X..", ".XXX.XX", ".....XX"};
 constexpr const char* const kEngine7[7] = {"...XXX....", "....X.....", ".XXXXXXX..", "XXXXXXXXXX", "XXX....XXX", "XXXXXXXXXX", ".XXXXXXX.."};
-constexpr Bmp kLockCCls[3] = {{7, 7, kLockC7}, {9, 9, kLockC9}, {13, 13, kLockC13}};
-constexpr Bmp kLockOCls[3] = {{7, 7, kLockO7}, {9, 9, kLockO9}, {13, 13, kLockO13}};
 constexpr Bmp kBeltRowCls[4] = {{7, 7, kBelt7}, {9, 10, kBelt10}, {12, 14, kBelt14}, {15, 18, kBelt18}};
 constexpr Bmp kEngineRowCls[4] = {{10, 7, kEngine7}, {13, 9, kEngine9}, {18, 13, kEngine13}, {23, 17, kEngine17}};
-static_assert(ClassesOk(kLockCCls, 3) && ClassesOk(kLockOCls, 3) && ClassesOk(kBeltRowCls, 4) && ClassesOk(kEngineRowCls, 4),
+static_assert(ClassesOk(kBeltRowCls, 4) && ClassesOk(kEngineRowCls, 4),
               "state row bitmaps: a row is not w wide / a class is not h rows / an unknown character");
-constexpr PixelSet kLockCSet = {kLockCCls, 3, 1, 9, 18};
-constexpr PixelSet kLockOSet = {kLockOCls, 3, 1, 9, 18};
 constexpr PixelSet kBeltRowSet = {kBeltRowCls, 4, 2, 14, 28};
 constexpr PixelSet kEngineRowSet = {kEngineRowCls, 4, 2, 14, 28};
 
@@ -1464,20 +1529,14 @@ void DrawStateRow(ImDrawList* dl, float W, float H, float a, unsigned hud, doubl
     an.screenH = H;
     an.docked = c.docked;
     an.edge = std::fmax(2.0f, std::floor(S(2.0f)));
-    if (c.docked) {
-        an.x = c.vx;
-        an.w = c.vw;
-        an.rowH = c.vH;                                             // the strip's own height: one family
-        an.stripBottom = c.dockY + c.vH;                            // its resting edge (the row does not ride the strip's slide)
-        an.radarTop = c.radarY;
-        an.gap = std::fmax(2.0f, std::floor(S(4.0f)));
-    } else {
-        an.x = c.x;
-        an.w = c.w;
-        an.rowH = std::fmax(kStripMinH, std::floor(S(14.0f)));
-        an.plateTop = L.speedoVisible ? L.speedoY : (L.vitalsVisible ? L.vitalsY : H - c.gut);
-        an.gap = c.gap;
-    }
+    // 0.4.29 (GI): the row belongs to the car, so it always sits on the bottom-right cluster, on top of the speedometer plate, never on the
+    // radar block (the radar + HP / satiety element stays one piece on the left)
+    an.docked = false;
+    an.x = c.x;
+    an.w = c.w;
+    an.rowH = std::fmax(kStripMinH, std::floor(S(14.0f)));
+    an.plateTop = L.speedoVisible ? L.speedoY : (L.vitalsVisible && !c.docked ? L.vitalsY : H - c.gut);
+    an.gap = c.gap;
     const gage::sync::RowRect r = gage::sync::PlaceStateRow(an);
     if (r.where == gage::sync::RowWhere::None)
         return;
@@ -1555,7 +1614,7 @@ void DrawStateRow(ImDrawList* dl, float W, float H, float a, unsigned hud, doubl
         s_where = (int)r.where;
         GLOGI("overlay: vehicle state row %s: x %.0f-%.0f y %.0f-%.0f (%s); lock / belt / engine, toggles %s",
               gage::sync::RowWhereName(r.where), (double)r.x, (double)(r.x + r.w), (double)r.y, (double)(r.y + r.h),
-              c.docked ? "the docked strip's left edge, width and height" : "the bottom-right cluster's edge and width", toggles ? "drawn" : "left out (cells too narrow)");
+              "on the speedometer: the bottom-right cluster's edge and width", toggles ? "drawn" : "left out (cells too narrow)");
     }
 }
 
@@ -2830,7 +2889,7 @@ void UiFrame()
     const double rowNowMs = ImGui::GetTime() * 1000.0;
     {
         const bool flash = (rowHud & 1024u) != 0;
-        const bool wanted = !loading && ((inVeh && (rowHud & 128u) != 0) || flash);
+        const bool wanted = !loading && flash;   // 0.4.29: in a vehicle the speedometer strip carries lock / belt / engine; the row is only the on-foot lock flash
         const bool wasHidden = u.rowA <= 0.003f;
         u.rowA = Approach(u.rowA, wanted ? 1.0f : 0.0f, dt / 0.18f);
         gage::sync::RowState rs;

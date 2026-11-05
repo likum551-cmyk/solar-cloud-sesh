@@ -260,9 +260,10 @@ namespace gage::game::Overlay {
         bool  stripVisible = false;
         float stripX = 0, stripY = 0, stripW = 0, stripH = 0;
         bool  stripIndLeftLit = false, stripIndRightLit = false;
-        float stripLampX = 0, fuelBarX = 0;       // the headlamp's left edge and the fuel bar's first pixel above it (equal when an even gap allows)
+        float stripLampX = 0, fuelBarX = 0;       // the headlamp's first ink column (0.4.29: on the pump's left edge when the gap allows) and the fuel bar's first pixel
         int   stripLights = 0;
         bool  stripBeltOn = false, stripBeltWarn = false, stripEngineOff = false;
+        int   stripLock = -1;   // the strip's padlock: -1 unknown, 0 unlocked, 1 locked
         // 0.4.27 the vehicle state row: its box, where it went (sync::RowWhere as an int), and what each cell showed (lock -1 / 0 / 1)
         bool  rowVisible = false;
         int   rowWhere = 0;

@@ -177,6 +177,11 @@ namespace {
     std::atomic<bool> g_locoR3{true};
     std::atomic<bool> g_locoRepair{true};
     std::atomic<bool> g_locoGaitClip{true};   // 0.4.17: loco_gait_clip=0 = the 0.4.15 speed-derived blend ratio
+    // 0.4.29: loco_face (default on) = a Blend puppet with a moving gait gets its HEADING written outright every frame (the controller's
+    // 50 ms step toward the sender's heading) and the sender's heading as its desired heading, as FiveM's ped blender does. The old path fed
+    // SET_PED_DESIRED_HEADING with "the ped's own heading plus a small step", and the live R5 lines (0.4.27, both editions) showed the puppet facing
+    // 100-116 degrees (p95 up to 175) away from where it moved: the moonwalk. loco_face=0 = that old path. Re-read at every Welcome.
+    std::atomic<bool> g_locoFace{true};
     // R5 (on-foot sync): loco_blend_grace = 0 puts the round-4 Blend rules back whole (no grace window after a task-changing Reset, no probation, no trim gate,
     // the 30 s / 300 s Placed hold, the 8 s ladder hold, 12 level changes: sync::Round4SelfCheck). loco_placed_ms = N sets the Placed hold after a
     // blend fall that a task-changing event explains to N ms (cap 4 N; a fall nothing explains keeps 30 s / 300 s); 0 = the old 30 s hold for every fall;
@@ -1934,6 +1939,10 @@ namespace {
         g_locoRepair.store(reg::Get(L"loco_repair") != L"0");
         g_locoGaitClip.store(reg::Get(L"loco_gait_clip") != L"0");
         GLOGI("engine: on-foot clip (0.4.17): loco_gait_clip=%s", g_locoGaitClip.load() ? "on (blend ratio = the sender's gait 1/2/3)" : "OFF (0.4.15 speed knob)");
+        g_locoFace.store(reg::Get(L"loco_face") != L"0");
+        GLOGI("engine: on-foot facing (0.4.29): loco_face=%s", g_locoFace.load()
+                  ? "on (a walking Blend puppet's heading is written every frame toward the sender's; the 'R5: ... heading error' numbers are the proof)"
+                  : "OFF (SET_PED_DESIRED_HEADING with the ped's own heading plus a step, as 0.4.28)");
         {
             // R5: the grace window after a task-changing Reset and the shorter Placed hold (Blend only)
             g_locoBlendGrace.store(reg::Get(L"loco_blend_grace") != L"0");
@@ -7611,6 +7620,12 @@ namespace {
         {
             if (o.gait == sync::Gait::Still)
                 g_world->SetEntityHeading(ped, o.heading);
+            else if (g_locoBlend.load() && g_locoFace.load())
+            {
+                // 0.4.29 (loco_face): the Blend carries the position by the velocity, so the facing is ours as well (FiveM's ped blender)
+                g_world->SetEntityHeading(ped, o.heading);
+                g_world->SetPedDesiredHeading(ped, Heading360(pose.k.heading));
+            }
             else
                 g_world->SetPedDesiredHeading(ped, o.heading);
         }

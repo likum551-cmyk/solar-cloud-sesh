@@ -250,6 +250,17 @@ function stageLoose(name, rpf, staging, report, encrypted) {
     if (walk(stream9).length !== walk(stream).length) throw new Error("the gen9 conversion lost files");
     rmSync(stream, { recursive: true, force: true });
     renameSync(stream9, stream);
+    // The known Enhanced crash causes (cw_gen9.ps1 gen9fix): dashboard render-target textures go, and a model over the 128 limit is
+    // either a _hi variant (dropped: the game draws the base model, which must be under the limit) or a refusal.
+    for (const l of codeWalker("gen9fix", stream, stream)) {
+      if (l.startsWith("STRIPRT ")) report.textures.push(`${l.slice(8)} removed (script_rt render target: ERR_GFX_STATE on Enhanced)`);
+      const m = /^OVER (\S+) (.*)$/.exec(l);
+      if (!m) continue;
+      if (!/_hi\.yft$/i.test(m[1])) throw new Error(`${m[1]} is over Enhanced's 128 materials / geometries (${m[2]}) and has no base model to fall back to`);
+      rmSync(path.join(stream, m[1]), { force: true });
+      seen.delete(m[1].toLowerCase());
+      report.warnings.push(`${m[1]} dropped: over Enhanced's 128 limit (${m[2]}); the base model is drawn up close`);
+    }
     report.gen9 = seen.size;
   }
   report.stream = seen.size;
