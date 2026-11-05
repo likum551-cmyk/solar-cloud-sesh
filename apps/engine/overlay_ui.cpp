@@ -718,7 +718,7 @@ void DrawLogo(ImDrawList* dl, float W, float a, UiState& L)
 // GTA's bars sit; beyond that the plate returns to the bottom-right, as with the radar off.
 constexpr float kStripFrac = 0.07f;        // strip height / radar height (GTA's bars are about as thin)
 constexpr float kStripMinH = 11.0f;        // and never thinner than this: 11 px holds the 7 px glyph class (2 px above and below) and a 5 px bar
-constexpr float kStripMaxCover = 0.08f;    // the most of the radar's height the strip may tuck into the map
+constexpr float kStripMaxCover = 0.0f;     // 0.4.23: the strip never tucks into the map (GI saw the 0.4.22 tuck overlap it)
 struct Cluster {
     float x = 0, w = 0;                      // left edge and width of the speedometer (and of the vitals plate while it stays here)
     float gut = 0, gap = 0;                  // screen gutter, space between the two plates
@@ -761,8 +761,13 @@ Cluster ClusterLayout(float W, float H)
         c.radarX = radar.x0; c.radarY = radar.y0; c.radarW = radar.x1 - radar.x0; c.radarH = radar.y1 - radar.y0;
         // The strip is kStripFrac of the radar's height (never under kStripMinH px: 720p's 8 px held no 7 px glyph and a 5 px bar), the radar's
         // width (held to 120..400 px at 1080p). It sits flush under the radar's bottom edge (gap 0), like GTA's own bars.
-        const float stripH = std::fmax(kStripMinH, std::floor(c.radarH * kStripFrac));
-        const gage::sync::VitalsDock d = gage::sync::DockVitals(W, H, radar, stripH, S(120.0f), S(400.0f), 0.0f, S(10.0f),
+        // 0.4.23 (GI, live 2560x1440: the strip tucked 8 px into the map): never cover the map. The strip shrinks to the free
+        // margin under the radar (down to kStripMinH) and rests kStripEdge px above the screen edge; if not even that fits, the
+        // bottom-right plate returns.
+        const float edge = std::fmax(2.0f, std::floor(S(2.0f)));
+        const float room = std::floor(H - edge - radar.y1);
+        const float stripH = std::fmax(kStripMinH, std::fmin(std::floor(c.radarH * kStripFrac), room));
+        const gage::sync::VitalsDock d = gage::sync::DockVitals(W, H, radar, stripH, S(120.0f), S(400.0f), 0.0f, edge,
                                                                 kStripMaxCover);
         c.dockWhy = (int)d.why;
         if (d.docked) {
