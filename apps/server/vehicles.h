@@ -21,8 +21,8 @@
 //    still owed to a receiver. An empty vehicle is destroyed after Rules::emptyDespawnMs.
 //  * Occupancy (the only truth about who sits where): Enter checks the seat range, that the seat is
 //    free, the distance (Rules::enterDistance from the player's last server-known position) and the
-//    lock (the spawner may still enter its own locked vehicle); a player sitting elsewhere leaves that
-//    vehicle first. Exit frees the seat; a driver's vehicle parks with its last state (velocities and
+//    lock (the spawner and, 0.4.22, the LAST DRIVER may still enter a locked vehicle: libs/sync/vehicle_lock.h); a player sitting
+//    elsewhere leaves that vehicle first. Exit frees the seat; a driver's vehicle parks with its last state (velocities and
 //    steering zeroed, horn off). PlayerGone (disconnect) frees the seat; the player's EMPTY vehicles are
 //    destroyed with it and the ones somebody else sits in become orphans (no spawner, but still counted
 //    against the address) that go Rules::orphanMs after they empty.
@@ -56,6 +56,7 @@
 #include "anticheat.h"
 #include "protocol/protocol.h"
 #include "protocol/quant.h"
+#include "sync/vehicle_lock.h"
 
 #include <algorithm>
 #include <cmath>
@@ -111,6 +112,10 @@ namespace gage::server {
             // Defence in depth behind the client's own baselines (libs/sync/vehicle_damage.h); false = trust the report as in v6.
             bool     damageNeedsHealthLoss = true;
             uint16_t cleanHealth = 995;
+            // 0.4.22 door locks (server.json vehicleLocks / vehicleLockDistance): false = SetLocked is refused NotAllowed (nothing is ever locked);
+            // lockDistance = how close (m, to the vehicle's last server position) a key holder OUTSIDE it must be to lock or unlock it, 0 = any distance.
+            bool     locksEnabled = true;
+            float    lockDistance = 12.0f;
         };
 
         // One player as AssignControllers sees them: where they are, whether the server has a position of theirs, and
@@ -138,6 +143,7 @@ namespace gage::server {
             uint32_t ownerKey = 0;     // the spawner's source address (0 = unknown): the per-address caps count it, also after the spawner left
             bool adopted = false;
             bool orphan = false;       // its spawner left while somebody sat in it
+            uint16_t lastDriver = proto::kNoPlayer; // 0.4.22: the player who last took seat 0 (never on the wire); holds the key with the spawner; cleared when it disconnects
             uint64_t createdMs = 0;
             uint64_t emptySinceMs = 0; // valid while nobody sits in it
             uint64_t posMs = 0;        // server time the last accepted sample was TAKEN at (the sender's clock placed on the server's), or the creation time
@@ -376,7 +382,7 @@ namespace gage::server {
             if (cur.veh != id) // a seat shuffle inside the same vehicle skips the door checks
             {
                 if (Dist2(playerPos, V.s.k) > rules_.enterDistance * rules_.enterDistance) return Code::TooFar;
-                if ((V.s.flags & proto::kVehLocked) && V.spawner != player) return Code::Locked;
+                if ((V.s.flags & proto::kVehLocked) && !sync::MayEnterLocked(V.spawner == player, V.lastDriver == player)) return Code::Locked;
             }
             NoteTick(tick);
             if (cur.veh != kNone) Leave(player, nowMs, tick);
@@ -384,7 +390,11 @@ namespace gage::server {
             V.s.seats[seat] = player;
             occ_[player] = Seat{id, (uint8_t)seat};
             V.changedTick = tick;
-            if (seat == 0) SetController(V, player, nowMs, tick); // the driver controls; the displacement budget starts now
+            if (seat == 0)
+            {
+                V.lastDriver = player;                  // 0.4.22: the last driver holds the key (SetLocked, entering a locked vehicle)
+                SetController(V, player, nowMs, tick);  // the driver controls; the displacement budget starts now
+            }
             return Code::Ok;
         }
 
@@ -438,7 +448,7 @@ namespace gage::server {
             const uint16_t held = ReservedBy(id, seat, nowMs);
             if (held != proto::kNoPlayer && held != player) return Code::SeatTaken;
             if (Dist2(playerPos, V.s.k) > rules_.enterDistance * rules_.enterDistance) return Code::TooFar;
-            if ((V.s.flags & proto::kVehLocked) && V.spawner != player) return Code::Locked;
+            if ((V.s.flags & proto::kVehLocked) && !sync::MayEnterLocked(V.spawner == player, V.lastDriver == player)) return Code::Locked;
             NoteTick(tick);
             Intent& I = intent_[player];
             if (I.veh == id && I.seat == seat)
@@ -485,6 +495,7 @@ namespace gage::server {
             for (Vehicle& V : v_)
             {
                 if (!V.exists) continue;
+                if (V.lastDriver == player) V.lastDriver = proto::kNoPlayer;   // 0.4.22: a later player with this id must not inherit the key
                 // v5: a vehicle the departed player controlled has no controller until AssignControllers finds one.
                 if (V.s.ctrl == player) ClearController(V, tick);
                 if (V.spawner != player) continue;
@@ -679,6 +690,38 @@ namespace gage::server {
             if (!V) return Code::NoVehicle;
             if (V->s.seats[0] != player && V->spawner != player) return Code::NotAllowed;
             const uint8_t f = on ? (uint8_t)(V->s.flags | flag) : (uint8_t)(V->s.flags & ~flag);
+            if (f != V->s.flags) V->changedTick = tick;
+            V->s.flags = f;
+            return Code::Ok;
+        }
+        // 0.4.22: VehicleOp::SetLocked. sync::JudgeLockToggle is the rule (libs/sync/vehicle_lock.h): the player in seat 0, the spawner or the
+        // last driver; a player OUTSIDE the vehicle must also be within Rules::lockDistance of it by `playerPos` (the last position the server has;
+        // `havePos` false = it has none: NoState). Rules::locksEnabled false refuses everything with NotAllowed. Idempotent: locking a locked
+        // vehicle is Ok and changes nothing (no fresh frames). `before` (optional) gets the flag as it was.
+        Code SetLocked(uint16_t player, uint16_t id, bool on, const proto::Kinematics& playerPos, bool havePos, uint32_t tick, bool* before = nullptr)
+        {
+            Vehicle* V = Mutable(id);
+            if (!V) return Code::NoVehicle;
+            if (before) *before = (V->s.flags & proto::kVehLocked) != 0;
+            if (!rules_.locksEnabled) return Code::NotAllowed;
+            sync::LockActor a;
+            a.inThisVehicle = player < occ_.size() && occ_[player].veh == id;
+            a.driverSeat = V->s.seats[0] == player;
+            a.spawner = V->spawner == player;
+            a.lastDriver = V->lastDriver == player;
+            if (!a.inThisVehicle)
+            {
+                if (!havePos) return Code::NoState;
+                a.distM = std::sqrt(Dist2(playerPos, V->s.k));
+            }
+            const float reach = rules_.lockDistance > 0.0f ? rules_.lockDistance : 3.0e38f;
+            switch (sync::JudgeLockToggle(a, reach))
+            {
+            case sync::LockVerdict::Ok: break;
+            case sync::LockVerdict::NotAllowed: return Code::NotAllowed;
+            case sync::LockVerdict::TooFar: return Code::TooFar;
+            }
+            const uint8_t f = on ? (uint8_t)(V->s.flags | proto::kVehLocked) : (uint8_t)(V->s.flags & ~proto::kVehLocked);
             if (f != V->s.flags) V->changedTick = tick;
             V->s.flags = f;
             return Code::Ok;

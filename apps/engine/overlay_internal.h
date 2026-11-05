@@ -21,9 +21,10 @@ namespace gage::game::Overlay::detail {
         void* mark1024 = nullptr;    // 1024 px high, all ink                     (the loader's background mark)
         void* lockup = nullptr;      // horizontal lockup (mark + wordmark), 256 px high, ink + gold hook, with 4 units of clear space
         int   lockupW = 0, lockupH = 0;
-        void* sceneA = nullptr;      // real GTA V stills behind the loader (16:9), crossfaded
-        void* sceneB = nullptr;
+        void* scenes[10] = {};       // the loader's GTA V pictures (16:9), cycled; the first sceneCount are valid
+        int   sceneCount = 0;
     };
+    constexpr int kLoaderScenes = 10; // = the scene entries in cmake/gage_overlay.cmake and UiTextures::scenes
 
     // Build the fonts and the overlay style. ImGui's context must be current and the
     // backends not yet initialised (the font atlas is uploaded on the first frame).

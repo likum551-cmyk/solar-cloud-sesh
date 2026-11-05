@@ -53,6 +53,38 @@ namespace gage::game::Overlay {
     // pushes anything the overlay shows health and satiety full, no fuel.
     void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel);
 
+    // 0.4.22 minimap: dock = true puts the vitals under GTA's radar (bottom-left) as a slim strip instead of the bottom-right plate:
+    // the radar's left edge and width, about 7 % of its height, health in the left half and food in the right half (a glyph and a
+    // thin bar each, no numbers), directly under the radar's bottom edge inside the safe-zone margin. The speedometer then rests on
+    // the bottom gutter. The radar's rectangle is computed here (libs/sync/minimap.h RadarKeepOut) from the display size and safeZone
+    // (GET_SAFE_ZONE_SIZE, as the engine reads it; safeZoneOk false = unreadable, the widest margin is assumed). Where the margin under
+    // the radar is too small the strip tucks up into the radar's bottom edge, at most 8 % of its height; past that the plate stays in
+    // the bottom-right (UiState::vitalsDockWhy says why). dock = false is the pre-0.4.22 layout. Any thread.
+    void SetRadarDock(bool dock, float safeZone, bool safeZoneOk);
+
+    // 0.4.22 vehicle controls (libs/sync/vehicle_controls.h). The keys are read in UiFrame from ImGui's key events, the same source as Tab / T /
+    // Enter: Left / Right Arrow (indicators), Down Arrow (hazards), Y (engine), B (seatbelt); H is GTA's own headlight control and is not read here.
+    // Nothing is taken while the chat, the Tab menu, a text box or the quit card has the keyboard. TakeVehicleKeys returns the bits pressed since
+    // the last call (edges, no auto-repeat) and clears them; a press older than 400 ms is dropped (the engine's tick was not running). Any thread.
+    enum VehicleKey : unsigned { kVkLeft = 1u << 0, kVkRight = 1u << 1, kVkHazard = 1u << 2, kVkEngine = 1u << 3, kVkBelt = 1u << 4 };
+    unsigned TakeVehicleKeys();
+
+    // The small status strip along the foot of the speedometer plate (vehicle only): the two turn arrows (blinking at about 1.5 Hz while on;
+    // the blink is the overlay's), the headlights (off / low / high), the seatbelt (beltOn buckled; beltWarn = unbuckled and moving, the warning
+    // colour) and the engine (engineOff, the warning colour). show false removes the strip and the plate returns to its old height.
+    struct VehicleHud {
+        bool show = false;
+        bool indLeft = false, indRight = false;
+        int  lights = 0;                          // 0 off, 1 low beam, 2 high beam
+        bool beltOn = false, beltWarn = false, engineOff = false;
+    };
+    void SetVehicleHud(const VehicleHud& h);
+
+    // Capture proof only (tools / selftests; the engine never calls it): hold the HUD clock at one phase, 0..1. Every blink and pulse of the HUD (the turn
+    // indicators blink on phase < 0.5; the low-vital, belt-warning and rail alarms pulse on the 2nd harmonic of the same phase) comes from the one clock
+    // phase = fract(t * 1.5), so a still frame can show any beat. A value < 0 (the default) gives the clock back to the real time. Any thread.
+    void SetHudPhaseForTest(float phase);
+
     // W10: the player name tags, one per remote ped in range, drawn in the world layer under the HUD plates. The
     // engine decides which tags exist and where (libs/sync/nametag.h: range, projection, line of sight, dead, the
     // fade); the overlay only draws what it was handed. x / y are 0..1 of the screen (y grows down) and mark the
@@ -84,6 +116,12 @@ namespace gage::game::Overlay {
         bool ready = false;     // the game has the model (IS_MODEL_IN_CDIMAGE); a not-ready row is dimmed
     };
     void SetCars(const CarEntry* cars, int count, bool loading);
+
+    // The Tab menu's "Noclip" toggle (quick actions, middle column): available says the engine offers it at all (the noclip
+    // registry switch; false hides the row, its key hints and the "/noclip" typed-command hint), active is the state the row
+    // shows (On in gold / Off). Clicking the row submits "/noclip". Any thread; until the engine pushes, the row is offered
+    // and off.
+    void SetNoclip(bool available, bool active);
 
     // A chat line for the log. name is empty/null for a server or system line;
     // self marks the local player's own line. UTF-8, control characters become
@@ -175,8 +213,8 @@ namespace gage::game::Overlay {
         float loaderAlpha = 0, hudAlpha = 0;      // 0..1
         bool  interactive = false;
         bool  loaderFailed = false;               // the status is a dead end: the progress row is still
-        bool  loaderSceneTextured = false;        // the real GTA V stills are behind the loader
-        float loaderSceneMix = 0;                 // 0: first still, 1: second; between the two is a crossfade
+        bool  loaderSceneTextured = false;        // the GTA V pictures are behind the loader
+        float loaderSceneMix = 0;                 // 0: the current picture, 1: the next; between the two is a crossfade
         bool  loaderLockupTextured = false;       // false: the typeset fallback wordmark was drawn
         float loaderLockupX = 0, loaderLockupY = 0, loaderLockupW = 0, loaderLockupH = 0;
         float loaderBarX = 0, loaderBarY = 0, loaderBarW = 0, loaderBarH = 0;        // progress segments
@@ -196,6 +234,8 @@ namespace gage::game::Overlay {
         int   actionCount = 0;
         float actionRect[kMaxActions][4] = {};    // x, y, w, h of each button
         char  actionCmd[kMaxActions][48] = {};
+        int   noclipRow = -1;                     // index of the noclip toggle in actionRect / actionCmd on the quick actions page, -1 when it is not shown
+        bool  noclipOn = false;                   // the state the toggle showed
         // the Tab menu's pages: 0 quick actions, 1 cars. On the cars page actionRect / actionCmd hold its rows.
         int   invTab = 0;
         float tabRect[2][4] = {};                 // the two page tabs in the header
@@ -209,12 +249,26 @@ namespace gage::game::Overlay {
         bool  speedoVisible = false;
         float speedoX = 0, speedoY = 0, speedoW = 0, speedoH = 0;
         int   speedShown = 0, speedLit = 0, speedSegments = 0;
+        // the status strip on the speedometer plate (0.4.22): its box, the arrows lit this frame (the blink), and what each glyph showed
+        bool  stripVisible = false;
+        float stripX = 0, stripY = 0, stripW = 0, stripH = 0;
+        bool  stripIndLeftLit = false, stripIndRightLit = false;
+        float stripLampX = 0, fuelBarX = 0;       // the headlamp's left edge and the fuel bar's first pixel above it (equal when an even gap allows)
+        int   stripLights = 0;
+        bool  stripBeltOn = false, stripBeltWarn = false, stripEngineOff = false;
         // name tags (W10): how many were drawn last frame (alpha > 0.01), and the first one's box, for the capture proof
         int   nameTagsShown = 0;
         float nameTagX = 0, nameTagY = 0, nameTagW = 0, nameTagH = 0;
         // vitals cluster (bottom-right, same right edge and width as the speedometer, under it)
         bool  vitalsVisible = false;
         float vitalsX = 0, vitalsY = 0, vitalsW = 0, vitalsH = 0;
+        // 0.4.22: the vitals strip under GTA's radar (SetRadarDock); then vitalsX..H is the strip. vitalsDocked: it is there (else
+        // the bottom-right plate); vitalsDockWhy: the sync::DockWhy as an int (0 = docked); radarX..H: the radar rectangle the
+        // layout used (0 when not docking); vitalsCoverPx: how far the strip reaches up into that rectangle (0 = wholly under it).
+        bool  vitalsDocked = false;
+        int   vitalsDockWhy = -1;                 // -1: not asked (dock off)
+        float radarX = 0, radarY = 0, radarW = 0, radarH = 0;
+        float vitalsCoverPx = 0;
         int   vitalsRows = 0;                     // always 2 (health, satiety); fuel is on the speedometer plate
         int   healthShown = 0, satietyShown = 0, fuelShown = 0;   // percent as drawn (eased); fuelShown from the speedo
         bool  healthLow = false, satietyLow = false, fuelLow = false;   // below the warning threshold

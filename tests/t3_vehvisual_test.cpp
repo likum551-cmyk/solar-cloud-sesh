@@ -985,6 +985,8 @@ static void TestRealServer()
 
 #include "r3_t4_tests.h"   // R3 T4: vehicle damage state, the sanity layer, the v7 wire (one include, one call below)
 #include "vehsignals_tests.h"   // 0.4.18: the horn and headlights / high beam on the copies (one include, one call below)
+#include "doors_seats_net_tests.h"   // 0.4.22: door locks and rear seats through the real server, the switches, the store (one include, one call below)
+#include "vehcontrols_wire_tests.h"   // 0.4.22: the indicator and engine keys on the wire, the store and the real server (one include, one call below)
 
 int main()
 {
@@ -998,9 +1000,13 @@ int main()
     const int r2Checks = g_run;
     RunR3T4Tests();
     RunVehSignalsTests();
+    RunDoorsSeatsNetTests();
+    RunVehControlsWireTests();
     // A skipped section (an early return) must fail, not pass vacuously: 7 wire + 8 store + 13 visual + 6 steer / brake + 8 real-server
-    // (round 2), then the R3 T4 checks (kR3T4Checks, tests/r3_t4_tests.h) and the 0.4.18 signals (kVehSignalsChecks, tests/vehsignals_tests.h).
-    const int expected = 7 + 8 + 13 + 6 + 8 + kR3T4Checks + kVehSignalsChecks;
+    // (round 2), then the R3 T4 checks (kR3T4Checks, tests/r3_t4_tests.h), the 0.4.18 signals (kVehSignalsChecks, tests/vehsignals_tests.h),
+    // the 0.4.22 doors and seats (kDoorsSeatsNetChecks, tests/doors_seats_net_tests.h) and vehicle controls on the wire (kVehControlsWireChecks,
+    // tests/vehcontrols_wire_tests.h).
+    const int expected = 7 + 8 + 13 + 6 + 8 + kR3T4Checks + kVehSignalsChecks + kDoorsSeatsNetChecks + kVehControlsWireChecks;
     (void)r2Checks;
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)

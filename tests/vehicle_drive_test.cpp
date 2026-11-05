@@ -2154,6 +2154,7 @@ static void TestSyncD() {
 #include "t4_collision_tests.h"
 #include "r3_t5_tests.h"
 #include "r4_t2_tests.h"
+#include "vehicle_shake_tests.h"   // 0.4.22 cars shake: the angular velocity frame, the anti-roll / copy loops, the meters
 
 int main() {
     if (std::getenv("R4T2_REPORT")) { r4t2::Report(); return 0; }   // R4 T2: the scratch report (no checks)
@@ -2190,9 +2191,11 @@ int main() {
 
     r4t2::TestR4T2();
 
+    shaketests::TestShake();
+
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
     // + hyper tune kHyperTuneChecks (4 + the profiles and assists) + W9 11 + Sync B 8 (kSyncBChecks as listed in its header) + Sync D kSyncDChecks
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks;
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks + shaketests::kShakeChecks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

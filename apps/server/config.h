@@ -63,6 +63,11 @@ namespace gage::server {
         // R3 T5: the contact arbiter places a controller's samples at their TRUE time, not the SampleClock's (sample time + the fastest uplink): each
         // sample is moved back by half the controller's round trip, at most this many ms (0..500, 0 = off; server.json contactLagCapMs).
         uint32_t contactLagCapMs = 150;
+        // 0.4.22 door locks (libs/sync/vehicle_lock.h; no protocol change). vehicleLocks 1 = on, 0 = SetLocked is refused NotAllowed (nothing can be
+        // locked). vehicleLockDistance, 0..100 m (0 = any distance): how close a key holder (the spawner or the last driver) OUTSIDE a vehicle must be
+        // to lock or unlock it; the player in its driver's seat can always do it.
+        uint32_t vehicleLocks = 1;
+        uint32_t vehicleLockDistance = 12;
 
         // ---- server.json keys: combat (protocol v4; damage scaling v5, apps/server/damage.h) ----
         // playerHealth: the maximum a player has at join, after `heal` and after a respawn, announced in

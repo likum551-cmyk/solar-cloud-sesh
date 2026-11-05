@@ -205,6 +205,8 @@ namespace gage::server {
         if (cfg.vehicleMaxSpeed < 10 || cfg.vehicleMaxSpeed > 600) return fail("vehicleMaxSpeed must be 10..600");
         if (cfg.fuelDrainPerMinute > 1000) return fail("fuelDrainPerMinute must be 0..1000");
         if (cfg.contactLagCapMs > 500) return fail("contactLagCapMs must be 0..500");
+        if (cfg.vehicleLocks > 1) return fail("vehicleLocks must be 0 or 1");
+        if (cfg.vehicleLockDistance > 100) return fail("vehicleLockDistance must be 0..100");
         if (cfg.playerHealth < 1 || cfg.playerHealth > 255) return fail("playerHealth must be 1..255");
         for (const std::pair<const char*, uint32_t> p : {std::make_pair("firearmDamagePercent", cfg.firearmDamagePercent),
                                                          std::make_pair("meleeDamagePercent", cfg.meleeDamagePercent),
@@ -467,6 +469,16 @@ namespace gage::server {
                 if (!WholeNumber(v, 0, 500, n)) return fail("\"contactLagCapMs\" must be a whole number 0..500");
                 out.contactLagCapMs = n;
             }
+            else if (key == "vehicleLocks")
+            {
+                if (!WholeNumber(v, 0, 1, n)) return fail("\"vehicleLocks\" must be 0 or 1");
+                out.vehicleLocks = n;
+            }
+            else if (key == "vehicleLockDistance")
+            {
+                if (!WholeNumber(v, 0, 100, n)) return fail("\"vehicleLockDistance\" must be a whole number 0..100 (0 = any distance)");
+                out.vehicleLockDistance = n;
+            }
             else if (key == "fuelDrainPerMinute")
             {
                 if (!WholeNumber(v, 0, 1000, n)) return fail("\"fuelDrainPerMinute\" must be a whole number 0..1000");
@@ -597,7 +609,7 @@ namespace gage::server {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
                                     "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, adminPort, adminToken, "
                                     "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
-                                    "vehicleMaxSpeed, contactLagCapMs, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
+                                    "vehicleMaxSpeed, contactLagCapMs, vehicleLocks, vehicleLockDistance, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "
                                     "respawnArmour, respawnDelaySeconds, maxHitDistance, "
                                     "hitsPerSecond, meleeAdjudicate, meleeReachPercent, spawnPoints, hitShotWindowMs, hitDamageScalePercent, onFootMaxSpeed, "

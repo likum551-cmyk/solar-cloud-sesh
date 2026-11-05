@@ -417,18 +417,27 @@ static void TestPackMeta() {
 // The overlay car browser's text rules (pack_meta.h), on the names the staged packs really carry (2026-11-05).
 static void TestCarBrowserText() {
     using namespace gage::game::content;
+    // The rule for a car the table (kCarNames) does not know: the model ids here are made up, so the table is not hit.
     struct Row { const char *make, *label, *model, *want; };
     const Row rows[] = {
-        {"jesko", "jesko", "jesko", "Jesko"},                          // same once squashed, all lower case -> capital
-        {"BMW M5", "BMWM5", "bmwm5", "BMW M5"},                        // same once squashed -> the spaced spelling
-        {"AUDI", "RS6", "rs6", "AUDI RS6"},                            // different -> make + label
-        {"Lamborghini", "Diablo SV", "diabloSV", "Lamborghini Diablo SV"},
-        {"BMW", "BMW M3 GTR", "m3gtr", "BMW M3 GTR"},                  // label starts with the make -> the label
-        {"", "", "supra", "Supra"},                                    // nothing -> the model
+        {"jesko", "jesko", "q1", "Jesko"},                             // same once squashed, all lower case -> capital
+        {"BMW M5", "BMWM5", "q2", "BMW M5"},                           // same once squashed -> the spaced spelling
+        {"AUDI", "RS6", "q3", "Audi RS6"},                             // a shouted make gets a lower-case tail; RS6 has a digit, kept
+        {"Lamborghini", "Diablo SV", "q4", "Lamborghini Diablo SV"},
+        {"BMW", "BMW M3 GTR", "q5", "BMW M3 GTR"},                     // label starts with the make -> the label; BMW is 3 letters, kept
+        {"", "", "q6", "Q6"},                                          // nothing -> the model
         {"NULL", "CARNOTFOUND", "z350", "Z350"},                       // the game's "no text" labels count as missing
         {"Nissan", "", "z350", "Nissan Z350"},                         // a lone make is followed by the model
         {"", "Skyline GT-R", "r34", "Skyline GT-R"},
-        {"  Audi  ", " RS6 ", "rs6", "Audi RS6"},                      // trimmed
+        {"  Audi  ", " RS6 ", "q7", "Audi RS6"},                       // trimmed
+        {"LAMBO", "LP700R", "q8", "Lamborghini LP700R"},               // a make written another way goes by its name
+        {"MERCEDES", "MBC63S", "q9", "Mercedes-Benz MBC63S"},
+        {"MB", "G63", "q10", "Mercedes-Benz G63"},
+        {"PORSCHE", "Taycan", "q11", "Porsche Taycan"},
+        {"TOYOTA", "supra", "q12", "Toyota Supra"},
+        {"TESLAS", "teslas", "q13", "Teslas"},                         // alias Tesla, the label starts with it -> the label
+        {"BENEFAC", "w210", "q14", "Benefac W210"},                    // an unknown shouted make still loses the shouting
+        {"Koenigsegg", "REGERA", "q15", "Koenigsegg Regera"},
     };
     for (const Row& r : rows) {
         const std::string got = CarDisplayName(r.make, r.label, r.model);
@@ -445,6 +454,125 @@ static void TestCarBrowserText() {
           "any case, any term order, extra spaces");
     CHECK(!MatchesAllTerms("diablo sedan", hay), "every term must match (AND), not any");
     CHECK(!MatchesAllTerms("jesko", hay) && !MatchesAllTerms("lambox", hay), "a missing term fails");
+}
+
+// The names of the 15 served cars (2026-11-05). make / label / model are what their vehicles.meta files say: the 11 loose
+// packs read from the staged copies, the 4 NG packs (nis350z, regera, supra, w210) from the plain deflate streams of their
+// dlc.rpf. The list the menu builds from them must name each car by make and model, group the makes, and never show two
+// cars under one name.
+static void TestCarNames() {
+    using namespace gage::game::content;
+    struct Real { const char *make, *label, *model, *want; };
+    const Real real[] = {
+        {"jesko", "jesko", "jesko", "Koenigsegg Jesko"},
+        {"AUDI", "RS6", "rs6", "Audi RS6"},
+        {"BMW M5", "BMWM5", "bmwm5", "BMW M5"},
+        {"Lamborghini", "Diablo SV", "diabloSV", "Lamborghini Diablo SV"},
+        {"LAMBO", "LP700R", "lp700r", "Lamborghini Aventador LP700-4"},
+        {"BMW", "M3GTR", "m3gtr", "BMW M3 GTR"},
+        {"MERCEDES", "MBC63S", "mbc63s", "Mercedes-AMG C63 S"},
+        {"MercedesE420W211", "Mercedes E420", "mbe420", "Mercedes-Benz E420"},
+        {"MBG63", "MB G63", "mbg63", "Mercedes-AMG G63"},
+        {"PORSCHE", "Taycan", "taycan", "Porsche Taycan"},
+        {"TESLAS", "teslas", "teslas", "Tesla Model S"},
+        {"NISSAN", "350z", "nis350z", "Nissan 350Z"},
+        {"regera", "regera", "regera", "Koenigsegg Regera"},
+        {"TOYOTA", "supra", "supra", "Toyota Supra"},
+        {"BENEFAC", "w210", "w210", "Mercedes-Benz E-Class W210"},
+    };
+    for (const Real& r : real) {
+        const std::string got = CarDisplayName(r.make, r.label, r.model);
+        CHECK(got == r.want, "%s: '%s', want '%s'", r.model, got.c_str(), r.want);
+    }
+    // The model is looked up in any case and trimmed; the pack's own text is ignored once the table knows the car.
+    CHECK(CarDisplayName("x", "y", "DIABLOSV") == "Lamborghini Diablo SV" && CarDisplayName("", "", " Rs6 ") == "Audi RS6",
+          "table lookup: any case, trimmed");
+
+    // The table itself: keys lower case and unique, names short enough for CarEntry::name[80], every make alias squashed.
+    {
+        bool keysOk = true, namesOk = true, aliasOk = true;
+        for (const auto& a : metadetail::kCarNames) {
+            for (const char* p = a.key; *p; ++p) keysOk = keysOk && !std::isupper((unsigned char)*p);
+            namesOk = namesOk && std::strlen(a.text) > 0 && std::strlen(a.text) < 60;
+            int same = 0;
+            for (const auto& b : metadetail::kCarNames) same += std::strcmp(a.key, b.key) == 0;
+            keysOk = keysOk && same == 1;
+        }
+        for (const auto& a : metadetail::kMakeNames) aliasOk = aliasOk && metadetail::Squash(a.key) == a.key;
+        CHECK(keysOk && namesOk && aliasOk, "table rows: keys %d names %d aliases %d", (int)keysOk, (int)namesOk, (int)aliasOk);
+    }
+
+    // The list: every real car once, grouped by make, sorted by name; the order of the input does not matter.
+    std::vector<CarIn> in;
+    for (const Real& r : real) in.push_back(CarIn{ r.model, r.make, r.label });
+    std::vector<size_t> dropped;
+    const std::vector<CarOut> list = BuildCarList(in, &dropped);
+    const char* const order[] = {
+        "Audi RS6", "BMW M3 GTR", "BMW M5", "Koenigsegg Jesko", "Koenigsegg Regera", "Lamborghini Aventador LP700-4",
+        "Lamborghini Diablo SV", "Mercedes-AMG C63 S", "Mercedes-AMG G63", "Mercedes-Benz E-Class W210", "Mercedes-Benz E420",
+        "Nissan 350Z", "Porsche Taycan", "Tesla Model S", "Toyota Supra",
+    };
+    CHECK(list.size() == 15 && dropped.empty(), "15 cars in, %u rows out, %u dropped", (unsigned)list.size(), (unsigned)dropped.size());
+    {
+        bool same = list.size() == 15;
+        std::string seen;
+        for (size_t i = 0; i < list.size() && i < 15; ++i) {
+            same = same && list[i].name == order[i];
+            seen += list[i].name + " | ";
+        }
+        CHECK(same, "sorted names: %s", seen.c_str());
+    }
+    {
+        std::vector<CarIn> rev(in.rbegin(), in.rend());
+        const std::vector<CarOut> l2 = BuildCarList(rev);
+        bool same = l2.size() == list.size();
+        for (size_t i = 0; same && i < l2.size(); ++i) same = l2[i].name == list[i].name && rev[l2[i].src].model == in[list[i].src].model;
+        CHECK(same, "the same list from the cars in the opposite order");
+    }
+    {
+        // What the menu searches (overlay_ui.cpp: name, model, class, pack, lower case): one make is one search.
+        auto hits = [&](const char* q) {
+            int n = 0;
+            for (const CarOut& c : list) {
+                std::string hay = c.name + " " + in[c.src].model;
+                for (char& ch : hay) ch = (char)std::tolower((unsigned char)ch);
+                n += MatchesAllTerms(q, hay) ? 1 : 0;
+            }
+            return n;
+        };
+        CHECK(hits("mercedes") == 4 && hits("lamborghini") == 2 && hits("bmw") == 2 && hits("koenigsegg") == 2,
+              "one search per make: mercedes %d lamborghini %d bmw %d koenigsegg %d", hits("mercedes"), hits("lamborghini"), hits("bmw"),
+              hits("koenigsegg"));
+        CHECK(hits("diablosv") == 1 && hits("nis350z") == 1 && hits("w210") == 1, "the spawn id still finds its car");
+    }
+
+    // A model two packs both define is listed once, for the pack that came first.
+    {
+        const std::vector<CarIn> two = { CarIn{ "supra", "TOYOTA", "supra" }, CarIn{ "a1", "Audi", "A1" }, CarIn{ "SUPRA", "x", "y" } };
+        std::vector<size_t> d;
+        const std::vector<CarOut> l = BuildCarList(two, &d);
+        CHECK(l.size() == 2 && d.size() == 1 && d[0] == 2, "repeated model: %u rows, %u dropped", (unsigned)l.size(), (unsigned)d.size());
+        bool firstKept = false;
+        for (const CarOut& c : l) firstKept = firstKept || (c.src == 0 && c.name == "Toyota Supra");
+        CHECK(firstKept, "the first car of the model is the one kept");
+    }
+    // Two different models that read the same get their model appended, however the spaces and case fall.
+    {
+        const std::vector<CarIn> clash = { CarIn{ "q1", "BMW", "M5" }, CarIn{ "q2", "", "BMWM5" }, CarIn{ "q3", "Audi", "RS6" } };
+        const std::vector<CarOut> l = BuildCarList(clash);
+        CHECK(l.size() == 3 && l[0].name == "Audi RS6" && l[1].name == "BMW M5 (q1)" && l[2].name == "BMWM5 (q2)",
+              "clashing names: '%s' '%s' '%s'", l.size() > 0 ? l[0].name.c_str() : "", l.size() > 1 ? l[1].name.c_str() : "",
+              l.size() > 2 ? l[2].name.c_str() : "");
+    }
+    // The order ignores case: a name that starts with a lower-case letter ("iX3") sits among the i's.
+    {
+        const std::vector<CarIn> mixed = { CarIn{ "q1", "Koenigsegg", "One" }, CarIn{ "q2", "", "iX3" }, CarIn{ "q3", "Audi", "A4" } };
+        const std::vector<CarOut> l = BuildCarList(mixed);
+        CHECK(l.size() == 3 && l[0].name == "Audi A4" && l[1].name == "iX3" && l[2].name == "Koenigsegg One",
+              "case-blind order: '%s' '%s' '%s'", l.size() > 0 ? l[0].name.c_str() : "", l.size() > 1 ? l[1].name.c_str() : "",
+              l.size() > 2 ? l[2].name.c_str() : "");
+    }
+    CHECK(BuildCarList({}).empty(), "no cars -> no rows");
 }
 
 // The runtime handling tune for NG packs (handling_tune.h): the same rules file stage_packs.mjs applies to loose packs.
@@ -541,6 +669,7 @@ int main() {
     TestGoldenVectors();
     TestPackMeta();
     TestCarBrowserText();
+    TestCarNames();
     TestHandlingTune();
     TestRoundTrip();
     TestRsc7Parse();

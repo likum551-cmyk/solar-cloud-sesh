@@ -34,9 +34,9 @@ namespace {
             if (d < r.nearestDoorM) r.nearestDoorM = d;
         }
         const bool ownedByOther = c.ownerId != kEntryNobody && c.ownerId != me;
-        if (c.locked && c.ownerId != me)
+        if (c.locked && c.ownerId != me && !c.keyHolder)
         {
-            r.reason = EntryReason::Locked;     // the server lets only the spawner into a locked car
+            r.reason = EntryReason::Locked;     // the server lets only the spawner and the last driver into a locked car (0.4.22: keyHolder)
             return r;
         }
         const bool driverFree = n > 0 && c.seats[0] == kEntryNobody;

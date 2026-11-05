@@ -683,6 +683,18 @@ const HashMapping kCrossmap3889[] = {
     {native::SET_MINIMAP_HIDE_FOW,                             0x84DE06FB962FF36D},
     {native::GET_MINIMAP_FOW_DISCOVERY_RATIO,                  0x6FF69BB93DBFAF25},
     {native::GET_MINIMAP_FOW_COORDINATE_IS_REVEALED,           0x9A761B33F5EF75C5},
+    // 0.4.22 minimap: peddrive lookup tool (natlookup.mjs), YimMenu b3889 crossmap and YimMenuV2 enhanced AGREE for all 11.
+    {native::IS_RADAR_HIDDEN,                                  0xBE259DBA45F2996E},
+    {native::IS_MINIMAP_RENDERING,                             0x6DA5456258FF887A},
+    {native::IS_RADAR_PREFERENCE_SWITCHED_ON,                  0xC1FF684795F27005},
+    {native::IS_HUD_HIDDEN,                                    0xC5D15A335232A15D},
+    {native::REQUEST_SCALEFORM_MOVIE,                          0x8DE4F68A9728925E},
+    {native::HAS_SCALEFORM_MOVIE_LOADED,                       0xA0C7B98BCF1EEF9E},
+    {native::BEGIN_SCALEFORM_MOVIE_METHOD,                     0x88F483FBD433696A},
+    {native::SCALEFORM_MOVIE_METHOD_ADD_PARAM_INT,             0x330108B080A2132F},
+    {native::END_SCALEFORM_MOVIE_METHOD,                       0xE6B753D52F4CA222},
+    {native::SET_BIGMAP_ACTIVE,                                0xC2F71CC2AB70CFB1},
+    {native::GET_SAFE_ZONE_SIZE,                               0x897B441FF18ECBBB},
     // freemode look (ApplyPedOutfit), same YimMenu b3889 source: natives.hpp enum index 4134 / 4135 /
     // 4140 -> crossmap.hpp[index]. Each also equals YimMenuV2 `enhanced` g_Crossmap[Natives.hpp index
     // 4214 / 4215 / 4220] (two separately indexed lists agreeing by native name). Not live-checked
@@ -717,6 +729,7 @@ const HashMapping kCrossmap3889[] = {
     {native::SET_PED_CAN_EVASIVE_DIVE,                         0x84D421ACEBF9E529},
     {native::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS,             0xAAA71DD7E9059338},
     {native::SET_PED_CONFIG_FLAG,                              0x0428AFDCAA63B06E},
+    {native::GET_PED_CONFIG_FLAG,                              0x49F8918E2DC5FFBC},
     {native::SET_PED_KEEP_TASK,                                0x44FB298D6382876D},
     {native::SET_PED_CAN_PLAY_AMBIENT_ANIMS,                   0xC1BC1B8A5AA67C6B},
     {native::IS_PED_FALLING,                                   0x9857C978BD3CBEDA},
@@ -749,6 +762,9 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_PED_IN_VEHICLE_SEAT,                          0xFD5C5BBD1FE92BB7},
     {native::GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS,             0x2EEC0612337D20CE},
     {native::IS_VEHICLE_SEAT_FREE,                             0xC39AE5D390581AD5},
+    {native::GET_VEHICLE_MODEL_NUMBER_OF_SEATS,                0xDC1AA2FE20EEB2E9},   // 0.4.22 doors and seats
+    {native::GET_VEHICLE_DOOR_LOCK_STATUS,                     0x38A100E16C95161B},   // 0.4.22
+    {native::PLAY_SOUND_FRONTEND,                              0xBF3D28CA44F3BE2D},   // 0.4.22
     {native::GET_SEAT_PED_IS_TRYING_TO_ENTER,                  0x03603B0046EE6ACD},
     {native::GET_VEHICLE_PED_IS_TRYING_TO_ENTER,               0xF9F8E3060F7CAEDB},
     {native::GET_VEHICLE_PED_IS_USING,                         0xCDA725BC2F170795},
@@ -878,6 +894,11 @@ const HashMapping kCrossmap3889[] = {
     {native::IS_VEHICLE_RADIO_ON,                         0xC052348A3DF7313F},
     {native::IS_HUD_COMPONENT_ACTIVE,                     0x7B035E8A1D320F1B},
     {native::IS_DISABLED_CONTROL_PRESSED,                 0x4465D55576678706},
+    // 0.4.22 noclip: YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced (and legacy) by name; public hashes in hook.h.
+    {native::SET_ENTITY_HAS_GRAVITY,                      0xBF861D73D95BF415},
+    {native::GET_ENTITY_COLLISION_DISABLED,               0x8473361800D1B85B},
+    {native::SET_PLAYER_INVINCIBLE,                       0x2B52F77101390E6F},
+    {native::GET_PLAYER_INVINCIBLE,                       0xCF59B5FEF38A9930},
     // 0.4.19 spawn reveal: lookup tool, YimMenu b3889 and YimMenuV2 enhanced agree by name.
     {native::CLEAR_TIMECYCLE_MODIFIER,                    0x80F87A4A3B930613},
     {native::GET_TIMECYCLE_MODIFIER_INDEX,                0x8960847E5FD7B48F},
@@ -3846,10 +3867,8 @@ void World::SuppressSPFrame() {
         uint64_t args[] = { 0, control, 1 };  // DISABLE_CONTROL_ACTION(0, control, true)
         CallNative(native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
     }
-    // Hide GTA's minimap and the health/armour arcs around it; we draw our own HUD. Keep the rest
-    // of the HUD (reticle) shown.
-    uint64_t off[] = { 0 };
-    CallNative(native::DISPLAY_RADAR, off, 1, nullptr);
+    // The radar is DisplayRadar's since 0.4.22 (the engine's TickMinimap: shown after the entry, minimap=0 hides it). Keep the
+    // rest of the HUD (reticle) shown.
     uint64_t show[] = { 1 };
     CallNative(native::DISPLAY_HUD, show, 1, nullptr);
     // Hide GTA's notification / SMS / phone toasts (the "feed") every frame.
@@ -4236,11 +4255,11 @@ void World::PlaceVehicleOnGround(int32_t veh) {
     CallNative(native::SET_VEHICLE_ON_GROUND_PROPERLY, args, 2, nullptr);
 }
 
-void World::SetVehicleEngineOn(int32_t veh, bool on) {
-    if (!veh) return;
+bool World::SetVehicleEngineOn(int32_t veh, bool on, bool instantly, bool disableAutoStart) {
+    if (!veh) return false;
     // SET_VEHICLE_ENGINE_ON(veh, on, instantly, disableAutoStart)
-    uint64_t args[] = { (uint64_t)(uint32_t)veh, on ? 1ull : 0ull, 1, 0 };
-    CallNative(native::SET_VEHICLE_ENGINE_ON, args, 4, nullptr);
+    uint64_t args[] = { (uint64_t)(uint32_t)veh, on ? 1ull : 0ull, instantly ? 1ull : 0ull, disableAutoStart ? 1ull : 0ull };
+    return CallNative(native::SET_VEHICLE_ENGINE_ON, args, 4, nullptr);
 }
 
 int32_t World::GetVehiclePedIsIn(int32_t ped) {
@@ -4587,6 +4606,72 @@ bool World::MapFowReadback(float& ratio, bool& farRevealed) {
     return true;
 }
 
+// --- 0.4.22 minimap: the native side of sync/minimap.h (the engine decides when) ---
+bool World::DisplayRadar(bool show) {
+    uint64_t arg[] = { show ? 1u : 0u };
+    return CallNative(native::DISPLAY_RADAR, arg, 1, nullptr);
+}
+
+void World::ReadRadar(RadarReadback& out) {
+    out = RadarReadback();
+    uint64_t r[4] = {};
+    out.hiddenOk = CallNative(native::IS_RADAR_HIDDEN, nullptr, 0, r);
+    out.hidden = out.hiddenOk && (uint32_t)r[0] != 0;
+    r[0] = 0;
+    out.renderingOk = CallNative(native::IS_MINIMAP_RENDERING, nullptr, 0, r);
+    out.rendering = out.renderingOk && (uint32_t)r[0] != 0;
+    r[0] = 0;
+    out.prefOk = CallNative(native::IS_RADAR_PREFERENCE_SWITCHED_ON, nullptr, 0, r);
+    out.pref = out.prefOk && (uint32_t)r[0] != 0;
+    r[0] = 0;
+    out.hudOk = CallNative(native::IS_HUD_HIDDEN, nullptr, 0, r);
+    out.hudHidden = out.hudOk && (uint32_t)r[0] != 0;
+    r[0] = 0;
+    out.waypointOk = CallNative(native::IS_WAYPOINT_ACTIVE, nullptr, 0, r);
+    out.waypoint = out.waypointOk && (uint32_t)r[0] != 0;
+}
+
+int World::RequestScaleform(const char* name) {
+    if (!name) return 0;
+    uint64_t arg[] = { (uint64_t)(uintptr_t)name };
+    uint64_t r[4] = {};
+    if (!CallNative(native::REQUEST_SCALEFORM_MOVIE, arg, 1, r)) return 0;
+    return (int)(uint32_t)r[0];
+}
+
+bool World::ScaleformLoaded(int handle) {
+    if (!handle) return false;
+    uint64_t arg[] = { (uint64_t)(uint32_t)handle };
+    uint64_t r[4] = {};
+    return CallNative(native::HAS_SCALEFORM_MOVIE_LOADED, arg, 1, r) && (uint32_t)r[0] != 0;
+}
+
+bool World::ScaleformCallInt(int handle, const char* method, int arg, bool& began) {
+    began = false;
+    if (!handle || !method) return false;
+    uint64_t begin[] = { (uint64_t)(uint32_t)handle, (uint64_t)(uintptr_t)method };
+    uint64_t r[4] = {};
+    if (!CallNative(native::BEGIN_SCALEFORM_MOVIE_METHOD, begin, 2, r)) return false;
+    began = (uint32_t)r[0] != 0;
+    if (!began) return true;                 // nothing was pushed: no add / end (the stack protocol)
+    uint64_t add[] = { (uint64_t)(uint32_t)arg };
+    if (!CallNative(native::SCALEFORM_MOVIE_METHOD_ADD_PARAM_INT, add, 1, nullptr)) return false;
+    return CallNative(native::END_SCALEFORM_MOVIE_METHOD, nullptr, 0, nullptr);
+}
+
+bool World::SetBigmap(bool on) {
+    uint64_t arg[] = { on ? 1u : 0u, 0 };    // SET_BIGMAP_ACTIVE(toggleBigMap, showFullMap = false)
+    return CallNative(native::SET_BIGMAP_ACTIVE, arg, 2, nullptr);
+}
+
+bool World::SafeZoneSize(float& out) {
+    out = 1.0f;
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_SAFE_ZONE_SIZE, nullptr, 0, r)) return false;
+    memcpy(&out, &r[0], 4);                  // a float in the low 4 bytes
+    return true;
+}
+
 uint32_t World::GetEntityModel(int32_t handle) {
     if (!handle) return 0;
     uint64_t arg[] = { (uint64_t)(uint32_t)handle };
@@ -4799,6 +4884,16 @@ bool World::SetPedConfigFlag(int32_t ped, int flag, bool value) {
     if (!ped) return false;
     uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)flag, value ? 1ull : 0ull };
     return CallNative(native::SET_PED_CONFIG_FLAG, args, 3, nullptr);
+}
+
+bool World::GetPedConfigFlag(int32_t ped, int flag, bool& value) {
+    if (!ped) return false;
+    // GET_PED_CONFIG_FLAG(ped, flagId, p2 = FALSE): the BOOL return is the flag.
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)flag, 0 };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_PED_CONFIG_FLAG, args, 3, r)) return false;
+    value = (uint32_t)r[0] != 0;
+    return true;
 }
 
 bool World::GetGroundZ(float x, float y, float z, float& groundZ) {
@@ -5107,6 +5202,36 @@ bool World::IsVehicleSeatFree(int32_t veh, int seat, bool countEntering) {
     return CallNative(native::IS_VEHICLE_SEAT_FREE, args, 3, r) && (uint32_t)r[0];
 }
 
+int World::VehicleSeatFreeState(int32_t veh, int seat, bool countEntering) {
+    if (!veh) return -1;
+    uint64_t args[] = { entArg(veh), (uint64_t)(uint32_t)seat, boolArg(countEntering) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_VEHICLE_SEAT_FREE, args, 3, r)) return -1;
+    return (uint32_t)r[0] ? 1 : 0;
+}
+
+int World::GetVehicleModelNumberOfSeats(uint32_t model) {
+    if (!model) return -1;
+    uint64_t arg[] = { (uint64_t)model };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_MODEL_NUMBER_OF_SEATS, arg, 1, r)) return -1;
+    return intOf(r[0]);
+}
+
+int World::GetVehicleDoorLockStatus(int32_t veh) {
+    if (!veh) return -1;
+    uint64_t arg[] = { entArg(veh) };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_VEHICLE_DOOR_LOCK_STATUS, arg, 1, r)) return -1;
+    return intOf(r[0]);
+}
+
+bool World::PlaySoundFrontend(const char* name, const char* set) {
+    if (!name || !set) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)-1, ptrArg(name), ptrArg(set), boolArg(false) };
+    return CallNative(native::PLAY_SOUND_FRONTEND, args, 4, nullptr);
+}
+
 bool World::GetSeatPedIsTryingToEnter(int32_t ped, int& seat) {
     if (!ped) return false;
     uint64_t arg[] = { entArg(ped) };
@@ -5167,6 +5292,15 @@ bool World::SetVehicleBodyHealth(int32_t veh, float health) {
 
 bool World::IsVehicleEngineRunning(int32_t veh) {
     return callPedBool(*this, native::GET_IS_VEHICLE_ENGINE_RUNNING, veh);
+}
+
+bool World::GetVehicleEngineRunning(int32_t veh, bool& running) {
+    if (!veh) return false;
+    uint64_t arg[] = { (uint64_t)(uint32_t)veh };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_IS_VEHICLE_ENGINE_RUNNING, arg, 1, r)) return false;
+    running = (uint32_t)r[0] != 0;
+    return true;
 }
 
 bool World::HasEntityCollidedWithAnything(int32_t entity) {
@@ -5916,6 +6050,38 @@ bool World::IsDisabledControlPressed(int pad, int control, bool& pressed) {
     return true;
 }
 
+bool World::SetEntityHasGravity(int32_t handle, bool on) {
+    if (!handle) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)handle, on ? 1ull : 0ull };
+    return CallNative(native::SET_ENTITY_HAS_GRAVITY, args, 2, nullptr);
+}
+
+bool World::GetEntityCollisionDisabled(int32_t handle, bool& disabled) {
+    if (!handle) return false;
+    uint64_t arg[] = { (uint64_t)(uint32_t)handle };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_ENTITY_COLLISION_DISABLED, arg, 1, r)) return false;
+    disabled = (uint32_t)r[0] != 0;
+    return true;
+}
+
+bool World::SetPlayerInvincible(bool on) {
+    uint64_t player[4] = {};
+    if (!CallNative(native::PLAYER_ID, nullptr, 0, player)) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)player[0], on ? 1ull : 0ull };
+    return CallNative(native::SET_PLAYER_INVINCIBLE, args, 2, nullptr);
+}
+
+bool World::GetPlayerInvincible(bool& on) {
+    uint64_t player[4] = {};
+    if (!CallNative(native::PLAYER_ID, nullptr, 0, player)) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)player[0] };
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_PLAYER_INVINCIBLE, args, 1, r)) return false;
+    on = (uint32_t)r[0] != 0;
+    return true;
+}
+
 bool World::GetTimecycleModifierIndex(int& index) {
     uint64_t r[4] = {};
     if (!CallNative(native::GET_TIMECYCLE_MODIFIER_INDEX, nullptr, 0, r)) return false;
@@ -6436,6 +6602,18 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_MINIMAP_HIDE_FOW),
         GAGE_NEW_NATIVE(GET_MINIMAP_FOW_DISCOVERY_RATIO),
         GAGE_NEW_NATIVE(GET_MINIMAP_FOW_COORDINATE_IS_REVEALED),
+        // 0.4.22 minimap.
+        GAGE_NEW_NATIVE(IS_RADAR_HIDDEN),
+        GAGE_NEW_NATIVE(IS_MINIMAP_RENDERING),
+        GAGE_NEW_NATIVE(IS_RADAR_PREFERENCE_SWITCHED_ON),
+        GAGE_NEW_NATIVE(IS_HUD_HIDDEN),
+        GAGE_NEW_NATIVE(REQUEST_SCALEFORM_MOVIE),
+        GAGE_NEW_NATIVE(HAS_SCALEFORM_MOVIE_LOADED),
+        GAGE_NEW_NATIVE(BEGIN_SCALEFORM_MOVIE_METHOD),
+        GAGE_NEW_NATIVE(SCALEFORM_MOVIE_METHOD_ADD_PARAM_INT),
+        GAGE_NEW_NATIVE(END_SCALEFORM_MOVIE_METHOD),
+        GAGE_NEW_NATIVE(SET_BIGMAP_ACTIVE),
+        GAGE_NEW_NATIVE(GET_SAFE_ZONE_SIZE),
         // remote-player ped driving, sender state readers, appearance read/apply.
         GAGE_NEW_NATIVE(SET_ENTITY_COORDS_NO_OFFSET),
         GAGE_NEW_NATIVE(SET_ENTITY_VELOCITY),
@@ -6460,6 +6638,7 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_PED_CAN_EVASIVE_DIVE),
         GAGE_NEW_NATIVE(SET_BLOCKING_OF_NON_TEMPORARY_EVENTS),
         GAGE_NEW_NATIVE(SET_PED_CONFIG_FLAG),
+        GAGE_NEW_NATIVE(GET_PED_CONFIG_FLAG),
         GAGE_NEW_NATIVE(SET_PED_KEEP_TASK),
         GAGE_NEW_NATIVE(SET_PED_CAN_PLAY_AMBIENT_ANIMS),
         GAGE_NEW_NATIVE(IS_PED_FALLING),
@@ -6490,6 +6669,9 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_PED_IN_VEHICLE_SEAT),
         GAGE_NEW_NATIVE(GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS),
         GAGE_NEW_NATIVE(IS_VEHICLE_SEAT_FREE),
+        GAGE_NEW_NATIVE(GET_VEHICLE_MODEL_NUMBER_OF_SEATS),
+        GAGE_NEW_NATIVE(GET_VEHICLE_DOOR_LOCK_STATUS),
+        GAGE_NEW_NATIVE(PLAY_SOUND_FRONTEND),
         GAGE_NEW_NATIVE(GET_SEAT_PED_IS_TRYING_TO_ENTER),
         GAGE_NEW_NATIVE(GET_VEHICLE_PED_IS_TRYING_TO_ENTER),
         GAGE_NEW_NATIVE(GET_VEHICLE_PED_IS_USING),
@@ -6608,6 +6790,10 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(IS_VEHICLE_RADIO_ON),
         GAGE_NEW_NATIVE(IS_HUD_COMPONENT_ACTIVE),
         GAGE_NEW_NATIVE(IS_DISABLED_CONTROL_PRESSED),
+        GAGE_NEW_NATIVE(SET_ENTITY_HAS_GRAVITY),
+        GAGE_NEW_NATIVE(GET_ENTITY_COLLISION_DISABLED),
+        GAGE_NEW_NATIVE(SET_PLAYER_INVINCIBLE),
+        GAGE_NEW_NATIVE(GET_PLAYER_INVINCIBLE),
         GAGE_NEW_NATIVE(CLEAR_TIMECYCLE_MODIFIER),
         GAGE_NEW_NATIVE(GET_TIMECYCLE_MODIFIER_INDEX),
         GAGE_NEW_NATIVE(GET_VEHICLE_LIGHTS_STATE),

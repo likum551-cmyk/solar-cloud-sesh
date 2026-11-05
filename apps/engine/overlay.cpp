@@ -10,8 +10,17 @@
 #include "overlay_mark256.h"     // kOverlayMark256Png     brand/solar/derived, mark 128 x 256
 #include "overlay_mark1024.h"    // kOverlayMark1024Png    brand/solar/derived, mark 512 x 1024
 #include "overlay_lockup.h"      // kOverlayLockupPng      brand/solar/derived, horizontal lockup, 256 px high
-#include "overlay_sceneA.h"      // kOverlaySceneAJpg      brand/loader, real GTA V still, 1600x900 JPEG
-#include "overlay_sceneB.h"      // kOverlaySceneBJpg      brand/loader, real GTA V still, 1600x900 JPEG
+// kOverlayScene0Jpg .. kOverlayScene9Jpg: brand/loader, the loader's GTA V artwork, 1920x1080 JPEG (gage_overlay.cmake)
+#include "overlay_scene0.h"
+#include "overlay_scene1.h"
+#include "overlay_scene2.h"
+#include "overlay_scene3.h"
+#include "overlay_scene4.h"
+#include "overlay_scene5.h"
+#include "overlay_scene6.h"
+#include "overlay_scene7.h"
+#include "overlay_scene8.h"
+#include "overlay_scene9.h"
 
 #include "imgui.h"
 #include "backends/imgui_impl_dx11.h"
@@ -477,12 +486,30 @@ bool InitNew(IDXGISwapChain* sc)
         tx.lockupW = w;     // the lockup was loaded last; w/h are 0 when it failed
         tx.lockupH = hgt;
     }
-    load(kOverlaySceneAJpg, kOverlaySceneAJpgLen, "loader scene A", &tx.sceneA);
-    load(kOverlaySceneBJpg, kOverlaySceneBJpgLen, "loader scene B", &tx.sceneB);
+    // The loader's pictures: the ones that decode are packed to the front, so the loader cycles over sceneCount.
+    {
+        struct Scene { const unsigned char* bytes; unsigned long len; };
+        const Scene kScenes[detail::kLoaderScenes] = {
+            {kOverlayScene0Jpg, kOverlayScene0JpgLen}, {kOverlayScene1Jpg, kOverlayScene1JpgLen},
+            {kOverlayScene2Jpg, kOverlayScene2JpgLen}, {kOverlayScene3Jpg, kOverlayScene3JpgLen},
+            {kOverlayScene4Jpg, kOverlayScene4JpgLen}, {kOverlayScene5Jpg, kOverlayScene5JpgLen},
+            {kOverlayScene6Jpg, kOverlayScene6JpgLen}, {kOverlayScene7Jpg, kOverlayScene7JpgLen},
+            {kOverlayScene8Jpg, kOverlayScene8JpgLen}, {kOverlayScene9Jpg, kOverlayScene9JpgLen},
+        };
+        tx.sceneCount = 0;
+        for (int i = 0; i < detail::kLoaderScenes; ++i) {
+            char what[32];
+            std::snprintf(what, sizeof(what), "loader scene %d", i);
+            void* t = nullptr;
+            load(kScenes[i].bytes, kScenes[i].len, what, &t);
+            if (t) tx.scenes[tx.sceneCount++] = t;
+        }
+        GLOGI("overlay: loader pictures: %d of %d decoded", tx.sceneCount, detail::kLoaderScenes);
+    }
     detail::UiSetTextures(tx);
     GLOGI("overlay: ready (swap chain %p, device %p, hwnd %p, %ux%u, ui scale %.2f, %d/%d brand textures, brand art %s)",
           (void*)sc, (void*)dev, (void*)g.hwnd, desc.BufferDesc.Width, desc.BufferDesc.Height, g.uiScale, loaded,
-          detail::kUseBrandArt ? 6 : 2, detail::kUseBrandArt ? "on" : "off (typeset fallbacks)");
+          detail::kUseBrandArt ? 4 + detail::kLoaderScenes : detail::kLoaderScenes, detail::kUseBrandArt ? "on" : "off (typeset fallbacks)");
     return true;
 }
 

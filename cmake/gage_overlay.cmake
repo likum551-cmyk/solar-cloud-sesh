@@ -20,10 +20,20 @@ set(GAGE_OVERLAY_ASSETS
     "mark256|solar/derived/solar-rp-mark-full-256.png|kOverlayMark256Png"
     "mark1024|solar/derived/solar-rp-mark-ink-1024.png|kOverlayMark1024Png"
     "lockup|solar/derived/solar-rp-lockup-horizontal-full-256h.png|kOverlayLockupPng"
-    # Real GTA V stills (the owner's standing rule: the loader shows the game itself), 1600x900 JPEG,
-    # decoded by WIC like the PNGs. The loader crossfades the two.
-    "sceneA|loader/loader-scene-downtown.jpg|kOverlaySceneAJpg"
-    "sceneB|loader/loader-scene-vehicle.jpg|kOverlaySceneBJpg"
+    # The loader's pictures (0.4.22, GI's pick from fresh_images/): GTA V official artwork, cropped to 16:9 from the
+    # top, 1920x1080 JPEG, with a soft scrim baked into the bottom-left corner over the artwork's logo. Decoded by WIC
+    # like the PNGs; the loader cycles through them (apps/engine/overlay_ui.cpp DrawLoader). The order here is the
+    # order kOverlaySceneJpg lists in overlay.cpp.
+    "scene0|loader/loader-art-beach-weather.jpg|kOverlayScene0Jpg"
+    "scene1|loader/loader-art-chop.jpg|kOverlayScene1Jpg"
+    "scene2|loader/loader-art-franklin-and-chop.jpg|kOverlayScene2Jpg"
+    "scene3|loader/loader-art-michael-business.jpg|kOverlayScene3Jpg"
+    "scene4|loader/loader-art-michael-sweatshop.jpg|kOverlayScene4Jpg"
+    "scene5|loader/loader-art-simeon.jpg|kOverlayScene5Jpg"
+    "scene6|loader/loader-art-starlet.jpg|kOverlayScene6Jpg"
+    "scene7|loader/loader-art-stop-and-frisk.jpg|kOverlayScene7Jpg"
+    "scene8|loader/loader-art-tao-cheng.jpg|kOverlayScene8Jpg"
+    "scene9|loader/loader-art-trevor-firestarter.jpg|kOverlayScene9Jpg"
 )
 set(GAGE_OVERLAY_GENERATED "")
 foreach(asset IN LISTS GAGE_OVERLAY_ASSETS)

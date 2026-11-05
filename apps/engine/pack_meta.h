@@ -3,11 +3,13 @@
 //   MetaFilesOfType(content.xml, "VEHICLE_METADATA_FILE")  the dataFiles entries of one type, as written
 //                                                          ("dlc_rs6:/common/data/vehicles.meta")
 //   ParseVehiclesMeta(vehicles.meta)                       every vehicle the meta defines: model / make / label / class
-// and the overlay car browser's text rules (CarDisplayName, CarClassName, MatchesAllTerms).
+// and the overlay car browser's text rules (CarDisplayName with its table of the served cars, BuildCarList, CarClassName,
+// MatchesAllTerms).
 // Both are tolerant scanners, not XML parsers: add-on packs come from many tools (comments, odd whitespace, attribute
 // order), and a field the scan cannot find is left empty rather than failing the whole pack.
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <string>
 #include <vector>
@@ -170,21 +172,113 @@ namespace gage::game::content {
         }
     }  // namespace metadetail
 
-    // The name the car browser shows. Packs fill <vehicleMakeName> / <gameName> loosely ("jesko" / "jesko",
-    // "BMW M5" / "BMWM5", "AUDI" / "RS6", "Lamborghini" / "Diablo SV"), so repeats are folded:
-    //   both missing           -> the model name
-    //   one missing            -> the other (a lone make is followed by the model: "AUDI rs6")
-    //   the same once squashed -> the one written with more spaces ("BMW M5")
-    //   label starts with make -> the label ("BMW M3")
-    //   otherwise              -> "<make> <label>" ("AUDI RS6", "Lamborghini Diablo SV")
-    // then an all-lower-case word gets a capital ("Jesko").
+    namespace metadetail {
+        struct TextRow { const char* key; const char* text; };
+
+        // The cars of the served packs, by spawn id (the <modelName>, any case), as "<make> <model>". The packs write
+        // their make and name loosely (2026-11-05, read from the staged vehicles.meta files and, for the four NG packs,
+        // from the plain deflate streams of their dlc.rpf): <vehicleMakeName> / <gameName> are LAMBO / LP700R,
+        // Lamborghini / Diablo SV, MERCEDES / MBC63S, MBG63 / MB G63, MercedesE420W211 / Mercedes E420, BENEFAC / w210 (a
+        // stock GTA brand written for a Mercedes), jesko / jesko. That is five spellings of two makes, and a search for
+        // "mercedes" missed two of the four Mercedes. This table names the cars the owner serves; a car it does not know
+        // gets the rule in CarDisplayName, so a new pack still reads sensibly before it earns a row here.
+        inline constexpr TextRow kCarNames[] = {
+            {"bmwm5",      "BMW M5"},
+            {"diablosv",   "Lamborghini Diablo SV"},
+            {"jesko",      "Koenigsegg Jesko"},
+            {"lp700r",     "Lamborghini Aventador LP700-4"},
+            {"m3gtr",      "BMW M3 GTR"},
+            {"mbc63s",     "Mercedes-AMG C63 S"},
+            {"mbe420",     "Mercedes-Benz E420"},
+            {"mbg63",      "Mercedes-AMG G63"},
+            {"nis350z",    "Nissan 350Z"},
+            {"regera",     "Koenigsegg Regera"},
+            {"rs6",        "Audi RS6"},
+            {"supra",      "Toyota Supra"},
+            {"taycan",     "Porsche Taycan"},
+            {"teslas",     "Tesla Model S"},
+            {"valkyrietp", "Aston Martin Valkyrie"},    // staged before 2026-11-05 15:11, not served now
+            {"volga",      "GAZ Volga"},                // not served yet (its archive does not mount)
+            {"w210",       "Mercedes-Benz E-Class W210"},
+        };
+
+        // A make written another way, by its squashed spelling (letters and digits, lower case) -> the name it goes by.
+        inline constexpr TextRow kMakeNames[] = {
+            {"amg",          "Mercedes-AMG"},
+            {"audi",         "Audi"},
+            {"bmw",          "BMW"},
+            {"koenigsegg",   "Koenigsegg"},
+            {"lambo",        "Lamborghini"},
+            {"lamborghini",  "Lamborghini"},
+            {"mb",           "Mercedes-Benz"},
+            {"mercedes",     "Mercedes-Benz"},
+            {"mercedesbenz", "Mercedes-Benz"},
+            {"nissan",       "Nissan"},
+            {"porsche",      "Porsche"},
+            {"tesla",        "Tesla"},
+            {"teslas",       "Tesla"},
+            {"toyota",       "Toyota"},
+        };
+
+        // Words written in capitals with four letters or more get a lower-case tail ("TOYOTA" -> "Toyota"); shorter ones
+        // (BMW, GT, SV) and anything with a digit (RS6, M3GTR, LP700R) stay as the pack wrote them.
+        inline std::string TitleShoutedWords(const std::string& s)
+        {
+            std::string o = s;
+            for (size_t i = 0; i < o.size();) {
+                size_t e = i;
+                while (e < o.size() && o[e] != ' ') ++e;
+                int letters = 0;
+                bool shout = true;
+                for (size_t k = i; k < e; ++k) {
+                    const unsigned char c = (unsigned char)o[k];
+                    if (std::isalpha(c)) { ++letters; if (!std::isupper(c)) shout = false; }
+                    else if (std::isdigit(c)) shout = false;
+                }
+                if (shout && letters >= 4) {
+                    bool first = true;
+                    for (size_t k = i; k < e; ++k) {
+                        if (!std::isalpha((unsigned char)o[k])) continue;
+                        if (first) first = false;
+                        else o[k] = (char)std::tolower((unsigned char)o[k]);
+                    }
+                }
+                i = e + 1;
+            }
+            return o;
+        }
+
+        inline std::string CanonMake(const std::string& make)
+        {
+            const std::string sq = Squash(make);
+            for (const TextRow& r : kMakeNames)
+                if (sq == r.key) return r.text;
+            return TitleShoutedWords(make);
+        }
+    }  // namespace metadetail
+
+    // The name the car browser shows, "<make> <model>" ("BMW M5", "Lamborghini Aventador LP700-4"); the spawn id is
+    // shown next to it by the menu and stays searchable.
+    //   a model in kCarNames -> its row (the cars served today; any case of the model)
+    //   otherwise the pack's own text, folded: packs fill <vehicleMakeName> / <gameName> loosely ("jesko" / "jesko",
+    //   "BMW M5" / "BMWM5", "AUDI" / "RS6", "LAMBO" / "LP700R"), so the make goes by its proper name (LAMBO ->
+    //   Lamborghini), shouted words get a lower-case tail (TOYOTA -> Toyota), and repeats are folded:
+    //     both missing           -> the model name
+    //     one missing            -> the other (a lone make is followed by the model: "Audi rs6")
+    //     the same once squashed -> the one written with more spaces ("BMW M5")
+    //     label starts with make -> the label ("BMW M3")
+    //     otherwise              -> "<make> <label>" ("Audi RS6", "Lamborghini Diablo SV")
+    //   then an all-lower-case word gets a capital ("Jesko").
     inline std::string CarDisplayName(const std::string& make, const std::string& label, const std::string& model)
     {
         using namespace metadetail;
-        const std::string mk = NoText(make) ? "" : Trim(make), lb = NoText(label) ? "" : Trim(label);
+        const std::string id = Trim(model);
+        for (const TextRow& r : kCarNames)
+            if (IEquals(id, r.key)) return r.text;
+        const std::string mk = NoText(make) ? "" : CanonMake(Trim(make)), lb = NoText(label) ? "" : TitleShoutedWords(Trim(label));
         std::string out;
-        if (mk.empty() && lb.empty()) out = model;
-        else if (lb.empty()) out = mk + " " + model;
+        if (mk.empty() && lb.empty()) out = id;
+        else if (lb.empty()) out = mk + " " + id;
         else if (mk.empty()) out = lb;
         else {
             const std::string sm = Squash(mk), sl = Squash(lb);
@@ -193,6 +287,56 @@ namespace gage::game::content {
             else out = mk + " " + lb;
         }
         return CapitalizeLowerWords(out);
+    }
+
+    // One car as a pack defines it, and one row of the finished list.
+    struct CarIn { std::string model, make, label; };
+    struct CarOut {
+        size_t src = 0;      // index into the BuildCarList input
+        std::string name;    // CarDisplayName, made unique
+    };
+
+    // The car browser's list from the cars of every mounted pack, given in mount order:
+    //   1. a car whose model repeats an earlier car's (any case) is left out and its input index goes to *dropped: both
+    //      would spawn the same model, so the list shows it once, for the pack that mounted first;
+    //   2. every car gets CarDisplayName;
+    //   3. cars that would read the same (squashed, any case) get their model appended to the name ("Toyota Supra (supra2)"),
+    //      so two rows never look like one;
+    //   4. sorted by name without regard to case (the same make sits together; step 3 leaves no two names equal).
+    inline std::vector<CarOut> BuildCarList(const std::vector<CarIn>& in, std::vector<size_t>* dropped = nullptr)
+    {
+        using namespace metadetail;
+        std::vector<CarOut> out;
+        std::vector<std::string> models;                       // lower case, the kept cars' models
+        for (size_t i = 0; i < in.size(); ++i) {
+            std::string m = Trim(in[i].model);
+            for (char& c : m) c = (char)std::tolower((unsigned char)c);
+            bool dup = false;
+            for (const std::string& o : models)
+                if (o == m) { dup = true; break; }
+            if (dup) {
+                if (dropped) dropped->push_back(i);
+                continue;
+            }
+            models.push_back(m);
+            CarOut r;
+            r.src = i;
+            r.name = CarDisplayName(in[i].make, in[i].label, in[i].model);
+            out.push_back(std::move(r));
+        }
+        std::vector<std::string> keys(out.size());
+        for (size_t i = 0; i < out.size(); ++i) keys[i] = Squash(out[i].name);
+        for (size_t i = 0; i < out.size(); ++i) {
+            bool shared = false;
+            for (size_t k = 0; k < out.size() && !shared; ++k) shared = k != i && keys[k] == keys[i];
+            if (shared) out[i].name += " (" + Trim(in[out[i].src].model) + ")";
+        }
+        auto lower = [](std::string s) {
+            for (char& c : s) c = (char)std::tolower((unsigned char)c);
+            return s;
+        };
+        std::sort(out.begin(), out.end(), [&](const CarOut& a, const CarOut& b) { return lower(a.name) < lower(b.name); });
+        return out;
     }
 
     // "VC_SUPER" -> "Super", "VC_SPORT_CLASSIC" -> "Sport classic"; "" stays "".

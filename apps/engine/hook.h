@@ -217,6 +217,21 @@ namespace gage::game {
         constexpr uint64_t GET_MINIMAP_FOW_DISCOVERY_RATIO                  = 0xE0130B41D3CF4574;  // float ()
         constexpr uint64_t GET_MINIMAP_FOW_COORDINATE_IS_REVEALED           = 0x6E31B91145873922;  // BOOL (float x, y, z)
 
+        // 0.4.22 minimap (sync/minimap.h): GTA's radar shown, its read-backs, the health / armour bars hidden through the "minimap"
+        // scaleform movie, and the safe zone for the overlay clearance check. Public hashes and signatures: alloc8or natives.json
+        // (HUD::, GRAPHICS::); 3889 hashes in kCrossmap3889 (lookup tool: YimMenu b3889 and YimMenuV2 enhanced AGREE for all 11).
+        constexpr uint64_t IS_RADAR_HIDDEN                                  = 0x157F93B036700462;  // BOOL ()
+        constexpr uint64_t IS_MINIMAP_RENDERING                             = 0xAF754F20EB5CD51A;  // BOOL ()
+        constexpr uint64_t IS_RADAR_PREFERENCE_SWITCHED_ON                  = 0x9EB6522EA68F22FE;  // BOOL (): the profile's radar setting
+        constexpr uint64_t IS_HUD_HIDDEN                                    = 0xA86478C6958735C5;  // BOOL ()
+        constexpr uint64_t REQUEST_SCALEFORM_MOVIE                          = 0x11FE353CF9733E6F;  // int (const char* name)
+        constexpr uint64_t HAS_SCALEFORM_MOVIE_LOADED                       = 0x85F01B8D5B90570E;  // BOOL (int handle)
+        constexpr uint64_t BEGIN_SCALEFORM_MOVIE_METHOD                     = 0xF6E48914C7A8694E;  // BOOL (int handle, const char* method)
+        constexpr uint64_t SCALEFORM_MOVIE_METHOD_ADD_PARAM_INT             = 0xC3D0841A0CC546A6;  // void (int)
+        constexpr uint64_t END_SCALEFORM_MOVIE_METHOD                       = 0xC6796A8FFA375E53;  // void ()
+        constexpr uint64_t SET_BIGMAP_ACTIVE                                = 0x231C8F89D0539D8F;  // void (BOOL toggleBigMap, BOOL showFullMap)
+        constexpr uint64_t GET_SAFE_ZONE_SIZE                               = 0xBAF107B6BB2C97F0;  // float (): 1.0 at the settings maximum
+
         // remote-player ped driving (GTA Network / RAGECOOP style: a locomotion task, a per-frame
         // velocity steer and a rare hard snap), the local-state readers the sender needs, and the
         // appearance read/apply. Each also has a kCrossmap3889 row (hook.cpp).
@@ -243,6 +258,7 @@ namespace gage::game {
         constexpr uint64_t SET_PED_CAN_EVASIVE_DIVE               = 0x6B7A646C242A7059;
         constexpr uint64_t SET_BLOCKING_OF_NON_TEMPORARY_EVENTS   = 0x9F8AA94D6D97DBF4;
         constexpr uint64_t SET_PED_CONFIG_FLAG                    = 0x1913FE4CBF41C463;
+        constexpr uint64_t GET_PED_CONFIG_FLAG                    = 0x7EE53118C892B513;   // 0.4.22 seatbelt read-back (3889 0x49F8918E2DC5FFBC)
         constexpr uint64_t SET_PED_KEEP_TASK                      = 0x971D38760FBC02EF;
         constexpr uint64_t SET_PED_CAN_PLAY_AMBIENT_ANIMS         = 0x6373D1349925A70E;
         constexpr uint64_t IS_PED_FALLING                         = 0xFB92A102F1C4DFA3;
@@ -276,6 +292,14 @@ namespace gage::game {
         constexpr uint64_t GET_PED_IN_VEHICLE_SEAT                = 0xBB40DD2270B65366;
         constexpr uint64_t GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS   = 0xA7C4F2C6E744A550;
         constexpr uint64_t IS_VEHICLE_SEAT_FREE                   = 0x22AC59A870E6A669;
+        // 0.4.22 doors and seats (libs/sync/vehicle_lock.h). Public hashes and signatures from alloc8or natives.json; each 3889 hash is in
+        // kCrossmap3889 and AGREES between YimMenu b3889 and YimMenuV2 enhanced / legacy (natlookup.mjs, 2026-11-05).
+        //   GET_VEHICLE_MODEL_NUMBER_OF_SEATS  VEHICLE int(Hash modelHash)   seats INCLUDING the driver
+        //   GET_VEHICLE_DOOR_LOCK_STATUS       VEHICLE int(Vehicle)          eVehicleLockState: 1 unlocked, 2 locked, 4 locked with the player trapped inside
+        //   PLAY_SOUND_FRONTEND                AUDIO void(int soundId, const char* audioName, const char* audioRef, BOOL p3)
+        constexpr uint64_t GET_VEHICLE_MODEL_NUMBER_OF_SEATS      = 0x2AD93716F184EDA4;
+        constexpr uint64_t GET_VEHICLE_DOOR_LOCK_STATUS           = 0x25BC98A59C2EA962;
+        constexpr uint64_t PLAY_SOUND_FRONTEND                    = 0x67C540AA08E4A6F5;
         constexpr uint64_t GET_SEAT_PED_IS_TRYING_TO_ENTER        = 0x6F4C85ACD641BCD2;
         constexpr uint64_t GET_VEHICLE_PED_IS_TRYING_TO_ENTER     = 0x814FA8BE5449445D;
         constexpr uint64_t GET_VEHICLE_PED_IS_USING               = 0x6094AD011A2EA87D;
@@ -458,6 +482,20 @@ namespace gage::game {
         constexpr uint64_t IS_VEHICLE_RADIO_ON                         = 0x0BE4BE946463F917;
         constexpr uint64_t IS_HUD_COMPONENT_ACTIVE                     = 0xBC4C9EA5391ECC0D;
         constexpr uint64_t IS_DISABLED_CONTROL_PRESSED                 = 0xE2587F8CBBD87B1D;
+        // 0.4.22 noclip (libs/sync/noclip.h). Lookup tool natlookup.mjs 2026-11-05: YimMenu b3889 crossmap and YimMenuV2 enhanced agree
+        // by name and signature (and legacy has the same 3889 hash); public hashes and signatures from alloc8or natives.json:
+        //   SET_ENTITY_HAS_GRAVITY         public 0x4A4722448F18EEF5  3889 0xBF861D73D95BF415  void (Entity, BOOL toggle)
+        //   GET_ENTITY_COLLISION_DISABLED  public 0xCCF1E97BEFDAE480  3889 0x8473361800D1B85B  BOOL (Entity); true = no collision
+        //   SET_PLAYER_INVINCIBLE          public 0x239528EACDC3E7DE  3889 0x2B52F77101390E6F  void (Player, BOOL toggle)
+        //   GET_PLAYER_INVINCIBLE          public 0xB721981B2B939E07  3889 0xCF59B5FEF38A9930  BOOL (Player); the flag SET_PLAYER_INVINCIBLE sets
+        // (There is no getter for SET_ENTITY_HAS_GRAVITY, nor for SET_ENTITY_INVINCIBLE, in either crossmap.)
+        // Already wired and reused: SET_ENTITY_COLLISION, SET_ENTITY_INVINCIBLE, SET_ENTITY_COORDS_NO_OFFSET, SET_ENTITY_VELOCITY,
+        // SET_ENTITY_HEADING, GET_GAMEPLAY_CAM_ROT, GET_GROUND_Z_FOR_3D_COORD, REQUEST_COLLISION_AT_COORD, DISABLE_CONTROL_ACTION,
+        // GET_ENTITY_HEIGHT_ABOVE_GROUND, GET_ENTITY_SPEED.
+        constexpr uint64_t SET_ENTITY_HAS_GRAVITY                      = 0x4A4722448F18EEF5;
+        constexpr uint64_t GET_ENTITY_COLLISION_DISABLED               = 0xCCF1E97BEFDAE480;
+        constexpr uint64_t SET_PLAYER_INVINCIBLE                       = 0x239528EACDC3E7DE;
+        constexpr uint64_t GET_PLAYER_INVINCIBLE                       = 0xB721981B2B939E07;
         // 0.4.19 spawn reveal (GI: "sometimes I spawn with a green hue mid-air"). Lookup tool natlookup.mjs 2026-11-05: YimMenu
         // b3889 crossmap and YimMenuV2 enhanced agree by name (and legacy):
         //   CLEAR_TIMECYCLE_MODIFIER       public 0x0F07E7745A236711  3889 0x80F87A4A3B930613  void ()
@@ -766,11 +804,11 @@ namespace gage::game {
         // ambientTally. SuppressSPSystems no longer calls it: the engine's ambient tick does.
         void     SuppressAmbientSystems(float x, float y, float z, bool haveCoords);
         // Every-frame (call each script tick while on the server): holds the character-wheel, weapon
-        // wheel, phone and MP character-select controls disabled, hides GTA's minimap and the
-        // health/armour arcs around it (we draw our own HUD), hides the notification/SMS feed, blocks
+        // wheel, phone and MP character-select controls disabled, hides the notification/SMS feed, blocks
         // vehicle rewards, pre-empts a code-requested autosave, and clears any wanted level the instant
         // it appears. (The pause menu is left alone here; the engine's HoldMenuControls disables Esc
-        // (control 200) so it cannot pause the game; P (199) still opens the pausing menu.)
+        // (control 200) so it cannot pause the game; P (199) still opens the pausing menu.) The radar is
+        // not touched here since 0.4.22: DisplayRadar (below) is called by the engine's TickMinimap.
         void     SuppressSPFrame();
         // Every-frame (the engine's TickAmbient calls it on every tick, whatever the connection or
         // entry state, and on the render-thread fallback): sets the ped, scenario-ped, vehicle,
@@ -832,6 +870,30 @@ namespace gage::game {
         // Read-back of the fog DATA (not of the hide flag, which has no getter): the discovered ratio and whether a
         // far coordinate (Paleto Bay) is revealed. False when unresolved.
         bool     MapFowReadback(float& ratio, bool& farRevealed);
+        // 0.4.22 minimap (sync/minimap.h decides; script tick only). DisplayRadar is the ONE DISPLAY_RADAR call site (every tick,
+        // true = GTA's radar shown); false when the native does not resolve. ReadRadar fills the passive read-backs, each with its
+        // own ok flag (false = that native did not resolve): IS_RADAR_HIDDEN, IS_MINIMAP_RENDERING (the render side), the profile's
+        // IS_RADAR_PREFERENCE_SWITCHED_ON, IS_HUD_HIDDEN and IS_WAYPOINT_ACTIVE.
+        struct RadarReadback
+        {
+            bool hiddenOk = false, hidden = false;
+            bool renderingOk = false, rendering = false;
+            bool prefOk = false, pref = false;
+            bool hudOk = false, hudHidden = false;
+            bool waypointOk = false, waypoint = false;
+        };
+        bool     DisplayRadar(bool show);
+        void     ReadRadar(RadarReadback& out);
+        // The "minimap" scaleform movie: RequestScaleform returns its handle (REQUEST_SCALEFORM_MOVIE, idempotent; 0 = unresolved
+        // or refused), ScaleformLoaded is HAS_SCALEFORM_MOVIE_LOADED (false when unresolved). ScaleformCallInt runs
+        // BEGIN_SCALEFORM_MOVIE_METHOD(handle, method), ADD_PARAM_INT(arg), END_SCALEFORM_MOVIE_METHOD; the add / end are issued
+        // only when the begin returned true (began says so). False when a native does not resolve. SetBigmap is
+        // SET_BIGMAP_ACTIVE(on, false). SafeZoneSize is GET_SAFE_ZONE_SIZE (1.0 = the settings maximum).
+        int      RequestScaleform(const char* name);
+        bool     ScaleformLoaded(int handle);
+        bool     ScaleformCallInt(int handle, const char* method, int arg, bool& began);
+        bool     SetBigmap(bool on);
+        bool     SafeZoneSize(float& out);
         // Diagnostic: log every live GTA script thread (id + script-name hash, resolved to a
         // readable name when known, else hex) to gage.log. `when` tags the line (e.g. "pristine"
         // before suppression, "after-suppress" a few seconds in). Read-only; walks the same
@@ -881,7 +943,9 @@ namespace gage::game {
         int32_t  CreateVehicle(uint32_t modelHash, float x, float y, float z, float heading);
         bool     SetPedIntoVehicle(int32_t ped, int32_t veh, int seat);
         void     PlaceVehicleOnGround(int32_t veh);
-        void     SetVehicleEngineOn(int32_t veh, bool on);
+        // SET_VEHICLE_ENGINE_ON(veh, on, instantly, disableAutoStart). true = the native could be called. The 0.4.22 Y key switches OFF
+        // with disableAutoStart so that the game does not start the engine again by itself.
+        bool     SetVehicleEngineOn(int32_t veh, bool on, bool instantly = true, bool disableAutoStart = false);
         int32_t  GetVehiclePedIsIn(int32_t ped);
         void     FixVehicle(int32_t veh);
         void     GiveWeapon(int32_t ped, uint32_t weaponHash, int ammo);
@@ -937,6 +1001,8 @@ namespace gage::game {
         bool     SetPedToRagdoll(int32_t ped, int time1Ms, int time2Ms);  // type 0; the native's own BOOL
         bool     SetPedCanRagdoll(int32_t ped, bool can);
         bool     SetPedConfigFlag(int32_t ped, int flag, bool value);    // ePedConfigFlags id
+        // GET_PED_CONFIG_FLAG(ped, flag, FALSE): true = could be called and `value` is the flag (false is not "unreadable").
+        bool     GetPedConfigFlag(int32_t ped, int flag, bool& value);
         bool     SetEntityCollision(int32_t handle, bool on);            // keepPhysics = true
         // GET_GROUND_Z_FOR_3D_COORD(ignoreWater false): ground height under (x, y) below z. False
         // when there is none (not streamed in, beyond render distance) or it cannot be called.
@@ -991,6 +1057,14 @@ namespace gage::game {
         int      GetVehicleMaxPassengers(int32_t veh);  // excludes the driver; -1 = cannot call
         // countEntering true: a seat someone is entering (TASK_ENTER_VEHICLE) already counts taken.
         bool     IsVehicleSeatFree(int32_t veh, int seat, bool countEntering = false);
+        // 0.4.22: the same native with an answer for "could not call": -1 unknown, 0 taken, 1 free.
+        int      VehicleSeatFreeState(int32_t veh, int seat, bool countEntering);
+        // 0.4.22: seats of a MODEL including the driver (GET_VEHICLE_MODEL_NUMBER_OF_SEATS); -1 = cannot call.
+        int      GetVehicleModelNumberOfSeats(uint32_t model);
+        // 0.4.22: eVehicleLockState read back (1 unlocked, 2 locked, 4 locked with the player inside); -1 = cannot call.
+        int      GetVehicleDoorLockStatus(int32_t veh);
+        // 0.4.22: PLAY_SOUND_FRONTEND(-1, name, set, false); the strings are passed by pointer (literals); false = could not be called.
+        bool     PlaySoundFrontend(const char* name, const char* set);
         // The raw seat index; only meaningful while GetVehiclePedIsTryingToEnter is non-zero.
         bool     GetSeatPedIsTryingToEnter(int32_t ped, int& seat);
         int32_t  GetVehiclePedIsTryingToEnter(int32_t ped);  // 0 = none
@@ -1009,6 +1083,8 @@ namespace gage::game {
         bool     GetVehicleBodyHealth(int32_t veh, float& health);
         bool     SetVehicleBodyHealth(int32_t veh, float health);
         bool     IsVehicleEngineRunning(int32_t veh);  // false also when it cannot be called
+        // true = could be called and `running` is the answer (the 0.4.22 controls need to tell "off" from "unreadable").
+        bool     GetVehicleEngineRunning(int32_t veh, bool& running);
         // W9: HAS_ENTITY_COLLIDED_WITH_ANYTHING (true when the entity touched anything since it was last asked; whether the
         // ground counts is INFERRED: the drive controller opens a grace on a rising contact only and has a cooldown) and
         // GET_VEHICLE_CLASS (-1 when it cannot be called; 8 motorcycles, 13 cycles).
@@ -1205,6 +1281,12 @@ namespace gage::game {
         bool     IsVehicleRadioOn(int32_t veh, bool& on);
         bool     IsHudComponentActive(int id, bool& active);
         bool     IsDisabledControlPressed(int pad, int control, bool& pressed);
+        // 0.4.22 noclip (libs/sync/noclip.h). Setters: true = the native could be called. Getters: false = could not be called
+        // (the out value is then untouched). The player forms act on the local player (PLAYER_ID()).
+        bool     SetEntityHasGravity(int32_t handle, bool on);
+        bool     GetEntityCollisionDisabled(int32_t handle, bool& disabled);
+        bool     SetPlayerInvincible(bool on);
+        bool     GetPlayerInvincible(bool& on);
         // 0.4.19 spawn reveal: the screen state a spawn can be left in (timecycle modifier, animated post-fx).
         bool     GetTimecycleModifierIndex(int& index);     // -1 = no modifier
         bool     ClearTimecycleModifier();

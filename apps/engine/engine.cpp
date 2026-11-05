@@ -27,10 +27,12 @@
 #include "sync/vehicle_body.h"
 #include "sync/vehicle_visual.h"
 #include "sync/vehicle_signals.h"
+#include "sync/vehicle_controls.h"
 #include "sync/vehicle_damage.h"
 #include "sync/pedstate.h"
 #include "sync/cover.h"
 #include "sync/vehicle_entry.h"
+#include "sync/vehicle_lock.h"
 #include "sync/vehicle_w9.h"
 #include "sync/vehicle_contact.h"
 #include "sync/vehicle_impact.h"
@@ -43,9 +45,12 @@
 #include "sync/swing.h"
 #include "sync/gtaids.h"
 #include "sync/hypertune.h"
+#include "sync/vehicle_shake.h"
 #include "sync/pausemenu.h"
 #include "sync/radio_off.h"
 #include "sync/mapclear.h"
+#include "sync/minimap.h"
+#include "sync/noclip.h"
 #include "common/registry.h"
 
 #include <windows.h>
@@ -450,6 +455,8 @@ namespace {
         uint32_t driveResetSeq = 0, appliedDriveResetSeq = 0;   // Sync D: VehNet::driveResetSeq and the one the tick has handled
         uint32_t syncDPersistentSeen = 0, syncDUnderFloorSeen = 0, syncDBlendsSeen = 0, syncDGracesSeen = 0;   // drive stats at the last "(D)" line
         sync::DriveErrWindow errWin;  // Sync D: this copy's drive error against the sender's, per 10 s (the "vehicle drive (D)" line)
+        sync::shake::CopyMeter shake; // 0.4.22: this copy's high-frequency error and error flips against its owner's stream (the "vehicle shake (0.4.22)" line)
+        uint32_t angWrites = 0;       // 0.4.22: angular commands written to this copy (every kShakeAngCheckEvery-th is read back)
         int32_t handle = 0;           // the local entity (0 = not spawned)
         uint32_t spawnedModel = 0;
         bool adopted = false;         // `handle` is our own car, bound by a Register answer
@@ -516,8 +523,40 @@ namespace {
         sync::HornSync horn;                         // the controller's horn on this copy: a rise, renewals, the release (veh_horn_sync)
         sync::LightsKeeper lightsKeep;               // the headlights / high beam kept against the GET_VEHICLE_LIGHTS_STATE read-back (veh_lights_keep)
         double sigStateMs = -1e9;                    // when the newest state was applied here (a horn without fresh states is let go)
+        // ---- 0.4.22 doors (libs/sync/vehicle_lock.h; script tick) ----
+        sync::LockKeeper lockKeep;                   // the door lock kept against the GET_VEHICLE_DOOR_LOCK_STATUS read-back (veh_locks)
+        // ---- 0.4.22 vehicle controls (libs/sync/vehicle_controls.h; script tick) ----
+        uint8_t ctlInd = 0;                          // the indicator bits (kVeh2IndicatorL / R) a controller sends for this car: our own state machine's
     };
     std::map<uint16_t, NetVeh> g_vehs;            // script tick only (no lock)
+    // 0.4.22 vehicle controls: Left / Right Arrow indicators, Down Arrow hazards, Y engine, B seatbelt (H is GTA's own headlight control). The machine
+    // (key -> state, auto-cancel, engine guard, belt, fuel_use) is libs/sync/vehicle_controls.h; TickVehicleControls (below) feeds it and calls
+    // the natives it names. Switches (HKCU\Software\GAGE-MP, read at every Welcome): veh_keys (default on; 0 = nothing read, issued or drawn),
+    // veh_indicator_autocancel (default on), veh_indicator_sync (default on; 0 = indicator bits neither sent nor applied, the 0.4.21 wire),
+    // fuel_use (default OFF; 1 = an empty tank cuts the engine of the car we drive and it will not start).
+    sync::VehControls g_vc;                       // script tick
+    std::atomic<bool> g_vcKeys{true}, g_vcAutoCancel{true}, g_vcIndSync{true}, g_vcFuelUse{false};
+    std::atomic<bool> g_vcReset{false};           // set by the Welcome (join worker): the script tick resets g_vc
+    sync::FuelHud g_fuelHud;                     // script tick: the gauge on the speedometer plate (set by TickVehicleControls, pushed by DrawHud)
+    struct VcExtraStats
+    {
+        uint32_t copyIndApplied = 0, copyIndFailed = 0;     // SET_VEHICLE_INDICATOR_LIGHTS calls on copies (from the controller's bits)
+        uint32_t copyEngineApplied = 0;                      // SET_VEHICLE_ENGINE_ON calls on copies from the controller's engine bit
+        uint32_t indCalls = 0, indFailed = 0, engineCalls = 0, engineFailed = 0, beltCalls = 0, beltFailed = 0;   // our own car's natives
+        uint32_t ticksInVeh = 0, ticksBlocked = 0, beltReads = 0, beltReadFail = 0, beltFlagTrue = 0, lightsLow = 0, lightsHigh = 0, engineStopped = 0;
+        uint32_t keyLines = 0;                               // per-key log lines written in this session (capped)
+    };
+    VcExtraStats g_vcx;
+    double g_vcReportMs = 0, g_vcBeltReadMs = -1e9;
+    bool g_vcFirstReport = true;
+    sync::VehControlsConfig VehControlsConfigNow()
+    {
+        sync::VehControlsConfig c;
+        c.keys = g_vcKeys.load(std::memory_order_relaxed);
+        c.autoCancel = g_vcAutoCancel.load(std::memory_order_relaxed);
+        c.fuelUse = g_vcFuelUse.load(std::memory_order_relaxed);
+        return c;
+    }
     // The vehicles' timeline and render time are the connection's NetClock (g_sync.Clock()): snapshots are stamped
     // tick * tickMs - ageMs on its timeline and drawn at its RenderT(now) minus the car's class extra (VehNet::extra).
     // Until the W7 change of the sync plan they had a clock of their own (a decaying maximum offset, a fixed 120 ms).
@@ -531,6 +570,26 @@ namespace {
     // default 0 derives it from successive rotations (the frame of that native is unverified,
     // vehicle_drive.h RISK). veh_angframe=body applies the controller's body-frame output instead.
     std::atomic<bool> g_vehUseAngVel{false}, g_vehAngBody{false};
+    // 0.4.22 cars shake (libs/sync/vehicle_shake.h): GI's live log proved that SET_ENTITY_ANGULAR_VELOCITY takes its vector in the car's BODY
+    // frame while GET_ENTITY_ROTATION_VELOCITY returns the WORLD frame; the hyper assists' anti-roll and every remote copy's angular command
+    // used to hand the setter a world vector, which turns a car's pitch / roll rates by its heading every tick. veh_shake_fix=0 in
+    // HKCU\Software\GAGE-MP restores those writes (default on); veh_angframe=world keeps the world frame with the fix on. The judge follows the
+    // read-backs (it flips frames if the setter turns out to take the other one). All of it is the script tick's; the switches are atomics.
+    std::atomic<bool> g_shakeFix{true}, g_shakeWorldPinned{false};
+    sync::shake::AngFrameJudge g_angJudge;
+    sync::shake::LocalMeter g_localShake;
+    constexpr uint32_t kShakeAngCheckEvery = 30;   // a copy's angular command is read back every 30th write
+    struct ShakeStats                              // the counters of the 10 s "engine: vehicle shake (0.4.22)" lines
+    {
+        uint32_t assistVelWrites = 0, assistAngWrites = 0, assistAngBody = 0, assistAngWorld = 0;
+        double dvSum = 0, dvMax = 0, dwSum = 0, dwMax = 0;        // what the hyper assist changed per write: m/s, rad/s
+        uint32_t assistMask = 0;                                   // the assists in force on the car we drive (0 = none / not a tuned car)
+        float power = 0;                                           // the power multiplier written every tick (0 = none)
+        uint32_t copyAngWrites = 0, copyAngBody = 0, copyAngWorld = 0, impactAngWrites = 0;
+        int32_t localVeh = 0;                                      // the car the shake meter is following and its model
+        uint32_t localModel = 0;
+    };
+    ShakeStats g_shk;
     // R3 T4: veh_damage_sync=0 in HKCU\Software\GAGE-MP switches the vehicle damage state off (no damage block sent or applied, copies keep
     // their own local damage rules: the v6 behaviour); veh_visual_guard=0 switches the sanity layer off (tyre / window / handbrake reads reach the
     // wire as in v6). Both default on and are re-read at every Welcome.
@@ -554,6 +613,39 @@ namespace {
     // 400 ms soft-correction grace and the own-physics adoption: rubber-banding every ~1.2 s). veh_ride_lead=0: the car we ride in gets the near-car
     // lead (0.4.15: up to 450 ms of extrapolation ahead of the driver's last report, with the camera inside it). Default on = both fixes. Re-read at Welcome.
     std::atomic<bool> g_rideGate{true}, g_rideLead{true};
+    // 0.4.22 doors and seats (GI: "locking / unlocking doors, and being able to sit in the back seats if the car has 4 doors"; rules in
+    // libs/sync/vehicle_lock.h, tests in tests/doors_seats_tests.h and tests/doors_seats_net_tests.h). No protocol change: the lock is
+    // VehicleState.flags kVehLocked and VehicleOp::SetLocked, the seats are Enter / EnterIntent with a wire seat 0..7.
+    //   veh_rear_seats=0  F and G see only the driver's seat and the front passenger's (wire seats 0 and 1), as a two-door picks; default on
+    //   veh_locks=0       no L key and no lock read-back on the copies (the flag the server sends is still applied once per change); default on
+    // Both re-read at every Welcome. DoorsSeatsStats is the 10 s line "engine: doors and seats (0.4.22)" (script tick only).
+    std::atomic<bool> g_vehRearSeats{true}, g_vehLocks{true};
+    struct DoorsSeatsStats
+    {
+        uint32_t pressF = 0, pressG = 0;                         // entry presses we took (a GTA-started entry we stopped counts as F)
+        uint32_t pickSeat[4] = {};                               // the seat of each pick that began an entry, by sync::SeatClass
+        uint32_t refusedLocked = 0, refusedFull = 0, refusedOwned = 0, refusedFar = 0;   // picks that found no seat, by reason
+        uint32_t freeYes = 0, freeNo = 0, freeUnknown = 0;       // IS_VEHICLE_SEAT_FREE(seat, entering counts) at a pick the server's list called free
+        uint32_t seatMatch = 0, seatDiffers = 0, seatNotSeated = 0;   // the entry's read-back: GET_PED_IN_VEHICLE_SEAT against the seat picked
+        uint32_t lockPress = 0, lockHeld = 0, lockSent = 0, lockNotSent = 0;   // the L key (only counted while a networked car is in reach)
+        uint32_t lockOk = 0, lockOkLocked = 0, lockOkUnlocked = 0, lockRefused = 0, lockRefusedBy[16] = {};   // the server's answers
+        uint32_t soundOk = 0, soundFail = 0;
+        sync::LockKeepStats keep;                                // the copies' lock read-back (this window)
+    };
+    DoorsSeatsStats g_ds;
+    struct DoorsSeatsState
+    {
+        struct Expect { bool active = false; int netId = -1; int seat = -1; double atMs = 0; } expect;   // the seat the last pick named
+        struct Pending { bool active = false; int netId = -1; bool wantLocked = false; double sentMs = 0; } lockPending;
+        sync::KeyRing keys;                                      // cars we drove or own: only orders the L pick between two cars
+        uint32_t reissueLogged = 0;                              // lock re-issue lines written this session (the 10 s line counts the rest)
+    };
+    DoorsSeatsState g_dsState;
+    constexpr int kControlLockKey = 182;                         // INPUT_CELLPHONE_CAMERA_FOCUS_LOCK, the L key (INFERRED: confirm live)
+    constexpr int kControlThrowGrenade = 58;                     // the G key's other control on foot (INFERRED): disabled with the entry keys
+    constexpr double kLockPendingMs = 1500.0;                    // a second L press while an answer is out is ignored for this long
+    void LogDoorsSeatsSwitches();                                // below, with the F / G entry (needs its constants)
+
     // 0.4.19 spawn reveal (GI: "sometimes I spawn in with a green hue, mid air", mostly on the first launch after the launcher downloaded
     // packs). The car packs mount on the game thread from the entry on, and the 0.4.18 reveal (collision loaded, or 4 s) fell in the
     // middle of it (live 0.4.18: reveal 46.5 s, mounts 45.5-47.8 s). spawn_wait_packs=0: reveal on collision only, as before.
@@ -603,6 +695,27 @@ namespace {
               g_mapClearBlips.load() ? "on (every blip but the player arrow, north, a waypoint and our own hidden every 3 s after the entry; the stale waypoint cleared once)"
                                      : "OFF (0.4.18: ClearSpBlips at the entry)",
               g_mapReveal.load() ? "on (SET_MINIMAP_HIDE_FOW(true) every 3 s after the entry)" : "OFF (the save's fog of war)");
+    }
+    // 0.4.22 minimap (GI: "add a minimap"; libs/sync/minimap.h has the rules and the evidence). minimap: unset / anything but "0" = GTA's own radar shown
+    // after the entry (bottom-left, on foot and in a vehicle; hidden while the pause menu is up), "0" = hidden as before. minimap_bars: unset / 1 = GTA's
+    // health / armour bars hidden (SETUP_HEALTH_ARMOUR(3) every tick + one big-radar flip per entry), 2 = the method call without the flip, 0 = the bars as
+    // the game draws them. Both re-read at every Welcome; the bars' mode reaches the gate on the script tick (g_barsReset), never from this thread.
+    std::atomic<bool> g_minimap{true};
+    std::atomic<int>  g_barsMode{(int)sync::BarsMode::SetupRefresh};
+    std::atomic<bool> g_barsReset{true};
+    sync::BarsGate g_barsGate;          // script tick only
+    void MinimapReadSwitches()
+    {
+        g_minimap.store(reg::Get(L"minimap") != L"0");
+        const sync::BarsMode bm = sync::ParseBarsMode(reg::Get(L"minimap_bars"));
+        g_barsMode.store((int)bm);
+        g_barsReset.store(true);
+        GLOGI("engine: minimap (0.4.22): minimap=%s minimap_bars=%s",
+              g_minimap.load() ? "on (GTA's radar, bottom-left, after the entry; hidden while the pause menu is up; the player arrow and a waypoint show)"
+                               : "OFF (hidden as before)",
+              bm == sync::BarsMode::Off ? "0 (GTA's health / armour bars as the game draws them)"
+              : bm == sync::BarsMode::Setup ? "2 (SETUP_HEALTH_ARMOUR(3) each tick, no big-radar flip)"
+                                            : "on (one big-radar flip per entry, then SETUP_HEALTH_ARMOUR(3) each tick; LIVE-UNVERIFIED)");
     }
     constexpr double kContactNearM = 10.0;       // origin to origin: a vehicle we control this close is the likely toucher of a copy
     // The round trip (ms) the server measures to each vehicle controller (Msg::LinkInfo, join worker -> script tick), by player id.
@@ -949,7 +1062,7 @@ namespace {
     // path (SendChat) parses the line off the game thread and queues it; the script
     // tick drains and runs it, because the vehicle/weapon natives must run there.
     struct Command {
-        enum Kind { Heal, Kill, Tp, Car, Gun, Fix, Emote, Scenario, StopAnim, Swing } kind = Heal;
+        enum Kind { Heal, Kill, Tp, Car, Gun, Fix, Emote, Scenario, StopAnim, Swing, Noclip } kind = Heal;
         float x = 0, y = 0, z = 0;    // /tp
         std::string arg;              // /car, /gun model/weapon name; /e dictionary; /scenario name
         std::string arg2;             // /e clip name
@@ -1181,6 +1294,40 @@ namespace {
         }
         g_radio = RadioStats();
     }
+    // ---- 0.4.22 noclip (libs/sync/noclip.h has the rules and the keys; GI: noclip in the Tab menu's quick actions, also /noclip) ----
+    // noclip (HKCU\Software\GAGE-MP): unset / 1 = available (the Tab menu row, /noclip), 0 = the row is hidden and noclip cannot
+    // start (one already flying lands and gives its flags back). Read at every Welcome; on until the first Welcome.
+    std::atomic<bool> g_noclipSwitch{true};
+    sync::noclip::Gate g_noclip;
+    bool g_noclipToggle = false;            // a request from RunCommands (/noclip, the Tab menu row), consumed by TickNoclip the same tick
+    struct NoclipStats
+    {
+        // flying (script ticks)
+        uint32_t onTicks = 0, moves = 0, keysHeld = 0, fastTicks = 0, slowTicks = 0, holdTicks = 0, controlHolds = 0, resyncs = 0;
+        // starts / ends / refusals
+        uint32_t starts = 0, endToggle = 0, endSwitch = 0, endNotReady = 0, endGone = 0;
+        uint32_t refusedDisabled = 0, refusedNotReady = 0, refusedPassenger = 0;
+        // landings
+        uint32_t placed = 0, fellBack = 0, skipped = 0;
+        // issued vs read back (samples every kProbeEveryMs while flying)
+        uint32_t samples = 0, collisionOff = 0, collisionBackOn = 0, invincibleOn = 0, invincibleLost = 0, groundProbes = 0, groundValid = 0,
+                 uncallable = 0;
+        float cmdSpeedMax = 0, gameSpeedMax = 0, driftMax = 0, heightLast = 0, camPitchLast = 0, camYawLast = 0;
+    };
+    NoclipStats g_noclipStats;
+    double g_noclipReportMs = 0, g_noclipProbeMs = 0;
+    bool g_noclipFirstReport = true, g_noclipHaveWritten = false, g_noclipWasActive = false;
+    sync::noclip::Vec3 g_noclipLastWritten;
+
+    void ReadNoclipSwitch()
+    {
+        g_noclipSwitch.store(reg::Get(L"noclip") != L"0");
+        GLOGI("engine: noclip (0.4.22): noclip=%s", g_noclipSwitch.load()
+              ? "on (Tab menu > Quick actions > Noclip, or /noclip: W A S D fly along the view, Space up, Ctrl down, Shift fast x5, Alt slow x0.2; "
+                "no collision, no gravity, invincible while on; the flags are read first and given back, and it lands on the ground under you)"
+              : "OFF (0 = the Tab menu row is hidden and noclip cannot start)");
+    }
+
     template <typename T> void AtomicMax(std::atomic<T>& a, T v)
     {
         T cur = a.load(std::memory_order_relaxed);
@@ -1685,6 +1832,13 @@ namespace {
         // v4 switches, re-read at every Welcome like peer_drive.
         g_vehUseAngVel.store(reg::Get(L"veh_angvel") == L"1");
         g_vehAngBody.store(reg::Get(L"veh_angframe") == L"body");
+        g_shakeFix.store(reg::Get(L"veh_shake_fix") != L"0");         // 0.4.22: the angular writes in the setter's own (body) frame (0 = the pre-0.4.22 world vectors)
+        g_shakeWorldPinned.store(reg::Get(L"veh_angframe") == L"world");
+        GLOGI("engine: vehicle shake (0.4.22): veh_shake_fix=%s, angular writes in the %s frame (SET_ENTITY_ANGULAR_VELOCITY takes the BODY frame, "
+              "GET_ENTITY_ROTATION_VELOCITY returns the WORLD frame: the live read-backs of 2026-11-05 are R(q) * wrote); a 10 s line reports the high-frequency "
+              "pitch / roll / vertical-speed jitter of the car we drive and of the remote copies' pose error, and the angular write read-backs",
+              g_shakeFix.load() ? "on" : "OFF (pre-0.4.22 world-vector writes)", !g_shakeFix.load() ? (g_vehAngBody.load() ? "copies: body (veh_angframe), assists: world" : "world") :
+              (g_shakeWorldPinned.load() ? "world (veh_angframe=world)" : "body, following the read-backs"));
         g_peerHits.store(reg::Get(L"peer_hits") != L"0");
         g_vehDriveByAimOnly.store(reg::Get(L"veh_driveby") == L"aim");
         g_vehDamageSync.store(reg::Get(L"veh_damage_sync") != L"0");     // R3 T4: the vehicle damage state (default on; 0 = the v6 behaviour)
@@ -1699,6 +1853,7 @@ namespace {
         GLOGI("engine: passenger ride (0.4.17): veh_ride_gate=%s veh_ride_lead=%s", g_rideGate.load() ? "on" : "OFF (0.4.15)",
               g_rideLead.load() ? "on" : "OFF (0.4.15)");
         ReadRadioOffSwitch();                                           // 0.4.19: no_radio (0 = the radio and its wheel as before)
+        ReadNoclipSwitch();                                             // 0.4.22: noclip (0 = no Tab menu row, noclip cannot start)
         g_spawnWaitPacks.store(reg::Get(L"spawn_wait_packs") != L"0");  // 0.4.19: the reveal waits for the car packs (0 = collision only)
         g_spawnClearFx.store(reg::Get(L"spawn_clear_fx") != L"0");      // 0.4.19: clear timecycle modifier + post-fx at the reveal
         GLOGI("engine: spawn reveal (0.4.19): spawn_wait_packs=%s spawn_clear_fx=%s", g_spawnWaitPacks.load() ? "on" : "OFF (0.4.18)",
@@ -1710,8 +1865,8 @@ namespace {
         {
             const sync::HornConfig hc = HornConfigNow();
             GLOGI("engine: vehicle signals (0.4.19): veh_horn_sync=%s, veh_horn_held=%s, veh_horn_stop=%s, veh_lights_keep=%s; indicators: the 3889 "
-                  "script API has no getter (GET_VEHICLE_INDICATOR_LIGHTS is in neither crossmap), so a controller sends them clear and a copy shows "
-                  "them only if something sets the bits; wheel spin: a copy moves by SET_ENTITY_VELOCITY every frame (its wheels roll on the road; no "
+                  "script API has no getter (GET_VEHICLE_INDICATOR_LIGHTS is in neither crossmap), so since 0.4.22 the controller's own key state "
+                  "machine is what goes in the flags2 bits (veh_keys / veh_indicator_sync, below); wheel spin: a copy moves by SET_ENTITY_VELOCITY every frame (its wheels roll on the road; no "
                   "script read-back of a wheel's speed exists); steering: SET_VEHICLE_STEER_BIAS every frame (no read-back of the wheel angle exists)",
                   g_hornSync.load() ? "on (a rise starts the horn at once, renewed while held)" : "OFF (0.4.17: START_VEHICLE_HORN 400 ms per received state)",
                   g_hornHeld.load() ? "on (mode HELDDOWN)" : "OFF (mode 0)",
@@ -1720,9 +1875,26 @@ namespace {
             GLOGI("engine: vehicle signals (0.4.19): horn hold %d ms renewed every %.0f ms, let go after %.0f ms without a state; mode hash 0x%08x",
                   hc.holdMs, hc.renewMs, hc.staleMs, g_hornHeld.load() ? (unsigned)kHornModeHeldDown : 0u);
         }
+        g_vcKeys.store(reg::Get(L"veh_keys") != L"0");                          // 0.4.22: the vehicle keys and their mechanics (0 = none of it)
+        g_vcAutoCancel.store(reg::Get(L"veh_indicator_autocancel") != L"0");    // 0.4.22: a single indicator goes out after a completed turn
+        g_vcIndSync.store(reg::Get(L"veh_indicator_sync") != L"0");             // 0.4.22: the indicator bits go on the wire and onto copies
+        g_vcFuelUse.store(reg::Get(L"fuel_use") == L"1");                        // 0.4.22: an empty tank cuts / refuses the engine (default OFF: no pumps yet)
+        g_vcReset.store(true);                                                  // the script tick forgets the cars it switched off (g_vc is its own)
+        GLOGI("engine: vehicle controls (0.4.22): veh_keys=%s, veh_indicator_autocancel=%s, veh_indicator_sync=%s, fuel_use=%s; keys: Left / Right Arrow "
+              "indicators, Down Arrow hazards, Y engine, B seatbelt (H = GTA's own headlights); GTA controls held disabled in a vehicle: 172-175 (the arrow "
+              "keys' cellphone controls), 29 (B), 246 (Y)",
+              g_vcKeys.load() ? "on" : "OFF (no key read, nothing issued or drawn)",
+              g_vcAutoCancel.load() ? "on (45 degrees of turn, the wheel centred 0.4 s)" : "OFF",
+              g_vcIndSync.load() ? "on (kVeh2IndicatorL / R sent and applied on copies)" : "OFF (the bits are neither sent nor applied)",
+              g_vcFuelUse.load() ? "ON (an empty tank cuts the engine of our own car and it will not start)" : "off (the gauge only shows the level)");
         MapReadSwitches();                                           // 0.4.20: map_clear_blips / map_reveal
+        MinimapReadSwitches();                                       // 0.4.22: minimap / minimap_bars
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
+        g_vehRearSeats.store(reg::Get(L"veh_rear_seats") != L"0");     // 0.4.22: F / G may pick the rear seats (0 = driver + front passenger only)
+        g_vehLocks.store(reg::Get(L"veh_locks") != L"0");              // 0.4.22: the L key and the lock read-back on the copies (0 = neither)
+        g_dsState = DoorsSeatsState();                                 // a new session: no pick waiting for a read-back, no lock answer pending, no keys
+        LogDoorsSeatsSwitches();                                       // 0.4.22 (defined with the F / G entry)
         {
             // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
             const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
@@ -3167,6 +3339,7 @@ namespace {
         }
         else if (verb == "stopanim") c.kind = Command::StopAnim;
         else if (verb == "swing") c.kind = Command::Swing;     // R4 T3: a punch on the nearest other player's puppet, the next survey attempt (local only)
+        else if (verb == "noclip") c.kind = Command::Noclip;   // 0.4.22: the Tab menu's Noclip row sends this; toggles (libs/sync/noclip.h)
         else return false;  // unknown: let it go to the server as chat
 
         std::lock_guard<std::mutex> lk(g_cmdMtx);
@@ -3243,6 +3416,9 @@ namespace {
                 break;
             case Command::Swing:
                 RunSwingTest(lp);
+                break;
+            case Command::Noclip:
+                g_noclipToggle = true;                 // TickNoclip (right after this) decides: start, stop, or refuse with a reason
                 break;
             case Command::StopAnim:
                 g_localEmote.Stop();
@@ -3340,8 +3516,9 @@ namespace {
         float satFrac = g_satiety / 100.0f;
         satFrac = satFrac < 0 ? 0 : (satFrac > 1 ? 1 : satFrac);
 
-        // Fuel is server-authoritative and comes in a later phase: no client-side fuel here.
-        game::Overlay::SetVitals(hpFrac, satFrac, 0.0f, g_life == Life::Alive, false);
+        // Fuel is server-owned (VehicleState.fuelPermille; no native reads one in 3889: GET_VEHICLE_FUEL_LEVEL is FiveM-only). 0.4.22: the gauge on the
+        // speedometer plate shows the level of the networked car we sit in (TickVehicleControls sets g_fuelHud earlier in this tick).
+        game::Overlay::SetVitals(hpFrac, satFrac, g_fuelHud.frac, g_life == Life::Alive, g_fuelHud.show);
     }
 
     // ---- the in-game UI (overlay) -----------------------------------------
@@ -3567,6 +3744,232 @@ namespace {
         }
         if (out.justClosed)
             GLOGI("engine: pause menu closed after %.1f s", (nowMs - g_pauseOpenedAtMs) / 1000.0);
+    }
+
+    // ---- 0.4.22 minimap (GI: "add a minimap"). sync/minimap.h decides; this is the only DISPLAY_RADAR caller. Script tick only. ----
+    // Every tick (from the first one with a ped): DISPLAY_RADAR(wanted), GTA's bars hidden through the "minimap" movie while it shows, and passive read-backs
+    // every 100 ms. The 10 s line counts what the read-backs said once a decision has stood for kMiniSettleMs (the render side lags a toggle by a frame or two).
+    struct MinimapStats
+    {
+        uint32_t ticks = 0, wantedTicks = 0, radarOn = 0, radarOff = 0, radarUncallable = 0;
+        uint32_t samples = 0, hudHidden = 0, prefOff = 0, waypointSamples = 0, readUnresolved = 0;
+        uint32_t wSettled = 0, wHiddenTrue = 0, wRenderFalse = 0;     // radar wanted: IS_RADAR_HIDDEN reading true / IS_MINIMAP_RENDERING reading false are the bad answers
+        uint32_t uSettled = 0, uHiddenFalse = 0;                        // radar not wanted: IS_RADAR_HIDDEN reading false is the bad answer
+        uint32_t setupOk = 0, setupBeginRefused = 0, barsUncallable = 0, requestFailed = 0;
+    };
+    constexpr double kMiniSettleMs = 500.0, kMiniSampleMs = 100.0, kMiniLogMs = 10000.0, kMiniSafeZoneMs = 2000.0;
+    MinimapStats g_mini;
+    float g_miniSafe = 1.0f;                  // GET_SAFE_ZONE_SIZE (read every kMiniSafeZoneMs; the player can change it in the settings)
+    bool g_miniSafeOk = false;
+    double g_miniSafeMs = -1e18;
+    bool g_miniWanted = false;
+    double g_miniChangeMs = 0, g_miniSampleMs = 0, g_miniLogMs = 0;
+    int g_miniMovie = 0;                      // the "minimap" scaleform handle (0 = not yet requested / refused)
+    bool g_miniMovieLoaded = false;           // HAS_SCALEFORM_MOVIE_LOADED at the last check
+    int g_miniTransitions = 0;                // radar on / off changes logged (capped)
+
+    // Where GTA puts the radar against what our overlay drew last frame. The persistent plates (chat, mark, speedometer, vitals) must stay clear of it; the Tab
+    // menu is modal (the scrim dims the radar under it), so it is reported apart.
+    std::string MinimapClearance()
+    {
+        using game::Overlay::UiState;
+        // LastUiState copies a struct the render thread rewrites each frame: take it twice and use it only when the fields we read agree.
+        const UiState a = game::Overlay::LastUiState();
+        const UiState b = game::Overlay::LastUiState();
+        auto same = [](float x, float y) { return x == y; };
+        if (!a.valid || !same(a.displayW, b.displayW) || !same(a.displayH, b.displayH) || !same(a.chatX, b.chatX) || !same(a.chatH, b.chatH) ||
+            !same(a.logoX, b.logoX) || !same(a.speedoX, b.speedoX) || !same(a.vitalsX, b.vitalsX) || !same(a.invX, b.invX))
+            return "overlay layout not read (no frame drawn yet, or it changed under the read)";
+        const float sz = g_miniSafe;             // the value the overlay was given (TickMinimap reads it every 2 s)
+        const bool szOk = g_miniSafeOk;
+        const sync::ScreenRect keep = sync::RadarKeepOut(a.displayW, a.displayH, sz, szOk, 0.02f);
+        const sync::ScreenRect radar = sync::RadarKeepOut(a.displayW, a.displayH, sz, szOk, 0.0f);
+        auto rect = [](float x, float y, float w, float h) { sync::ScreenRect r; r.x0 = x; r.y0 = y; r.x1 = x + w; r.y1 = y + h; return r; };
+        std::string hit;
+        auto test = [&](const char* name, bool present, const sync::ScreenRect& r) {
+            if (present && sync::RectsOverlap(keep, r))
+                hit += (hit.empty() ? "" : ", ") + std::string(name);
+        };
+        test("chat", a.chatW > 0.0f && a.chatH > 0.0f, rect(a.chatX, a.chatY, a.chatW, a.chatH));
+        test("mark", a.logoW > 0.0f, rect(a.logoX, a.logoY, a.logoW, a.logoH));
+        test("speedometer", a.speedoVisible, rect(a.speedoX, a.speedoY, a.speedoW, a.speedoH));
+        // The vitals plate is meant to touch the radar while it is docked under it (it takes its left edge and width); only a plate that
+        // stayed in the bottom-right cluster is tested like the other plates.
+        test("vitals", a.vitalsVisible && !a.vitalsDocked, rect(a.vitalsX, a.vitalsY, a.vitalsW, a.vitalsH));
+        const bool tabOver = a.invOpen && sync::RectsOverlap(keep, rect(a.invX, a.invY, a.invW, a.invH));
+        char buf[900];
+        std::snprintf(buf, sizeof(buf),
+                      "overlay %s the radar (display %.0fx%.0f, safe zone %.2f%s, radar x %.0f-%.0f y %.0f-%.0f, kept clear incl. a 2 %% gutter x %.0f-%.0f y %.0f-%.0f)%s%s%s",
+                      hit.empty() ? "CLEAR of" : "OVERLAPS", (double)a.displayW, (double)a.displayH, (double)sync::SafeZoneClamped(sz, szOk),
+                      szOk ? " read" : " UNREADABLE, worst case taken", (double)radar.x0, (double)radar.x1, (double)radar.y0, (double)radar.y1,
+                      (double)keep.x0, (double)keep.x1, (double)keep.y0, (double)keep.y1, hit.empty() ? "" : ": ", hit.c_str(),
+                      a.invOpen ? (tabOver ? "; Tab menu open and over the radar (modal, dimmed)" : "; Tab menu open, clear") : "");
+        std::string out = buf;
+        // Where the vitals plate went and why (the overlay's own layout, read back).
+        const char* why = a.vitalsDockWhy >= 0 && a.vitalsDockWhy <= (int)sync::DockWhy::CoversRadar ? sync::DockWhyName((sync::DockWhy)a.vitalsDockWhy)
+                                                                                                     : "dock not asked";
+        if (!a.vitalsVisible)
+            out += "; vitals plate hidden now (" + std::string(why) + ")";
+        else
+        {
+            char vb[360];
+            std::snprintf(vb, sizeof(vb), "; vitals plate %s at x %.0f-%.0f y %.0f-%.0f (%s)", a.vitalsDocked ? "DOCKED under the radar" : "bottom-right",
+                          (double)a.vitalsX, (double)(a.vitalsX + a.vitalsW), (double)a.vitalsY, (double)(a.vitalsY + a.vitalsH), why);
+            out += vb;
+            if (a.vitalsDocked)
+            {
+                const float rh = a.radarH > 0.0f ? a.radarH : (radar.y1 - radar.y0);
+                std::snprintf(vb, sizeof(vb), "; it reaches %.0f px (%.0f %%) up into the radar, radar left edge %.0f width %.0f, plate left edge %.0f width %.0f",
+                              (double)a.vitalsCoverPx, rh > 0.0f ? (double)(100.0f * a.vitalsCoverPx / rh) : 0.0, (double)a.radarX, (double)a.radarW,
+                              (double)a.vitalsX, (double)a.vitalsW);
+                out += vb;
+            }
+        }
+        return out;
+    }
+
+    void LogMinimap(double nowMs, bool wanted)
+    {
+        MinimapStats& s = g_mini;
+        const sync::BarsGate::Stats& bs = g_barsGate.Counters();
+        const sync::BarsMode bm = g_barsGate.Mode();
+        const std::string clearance = wanted ? MinimapClearance() : std::string("radar not shown now");
+        GLOGI("engine: minimap (0.4.22), last 10 s: minimap=%s minimap_bars=%s; radar wanted %u of %u ticks (DISPLAY_RADAR true %u / false %u / uncallable %u); "
+              "%u read-back samples, those %.0f ms after a change: radar wanted %u -> IS_RADAR_HIDDEN true %u (expect 0), IS_MINIMAP_RENDERING false %u (expect 0); "
+              "radar not wanted %u -> IS_RADAR_HIDDEN false %u (expect 0); IS_HUD_HIDDEN true in %u; profile radar preference OFF in %u (the game draws no radar then); "
+              "natives unresolved %u; waypoint active in %u samples; bars: movie handle %d %s, SETUP_HEALTH_ARMOUR called %u (begin refused %u, uncallable %u), "
+              "movie requests %u (failed %u), big-radar flip on %u / off %u, left on %s (no getter shows the bars themselves); %s",
+              g_minimap.load() ? "on" : "OFF", sync::BarsModeName(bm), s.wantedTicks, s.ticks, s.radarOn, s.radarOff, s.radarUncallable, s.samples, kMiniSettleMs,
+              s.wSettled, s.wHiddenTrue, s.wRenderFalse, s.uSettled, s.uHiddenFalse, s.hudHidden, s.prefOff, s.readUnresolved, s.waypointSamples, g_miniMovie,
+              g_miniMovieLoaded ? "loaded" : "NOT loaded", s.setupOk, s.setupBeginRefused, s.barsUncallable, bs.requests, s.requestFailed, bs.refreshOn,
+              bs.refreshOff, g_barsGate.BigmapOn() ? "YES" : "no", clearance.c_str());
+        g_barsGate.ClearCounters();
+        s = MinimapStats();
+    }
+
+    void TickMinimap(double nowMs)
+    {
+        MinimapStats& s = g_mini;
+        if (g_barsReset.exchange(false))
+        {
+            g_barsGate.SetMode((sync::BarsMode)g_barsMode.load());
+            g_barsGate.Reset();
+        }
+        sync::RadarInputs in;
+        in.switchOn = g_minimap.load();
+        in.entryDone = g_entry.load() == Entry::Done;
+        in.pauseMenuActive = g_pauseMenuActive;
+        const bool wanted = sync::RadarWanted(in);
+        if (wanted != g_miniWanted)
+        {
+            g_miniWanted = wanted;
+            g_miniChangeMs = nowMs;
+            if (g_miniTransitions < 24)
+            {
+                ++g_miniTransitions;
+                GLOGI("engine: minimap (0.4.22): radar %s (minimap=%s, entry %s, pause menu %s)", wanted ? "SHOWN" : "hidden", in.switchOn ? "on" : "OFF",
+                      in.entryDone ? "done" : "not done", in.pauseMenuActive ? "up" : "closed");
+            }
+        }
+        if (!in.entryDone)
+            g_miniLogMs = 0;                     // the 10 s line is for play, not for loading
+        // The overlay docks the vitals plate under the radar while the minimap switch is on (it cannot call a native, so the safe zone comes from here).
+        if (nowMs - g_miniSafeMs >= kMiniSafeZoneMs)
+        {
+            g_miniSafeMs = nowMs;
+            g_miniSafeOk = g_world->SafeZoneSize(g_miniSafe);
+        }
+        game::Overlay::SetRadarDock(in.switchOn, g_miniSafe, g_miniSafeOk);
+        ++s.ticks;
+        if (wanted)
+            ++s.wantedTicks;
+        if (g_world->DisplayRadar(wanted))
+            ++(wanted ? s.radarOn : s.radarOff);
+        else
+            ++s.radarUncallable;
+
+        // GTA's health / armour bars: the gate decides, this performs. The movie's loaded flag is read only when the gate could use it.
+        sync::BarsInputs bi;
+        bi.radarOn = wanted;
+        bi.haveHandle = g_miniMovie != 0;
+        if (wanted && g_barsGate.Mode() != sync::BarsMode::Off && bi.haveHandle)
+            g_miniMovieLoaded = g_world->ScaleformLoaded(g_miniMovie);
+        bi.loaded = bi.haveHandle && g_miniMovieLoaded;
+        switch (g_barsGate.Next(bi, nowMs))
+        {
+        case sync::BarsAction::None:
+            break;
+        case sync::BarsAction::Request:
+            g_miniMovie = g_world->RequestScaleform("minimap");
+            g_miniMovieLoaded = false;
+            if (!g_miniMovie)
+                ++s.requestFailed;
+            break;
+        case sync::BarsAction::RefreshOn:
+            if (!g_world->SetBigmap(true))
+                ++s.barsUncallable;
+            break;
+        case sync::BarsAction::RefreshOff:
+            if (!g_world->SetBigmap(false))
+                ++s.barsUncallable;
+            break;
+        case sync::BarsAction::Setup:
+        {
+            bool began = false;
+            if (!g_world->ScaleformCallInt(g_miniMovie, "SETUP_HEALTH_ARMOUR", sync::kBarsHideType, began))
+                ++s.barsUncallable;
+            else if (!began)
+                ++s.setupBeginRefused;
+            else
+                ++s.setupOk;
+            break;
+        }
+        }
+
+        // Passive read-backs (every mode, so minimap=0 shows the radar really is hidden).
+        if (nowMs - g_miniSampleMs >= kMiniSampleMs)
+        {
+            g_miniSampleMs = nowMs;
+            game::World::RadarReadback rb;
+            g_world->ReadRadar(rb);
+            ++s.samples;
+            if (!rb.hiddenOk || !rb.renderingOk || !rb.prefOk || !rb.hudOk || !rb.waypointOk)
+                ++s.readUnresolved;
+            if (rb.hudOk && rb.hudHidden)
+                ++s.hudHidden;
+            if (rb.prefOk && !rb.pref)
+                ++s.prefOff;
+            if (rb.waypointOk && rb.waypoint)
+                ++s.waypointSamples;
+            if (nowMs - g_miniChangeMs >= kMiniSettleMs)
+            {
+                if (wanted)
+                {
+                    ++s.wSettled;
+                    if (rb.hiddenOk && rb.hidden)
+                        ++s.wHiddenTrue;
+                    if (rb.renderingOk && !rb.rendering)
+                        ++s.wRenderFalse;
+                }
+                else
+                {
+                    ++s.uSettled;
+                    if (rb.hiddenOk && !rb.hidden)
+                        ++s.uHiddenFalse;
+                }
+            }
+        }
+
+        if (in.entryDone)
+        {
+            if (g_miniLogMs == 0)
+                g_miniLogMs = nowMs;
+            else if (nowMs - g_miniLogMs >= kMiniLogMs)
+            {
+                g_miniLogMs = nowMs;
+                LogMinimap(nowMs, wanted);
+            }
+        }
     }
 
     // A Pose heading ((-180, 180]) as the game's [0, 360).
@@ -7614,6 +8017,7 @@ namespace {
         ResetVehicleDamage(v);         // R3 T4: ... nor of the damage state, and every baseline starts over
         v.horn.Reset();                // 0.4.19: ... nor its horn or lights
         v.lightsKeep.Reset();
+        v.lockKeep.Reset();            // 0.4.22: ... nor its door lock
     }
 
     // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
@@ -7969,7 +8373,8 @@ namespace {
     {
         const int32_t h = v.handle;
         const proto::VehicleState& st = v.st;
-        const sync::BodyDelta d = sync::DiffBody(v.bodyShown, st.flags2, st.doors);
+        sync::BodyDelta d = sync::DiffBody(v.bodyShown, st.flags2, st.doors);
+        d.flags2 = sync::CopyFlags2Delta(d.flags2, g_vcIndSync.load(std::memory_order_relaxed));   // 0.4.22: veh_indicator_sync=0 leaves the indicators alone
         if (!d.Any())
             return;
         const bool instantly = !v.bodyShown.valid;
@@ -7978,9 +8383,9 @@ namespace {
         if (d.flags2 & proto::kVeh2Interior)
             g_world->SetVehicleInteriorLight(h, (st.flags2 & proto::kVeh2Interior) != 0);
         if (d.flags2 & proto::kVeh2IndicatorL)
-            g_world->SetVehicleIndicatorLights(h, 1, (st.flags2 & proto::kVeh2IndicatorL) != 0);
+            ++(g_world->SetVehicleIndicatorLights(h, 1, (st.flags2 & proto::kVeh2IndicatorL) != 0) ? g_vcx.copyIndApplied : g_vcx.copyIndFailed);
         if (d.flags2 & proto::kVeh2IndicatorR)
-            g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0);
+            ++(g_world->SetVehicleIndicatorLights(h, 0, (st.flags2 & proto::kVeh2IndicatorR) != 0) ? g_vcx.copyIndApplied : g_vcx.copyIndFailed);
         if (d.flags2 & proto::kVeh2Brake)
             ++(g_world->SetVehicleBrakeLights(h, (st.flags2 & proto::kVeh2Brake) != 0) ? g_vis.brakeSet : g_vis.brakeFail);
         // The first sight applies "released" too: a copy must not keep a handbrake of its own. With the sanity layer on (R3 T4) the handbrake is
@@ -8027,8 +8432,13 @@ namespace {
         const int lock = (st.flags & proto::kVehLocked) ? 2 : 1;
         if (lock != v.appliedLock)
         {
-            g_world->SetVehicleDoorsLocked(h, lock);
+            const bool ok = g_world->SetVehicleDoorsLocked(h, lock);
+            // 0.4.22: a lock that is not the unlocked default (or a change of one) is logged; the keeper reads it back at once and again every second
+            if (lock == sync::kLockLocked || v.appliedLock >= 0)
+                GLOGI("engine: doors: vehicle id=%u is now %s (the server's flag): SET_VEHICLE_DOORS_LOCKED(%d) %s", (unsigned)st.id,
+                      lock == sync::kLockLocked ? "LOCKED" : "UNLOCKED", lock, ok ? "called" : "NOT callable");
             v.appliedLock = lock;
+            v.lockKeep.Reset();
         }
         // SET_VEHICLE_LIGHTS: 0 normal, 1 forced off, 2 forced on. Our own car: forced on by the server's override
         // only. A copy: on when the override or the controller's actual headlights say so, else forced off (a
@@ -8055,6 +8465,7 @@ namespace {
         {
             g_world->SetVehicleEngineOn(h, engine != 0);
             v.appliedEngine = engine;
+            ++g_vcx.copyEngineApplied;                 // 0.4.22: the controller's Y (the engine bit) reaches this copy
         }
         const int siren = (st.flags & proto::kVehSiren) ? 1 : 0;
         if (siren != v.appliedSiren)
@@ -8300,7 +8711,16 @@ namespace {
             g_world->SetEntityVelocity(v.handle, nvx, nvy, vz);
             const bool haveRot = g_world->GetEntityRotationVelocity(v.handle, ax, ay, az);
             if (haveRot && std::fabs(d.dw) > 1e-3)
-                g_world->SetEntityAngularVelocity(v.handle, ax, ay, az + (float)d.dw);
+            {
+                // 0.4.22: (ax, ay, az) is the WORLD angular velocity and the setter takes a BODY vector: written back unchanged the x / y part
+                // (pitch / roll rates) came out turned by the heading. Hand it the body-frame version when the orientation can be read.
+                sync::DriveVec wv = { ax, ay, az + (float)d.dw };
+                float oqx = 0, oqy = 0, oqz = 0, oqw = 1;
+                if (g_shakeFix.load() && g_angJudge.UseBody() && g_world->GetEntityQuaternion(v.handle, oqx, oqy, oqz, oqw))
+                    wv = sync::shake::WorldToBody({ oqx, oqy, oqz, oqw }, wv);
+                g_world->SetEntityAngularVelocity(v.handle, wv.x, wv.y, wv.z);
+                ++g_shk.impactAngWrites;
+            }
             v.impactTracker.NoteWritten({ nvx, nvy }, haveRot ? az + d.dw : 0.0, d.dv, d.dw);
             ++g_t4.applied;
             {
@@ -8487,6 +8907,8 @@ namespace {
                     ResetVehicleDamage(v);             // R3 T4: new role, new baselines
                     v.horn.Reset();                    // 0.4.19: the new controller's horn and lights start afresh
                     v.lightsKeep.Reset();
+                    // 0.4.22: a car we take over keeps blinking what it showed (hazards on a parked car): our updates start from the server's bits.
+                    v.ctlInd = g_vcIndSync.load(std::memory_order_relaxed) ? (uint8_t)(st.flags2 & sync::kVcIndBoth) : (uint8_t)0;
                 }
                 if (v.appliedVersion != v.stVersion)
                 {
@@ -8638,6 +9060,14 @@ namespace {
                                     ++g_r4.ownUnder3m;
                             }
                             sync::VehicleDriveOutput o = v.drive.Update(in);
+                            {
+                                // 0.4.22 shake meter: the error vectors the controller worked from (target - local, and the rotation that takes the local
+                                // pose to the target), by the target's speed; a snapped frame restarts the history
+                                const sync::DriveVec pe = { s.pos.x - in.localPos.x, s.pos.y - in.localPos.y, s.pos.z - in.localPos.z };
+                                const sync::DriveVec re = sync::vq::Log(sync::vq::Mul(sync::vq::Normalize(s.rot), sync::vq::Conj(sync::vq::Normalize(in.localRot))));
+                                v.shake.Add(in.dtMs, pe, re,
+                                            std::sqrt((double)s.vel.x * s.vel.x + (double)s.vel.y * s.vel.y + (double)s.vel.z * s.vel.z), o.snap);
+                            }
                             {
                                 // R4 T2: what did the flag touch (the evidence we can read), what the gate decided, and the watch that compares this copy with its owner after the contact
                                 if (in.contact)
@@ -8823,9 +9253,21 @@ namespace {
                                 g_world->SetEntityVelocity(h, o.velocity.x, o.velocity.y, o.velocity.z);
                             if (o.setAngularVelocity)
                             {
-                                const sync::DriveVec& w = g_vehAngBody.load(std::memory_order_relaxed)
-                                                              ? o.angularVelocityBody : o.angularVelocity;
+                                // 0.4.22: the setter takes the BODY frame (libs/sync/vehicle_shake.h); the controller's world vector went in unchanged
+                                // before. With the fix on the frame follows the judge; veh_shake_fix=0 keeps veh_angframe's choice (default world).
+                                const bool bodyFrame = g_shakeFix.load(std::memory_order_relaxed) ? g_angJudge.UseBody()
+                                                                                                 : g_vehAngBody.load(std::memory_order_relaxed);
+                                const sync::DriveVec& w = bodyFrame ? o.angularVelocityBody : o.angularVelocity;
                                 g_world->SetEntityAngularVelocity(h, w.x, w.y, w.z);
+                                ++g_shk.copyAngWrites;
+                                ++(bodyFrame ? g_shk.copyAngBody : g_shk.copyAngWorld);
+                                if (++v.angWrites % kShakeAngCheckEvery == 0)
+                                {
+                                    // the read-back of the evidence: the world vector the game now reports against what the frames predict
+                                    float rx = 0, ry = 0, rz = 0;
+                                    if (g_world->GetEntityRotationVelocity(h, rx, ry, rz))
+                                        g_angJudge.Add(sync::shake::ClassifyAngWrite(o.setQuaternion ? o.rot : (o.snap ? o.snapRot : in.localRot), w, { rx, ry, rz }));
+                                }
                             }
                             // Steering (sync plan W2 D): the sender fills VehicleUpdate.steer from its yaw rate
                             // (sync::EstimateSteer). The wire is -1 left .. +1 right and SET_VEHICLE_STEER_BIAS
@@ -9089,11 +9531,16 @@ namespace {
                 if (si.bone[s] >= 0)
                     ++found;
             }
+            // 0.4.22: both seat-count natives (the vehicle's own count excludes the driver, the model's includes him); the larger wins.
             const int passengers = g_world->GetVehicleMaxPassengers(veh);
-            si.maxSeats = passengers >= 0 ? std::min(passengers + 1, sync::kEntrySeats) : 2;
-            GLOGI("engine: vehicle: model 0x%08x has %d seats%s; %d of 8 seat bones found%s", (unsigned)model,
-                  si.maxSeats, passengers >= 0 ? "" : " (GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS not callable: assumed)",
-                  found, found == 0 ? " -- door positions use fixed offsets" : "");
+            const int modelSeats = g_world->GetVehicleModelNumberOfSeats(model);
+            const sync::SeatCount sc = sync::ResolveSeatCount(passengers, modelSeats);
+            si.maxSeats = sc.seats;
+            GLOGI("engine: vehicle: model 0x%08x has %d seats (GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS %d%s, GET_VEHICLE_MODEL_NUMBER_OF_SEATS %d%s)%s%s; "
+                  "%d of 8 seat bones found%s", (unsigned)model, si.maxSeats, passengers, passengers >= 0 ? "" : " (not callable)", modelSeats,
+                  modelSeats >= 1 ? "" : " (not callable)", sc.disagree ? ", THE TWO DISAGREE: the larger is used" : "",
+                  !sc.fromVehicle && !sc.fromModel ? ", neither callable: assumed 2" : "", found,
+                  found == 0 ? " -- door positions use fixed offsets" : "");
         }
         return si;
     }
@@ -9103,10 +9550,11 @@ namespace {
     void FillEntryDoors(EntryCar& car)
     {
         const SeatInfo& si = SeatInfoFor(car.handle, car.model);
-        car.c.maxSeats = si.maxSeats;
+        const int offered = sync::SeatsOffered(si.maxSeats, g_vehRearSeats.load(std::memory_order_relaxed));   // 0.4.22: veh_rear_seats=0 stops at the front passenger
+        car.c.maxSeats = offered;
         sync::DriveQuat q;
         bool haveQ = false, triedQ = false;
-        for (int s = 0; s < si.maxSeats && s < sync::kEntrySeats; ++s)
+        for (int s = 0; s < offered && s < sync::kEntrySeats; ++s)
         {
             float x = car.x, y = car.y, z = car.z;
             if (si.bone[s] >= 0 && g_world->GetWorldPositionOfEntityBone(car.handle, si.bone[s], x, y, z))
@@ -9168,6 +9616,7 @@ namespace {
             // VehicleState.ownerId (v5): the pick avoids the driver's seat of a car somebody else owns (PickEntry),
             // and the server's NotOwner (12) is the authority if a stale view picked it anyway.
             car.c.ownerId = v.st.ownerId;
+            car.c.keyHolder = g_dsState.keys.Has((int)kv.first);   // 0.4.22: a car we drove last may be entered locked (the server decides: spawner / last driver)
             out.push_back(car);
         }
     }
@@ -9345,7 +9794,7 @@ namespace {
         // The keys. Disabled first: IS_DISABLED_CONTROL_JUST_PRESSED reads the control in its disabled state
         // (the pause menu's pattern). Presses while the chat or a panel has the keyboard are not ours.
         if (takeKeys)
-            for (const int control : { kControlEnter, kControlDetonate })
+            for (const int control : { kControlEnter, kControlDetonate, kControlThrowGrenade })   // 0.4.22: G is also the grenade throw on foot
             {
                 uint64_t args[] = { 0, (uint64_t)control, 1 };     // DISABLE_CONTROL_ACTION(0, control, true)
                 g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
@@ -9390,6 +9839,7 @@ namespace {
             g_entryWalk.startMs = nowMs;
             g_entryGuard.OnPress(nowMs);               // W9 item 3: the press is ours, control 23 stays disabled until seated + 500 ms
             ++g_v4.entryPresses;
+            ++(pressG ? g_ds.pressG : g_ds.pressF);    // 0.4.22
         }
         else
         {
@@ -9431,6 +9881,7 @@ namespace {
             {
                 EntryNotice(sync::EntryRefusalText(pick.reason), nowMs);
                 GLOGI("engine: vehicle: %s refused: %s", wantDriver ? "F" : "G", sync::EntryRefusalText(pick.reason));
+                ++(pick.reason == sync::EntryReason::Locked ? g_ds.refusedLocked : pick.reason == sync::EntryReason::Owned ? g_ds.refusedOwned : g_ds.refusedFull);
             }
             CancelEntryWalk(lp);                       // mid-walk: the seat went away (taken, locked): stop quietly
             return;
@@ -9449,9 +9900,30 @@ namespace {
         if (pick.doorDistM > kEntryWalkMaxM)
         {
             if (begin)
+            {
                 EntryNotice(sync::LocalVehicleLink::RefusalText(3 /* TooFar */), nowMs);
+                ++g_ds.refusedFar;
+            }
             CancelEntryWalk(lp);
             return;
+        }
+        // 0.4.22: arm the read-back of this pick (TickDoorsSeats compares it with the seat GTA really puts the ped in), and for the press that
+        // began the entry count the seat class and read IS_VEHICLE_SEAT_FREE (entering counts) next to the server's list, which called it free.
+        g_dsState.expect.active = true;
+        g_dsState.expect.netId = pick.netId;
+        g_dsState.expect.seat = pick.seat;
+        g_dsState.expect.atMs = nowMs;
+        if (begin)
+        {
+            ++g_ds.pickSeat[(int)sync::ClassifySeat(pick.seat)];
+            const int seatFree = g_world->VehicleSeatFreeState(car->handle, pick.seat - 1, true);
+            ++(seatFree < 0 ? g_ds.freeUnknown : seatFree ? g_ds.freeYes : g_ds.freeNo);
+            GLOGI("engine: doors: %s picked wire seat %d (GTA seat %d, %s) of vehicle id=%d, door %.2f m away; the model offers %d seats; "
+                  "IS_VEHICLE_SEAT_FREE (a ped entering counts) says %s while the server's list says free", wantDriver ? "F" : "G", pick.seat,
+                  pick.seat - 1, sync::ClassifySeat(pick.seat) == sync::SeatClass::Driver ? "driver"
+                  : sync::ClassifySeat(pick.seat) == sync::SeatClass::FrontPassenger ? "front passenger"
+                  : sync::ClassifySeat(pick.seat) == sync::SeatClass::Rear ? "REAR" : "further back", pick.netId, (double)pick.doorDistM,
+                  car->c.maxSeats, seatFree < 0 ? "unknown (not callable)" : seatFree ? "free" : "TAKEN");
         }
         if (begin && g_seatIntentOn.load() && !car->c.locked)
         {
@@ -9505,6 +9977,620 @@ namespace {
             g_entryWalk.taskMs = nowMs;
             g_entryWalk.target = pick.door;
         }
+    }
+
+    // ---- 0.4.22 noclip: the keys, the natives and the log lines around sync::noclip::Gate (libs/sync/noclip.h) ----------------------------
+    // The keys are read raw (GetAsyncKeyState), not through the game's controls: noclip's keys do not depend on what the player
+    // rebound, on the on-foot / vehicle context or on a control held disabled. Only while the game's window is the foreground
+    // window and neither the chat nor a Tab menu panel has the keyboard (Overlay::WantsInput).
+    bool NoclipOurWindowForeground()
+    {
+        const HWND fg = GetForegroundWindow();
+        if (!fg)
+            return false;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        return pid == GetCurrentProcessId();
+    }
+
+    bool NoclipKeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+    sync::noclip::Keys ReadNoclipKeys()
+    {
+        sync::noclip::Keys k;
+        if (game::Overlay::WantsInput() || !NoclipOurWindowForeground())
+            return k;
+        k.fwd = NoclipKeyDown('W');
+        k.back = NoclipKeyDown('S');
+        k.left = NoclipKeyDown('A');
+        k.right = NoclipKeyDown('D');
+        k.up = NoclipKeyDown(VK_SPACE);
+        k.down = NoclipKeyDown(VK_CONTROL);
+        k.fast = NoclipKeyDown(VK_SHIFT);
+        k.slow = NoclipKeyDown(VK_MENU);
+        return k;
+    }
+
+    sync::noclip::GroundRead NoclipGround(float x, float y, float z)
+    {
+        sync::noclip::GroundRead g;
+        float gz = 0;
+        if (g_world->GetGroundZ(x, y, z, gz))
+        {
+            g.found = true;
+            g.z = gz;
+        }
+        return g;
+    }
+
+    const char* NoclipSubjectName(sync::noclip::Subject s)
+    {
+        switch (s)
+        {
+        case sync::noclip::Subject::Ped: return "ped";
+        case sync::noclip::Subject::Vehicle: return "vehicle";
+        case sync::noclip::Subject::None: break;
+        }
+        return "none";
+    }
+
+    const char* NoclipEndName(sync::noclip::EndWhy w)
+    {
+        switch (w)
+        {
+        case sync::noclip::EndWhy::Toggled: return "toggled off";
+        case sync::noclip::EndWhy::SwitchedOff: return "noclip=0";
+        case sync::noclip::EndWhy::NotReady: return "player not alive / not entered";
+        case sync::noclip::EndWhy::SubjectGone: return "the ped / vehicle changed or vanished";
+        case sync::noclip::EndWhy::None: break;
+        }
+        return "?";
+    }
+
+    const char* NoclipPhaseName(sync::noclip::Phase p)
+    {
+        switch (p)
+        {
+        case sync::noclip::Phase::On: return "on";
+        case sync::noclip::Phase::Landing: return "landing";
+        case sync::noclip::Phase::Off: break;
+        }
+        return "off";
+    }
+
+    float NoclipLen(float x, float y, float z) { return std::sqrt(x * x + y * y + z * z); }
+
+    // The 10 s line (quiet windows are skipped; the first one is always written, so the log shows the switch state).
+    void NoclipReport(double nowMs, bool enabled)
+    {
+        if (nowMs - g_noclipReportMs < 10000.0)
+            return;
+        g_noclipReportMs = nowMs;
+        const NoclipStats& s = g_noclipStats;
+        const uint32_t activity = s.onTicks + s.holdTicks + s.starts + s.endToggle + s.endSwitch + s.endNotReady + s.endGone +
+                                  s.refusedDisabled + s.refusedNotReady + s.refusedPassenger;
+        if (activity || g_noclipFirstReport)
+        {
+            g_noclipFirstReport = false;
+            GLOGI("engine: noclip (0.4.22): last 10 s: noclip=%s, now %s; started %u, ended %u (toggle %u, noclip=0 %u, player not alive %u, "
+                  "ped / vehicle gone %u), refused %u (noclip=0 %u, not ready %u, passenger %u); flying %u ticks (keys held %u, shift %u, alt %u, "
+                  "resynced %u), %d controls held disabled on %u ticks, landing-hold ticks %u, landed: placed %u, fell back to the last safe spot %u, "
+                  "left where it was %u; issued vs read back (%u samples every 0.5 s): collision off %u, collision back on %u (re-asserted), "
+                  "invincible %u, invincible lost %u (re-asserted); ground probes %u (valid %u); commanded speed max %.1f m/s, game speed max %.1f m/s, "
+                  "position drift max %.2f m (game vs what was written), height %.1f m, camera pitch %.1f yaw %.1f; uncallable %u",
+                  enabled ? "on" : "OFF", NoclipPhaseName(g_noclip.GetPhase()), s.starts,
+                  s.endToggle + s.endSwitch + s.endNotReady + s.endGone, s.endToggle, s.endSwitch, s.endNotReady, s.endGone,
+                  s.refusedDisabled + s.refusedNotReady + s.refusedPassenger, s.refusedDisabled, s.refusedNotReady, s.refusedPassenger,
+                  s.onTicks, s.keysHeld, s.fastTicks, s.slowTicks, s.resyncs, sync::noclip::kDisabledControlCount, s.controlHolds, s.holdTicks,
+                  s.placed, s.fellBack, s.skipped, s.samples, s.collisionOff, s.collisionBackOn, s.invincibleOn, s.invincibleLost,
+                  s.groundProbes, s.groundValid, s.cmdSpeedMax, s.gameSpeedMax, s.driftMax, s.heightLast, s.camPitchLast, s.camYawLast,
+                  s.uncallable);
+        }
+        g_noclipStats = NoclipStats();
+    }
+
+    // Every script tick, on the entered player (the call sits after RunCommands, before TickVehicleEntry). lp = the local ped,
+    // lpVeh = the vehicle it is in (0 on foot).
+    void TickNoclip(int32_t lp, int32_t lpVeh, double nowMs)
+    {
+        namespace nc = sync::noclip;
+        NoclipStats& st = g_noclipStats;
+        const bool toggle = g_noclipToggle;
+        g_noclipToggle = false;
+        const bool enabled = g_noclipSwitch.load();
+        if (g_noclip.GetPhase() == nc::Phase::Off && !toggle)
+        {
+            game::Overlay::SetNoclip(enabled, false);
+            NoclipReport(nowMs, enabled);
+            return;
+        }
+
+        const bool wasOn = g_noclip.GetPhase() == nc::Phase::On;
+        nc::In in;
+        in.nowMs = nowMs;
+        in.enabled = enabled;
+        in.toggle = toggle;
+        in.ready = lp && g_life == Life::Alive && g_entry.load() == Entry::Done && !g_world->IsPedDeadOrDying(lp);
+        if (in.ready)
+        {
+            if (lpVeh && g_world->GetPedInVehicleSeat(lpVeh, -1) == lp)
+            {
+                in.entity = lpVeh;
+                in.subject = nc::Subject::Vehicle;
+            }
+            else
+            {
+                in.entity = lp;
+                in.subject = nc::Subject::Ped;
+                in.passenger = lpVeh != 0;
+            }
+            if (!g_world->GetEntityCoords(in.entity, in.pos.x, in.pos.y, in.pos.z))
+            {
+                in.entity = 0;                           // cannot be read: gone (Off: not ready; flying: the subject changed)
+                in.subject = nc::Subject::None;
+            }
+        }
+        const bool flying = g_noclip.Active();
+        if (!flying && toggle && enabled && in.ready && in.entity && !in.passenger)
+        {
+            // The flags noclip changes, read before anything is set (they are given back exactly as read).
+            bool disabled = false;
+            if (g_world->GetEntityCollisionDisabled(in.entity, disabled))
+                in.read.collision = !disabled;
+            else
+                ++st.uncallable;
+            bool inv = false;
+            if (g_world->GetPlayerInvincible(inv))
+                in.read.invincible = inv;
+            else
+                ++st.uncallable;
+        }
+        static float s_pitch = 0, s_yaw = 0;
+        if (flying)
+        {
+            in.keys = ReadNoclipKeys();
+            float pitch = 0, roll = 0, yaw = 0;
+            if (g_world->GetGameplayCamRot(pitch, roll, yaw))
+            {
+                s_pitch = pitch;
+                s_yaw = yaw;
+            }
+            in.pitchDeg = s_pitch;
+            in.yawDeg = s_yaw;
+            st.camPitchLast = s_pitch;
+            st.camYawLast = s_yaw;
+            if (in.entity)
+            {
+                g_world->RequestCollisionAt(in.pos.x, in.pos.y, in.pos.z);   // the world around has to have collision when we land
+                const bool ending = wasOn && (toggle || !enabled);
+                if (ending || g_noclip.GetPhase() == nc::Phase::Landing)
+                {
+                    in.probed = true;
+                    in.below = NoclipGround(in.pos.x, in.pos.y, in.pos.z);
+                    in.above = NoclipGround(in.pos.x, in.pos.y, in.pos.z + nc::kHighProbeM);
+                    ++st.groundProbes;
+                    if (nc::GroundValid(in.below) || nc::GroundValid(in.above))
+                        ++st.groundValid;
+                }
+                else if (nowMs - g_noclipProbeMs >= nc::kProbeEveryMs)
+                {
+                    g_noclipProbeMs = nowMs;
+                    in.probed = true;
+                    in.below = NoclipGround(in.pos.x, in.pos.y, in.pos.z);
+                    ++st.groundProbes;
+                    if (nc::GroundValid(in.below))
+                        ++st.groundValid;
+                }
+            }
+        }
+
+        const nc::Out out = g_noclip.Tick(in);
+
+        if (out.refused != nc::Refusal::None)
+        {
+            const char* say = "";
+            switch (out.refused)
+            {
+            case nc::Refusal::Disabled:
+                ++st.refusedDisabled;
+                say = "Noclip is turned off on this PC (noclip=0 in the launcher settings).";
+                break;
+            case nc::Refusal::NotReady:
+                ++st.refusedNotReady;
+                say = "Noclip needs a living character in the world.";
+                break;
+            case nc::Refusal::Passenger:
+                ++st.refusedPassenger;
+                say = "Noclip: you are a passenger. Take the driver's seat, or leave the vehicle first.";
+                break;
+            case nc::Refusal::None:
+                break;
+            }
+            game::Overlay::PushSystemLine(say);
+            GLOGI("engine: noclip (0.4.22): refused: %s", say);
+        }
+
+        // The game's own controls stay out of the way while noclip owns the keys (a per-frame effect, hence every tick).
+        if (g_noclip.Active() || out.end)
+        {
+            for (const int control : nc::kDisabledControls)
+            {
+                uint64_t args[] = { 0, (uint64_t)control, 1 };  // DISABLE_CONTROL_ACTION(0, control, true)
+                g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+            }
+            ++st.controlHolds;
+        }
+
+        if (out.begin)
+        {
+            CancelEntryWalk(lp);                         // a F / G walk to a car must not run under a flying ped
+            g_noclipHaveWritten = false;
+            g_noclipProbeMs = nowMs;
+            const bool a = g_world->SetEntityCollision(out.entity, false);
+            const bool b = g_world->SetEntityHasGravity(out.entity, false);
+            const bool c = g_world->SetPlayerInvincible(true);
+            const bool d = out.subject != nc::Subject::Vehicle || g_world->SetEntityInvincible(out.entity, true);
+            if (!a || !b || !c || !d)
+                ++st.uncallable;
+            ++st.starts;
+            bool disabledNow = false;
+            const bool rb = g_world->GetEntityCollisionDisabled(out.entity, disabledNow);
+            GLOGI("engine: noclip (0.4.22): ON, %s %d at %.1f %.1f %.1f; flags read first: collision %s, gravity %s (no getter), invincible %s; "
+                  "set: collision off %s, gravity off %s, invincible on %s%s; collision-disabled read-back %s",
+                  NoclipSubjectName(out.subject), out.entity, in.pos.x, in.pos.y, in.pos.z, g_noclip.Saved().collision ? "on" : "off",
+                  g_noclip.Saved().gravity ? "on" : "off", g_noclip.Saved().invincible ? "on" : "off", a ? "ok" : "FAILED", b ? "ok" : "FAILED",
+                  c ? "ok" : "FAILED", out.subject == nc::Subject::Vehicle ? (d ? ", vehicle invincible ok" : ", vehicle invincible FAILED") : "",
+                  rb ? (disabledNow ? "yes" : "NO (the game ignored it)") : "uncallable");
+            game::Overlay::PushSystemLine("Noclip on: W A S D fly along the view, Space up, Ctrl down, Shift fast, Alt slow.");
+        }
+
+        if (out.move)
+        {
+            ++st.onTicks;
+            ++st.moves;
+            if (in.keys.Any())
+            {
+                ++st.keysHeld;
+                if (in.keys.fast) ++st.fastTicks;
+                if (in.keys.slow) ++st.slowTicks;
+            }
+            if (out.resynced)
+                ++st.resyncs;
+            if (g_noclipHaveWritten)
+            {
+                const float drift = NoclipLen(in.pos.x - g_noclipLastWritten.x, in.pos.y - g_noclipLastWritten.y, in.pos.z - g_noclipLastWritten.z);
+                if (drift > st.driftMax)
+                    st.driftMax = drift;
+            }
+            g_world->SetEntityCoordsNoOffset(out.entity, out.pos.x, out.pos.y, out.pos.z);
+            g_world->SetEntityVelocity(out.entity, out.vel.x, out.vel.y, out.vel.z);
+            g_world->SetEntityHeading(out.entity, out.heading);
+            g_noclipLastWritten = out.pos;
+            g_noclipHaveWritten = true;
+            const float cmd = NoclipLen(out.vel.x, out.vel.y, out.vel.z);
+            if (cmd > st.cmdSpeedMax)
+                st.cmdSpeedMax = cmd;
+            st.heightLast = out.pos.z;
+            if (in.probed)
+            {
+                // Issued vs read back, every 0.5 s: collision still off, invincibility still on, the speed the game holds.
+                bool disabled = false;
+                if (g_world->GetEntityCollisionDisabled(out.entity, disabled))
+                {
+                    ++st.samples;
+                    if (disabled)
+                        ++st.collisionOff;
+                    else
+                    {
+                        ++st.collisionBackOn;
+                        g_world->SetEntityCollision(out.entity, false);
+                    }
+                }
+                bool inv = false;
+                if (g_world->GetPlayerInvincible(inv))
+                {
+                    if (inv)
+                        ++st.invincibleOn;
+                    else
+                    {
+                        ++st.invincibleLost;
+                        g_world->SetPlayerInvincible(true);
+                    }
+                }
+                float vx = 0, vy = 0, vz = 0;
+                if (g_world->GetEntityVelocity(out.entity, vx, vy, vz))
+                {
+                    const float gs = NoclipLen(vx, vy, vz);
+                    if (gs > st.gameSpeedMax)
+                        st.gameSpeedMax = gs;
+                }
+            }
+        }
+
+        if (out.hold)
+        {
+            ++st.holdTicks;
+            g_world->SetEntityCoordsNoOffset(out.entity, out.pos.x, out.pos.y, out.pos.z);   // still, until the ground under it exists
+            g_world->SetEntityVelocity(out.entity, 0.0f, 0.0f, 0.0f);
+        }
+
+        if (out.end)
+        {
+            const bool askedFor = out.why == nc::EndWhy::Toggled || out.why == nc::EndWhy::SwitchedOff;
+            bool placedOk = true;
+            if (out.land.kind == nc::LandKind::Place || out.land.kind == nc::LandKind::Fallback)
+            {
+                placedOk = g_world->SetEntityCoordsNoOffset(out.entity, out.land.x, out.land.y, out.land.z);
+                g_world->SetEntityVelocity(out.entity, 0.0f, 0.0f, 0.0f);
+                if (out.land.kind == nc::LandKind::Place) ++st.placed; else ++st.fellBack;
+            }
+            else
+                ++st.skipped;
+            // The flags go back last, exactly as read when it began (the subject stands on the ground by now).
+            const bool a = g_world->SetEntityCollision(out.entity, out.restore.collision);
+            const bool b = g_world->SetEntityHasGravity(out.entity, out.restore.gravity);
+            const bool c = g_world->SetPlayerInvincible(out.restore.invincible);
+            const bool d = out.subject != nc::Subject::Vehicle || g_world->SetEntityInvincible(out.entity, false);
+            if (askedFor && (!a || !b || !c || !d || !placedOk))
+                ++st.uncallable;
+            bool disabledNow = false;
+            const bool rb = g_world->GetEntityCollisionDisabled(out.entity, disabledNow);
+            switch (out.why)
+            {
+            case nc::EndWhy::Toggled: ++st.endToggle; break;
+            case nc::EndWhy::SwitchedOff: ++st.endSwitch; break;
+            case nc::EndWhy::NotReady: ++st.endNotReady; break;
+            case nc::EndWhy::SubjectGone: ++st.endGone; break;
+            case nc::EndWhy::None: break;
+            }
+            const char* landed = out.land.kind == nc::LandKind::Place ? "placed on the ground"
+                               : out.land.kind == nc::LandKind::Fallback ? "no ground read within 1.5 s: back to the last safe spot"
+                               : "not moved";
+            GLOGI("engine: noclip (0.4.22): OFF (%s), %s %d: %s (%.1f %.1f %.1f); flags given back: collision %s, gravity %s, invincible %s "
+                  "(calls %s); collision-disabled read-back %s",
+                  NoclipEndName(out.why), NoclipSubjectName(out.subject), out.entity, landed,
+                  out.land.kind == nc::LandKind::Skip ? in.pos.x : out.land.x, out.land.kind == nc::LandKind::Skip ? in.pos.y : out.land.y,
+                  out.land.kind == nc::LandKind::Skip ? in.pos.z : out.land.z, out.restore.collision ? "on" : "off",
+                  out.restore.gravity ? "on" : "off", out.restore.invincible ? "on" : "off", (a && b && c && d) ? "ok" : "some failed (entity gone?)",
+                  rb ? (disabledNow ? "STILL DISABLED" : "collision on again") : "uncallable");
+            if (askedFor)
+                game::Overlay::PushSystemLine("Noclip off.");
+            g_noclipHaveWritten = false;
+        }
+
+        game::Overlay::SetNoclip(enabled, g_noclip.GetPhase() == nc::Phase::On);
+        NoclipReport(nowMs, enabled);
+    }
+
+    // ---- 0.4.22 doors and seats: the L key, the server's answers, the read-backs (rules: libs/sync/vehicle_lock.h) ----------------
+    // The lock is the server's: L only ASKS (VehicleOp::SetLocked, arg 1 locks / 0 unlocks, toggling what the replicated flag says), the answer
+    // is shown (a chat line and a frontend sound) and the flag comes back in the VehicleWorld, which ApplyVehicleFields turns into
+    // SET_VEHICLE_DOORS_LOCKED(2 / 1) on every copy, late joiners included (they get the flag in their first full entry). TickLockKeeper then
+    // reads GET_VEHICLE_DOOR_LOCK_STATUS back about once a second and puts a lock the game dropped back.
+    constexpr float kLockReachM = 8.0f;          // L sees a networked car this close (to its origin); the server's own limit for a player outside it is vehicleLockDistance
+    constexpr double kSeatGraceMs = 2000.0;      // a pick with no entry under way is judged "never sat in it" this long after it was last picked
+    constexpr int kLockCandMax = 16;
+
+    void LogDoorsSeatsSwitches()
+    {
+        GLOGI("engine: doors and seats (0.4.22): veh_rear_seats=%s (F / G %s), veh_locks=%s (the L key and the lock read-back on the copies %s); "
+              "controls (INFERRED ids, confirm live): F = %d, G = %d (+ %d, the grenade throw, disabled with it), L = %d (disabled while a networked car is in reach)",
+              g_vehRearSeats.load() ? "on" : "off", g_vehRearSeats.load() ? "may pick the rear seats of a car that has them" : "see only the driver's seat and the front passenger's",
+              g_vehLocks.load() ? "on" : "off", g_vehLocks.load() ? "work" : "are off", kControlEnter, kControlDetonate, kControlThrowGrenade, kControlLockKey);
+    }
+
+    // The answer to our SetLocked (DrainEvents routes it here, not to the link).
+    void HandleLockResult(const proto::VehicleResult& r, double nowMs)
+    {
+        DoorsSeatsState::Pending& pd = g_dsState.lockPending;
+        const bool matched = pd.active && pd.netId == (int)r.vehId;
+        bool want = false;
+        if (matched)
+            want = pd.wantLocked;
+        else
+        {
+            const auto it = g_vehs.find(r.vehId);
+            want = it != g_vehs.end() && (it->second.st.flags & proto::kVehLocked) != 0;   // late or unmatched: what the flag says now
+        }
+        if (matched)
+            pd.active = false;
+        const uint8_t code = (uint8_t)r.code;
+        const char* text = sync::LockResultText(code, want);
+        game::Overlay::PushSystemLine(text);
+        const sync::LockSound snd = sync::LockSoundFor(code, want);
+        ++(g_world->PlaySoundFrontend(snd.name, snd.set) ? g_ds.soundOk : g_ds.soundFail);
+        if (code == 0)
+        {
+            ++g_ds.lockOk;
+            ++(want ? g_ds.lockOkLocked : g_ds.lockOkUnlocked);
+            g_dsState.keys.Note((int)r.vehId);                 // an Ok means the server counts us as the key's holder
+            GLOGI("engine: doors: the server answered SetLocked id=%u: Ok, the vehicle is now %s (%.0f ms after the press%s)", (unsigned)r.vehId,
+                  want ? "LOCKED" : "UNLOCKED", matched ? nowMs - pd.sentMs : -1.0, matched ? "" : "; no press of ours was waiting for it");
+        }
+        else
+        {
+            ++g_ds.lockRefused;
+            ++g_ds.lockRefusedBy[code & 15];
+            if (code == 5 /* NotAllowed */ || code == 1 /* NoVehicle */)
+                g_dsState.keys.Forget((int)r.vehId);
+            GLOGW("engine: doors: the server REFUSED SetLocked id=%u: %s (%s)", (unsigned)r.vehId, VehResultName(code), text);
+        }
+    }
+
+    // The seat read-back of an F / G pick (armed by TickVehicleEntry) and the keys of the cars we drive.
+    void TickSeatReadback(int32_t lp, int32_t lpVeh, int inNetId, double nowMs)
+    {
+        DoorsSeatsState::Expect& ex = g_dsState.expect;
+        if (!ex.active)
+            return;
+        if (!lp)
+        {
+            ex.active = false;
+            return;
+        }
+        const bool busy = g_localEnter.Active() || g_entryWalk.active;
+        if (lpVeh && inNetId >= 0)
+        {
+            int actual = -1;                                   // the wire seat the game says our ped sits in
+            for (int s = -1; s < (int)proto::kVehSeats - 1; ++s)
+                if (g_world->GetPedInVehicleSeat(lpVeh, s) == lp)
+                {
+                    actual = s + 1;
+                    break;
+                }
+            if (actual < 0 && nowMs - ex.atMs < kSeatGraceMs)
+                return;                                        // GET_VEHICLE_PED_IS_IN names the car a moment before the seat reads: try again
+            const bool theCar = inNetId == ex.netId;
+            const sync::SeatReadback rb = theCar ? sync::JudgeSeatReadback(ex.seat, actual) : sync::SeatReadback::NotSeated;
+            ++(rb == sync::SeatReadback::Match ? g_ds.seatMatch : rb == sync::SeatReadback::Differs ? g_ds.seatDiffers : g_ds.seatNotSeated);
+            if (rb == sync::SeatReadback::Match)
+                GLOGI("engine: doors: seat read-back OK: picked wire seat %d of vehicle id=%d, GET_PED_IN_VEHICLE_SEAT puts us in wire seat %d (GTA seat %d)", ex.seat,
+                      ex.netId, actual, actual - 1);
+            else if (rb == sync::SeatReadback::Differs)
+                GLOGW("engine: doors: seat read-back DIFFERS: picked wire seat %d of vehicle id=%d, GET_PED_IN_VEHICLE_SEAT puts us in wire seat %d (GTA seat %d)",
+                      ex.seat, ex.netId, actual, actual - 1);
+            else
+                GLOGW("engine: doors: seat read-back NOT SEATED: picked wire seat %d of vehicle id=%d, but %s", ex.seat, ex.netId,
+                      !theCar ? "we are in another networked vehicle" : "the game has no seat of that car holding us");
+            ex.active = false;
+            return;
+        }
+        if (!busy && nowMs - ex.atMs >= kSeatGraceMs)
+        {
+            ++g_ds.seatNotSeated;
+            GLOGI("engine: doors: seat read-back: picked wire seat %d of vehicle id=%d but we never sat in it (refused, cancelled or out of reach)", ex.seat, ex.netId);
+            ex.active = false;
+        }
+    }
+
+    // L: lock / unlock the vehicle we are in, or the networked one in reach we hold the key of (else the nearest: the server answers NotAllowed to a
+    // stranger). Script tick, on foot or seated; the control is disabled only while a networked car is in reach.
+    void TickLockKey(int32_t lp, int32_t lpVeh, bool dead, double nowMs)
+    {
+        if (!lp || dead)
+            return;
+        float lpPos[3];
+        if (!g_world->GetEntityCoords(lp, lpPos[0], lpPos[1], lpPos[2]))
+            return;
+        const uint16_t me = join::MyId();
+        sync::LockCand cands[kLockCandMax];
+        int n = 0;
+        for (const auto& kv : g_vehs)
+        {
+            const NetVeh& v = kv.second;
+            if (!v.handle || v.removed || !v.present || !v.haveState)
+                continue;
+            const bool inside = lpVeh && v.handle == lpVeh;
+            if (!inside && (std::fabs(v.st.k.x - lpPos[0]) > 40.0f || std::fabs(v.st.k.y - lpPos[1]) > 40.0f))
+                continue;                                      // cheap reject by the server position before the native
+            float x = 0, y = 0, z = 0;
+            if (!g_world->GetEntityCoords(v.handle, x, y, z))
+                continue;
+            const float dx = x - lpPos[0], dy = y - lpPos[1], dz = z - lpPos[2];
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (!inside && d > kLockReachM)
+                continue;
+            if (n >= kLockCandMax)
+                break;
+            sync::LockCand& c = cands[n++];
+            c.netId = (int)kv.first;
+            c.distM = inside ? 0.0f : d;
+            c.locked = (v.st.flags & proto::kVehLocked) != 0;
+            c.keyed = g_dsState.keys.Has((int)kv.first) || (me != proto::kNoPlayer && v.st.ownerId == me);
+            c.inside = inside;
+        }
+        if (n == 0)
+            return;                                            // no networked car in reach: the L key stays the game's
+        uint64_t args[] = { 0, (uint64_t)kControlLockKey, 1 };     // DISABLE_CONTROL_ACTION(0, 182, true), so IS_DISABLED_CONTROL_JUST_PRESSED reads it
+        g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+        if (game::Overlay::WantsInput() || !g_world->IsDisabledControlJustPressed(0, kControlLockKey))
+            return;
+        ++g_ds.lockPress;
+        DoorsSeatsState::Pending& pd = g_dsState.lockPending;
+        if (pd.active && nowMs - pd.sentMs < kLockPendingMs)
+        {
+            ++g_ds.lockHeld;                                   // the last press has not been answered yet
+            return;
+        }
+        const sync::LockPick pick = sync::PickLockTarget(cands, n);
+        if (pick.why != sync::LockWhy::Ok)
+            return;
+        proto::VehicleCmd c;
+        c.op = proto::VehicleOp::SetLocked;
+        c.vehId = (uint16_t)pick.netId;
+        c.arg = pick.wantLocked ? 1u : 0u;
+        const bool sent = join::SendVehicleCmd(c);
+        ++g_v4.vehCmds;
+        ++(sent ? g_ds.lockSent : g_ds.lockNotSent);
+        if (sent)
+            pd = DoorsSeatsState::Pending{ true, pick.netId, pick.wantLocked, nowMs };
+        GLOGI("engine: doors: L -> asking the server to %s vehicle id=%d (%s%s) %s", pick.wantLocked ? "LOCK" : "UNLOCK", pick.netId,
+              pick.inside ? "we sit in it" : "in reach", pick.keyed ? ", we believe we hold its key" : "", sent ? "sent" : "NOT sent (no session)");
+        if (!sent)
+            game::Overlay::PushSystemLine("Not connected.");
+    }
+
+    // The copies' lock, read back about once a second and put back when the game dropped it. Script tick.
+    void TickLockKeeper(double nowMs)
+    {
+        if (!g_vehLocks.load(std::memory_order_relaxed))
+            return;
+        for (auto& kv : g_vehs)
+        {
+            NetVeh& v = kv.second;
+            if (!v.handle || v.removed || !v.present || !v.haveState || v.appliedLock < 0)
+                continue;
+            const int want = sync::LockStateFor((v.st.flags & proto::kVehLocked) != 0);
+            if (v.appliedLock != want || !v.lockKeep.Due(nowMs))
+                continue;                                      // the newest flag is not applied yet (ApplyVehicleFields does that), or not due
+            const sync::LockKeepStats before = v.lockKeep.Stats();
+            const int status = g_world->GetVehicleDoorLockStatus(v.handle);
+            const sync::LockKeeper::Act act = v.lockKeep.Observe(want, status, nowMs);
+            const sync::LockKeepStats& after = v.lockKeep.Stats();
+            g_ds.keep.reads += after.reads - before.reads;
+            g_ds.keep.readFails += after.readFails - before.readFails;
+            g_ds.keep.match += after.match - before.match;
+            g_ds.keep.mismatch += after.mismatch - before.mismatch;
+            g_ds.keep.reissued += after.reissued - before.reissued;
+            g_ds.keep.stuck += after.stuck - before.stuck;
+            g_ds.keep.restored += after.restored - before.restored;
+            if (after.stuck != before.stuck && g_dsState.reissueLogged < 40)
+            {
+                ++g_dsState.reissueLogged;
+                GLOGW("engine: doors: vehicle id=%u: GET_VEHICLE_DOOR_LOCK_STATUS keeps reading %d, not the %d the server's flag asks for, after %d re-issues: "
+                      "left alone for %.0f s (a script or the game owns its doors)", (unsigned)kv.first, status, want, sync::LockKeeper::kMaxReissues,
+                      sync::LockKeeper::kBackoffMs / 1000.0);
+            }
+            if (act == sync::LockKeeper::Act::Reissue)
+            {
+                const bool ok = g_world->SetVehicleDoorsLocked(v.handle, want);
+                if (g_dsState.reissueLogged < 40)
+                {
+                    ++g_dsState.reissueLogged;
+                    GLOGW("engine: doors: vehicle id=%u: the game's lock status reads %d, the server's flag wants %d: SET_VEHICLE_DOORS_LOCKED re-issued (%s)",
+                          (unsigned)kv.first, status, want, ok ? "called" : "NOT callable");
+                }
+            }
+        }
+    }
+
+    // Runs every script tick on the connected, entered player, AFTER TickLocalVehicle.
+    void TickDoorsSeats(int32_t lp, int32_t lpVeh, bool dead, double nowMs)
+    {
+        int inNetId = -1;                                      // the networked car we sit in
+        if (lp && lpVeh)
+            for (const auto& kv : g_vehs)
+                if (kv.second.handle == lpVeh && !kv.second.removed)
+                {
+                    inNetId = (int)kv.first;
+                    break;
+                }
+        if (inNetId >= 0 && g_localSeat == 0)
+            g_dsState.keys.Note(inNetId);                      // the driver of the last ride holds its key (the server's lastDriver)
+        TickSeatReadback(lp, lpVeh, inNetId, nowMs);
+        if (g_vehLocks.load(std::memory_order_relaxed))
+            TickLockKey(lp, lpVeh, dead, nowMs);
+        TickLockKeeper(nowMs);
     }
 
     // Our own vehicle: which one, which seat, and the link's commands and answers.
@@ -9701,6 +10787,256 @@ namespace {
               (unsigned)(o.cmd == sync::VehLinkCmd::Register ? c.arg : 0), sent ? "sent" : "NOT sent (no session)");
     }
 
+    // ---- 0.4.22 vehicle controls ------------------------------------------------------------------------------------------------------------------
+    // GI: "indicators for turn signals, headlights, belt and engine on/off, mechanical keys, small indicators on the car UI", and a fuel gauge.
+    // Left / Right Arrow = the left / right indicator, Down Arrow = hazards, Y = engine off / on, B = seatbelt, H = GTA's own INPUT_VEH_HEADLIGHT (74),
+    // untouched: the strip reads GET_VEHICLE_LIGHTS_STATE. The key -> state rules, the auto-cancel after a completed turn, the engine guard, the belt
+    // and fuel_use are libs/sync/vehicle_controls.h (tested in tests/vehcontrols_pure_tests.h, the wire path in tests/vehcontrols_wire_tests.h).
+    // This function feeds the machine (the overlay's key edges, the native reads), calls the natives it names, pushes the strip and the fuel gauge
+    // to the overlay and writes the log. Held disabled every tick in a vehicle: 172-175 (the arrow keys' cellphone controls), 29 (B), 246 (Y).
+    // Script tick only; lp != 0. veh_keys=0: nothing is read, issued or drawn (the fuel gauge is independent of it).
+    const char* VcIndName(uint8_t ind)
+    {
+        return ind == sync::kVcIndBoth ? "hazards" : (ind == proto::kVeh2IndicatorL ? "left" : (ind == proto::kVeh2IndicatorR ? "right" : "off"));
+    }
+    bool VcApplyIndicators(int32_t veh, uint8_t ind)
+    {
+        const bool l = g_world->SetVehicleIndicatorLights(veh, 1, (ind & proto::kVeh2IndicatorL) != 0);
+        const bool r = g_world->SetVehicleIndicatorLights(veh, 0, (ind & proto::kVeh2IndicatorR) != 0);
+        g_vcx.indCalls += 2;
+        g_vcx.indFailed += (l ? 0u : 1u) + (r ? 0u : 1u);
+        return l && r;
+    }
+    NetVeh* VcNetVehOf(int32_t handle)
+    {
+        if (!handle)
+            return nullptr;
+        for (auto& kv : g_vehs)
+            if (kv.second.handle == handle && !kv.second.removed)
+                return &kv.second;
+        return nullptr;
+    }
+    void VcLogEvent(const sync::VcEvent& e, int32_t veh)
+    {
+        static const char* const kKeyName[sync::kVcKeyCount] = { "Left", "Right", "Down (hazards)", "Y (engine)", "B (belt)" };
+        static const char* const kWhyName[] = { "not in a vehicle", "chat / Tab menu / pause menu has the keyboard", "not the driver", "the tank is empty (fuel_use)", "veh_keys=0" };
+        if (g_vcx.keyLines >= 300 || (e.kind == sync::VcEv::Rejected && e.b == (uint8_t)sync::VcWhy::Off))
+            return;                                              // the 10 s line carries the counts (veh_keys=0 presses are not worth a line)
+        ++g_vcx.keyLines;
+        switch (e.kind)
+        {
+        case sync::VcEv::Entered:
+            GLOGI("engine: vehicle controls: sat in vehicle %d; the car shows indicators %s; the ped's flag 32 (WillFlyThroughWindscreen) read %s; "
+                  "set to true (unbuckled)", veh, VcIndName(e.a), e.b ? "true" : "false");
+            break;
+        case sync::VcEv::Left:
+            GLOGI("engine: vehicle controls: left the car; indicators %s (hazards stay on a parked car, a single side goes out), belt was %s; flag 32 put back",
+                  VcIndName(e.a), e.b ? "buckled" : "off");
+            break;
+        case sync::VcEv::Indicator:
+            GLOGI("engine: vehicle controls: indicators -> %s (SET_VEHICLE_INDICATOR_LIGHTS on vehicle %d)", VcIndName(e.a), veh);
+            break;
+        case sync::VcEv::AutoCancel:
+            GLOGI("engine: vehicle controls: the indicator went out by itself after a completed turn (net heading change %d degrees, wheel centred)", (int)e.deg);
+            break;
+        case sync::VcEv::EngineKey:
+            GLOGI("engine: vehicle controls: Y: engine -> %s (SET_VEHICLE_ENGINE_ON %s, instantly %d, disableAutoStart %d)", e.a ? "ON" : "OFF", e.a ? "true" : "false",
+                  e.a ? 0 : 1, e.a ? 0 : 1);
+            break;
+        case sync::VcEv::EngineGuard:
+            GLOGI("engine: vehicle controls: the game started the engine of a car we switched off: off again (guard)");
+            break;
+        case sync::VcEv::FuelCut:
+            GLOGI("engine: vehicle controls: fuel_use: the tank is empty, engine cut (and it will not start)");
+            break;
+        case sync::VcEv::Belt:
+            GLOGI("engine: vehicle controls: B: seatbelt %s (PED config flag 32 set to %s)", e.a ? "BUCKLED" : "off", e.a ? "false" : "true");
+            break;
+        case sync::VcEv::BeltAuto:
+            GLOGI("engine: vehicle controls: the exit task started (F): belt unbuckled (flag 32 true)");
+            break;
+        case sync::VcEv::BeltReassert:
+            GLOGI("engine: vehicle controls: the game moved PED config flag 32 under a %s belt: set again", e.a ? "buckled" : "unbuckled");
+            break;
+        case sync::VcEv::Rejected:
+            GLOGI("engine: vehicle controls: %s ignored: %s", e.a < sync::kVcKeyCount ? kKeyName[e.a] : "?", e.b < 5 ? kWhyName[e.b] : "?");
+            break;
+        case sync::VcEv::None:
+            break;
+        }
+    }
+    void TickVehicleControls(int32_t lp, int32_t lpVeh, bool dead, double nowMs)
+    {
+        if (g_vcReset.exchange(false))
+            g_vc.Reset();
+        g_vc.Configure(VehControlsConfigNow());
+        const bool keysOn = g_vcKeys.load(std::memory_order_relaxed);
+        const bool indSync = g_vcIndSync.load(std::memory_order_relaxed);
+        const int32_t veh = (lp && lpVeh && !dead) ? lpVeh : 0;
+        NetVeh* nv = VcNetVehOf(veh);
+
+        // The seat: the link's own (refreshed every 500 ms by TickLocalVehicle) in a server session, the driver's seat read otherwise.
+        int seat = -1;
+        if (veh)
+        {
+            if (ServerMode())
+                seat = g_localSeat;
+            else if (g_world->GetPedInVehicleSeat(veh, -1) == lp)
+                seat = 0;
+            else
+                seat = 1;
+        }
+
+        sync::VehControlsIn in;
+        in.nowMs = nowMs;
+        in.presses = game::Overlay::TakeVehicleKeys();           // always taken: a press never waits for the next car
+        in.vehicle = keysOn ? (uint32_t)veh : 0u;
+        in.seat = seat;
+        in.blocked = game::Overlay::Interactive() || game::Overlay::QuitPromptOpen() || g_pauseMenuActive;
+        if (in.vehicle)
+        {
+            in.exiting = g_world->GetIsTaskActive(lp, kTaskExitVehicle);
+            in.shownInd = (indSync && nv && nv->haveState) ? (uint8_t)(nv->st.flags2 & sync::kVcIndBoth) : (uint8_t)0;
+            in.headingDeg = g_world->GetEntityHeading(veh);
+            in.speedMps = g_world->GetEntitySpeed(veh);
+            float axis = 0.0f;
+            in.steerOk = g_world->GetControlNormal(0, kCtlVehMoveLR, axis);
+            in.steer = axis;
+            bool running = false;
+            in.engineOk = g_world->GetVehicleEngineRunning(veh, running);
+            in.engineRunning = running;
+            if (g_vc.Vehicle() != (uint32_t)veh || nowMs - g_vcBeltReadMs >= 1000.0)
+            {
+                bool flag = true;
+                in.beltFlagOk = g_world->GetPedConfigFlag(lp, sync::kVcPcfWillFlyThroughWindscreen, flag);
+                in.beltFlag = flag;
+                g_vcBeltReadMs = nowMs;
+                ++g_vcx.beltReads;
+                if (!in.beltFlagOk)
+                    ++g_vcx.beltReadFail;
+                else if (flag)
+                    ++g_vcx.beltFlagTrue;
+            }
+            if (nv && nv->haveState)
+            {
+                in.fuelKnown = true;
+                in.fuelPermille = nv->st.fuelPermille;
+            }
+            for (const int control : sync::kVcDisabledControls)
+            {
+                uint64_t args[] = { 0, (uint64_t)control, 1 };       // DISABLE_CONTROL_ACTION(0, control, true): a per-frame effect
+                g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+            }
+            ++g_vcx.ticksInVeh;
+            if (in.blocked)
+                ++g_vcx.ticksBlocked;
+            if (!in.engineOk || !in.engineRunning)
+                ++g_vcx.engineStopped;
+        }
+
+        const sync::VehControlsOut out = g_vc.Tick(in);
+
+        // The natives the machine names. A car we just left first (hazards stay, a single side goes out), then the car we sit in.
+        if (out.leftVehicle)
+        {
+            if (out.leftIndChanged)
+                VcApplyIndicators((int32_t)out.leftVehicle, out.leftInd);
+            if (NetVeh* lv = VcNetVehOf((int32_t)out.leftVehicle))
+                lv->ctlInd = indSync ? out.leftInd : (uint8_t)0;     // what a controller keeps sending for the parked car
+        }
+        if (out.setIndicators && in.vehicle)
+            VcApplyIndicators(veh, out.ind);
+        if (out.setEngine && in.vehicle)
+        {
+            const sync::VcEngineCall call = sync::EngineCallFor(out.engineOn);
+            ++g_vcx.engineCalls;
+            if (!g_world->SetVehicleEngineOn(veh, call.on, call.instantly, call.disableAutoStart))
+                ++g_vcx.engineFailed;
+        }
+        if (out.setBelt && lp)
+        {
+            ++g_vcx.beltCalls;
+            if (!g_world->SetPedConfigFlag(lp, sync::kVcPcfWillFlyThroughWindscreen, out.beltFlag))
+                ++g_vcx.beltFailed;
+        }
+        for (int i = 0; i < out.nev; ++i)
+            VcLogEvent(out.ev[i], out.ev[i].kind == sync::VcEv::Left ? (int32_t)out.leftVehicle : veh);
+        // What a controller sends for the car we drive; a passenger's machine state is not a controller's.
+        if (nv && in.vehicle && g_vc.Vehicle() == (uint32_t)veh && g_vc.Seat() == 0)
+            nv->ctlInd = indSync ? g_vc.Indicators() : (uint8_t)0;
+
+        // The strip and the fuel gauge.
+        game::Overlay::VehicleHud hud;
+        static bool lastLightsOk = false;
+        static int lastLights = 0;
+        if (in.vehicle)
+        {
+            const bool driver = seat == 0;
+            const uint8_t ind = sync::HudIndicators(driver, g_vc.Indicators(), nv && nv->haveState ? nv->st.flags2 : (uint8_t)0, indSync);
+            bool lightsOn = false, highBeam = false;
+            lastLightsOk = g_world->GetVehicleLightsState(veh, lightsOn, highBeam);
+            lastLights = sync::HudLights(lastLightsOk, lightsOn, highBeam);
+            if (lastLights == 1) ++g_vcx.lightsLow;
+            else if (lastLights == 2) ++g_vcx.lightsHigh;
+            hud.show = true;
+            hud.indLeft = (ind & proto::kVeh2IndicatorL) != 0;
+            hud.indRight = (ind & proto::kVeh2IndicatorR) != 0;
+            hud.lights = lastLights;
+            hud.beltOn = g_vc.Belt();
+            hud.beltWarn = sync::HudBeltWarn(g_vc.Belt(), in.speedMps, g_vc.Config().beltWarnMps);
+            hud.engineOff = g_vc.EngineOffHud(nowMs);
+        }
+        game::Overlay::SetVehicleHud(hud);
+        g_fuelHud = sync::FuelHudFor(veh != 0, nv != nullptr, nv && nv->haveState, nv ? (unsigned)nv->st.fuelPermille : 1000u);
+
+        // The 10 s line, with the read-backs: the indicator state has no getter (the machine's own state is what is sent and shown), the engine,
+        // the lights and the belt flag are read back every tick / about once a second.
+        static bool lastEngineOk = false, lastEngineRunning = false, lastBeltOk = false, lastBeltFlag = true;
+        if (in.vehicle)
+        {
+            lastEngineOk = in.engineOk;
+            lastEngineRunning = in.engineRunning;
+            if (in.beltFlagOk)
+            {
+                lastBeltOk = true;
+                lastBeltFlag = in.beltFlag;
+            }
+        }
+        if (nowMs - g_vcReportMs < 10000.0)
+            return;
+        g_vcReportMs = nowMs;
+        const sync::VehControlsStats s = g_vc.TakeStats();
+        const VcExtraStats& x = g_vcx;
+        const bool quiet = !x.ticksInVeh && !x.copyIndApplied && !x.copyEngineApplied && !s.rejNotInVehicle;
+        if (!quiet || g_vcFirstReport)
+        {
+            g_vcFirstReport = false;
+            GLOGI("engine: vehicle controls (0.4.22), last 10 s: veh_keys=%s indicator_autocancel=%s indicator_sync=%s fuel_use=%s; %u ticks in a vehicle "
+                  "(%u with a panel / pause menu holding the keyboard); presses taken: Left %u Right %u hazards %u Y %u B %u; ignored: not in a vehicle %u, "
+                  "keyboard held %u, not the driver %u, empty tank %u, veh_keys=0 %u; indicators: %u changes (%u by themselves after a turn), state now %s "
+                  "(NO getter exists in 3889, so there is no read-back: the machine's own state is what is sent and shown), SET_VEHICLE_INDICATOR_LIGHTS calls "
+                  "%u (%u failed); engine: Y off %u / on %u, guard re-issues %u, fuel cuts %u, SET_VEHICLE_ENGINE_ON calls %u (%u failed), READ-BACK "
+                  "GET_IS_VEHICLE_ENGINE_RUNNING %s, stopped on %u of %u ticks",
+                  g_vcKeys.load() ? "on" : "OFF", g_vcAutoCancel.load() ? "on" : "OFF", indSync ? "on" : "OFF", g_vcFuelUse.load() ? "ON" : "off",
+                  x.ticksInVeh, x.ticksBlocked, s.taken[0], s.taken[1], s.taken[2], s.taken[3], s.taken[4], s.rejNotInVehicle, s.rejBlocked, s.rejNotDriver,
+                  s.rejNoFuel, s.rejOff, s.indicatorChanges, s.autoCancels, VcIndName(g_vc.Indicators()), x.indCalls, x.indFailed, s.engineOff, s.engineOn,
+                  s.engineGuards, s.fuelCuts, x.engineCalls, x.engineFailed, lastEngineOk ? (lastEngineRunning ? "running" : "stopped") : "not readable",
+                  x.engineStopped, x.ticksInVeh);
+            GLOGI("engine: vehicle controls (0.4.22), last 10 s, continued: READ-BACK GET_VEHICLE_LIGHTS_STATE %s, low beam %u / high beam %u ticks; "
+                  "belt: on %u / off %u, unbuckled by F %u, flag re-asserted %u, SET_PED_CONFIG_FLAG(32) calls %u (%u failed), READ-BACK flag 32 %s "
+                  "(%u reads, %u failed, true on %u) while the belt is %s; COPIES: SET_VEHICLE_INDICATOR_LIGHTS %u (%u failed) and SET_VEHICLE_ENGINE_ON %u "
+                  "applied from the controllers' bits; fuel gauge %s (%u permille)",
+                  lastLightsOk ? (lastLights == 0 ? "lights off" : (lastLights == 1 ? "low beam" : "high beam")) : "not readable",
+                  x.lightsLow, x.lightsHigh, s.beltOn, s.beltOff, s.beltAuto, s.beltReasserts, x.beltCalls, x.beltFailed,
+                  lastBeltOk ? (lastBeltFlag ? "true (flies through the windscreen)" : "false (held)") : "not read", x.beltReads, x.beltReadFail, x.beltFlagTrue,
+                  g_vc.Belt() ? "buckled" : "off", x.copyIndApplied, x.copyIndFailed, x.copyEngineApplied,
+                  g_fuelHud.show ? "shown" : "hidden", (unsigned)(g_fuelHud.frac * 1000.0f + 0.5f));
+        }
+        const uint32_t keyLines = g_vcx.keyLines;
+        g_vcx = VcExtraStats();
+        g_vcx.keyLines = keyLines;
+    }
+
     // Front axle to rear axle of the vehicle's model, from the wheel bones wheel_lf and wheel_lr (names
     // INFERRED), measured once per model and cached. kFallbackWheelbaseM when the bones are missing (bikes,
     // boats, planes) or cannot be read; the steering estimate for those is not meaningful anyway. Script tick.
@@ -9737,7 +11073,7 @@ namespace {
     // The controller's reads of a vehicle's body (sync plan W6, protocol v5 flags2 / doors): the lights and high
     // beam (GET_VEHICLE_LIGHTS_STATE), the six doors (GET_VEHICLE_DOOR_ANGLE_RATIO above 0.1 = open) and the
     // convertible roof. There is no interior-light getter in the script API (skipped: bit 2 is always 0) and none
-    // for the indicators (INFERRED: a script-set indicator would need its own command; bits 3 and 4 are 0).
+    // for the indicators (bits 3 and 4 are 0 here; since 0.4.22 SendControlledVehicles ORs in the controls' own indicator state, NetVeh::ctlInd).
     // A native that cannot be called leaves its bit 0. Script tick.
     void ReadVehicleBody(int32_t veh, uint8_t& flags2, uint8_t& doors)
     {
@@ -9925,6 +11261,9 @@ namespace {
             const bool sendDmg = dmgOn && v.dmgSend.Due(v.dmgReport, v.st.dmg, nowMs);
             u.flags2 = (uint8_t)((v.bodyFlags2 & ~(proto::kVeh2Brake | proto::kVeh2Handbrake)) | (brakeBit ? proto::kVeh2Brake : 0) |
                                  (handBit ? proto::kVeh2Handbrake : 0));
+            // 0.4.22: the indicators have no getter, so the controls' own state (the key machine of the car we drive, or what a car we left / took
+            // over keeps blinking) is what goes out; veh_indicator_sync=0 sends them clear as before.
+            u.flags2 = sync::ControllerFlags2(u.flags2, v.ctlInd, g_vcIndSync.load(std::memory_order_relaxed));
             // A door that is broken off reads as open for ever: it is not an open door (the copy would fight the damage replay).
             u.doors = (uint8_t)(v.bodyDoors & ~(dmgOn ? (v.dmgReport.parts & proto::kVehDmgDoorsMask) : 0));
             u.tyres = v.visReport.tyres;
@@ -10149,6 +11488,13 @@ namespace {
                     HandleIntentResult(r);             // T1: ours, not the link's
                     break;
                 }
+                if (r.op == proto::VehicleOp::SetLocked)
+                {
+                    HandleLockResult(r, nowMs);        // 0.4.22: the L key's answer, not the link's
+                    break;
+                }
+                if (r.op == proto::VehicleOp::Enter && r.code == proto::VehicleResultCode::Locked)
+                    g_dsState.keys.Forget((int)r.vehId);   // 0.4.22: the key we believed in is gone (somebody else drove it since)
                 g_link.OnResult((uint8_t)r.op, (uint8_t)r.code, r.vehId);
                 if (r.code == proto::VehicleResultCode::Ok)
                 {
@@ -10252,20 +11598,39 @@ namespace {
         }
     }
 
-    void HyperVerifyAngular(HyperState& st, int32_t veh, const sync::HyperVec& wrote)
+    // `intended` is the WORLD angular velocity the assist wants, `wrote` the vector actually handed to the setter (the body-frame version
+    // of it with the 0.4.22 fix, the same world vector without), `q` the car's orientation at the write.
+    //
+    // Before 0.4.22 (veh_shake_fix=0) the check was "does the read-back equal what was written, x / y within 3 % of the vector": on the
+    // live Jesko (0.4.14, 2026-11-05) the yaw read back to 3 decimals while roll / pitch were 0.01-0.02 off, which was put down to the car's
+    // body tilt. It was the FRAME: the setter takes a body vector, so the x / y part comes back turned by the heading (gage.log 08:06:52:
+    // wrote -0.019 0.032 -0.002, read 0.037 -0.001 -0.001 at heading ~238 = R(q) * wrote). The old check passed only at headings near 0 and
+    // killed the assist otherwise. With the fix the test is "the read-back (world) equals the intended world vector", and every read-back
+    // also goes to the frame judge, which flips the writers' frame if the evidence says the setter takes the other one.
+    void HyperVerifyAngular(HyperState& st, int32_t veh, const sync::DriveQuat& q, const sync::HyperVec& intended, const sync::DriveVec& wrote)
     {
         const uint32_t n = st.angWrites++;
         if (!(n < 12 || n % 120 == 0))
             return;
         float x = 0, y = 0, z = 0;
-        // The setter and the getter do not use exactly the same frame: on the live Jesko (0.4.14, 2026-11-05) the
-        // yaw read back to 3 decimals every time while roll / pitch were 0.01-0.02 off, which is a ~1.16 rad/s
-        // yaw vector tilted by the car's ~0.6 degree body tilt, not a write that failed. So x / y get a tolerance
-        // relative to the whole vector (3 % = a 1.7 degree frame difference); z keeps the tight one.
-        const float mag = std::sqrt(wrote.x * wrote.x + wrote.y * wrote.y + wrote.z * wrote.z);
-        const auto close = [](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.01f * std::fabs(b); };
-        const auto closeTilt = [mag](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.03f * mag; };
-        if (g_world->GetEntityRotationVelocity(veh, x, y, z) && closeTilt(x, wrote.x) && closeTilt(y, wrote.y) && close(z, wrote.z))
+        bool good = false;
+        if (g_world->GetEntityRotationVelocity(veh, x, y, z))
+        {
+            g_angJudge.Add(sync::shake::ClassifyAngWrite(q, wrote, { x, y, z }));
+            if (g_shakeFix.load())
+            {
+                const float mag = std::sqrt(intended.x * intended.x + intended.y * intended.y + intended.z * intended.z);
+                good = sync::shake::Dist3({ x, y, z }, { intended.x, intended.y, intended.z }) <= 0.01f + 0.01f * mag;
+            }
+            else
+            {
+                const float mag = std::sqrt(wrote.x * wrote.x + wrote.y * wrote.y + wrote.z * wrote.z);
+                const auto close = [](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.01f * std::fabs(b); };
+                const auto closeTilt = [mag](float a, float b) { return std::fabs(a - b) <= 0.01f + 0.03f * mag; };
+                good = closeTilt(x, wrote.x) && closeTilt(y, wrote.y) && close(z, wrote.z);
+            }
+        }
+        if (good)
         {
             ++st.angOk;
             return;
@@ -10275,9 +11640,10 @@ namespace {
         if (logged < 4)
         {
             ++logged;
-            GLOGW("engine: hyper assist: SET_ENTITY_ANGULAR_VELOCITY wrote %.3f %.3f %.3f and the same-tick GET_ENTITY_ROTATION_VELOCITY says "
-                  "%.3f %.3f %.3f (bad %u, ok %u)", (double)wrote.x, (double)wrote.y, (double)wrote.z, (double)x, (double)y, (double)z,
-                  st.angBad, st.angOk);
+            GLOGW("engine: hyper assist: SET_ENTITY_ANGULAR_VELOCITY wrote %.3f %.3f %.3f (intended world %.3f %.3f %.3f) and the same-tick "
+                  "GET_ENTITY_ROTATION_VELOCITY says %.3f %.3f %.3f (bad %u, ok %u; veh_shake_fix %s)", (double)wrote.x, (double)wrote.y, (double)wrote.z,
+                  (double)intended.x, (double)intended.y, (double)intended.z, (double)x, (double)y, (double)z, st.angBad, st.angOk,
+                  g_shakeFix.load() ? "on" : "OFF");
         }
         if (st.angBad >= 4 && st.angBad > st.angOk)
         {
@@ -10293,6 +11659,7 @@ namespace {
     {
         const double dtMs = st.lastMs > 0.0 ? now - st.lastMs : 0.0;
         st.lastMs = now;
+        g_shk.assistMask = st.mask;
         float vx = 0, vy = 0, vz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
         if (!g_world->GetEntityVelocity(veh, vx, vy, vz))
         {
@@ -10350,6 +11717,11 @@ namespace {
             if (g_world->SetEntityVelocity(veh, out.vel.x, out.vel.y, out.vel.z))
             {
                 ++st.velN;
+                ++g_shk.assistVelWrites;                // 0.4.22: how hard the assist pushes the car per write (the shake line)
+                const double dv = std::sqrt((double)(out.vel.x - in.vel.x) * (out.vel.x - in.vel.x) + (double)(out.vel.y - in.vel.y) * (out.vel.y - in.vel.y) +
+                                            (double)(out.vel.z - in.vel.z) * (out.vel.z - in.vel.z));
+                g_shk.dvSum += dv;
+                g_shk.dvMax = std::max(g_shk.dvMax, dv);
                 HyperVerifyVelocity(st, veh, out.vel);
             }
             else if (++st.velFail >= 30 && st.velN == 0)
@@ -10361,10 +11733,21 @@ namespace {
         }
         if (out.angChanged && !st.angDead && st.mask != 0)
         {
-            if (g_world->SetEntityAngularVelocity(veh, out.angVel.x, out.angVel.y, out.angVel.z))
+            // 0.4.22: the setter takes the BODY frame, the assist computed a WORLD vector (see libs/sync/vehicle_shake.h): hand it the
+            // body-frame version unless veh_shake_fix=0 or the frame judge has found the setter takes the world frame after all.
+            const bool body = g_shakeFix.load() && g_angJudge.UseBody();
+            const sync::DriveVec wvec = body ? sync::shake::WorldToBody(q, { out.angVel.x, out.angVel.y, out.angVel.z })
+                                             : sync::DriveVec{ out.angVel.x, out.angVel.y, out.angVel.z };
+            if (g_world->SetEntityAngularVelocity(veh, wvec.x, wvec.y, wvec.z))
             {
                 ++st.angN;
-                HyperVerifyAngular(st, veh, out.angVel);
+                ++g_shk.assistAngWrites;
+                ++(body ? g_shk.assistAngBody : g_shk.assistAngWorld);
+                const double dw = std::sqrt((double)(out.angVel.x - in.angVel.x) * (out.angVel.x - in.angVel.x) + (double)(out.angVel.y - in.angVel.y) * (out.angVel.y - in.angVel.y) +
+                                            (double)(out.angVel.z - in.angVel.z) * (out.angVel.z - in.angVel.z));
+                g_shk.dwSum += dw;
+                g_shk.dwMax = std::max(g_shk.dwMax, dw);
+                HyperVerifyAngular(st, veh, q, out.angVel, wvec);
             }
             else if (++st.angFail >= 30 && st.angN == 0)
             {
@@ -10421,7 +11804,7 @@ namespace {
         for (std::size_t i = 0; i < out.size(); ++i) {
             const game::content::PackVehicle& v = list[i];
             put(out[i].model, sizeof(out[i].model), v.model);
-            put(out[i].name, sizeof(out[i].name), game::content::CarDisplayName(v.make, v.label, v.model));
+            put(out[i].name, sizeof(out[i].name), v.name.empty() ? v.model : v.name);   // BuildCarList's name (pack_meta.h)
             put(out[i].vclass, sizeof(out[i].vclass), game::content::CarClassName(v.vclass));
             put(out[i].pack, sizeof(out[i].pack), v.pack);
             out[i].ready = v.ready;
@@ -10477,6 +11860,7 @@ namespace {
         if (!tuneOn)
             return;
         g_world->SetVehicleCheatPowerIncrease(veh, prof->power);   // the game clears it every frame
+        g_shk.power = prof->power;                                 // 0.4.22: the shake line names what is written to the car every tick
         if (st.veh != veh)
         {
             st = HyperState();                         // a new car: its own window, read-back record and mask
@@ -10537,6 +11921,30 @@ namespace {
         if (prof->assist.Any())
             HyperAssistFrame(st, *prof, veh, now);
         HyperLogWindow(st, *prof, now);
+    }
+
+    // 0.4.22 (libs/sync/vehicle_shake.h): the shake meter of the car the local player DRIVES, any car (tuned or not): its pitch, roll and
+    // vertical speed at the script tick, as second differences (a buzz at tick rate reads at full gain, a 1-2 Hz bounce at none). Reads only:
+    // GET_ENTITY_VELOCITY and GET_ENTITY_QUATERNION. The 10 s line is "engine: vehicle shake (0.4.22) ... OUR car". Script tick.
+    void TickShakeMeter(int32_t lp, double nowMs)
+    {
+        const int32_t veh = lp ? g_world->GetVehiclePedIsIn(lp) : 0;
+        float vx = 0, vy = 0, vz = 0, qx = 0, qy = 0, qz = 0, qw = 1;
+        if (!veh || g_world->GetPedInVehicleSeat(veh, -1) != lp || !g_world->GetEntityVelocity(veh, vx, vy, vz) ||
+            !g_world->GetEntityQuaternion(veh, qx, qy, qz, qw))
+        {
+            g_localShake.Restart();
+            if (!veh)
+                g_shk.localVeh = 0;
+            return;
+        }
+        if (g_shk.localVeh != veh)
+        {
+            g_shk.localVeh = veh;
+            g_shk.localModel = g_world->GetEntityModel(veh);
+            g_localShake.Restart();
+        }
+        g_localShake.Add(nowMs, { vx, vy, vz }, { qx, qy, qz, qw });
     }
 
     // W10 (docs/sync-specs/live-0.4.2-fixes.md, libs/sync/nametag.h has every rule): the name above each remote ped's head.
@@ -10746,6 +12154,8 @@ namespace {
             g_haveRealPed = false;                    // the alt-tab fallback has no state of the old session to resend
         }
         g_link.Reset();
+        g_angJudge.Configure(g_shakeFix.load() && !g_shakeWorldPinned.load());   // 0.4.22: a new session starts on the body frame again
+        g_localShake.Restart();
         g_vitals.Reset(g_playerHealth.load(), 0);     // the server playerHealth, no armour (Welcome)
         g_health.Reset();
         if (!g_v4ResetEnded.load())
@@ -11160,6 +12570,47 @@ namespace {
         lastDisplaced = displaced;
     }
 
+    // 0.4.22, every 10 s with the seats line: the F / G keys by seat class, what IS_VEHICLE_SEAT_FREE said at a pick, the READ-BACK of the seat
+    // GET_PED_IN_VEHICLE_SEAT really put us in, the L key and the server's answers, and the copies' lock read back with
+    // GET_VEHICLE_DOOR_LOCK_STATUS. Printed when the window had any of it or a copy is locked. Counters are of the last window. Script tick.
+    void ReportDoorsSeats()
+    {
+        const DoorsSeatsStats& d = g_ds;
+        uint32_t copies = 0, lockedCopies = 0;
+        for (const auto& kv : g_vehs)
+            if (kv.second.handle && !kv.second.removed && kv.second.haveState)
+            {
+                ++copies;
+                if (kv.second.st.flags & proto::kVehLocked)
+                    ++lockedCopies;
+            }
+        const uint32_t picks = d.pickSeat[0] + d.pickSeat[1] + d.pickSeat[2] + d.pickSeat[3];
+        const bool active = d.pressF || d.pressG || picks || d.refusedLocked || d.refusedFull || d.refusedOwned || d.refusedFar || d.seatMatch ||
+                            d.seatDiffers || d.seatNotSeated || d.lockPress || d.lockOk || d.lockRefused || d.keep.reissued || d.keep.stuck || lockedCopies;
+        if (active)
+        {
+            std::string by;
+            for (int i = 1; i < 16; ++i)
+                if (d.lockRefusedBy[i])
+                {
+                    char b[40];
+                    std::snprintf(b, sizeof(b), "%s%s=%u", by.empty() ? "" : " ", VehResultName((uint8_t)i), d.lockRefusedBy[i]);
+                    by += b;
+                }
+            GLOGI("engine: doors and seats (0.4.22), last 10 s: switches rear_seats=%s locks=%s; F %u / G %u presses; picks that began an entry: driver %u, front "
+                  "passenger %u, REAR %u, further back %u; no seat found: locked %u, full %u, owned %u, too far %u; IS_VEHICLE_SEAT_FREE at a pick: free %u / taken %u / "
+                  "unknown %u; SEAT READ-BACK (GET_PED_IN_VEHICLE_SEAT): match %u / differs %u / never seated %u; L: %u presses (%u held back by an unanswered one), "
+                  "%u sent (%u not sent), server answers Ok %u (locked %u / unlocked %u), refused %u [%s], frontend sound ok %u / not callable %u; COPIES: %u of %u locked, "
+                  "LOCK READ-BACK (GET_VEHICLE_DOOR_LOCK_STATUS) %u reads (%u not callable): match %u / mismatch %u, re-issued %u, restored %u, left alone (stuck) %u",
+                  g_vehRearSeats.load() ? "on" : "off", g_vehLocks.load() ? "on" : "off", d.pressF, d.pressG, d.pickSeat[0], d.pickSeat[1], d.pickSeat[2], d.pickSeat[3],
+                  d.refusedLocked, d.refusedFull, d.refusedOwned, d.refusedFar, d.freeYes, d.freeNo, d.freeUnknown, d.seatMatch, d.seatDiffers, d.seatNotSeated,
+                  d.lockPress, d.lockHeld, d.lockSent, d.lockNotSent, d.lockOk, d.lockOkLocked, d.lockOkUnlocked, d.lockRefused, by.empty() ? "none" : by.c_str(),
+                  d.soundOk, d.soundFail, lockedCopies, copies, d.keep.reads, d.keep.readFails, d.keep.match, d.keep.mismatch, d.keep.reissued, d.keep.restored,
+                  d.keep.stuck);
+        }
+        g_ds = DoorsSeatsStats();
+    }
+
     // T3, every 10 s with the vehicles lines: the vehicle visual state (tyres, windows, brake lights, handbrake, steering). Counters of the
     // last window (the VisStats ones) and totals since the first sight of each car (the per-car sync::VisualSync stats): see
     // docs/api/protocol.md "T3". Script tick.
@@ -11249,6 +12700,64 @@ namespace {
         g_sig = SigStats();
     }
 
+    // 0.4.22 cars shake, every 10 s with the vehicles lines (libs/sync/vehicle_shake.h has the definitions). Grep "engine: vehicle shake (0.4.22)".
+    //   OUR car: the car the local player drives, ticks by speed band (0-10 / 10-30 / over 30 m/s horizontal), the high-frequency part of its
+    //     pitch and roll (rms of the second difference at the script tick, degrees: ~0.01 = smooth, a 50 Hz buzz of amplitude a reads 4a) and the
+    //     vertical-speed sign flips per second (a buzz reads ~100, a bumpy road a few); what we write to it every tick (the hyper assist's velocity /
+    //     angular changes per write, the power multiplier, the assists in force).
+    //   remote copies: the same kind of numbers for the pose error the drive controller works from (position in mm, rotation in millidegrees), by
+    //     the target's speed (parked / slow / moving), and the sign flips of that error (a copy overshooting its target every frame).
+    //   angular writes: how many went out in which frame and what the read-backs said (body / world / both / neither), the frame in force.
+    void ReportVehShake()
+    {
+        const sync::shake::LocalMeter::Window lw = g_localShake.Take();
+        sync::shake::CopyMeter::Window cw;
+        for (auto& kv : g_vehs)
+            cw.Merge(kv.second.shake.Take());
+        const sync::shake::AngFrameJudge::Counts jc = g_angJudge.TakeWindow();
+        const ShakeStats s = g_shk;
+        uint32_t copyFrames = 0;
+        for (int i = 0; i < sync::shake::CopyMeter::kKinds; ++i)
+            copyFrames += cw.bucket[i].frames;
+        if (lw.ticks)
+        {
+            const char* pack = s.localModel ? game::content::PackOfModel(s.localModel) : nullptr;
+            const auto& b = lw.band;
+            GLOGI("engine: vehicle shake (0.4.22), last 10 s, OUR car (vehicle %d, model 0x%08x, pack %s): %u ticks (bands 0-10 / 10-30 / over 30 m/s: %u / %u / %u, "
+                  "mean speed %.1f / %.1f / %.1f); pitch high-frequency rms %.3f / %.3f / %.3f deg (max %.2f), roll %.3f / %.3f / %.3f deg (max %.2f), "
+                  "vertical-speed sign flips per s %.1f / %.1f / %.1f; history restarts %u; WE WRITE: velocity %u times (mean change %.3f, max %.3f m/s), "
+                  "angular %u times (%u body frame / %u world frame; mean change %.4f, max %.3f rad/s), assists mask 0x%x, power x%.1f every tick; "
+                  "veh_shake_fix=%s",
+                  s.localVeh, (unsigned)s.localModel, pack ? pack : "-", lw.ticks, b[0].ticks, b[1].ticks, b[2].ticks, b[0].MeanSpeed(), b[1].MeanSpeed(),
+                  b[2].MeanSpeed(), b[0].PitchRms(), b[1].PitchRms(), b[2].PitchRms(), std::max(b[0].pitchMax, std::max(b[1].pitchMax, b[2].pitchMax)),
+                  b[0].RollRms(), b[1].RollRms(), b[2].RollRms(), std::max(b[0].rollMax, std::max(b[1].rollMax, b[2].rollMax)), b[0].FlipsPerS(),
+                  b[1].FlipsPerS(), b[2].FlipsPerS(), lw.restarts, s.assistVelWrites, s.assistVelWrites ? s.dvSum / s.assistVelWrites : 0.0, s.dvMax,
+                  s.assistAngWrites, s.assistAngBody, s.assistAngWorld, s.assistAngWrites ? s.dwSum / s.assistAngWrites : 0.0, s.dwMax, s.assistMask,
+                  (double)s.power, g_shakeFix.load() ? "on" : "OFF");
+        }
+        if (copyFrames || s.copyAngWrites || s.impactAngWrites || jc.body || jc.world || jc.both || jc.neither)
+        {
+            using sync::shake::CopyMeter;
+            const CopyMeter::Bucket& pk = cw.bucket[CopyMeter::Parked];
+            const CopyMeter::Bucket& sl = cw.bucket[CopyMeter::Slow];
+            const CopyMeter::Bucket& mv = cw.bucket[CopyMeter::Moving];
+            GLOGI("engine: vehicle shake (0.4.22), last 10 s, remote copies: PARKED %u frames: position high-frequency rms %.2f mm (max %.1f), rotation %.1f mdeg "
+                  "(max %.1f), error sign flips %u pos / %u rot; SLOW (0.5-3 m/s) %u frames: %.2f mm (max %.1f), %.1f mdeg, flips %u / %u; MOVING (over 3 m/s) %u frames: "
+                  "%.2f mm (max %.1f), %.1f mdeg (max %.1f), flips %u / %u; history restarts %u; ANGULAR WRITES: copies %u (%u body frame / %u world frame), "
+                  "server impacts %u; read-backs of ALL angular writes (copies, assist, impacts) %u body / %u world / %u both / %u neither; frame in force: %s "
+                  "(judge flips %u); veh_shake_fix=%s",
+                  pk.frames, pk.PosHfRmsMm(), pk.posMax * 1000.0, pk.RotHfRmsMdeg(), pk.rotMax * 1000.0, pk.posFlips, pk.rotFlips, sl.frames, sl.PosHfRmsMm(),
+                  sl.posMax * 1000.0, sl.RotHfRmsMdeg(), sl.posFlips, sl.rotFlips, mv.frames, mv.PosHfRmsMm(), mv.posMax * 1000.0, mv.RotHfRmsMdeg(),
+                  mv.rotMax * 1000.0, mv.posFlips, mv.rotFlips, cw.restarts, s.copyAngWrites, s.copyAngBody, s.copyAngWorld, s.impactAngWrites, jc.body, jc.world,
+                  jc.both, jc.neither, g_angJudge.UseBody() ? "body" : "world", g_angJudge.Flips(), g_shakeFix.load() ? "on" : "OFF");
+        }
+        const int32_t keepVeh = g_shk.localVeh;
+        const uint32_t keepModel = g_shk.localModel;
+        g_shk = ShakeStats();
+        g_shk.localVeh = keepVeh;                      // the identity of the car being followed survives the window
+        g_shk.localModel = keepModel;
+    }
+
     // R3 T4, every 10 s with the vehicles lines: the vehicle damage state, the controller's reads AND the copy's applied state per damaged car, so
     // ONE log shows a divergence (the "ctl" line is what our game reads off a car we control and what we report; the "copy" line is the server's
     // block next to what our game shows on a car somebody else controls), plus the sanity layer's counters and the pedal histogram that answers
@@ -11332,6 +12841,7 @@ namespace {
         ReportVehVisual();                             // T3
         ReportVehDamage();                             // R3 T4
         ReportVehSignals();                            // 0.4.18
+        ReportVehShake();                              // 0.4.22
         g_v4.hitDamage = g_hitDamageConfirmed.load(std::memory_order_relaxed);   // the join worker counts it
         g_v4.hitsConfirmed = g_hitConfirmCount.load(std::memory_order_relaxed);
         const V4Stats& c = g_v4;
@@ -11559,6 +13069,7 @@ namespace {
                 lastHand[0] = g_syncDHandovers[0].load();
                 lastHand[1] = g_syncDHandovers[1].load();
                 ReportSeats();                             // T1 seats
+                ReportDoorsSeats();                        // 0.4.22 doors and seats
             }
             const sync::VitalsStats& vs = g_vitals.Stats();
             const sync::HitBatchStats& hs = g_hits.Stats();
@@ -11952,7 +13463,11 @@ namespace {
         if (inScript && mayChange)
             TickHyperTune(lp);                         // the hyper cars (libs/sync/hypertune.h): power every frame, top speed once
         if (inScript && mayChange)
+            TickShakeMeter(lp, NowMs());               // 0.4.22: reads the car we drive (pitch / roll / vertical-speed jitter) for the 10 s shake line
+        if (inScript && mayChange)
             TickRadioOff(lp, NowMs());                 // 0.4.19: no vehicle radio, no radio wheel / its slow-mo (libs/sync/radio_off.h)
+        if (inScript && mayChange)
+            TickMinimap(NowMs());                      // 0.4.22: GTA's radar after the entry + its bars hidden + the vitals dock (libs/sync/minimap.h)
         if (inScript && mayChange && lp) {
             // Auto-mount the add-on car packs through the game's own DLC loader, if armed (pack_mount=1; default off),
             // and hand the Tab menu's car browser the list whenever it (or the loading state) changes.
@@ -12153,8 +13668,12 @@ namespace {
                 if (lp)
                 {
                     WorkSection s(probe, kSecCommands);
-                    RunCommands(lp, now);   // /car /gun /heal /kill /tp /fix
+                    RunCommands(lp, now);   // /car /gun /heal /kill /tp /fix /noclip
                 }
+            }
+            {
+                WorkSection s(probe, kSecCommands);
+                TickNoclip(lp, lpVeh, nowMs);   // 0.4.22: flies, lands and gives the flags back; also runs while dead / not Alive (ends at once)
             }
             if (lp)
             {
@@ -12163,9 +13682,12 @@ namespace {
                 TickLocalEmote(lp, lpVeh != 0, dead, nowMs);
                 if (ServerMode())
                 {
-                    TickVehicleEntry(lp, lpVeh, dead, nowMs);   // F / G first; the link sees the new seat next tick
+                    if (!g_noclip.Active())     // F / G do not walk a flying ped to a car
+                        TickVehicleEntry(lp, lpVeh, dead, nowMs);   // F / G first; the link sees the new seat next tick
                     TickLocalVehicle(lp, lpVeh, dead, nowMs);
+                    TickDoorsSeats(lp, lpVeh, dead, nowMs);     // 0.4.22: the L key, the lock read-back on the copies, the seat read-back of a pick
                 }
+                TickVehicleControls(lp, lpVeh, dead, nowMs);    // 0.4.22: indicators, engine, belt keys + the strip and the fuel gauge (server or not)
             }
             if (lp)
             {

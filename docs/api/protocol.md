@@ -434,9 +434,9 @@ type `0F`, `u16` vehId, `u8` op, `u32` arg; op 8 (`Register`) adds a tail. Every
 |---|---|---|---|
 | 1 | `Spawn` | model hash (not 0) | needs a server-known position (`NoState`); placed 4 m ahead of the requester, facing its heading; caps below |
 | 2 | `Despawn` | | its spawner only (occupants are put out) |
-| 3 | `Enter` | seat 0..7 (0 = driver) | seat free, vehicle within `vehicleEnterDistance` (10 m) of the requester's last position, not locked (its spawner may still enter); a player sitting elsewhere leaves that seat first; a seat change inside the same vehicle skips the distance and lock checks. v5: the driver's seat (0) of an **owned** vehicle is its owner's alone: anybody else gets `NotOwner`, checked before everything else about the seat (so GTA's seat shuffle into an empty driver's seat, and a seat somebody sits in, are `NotOwner` too, and the client knows why and does not retry); the other seats are open to everybody |
+| 3 | `Enter` | seat 0..7 (0 = driver) | seat free, vehicle within `vehicleEnterDistance` (10 m) of the requester's last position, not locked (its spawner and, 0.4.22, its last driver may still enter: `Locked` for everybody else, rear seats included); a player sitting elsewhere leaves that seat first; a seat change inside the same vehicle skips the distance and lock checks. v5: the driver's seat (0) of an **owned** vehicle is its owner's alone: anybody else gets `NotOwner`, checked before everything else about the seat (so GTA's seat shuffle into an empty driver's seat, and a seat somebody sits in, are `NotOwner` too, and the client knows why and does not retry); the other seats are open to everybody |
 | 4 | `Exit` | | the vehicle the requester sits in; a driver's vehicle **parks** (velocities, steering and horn cleared) |
-| 5 | `SetLocked` | non-zero = locked | its driver or spawner |
+| 5 | `SetLocked` | non-zero = locked | 0.4.22: the player in its driver's seat, its spawner or its last driver (the last player to take seat 0, never on the wire); from outside the vehicle also within `vehicleLockDistance` (12 m, 0 = any) of it (`TooFar`; `NoState` without a server position); `NotAllowed` for anybody else and for everybody with `vehicleLocks` 0. Repeating the current state is Ok and changes nothing. See "0.4.22 door locks and rear seats" below |
 | 6 | `SetLights` | non-zero = on | its driver or spawner |
 | 7 | `SetColours` | primary \| secondary << 8 | its driver or spawner |
 | 8 | `Register` | model hash | adopt a local (ambient) car: the tail is `u64` position (cm), `u32` rotation, `u8` colour1, `u8` colour2, `u8` seat (16 bytes; 23-byte message). Within `vehicleEnterDistance` of the requester; the server creates the vehicle there (adopted, the requester its spawner) and seats the requester. An adopted vehicle is not owned |
@@ -1297,3 +1297,63 @@ Every read that feeds the wire is judged against a per-car BASELINE learned at t
   (ctl|copy): server body / engine / petrol / parts / dents ...; <controller's|copy's own> read body / petrol / doors / lamps / dents ...` so one log shows the
   controller's reads and the copy's applied state side by side. The first replays are logged in full (`damage (copy)`), the guards once (`damage guards for a ...`).
 <!-- R3-T4-END -->
+
+<!-- DOORS-SEATS-BEGIN: 0.4.22. NO wire change: no kVersion bump, no new message, no new bit. -->
+## 0.4.22 door locks and rear seats (no protocol change)
+
+GI: "locking / unlocking doors, and being able to sit in the back seats if the car has 4 doors". Everything rides what v4-v6 already carry:
+the lock is `VehicleState.flags` bit 0 (`kVehLocked`, server-owned, in every full and every motion-only entry and in a newcomer's first full entry),
+it is toggled with `VehicleCmd` op 5 `SetLocked` (arg 1 locks, 0 unlocks) and refused with the existing `VehicleResult` codes; a seat is claimed with
+`Enter` / `EnterIntent` and a wire seat 0..7 (wire seat s is GTA seat s-1: 0 driver, 1 front passenger, 2 rear left, 3 rear right, 4.. further back).
+Rules both sides share: `libs/sync/vehicle_lock.h`; seat choice: `libs/sync/vehicle_entry.h`. Tests: `tests/doors_seats_tests.h` (gameplay_test),
+`tests/doors_seats_net_tests.h` (t3_vehvisual_test, the real server over loopback ENet).
+
+### Who holds the key (server, `VehicleStore::SetLocked` / `Enter` / `Reserve`)
+
+* the player in the driver's seat (seat 0) of the vehicle, the **spawner** (the player whose Spawn or Register created it, also after a `Release`) and the
+  **last driver** (`Vehicle::lastDriver`: the last player to take seat 0; a server-side field, never on the wire, cleared when that player disconnects so a
+  later player with the same id does not inherit it) may lock and unlock it, and may **enter it while it is locked**;
+* from inside the vehicle the distance is not looked at; from outside the player must be within `vehicleLockDistance` of the vehicle's last server position
+  (`TooFar`; `NoState` when the server has no position of theirs). `NotAllowed` for a passenger without the key and for everybody else;
+* a locked vehicle refuses every other player's `Enter` and `EnterIntent` with `Locked` (a seat change inside the same vehicle is never refused, and an
+  `Exit` is never refused: the occupants of a locked car can always get out). Ownership (v5) is unchanged: the driver's seat of an owned car is its owner's;
+* the key follows the last driver: after the spawner (or anybody) has taken seat 0, the previous driver has lost it.
+
+### server.json (docs/api/server.md)
+
+`vehicleLocks` (0 or 1, default 1; 0 = `SetLocked` is refused `NotAllowed`, nothing is ever locked) and `vehicleLockDistance` (0..100 m, default 12;
+0 = any distance). Log lines: at start `doors: vehicle locks on (...)` / `OFF`; per lock `doors: <name> (id N) lock|unlock vehicle id=V (the driver | its spawner | its last driver)`;
+per refusal (rate limited per player like every drop line) `drop id=N <name>: SetLocked refused: <name> tried to lock|unlock vehicle id=V: <code> (<why>)` and
+`Enter|EnterIntent refused: <name> (id N) at locked vehicle id=V seat S: Locked (no key; spawner A, last driver B)`; every 10 s while locks flowed
+`doors: last 10 s: locked a, unlocked b, SetLocked refused c, entries refused because the vehicle was locked d`.
+
+### Client (apps/engine/engine.cpp; HKCU\Software\GAGE-MP)
+
+* **G / F** (existing keys, controls 47 and 23): the nearest free passenger seat of the nearest networked vehicle within 8 m, by door distance, **rear seats
+  included** when the model has them: the seat count is the larger of `GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS(vehicle) + 1` and
+  `GET_VEHICLE_MODEL_NUMBER_OF_SEATS(model)`; it goes through the T1 intent flow (EnterIntent, the server's reservation, `TASK_ENTER_VEHICLE` for that seat
+  with the no-jack flag), a locked car (a key holder's entry) through the walk and `SET_PED_INTO_VEHICLE`; the server's `Enter` is the authority either
+  way. Control 58 (INPUT_THROW_GRENADE, also G on foot) is disabled with them. `veh_rear_seats=0`: F / G see only seats 0 and 1.
+* **L** (control 182, INPUT_CELLPHONE_CAMERA_FOCUS_LOCK, disabled while a networked vehicle is within 8 m): locks or unlocks the vehicle we sit in, else the
+  nearest vehicle in reach we hold the key of (the key ring: cars we drove or own), else the nearest one; it asks for the opposite of the replicated flag, and a
+  second press is ignored until the answer (or 1.5 s) arrives. The answer is a chat line ("Vehicle locked." / "Vehicle unlocked." / the refusal) and a frontend
+  sound (`PLAY_SOUND_FRONTEND`: SELECT locked, BACK unlocked, ERROR refused). Never active while the chat or a panel has the keyboard.
+* **Every copy** gets `SET_VEHICLE_DOORS_LOCKED(2 locked | 1 unlocked)` from the flag (`ApplyVehicleFields`, once per change; a late joiner gets it with the first
+  full entry). `GET_VEHICLE_DOOR_LOCK_STATUS` is read back about once a second (`LockKeeper`); a lock the game dropped is set again, a car that keeps
+  refusing it is left alone for 10 s after 3 tries. Lock state 2 lets the player inside get out (4 would trap him and is not used).
+* `veh_locks=0`: no L key and no read-back (the flag from the server is still applied once per change). Both switches are re-read at every Welcome.
+
+### Diagnostics
+
+Every 10 s (when anything happened or a copy is locked): `engine: doors and seats (0.4.22), last 10 s: ...` with the presses, the seat class of each pick, the refusals,
+`IS_VEHICLE_SEAT_FREE` at a pick, the SEAT READ-BACK (`GET_PED_IN_VEHICLE_SEAT` against the seat picked: match / differs / never seated), the L presses and the
+server's answers, and the LOCK READ-BACK of the copies (reads, match / mismatch, re-issued, restored, left alone). One line per action: `engine: doors: F|G picked wire seat ...`,
+`engine: doors: L -> asking the server to LOCK|UNLOCK vehicle id=...`, `engine: doors: the server answered SetLocked ...`, `engine: doors: vehicle id=N is now LOCKED|UNLOCKED`,
+`engine: doors: seat read-back OK|DIFFERS|NOT SEATED ...`. The first sight of a model logs both seat-count natives and warns when they disagree.
+
+### Evidence level
+
+The server, the wire and the session are **real** (tested over loopback ENet). What the game does with `SET_VEHICLE_DOORS_LOCKED(2)` on a copy a puppet or a player is
+inside, whether control 182 and 58 are the L key and the grenade throw, the sound names and the rear seat bones of a given model are **live-unverified** (the log
+lines above are the live check).
+<!-- DOORS-SEATS-END -->

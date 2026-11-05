@@ -63,6 +63,7 @@ static void Check(const char* name, bool ok, const std::string& got = "")
 #include "t6_health_tests.h"   // T6 health: the server -> wire -> client apply -> HUD chain on a simulated ped (needs Check above)
 #include "r3_t1_health_tests.h"   // R3 T1 health: the measured GTA ceiling, DIRECT / SCALED, under 5 switchable GTA models
 #include "map_clear_tests.h"   // 0.4.20 map clean-up: blip verdicts, sweep plan, schedule, tally (needs Check above)
+#include "minimap_tests.h"     // 0.4.22 minimap: radar decision, bars gate, radar rectangle, vitals dock (needs Check above)
 
 static std::string F(const char* fmt, ...)
 {
@@ -3057,6 +3058,9 @@ static void TestSyncD()
 #include "t1_seats_tests.h"   // T1 seats (wire v6): server reservations, puppet replay, local flow, the three-client scenario
 #include "r3_t3_cover_tests.h"   // R3 T3 cover: sender classifier, verified cover window vs the 0d code on a simulated puppet
 #include "radio_off_tests.h"   // 0.4.19 radio off: the rules, the gate, a drive against a game model (old behaviour must fail)
+#include "noclip_tests.h"   // 0.4.22 noclip: movement math, state machine, saved flags, ground placement (needs Check and F above)
+#include "doors_seats_tests.h"   // 0.4.22 doors and seats: rear-seat choice, the lock rules, the lock keeper (needs Check / F above)
+#include "vehcontrols_pure_tests.h"   // 0.4.22 vehicle controls: keys -> indicators / engine / belt, auto-cancel, fuel gauge, wire helpers
 
 int main()
 {
@@ -3108,6 +3112,10 @@ int main()
     r4t3::ClientTests();
     radiooff::RunPure();                            // 0.4.19 radio off (tests/radio_off_tests.h)
     mapclear::RunPure();                            // 0.4.20 map clean-up (tests/map_clear_tests.h)
+    minimaptest::RunPure();                         // 0.4.22 minimap (tests/minimap_tests.h)
+    noclipt::RunPure();                             // 0.4.22 noclip (tests/noclip_tests.h)
+    doorsseats::RunPure();                          // 0.4.22 doors and seats (tests/doors_seats_tests.h)
+    vehctl::RunPure();                              // 0.4.22 vehicle controls (tests/vehcontrols_pure_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3117,7 +3125,11 @@ int main()
     // + W10 16 (fade 1, scale 1, projection 1, cache 1, cache rate 1, eased alpha 1, hidden rules 3, walk-away 1, wall latency 1, candidates 1, text 3, cap 1)
     // + 0.4.5 melee audit 8 (punch, combo, miss then hit, stale event, window edge, guns, event gate, client/server window)
     const int expected = 41 + 8 + 8 + 13 + 23 + 42 + 18 + 7 + 60 + 52 + 23 + 11 + 7 + 6 + 8 + 16 + kSyncDGameplayChecks + 8
-                       + mapclear::kChecks;   // + 0.4.20 map clean-up 19
+                       + mapclear::kChecks    // + 0.4.20 map clean-up 19
+                       + minimaptest::kChecks // + 0.4.22 minimap 28
+                       + noclipt::kChecks     // + 0.4.22 noclip 31
+                       + doorsseats::kPureChecks    // + 0.4.22 doors and seats 19
+                       + vehctl::kPureChecks; // + 0.4.22 vehicle controls 38
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

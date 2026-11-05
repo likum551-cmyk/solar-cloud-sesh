@@ -74,6 +74,7 @@ namespace gage::game::content {
     // One car a mounted pack carries.
     struct PackVehicle {
         std::string model;    // the /car name
+        std::string name;     // what the menu shows: "BMW M5" (pack_meta.h BuildCarList; unique in the list)
         std::string make;     // vehicles.meta <vehicleMakeName>
         std::string label;    // vehicles.meta <gameName>
         std::string vclass;   // vehicles.meta <vehicleClass> (VC_SUPER, ...)
@@ -81,7 +82,8 @@ namespace gage::game::content {
         bool ready = false;   // IS_MODEL_IN_CDIMAGE said yes
     };
 
-    // Every car of every mounted pack, sorted by make then model. Any thread (a locked copy).
+    // Every car of every mounted pack, sorted by name; a model two packs both define is listed once, for the
+    // pack that mounted first. Any thread (a locked copy).
     std::vector<PackVehicle> Vehicles();
 
     // Changes whenever Vehicles() would return something new (a pack mounted, a car reached the cdimage). Any thread.

@@ -53,7 +53,8 @@ namespace gage::server {
             kDropHit = 7,
             kDropAnim = 8,
             kDropUntrusted = 9,
-            kDropKinds = 10
+            kDropLock = 10,      // 0.4.22: a SetLocked refused, or an Enter / EnterIntent refused Locked
+            kDropKinds = 11
         };
 
         // v4 per-player rate limits (token buckets: burst, per second). VehicleCmd of any kind; Spawn and
@@ -308,6 +309,14 @@ namespace gage::server {
                     std::to_string(seated) + ", cancelled " + std::to_string(canc) + " (expired " + std::to_string(n.seatExpired - o.seatExpired) +
                     "), announced exits " + std::to_string(exits) + ", notices sent " + std::to_string(n.seatNoticesSent - o.seatNoticesSent));
         }
+        {
+            // 0.4.22 doors: one line while locks flowed.
+            const uint64_t lk = n.vehicleLocks - o.vehicleLocks, ulk = n.vehicleUnlocks - o.vehicleUnlocks, ref = n.lockRefused - o.lockRefused,
+                           ent = n.lockedEntryRefused - o.lockedEntryRefused;
+            if (lk + ulk + ref + ent != 0)
+                Log("doors: last 10 s: locked " + std::to_string(lk) + ", unlocked " + std::to_string(ulk) + ", SetLocked refused " + std::to_string(ref) +
+                    ", entries refused because the vehicle was locked " + std::to_string(ent));
+        }
         LogMeleeSummary(n, o);
         hitLogMark_ = stats_;
     }
@@ -415,6 +424,8 @@ namespace gage::server {
             vr.enterDistance = (float)cfg_.vehicleEnterDistance;
             vr.maxSpeed = (float)cfg_.vehicleMaxSpeed;
             vr.fuelDrainPerMinute = cfg_.fuelDrainPerMinute;
+            vr.locksEnabled = cfg_.vehicleLocks != 0;                 // 0.4.22
+            vr.lockDistance = (float)cfg_.vehicleLockDistance;
             vr.enterRadius = (float)cfg_.repl.enterRadius;
             vr.leaveRadius = (float)cfg_.repl.leaveRadius;
             vr.nearDist = (float)cfg_.repl.nearDist;
@@ -455,6 +466,9 @@ namespace gage::server {
         // value that undercuts another (rateNearHz under tickHz) is a WARNING naming both.
         Log(DescribeRepl(cfg_));
         Log(DescribeCombat(cfg_));
+        Log(std::string("doors: vehicle locks ") + (cfg_.vehicleLocks ? "on (key: the driver's seat, the spawner or the last driver; from outside within " +
+                                                                       (cfg_.vehicleLockDistance ? std::to_string(cfg_.vehicleLockDistance) + " m" : std::string("any distance")) + ")"
+                                                                     : std::string("OFF (SetLocked is refused)")));
         Log(DescribeLatestClient(cfg_));
         for (const std::string& w : ConfigWarnings(cfg_)) Log("WARNING: " + w);
         Log("authority: hits tied to shots within " +
@@ -1580,6 +1594,20 @@ namespace gage::server {
         }
     }
 
+    void Server::LockedEntryRefused(Conn& c, const proto::VehicleCmd& m, const char* op)
+    {
+        stats_.lockedEntryRefused++;
+        const VehicleStore::Vehicle* v = vehicles_.Get(m.vehId);
+        std::string who = "nobody";                                   // the vehicle's key holders, for the log
+        if (v)
+        {
+            who = "spawner " + (v->spawner == proto::kNoPlayer ? std::string("none") : std::to_string(v->spawner)) + ", last driver " +
+                  (v->lastDriver == proto::kNoPlayer ? std::string("none") : std::to_string(v->lastDriver));
+        }
+        LogDrop(c, kDropLock, std::string(op) + " refused: " + c.name + " (id " + std::to_string(c.id) + ") at locked vehicle id=" + std::to_string(m.vehId) +
+                                  " seat " + std::to_string(m.arg & 0xFF) + ": Locked (no key; " + who + ")");
+    }
+
     proto::VehicleResultCode Server::RunVehicleCmd(Conn& c, const proto::VehicleCmd& m, uint16_t& vehId)
     {
         using Code = proto::VehicleResultCode;
@@ -1676,7 +1704,11 @@ namespace gage::server {
                 stats_.untrustedRefusals++;
                 return Code::RateLimited;
             }
-            return vehicles_.Enter(c.id, m.vehId, m.arg, c.k, nowMs, tick_);
+        {
+            const Code r = vehicles_.Enter(c.id, m.vehId, m.arg, c.k, nowMs, tick_);
+            if (r == Code::Locked) LockedEntryRefused(c, m, "Enter");
+            return r;
+        }
         case proto::VehicleOp::Exit:
             return vehicles_.Exit(c.id, m.vehId, nowMs, tick_, true); // T1: announced (SeatNotice::Exited), or a pending reservation cancelled
         case proto::VehicleOp::EnterIntent:
@@ -1693,6 +1725,7 @@ namespace gage::server {
             const Code r = vehicles_.Reserve(c.id, m.vehId, m.arg & 0xFF, (m.arg & proto::kIntentRun) != 0, c.k, nowMs, tick_);
             if (r == Code::Ok) stats_.seatIntents++;
             else stats_.seatIntentsRefused++;
+            if (r == Code::Locked) LockedEntryRefused(c, m, "EnterIntent");
             return r;
         }
         case proto::VehicleOp::CancelIntent:
@@ -1700,7 +1733,43 @@ namespace gage::server {
         case proto::VehicleOp::Release:
             return vehicles_.Release(c.id, m.vehId, tick_); // v5: the owner gives the driver's seat to anybody
         case proto::VehicleOp::SetLocked:
-            return vehicles_.SetFlag(c.id, m.vehId, proto::kVehLocked, m.arg != 0, tick_);
+        {
+            // 0.4.22: the driver's seat, the spawner or the last driver; from outside within vehicleLockDistance (VehicleStore::SetLocked).
+            const bool on = m.arg != 0;
+            const VehicleStore::Vehicle* v = vehicles_.Get(m.vehId);
+            bool wasLocked = false;
+            const Code r = vehicles_.SetLocked(c.id, m.vehId, on, c.k, c.hasState, tick_, &wasLocked);
+            const std::string what = std::string(on ? "lock" : "unlock") + " vehicle id=" + std::to_string(m.vehId);
+            if (r == Code::Ok)
+            {
+                if (on != wasLocked) ++(on ? stats_.vehicleLocks : stats_.vehicleUnlocks);
+                const bool seat0 = v && v->s.seats[0] == c.id;
+                const std::string how = seat0 ? "the driver" : v && v->spawner == c.id ? "its spawner" : "its last driver";
+                Log("doors: " + c.name + " (id " + std::to_string(c.id) + ") " + what + (on == wasLocked ? ": already so, nothing changed" : "") + " (" + how + ")");
+            }
+            else
+            {
+                stats_.lockRefused++;
+                std::string why;
+                switch (r)
+                {
+                case Code::NotAllowed:
+                    why = cfg_.vehicleLocks ? "not in the driver's seat, not its spawner, not its last driver" : "vehicle locks are off on this server";
+                    break;
+                case Code::TooFar:
+                    why = "more than " + std::to_string(cfg_.vehicleLockDistance) + " m from it";
+                    break;
+                case Code::NoState:
+                    why = "the server has no position of theirs";
+                    break;
+                default:
+                    why = proto::ToString(r);
+                    break;
+                }
+                LogDrop(c, kDropLock, "SetLocked refused: " + c.name + " tried to " + what + ": " + proto::ToString(r) + " (" + why + ")");
+            }
+            return r;
+        }
         case proto::VehicleOp::SetLights:
             return vehicles_.SetFlag(c.id, m.vehId, proto::kVehLights, m.arg != 0, tick_);
         case proto::VehicleOp::SetColours:

@@ -1,9 +1,12 @@
 // GAGE-MP in-game overlay: the real UI (loading state, corner mark, chat, quick actions,
 // vitals, speedometer). Contract: overlay.h. Seam to the D3D11 plumbing: overlay_internal.h.
 //
-// Screen layout (one 28 px gutter at 1080p on every edge): the mark top-right, the chat top-left
+// Screen layout (one 28 px gutter at 1080p on every edge, bar the docked vitals strip below): the mark top-right, the chat top-left
 // (its plate starts 100 px from the top), the vitals plate and the speedometer stacked on the
-// bottom-right edge, sharing a right edge and a width.
+// bottom-right edge, sharing a right edge and a width. The bottom-left corner is GTA's radar
+// (0.4.22 minimap): nothing persistent of ours is drawn there except the vitals, which dock as a slim
+// strip directly under the radar while it is on (ClusterLayout / DrawVitalsStrip; the speedometer then
+// rests alone on the gutter).
 //
 // Everything that draws runs between ImGui::NewFrame and ImGui::Render on the render
 // thread and never calls a game native. The push/pull functions at the bottom of the
@@ -28,6 +31,7 @@
 #include "pack_meta.h"
 #include "common/logger.h"
 #include "protocol/protocol.h"
+#include "sync/minimap.h"     // RadarKeepOut / DockVitals: where GTA's radar is, and where the vitals plate goes under it
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImGuiContext::ConfigNavWindowingKey* (UiInit)
@@ -142,6 +146,18 @@ std::atomic<float>    g_vitSatiety{1.0f};
 std::atomic<float>    g_vitFuel{1.0f};
 std::atomic<bool>     g_vitShow{true};
 std::atomic<bool>     g_vitShowFuel{false};
+// 0.4.22 minimap (SetRadarDock): dock the vitals plate under GTA's radar. Off until the engine says so (the pre-0.4.22 layout).
+std::atomic<bool>     g_radarDock{false};
+std::atomic<float>    g_radarSafeZone{1.0f};
+std::atomic<bool>     g_radarSafeZoneOk{false};
+// 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
+// one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown.
+std::atomic<unsigned>  g_vehKeys{0};
+std::atomic<ULONGLONG> g_vehKeysAt{0};
+std::atomic<unsigned>  g_vehHud{0};
+constexpr ULONGLONG    kVehKeyStaleMs = 400;
+// The HUD clock's capture hook (Overlay::SetHudPhaseForTest): < 0 = off, the clock runs from ImGui's time; 0..1 = every blink and pulse is held at that phase.
+std::atomic<float>     g_hudPhaseForce{-1.0f};
 
 // Keep printable text: control characters become spaces, and a cut never leaves half a UTF-8 sequence.
 std::string Clean(const char* s, std::size_t maxBytes)
@@ -228,6 +244,7 @@ struct Ui {
     // The bottom-right cluster's eased values (TickVitals, UiFrame): what is drawn trails what was pushed.
     float    speedSm = 0.0f;                // displayed speed, km/h
     float    vitalsA = 0.0f, fuelA = 0.0f;  // cluster / fuel row visibility
+    float    stripA = 0.0f;                 // the speedometer plate's status strip (0.4.22): eased so the plate never jumps in height
     struct Vital {
         float fill = 1.0f;                  // the bar's level as drawn
         float trail = 1.0f;                 // lags above fill after a loss, so damage reads
@@ -304,6 +321,17 @@ ImU32 Col(Rgb c, float a)
 {
     return ImGui::ColorConvertFloat4ToU32(ImVec4(c.r, c.g, c.b, Clamp01(a)));
 }
+// The one HUD clock (0.4.22): every blink and pulse of the vitals strip, the speedometer's status strip and the plates' rail comes from this phase,
+// phi = fract(t * 1.5), so they all beat together. The turn indicators blink on phi < 0.5 (1.5 Hz, on for the first half); every alarm (a low vital,
+// the unbuckled belt, the rail) pulses on the 2nd harmonic of the same phase, 3 Hz, brightest exactly when an indicator comes on and when it goes off.
+float HudPhase()
+{
+    const float f = g_hudPhaseForce.load();
+    if (f >= 0.0f)
+        return f - std::floor(f);
+    return (float)std::fmod(ImGui::GetTime() * 1.5, 1.0);
+}
+float AlarmPulse(float phi) { return 0.5f + 0.5f * std::cos(phi * 12.5663706f); }   // 4 pi: two beats per phase, 1 at phi = 0 and 0.5, 0 at 0.25 and 0.75
 // Distance from a text box's top to its baseline at the size drawn (lets two faces share a baseline).
 float AscentPx(const Fnt& f) { return f.font->Ascent * (f.px / f.base); }
 // The ink box of a numeral at the size drawn, as offsets from the text box's top. '1' is flat on
@@ -466,17 +494,15 @@ int ChatCharFilter(ImGuiInputTextCallbackData* d)
 struct Action {
     const char* label;
     const char* cmd;      // what is queued for the engine (QueueCommand in engine.cpp)
-    int         column;   // 0 player, 1 vehicles, 2 weapons
+    int         column;   // 0 player, 1 movement, 2 weapons
+    int         kind = 0; // 1: the noclip toggle (shows On / Off, hidden when the engine says noclip=0)
 };
+// (The cars that used to be the middle column are the Tab menu's Cars page now; 0.4.22 put the noclip toggle there.)
 const Action kActions[] = {
     {"Heal",           "/heal",                 0},
     {"Repair vehicle", "/fix",                  0},
     {"Go to spawn",    "/spawn",                0},
-    {"Adder",          "/car adder",            1},
-    {"Zentorno",       "/car zentorno",         1},
-    {"T20",            "/car t20",              1},
-    {"Comet",          "/car comet2",           1},
-    {"Bati 801",       "/car bati",             1},
+    {"Noclip",         "/noclip",               1, 1},
     {"Pistol",         "/gun pistol",           2},
     {"Micro SMG",      "/gun microsmg",         2},
     {"Carbine rifle",  "/gun carbinerifle",     2},
@@ -485,7 +511,13 @@ const Action kActions[] = {
 };
 constexpr int kActionCount = (int)(sizeof(kActions) / sizeof(kActions[0]));
 static_assert(kActionCount <= UiState::kMaxActions, "UiState::kMaxActions is too small");
-const char* const kColumnTitle[3] = {"Player", "Vehicles", "Weapons"};
+const char* const kColumnTitle[3] = {"Player", "Movement", "Weapons"};
+constexpr int kActionNoclip = 1;
+// Pushed by the engine (SetNoclip): is the toggle offered at all (the noclip registry switch), and is it on. Until the engine
+// says otherwise the row is offered and off.
+std::atomic<bool> g_noclipAvail{true};
+std::atomic<bool> g_noclipOn{false};
+bool ActionShown(const Action& a) { return a.kind != kActionNoclip || g_noclipAvail.load(); }
 
 // ---------------------------------------------------------------------------
 // Panel open / close
@@ -669,13 +701,37 @@ void DrawLogo(ImDrawList* dl, float W, float a, UiState& L)
 // the two read as a single instrument block. The speedometer sits directly above the vitals plate and
 // drops into the corner while the vitals are hidden; the vitals plate is a fixed two rows (HP, FOOD) so
 // it never shifts, and fuel is a gauge on the speedometer plate (vehicle data, shown only in a vehicle).
+//
+// 0.4.22 minimap: with GTA's radar on (SetRadarDock) the vitals leave this cluster and dock at the bottom-left as a
+// slim strip, the radar's left edge and width (libs/sync/minimap.h DockVitals), health in its left half and food in
+// its right half. The speedometer then rests on the bottom gutter alone.
+//
+// Placement, one of the two options (2026-11-05): DIRECTLY UNDER the radar's bottom edge, inside the safe-zone margin,
+// FLUSH with it (gap 0, as GTA's own bars were, a hairline gap read as a seam), and not over the map where GTA's own
+// bars were. At the default safe zone that covers no map pixel at all, it does not depend on the (live-unverified)
+// hiding of GTA's bars (minimap_bars: they sit inside the radar, so at worst they show once more above our strip), and
+// an error in the radar rectangle (a community formula) only changes the gap. Whether GTA's own radar anchor includes
+// a ~18 px band for those bars (radar rect bottom above the drawn map's) is a live question, not decided here: the
+// log line names the strip's top y and the radar rect's bottom y, so one live screenshot settles it.
+// Where the margin under the radar is too small for the strip (a safe zone past about
+// 0.95 at 1080p) it tucks up into the radar's bottom edge, at most kStripMaxCover of the radar's height, which is where
+// GTA's bars sit; beyond that the plate returns to the bottom-right, as with the radar off.
+constexpr float kStripFrac = 0.07f;        // strip height / radar height (GTA's bars are about as thin)
+constexpr float kStripMinH = 11.0f;        // and never thinner than this: 11 px holds the 7 px glyph class (2 px above and below) and a 5 px bar
+constexpr float kStripMaxCover = 0.08f;    // the most of the radar's height the strip may tuck into the map
 struct Cluster {
-    float x = 0, w = 0;                      // left edge and width, shared by both plates
+    float x = 0, w = 0;                      // left edge and width of the speedometer (and of the vitals plate while it stays here)
     float gut = 0, gap = 0;                  // screen gutter, space between the two plates
     float padX = 0, padT = 0, padB = 0;      // vitals plate: side, top (clears the rail) and bottom padding
     float rowH = 0, rowGap = 0;
     float vH = 0, vTop = 0;                  // vitals plate height now (animated rows) and its top edge
+    float vx = 0, vw = 0;                    // the vitals' left edge and width (c.x / c.w unless docked); vH / vTop become the strip's
     float speedoBottom = 0;                  // where the speedometer's bottom edge goes
+    bool  docked = false;                    // the vitals are the strip under the radar
+    int   dockWhy = -1;                      // gage::sync::DockWhy as an int; -1 = no radar asked for
+    float radarX = 0, radarY = 0, radarW = 0, radarH = 0;   // the radar rectangle used (docking asked for)
+    float coverPx = 0;                       // how far the docked strip reaches up into the radar (0 = wholly under it)
+    float dockY = 0;                         // the docked strip's resting top edge (vTop is that while it slides in or out)
 };
 Cluster ClusterLayout(float W, float H)
 {
@@ -692,11 +748,36 @@ Cluster ClusterLayout(float W, float H)
     const float rows = 2.0f;                 // health and satiety, always: fuel lives on the speedometer plate
     c.vH = std::floor(c.padT + rows * c.rowH + (rows - 1.0f) * c.rowGap + c.padB);
     // The vitals plate slides in from below the screen edge (and out again); the speedometer rides on its
-    // top edge until the plate is gone, then rests on the gutter. Both are bottom-anchored, so a row
-    // growing in (fuel) lifts the speedometer instead of overlapping it.
+    // top edge until the plate is gone, then rests on the gutter (this stacking holds for the bottom-right
+    // plate only: with the plate docked under the radar, below, the speedometer always rests on the gutter).
     const float e = u.vitalsA * u.vitalsA * (3.0f - 2.0f * u.vitalsA);
     c.vTop = std::floor(H - c.gut - c.vH + (1.0f - e) * (c.vH + c.gut));
     c.speedoBottom = std::floor(std::fmin(H - c.gut, c.vTop - c.gap));
+    c.vx = c.x;
+    c.vw = c.w;
+    if (g_radarDock.load()) {
+        const gage::sync::ScreenRect radar =
+            gage::sync::RadarKeepOut(W, H, g_radarSafeZone.load(), g_radarSafeZoneOk.load(), 0.0f);
+        c.radarX = radar.x0; c.radarY = radar.y0; c.radarW = radar.x1 - radar.x0; c.radarH = radar.y1 - radar.y0;
+        // The strip is kStripFrac of the radar's height (never under kStripMinH px: 720p's 8 px held no 7 px glyph and a 5 px bar), the radar's
+        // width (held to 120..400 px at 1080p). It sits flush under the radar's bottom edge (gap 0), like GTA's own bars.
+        const float stripH = std::fmax(kStripMinH, std::floor(c.radarH * kStripFrac));
+        const gage::sync::VitalsDock d = gage::sync::DockVitals(W, H, radar, stripH, S(120.0f), S(400.0f), 0.0f, S(10.0f),
+                                                                kStripMaxCover);
+        c.dockWhy = (int)d.why;
+        if (d.docked) {
+            c.docked = true;
+            c.coverPx = d.coverPx;
+            c.vx = std::floor(d.x);
+            c.vw = std::floor(d.w);
+            c.vH = std::floor(d.h);
+            // Slides in from below the screen edge like the cluster plate did (and out again), from the docked top.
+            const float top = std::floor(d.y);
+            c.dockY = top;
+            c.vTop = std::floor(top + (1.0f - e) * (H - top));
+            c.speedoBottom = std::floor(H - c.gut);        // the speedometer no longer rides on the vitals
+        }
+    }
     return c;
 }
 
@@ -713,21 +794,32 @@ void IconHeart(ImDrawList* dl, float x, float y, float s, ImU32 col)
     const ImVec2 tri[3] = {{x + s * 0.05f, cy - r * 0.10f}, {x + s * 0.95f, cy - r * 0.10f}, {x + s * 0.50f, y + s * 0.97f}};
     dl->AddTriangleFilled(tri[0], tri[1], tri[2], col);
 }
-void IconFood(ImDrawList* dl, float x, float y, float s, ImU32 col)   // a fork and knife (dining)
+// A burger: a domed top bun, a patty that overhangs the buns, a flat bottom bun. Filled like the heart, so the
+// two glyphs carry the same weight; the gaps between the layers (at least 1 px) are what make it read at 16 px.
+// It replaced a fork and knife (0.4.22, GI): thin strokes that blurred into a squiggle at HUD size.
+void IconFood(ImDrawList* dl, float x, float y, float s, ImU32 col)
 {
-    const float th = std::fmax(1.6f, s * 0.085f);
-    // Fork (left): three tines over a short neck, then a handle.
-    for (int i = 0; i < 3; ++i) {
-        const float tx = x + s * (0.14f + 0.10f * (float)i);
-        dl->AddLine(ImVec2(tx, y + s * 0.06f), ImVec2(tx, y + s * 0.34f), col, th);
+    // Every edge lands on a whole pixel (visual-critic, 0.4.22): with fractional edges the 16 px glyph's lower gap fell
+    // across two rows and smeared the patty into the bun. 16 px: dome 6, gap 1, patty 2, gap 1, bun 3 rows; the patty
+    // overhangs the buns by exactly 1 px a side.
+    auto R = [](float v) { return std::round(v); };
+    const float gap = std::fmax(1.0f, R(s * 0.08f));
+    const float domeY0 = R(y + s * 0.06f), topY1 = R(y + s * 0.44f);
+    const float patY0 = topY1 + gap, patY1 = patY0 + std::fmax(2.0f, R(s * 0.13f));
+    const float botY0 = patY1 + gap, botY1 = botY0 + std::fmax(3.0f, R(s * 0.19f));
+    const float domeX0 = R(x + s * 0.06f), domeX1 = R(x + s * 0.94f);
+    // Top bun: a half ellipse standing on its flat base.
+    const float cx = (domeX0 + domeX1) * 0.5f, rx = (domeX1 - domeX0) * 0.5f, ry = topY1 - domeY0;
+    const int kSeg = 16;
+    dl->PathClear();
+    for (int i = 0; i <= kSeg; ++i) {
+        const float t = 3.14159265f * (1.0f + (float)i / (float)kSeg);   // pi .. 2pi: left base, over the top, right base
+        dl->PathLineTo(ImVec2(cx + rx * std::cos(t), topY1 + ry * std::sin(t)));
     }
-    dl->AddLine(ImVec2(x + s * 0.14f, y + s * 0.34f), ImVec2(x + s * 0.34f, y + s * 0.34f), col, th);
-    dl->AddLine(ImVec2(x + s * 0.24f, y + s * 0.34f), ImVec2(x + s * 0.24f, y + s * 0.96f), col, th * 1.5f);
-    // Knife (right): a blade that tapers to the tip, over a handle on the same axis.
-    const float kx = x + s * 0.68f;
-    const ImVec2 blade[3] = {{kx - s * 0.08f, y + s * 0.06f}, {kx + s * 0.02f, y + s * 0.06f}, {kx + s * 0.02f, y + s * 0.50f}};
-    dl->AddTriangleFilled(blade[0], blade[1], blade[2], col);
-    dl->AddLine(ImVec2(kx + s * 0.02f, y + s * 0.50f), ImVec2(kx + s * 0.02f, y + s * 0.96f), col, th * 1.5f);
+    dl->PathFillConvex(col);
+    dl->AddRectFilled(ImVec2(R(x + s * 0.02f), patY0), ImVec2(R(x + s * 0.98f), patY1), col, s * 0.07f);
+    dl->AddRectFilled(ImVec2(R(x + s * 0.08f), botY0), ImVec2(R(x + s * 0.92f), botY1), col, s * 0.09f,
+                      ImDrawFlags_RoundCornersBottom);
 }
 void IconFuel(ImDrawList* dl, float x, float y, float s, ImU32 col)   // a gas pump: body + nozzle hooked over the top
 {
@@ -739,6 +831,188 @@ void IconFuel(ImDrawList* dl, float x, float y, float s, ImU32 col)   // a gas p
     dl->AddLine(ImVec2(bx1 + s * 0.26f, by1 - s * 0.06f), ImVec2(bx1 + s * 0.26f, by0 + s * 0.16f), col, th);  // riser
     dl->AddLine(ImVec2(bx1 + s * 0.26f, by0 + s * 0.16f), ImVec2(bx1 + s * 0.02f, by0 + s * 0.16f), col, th);  // hook over head
 }
+
+// ---- Pixel glyphs (0.4.22) ---------------------------------------------------------------------------------------------------------------------
+// The vitals strip and the speedometer's status strip draw hand-authored bitmaps, not primitives: IconHeart's anti-aliased circles blur to a blob in a
+// 6-13 px box, and a diagonal or a curve built from a triangle or a line lands between pixels at 10-18 px (the old turn arrow was two shapes with a
+// double-alpha seam where they overlapped). A glyph is a few size classes of one bitmap ('X' = the glyph's colour, 'x' = the same colour at kPixelTone
+// of its alpha, '.' = nothing); a box takes the largest class that fits, drawn as one rectangle per run, every edge on a whole pixel, so one bitmap is
+// one alpha with no seam. The row strings are checked at compile time (BmpOk): exactly w characters a row, exactly h rows, only those three characters.
+constexpr float kPixelTone = 0.55f;
+struct Bmp {
+    int w, h;
+    const char* const* rows;
+};
+constexpr bool BmpOk(const Bmp& b)
+{
+    if (b.w <= 0 || b.h <= 0 || !b.rows)
+        return false;
+    for (int r = 0; r < b.h; ++r) {
+        if (!b.rows[r])
+            return false;
+        int c = 0;
+        for (; b.rows[r][c]; ++c)
+            if (b.rows[r][c] != '.' && b.rows[r][c] != 'X' && b.rows[r][c] != 'x')
+                return false;
+        if (c != b.w)
+            return false;
+    }
+    return true;
+}
+constexpr bool ClassesOk(const Bmp* cls, int n)
+{
+    for (int i = 0; i < n; ++i)
+        if (!BmpOk(cls[i]) || (i > 0 && cls[i].h <= cls[i - 1].h))
+            return false;      // ascending by height, or PixelPick would take the wrong class
+    return true;
+}
+// A glyph's classes, ascending by height. From a box side of scaleFrom px up the class scaleCls is drawn at a whole factor (box / scaleBase) instead.
+struct PixelSet {
+    const Bmp* cls;
+    int n;
+    int scaleCls, scaleBase, scaleFrom;
+};
+// The class a box of side n takes (and the whole factor k it is drawn at); null when even the smallest class does not fit.
+const Bmp* PixelPick(const PixelSet& g, int n, int* k)
+{
+    *k = 1;
+    if (n < g.cls[0].h)
+        return nullptr;
+    if (g.scaleCls >= 0 && n >= g.scaleFrom) {
+        *k = n / g.scaleBase;
+        return &g.cls[g.scaleCls];
+    }
+    const Bmp* best = &g.cls[0];
+    for (int i = 1; i < g.n; ++i)
+        if (g.cls[i].h <= n)
+            best = &g.cls[i];
+    return best;
+}
+ImU32 ScaleAlpha(ImU32 col, float k)
+{
+    const ImU32 a = (col >> IM_COL32_A_SHIFT) & 0xFF;
+    return (col & ~IM_COL32_A_MASK) | ((ImU32)((float)a * k + 0.5f) << IM_COL32_A_SHIFT);
+}
+// Draws a bitmap with its top-left corner at (ox, oy) (whole pixels), every cell k px square; flip mirrors it left to right (one bitmap, both arrows).
+void PixelDraw(ImDrawList* dl, float ox, float oy, const Bmp& b, int k, ImU32 col, bool flip)
+{
+    const ImU32 tone = ScaleAlpha(col, kPixelTone);
+    const float kf = (float)k;
+    for (int r = 0; r < b.h; ++r) {
+        for (int c0 = 0; c0 < b.w;) {
+            const char ch = b.rows[r][flip ? b.w - 1 - c0 : c0];
+            if (ch == '.') {
+                ++c0;
+                continue;
+            }
+            int c1 = c0 + 1;
+            while (c1 < b.w && b.rows[r][flip ? b.w - 1 - c1 : c1] == ch)
+                ++c1;
+            dl->AddRectFilled(ImVec2(ox + kf * (float)c0, oy + kf * (float)r), ImVec2(ox + kf * (float)c1, oy + kf * (float)(r + 1)), ch == 'X' ? col : tone);
+            c0 = c1;
+        }
+    }
+}
+// A glyph centred in a square box of side s at (x, y): the vitals strip's two glyphs.
+void PixelGlyph(ImDrawList* dl, float x, float y, float s, const PixelSet& g, ImU32 col)
+{
+    const int n = (int)std::floor(s);
+    const float x0 = std::floor(x), y0 = std::floor(y);
+    int k = 1;
+    const Bmp* b = PixelPick(g, n, &k);
+    if (!b) {
+        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + (float)n, y0 + (float)n), col);
+        return;
+    }
+    PixelDraw(dl, x0 + (float)((n - b->w * k) / 2), y0 + (float)((n - b->h * k) / 2), *b, k, col, false);
+}
+
+// ---- the vitals strip's glyphs: square classes of 5, 7, 9 and 13 px, the 9 px class scaled by a whole factor from an 18 px box up. Both glyphs sit at
+// the same offset in a box, so they span the same rows (one baseline).
+constexpr const char* const kHeart5[5] = {".X.X.", "XXXXX", "XXXXX", ".XXX.", "..X.."};
+constexpr const char* const kHeart7[7] = {".XX.XX.", "XXXXXXX", "XXXXXXX", "XXXXXXX", ".XXXXX.", "..XXX..", "...X..."};
+constexpr const char* const kHeart9[9] = {".XX...XX.", "XXXX.XXXX", "XXXXXXXXX", "XXXXXXXXX", "XXXXXXXXX", ".XXXXXXX.", "..XXXXX..", "...XXX...", "....X...."};
+constexpr const char* const kHeart13[13] = {".XXXX...XXXX.", "XXXXXX.XXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX",
+                                            "XXXXXXXXXXXXX", ".XXXXXXXXXXX.", "..XXXXXXXXX..", "...XXXXXXX...", "....XXXXX....", ".....XXX.....", "......X......"};
+// The burger (critic fix: three flat bars read as the "hamburger menu" icon): a domed top bun whose widest rows carry single-pixel sesame knockouts, a gap,
+// the patty in the second tone ('x'), a gap, a two-row bun with rounded lower corners. 5 and 7 px have no room for all of that: the 7 px burger keeps a
+// three-row dome (3, 5, 7 wide: the curve is what stops it reading as the menu icon), the patty right under it (the tone alone parts them), one gap, the bun.
+constexpr const char* const kBurger5[5] = {".XXX.", "XXXXX", "xxxxx", "XXXXX", ".XXX."};
+constexpr const char* const kBurger7[7] = {"..XXX..", ".XXXXX.", "XXXXXXX", "xxxxxxx", ".......", "XXXXXXX", ".XXXXX."};
+constexpr const char* const kBurger9[9] = {"..XXXXX..", ".XXX.XXX.", "XX.XXX.XX", "XXXXXXXXX", ".........", "xxxxxxxxx", ".........", "XXXXXXXXX", ".XXXXXXX."};
+constexpr const char* const kBurger13[13] = {"....XXXXX....", "..XXXX.XXXX..", ".XXX.XXX.XXX.", "XX.XXX.XXX.XX", "XXXXXXXXXXXXX", ".............", "xxxxxxxxxxxxx",
+                                             "xxxxxxxxxxxxx", ".............", "XXXXXXXXXXXXX", "XXXXXXXXXXXXX", ".XXXXXXXXXXX.", "..XXXXXXXXX.."};
+constexpr Bmp kHeartCls[4] = {{5, 5, kHeart5}, {7, 7, kHeart7}, {9, 9, kHeart9}, {13, 13, kHeart13}};
+constexpr Bmp kBurgerCls[4] = {{5, 5, kBurger5}, {7, 7, kBurger7}, {9, 9, kBurger9}, {13, 13, kBurger13}};
+static_assert(ClassesOk(kHeartCls, 4) && ClassesOk(kBurgerCls, 4), "vitals bitmaps: a row is not w wide / a class is not h rows / an unknown character");
+constexpr PixelSet kHeartSet = {kHeartCls, 4, 2, 9, 18};
+constexpr PixelSet kBurgerSet = {kBurgerCls, 4, 2, 9, 18};
+void IconHeartMini(ImDrawList* dl, float x, float y, float s, ImU32 col) { PixelGlyph(dl, x, y, s, kHeartSet, col); }
+void IconFoodMini(ImDrawList* dl, float x, float y, float s, ImU32 col) { PixelGlyph(dl, x, y, s, kBurgerSet, col); }
+
+// ---- the speedometer's status strip (vehicle controls): a left arrow (the right one is its mirror), the headlamp (low / high beam), the seat belt and the
+// engine, in three size classes around 10 / 14 / 18 px (the box is floor(S(14)): 11 at 720p, 14 at 1080p, 19 at 1440p; a 14 class scales by a whole
+// factor from 28 px, 4K). Cells in the box's centre line are mirrored about the line between two rows (even heights), so nothing is off by half a pixel.
+//
+// The turn arrow: a 45 degree head and a stem, the tip two cells wide (one bitmap, mirrored for the right arrow).
+constexpr const char* const kTurn10[10] = {"....X........", "...XX........", "..XXX........", ".XXXXXXXXXXXX", "XXXXXXXXXXXXX",
+                                           "XXXXXXXXXXXXX", ".XXXXXXXXXXXX", "..XXX........", "...XX........", "....X........"};
+constexpr const char* const kTurn14[14] = {"......X............", ".....XX............", "....XXX............", "...XXXX............", "..XXXXXXXXXXXXXXXXX",
+                                           ".XXXXXXXXXXXXXXXXXX", "XXXXXXXXXXXXXXXXXXX", "XXXXXXXXXXXXXXXXXXX", ".XXXXXXXXXXXXXXXXXX", "..XXXXXXXXXXXXXXXXX",
+                                           "...XXXX............", "....XXX............", ".....XX............", "......X............"};
+constexpr const char* const kTurn18[18] = {"........X...............", ".......XX...............", "......XXX...............", ".....XXXX...............",
+                                           "....XXXXX...............", "...XXXXXX...............", "..XXXXXXXXXXXXXXXXXXXXXX", ".XXXXXXXXXXXXXXXXXXXXXXX",
+                                           "XXXXXXXXXXXXXXXXXXXXXXXX", "XXXXXXXXXXXXXXXXXXXXXXXX", ".XXXXXXXXXXXXXXXXXXXXXXX", "..XXXXXXXXXXXXXXXXXXXXXX",
+                                           "...XXXXXX...............", "....XXXXX...............", ".....XXXX...............", "......XXX...............",
+                                           ".......XX...............", "........X..............."};
+// The headlamp: a D (flat side left) with three beams streaming left, 1 cell thick at 9 px and 2 at 14 / 18. High beam: level. Low beam: each beam steps
+// down twice on its way out (a 2-step stair, 1 cell a step), so the two read apart by shape as well as by colour.
+constexpr const char* const kHigh9[9] = {"......XXX..", "XXXXX.XXXX.", "......XXXXX", "......XXXXX", "XXXXX.XXXXX", "......XXXXX", "......XXXXX", "XXXXX.XXXX.", "......XXX.."};
+constexpr const char* const kLow9[9] = {"...XX.XXX..", ".XX...XXXX.", "X.....XXXXX", "...XX.XXXXX", ".XX...XXXXX", "X.....XXXXX", "...XX.XXXXX", ".XX...XXXX.", "X.....XXX.."};
+constexpr const char* const kHigh14[14] = {"..........XXXX...", "XXXXXXXXX.XXXXXX.", "XXXXXXXXX.XXXXXXX", "..........XXXXXXX", "..........XXXXXXX", "..........XXXXXXX",
+                                           "XXXXXXXXX.XXXXXXX", "XXXXXXXXX.XXXXXXX", "..........XXXXXXX", "..........XXXXXXX", "..........XXXXXXX", "XXXXXXXXX.XXXXXXX",
+                                           "XXXXXXXXX.XXXXXX.", "..........XXXX..."};
+constexpr const char* const kLow14[14] = {"......XXX.XXXX...", "...XXXXXX.XXXXXX.", "XXXXXX....XXXXXXX", "XXX.......XXXXXXX", "..........XXXXXXX", "......XXX.XXXXXXX",
+                                          "...XXXXXX.XXXXXXX", "XXXXXX....XXXXXXX", "XXX.......XXXXXXX", "..........XXXXXXX", "......XXX.XXXXXXX", "...XXXXXX.XXXXXXX",
+                                          "XXXXXX....XXXXXX.", "XXX.......XXXX..."};
+constexpr const char* const kHigh18[18] = {".............XXXXX....", ".............XXXXXXX..", "XXXXXXXXXXXX.XXXXXXXX.", "XXXXXXXXXXXX.XXXXXXXXX", ".............XXXXXXXXX",
+                                           ".............XXXXXXXXX", ".............XXXXXXXXX", ".............XXXXXXXXX", "XXXXXXXXXXXX.XXXXXXXXX", "XXXXXXXXXXXX.XXXXXXXXX",
+                                           ".............XXXXXXXXX", ".............XXXXXXXXX", ".............XXXXXXXXX", ".............XXXXXXXXX",
+                                           "XXXXXXXXXXXX.XXXXXXXXX", "XXXXXXXXXXXX.XXXXXXXX.", ".............XXXXXXX..", ".............XXXXX...."};
+constexpr const char* const kLow18[18] = {".............XXXXX....", "........XXXX.XXXXXXX..", "....XXXXXXXX.XXXXXXXX.", "XXXXXXXX.....XXXXXXXXX", "XXXX.........XXXXXXXXX",
+                                          ".............XXXXXXXXX", ".............XXXXXXXXX", "........XXXX.XXXXXXXXX", "....XXXXXXXX.XXXXXXXXX", "XXXXXXXX.....XXXXXXXXX",
+                                          "XXXX.........XXXXXXXXX", ".............XXXXXXXXX", ".............XXXXXXXXX", "........XXXX.XXXXXXXXX",
+                                          "....XXXXXXXX.XXXXXXXXX", "XXXXXXXX.....XXXXXXXX.", "XXXX.........XXXXXXX..", ".............XXXXX...."};
+// The seat-belt telltale (ISO 2575): a person seated facing right, head, torso, thigh forward, shin down, and a 1 cell diagonal strap cut from the
+// shoulder to the hip. The strap is a hole in the bitmap, so it is there in every state (idle ghost, buckled, warning); the head is 3x3 at 10 px.
+constexpr const char* const kBelt10[10] = {"...XXX...", "...XXX...", "...XXX...", ".........", "..X.XXX..", "..XX.XX..", "..XXX.XXX", "..XXXX.XX", ".......XX", ".......XX"};
+constexpr const char* const kBelt14[14] = {".....XX.....", "....XXXX....", "....XXXX....", ".....XX.....", "............", "...X.XXXX...", "...XX.XXX...",
+                                           "...XXX.XX...", "...XXXX.X...", "...XXXXX.XXX", "...XXXXXX.XX", "...XXXXXXXXX", ".........XXX", ".........XXX"};
+constexpr const char* const kBelt18[18] = {"......XXX......", ".....XXXXX.....", ".....XXXXX.....", ".....XXXXX.....", "......XXX......", "...............",
+                                           "....X.XXXXX....", "....XX.XXXX....", "....XXX.XXX....", "....XXXX.XX....", "....XXXXX.X....", "....XXXXXX.XXXX",
+                                           "....XXXXXXX.XXX", "....XXXXXXXXXXX", "....XXXXXXXXXXX", "...........XXXX", "...........XXXX", "...........XXXX"};
+// The engine-warning pictogram: a block with a capped intake on top, a shaft with a crossbar on the left, a stub on the right and a vent slit cut out of
+// the block, so it reads as a machine and not as a blob.
+constexpr const char* const kEngine9[9] = {"...XXXXX.....", "....XXX......", "..XXXXXXXXX..", "X.XXXXXXXXX..", "XXXXXXXXXXXXX", "XXXX.....XXXX", "XXXXXXXXXXXXX", "X.XXXXXXXXX..", "..XXXXXXXXX.."};
+constexpr const char* const kEngine13[13] = {".....XXXXXXXX.....", ".....XXXXXXXX.....", ".......XXXX.......", ".......XXXX.......", "...XXXXXXXXXXXX...",
+                                             "XX.XXXXXXXXXXXX...", "XX.XXXXXXXXXXXX...", "XXXXXXXXXXXXXXXXXX", "XXXXX........XXXXX", "XXXXXXXXXXXXXXXXXX",
+                                             "XX.XXXXXXXXXXXX...", "XX.XXXXXXXXXXXX...", "...XXXXXXXXXXXX..."};
+constexpr const char* const kEngine17[17] = {"......XXXXXXXXXXX......", "......XXXXXXXXXXX......", "......XXXXXXXXXXX......", ".........XXXXX.........", ".........XXXXX.........",
+                                             "....XXXXXXXXXXXXXXX....", "XX..XXXXXXXXXXXXXXX....", "XX..XXXXXXXXXXXXXXX....", "XX..XXXXXXXXXXXXXXX....",
+                                             "XXXXXXXXXXXXXXXXXXXXXXX", "XXXXXXX.........XXXXXXX", "XXXXXXX.........XXXXXXX", "XXXXXXXXXXXXXXXXXXXXXXX",
+                                             "XX..XXXXXXXXXXXXXXX....", "XX..XXXXXXXXXXXXXXX....", "XX..XXXXXXXXXXXXXXX....", "....XXXXXXXXXXXXXXX...."};
+constexpr Bmp kTurnCls[3] = {{13, 10, kTurn10}, {19, 14, kTurn14}, {24, 18, kTurn18}};
+constexpr Bmp kHighCls[3] = {{11, 9, kHigh9}, {17, 14, kHigh14}, {22, 18, kHigh18}};
+constexpr Bmp kLowCls[3] = {{11, 9, kLow9}, {17, 14, kLow14}, {22, 18, kLow18}};
+constexpr Bmp kBeltCls[3] = {{9, 10, kBelt10}, {12, 14, kBelt14}, {15, 18, kBelt18}};
+constexpr Bmp kEngineCls[3] = {{13, 9, kEngine9}, {18, 13, kEngine13}, {23, 17, kEngine17}};
+static_assert(ClassesOk(kTurnCls, 3) && ClassesOk(kHighCls, 3) && ClassesOk(kLowCls, 3) && ClassesOk(kBeltCls, 3) && ClassesOk(kEngineCls, 3),
+              "status bitmaps: a row is not w wide / a class is not h rows / an unknown character");
+constexpr PixelSet kTurnSet = {kTurnCls, 3, 1, 14, 28};
+constexpr PixelSet kHighSet = {kHighCls, 3, 1, 14, 28};
+constexpr PixelSet kLowSet = {kLowCls, 3, 1, 14, 28};
+constexpr PixelSet kBeltSet = {kBeltCls, 3, 1, 14, 28};
+constexpr PixelSet kEngineSet = {kEngineCls, 3, 1, 14, 28};
 
 // The cluster's accent rail reflects the vitals: gold normally, ember as any vital goes low, and it
 // pulses once any vital is critical (at or below half its low mark). Both plates call this, so the whole
@@ -756,8 +1030,7 @@ void RailState(Rgb* col, float* alpha, float baseA)
     }
     *col = Mix(kGold, kEmber, warn);
     if (crit) {
-        const float pulse = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 6.2832f * 2.4f);
-        *alpha = baseA * (0.55f + 0.45f * pulse);
+        *alpha = baseA * (0.55f + 0.45f * AlarmPulse(HudPhase()));      // the HUD clock's alarm beat, the same as the glyphs and the belt
     } else {
         *alpha = baseA;
     }
@@ -817,11 +1090,12 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
 {
     const Cluster c = ClusterLayout(W, H);
     const float padX = S(20.0f), padT = S(20.0f), padB = S(14.0f), capGap = S(8.0f);
+    const float stripGap = S(10.0f), stripH = S(14.0f);      // 0.4.22 status strip under the caption row (vehicle controls)
     float dTop = 0.0f, dBot = 0.0f;
     DigitBox(u.num, &dTop, &dBot);
     const float dH = dBot - dTop;                            // the numerals' height, the wedge's tallest bar
     const float pw = c.w, px = c.x;
-    const float ph = std::floor(padT + dH + capGap + u.small.px + padB);
+    const float ph = std::floor(padT + dH + capGap + u.small.px + padB + (stripGap + stripH) * u.stripA);
     const float py = std::floor(c.speedoBottom - ph);
     ClusterPlate(dl, px, py, pw, ph, a);
 
@@ -879,6 +1153,10 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
     Text(dl, u.small, ImVec2(numX, capY), kInk2, a * 0.82f, "KM/H");
     int fuelPct = 0;
     bool fuelLow = false;
+    // Where the fuel bar's first pixel is: the pump's box and its gaps are layout constants, so it is known whether or not the gauge is live, and the
+    // status strip below lines the headlamp's left edge up with it (a bar start and a glyph edge 2 px apart read as a mistake).
+    const float pumpS = std::floor(u.small.px * 1.25f);          // a pump a little taller than the caption
+    const float fuelBarX0 = std::floor(numX + Measure(u.small, "KM/H").x + S(14.0f) + pumpS + S(10.0f));
     if (u.fuelA > 0.003f) {
         // The fuel gauge on the caption baseline: a pump glyph, a bar (ink-capped, as the vitals bars),
         // and the value in the brand's numerals. Ember as a whole once fuel is low. It is the vital a
@@ -895,14 +1173,14 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
         std::snprintf(fval, sizeof(fval), "%d", fuelPct);
         Fnt fsm = u.numMid;
         fsm.px = std::floor(u.small.px + S(4.0f));                 // the value, bold-italic, matched to the vitals values
-        const float gs = std::floor(u.small.px * 1.25f);          // a pump a little taller than the caption
+        const float gs = pumpS;
         const float gx0 = numX + Measure(u.small, "KM/H").x + S(14.0f);
         IconFuel(dl, gx0, std::floor(capY + (u.small.px - gs) * 0.5f), gs, Col(gcol, fa * 0.95f));
         const float vx = px + pw - padX - Measure(fsm, fval).x;
         Text(dl, fsm, ImVec2(vx, std::floor(capY + (u.small.px - fsm.px) * 0.5f)), icol, fa, fval, 0.0f, 0.5f);
         const float bh = std::fmax(5.0f, S(7.0f)), lean = bh * kSkew, tipw = std::fmax(2.0f, S(2.0f));
         const float by = std::floor(capY + (u.small.px - bh) * 0.5f);
-        const float bx0 = gx0 + gs + S(10.0f), bx1 = vx - S(10.0f);
+        const float bx0 = fuelBarX0, bx1 = vx - S(10.0f);
         if (bx1 - bx0 >= S(16.0f)) {
             PlateSlant(dl, bx0, by, bx1 - lean, by + bh, Col(kInk, 0.10f * fa), 0);
             const float fx = std::floor(bx0 + (bx1 - lean - bx0) * Clamp01(fv.fill));
@@ -914,10 +1192,135 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
         }
     }
 
+    // The status strip (0.4.22): [<]  headlamp  belt  engine  [>], pixel bitmaps (PixelSet; the size class comes from the box floor(S(14)): 10 px at 720p, 14 at
+    // 1080p, 18 at 1440p). At rest every glyph is a ghost, Col(kInk, 12 %) (the same as the unlit speed bars and every other ghost), so the slots never move;
+    // colour means something only when it is on or wrong: a turn arrow blinks gold (the HUD clock's phi < 0.5, both together for the hazards), the headlamp is
+    // lit ink on low beam and gold on high beam, a buckled belt is lit ink, an unbuckled belt at speed pulses ember (the alarm beat, 2nd harmonic of the blink),
+    // and a stopped engine is lit ink: it is a state, not an alarm (ember stays for alarms). The belt's strap is a hole in its bitmap, so it shows in every
+    // state. The outer edges stay on the KM/H caption's left edge and the fuel value's right edge; the centre group stays centred, and its gaps are chosen so
+    // the headlamp's left edge lands exactly on the fuel bar's first pixel above it (when no even gap does, the default gap and a clear offset).
+    if (u.stripA > 0.003f) {
+        const unsigned hud = g_vehHud.load();
+        const bool indL = (hud & 1u) != 0, indR = (hud & 2u) != 0;
+        const int lights = (int)((hud >> 2) & 3u);
+        const bool beltOn = (hud & 16u) != 0, beltWarn = (hud & 32u) != 0, engOff = (hud & 64u) != 0;
+        const float sa = a * u.stripA;
+        const int gn = (int)std::floor(stripH);
+        const float ay = std::floor(py + padT + dH + capGap + u.small.px + stripGap);
+        const float phi = HudPhase();
+        const bool blinkOn = phi < 0.5f;
+        const float pulse = AlarmPulse(phi);
+        const float ghost = 0.12f, litA = 0.92f;
+        const ImU32 gh = Col(kInk, sa * ghost);                          // every idle glyph
+        auto pick = [&](const PixelSet& s, int* k) -> const Bmp& {
+            const Bmp* b = PixelPick(s, gn, k);
+            return b ? *b : s.cls[0];
+        };
+        auto top = [&](const Bmp& b, int k) { return ay + (float)((gn - b.h * k) / 2); };
+        int kT = 1, kL = 1, kB = 1, kE = 1;
+        const Bmp& bT = pick(kTurnSet, &kT);
+        const Bmp& bL = pick(lights == 2 ? kHighSet : kLowSet, &kL);
+        const Bmp& bB = pick(kBeltSet, &kB);
+        const Bmp& bE = pick(kEngineSet, &kE);
+        const float wT = (float)(bT.w * kT), wL = (float)(bL.w * kL), wB = (float)(bB.w * kB), wE = (float)(bE.w * kE);
+
+        const ImU32 lit = Col(kGold, sa * 0.95f);
+        PixelDraw(dl, px + padX, top(bT, kT), bT, kT, (indL && blinkOn) ? lit : gh, false);
+        PixelDraw(dl, px + pw - padX - wT, top(bT, kT), bT, kT, (indR && blinkOn) ? lit : gh, true);
+
+        const float sum = wL + wB + wE;
+        const float want = pw - 2.0f * (fuelBarX0 - px);                 // the group width that puts its left edge on the fuel bar's first pixel
+        float gap1 = std::floor((want - sum) * 0.5f), gap2 = (want - sum) - gap1;
+        float gxL = fuelBarX0;
+        if (!(gap1 >= S(8.0f) && gap1 <= S(34.0f))) {
+            gap1 = gap2 = S(22.0f);
+            gxL = std::floor(px + (pw - (sum + gap1 + gap2)) * 0.5f);
+        }
+        PixelDraw(dl, gxL, top(bL, kL), bL, kL, lights > 0 ? Col(lights == 2 ? kGold : kInk2, sa * litA) : gh, false);
+        const float gxB = gxL + wL + gap1;
+        PixelDraw(dl, gxB, top(bB, kB), bB, kB, beltWarn ? Col(kEmber, sa * (0.55f + 0.45f * pulse)) : (beltOn ? Col(kInk2, sa * litA) : gh), false);
+        PixelDraw(dl, gxB + wB + gap2, top(bE, kE), bE, kE, engOff ? Col(kInk2, sa * litA) : gh, false);
+
+        L.stripVisible = true;
+        L.stripX = px; L.stripY = ay; L.stripW = pw; L.stripH = (float)gn;
+        L.stripLampX = gxL; L.fuelBarX = fuelBarX0;
+        L.stripIndLeftLit = indL && blinkOn; L.stripIndRightLit = indR && blinkOn;
+        L.stripLights = lights; L.stripBeltOn = beltOn; L.stripBeltWarn = beltWarn; L.stripEngineOff = engOff;
+    }
+
     L.speedoVisible = true;
     L.speedoX = px; L.speedoY = py; L.speedoW = pw; L.speedoH = ph;
     L.speedShown = shown; L.speedLit = (int)(t + 0.5f); L.speedSegments = kBars;
     L.fuelShown = fuelPct; L.fuelLow = fuelLow;
+}
+
+// 0.4.22 minimap: the vitals docked under GTA's radar, a slim strip instead of the plate (DrawVitals calls this when
+// ClusterLayout docked them). The strip's rect: the radar's left edge and width, kStripFrac of its height; health in the left half,
+// food in the right half, each a glyph (the bar's height + 2 px) and a thin bar, no numbers (they do not fit on a bar's baseline at
+// this height). One opaque underlay, one glyph row and one bar row for both halves, every edge on a whole pixel, the same colour
+// logic as the plate (ember + pulse when low): a low vital turns its glyph and fill ember and tints its EMPTY track ember (0.30), all pulsing together
+// on the HUD clock's alarm beat. The speedometer's rail still carries the block alarm; the strip has no rail of its own.
+void DrawVitalsStrip(ImDrawList* dl, const Cluster& c, float a, UiState& L)
+{
+    const float sx = c.vx, sy = c.vTop, sw = c.vw, sh = c.vH;       // whole pixels: ClusterLayout floors them
+    // Opaque, so no map shows through where the strip tucks into the radar's edge, and the bars read on one flat colour. The bottom-right
+    // corner is cut like the speedometer plate's (the family's one diagonal), deep enough to read as a cut (0.55 of the strip's height, 7 px at
+    // 1080p); the right half's track is held back from it (padR) so its corner clears the diagonal by 2 px.
+    const float cut = std::floor(sh * 0.55f);
+    const ImVec2 hull[5] = {{sx, sy}, {sx + sw, sy}, {sx + sw, sy + sh - cut}, {sx + sw - cut, sy + sh}, {sx, sy + sh}};
+    dl->AddConvexPolyFilled(hull, 5, Col(kPanel, a));
+    const float pad = sh >= 11.0f ? 2.0f : 1.0f;                    // above and below the glyph
+    const float gs = std::fmax(4.0f, sh - 2.0f * pad);              // the glyph's box = the bar's height + 2 px
+    const float barH = gs - 2.0f;
+    const float gy = sy + pad, by = gy + 1.0f;                      // the one glyph row and the one bar row of both halves
+    const float padX = std::fmax(2.0f, std::floor(S(5.0f)));        // inside the strip's left edge
+    const float diagIn = std::fmax(0.0f, (by + barH) - (sy + sh - cut));   // how far the diagonal has moved in at the track's bottom edge
+    const float padR = std::fmax(padX, diagIn + 2.0f);              // inside the strip's right edge: clear of the diagonal
+    const float midGap = std::fmax(4.0f, std::floor(S(10.0f)));     // between the two halves
+    const float gGap = std::fmax(2.0f, std::floor(S(4.0f)));        // glyph to bar
+    const float half = std::floor((sw - padX - padR - midGap) * 0.5f);
+    const float bw = half - gs - gGap;
+    const float tip = std::fmax(1.0f, std::floor(S(2.0f)));
+    const float phi = HudPhase();
+    const float pulse = AlarmPulse(phi);                            // one beat for both halves, the speedometer's belt and the rail
+    void (*const kGlyph[2])(ImDrawList*, float, float, float, ImU32) = {IconHeartMini, IconFoodMini};
+
+    int pct[2] = {0, 0};
+    for (int i = 0; i < 2; ++i) {
+        const Ui::Vital& v = u.vit[i];
+        const Rgb glyph = Mix(kInk2, kEmber, v.warn);
+        const float fillA = 1.0f - v.warn * 0.38f * (1.0f - pulse);
+        pct[i] = (int)(v.fill * 100.0f + 0.5f);
+        if (pct[i] == 0 && v.fill > 0.0f)
+            pct[i] = 1;                                      // never "0" while there is anything left
+        pct[i] = pct[i] > 100 ? 100 : pct[i];
+
+        const float gx = sx + padX + (float)i * (half + midGap);
+        kGlyph[i](dl, gx, gy, gs, Col(glyph, a * 0.95f * fillA));   // a low vital pulses its glyph with its fill
+        if (bw < 4.0f)
+            continue;                                        // a display too narrow for a bar keeps its glyphs
+        const float bx0 = gx + gs + gGap;
+        dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx0 + bw, by + barH), Col(kInk, 0.18f * a));   // the track: lifted from the plate's 0.10 so an empty bar reads
+        const float fx = std::floor(bx0 + bw * Clamp01(v.fill));
+        const float tx = std::floor(bx0 + bw * Clamp01(v.trail));
+        if (v.warn > 0.003f)                                 // a low vital tints its EMPTY track ember and pulses it with the glyph and the fill
+            dl->AddRectFilled(ImVec2(fx, by), ImVec2(bx0 + bw, by + barH), Col(kEmber, 0.30f * a * v.warn * (0.35f + 0.65f * pulse)));
+        if (tx > fx + 1.0f)
+            dl->AddRectFilled(ImVec2(fx, by), ImVec2(tx, by + barH), Col(kInk, 0.30f * a));   // the drain trail after a loss
+        if (fx - bx0 >= 1.0f) {
+            dl->AddRectFilled(ImVec2(bx0, by), ImVec2(fx, by + barH), Col(Mix(kGold, kEmber, v.warn), 0.95f * a * fillA));
+            if (fx - bx0 >= tip + 1.0f)
+                dl->AddRectFilled(ImVec2(fx - tip, by), ImVec2(fx, by + barH), Col(kInk, 0.90f * a * fillA));
+        }
+    }
+
+    L.vitalsVisible = true;
+    L.vitalsX = sx; L.vitalsY = sy; L.vitalsW = sw; L.vitalsH = sh;
+    L.vitalsDocked = true; L.vitalsDockWhy = c.dockWhy; L.vitalsCoverPx = c.coverPx;
+    L.radarX = c.radarX; L.radarY = c.radarY; L.radarW = c.radarW; L.radarH = c.radarH;
+    L.vitalsRows = 2;
+    L.healthShown = pct[0]; L.satietyShown = pct[1];
+    L.healthLow = u.vit[0].low; L.satietyLow = u.vit[1].low;
 }
 
 // The vitals plate: two fixed rows, HP and FOOD, each a glyph, a bar and the value. The glyph is the
@@ -929,7 +1332,35 @@ void DrawSpeedo(ImDrawList* dl, float W, float H, float a, float speed, UiState&
 void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
 {
     const Cluster c = ClusterLayout(W, H);
-    const float px = c.x, pw = c.w, py = c.vTop, ph = c.vH;
+    // Once per change, where the vitals went and why (the engine's 10 s minimap line repeats it). Render thread only.
+    {
+        static int s_state = -1000;
+        const int state = c.dockWhy < 0 ? -1000 : (c.docked ? (c.coverPx > 0.5f ? 1 : 0) : 100 + c.dockWhy);
+        if (state != s_state) {
+            s_state = state;
+            if (c.dockWhy >= 0) {
+                if (c.docked)
+                    GLOGI("overlay: vitals strip %s: x %.0f-%.0f y %.0f-%.0f (radar x %.0f-%.0f y %.0f-%.0f, %.0f px tucked into the map = %.1f %% of its height); "
+                          "strip top y %.0f, radar rect bottom y %.0f (gap %.0f px; if GTA's radar anchor includes its ~18 px bars band the drawn map ends that much above the rect's bottom); "
+                          "GTA's own bars sit inside the radar, not under it (minimap_bars hides them)",
+                          c.coverPx > 0.5f ? "TUCKED into the radar's bottom edge (the margin under it is too small)"
+                                           : "FLUSH UNDER the radar's bottom edge (inside the safe-zone margin, no map covered)",
+                          (double)c.vx, (double)(c.vx + c.vw), (double)c.dockY, (double)(c.dockY + c.vH), (double)c.radarX, (double)(c.radarX + c.radarW),
+                          (double)c.radarY, (double)(c.radarY + c.radarH), (double)c.coverPx,
+                          c.radarH > 0.0f ? (double)(100.0f * c.coverPx / c.radarH) : 0.0,
+                          (double)c.dockY, (double)(c.radarY + c.radarH), (double)(c.dockY - (c.radarY + c.radarH)));
+                else
+                    GLOGI("overlay: vitals plate stays BOTTOM-RIGHT (radar dock refused: %s; radar x %.0f-%.0f y %.0f-%.0f)",
+                          gage::sync::DockWhyName((gage::sync::DockWhy)c.dockWhy), (double)c.radarX, (double)(c.radarX + c.radarW), (double)c.radarY,
+                          (double)(c.radarY + c.radarH));
+            }
+        }
+    }
+    if (c.docked) {
+        DrawVitalsStrip(dl, c, a, L);
+        return;
+    }
+    const float px = c.vx, pw = c.vw, py = c.vTop, ph = c.vH;
     ClusterPlate(dl, px, py, pw, ph, a);
     dl->PushClipRect(ImVec2(px, py), ImVec2(px + pw, py + ph), true);
 
@@ -940,7 +1371,7 @@ void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
     const float bx0 = px + c.padX + gs + colGap;
     const float bw = std::floor((px + pw - c.padX) - (valW + colGap) - bx0 - lean);
     const float tip = std::fmax(2.0f, S(2.0f));
-    const float tPulse = (float)ImGui::GetTime();
+    const float pulse = AlarmPulse(HudPhase());                      // the HUD clock's alarm beat (also the strip's, the belt's and the rail's)
     void (*const kGlyph[2])(ImDrawList*, float, float, float, ImU32) = {IconHeart, IconFood};
 
     int pct[2] = {0, 0};
@@ -948,8 +1379,6 @@ void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
         const Ui::Vital& v = u.vit[i];
         const float ry = std::floor(py + c.padT + (float)i * (c.rowH + c.rowGap));
         const Rgb ink = Mix(kInk, kEmber, v.warn), glyph = Mix(kInk2, kEmber, v.warn);
-        const float hz = v.fill <= 0.10f ? 2.4f : 1.3f;
-        const float pulse = 0.5f + 0.5f * std::sin(tPulse * 6.2832f * hz);
         const float fillA = 1.0f - v.warn * 0.38f * (1.0f - pulse);
 
         pct[i] = (int)(v.fill * 100.0f + 0.5f);
@@ -982,6 +1411,8 @@ void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
 
     L.vitalsVisible = true;
     L.vitalsX = px; L.vitalsY = py; L.vitalsW = pw; L.vitalsH = ph;
+    L.vitalsDocked = c.docked; L.vitalsDockWhy = c.dockWhy; L.vitalsCoverPx = c.coverPx;
+    L.radarX = c.radarX; L.radarY = c.radarY; L.radarW = c.radarW; L.radarH = c.radarH;
     L.vitalsRows = 2;
     L.healthShown = pct[0]; L.satietyShown = pct[1];
     L.healthLow = u.vit[0].low; L.satietyLow = u.vit[1].low;
@@ -1215,21 +1646,75 @@ std::string FitText(const Fnt& f, const char* t, float maxW)
     return s.empty() ? std::string() : s + "...";
 }
 
-// A key hint: a small leaning key cap with its label. Returns the cap's right edge.
-float KeyCap(ImDrawList* dl, float x, float y, const char* label, float a)
+// A key hint: a small leaning key cap with its label. Returns the cap's right edge. minW (default 0) widens the cap to a
+// shared width (the label is centred in it), so a cluster of caps reads as one even group.
+float KeyCap(ImDrawList* dl, float x, float y, const char* label, float a, float minW = 0.0f)
 {
     const float h = u.small.px + S(8.0f);
-    const float w = Measure(u.small, label).x + S(16.0f);
+    const float tw = Measure(u.small, label).x;
+    const float w = (tw + S(16.0f) > minW) ? tw + S(16.0f) : minW;
     const float lean = PlateSlant(dl, x, y, x + w, y + h, Col(kInk, 0.10f * a), Col(kInk, 0.36f * a));
-    Text(dl, u.small, ImVec2(x + S(8.0f) + lean * 0.5f, y + S(4.0f)), kInk, a * 0.94f, label);
+    Text(dl, u.small, ImVec2(x + (w - tw) * 0.5f + lean * 0.5f, y + S(4.0f)), kInk, a * 0.94f, label);
     return x + w + lean;
 }
 
 // ---- the Tab menu's quick actions page --------------------------------------------------------
 // The three columns of kActions under the header, the line of typed commands, and the key hints. The y values are
 // offsets from the panel's top (DrawInventory's layout).
+// The noclip row's key hints, under the row: the keys that fly (key caps like the footer's, labels in the footer's dim ink).
+// Three lines; they light up while noclip is on. Returns the height they take below `y`.
+constexpr int kNoclipHintLines = 3;
+// The block ends level with the bottom of the third row of the Player column (the noclip row + the hints = three rows and two
+// gaps), so the two columns finish on one line: the gap between the lines follows from that. It never drops below S(3).
+struct NoclipHintsGeo { float top, lineGap, height; };
+NoclipHintsGeo NoclipHintsGeometry(float rowH, float rowGap)
+{
+    const float capH = u.small.px + S(8.0f);
+    NoclipHintsGeo g;
+    g.top = S(12.0f);
+    const float want = 2.0f * (rowH + rowGap);
+    const float lines = capH * (float)kNoclipHintLines;
+    g.lineGap = (want - g.top - lines) * 0.5f;
+    if (g.lineGap < S(3.0f))
+        g.lineGap = S(3.0f);
+    g.height = g.top + lines + g.lineGap * (float)(kNoclipHintLines - 1);
+    return g;
+}
+float NoclipHintsHeight(float rowH, float rowGap) { return NoclipHintsGeometry(rowH, rowGap).height; }
+void DrawNoclipHints(ImDrawList* dl, float x0, float y, float rowH, float rowGap, float a)
+{
+    const NoclipHintsGeo geo = NoclipHintsGeometry(rowH, rowGap);
+    const float capH = u.small.px + S(8.0f);
+    const float g = S(8.0f), gg = S(18.0f), gk = S(4.0f);
+    auto label = [&](float x, float cy, const char* t) {
+        Text(dl, u.small, ImVec2(x, cy + S(4.0f)), kInk, a * 0.80f, t);
+        return x + Measure(u.small, t).x;
+    };
+    // Shared cap widths: the four letters are one width, Space / Shift one, Ctrl / Alt one; the second pair of lines starts at one x.
+    const float wLetter = Measure(u.small, "W").x + S(16.0f);
+    const float wLong = (Measure(u.small, "Space").x > Measure(u.small, "Shift").x ? Measure(u.small, "Space").x : Measure(u.small, "Shift").x) + S(16.0f);
+    const float wMod = (Measure(u.small, "Ctrl").x > Measure(u.small, "Alt").x ? Measure(u.small, "Ctrl").x : Measure(u.small, "Alt").x) + S(16.0f);
+    const float wUp = Measure(u.small, "up").x, wFast = Measure(u.small, "fast").x;
+    float cy = y + geo.top;
+    float x = x0;
+    for (const char* k : {"W", "A", "S", "D"})
+        x = KeyCap(dl, x, cy, k, a, wLetter) + gk;
+    label(x - gk + g, cy, "fly");
+    cy += capH + geo.lineGap;
+    const float xs = KeyCap(dl, x0, cy, "Space", a, wLong) + g;
+    const float x2 = xs + (wUp > wFast ? wUp : wFast) + gg;
+    label(xs, cy, "up");
+    x = KeyCap(dl, x2, cy, "Ctrl", a, wMod) + g;
+    label(x, cy, "down");
+    cy += capH + geo.lineGap;
+    KeyCap(dl, x0, cy, "Shift", a, wLong);
+    label(xs, cy, "fast");
+    x = KeyCap(dl, x2, cy, "Alt", a, wMod) + g;
+    label(x, cy, "slow");
+}
+
 void DrawQuickActionsPage(ImDrawList* dl, float px, float py, float pw, float pad, float rowH, float rowGap, float headY0, float rowsY0, float helpY0, float footSepY0, float footH,
-                          const char* const (&kHelp)[3], float a, UiState& L)
+                          const char* const* help, int helpN, float a, UiState& L)
 {
     // Typed commands, one line under the columns.
     {
@@ -1237,9 +1722,9 @@ void DrawQuickActionsPage(ImDrawList* dl, float px, float py, float pw, float pa
         const char* lead = "Or type in chat";
         Text(dl, u.small, ImVec2(px + pad, hy), kInk2, a * 0.82f, lead);
         float hx = px + pad + Measure(u.small, lead).x + S(24.0f);
-        for (const char* line : kHelp) {
-            Text(dl, u.small, ImVec2(hx, hy), kInk, a * 0.90f, line);
-            hx += Measure(u.small, line).x + S(26.0f);
+        for (int h = 0; h < helpN; ++h) {
+            Text(dl, u.small, ImVec2(hx, hy), kInk, a * 0.90f, help[h]);
+            hx += Measure(u.small, help[h]).x + S(26.0f);
         }
     }
 
@@ -1268,20 +1753,36 @@ void DrawQuickActionsPage(ImDrawList* dl, float px, float py, float pw, float pa
         Text(dl, u.small, ImVec2(rx, capY + S(4.0f)), kInk, a * 0.80f, "close");
     }
 
-    // Columns
+    // Columns: a column with no row to show (the noclip switch off empties the middle one) leaves the others wider, so the
+    // panel never carries an empty gap.
     const float gapC = S(26.0f);
-    const float colW = std::floor((pw - 2.0f * pad - 2.0f * gapC) / 3.0f);
+    bool colUsed[3] = {false, false, false};
+    for (int i = 0; i < kActionCount; ++i)
+        if (ActionShown(kActions[i]))
+            colUsed[kActions[i].column] = true;
+    int slot[3] = {-1, -1, -1}, nCols = 0;
+    for (int c = 0; c < 3; ++c)
+        if (colUsed[c])
+            slot[c] = nCols++;
+    const float colW = std::floor((pw - 2.0f * pad - (float)(nCols > 1 ? nCols - 1 : 0) * gapC) / (float)(nCols > 0 ? nCols : 1));
     const float headY = py + headY0;
     const float rowsY = py + rowsY0;
     int rowIndex[3] = {0, 0, 0};
     for (int c = 0; c < 3; ++c)
-        Text(dl, u.small, ImVec2(px + pad + (colW + gapC) * (float)c, headY), kInk2, a * 0.82f, kColumnTitle[c]);
+        if (slot[c] >= 0)
+            Text(dl, u.small, ImVec2(px + pad + (colW + gapC) * (float)slot[c], headY), kInk2, a * 0.82f, kColumnTitle[c]);
 
     L.actionCount = 0;
+    L.noclipRow = -1;
+    L.noclipOn = g_noclipOn.load();
     int clicked = -1;
     for (int i = 0; i < kActionCount; ++i) {
         const Action& act = kActions[i];
-        const float cx = px + pad + (colW + gapC) * (float)act.column;
+        if (!ActionShown(act))
+            continue;
+        const bool isNoclip = act.kind == kActionNoclip;
+        const bool noclipOn = isNoclip && g_noclipOn.load();
+        const float cx = px + pad + (colW + gapC) * (float)slot[act.column];
         const float cy = rowsY + (rowH + rowGap) * (float)rowIndex[act.column]++;
         const float lean = rowH * kSkew;
         ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -1301,20 +1802,27 @@ void DrawQuickActionsPage(ImDrawList* dl, float px, float py, float pw, float pa
         ImU32 fill = Col(kInk, 0.09f * a), edge = 0;
         if (down)      { fill = Col(kGoldDown, 0.62f * a); edge = Col(kGoldHot, 0.95f * a); }
         else if (hot)  { fill = Col(kGold, 0.30f * a); edge = Col(kGold, 0.95f * a); }
+        else if (noclipOn) { fill = Col(kGold, 0.16f * a); edge = Col(kGold, 0.45f * a); }   // a toggle that is on: gold, quieter than a hot row
         PlateSlant(dl, cx, cy, x1, cy + rowH, fill, edge);
-        if (hot)
+        if (hot || noclipOn)
             PlateSlant(dl, cx, cy, cx + S(4.0f), cy + rowH, Col(kGold, a), 0);   // the lit row's tick
         Text(dl, u.semi, ImVec2(cx + S(18.0f) + lean * 0.5f, cy + std::floor((rowH - u.semi.px) * 0.5f)), kInk,
              a, act.label);
         // The command, right-aligned; when the row is too narrow for label and command it is cut
-        // with an ellipsis rather than dropped (a missing label looks like a bug).
+        // with an ellipsis rather than dropped (a missing label looks like a bug). The noclip toggle shows its state
+        // instead ("On" in gold, "Off" in the command's dim ink); its command is on the "Or type in chat" line.
         const ImVec2 ls = Measure(u.semi, act.label);
         const float cmdR = x1 - S(14.0f) + lean * 0.5f;
         const float cmdAvail = cmdR - (cx + S(18.0f) + lean * 0.5f + ls.x + S(14.0f));
-        const std::string cmdText = FitText(u.small, act.cmd, cmdAvail);
+        const char* rightText = isNoclip ? (noclipOn ? "On" : "Off") : act.cmd;
+        const std::string cmdText = FitText(u.small, rightText, cmdAvail);
         if (!cmdText.empty())
             Text(dl, u.small, ImVec2(cmdR - Measure(u.small, cmdText.c_str()).x, cy + std::floor((rowH - u.small.px) * 0.5f)),
-                 kInk, a * (hot ? 0.90f : 0.66f), cmdText.c_str());
+                 noclipOn ? kGold : kInk, noclipOn ? a : a * (hot ? 0.90f : 0.66f), cmdText.c_str());
+        if (isNoclip) {
+            L.noclipRow = L.actionCount;
+            DrawNoclipHints(dl, cx, cy + rowH, rowH, rowGap, a * (noclipOn ? 1.0f : 0.75f));
+        }
 
         if (L.actionCount < UiState::kMaxActions) {
             const int k = L.actionCount++;
@@ -1733,12 +2241,20 @@ void DrawInventory(float W, float H, float hudA, UiState& L)
     // The panel is as tall as its page's content. Quick actions: the tallest column, then one line of typed
     // commands, then the footer with the key hints. Cars: CarsPageLayout.
     int rowCount[3] = {0, 0, 0};
-    for (int i = 0; i < kActionCount; ++i)
+    float hintsH[3] = {0.0f, 0.0f, 0.0f};              // the noclip row's key hints sit under its row
+    for (int i = 0; i < kActionCount; ++i) {
+        if (!ActionShown(kActions[i]))
+            continue;
         ++rowCount[kActions[i].column];
-    static const char* const kHelp[] = {"/car <model>", "/gun <weapon>", "/tp <x> <y> <z>"};
+        if (kActions[i].kind == kActionNoclip)
+            hintsH[kActions[i].column] = NoclipHintsHeight(rowH, rowGap);
+    }
+    static const char* const kHelp[] = {"/car <model>", "/gun <weapon>", "/tp <x> <y> <z>", "/noclip"};
+    const int helpN = g_noclipAvail.load() ? 4 : 3;
     float contentH = 0.0f;
     for (int c = 0; c < 3; ++c)
-        contentH = std::fmax(contentH, (rowH + rowGap) * (float)rowCount[c] - rowGap);
+        if (rowCount[c] > 0)
+            contentH = std::fmax(contentH, (rowH + rowGap) * (float)rowCount[c] - rowGap + hintsH[c]);
     const float sepY0 = S(66.0f), headY0 = sepY0 + S(18.0f), rowsY0 = headY0 + S(32.0f);
     const float helpY0 = rowsY0 + contentH + S(22.0f);
     const float footSepY0 = helpY0 + u.small.px + S(18.0f);
@@ -1836,7 +2352,7 @@ void DrawInventory(float W, float H, float hudA, UiState& L)
         if (carsPage)
             DrawCarsPage(dl, px, py, pw, pad, rowH, rowGap, cl, a, L);
         else
-            DrawQuickActionsPage(dl, px, py, pw, pad, rowH, rowGap, headY0, rowsY0, helpY0, footSepY0, footH, kHelp, a, L);
+            DrawQuickActionsPage(dl, px, py, pw, pad, rowH, rowGap, headY0, rowsY0, helpY0, footSepY0, footH, kHelp, helpN, a, L);
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -1928,13 +2444,19 @@ void DrawLoader(float W, float H, ULONGLONG now, const std::string& status, bool
     const ImU32 top = Col(kPanelHi, a), bot = Col(kGround, a);
     dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, H), top, top, bot, bot);
 
-    // Real GTA V stills behind the block, cover-cropped to the display and crossfaded (8 s hold, 2 s
-    // fade). The ground stays under them (fully opaque while the loader is up). A dark gradient from
-    // the left keeps the type readable and leaves the right of the picture visible.
-    if (!u.loaderT0)
+    // GTA V artwork behind the block, cover-cropped to the display and cycled: each picture holds 8 s, then
+    // crossfades over 2 s into the next; the first one is picked at random per launch so a short load does not
+    // always show the same picture. The ground stays under them (fully opaque while the loader is up). A dark
+    // gradient from the left keeps the type readable and leaves the right of the picture visible.
+    static int s_firstScene = -1;
+    if (!u.loaderT0) {
         u.loaderT0 = now;
-    L.loaderSceneTextured = u.tex.sceneA != nullptr;
-    if (u.tex.sceneA || u.tex.sceneB) {
+        if (s_firstScene < 0 && u.tex.sceneCount > 0)
+            s_firstScene = (int)((GetTickCount64() / 7ULL) % (ULONGLONG)u.tex.sceneCount);
+    }
+    const int nScenes = u.tex.sceneCount;
+    L.loaderSceneTextured = nScenes > 0;
+    if (nScenes > 0) {
         const float aspect = 16.0f / 9.0f, dispAspect = W / H;
         float u0 = 0.0f, u1 = 1.0f, v0 = 0.0f, v1 = 1.0f;
         if (dispAspect > aspect) {            // wider than the picture: crop top and bottom
@@ -1944,16 +2466,16 @@ void DrawLoader(float W, float H, ULONGLONG now, const std::string& status, bool
             const float k = dispAspect / aspect;
             u0 = (1.0f - k) * 0.6f; u1 = u0 + k;
         }
-        const float cyc = (float)((now - u.loaderT0) % 20000ULL) / 1000.0f;     // 0..20 s
-        float mix = 0.0f;                     // 0: A, 1: B
-        if (cyc >= 8.0f && cyc < 10.0f)        mix = (cyc - 8.0f) / 2.0f;
-        else if (cyc >= 10.0f && cyc < 18.0f)  mix = 1.0f;
-        else if (cyc >= 18.0f)                 mix = 1.0f - (cyc - 18.0f) / 2.0f;
+        const ULONGLONG el = now - u.loaderT0;
+        const int slot = (int)(el / 10000ULL);                                  // 10 s per picture
+        const float in = (float)(el % 10000ULL) / 1000.0f;                     // 0..10 s into it
+        const int cur = ((s_firstScene < 0 ? 0 : s_firstScene) + slot) % nScenes;
+        float mix = in < 8.0f || nScenes < 2 ? 0.0f : (in - 8.0f) / 2.0f;     // 0: this picture, 1: the next
         mix = mix * mix * (3.0f - 2.0f * mix);
         L.loaderSceneMix = mix;
         const float dim = 0.80f;               // the picture's own brightness under the gradient
-        void* first = u.tex.sceneA ? u.tex.sceneA : u.tex.sceneB;
-        void* second = u.tex.sceneA ? u.tex.sceneB : nullptr;
+        void* first = u.tex.scenes[cur];
+        void* second = nScenes > 1 ? u.tex.scenes[(cur + 1) % nScenes] : nullptr;
         dl->AddImage((ImTextureID)first, ImVec2(0, 0), ImVec2(W, H), ImVec2(u0, v0), ImVec2(u1, v1),
                      Col({dim, dim, dim}, a));
         if (second && mix > 0.003f)
@@ -2120,6 +2642,7 @@ void UiSetTextures(const UiTextures& t)
 void UiReset()
 {
     g_interactive.store(false);
+    g_vehKeys.store(0);
     u = Ui();
 }
 
@@ -2159,6 +2682,7 @@ void UiFrame()
     else
         u.speedSm = Ease(u.speedSm, speed, 12.0f, dt, 0.15f);
     u.speedA = Approach(u.speedA, (inVeh && !loading) ? 1.0f : 0.0f, dt / 0.18f);
+    u.stripA = Approach(u.stripA, (inVeh && !loading && (g_vehHud.load() & 128u) != 0) ? 1.0f : 0.0f, dt / 0.18f);
     TickVitals(dt, loading);
     u.chatA = Approach(u.chatA, u.chatOpen ? 1.0f : 0.0f, dt / 0.12f);
     u.invA = Approach(u.invA, u.invOpen ? 1.0f : 0.0f, dt / 0.14f);
@@ -2196,6 +2720,21 @@ void UiFrame()
             OpenInventory();
         } else if (enter || tKey) {
             OpenChat(now);
+        }
+    }
+
+    // 0.4.22 vehicle keys: Left / Right / Down Arrow, Y and B as edges for the engine's script tick (TakeVehicleKeys). Never while the chat,
+    // the Tab menu, a text box or the quit card has the keyboard. The engine decides what a press means (in a vehicle, driver or not).
+    if (live && !u.chatOpen && !u.invOpen && !io.WantTextInput && g_quitPromptAt.load() == 0) {
+        unsigned k = 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))  k |= kVkLeft;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) k |= kVkRight;
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false))  k |= kVkHazard;
+        if (ImGui::IsKeyPressed(ImGuiKey_Y, false))          k |= kVkEngine;
+        if (ImGui::IsKeyPressed(ImGuiKey_B, false))          k |= kVkBelt;
+        if (k) {
+            g_vehKeysAt.store(now);
+            g_vehKeys.fetch_or(k);
         }
     }
 
@@ -2309,6 +2848,13 @@ void SetStats(bool inVehicle, float speedKmh)
     g_speedKmh.store(speedKmh == speedKmh && speedKmh > 0.0f ? speedKmh : 0.0f);   // NaN and negatives show 0
 }
 
+void SetRadarDock(bool dock, float safeZone, bool safeZoneOk)
+{
+    g_radarSafeZone.store(safeZone == safeZone ? safeZone : 1.0f);   // NaN reads as unknown (the layout also checks safeZoneOk)
+    g_radarSafeZoneOk.store(safeZoneOk);
+    g_radarDock.store(dock);
+}
+
 void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel)
 {
     g_vitHealth.store(Frac01(healthFrac));        // NaN counts as 0, the rest is clamped to 0..1
@@ -2332,6 +2878,25 @@ void PushChatLine(const char* name, const char* text, bool self)
 }
 
 void PushSystemLine(const char* text) { PushSystem(Clean(text, kTextMax)); }
+
+unsigned TakeVehicleKeys()
+{
+    const unsigned k = g_vehKeys.exchange(0);
+    if (!k)
+        return 0;
+    const ULONGLONG at = g_vehKeysAt.load();
+    return GetTickCount64() - at <= kVehKeyStaleMs ? k : 0;      // the engine's tick was not running: a stale press is not a press
+}
+
+void SetVehicleHud(const VehicleHud& h)
+{
+    const int lights = h.lights < 0 ? 0 : (h.lights > 2 ? 2 : h.lights);
+    const unsigned w = (h.indLeft ? 1u : 0u) | (h.indRight ? 2u : 0u) | ((unsigned)lights << 2) | (h.beltOn ? 16u : 0u) |
+                       (h.beltWarn ? 32u : 0u) | (h.engineOff ? 64u : 0u) | (h.show ? 128u : 0u);
+    g_vehHud.store(w);
+}
+
+void SetHudPhaseForTest(float phase) { g_hudPhaseForce.store(phase == phase ? phase : -1.0f); }
 
 void SetNameTags(const NameTag* tags, int count)
 {
@@ -2379,6 +2944,12 @@ void SetCars(const CarEntry* cars, int count, bool loading)
     d.cars.swap(v);
     d.carsLoading = loading;
     ++d.carsSeq;
+}
+
+void SetNoclip(bool available, bool active)
+{
+    g_noclipAvail.store(available);
+    g_noclipOn.store(available && active);
 }
 
 bool PopOutgoing(char* out, std::size_t cap)

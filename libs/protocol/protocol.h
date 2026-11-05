@@ -516,9 +516,9 @@ namespace gage::proto {
     {
         Spawn      = 1, // arg = GTA vehicle model hash (non-zero); the server assigns the id and places it 4 m ahead of the requester
         Despawn    = 2, // remove vehId: its spawner only (occupants are put out)
-        Enter      = 3, // become an occupant of vehId (arg = seat 0..7, 0 = driver): seat free, within 10 m, not locked
+        Enter      = 3, // become an occupant of vehId (arg = seat 0..7, 0 = driver): seat free, within 10 m, not locked (its spawner and last driver may enter it locked)
         Exit       = 4, // leave vehId (the vehicle you are in); a driver's vehicle parks with its last state
-        SetLocked  = 5, // arg != 0 locks vehId's doors, 0 unlocks: its driver or spawner
+        SetLocked  = 5, // arg != 0 locks vehId's doors, 0 unlocks: the player in its driver's seat, its spawner or (0.4.22) its last driver; from outside within server.json vehicleLockDistance (TooFar), else NotAllowed
         SetLights  = 6, // arg != 0 turns vehId's headlights on, 0 off: its driver or spawner
         SetColours = 7, // v4: arg = primary | secondary << 8 (GTA colour indices): its driver or spawner
         Register   = 8, // v4: adopt a local (ambient) car: arg = model hash, the tail carries where it is; the server

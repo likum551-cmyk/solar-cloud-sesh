@@ -1289,18 +1289,40 @@ bool MountSequence(World& world, Pack& p) {
 
 // Publish the menu's copy: every car of every mounted pack, the ones the cdimage has confirmed first-class.
 void PublishVehicles() {
-    std::vector<PackVehicle> out;
+    // The cars in mount order; BuildCarList names, de-duplicates and sorts them (pack_meta.h).
+    std::vector<CarIn> in;
+    std::vector<const Pack*> packOf;
+    std::vector<const PackModel*> modelOf;
     for (const Pack& p : g_packs)
         for (const PackModel& m : p.models) {
-            PackVehicle v;
-            v.model = m.v.model; v.make = m.v.make; v.label = m.v.label; v.vclass = m.v.vclass; v.pack = p.name;
-            v.ready = m.inCdimage;
-            out.push_back(std::move(v));
+            in.push_back(CarIn{ m.v.model, m.v.make, m.v.label });
+            packOf.push_back(&p);
+            modelOf.push_back(&m);
         }
-    std::sort(out.begin(), out.end(), [](const PackVehicle& a, const PackVehicle& b) {
-        const int c = _stricmp(a.make.c_str(), b.make.c_str());
-        return c != 0 ? c < 0 : _stricmp(a.model.c_str(), b.model.c_str()) < 0;
-    });
+    std::vector<size_t> dropped;
+    const std::vector<CarOut> list = BuildCarList(in, &dropped);
+    static std::vector<std::string> s_warned;   // one line per repeated model, not one per publish
+    for (const size_t d : dropped) {
+        std::string key = in[d].model + "@" + packOf[d]->name;
+        for (char& c : key) c = (char)tolower((unsigned char)c);
+        if (std::find(s_warned.begin(), s_warned.end(), key) != s_warned.end()) continue;
+        s_warned.push_back(key);
+        const char* first = "?";
+        for (size_t k = 0; k < in.size(); ++k)
+            if (_stricmp(in[k].model.c_str(), in[d].model.c_str()) == 0) { first = packOf[k]->name.c_str(); break; }
+        GLOGW("hook: [packstream] car '%s' of pack %s has the same model name as a car of pack %s: the list shows it once "
+              "(both spawn the same model)", in[d].model.c_str(), packOf[d]->name.c_str(), first);
+    }
+    std::vector<PackVehicle> out;
+    out.reserve(list.size());
+    for (const CarOut& c : list) {
+        const PackModel& m = *modelOf[c.src];
+        PackVehicle v;
+        v.model = m.v.model; v.name = c.name; v.make = m.v.make; v.label = m.v.label; v.vclass = m.v.vclass;
+        v.pack = packOf[c.src]->name;
+        v.ready = m.inCdimage;
+        out.push_back(std::move(v));
+    }
     std::lock_guard<std::mutex> lk(g_vehMutex);
     g_vehShared = std::move(out);
     ++g_vehGen;

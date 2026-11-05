@@ -15,8 +15,8 @@
 //     F (wantDriver)  seat 0 when it is free AND the car is not owned by someone else; otherwise the
 //                     nearest free seat >= 1 by door distance. Seat 0 wins over a nearer passenger door.
 //     G               the nearest free seat >= 1 by door distance, never seat 0.
-//     A locked car refuses F and G for anybody but its owner (the server lets the spawner in), with
-//     Locked. A car with nothing for the key refuses with Full (Owned: F, the only free seat is the
+//     A locked car refuses F and G for anybody but its owner or a key holder (the server lets the spawner and the last
+//     driver in; libs/sync/vehicle_lock.h), with Locked. A car with nothing for the key refuses with Full (Owned: F, the only free seat is the
 //     driver's and the car is owned by someone else).
 //   With several cars in reach the one with the nearest door is used; a car that cannot take the key
 //   is skipped for a farther one that can. When none can, the reason is the nearest car's.
@@ -51,6 +51,8 @@ namespace gage::sync {
         int      maxSeats = 0;                                    // wire seats the model has (passengers + the driver)
         bool     locked = false;                                  // doors locked (VehicleState.flags kVehLocked)
         uint16_t ownerId = kEntryNobody;                          // the player who owns it; kEntryNobody = unowned
+        bool     keyHolder = false;                               // 0.4.22: we believe we hold its key (we drove it last: libs/sync/vehicle_lock.h KeyRing);
+                                                                  // the server (spawner or last driver) has the last word
     };
 
     enum class EntryReason : uint8_t { Ok, NoCar, Full, Locked, Owned };
@@ -69,6 +71,61 @@ namespace gage::sync {
 
     // The chat line for a refusal ("" for Ok and NoCar).
     const char* EntryRefusalText(EntryReason reason);
+
+    // ---- 0.4.22 rear seats ----------------------------------------------------------------------------------------------------
+
+    // How many wire seats (the driver included) a vehicle offers. GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS(vehicle) excludes the driver and
+    // GET_VEHICLE_MODEL_NUMBER_OF_SEATS(model) includes it; -1 = the native could not be called. The vehicle's own count is used when it
+    // reads, the model's when only that one does, 2 (the driver and the front passenger, what an unreadable car had before) when neither does.
+    // When both read and differ the larger wins (a seat the game has that we would not offer is the worse mistake) and `disagree` is set so the
+    // log says so. Clamped to 1..kEntrySeats.
+    struct SeatCount
+    {
+        int  seats = 2;
+        bool fromVehicle = false;
+        bool fromModel = false;
+        bool disagree = false;
+    };
+    inline SeatCount ResolveSeatCount(int maxPassengers, int modelSeats)
+    {
+        SeatCount r;
+        const int viaVehicle = maxPassengers >= 0 ? maxPassengers + 1 : -1;
+        const int viaModel = modelSeats >= 1 ? modelSeats : -1;
+        r.fromVehicle = viaVehicle > 0;
+        r.fromModel = viaModel > 0;
+        if (r.fromVehicle && r.fromModel)
+        {
+            r.seats = viaVehicle > viaModel ? viaVehicle : viaModel;
+            r.disagree = viaVehicle != viaModel;
+        }
+        else if (r.fromVehicle)
+            r.seats = viaVehicle;
+        else if (r.fromModel)
+            r.seats = viaModel;
+        if (r.seats > kEntrySeats) r.seats = kEntrySeats;
+        if (r.seats < 1) r.seats = 1;
+        return r;
+    }
+
+    // veh_rear_seats=0 (HKCU): the pick sees only the driver's seat and the front passenger's (wire seats 0 and 1).
+    inline int SeatsOffered(int seats, bool rearSeats)
+    {
+        return rearSeats || seats <= 2 ? seats : 2;
+    }
+
+    // For the counters and the log: wire seat 0 the driver, 1 the front passenger, 2..3 the rear bench of a four-seater, 4.. further back.
+    enum class SeatClass : uint8_t { Driver, FrontPassenger, Rear, FurtherBack };
+    inline SeatClass ClassifySeat(int wireSeat)
+    {
+        return wireSeat <= 0 ? SeatClass::Driver : wireSeat == 1 ? SeatClass::FrontPassenger : wireSeat <= 3 ? SeatClass::Rear : SeatClass::FurtherBack;
+    }
+
+    // The read-back of an entry: the seat the pick named against the seat the game really put the ped in (-1 = in none of the car's seats).
+    enum class SeatReadback : uint8_t { Match, Differs, NotSeated };
+    inline SeatReadback JudgeSeatReadback(int wantedWireSeat, int actualWireSeat)
+    {
+        return actualWireSeat < 0 ? SeatReadback::NotSeated : actualWireSeat == wantedWireSeat ? SeatReadback::Match : SeatReadback::Differs;
+    }
 
     // ---- seated puppet drive-by --------------------------------------------------------------
 

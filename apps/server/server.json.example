@@ -36,6 +36,8 @@
   "vehicleEnterDistance": 10,
   "vehicleMaxSpeed": 170,
   "contactLagCapMs": 150,
+  "vehicleLocks": 1,
+  "vehicleLockDistance": 12,
   "fuelDrainPerMinute": 10,
   "playerHealth": 200,
   "firearmDamagePercent": 72,
