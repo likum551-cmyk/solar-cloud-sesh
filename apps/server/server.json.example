@@ -34,7 +34,7 @@
   "vehiclesPerPlayer": 3,
   "vehicleEmptyDespawnSeconds": 600,
   "vehicleEnterDistance": 10,
-  "vehicleMaxSpeed": 170,
+  "vehicleMaxSpeed": 139,
   "contactLagCapMs": 150,
   "vehicleLocks": 1,
   "vehicleLockDistance": 12,

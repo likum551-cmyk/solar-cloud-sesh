@@ -64,6 +64,11 @@ namespace gage::game::Overlay {
     // never the one asked for). The radar rectangle loses width and height about its bottom-left corner, so the strip stays flush under the smaller map.
     void SetRadarDock(bool dock, float safeZone, bool safeZoneOk, float scale = 1.0f);
 
+    // 0.4.31 hud_ring: true draws the vitals as GI's REV1 ring (libs/sync/hud_ring.h: a glass disc with the HP arc on the left and the SAT arc on
+    // the right, the HP / SAT strip under it), 56 px from the bottom-left corner at 1080p, scaled by H / 1080; the speedometer rests on the bottom
+    // gutter. The engine hides GTA's radar while it is on (the design's "map off" state). false = the 0.4.30 plate / radar strip. Any thread.
+    void SetHudRing(bool on);
+
     // 0.4.22 vehicle controls (libs/sync/vehicle_controls.h). The keys are read in UiFrame from ImGui's key events, the same source as Tab / T /
     // Enter: Left / Right Arrow (indicators), Down Arrow (hazards), Y (engine), B (seatbelt); H is GTA's own headlight control and is not read here.
     // Nothing is taken while the chat, the Tab menu, a text box or the quit card has the keyboard. TakeVehicleKeys returns the bits pressed since
@@ -285,6 +290,8 @@ namespace gage::game::Overlay {
         float radarX = 0, radarY = 0, radarW = 0, radarH = 0;
         float vitalsCoverPx = 0;
         int   vitalsRows = 0;                     // always 2 (health, satiety); fuel is on the speedometer plate
+        bool  vitalsRing = false;                 // 0.4.31: the vitals are the REV1 ring (vitalsX..H = its 288 x 352 component box, scaled)
+        float ringPulse[2] = {1.0f, 1.0f};        // the ring's fill opacity from the critical pulse (HP, SAT): 1 outside critical
         int   healthShown = 0, satietyShown = 0, fuelShown = 0;   // percent as drawn (eased); fuelShown from the speedo
         bool  healthLow = false, satietyLow = false, fuelLow = false;   // below the warning threshold
     };

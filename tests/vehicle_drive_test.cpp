@@ -1016,14 +1016,15 @@ static void TestHyperProfiles() {
     const HyperAssist& A = fix;
     const HyperAssist& P = jesko->assist;
 
-    // -- the production tune, pinned (GI 2026-11-05: Jesko, 600 km/h, power 2.35 = 3.5 - 33 %, handling +15 %) --
-    Check("hyper profile: the tune is 600 km/h, power x2.35, +400 % cap; the Jesko row has toughness and the firmer assists",
-          kHyperTargetKmh == 600.0f && kHyperPower == 2.35f && kHyperMaxPercent == 400.0f && jesko->targetKmh == 600.0f &&
+    // -- the production tune, pinned (GI 2026-11-05: Jesko, power 2.35 = 3.5 - 33 %, handling +15 %; 2026-11-06: 500 km/h again, the downforce
+    //    curve kept on its 600 km/h reference) --
+    Check("hyper profile: the tune is 500 km/h, power x2.35, +400 % cap; the Jesko row has toughness and the firmer assists",
+          kHyperTargetKmh == 500.0f && kHyperPower == 2.35f && kHyperMaxPercent == 400.0f && jesko->targetKmh == 500.0f &&
               jesko->power == 2.35f && jesko->tough && HyperTargetMs(*jesko) == kHyperTargetMs &&
-              P.downRefMs == kHyperTargetMs && P.downAtRefMs2 == 14.0f && P.downCapMs2 == 17.0f && P.gripRate == 6.9f && P.gripCapMs2 == 30.0f &&
+              P.downRefMs == 600.0f / 3.6f && P.downAtRefMs2 == 14.0f && P.downCapMs2 == 17.0f && P.gripRate == 6.9f && P.gripCapMs2 == 30.0f &&
               P.brakeMs2 == 14.0f && P.yawLatMs2 == 50.0f && P.yawFromMs == 45.0f && P.tiltRate == 4.6f &&
-              std::fabs(HyperTopSpeedPercent(100.0f) - 66.66667f) < 1e-3f && std::fabs(HyperTopSpeedPercent(50.0f) - 233.3333f) < 1e-2f &&
-              HyperTopSpeedPercent(10.0f) == 400.0f && HyperTopSpeedPercent(170.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f,
+              std::fabs(HyperTopSpeedPercent(100.0f) - 38.88889f) < 1e-3f && std::fabs(HyperTopSpeedPercent(50.0f) - 177.7778f) < 1e-2f &&
+              HyperTopSpeedPercent(10.0f) == 400.0f && HyperTopSpeedPercent(140.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f,
           F("pct(100) %.4f pct(50) %.4f", HyperTopSpeedPercent(100.0f), HyperTopSpeedPercent(50.0f)));
     HyperAssistIn rich = Level(100.0, kHyperAssistAll);   // a car that every assist would act on: a slide, the pedal, a spin, a roll rate
     rich.vel.x = 5.0f;
@@ -1056,7 +1057,7 @@ static void TestHyperProfiles() {
         const HyperProfile& p = kHyperProfiles[i];
         if (p.pack) ++packRows;
         tableOk = tableOk && ((p.model && *p.model) || (p.pack && *p.pack)) && lower(p.model) && lower(p.pack);
-        tableOk = tableOk && HyperTargetMs(p) > 0.0f && HyperTargetMs(p) <= 170.0f && p.power >= 1.0f;   // 170 m/s: the shipped vehicleMaxSpeed (apps/server/config.h)
+        tableOk = tableOk && HyperTargetMs(p) > 0.0f && HyperTargetMs(p) <= 139.0f && p.power >= 1.0f;   // 139 m/s: the shipped vehicleMaxSpeed (apps/server/config.h)
         tableOk = tableOk && (p.assist.gripCapMs2 + p.assist.brakeMs2) * kHyperMaxDt < 1.5f;
         tableOk = tableOk && (p.model ? HyperProfileFor(p.model) == &p : true) && (p.pack ? HyperProfileForPack(p.pack) == &p : true);
         for (size_t j = i + 1; j < kHyperProfileCount; ++j)
@@ -1066,7 +1067,7 @@ static void TestHyperProfiles() {
               HyperProfileForPack("vehicle_supra") && !HyperProfileForPack("vehicle_supra")->model &&
               std::strcmp(HyperProfileName(*HyperProfileForPack("vehicle_supra")), "vehicle_supra") == 0 &&
               std::strcmp(HyperProfileName(kHyperProfiles[0]), "jesko") == 0 && !HyperProfileForPack("vehicle_supra")->tough;
-    Check("hyper profile: every row names a model or a pack (lower case, unique), power >= 1, a target within the server's default 170 m/s "
+    Check("hyper profile: every row names a model or a pack (lower case, unique), power >= 1, a target within the server's default 139 m/s "
           "cap and a frame-bounded assist; the pack rows resolve by pack name",
           tableOk && looked == kHyperProfileCount, F("%zu rows, %zu pack rows", looked, packRows));
     {
@@ -1089,8 +1090,8 @@ static void TestHyperProfiles() {
               roadOk && roadRows == 15 && regera && regera->power == 1.6f && ro.downMs2 == 0.0f,
               F("%d road rows, rs6 down %.2f", roadRows, (double)ro.downMs2));
     }
-    Check("hyper profile: the Dubsta stand-in has the Jesko's acceleration (power), top speed (600 km/h, inside 400..612), toughness and assists",
-          dubsta->power == jesko->power && dubsta->targetKmh == jesko->targetKmh && dubsta->targetKmh >= 400.0f && dubsta->targetKmh <= 612.0f &&
+    Check("hyper profile: the Dubsta stand-in has the Jesko's acceleration (power), top speed (500 km/h, inside 400..500.4), toughness and assists",
+          dubsta->power == jesko->power && dubsta->targetKmh == jesko->targetKmh && dubsta->targetKmh >= 400.0f && dubsta->targetKmh <= 139.0f * 3.6f &&
               dubsta->tough && dubsta->assist.Any(),
           F("power %.1f target %.0f", dubsta->power, dubsta->targetKmh));
     bool pctOk = true;
@@ -1100,8 +1101,8 @@ static void TestHyperProfiles() {
         pctOk = pctOk && pct > 0.0f && pct < kHyperMaxPercent && std::fabs(est * (1.0f + pct / 100.0f) - HyperTargetMs(*dubsta)) < 0.01f;
         ++pcts;
     }
-    Check("hyper profile: a stock Dubsta estimate of 40..60 m/s is lifted exactly to the target, not held by the +400 % cap (it binds below 33.3 m/s)",
-          pctOk && pcts == 5 && HyperTopSpeedPercent(33.0f, HyperTargetMs(*dubsta)) == kHyperMaxPercent && HyperTopSpeedPercent(34.0f, HyperTargetMs(*dubsta)) < kHyperMaxPercent,
+    Check("hyper profile: a stock Dubsta estimate of 40..60 m/s is lifted exactly to the target, not held by the +400 % cap (it binds below 27.8 m/s)",
+          pctOk && pcts == 5 && HyperTopSpeedPercent(27.5f, HyperTargetMs(*dubsta)) == kHyperMaxPercent && HyperTopSpeedPercent(28.0f, HyperTargetMs(*dubsta)) < kHyperMaxPercent,
           F("%d estimates", pcts));
 
     // -- downforce --
@@ -1455,21 +1456,44 @@ static void TestHyperProfiles() {
               !HyperHealthLow(999.6f) && !HyperHealthLow(1200.0f) && !HyperHealthLow(std::nanf("")) && !HyperHealthLow(INFINITY),
           "");
 }
-constexpr int kHyperTuneChecks = 4 + 32;  // TestHyperTune's own four + TestHyperProfiles (keep in step: the run asserts the total)
+constexpr int kHyperTuneChecks = 4 + 3 + 32;  // TestHyperTune's own four + the acceleration curve's three + TestHyperProfiles (keep in step: the run asserts the total)
 
-// ---- hyper tune (libs/sync/hypertune.h, GI 2026-11-02: the Jesko at 500 km/h; 2026-11-05: 600 km/h) ----------------
+// ---- hyper tune (libs/sync/hypertune.h, GI 2026-11-02: the Jesko at 500 km/h; 2026-11-05: 600 km/h; 2026-11-06: 500 km/h) ----------------
 static void TestHyperTune() {
     using namespace gage::sync;
-    // 100 m/s stock (360 km/h) -> +66.7 % reaches 166.7 m/s (600 km/h).
+    // 100 m/s stock (360 km/h) -> +38.9 % reaches 138.9 m/s (500 km/h).
     const float p = HyperTopSpeedPercent(100.0f);
-    Check("hyper: a 100 m/s car gets the percentage that lands exactly on 600 km/h",
+    Check("hyper: a 100 m/s car gets the percentage that lands exactly on 500 km/h",
           std::fabs(100.0f * (1.0f + p / 100.0f) - kHyperTargetMs) < 0.01f, std::to_string(p));
     Check("hyper: a slow car is capped at +400 % (never more than 5x stock)", HyperTopSpeedPercent(10.0f) == kHyperMaxPercent,
           std::to_string(HyperTopSpeedPercent(10.0f)));
-    Check("hyper: a car already at or above 600 km/h gets 0, an unreadable estimate gets the safe +100 %",
-          HyperTopSpeedPercent(170.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f && HyperTopSpeedPercent(-5.0f) == 100.0f);
-    Check("hyper: the target stays under the server's default vehicleMaxSpeed (170 m/s, apps/server/config.h), so no update is clamped",
-          kHyperTargetMs < 170.0f, std::to_string(kHyperTargetMs));
+    Check("hyper: a car already at or above 500 km/h gets 0, an unreadable estimate gets the safe +100 %",
+          HyperTopSpeedPercent(139.0f) == 0.0f && HyperTopSpeedPercent(0.0f) == 100.0f && HyperTopSpeedPercent(-5.0f) == 100.0f);
+    Check("hyper: the target stays at or under the server's default vehicleMaxSpeed (139 m/s, apps/server/config.h), so no update is clamped",
+          kHyperTargetMs <= 139.0f, std::to_string(kHyperTargetMs));
+
+    // 0.4.31 the acceleration curve (GI 2026-11-06: "0-100 much faster than 100-200 and so on")
+    {
+        const float t = kHyperTargetMs, kmh = 1.0f / 3.6f;
+        const float a0 = AccelPowerAt(kHyperPower, t, 0.0f), a60 = AccelPowerAt(kHyperPower, t, 60.0f * kmh), a100 = AccelPowerAt(kHyperPower, t, 100.0f * kmh),
+                    a150 = AccelPowerAt(kHyperPower, t, 150.0f * kmh), a200 = AccelPowerAt(kHyperPower, t, 200.0f * kmh),
+                    a300 = AccelPowerAt(kHyperPower, t, 300.0f * kmh), a500 = AccelPowerAt(kHyperPower, t, t);
+        // strictly falling from the knee to where the floor takes over, the 0.4.30 flat power at 30 % of the top speed, held at 60 % of it on top
+        const bool shape = a0 == a60 && a60 > a100 && a100 > a150 && a150 > a200 && a200 > a300 && std::fabs(a150 - kHyperPower) < 1e-3f &&
+                           std::fabs(a60 - 4.89f) < 0.02f && std::fabs(a100 - 3.25f) < 0.02f && std::fabs(a300 - kHyperPower * 0.6f) < 1e-4f &&
+                           a500 == a300 && a0 <= kHyperPower * 2.2f;
+        Check("accel curve: a 500 km/h hyper car gets x4.89 to 60 km/h, x3.25 at 100, x2.35 (the old flat power) at 150, falling to the x1.41 floor by 300",
+              shape, F("0 %.3f 60 %.3f 100 %.3f 150 %.3f 200 %.3f 300 %.3f 500 %.3f", a0, a60, a100, a150, a200, a300, a500));
+        const float rt = 305.0f * kmh;
+        const float r0 = AccelPowerAt(1.0f, rt, 0.0f), r80 = AccelPowerAt(1.0f, rt, 80.0f * kmh), r100 = AccelPowerAt(1.0f, rt, 100.0f * kmh),
+                    rTop = AccelPowerAt(1.0f, rt, rt);
+        Check("accel curve: a 305 km/h road car at power 1.0 gets x1.40 off the line, more than 1 at 80 km/h, and never under stock (1.0) from ~91 km/h",
+              std::fabs(r0 - 1.40f) < 0.01f && r80 > 1.0f && r100 == 1.0f && rTop == 1.0f, F("0 %.3f 80 %.3f 100 %.3f top %.3f", r0, r80, r100, rTop));
+        Check("accel curve: NaN / negative speed is the launch value, a broken power or target returns the flat power (never 0, never NaN)",
+              AccelPowerAt(kHyperPower, t, std::nanf("")) == a0 && AccelPowerAt(kHyperPower, t, -20.0f) == a0 && AccelPowerAt(kHyperPower, 0.0f, 50.0f) == kHyperPower &&
+                  AccelPowerAt(0.0f, t, 50.0f) == 1.0f && AccelPowerAt(kHyperPower, std::nanf(""), 50.0f) == kHyperPower,
+              "");
+    }
     TestHyperProfiles();   // GI 2026-11-04: the per-model profiles and the driving assists
 }
 

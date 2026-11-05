@@ -33,6 +33,9 @@
 #include "protocol/protocol.h"
 #include "sync/minimap.h"     // RadarKeepOut / DockVitals: where GTA's radar is, and where the vitals plate goes under it
 #include "sync/vehicle_state_row.h"   // 0.4.27 the vehicle state row: where it goes, its cells, the change pulse
+#include "sync/hud_ring.h"            // 0.4.31 the vitals ring (GI's REV1 design): geometry, colours, state rules, the critical pulse
+#include "sync/hud_car.h"             // 0.4.31 the car cluster (GI's REV2 design): dial, fuel, blinkers, chips
+#include "overlay_sofia.h"            // kOverlaySofiaBoldTtf: Sofia Sans Bold (SIL OFL 1.1), the ring's labels and numerals
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImGuiContext::ConfigNavWindowingKey* (UiInit)
@@ -152,6 +155,8 @@ std::atomic<bool>     g_radarDock{false};
 std::atomic<float>    g_radarSafeZone{1.0f};
 std::atomic<bool>     g_radarSafeZoneOk{false};
 std::atomic<float>    g_radarScale{1.0f};   // 0.4.25 minimap_scale: the factor the game's radar was shrunk by (1 = the game's own size)
+// 0.4.31 hud_ring (SetHudRing): the vitals are the REV1 ring at the bottom-left (DrawVitalsRing) instead of the plate / the strip under the radar.
+std::atomic<bool>     g_hudRing{false};
 // 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
 // one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown;
 // 0.4.27 state row: 8 lock known, 9 locked, 10 the on-foot lock flash.
@@ -235,6 +240,14 @@ struct Ui {
     float px1 = 1.0f;                       // one hairline, in whole pixels
     float chatPlateH = 0.0f;                // the open chat plate's current height (animated)
     Fnt body, semi, small, title, mid, num, numMid;
+    Fnt ringNum, ringLabel;                 // 0.4.31 Sofia Sans Bold for the vitals ring (drawn at the spec's H / 1080, not at `scale`)
+    bool sofiaOk = false;                   // both loaded from the embedded face (false: ImGui's default font stands in)
+    float sofiaEm = 1.0f;                   // line height / em of the face (TtfLineToEm): css px times this = ImGui px
+    gage::sync::hudring::PulseClock ringPulse[2];   // the ring's critical pulse per gauge (HP, SAT)
+    Fnt carBig, carMid, carSmall;           // 0.4.31 the car cluster's Sofia sizes: the 96 px speed (digits only), the 26 px fuel value, 14 px labels
+    gage::sync::hudring::PulseClock carPulse[3];    // fuel arc (1..10), fuel pump (<= 25), unbuckled belt
+    gage::sync::hudcar::BlinkClock blink;   // one phase for both arrows (a hazard blinks them together)
+    unsigned blinkBits = 0;                 // the arrows lit last frame: a change restarts the phase
     detail::UiTextures tex;
 
     bool     first = true;
@@ -760,6 +773,10 @@ Cluster ClusterLayout(float W, float H)
     c.speedoBottom = std::floor(std::fmin(H - c.gut, c.vTop - c.gap));
     c.vx = c.x;
     c.vw = c.w;
+    if (g_hudRing.load()) {
+        c.speedoBottom = std::floor(H - c.gut);            // 0.4.31: the vitals are the ring at the bottom-left; nothing stacks under the speedometer
+        return c;
+    }
     if (g_radarDock.load()) {
         const gage::sync::ScreenRect radar =
             gage::sync::RadarKeepOut(W, H, g_radarSafeZone.load(), g_radarSafeZoneOk.load(), 0.0f, g_radarScale.load());
@@ -1511,6 +1528,774 @@ void DrawVitals(ImDrawList* dl, float W, float H, float a, UiState& L)
     L.healthLow = u.vit[0].low; L.satietyLow = u.vit[1].low;
 }
 
+// ---- 0.4.31 the vitals ring (GI's REV1 design, HUD_DESIGN_COMPONENTS/REV1/BUILD_SPEC.md; numbers and rules in libs/sync/hud_ring.h) ----------
+// The spec's "map off" state at its exact place and size (GI 2026-11-06: GTA's radar hidden until it can be moved into the circle). Draw order (spec 6):
+// disc glass, tracks, then per gauge the glow fallback and the crisp fill (with the critical pulse), then the strip, its labels, numerals and divider.
+// Everything scales by H / 1080 (the spec's rule), not by the overlay's clamped `scale`. Values snap (the spec animates nothing but the pulse).
+namespace ring = gage::sync::hudring;
+
+ImU32 RingCol(uint32_t rgba, float k)
+{
+    const float a = (float)(rgba & 0xFFu) * Clamp01(k);
+    return IM_COL32((rgba >> 24) & 0xFFu, (rgba >> 16) & 0xFFu, (rgba >> 8) & 0xFFu, (unsigned)std::floor(a + 0.5f));
+}
+
+// An arc about c (screen px) from aUp0 to aUp1 (the spec's degrees, y up) drawn as ONE mesh of nested capsules: ring j is every point at distance
+// rho[j] from the arc's centre line (outer arc, round end cap, inner arc, round start cap, the same point count per ring), carrying alpha[j] of col.
+// The strips between consecutive rings never overlap, so a translucent arc has one alpha everywhere and its round caps have no seam (ImGui's stroke
+// has flat ends, and a cap drawn over it doubles the alpha). A profile with an edge 1 px wide is the anti-aliased crisp arc (CrispProfile); a
+// Gaussian profile is the spec's blurred glow (GlowProfile), which ImGui cannot blur.
+constexpr int kRingMaxRings = 48;   // a sigma 10 glow reaches 36 px at 1080p (72 at 4K): about 1.25-1.5 px a ring
+constexpr int kRingMaxSegs = 180;   // 2 degrees a segment: a full circle
+void RingCapsule(ImDrawList* dl, ImVec2 c, float r, float aUp0, float aUp1, const float* rho, const float* alpha, int nr, ImU32 col)
+{
+    const unsigned colA = (col >> IM_COL32_A_SHIFT) & 0xFFu;
+    if (colA == 0u || nr < 2 || nr > kRingMaxRings)
+        return;
+    const float d0 = -aUp0 * ring::kPi / 180.0f, d1 = -aUp1 * ring::kPi / 180.0f;   // y down: the angle flips sign
+    const int n = std::min(kRingMaxSegs, std::max(4, (int)std::ceil(std::fabs(aUp1 - aUp0) / 2.0f)));   // arc segments
+    const int m = 10;                                                              // points inside each cap
+    // Every ring walks the same angles: the sines and cosines are computed once per arc, not once per ring (a glow has up to 24 rings; this
+    // runs inside the game's Present every frame).
+    float ca[kRingMaxSegs + 1], sa[kRingMaxSegs + 1], cc[m], sc[m];
+    for (int i = 0; i <= n; ++i) {
+        const float d = d0 + (d1 - d0) * (float)i / (float)n;
+        ca[i] = std::cos(d); sa[i] = std::sin(d);
+    }
+    for (int i = 1; i <= m; ++i) {
+        const float t = ring::kPi * (float)i / (float)(m + 1);
+        cc[i - 1] = std::cos(t); sc[i - 1] = std::sin(t);
+    }
+    const int K = 2 * (n + 1) + 2 * m;                                             // points per ring
+    const float s = d1 > d0 ? 1.0f : -1.0f;                                        // direction of travel along increasing d
+    const ImVec2 n0(std::cos(d0), std::sin(d0)), n1(std::cos(d1), std::sin(d1));   // radial at the ends
+    const ImVec2 o0(s * std::sin(d0), -s * std::cos(d0));                          // outward at the start: back along the travel
+    const ImVec2 o1(-s * std::sin(d1), s * std::cos(d1));                          // outward at the end: on along it
+    const ImVec2 e0(c.x + r * n0.x, c.y + r * n0.y), e1(c.x + r * n1.x, c.y + r * n1.y);
+    const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    const ImU32 rgb = col & ~IM_COL32_A_MASK;
+
+    dl->PrimReserve((nr - 1) * K * 6, nr * K);
+    const ImDrawIdx base = (ImDrawIdx)dl->_VtxCurrentIdx;
+    for (int j = 0; j < nr; ++j) {
+        const float q = rho[j];
+        const ImU32 cj = rgb | ((ImU32)std::floor((float)colA * Clamp01(alpha[j]) + 0.5f) << IM_COL32_A_SHIFT);
+        for (int i = 0; i <= n; ++i)                                               // outer arc, start -> end
+            dl->PrimWriteVtx(ImVec2(c.x + (r + q) * ca[i], c.y + (r + q) * sa[i]), uv, cj);
+        for (int i = 0; i < m; ++i)                                                // end cap, outer side -> inner side through the outward tip
+            dl->PrimWriteVtx(ImVec2(e1.x + q * (n1.x * cc[i] + o1.x * sc[i]), e1.y + q * (n1.y * cc[i] + o1.y * sc[i])), uv, cj);
+        for (int i = n; i >= 0; --i)                                               // inner arc, end -> start
+            dl->PrimWriteVtx(ImVec2(c.x + (r - q) * ca[i], c.y + (r - q) * sa[i]), uv, cj);
+        for (int i = 0; i < m; ++i)                                                // start cap, inner side -> outer side
+            dl->PrimWriteVtx(ImVec2(e0.x + q * (-n0.x * cc[i] + o0.x * sc[i]), e0.y + q * (-n0.y * cc[i] + o0.y * sc[i])), uv, cj);
+    }
+    for (int j = 0; j + 1 < nr; ++j)
+        for (int k = 0; k < K; ++k) {
+            const int k1 = (k + 1) % K;
+            const ImDrawIdx a = (ImDrawIdx)(base + j * K + k), b = (ImDrawIdx)(base + j * K + k1);
+            const ImDrawIdx a2 = (ImDrawIdx)(base + (j + 1) * K + k), b2 = (ImDrawIdx)(base + (j + 1) * K + k1);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b); dl->PrimWriteIdx(b2);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b2); dl->PrimWriteIdx(a2);
+        }
+}
+
+// A crisp arc of width w: full alpha to half the width less half a pixel, zero half a pixel beyond (the 1 px anti-aliased edge).
+int CrispProfile(float w, float* rho, float* alpha)
+{
+    const float h = std::fmax(0.5f, w * 0.5f);
+    rho[0] = 0.0f;               alpha[0] = 1.0f;
+    rho[1] = std::fmax(0.0f, h - 0.5f); alpha[1] = 1.0f;
+    rho[2] = h + 0.5f;           alpha[2] = 0.0f;
+    return rho[1] > 0.0f ? 3 : 2;
+}
+
+// The spec's glow: the arc (width w) blurred with a Gaussian of sigma: coverage at distance x from the centre line is
+// 0.5 * (erf((h - x) / (sigma sqrt 2)) + erf((h + x) / (sigma sqrt 2))), sampled out to h + 3 sigma.
+int GlowProfile(float w, float sigma, float* rho, float* alpha)
+{
+    const float h = w * 0.5f, sg = std::fmax(0.5f, sigma) * 1.41421356f;
+    const float reach = h + 3.0f * std::fmax(0.5f, sigma);
+    const int nr = std::min(kRingMaxRings, std::max(4, (int)std::ceil(reach / 1.25f) + 1));
+    for (int j = 0; j < nr; ++j) {
+        const float x = reach * (float)j / (float)(nr - 1);
+        rho[j] = x;
+        alpha[j] = j == nr - 1 ? 0.0f : 0.5f * ((float)std::erf((h - x) / sg) + (float)std::erf((h + x) / sg));
+    }
+    return nr;
+}
+
+void RingArc(ImDrawList* dl, ImVec2 c, float r, float aUp0, float aUp1, float w, ImU32 col)
+{
+    float rho[kRingMaxRings], al[kRingMaxRings];
+    RingCapsule(dl, c, r, aUp0, aUp1, rho, al, CrispProfile(w, rho, al), col);
+}
+
+void RingGlow(ImDrawList* dl, ImVec2 c, float r, float aUp0, float aUp1, float w, float sigma, ImU32 col)
+{
+    float rho[kRingMaxRings], al[kRingMaxRings];
+    RingCapsule(dl, c, r, aUp0, aUp1, rho, al, GlowProfile(w, sigma, rho, al), col);
+}
+
+// ImGui sizes a font by its line height (stb_truetype ScaleForPixelHeight: hhea ascender - descender), CSS by its em (head unitsPerEm). The
+// design's px are CSS px, so text is drawn at css * (ascender - descender) / unitsPerEm. Read from the font's own tables; 0 = unreadable.
+float TtfLineToEm(const unsigned char* d, std::size_t n)
+{
+    auto u16 = [&](std::size_t o) { return o + 2 <= n ? (unsigned)((d[o] << 8) | d[o + 1]) : 0u; };
+    auto u32 = [&](std::size_t o) { return o + 4 <= n ? ((std::size_t)d[o] << 24) | ((std::size_t)d[o + 1] << 16) | ((std::size_t)d[o + 2] << 8) | d[o + 3] : (std::size_t)0; };
+    const unsigned tables = u16(4);
+    std::size_t head = 0, hhea = 0;
+    for (unsigned i = 0; i < tables; ++i) {
+        const std::size_t rec = 12 + 16 * (std::size_t)i;
+        if (rec + 16 > n)
+            break;
+        if (std::memcmp(d + rec, "head", 4) == 0) head = u32(rec + 8);
+        if (std::memcmp(d + rec, "hhea", 4) == 0) hhea = u32(rec + 8);
+    }
+    if (!head || !hhea)
+        return 0.0f;
+    const unsigned upem = u16(head + 18);
+    const int asc = (int16_t)u16(hhea + 4), desc = (int16_t)u16(hhea + 6);
+    if (upem < 16 || asc - desc <= 0)
+        return 0.0f;
+    return (float)(asc - desc) / (float)upem;
+}
+
+// Text at a BASELINE (the spec's text y), each glyph followed by `track` px (the labels' letter-spacing, also after the last letter). Returns the advance.
+float RingText(ImDrawList* dl, const Fnt& f, float px, float x, float baseline, ImU32 col, const char* t, float track)
+{
+    if (!f.font || !(px > 0.0f))
+        return 0.0f;
+    const float k = px / f.font->FontSize;
+    const float top = baseline - f.font->Ascent * k;
+    float pen = x;
+    for (const char* p = t; *p; ++p) {
+        dl->AddText(f.font, px, ImVec2(std::floor(pen + 0.5f), std::floor(top + 0.5f)), col, p, p + 1);   // ImGui truncates each glyph: round instead (no -1 px drift)
+        const ImFontGlyph* g = f.font->FindGlyph((ImWchar)(unsigned char)*p);
+        pen += (g ? g->AdvanceX * k : px * 0.5f) + track;
+    }
+    return pen - x;
+}
+
+// Tabular numerals (the spec: fixed-width digits, left aligned in their slot): each digit centred in a cell `cell` px wide, starting at x.
+void RingNumber(ImDrawList* dl, const Fnt& f, float px, float cell, float x, float baseline, ImU32 col, int v)
+{
+    if (!f.font)
+        return;
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%d", v);
+    const float k = px / f.font->FontSize;
+    const float top = baseline - f.font->Ascent * k;
+    float pen = x;
+    for (const char* p = buf; *p; ++p) {
+        const ImFontGlyph* g = f.font->FindGlyph((ImWchar)(unsigned char)*p);
+        const float adv = g ? g->AdvanceX * k : cell;
+        dl->AddText(f.font, px, ImVec2(std::floor(pen + (cell - adv) * 0.5f + 0.5f), std::floor(top + 0.5f)), col, p, p + 1);
+        pen += cell;
+    }
+}
+
+void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiState& L)
+{
+    (void)W;
+    const float k = ring::Scale(H);
+    auto P = [&](float x, float y) { const ring::Pt s = ring::ToScreen({x, y}, H); return ImVec2(s.x, s.y); };
+    const ImVec2 c = P(ring::kCx, ring::kCy);
+
+    const int val[2] = {ring::Value(g_vitHealth.load()), ring::Value(g_vitSatiety.load())};
+    // The pulse: the HUD clock's capture hook holds it at phase * 1600 ms (0 = opacity 1.0, 0.5 = 0.4); live it runs per gauge from entering critical.
+    const float forced = g_hudPhaseForce.load();
+    float pulse[2];
+    for (int i = 0; i < 2; ++i) {
+        const bool crit = ring::Critical(val[i]);
+        pulse[i] = u.ringPulse[i].Step(crit, nowMs);
+        if (forced >= 0.0f && crit)
+            pulse[i] = ring::PulseOpacity((double)(forced - std::floor(forced)) * ring::kPulsePeriodMs);
+    }
+
+    // 1 disc glass
+    dl->AddCircleFilled(c, ring::kDiscR * k, RingCol(ring::kDiscGlass, a), 96);
+    // 2 tracks
+    const float R = ring::kArcR * k;
+    RingArc(dl, c, R, ring::kHpStartDeg, ring::kHpStartDeg - ring::kSweepDeg, ring::kArcW * k, RingCol(ring::kArcTrack, a));
+    RingArc(dl, c, R, ring::kSatStartDeg, ring::kSatStartDeg + ring::kSweepDeg, ring::kArcW * k, RingCol(ring::kArcTrack, a));
+    // 3 fills: the glow fallback (width 22 at 12 %, width 14 at 28 % of the glow alpha), then the crisp arc; the pulse scales all three
+    ring::GaugeLook look[2];
+    for (int i = 0; i < 2; ++i) {
+        const bool hp = i == 0;
+        look[i] = ring::Look(hp, val[i]);
+        if (!look[i].fill)
+            continue;
+        const float a0 = hp ? ring::kHpStartDeg : ring::kSatStartDeg;
+        const float a1 = hp ? ring::HpEndDeg(val[i]) : ring::SatEndDeg(val[i]);
+        const float pa = a * pulse[i];
+        RingGlow(dl, c, R, a0, a1, ring::kArcW * k, ring::kGlowSigma * k, RingCol(look[i].glow, pa));   // the spec's blur, as a Gaussian falloff
+        RingArc(dl, c, R, a0, a1, ring::kArcW * k, RingCol(look[i].arc, pa));
+    }
+    // 6 strip: the pill and its 1 px border inside the box
+    const ImVec2 s0 = P(ring::kStripX, ring::kStripY + ring::kStripH), s1 = P(ring::kStripX + ring::kStripW, ring::kStripY);
+    const float rr = ring::kStripRound * k;
+    dl->AddRectFilled(s0, s1, RingCol(ring::kStripGlass, a), rr);
+    dl->AddRect(ImVec2(s0.x + 0.5f, s0.y + 0.5f), ImVec2(s1.x - 0.5f, s1.y - 0.5f), RingCol(ring::kStripBorder, a), std::fmax(0.0f, rr - 0.5f), 0, 1.0f);
+    // 7 labels, numerals, divider
+    const float base = H - ring::kTextBaseY * k;
+    // css px to ImGui px (line height): the em ratio of the face (TtfLineToEm); the tabular cell and the tracking stay css px
+    const float lpx = ring::kLabelPx * k * u.sofiaEm, npx = ring::kNumPx * k * u.sofiaEm, tr = ring::kLabelTrackPx * k;
+    RingText(dl, u.ringLabel, lpx, ring::kHpLabelX * k, base, RingCol(look[0].label, a), "HP", tr);
+    const float cell = ring::kTabularEm * ring::kNumPx * k;
+    RingNumber(dl, u.ringNum, npx, cell, ring::kHpNumX * k, base, RingCol(look[0].numeral, a), val[0]);
+    const ImVec2 d0 = P(ring::kDividerX, ring::kDividerY + ring::kDividerH), d1 = P(ring::kDividerX + ring::kDividerW, ring::kDividerY);
+    dl->AddRectFilled(d0, ImVec2(std::fmax(d1.x, d0.x + 1.0f), d1.y), RingCol(ring::kStripDivider, a));
+    RingText(dl, u.ringLabel, lpx, ring::kSatLabelX * k, base, RingCol(look[1].label, a), "SAT", tr);
+    RingNumber(dl, u.ringNum, npx, cell, ring::kSatNumX * k, base, RingCol(look[1].numeral, a), val[1]);
+
+    const ImVec2 b0 = P(ring::kCompX, ring::kCompY + ring::kCompH), b1 = P(ring::kCompX + ring::kCompW, ring::kCompY);
+    L.vitalsVisible = true;
+    L.vitalsRing = true;
+    L.vitalsX = b0.x; L.vitalsY = b0.y; L.vitalsW = b1.x - b0.x; L.vitalsH = b1.y - b0.y;
+    L.vitalsDocked = false; L.vitalsDockWhy = -1; L.vitalsCoverPx = 0.0f;
+    L.vitalsRows = 2;
+    L.healthShown = val[0]; L.satietyShown = val[1];
+    L.healthLow = ring::Low(val[0]); L.satietyLow = ring::Low(val[1]);
+    L.ringPulse[0] = pulse[0]; L.ringPulse[1] = pulse[1];
+
+    static bool s_logged = false;
+    if (!s_logged) {
+        s_logged = true;
+        GLOGI("overlay: vitals ring (0.4.31 hud_ring, REV1): component x %.0f-%.0f y %.0f-%.0f at k %.3f (H / 1080), GTA's radar hidden; Sofia Sans %s",
+              (double)b0.x, (double)b1.x, (double)b0.y, (double)b1.y, (double)k,
+              u.sofiaOk ? "loaded" : "MISSING (ImGui's default font stands in)");
+    }
+}
+
+// ---- 0.4.31 the car cluster (GI's REV2 design, HUD_DESIGN_COMPONENTS/REV2/BUILD_SPEC_CAR.md; numbers and rules in libs/sync/hud_car.h) ---------
+// Bottom-right, x from the right edge, H / 1080. Draw order (spec 8): disc, tracks (speed, redline, fuel), speed glow + fill, fuel glow + fill, ticks,
+// dial numerals, needle (glow, bar), blinkers, speed readout + KM/H, fuel row + E / F, strip, chips. The icons are the spec's 24-unit vector paths
+// (section 5) drawn with ImGui paths, so they stay crisp at every display size (the sprite PNGs are 1080p rasters).
+namespace car = gage::sync::hudcar;
+
+// A straight capsule p0 -> p1 as nested rings (the same mesh idea as RingCapsule): ring j is every point at distance rho[j] from the segment.
+void SegCapsule(ImDrawList* dl, ImVec2 p0, ImVec2 p1, const float* rho, const float* alpha, int nr, ImU32 col)
+{
+    const unsigned colA = (col >> IM_COL32_A_SHIFT) & 0xFFu;
+    if (colA == 0u || nr < 2 || nr > kRingMaxRings)
+        return;
+    float dx = p1.x - p0.x, dy = p1.y - p0.y;
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (len < 1e-4f) { dx = 1.0f; dy = 0.0f; } else { dx /= len; dy /= len; }
+    const ImVec2 nrm(-dy, dx);
+    const int m = 12;
+    const int K = 4 + 2 * m;
+    const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    const ImU32 rgb = col & ~IM_COL32_A_MASK;
+    float cc[m], sc[m];
+    for (int i = 1; i <= m; ++i) {
+        const float t = ring::kPi * (float)i / (float)(m + 1);
+        cc[i - 1] = std::cos(t); sc[i - 1] = std::sin(t);
+    }
+    dl->PrimReserve((nr - 1) * K * 6, nr * K);
+    const ImDrawIdx base = (ImDrawIdx)dl->_VtxCurrentIdx;
+    for (int j = 0; j < nr; ++j) {
+        const float q = rho[j];
+        const ImU32 cj = rgb | ((ImU32)std::floor((float)colA * Clamp01(alpha[j]) + 0.5f) << IM_COL32_A_SHIFT);
+        dl->PrimWriteVtx(ImVec2(p0.x + nrm.x * q, p0.y + nrm.y * q), uv, cj);
+        dl->PrimWriteVtx(ImVec2(p1.x + nrm.x * q, p1.y + nrm.y * q), uv, cj);
+        for (int i = 0; i < m; ++i)        // the cap at p1: +normal side -> -normal side through +direction
+            dl->PrimWriteVtx(ImVec2(p1.x + q * (nrm.x * cc[i] + dx * sc[i]), p1.y + q * (nrm.y * cc[i] + dy * sc[i])), uv, cj);
+        dl->PrimWriteVtx(ImVec2(p1.x - nrm.x * q, p1.y - nrm.y * q), uv, cj);
+        dl->PrimWriteVtx(ImVec2(p0.x - nrm.x * q, p0.y - nrm.y * q), uv, cj);
+        for (int i = 0; i < m; ++i)        // the cap at p0: -normal side -> +normal side through -direction
+            dl->PrimWriteVtx(ImVec2(p0.x + q * (-nrm.x * cc[i] - dx * sc[i]), p0.y + q * (-nrm.y * cc[i] - dy * sc[i])), uv, cj);
+    }
+    for (int j = 0; j + 1 < nr; ++j)
+        for (int k = 0; k < K; ++k) {
+            const int k1 = (k + 1) % K;
+            const ImDrawIdx a = (ImDrawIdx)(base + j * K + k), b = (ImDrawIdx)(base + j * K + k1);
+            const ImDrawIdx a2 = (ImDrawIdx)(base + (j + 1) * K + k), b2 = (ImDrawIdx)(base + (j + 1) * K + k1);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b); dl->PrimWriteIdx(b2);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b2); dl->PrimWriteIdx(a2);
+        }
+}
+
+// The outer glow of a disc of radius R (CSS box-shadow 0 0 2 sigma): only outside the disc, coverage 0.5 * erfc(x / (sigma sqrt 2)) at x px beyond the edge.
+void DiscGlow(ImDrawList* dl, ImVec2 c, float R, float sigma, ImU32 col)
+{
+    const unsigned colA = (col >> IM_COL32_A_SHIFT) & 0xFFu;
+    if (colA == 0u || !(sigma > 0.0f))
+        return;
+    constexpr int rings = 10, segs = 48;
+    // the unit circle and the falloff are the same for every chip: computed once
+    static float cs[segs], sn[segs], fall[rings];
+    static bool tables = false;
+    if (!tables) {
+        for (int i = 0; i < segs; ++i) { const float t = 2.0f * ring::kPi * (float)i / (float)segs; cs[i] = std::cos(t); sn[i] = std::sin(t); }
+        for (int j = 0; j < rings; ++j) fall[j] = j == rings - 1 ? 0.0f : 0.5f * (float)std::erfc(3.0f * (float)j / (float)(rings - 1) / 1.41421356f);
+        tables = true;
+    }
+    const float reach = 3.0f * sigma;
+    const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    const ImU32 rgb = col & ~IM_COL32_A_MASK;
+    dl->PrimReserve((rings - 1) * segs * 6, rings * segs);
+    const ImDrawIdx base = (ImDrawIdx)dl->_VtxCurrentIdx;
+    for (int j = 0; j < rings; ++j) {
+        const float rr = R + reach * (float)j / (float)(rings - 1);
+        const ImU32 cj = rgb | ((ImU32)std::floor((float)colA * fall[j] + 0.5f) << IM_COL32_A_SHIFT);
+        for (int i = 0; i < segs; ++i)
+            dl->PrimWriteVtx(ImVec2(c.x + rr * cs[i], c.y + rr * sn[i]), uv, cj);
+    }
+    for (int j = 0; j + 1 < rings; ++j)
+        for (int i = 0; i < segs; ++i) {
+            const int i1 = (i + 1) % segs;
+            const ImDrawIdx a = (ImDrawIdx)(base + j * segs + i), b = (ImDrawIdx)(base + j * segs + i1);
+            const ImDrawIdx a2 = (ImDrawIdx)(base + (j + 1) * segs + i), b2 = (ImDrawIdx)(base + (j + 1) * segs + i1);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b); dl->PrimWriteIdx(b2);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b2); dl->PrimWriteIdx(a2);
+        }
+}
+
+// The spec's icons (section 5) in their 24-unit box at screen (ox, oy) top-left, size px. Stroke 1.9 units (arrows 1.4); "duo" shapes are also filled
+// with the icon colour at 22 % alpha. pass: 0 = the icon, 1 = its glow (wider strokes, no fills; the caller gives the glow colour).
+enum class Icon { Lock, Unlock, Engine, Belt, BeltOff, Lights, LightsOff, Pump, ArrowL, ArrowR };
+void DrawIcon(ImDrawList* dl, Icon ic, float ox, float oy, float size, ImU32 col, float glowWidth = 0.0f)
+{
+    const float s = size / 24.0f;
+    const bool glow = glowWidth > 0.0f;
+    const float w = glow ? glowWidth : 1.9f * s;
+    const ImU32 duo = glow ? 0u : RingCol(((col & 0xFFu) << 24) | (((col >> 8) & 0xFFu) << 16) | (((col >> 16) & 0xFFu) << 8) | 0xFFu,
+                                         0.22f * (float)((col >> IM_COL32_A_SHIFT) & 0xFFu) / 255.0f);
+    auto P = [&](float x, float y) { return ImVec2(ox + x * s, oy + y * s); };
+    auto line = [&](float x0, float y0, float x1, float y1) { dl->AddLine(P(x0, y0), P(x1, y1), col, w); };
+    auto arc = [&](float cx, float cy, float r, float a0deg, float a1deg) {   // SVG angles (y down), a0 -> a1
+        dl->PathArcTo(P(cx, cy), r * s, a0deg * ring::kPi / 180.0f, a1deg * ring::kPi / 180.0f, std::max(6, (int)(std::fabs(a1deg - a0deg) / 12.0f)));
+    };
+    auto rrect = [&](float x, float y, float rw, float rh, float rx, bool fill) {
+        if (fill && duo) dl->AddRectFilled(P(x, y), P(x + rw, y + rh), duo, rx * s);
+        dl->AddRect(P(x, y), P(x + rw, y + rh), col, rx * s, 0, w);
+    };
+    switch (ic) {
+    case Icon::Lock:
+    case Icon::Unlock:
+        rrect(5.0f, 11.0f, 14.0f, 10.0f, 2.5f, true);
+        if (!glow) dl->AddCircleFilled(P(12.0f, 16.0f), 1.3f * s, col, 12);
+        dl->PathLineTo(P(8.0f, 11.0f));
+        arc(   // PathArcTo adds its own first point: a PathLineTo to the same point is a zero-length segment, which ImGui's thick stroke draws as a spike
+12.0f, 7.5f, 4.0f, 180.0f, ic == Icon::Lock ? 360.0f : 323.13f);
+        if (ic == Icon::Lock) dl->PathLineTo(P(16.0f, 11.0f));
+        dl->PathStroke(col, 0, w);
+        break;
+    case Icon::Engine:
+        arc(12.0f, 13.0f, 9.0f, -45.0f, 225.0f);
+        dl->PathStroke(col, 0, w);
+        line(12.0f, 2.5f, 12.0f, 11.5f);
+        break;
+    case Icon::Belt:
+    case Icon::BeltOff:
+        if (duo) dl->AddCircleFilled(P(12.0f, 5.2f), 2.4f * s, duo, 16);
+        dl->AddCircle(P(12.0f, 5.2f), 2.4f * s, col, 16, w);
+        if (duo) {   // the torso's fill: the closed shape under the open stroke
+            dl->PathLineTo(P(8.0f, 21.0f));
+            arc(12.0f, 14.0f, 4.0f, 180.0f, 360.0f);
+            dl->PathLineTo(P(16.0f, 21.0f));
+            dl->PathFillConvex(duo);
+        }
+        dl->PathLineTo(P(8.0f, 21.0f));
+        arc(12.0f, 14.0f, 4.0f, 180.0f, 360.0f);
+        dl->PathLineTo(P(16.0f, 21.0f));
+        dl->PathStroke(col, 0, w);
+        if (ic == Icon::Belt) line(9.0f, 11.5f, 16.0f, 17.7f);
+        break;
+    case Icon::Lights:
+    case Icon::LightsOff: {
+        auto lamp = [&]() {
+            dl->PathLineTo(P(10.0f, 5.5f));
+            dl->PathBezierCubicCurveTo(P(6.4f, 5.5f), P(4.0f, 8.0f), P(4.0f, 12.0f), 10);
+            dl->PathBezierCubicCurveTo(P(4.0f, 16.0f), P(6.4f, 18.5f), P(10.0f, 18.5f), 10);
+        };
+        if (duo) { lamp(); dl->PathFillConvex(duo); }
+        lamp();
+        dl->PathStroke(col, ImDrawFlags_Closed, w);
+        if (ic == Icon::Lights) {
+            line(14.0f, 7.5f, 21.0f, 7.5f);
+            line(14.0f, 12.0f, 21.0f, 12.0f);
+            line(14.0f, 16.5f, 21.0f, 16.5f);
+        }
+        break;
+    }
+    case Icon::Pump:
+        rrect(4.0f, 3.0f, 10.0f, 18.0f, 2.0f, true);
+        rrect(6.6f, 6.0f, 4.8f, 4.0f, 1.0f, false);
+        dl->PathLineTo(P(14.0f, 9.0f));
+        arc(16.5f, 10.5f, 1.5f, -90.0f, 0.0f);   // starts at (16.5, 9)
+        arc(   // starts at (18, 16)
+19.5f, 16.0f, 1.5f, 180.0f, 0.0f);
+        dl->PathLineTo(P(21.0f, 8.0f));
+        dl->PathLineTo(P(18.0f, 5.0f));
+        dl->PathStroke(col, 0, w);
+        break;
+    case Icon::ArrowL:
+    case Icon::ArrowR: {
+        const bool L = ic == Icon::ArrowL;
+        auto X = [&](float x) { return L ? x : 24.0f - x; };
+        const ImVec2 pts[7] = {P(X(3.0f), 12.0f), P(X(10.5f), 5.0f), P(X(10.5f), 9.2f), P(X(21.0f), 9.2f), P(X(21.0f), 14.8f), P(X(10.5f), 14.8f),
+                               P(X(10.5f), 19.0f)};
+        // The spec's arrow is "fill + stroke 1.4": one polygon grown by half the stroke (glow: by half the glow width), drawn ONCE, so a translucent
+        // arrow (off: 0.28) has one alpha everywhere. The polygon is concave but star-shaped from the shaft's corner by the head (pts[2]): ImGui's
+        // fill fans from its first point, so starting there triangulates it correctly, and its anti-aliased fringe works on any clockwise outline.
+        // (A triangle + rectangle pair left a seam on their shared edge; a thick closed stroke mitred into spikes at the tip.)
+        static const int kCw[7] = {2, 3, 4, 5, 6, 0, 1}, kCcw[7] = {2, 1, 0, 6, 5, 4, 3};   // the mirrored right arrow reverses the winding
+        const int* ord = L ? kCw : kCcw;
+        const float d = glow ? w * 0.5f : 0.7f * s;
+        ImVec2 q[7];
+        for (int i = 0; i < 7; ++i) {
+            const ImVec2 a0 = pts[ord[(i + 6) % 7]], a1 = pts[ord[i]], a2 = pts[ord[(i + 1) % 7]];
+            auto unit = [](ImVec2 v) { const float l = std::sqrt(v.x * v.x + v.y * v.y); return l > 1e-6f ? ImVec2(v.x / l, v.y / l) : ImVec2(0, 0); };
+            const ImVec2 e0 = unit(ImVec2(a1.x - a0.x, a1.y - a0.y)), e1 = unit(ImVec2(a2.x - a1.x, a2.y - a1.y));
+            const ImVec2 n0(e0.y, -e0.x), n1(e1.y, -e1.x);          // outward normals of a clockwise (screen) outline
+            const ImVec2 m = unit(ImVec2(n0.x + n1.x, n0.y + n1.y));
+            // miter length: the crisp icon up to 4x (true corners); the glow (a blur rounds corners) at most 1.25x, or the head's back corners spike
+            const float cosHalf = std::fmax(glow ? 0.8f : 0.25f, m.x * n0.x + m.y * n0.y);
+            q[i] = ImVec2(a1.x + m.x * d / cosHalf, a1.y + m.y * d / cosHalf);
+        }
+        dl->AddConvexPolyFilled(q, 7, col);
+        break;
+    }
+    }
+}
+
+// ---- icon glows: the real blur, baked into the font atlas ------------------------------------------------------------------------------
+// CSS drop-shadow(0 0 R) is the glyph's own alpha blurred with a Gaussian of standard deviation R. ImGui cannot blur, and widened strokes (the first
+// two tries) mitre into "wings" at sharp corners (the headlight's D) and double up where strokes overlap (the lock's body). So each glowing icon state
+// is tessellated by ImGui once (DrawIcon into a scratch draw list), rasterised on the CPU from those triangles, blurred with a separable Gaussian, and
+// stored as alpha in a custom rect of the font atlas (UiInit, before the backend uploads it: no new texture path on either backend). Drawn as an
+// image tinted with the glow colour. Baked at the bake scale; a later display size only scales the image.
+struct IconGlowBake { Icon ic; float sizeDesign, sigmaDesign; };
+constexpr IconGlowBake kIconGlowBakes[] = {
+    {Icon::Lock, car::kChipD * 0.5f, 5.0f}, {Icon::Engine, car::kChipD * 0.5f, 5.0f}, {Icon::Lights, car::kChipD * 0.5f, 5.0f},
+    {Icon::Belt, car::kChipD * 0.5f, 4.0f}, {Icon::BeltOff, car::kChipD * 0.5f, 5.0f},
+    {Icon::Pump, car::kPumpSize, 4.0f}, {Icon::Pump, car::kPumpSize, 5.0f},
+    {Icon::ArrowL, car::kArrowSize, 5.0f}, {Icon::ArrowR, car::kArrowSize, 5.0f},
+};
+constexpr int kIconGlowCount = (int)(sizeof(kIconGlowBakes) / sizeof(kIconGlowBakes[0]));
+struct IconGlowSlot { int rect = -1; float iconPx = 0.0f, padPx = 0.0f; };
+IconGlowSlot g_iconGlow[kIconGlowCount];
+
+int IconGlowIndex(Icon ic, float sizeDesign, float sigmaDesign)
+{
+    for (int i = 0; i < kIconGlowCount; ++i)
+        if (kIconGlowBakes[i].ic == ic && std::fabs(kIconGlowBakes[i].sizeDesign - sizeDesign) < 0.01f && std::fabs(kIconGlowBakes[i].sigmaDesign - sigmaDesign) < 0.01f)
+            return i;
+    return -1;
+}
+
+// Step 1 (before the atlas is built): reserve a rect per glow, sized for the icon plus 3 sigma of blur on every side, at the bake scale.
+void IconGlowReserve(ImFontAtlas* atlas, float scale)
+{
+    for (int i = 0; i < kIconGlowCount; ++i) {
+        IconGlowSlot& s = g_iconGlow[i];
+        s.iconPx = kIconGlowBakes[i].sizeDesign * scale;
+        s.padPx = std::ceil(3.0f * kIconGlowBakes[i].sigmaDesign * scale) + 1.0f;
+        const int side = (int)std::ceil(s.iconPx + 2.0f * s.padPx);
+        s.rect = (side > 0 && side < 1024) ? atlas->AddCustomRectRegular(side, side) : -1;
+    }
+}
+
+// Step 2 (after the atlas is built, before the upload): rasterise, blur, write the alpha. A failure leaves the slot at -1 (the stroke fallback draws).
+void IconGlowFill(ImFontAtlas* atlas, float scale)
+{
+    unsigned char* tex = nullptr;
+    int tw = 0, th = 0;
+    atlas->GetTexDataAsAlpha8(&tex, &tw, &th);
+    if (!tex) {
+        for (IconGlowSlot& s : g_iconGlow) s.rect = -1;
+        GLOGW("overlay: icon glows not baked (no alpha atlas); the stroke glow stands in");
+        return;
+    }
+    ImDrawListSharedData sd;
+    sd.SetCircleTessellationMaxError(0.30f);
+    sd.ClipRectFullscreen = ImVec4(-8192.0f, -8192.0f, 8192.0f, 8192.0f);
+    sd.InitialFlags = ImDrawListFlags_AntiAliasedLines | ImDrawListFlags_AntiAliasedFill;
+    int baked = 0;
+    for (int i = 0; i < kIconGlowCount; ++i) {
+        IconGlowSlot& s = g_iconGlow[i];
+        const ImFontAtlasCustomRect* r = s.rect >= 0 ? atlas->GetCustomRectByIndex(s.rect) : nullptr;
+        if (!r || !r->IsPacked()) { s.rect = -1; continue; }
+        const int W = r->Width, H = r->Height;
+        ImDrawList dl(&sd);
+        dl._ResetForNewFrame();
+        dl.PushClipRectFullScreen();
+        DrawIcon(&dl, kIconGlowBakes[i].ic, s.padPx, s.padPx, s.iconPx, IM_COL32(255, 255, 255, 255));
+        // coverage: every triangle, alpha interpolated from its vertices (ImGui's anti-aliased fringes), composited "over" like the GPU would
+        std::vector<float> a((size_t)W * H, 0.0f);
+        for (const ImDrawCmd& cmd : dl.CmdBuffer)
+            for (unsigned e = 0; e + 2 < cmd.ElemCount; e += 3) {
+                const ImDrawVert* v[3];
+                for (int t = 0; t < 3; ++t) v[t] = &dl.VtxBuffer[(int)(cmd.VtxOffset + dl.IdxBuffer[(int)(cmd.IdxOffset + e + t)])];
+                const float area = (v[1]->pos.x - v[0]->pos.x) * (v[2]->pos.y - v[0]->pos.y) - (v[1]->pos.y - v[0]->pos.y) * (v[2]->pos.x - v[0]->pos.x);
+                if (std::fabs(area) < 1e-6f) continue;
+                const int x0 = std::max(0, (int)std::floor(std::min({v[0]->pos.x, v[1]->pos.x, v[2]->pos.x})));
+                const int x1 = std::min(W - 1, (int)std::ceil(std::max({v[0]->pos.x, v[1]->pos.x, v[2]->pos.x})));
+                const int y0 = std::max(0, (int)std::floor(std::min({v[0]->pos.y, v[1]->pos.y, v[2]->pos.y})));
+                const int y1 = std::min(H - 1, (int)std::ceil(std::max({v[0]->pos.y, v[1]->pos.y, v[2]->pos.y})));
+                for (int y = y0; y <= y1; ++y)
+                    for (int x = x0; x <= x1; ++x) {
+                        const float px = (float)x + 0.5f, py = (float)y + 0.5f;
+                        const float w0 = ((v[1]->pos.x - px) * (v[2]->pos.y - py) - (v[1]->pos.y - py) * (v[2]->pos.x - px)) / area;
+                        const float w1 = ((v[2]->pos.x - px) * (v[0]->pos.y - py) - (v[2]->pos.y - py) * (v[0]->pos.x - px)) / area;
+                        const float w2 = 1.0f - w0 - w1;
+                        if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                        const float va = (w0 * (float)(v[0]->col >> IM_COL32_A_SHIFT) + w1 * (float)(v[1]->col >> IM_COL32_A_SHIFT) +
+                                          w2 * (float)(v[2]->col >> IM_COL32_A_SHIFT)) / 255.0f;
+                        float& d = a[(size_t)y * W + x];
+                        d = d + va * (1.0f - d);
+                    }
+            }
+        // separable Gaussian, sigma at the bake scale, kernel to 3 sigma
+        const float sigma = std::max(0.5f, kIconGlowBakes[i].sigmaDesign * scale);
+        const int kr = (int)std::ceil(3.0f * sigma);
+        std::vector<float> ker((size_t)(2 * kr + 1));
+        float ks = 0.0f;
+        for (int j = -kr; j <= kr; ++j) ks += ker[(size_t)(j + kr)] = std::exp(-0.5f * (float)(j * j) / (sigma * sigma));
+        for (float& kv : ker) kv /= ks;
+        std::vector<float> tmp((size_t)W * H, 0.0f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float acc = 0.0f;
+                for (int j = -kr; j <= kr; ++j) { const int xx = x + j; if (xx >= 0 && xx < W) acc += ker[(size_t)(j + kr)] * a[(size_t)y * W + xx]; }
+                tmp[(size_t)y * W + x] = acc;
+            }
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float acc = 0.0f;
+                for (int j = -kr; j <= kr; ++j) { const int yy = y + j; if (yy >= 0 && yy < H) acc += ker[(size_t)(j + kr)] * tmp[(size_t)yy * W + x]; }
+                tex[(size_t)(r->Y + y) * tw + (r->X + x)] = (unsigned char)std::lround(std::min(1.0f, std::max(0.0f, acc)) * 255.0f);
+            }
+        ++baked;
+    }
+    GLOGI("overlay: icon glows baked: %d of %d into the font atlas (%dx%d) at scale %.2f", baked, kIconGlowCount, tw, th, scale);
+}
+
+// An icon's drop-shadow glow at the icon's box (ox, oy, size px). sigmaDesign: the glow's sigma in design px (= the CSS drop-shadow radius); k: H / 1080.
+// The baked image when there is one; otherwise six faint widened strokes (a rough stand-in: mitred corners).
+void IconGlow(ImDrawList* dl, Icon ic, float ox, float oy, float size, float sizeDesign, uint32_t rgba, float a, float sigmaDesign, float k)
+{
+    const int idx = IconGlowIndex(ic, sizeDesign, sigmaDesign);
+    const ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    if (idx >= 0 && g_iconGlow[idx].rect >= 0 && g_iconGlow[idx].iconPx > 0.0f && atlas->TexID) {
+        const IconGlowSlot& s = g_iconGlow[idx];
+        const ImFontAtlasCustomRect* r = const_cast<ImFontAtlas*>(atlas)->GetCustomRectByIndex(s.rect);
+        ImVec2 uv0, uv1;
+        atlas->CalcCustomRectUV(r, &uv0, &uv1);
+        const float f = size / s.iconPx;
+        const ImVec2 p0(ox - s.padPx * f, oy - s.padPx * f);
+        dl->AddImage(atlas->TexID, p0, ImVec2(p0.x + (float)r->Width * f, p0.y + (float)r->Height * f), uv0, uv1, RingCol(rgba, a));
+        return;
+    }
+    const float stroke = (ic == Icon::ArrowL || ic == Icon::ArrowR ? 1.4f : 1.9f) * size / 24.0f;
+    for (int i = 1; i <= 6; ++i)
+        DrawIcon(dl, ic, ox, oy, size, RingCol(rgba, a * 0.045f), stroke + sigmaDesign * k * (float)i * 0.5f);
+}
+
+// A chip (section 4): outer glow, fill, 1.5 px border inside, the icon (with its glow) at half the diameter. op: the whole chip's opacity (the warn pulse).
+void DrawChip(ImDrawList* dl, ImVec2 c, float D, car::Chip st, Icon ic, float a, float op, float k)
+{
+    const car::ChipLook lk = car::LookOf(st);
+    const float R = D * 0.5f, ao = a * op;
+    if (lk.glow)
+        DiscGlow(dl, c, R, car::kChipGlowSigma * k, RingCol(lk.glow, ao));
+    dl->AddCircleFilled(c, R, RingCol(lk.fill, ao), 48);
+    const float bw = car::kChipBorder * k;
+    dl->AddCircle(c, R - bw * 0.5f, RingCol(lk.border, ao), 48, bw);
+    const float is = D * 0.5f;
+    const float ix = c.x - is * 0.5f, iy = c.y - is * 0.5f;
+    if (lk.iconGlow)
+        IconGlow(dl, ic, ix, iy, is, car::kChipD * 0.5f, lk.iconGlow, ao, lk.iconGlowSigma, k);
+    DrawIcon(dl, ic, ix, iy, is, RingCol(lk.icon, ao * lk.iconAlpha));
+}
+
+// Text helpers in css px (converted with the face's em ratio). Centred: the run's own advances, no tracking.
+float SofiaWidth(const Fnt& f, float px, const char* t)
+{
+    if (!f.font) return 0.0f;
+    const float k = px / f.font->FontSize;
+    float w = 0.0f;
+    for (const char* p = t; *p; ++p) {
+        const ImFontGlyph* g = f.font->FindGlyph((ImWchar)(unsigned char)*p);
+        w += g ? g->AdvanceX * k : 0.0f;
+    }
+    return w;
+}
+// aDial: the dial's opacity (in a car); aStrip: the strip's. onFootLock: the on-foot lock flash, which draws only the lock chip on a glass disc.
+void DrawCarCluster(ImDrawList* dl, float W, float H, float aDial, float aStrip, bool onFootLock, float speedKmh, unsigned hud, double nowMs, UiState& L)
+{
+    const float k = car::Scale(H);
+    const float em = u.sofiaEm;
+    auto P = [&](float x, float y) { const car::Pt s = car::ToScreen({x, y}, W, H); return ImVec2(s.x, s.y); };
+    auto PD = [&](float deg, float r) { const car::Pt d = car::OnDial(deg, r); return P(d.x, d.y); };
+    const ImVec2 c = P(car::kCx, car::kCy);
+
+    car::CarState cs;
+    cs.locked = (hud & 256u) != 0 && (hud & 512u) != 0;
+    cs.engineOn = (hud & 64u) == 0;
+    cs.belted = (hud & 16u) != 0;
+    cs.lights = (int)((hud >> 2) & 3u);
+    const int spd = car::Speed(speedKmh);
+    const bool fuelKnown = g_vitShowFuel.load();
+    const int fuel = car::Fuel(g_vitFuel.load());
+
+    // the HUD clock's capture hook holds the pulse and the blink at a phase
+    const float forced = g_hudPhaseForce.load();
+    const bool force = forced >= 0.0f;
+    const double fph = (double)(forced - std::floor(forced));
+    auto pulseOf = [&](gage::sync::hudring::PulseClock& pc, bool on) {
+        const float v = pc.Step(on, nowMs);
+        return force && on ? gage::sync::hudring::PulseOpacity(fph * gage::sync::hudring::kPulsePeriodMs) : v;
+    };
+    const float fuelArcPulse = pulseOf(u.carPulse[0], fuelKnown && car::FuelArcPulse(fuel));
+    const float pumpPulse = pulseOf(u.carPulse[1], fuelKnown && car::FuelLow(fuel));
+    const float beltPulse = pulseOf(u.carPulse[2], car::BeltChip(cs) == car::Chip::Warn);
+    const unsigned blinkBits = hud & 3u;
+    if (blinkBits != u.blinkBits) { u.blink.on = false; u.blinkBits = blinkBits; }   // a change of side restarts the shared phase (hazard: one phase)
+    float blink = u.blink.Step(blinkBits != 0, nowMs);
+    if (force && blinkBits) blink = car::BlinkOpacity(fph * car::kBlinkPeriodMs);
+
+    if (aDial > 0.003f) {
+        const float a = aDial;
+        // 1 disc (the spec's #0A0907A8 assumes a backdrop blur: the same no-blur lift as the vitals ring)
+        dl->AddCircleFilled(c, car::kDiscR * k, RingCol(gage::sync::hudring::kDiscGlass, a), 128);
+        // 2 tracks
+        const float R = car::kArcR * k, aw = car::kArcW * k;
+        RingArc(dl, c, R, car::kSpeedStartDeg, car::kSpeedStartDeg - car::kSpeedSweepDeg, aw, RingCol(gage::sync::hudring::kArcTrack, a));
+        RingArc(dl, c, R, car::kRedFromDeg, car::kSpeedStartDeg - car::kSpeedSweepDeg, aw, RingCol(car::kRedTrack, a));
+        RingArc(dl, c, R, car::kFuelStartDeg, car::kFuelStartDeg + car::kFuelSweepDeg, aw, RingCol(gage::sync::hudring::kArcTrack, a));
+        // 3 fills
+        const bool red = car::Redline(spd);
+        const uint32_t spdCol = red ? car::kEmber : car::kAmber, spdGlow = red ? car::kRedGlow : car::kSpeedGlow;
+        if (spd > 0) {
+            RingGlow(dl, c, R, car::kSpeedStartDeg, car::SpeedDeg((float)spd), aw, car::kSpeedGlowSigma * k, RingCol(spdGlow, a));
+            RingArc(dl, c, R, car::kSpeedStartDeg, car::SpeedDeg((float)spd), aw, RingCol(spdCol, a));
+        }
+        if (fuelKnown && fuel > 0) {
+            const bool low = car::FuelLow(fuel);
+            const float fa = a * fuelArcPulse;
+            RingGlow(dl, c, R, car::kFuelStartDeg, car::FuelDeg(fuel), aw, car::kFuelGlowSigma * k, RingCol(low ? car::kLowGlow : car::kFuelGlow, fa));
+            RingArc(dl, c, R, car::kFuelStartDeg, car::FuelDeg(fuel), aw, RingCol(low ? car::kEmber : car::kBone, fa));
+        }
+        // 4 ticks (butt ends)
+        for (int i = 0; i < car::kTicks; ++i) {
+            const bool maj = car::TickMajor(i), rd = car::TickRed(i);
+            const float deg = car::TickDeg(i);
+            const uint32_t tc = rd ? (maj ? car::kTickRedMajor : car::kTickRedMinor) : (maj ? car::kTickMajor : car::kTickMinor);
+            dl->AddLine(PD(deg, maj ? car::kTickMajorInnerR : car::kTickMinorInnerR), PD(deg, car::kTickOuterR), RingCol(tc, a),
+                        (maj ? car::kTickMajorW : car::kTickMinorW) * k);
+        }
+        // 5 dial numerals, centred on r 114, baseline 4.5 below the anchor
+        for (int i = 0; i < car::kTicks; i += 4) {
+            char lab[8];
+            std::snprintf(lab, sizeof(lab), "%d", i * 25);
+            const float px = car::kDialNumPx * k * em;
+            const car::Pt an = car::OnDial(car::TickDeg(i), car::kDialNumR);
+            const ImVec2 sp = P(an.x, an.y - car::kDialNumBaseDrop);
+            const float wdt = SofiaWidth(u.carSmall, px, lab);
+            RingText(dl, u.carSmall, px, sp.x - wdt * 0.5f, sp.y, RingCol(car::TickRed(i) ? car::kDialNumRed : car::kDialNum, a), lab, 0.0f);
+        }
+        // 6 needle: glow, then the 28 x 4 bar (radius 2) along the radius at r 140
+        {
+            const float deg = car::SpeedDeg((float)spd);
+            const ImVec2 n0 = PD(deg, car::kNeedleR - (car::kNeedleLen - car::kNeedleW) * 0.5f), n1 = PD(deg, car::kNeedleR + (car::kNeedleLen - car::kNeedleW) * 0.5f);
+            float rho[kRingMaxRings], al[kRingMaxRings];
+            SegCapsule(dl, n0, n1, rho, al, GlowProfile(car::kNeedleW * k, car::kNeedleGlowSigma * k, rho, al), RingCol(spdGlow, a));
+            SegCapsule(dl, n0, n1, rho, al, CrispProfile(car::kNeedleW * k, rho, al), RingCol(spdCol, a));
+        }
+        // 7 blinkers: off = muted at 0.28, no glow; on = amber with a glow, blinking
+        for (int side = 0; side < 2; ++side) {
+            const bool on = (hud & (side == 0 ? 1u : 2u)) != 0;
+            const float x = side == 0 ? car::kArrowLX : car::kArrowRX;
+            const ImVec2 tl = P(x, car::kArrowY + car::kArrowSize);
+            const float sz = car::kArrowSize * k;
+            const Icon ic = side == 0 ? Icon::ArrowL : Icon::ArrowR;
+            if (on) {
+                const float ba = a * blink;
+                IconGlow(dl, ic, tl.x, tl.y, sz, car::kArrowSize, car::kSpeedGlow, ba, 5.0f, k);   // spec: sigma 2.5 = drop-shadow 5 px
+                DrawIcon(dl, ic, tl.x, tl.y, sz, RingCol(car::kAmber, ba));
+            } else {
+                DrawIcon(dl, ic, tl.x, tl.y, sz, RingCol(car::kMuted, a * 0.28f));
+            }
+        }
+        // 8 speed readout and KM/H (engine off: both at 0.4)
+        const float dim = cs.engineOn ? 1.0f : car::kEngineOffDim;
+        {
+            const ImVec2 b = P(car::SpeedRunX(spd), car::kSpeedBaseY);
+            RingNumber(dl, u.carBig, car::kSpeedPx * k * em, car::kSpeedDigitAdv * k, b.x, b.y, RingCol(red ? car::kEmber : car::kCream, a * dim), spd);
+            const ImVec2 ub = P(car::kUnitX, car::kUnitBaseY);
+            RingText(dl, u.carSmall, car::kUnitPx * k * em, ub.x, ub.y, RingCol(car::kMuted, a * dim), "KM/H", car::kUnitTrack * k);
+        }
+        // 9 fuel row (pump, value, %), E / F
+        {
+            const car::FuelRow fr = car::LayoutFuelRow(fuelKnown ? fuel : 0);
+            const ImVec2 pump = P(fr.pumpX, car::kPumpY + car::kPumpSize);
+            if (fuelKnown) {
+                const bool low = car::FuelLow(fuel);
+                const car::ChipLook pl = car::LookOf(car::PumpChip(fuel));
+                const float pa = a * (low ? pumpPulse : 1.0f);
+                IconGlow(dl, Icon::Pump, pump.x, pump.y, car::kPumpSize * k, car::kPumpSize, pl.iconGlow, pa, pl.iconGlowSigma, k);
+                DrawIcon(dl, Icon::Pump, pump.x, pump.y, car::kPumpSize * k, RingCol(pl.icon, pa));
+                const ImVec2 nb = P(fr.numX, car::kFuelBaseY), pb = P(fr.pctX, car::kFuelBaseY);
+                RingNumber(dl, u.carMid, car::kFuelPx * k * em, car::kFuelDigitAdv * k, nb.x, nb.y, RingCol(low ? car::kEmber : car::kCream, a), fuel);
+                RingText(dl, u.carSmall, car::kPctPx * k * em, pb.x, pb.y, RingCol(car::kMuted, a), "%", 0.0f);
+            } else {
+                // no fuel number for this car (not a networked car): the pump alone, in its off look, centred in the row
+                const float px = car::kRowX + (car::kRowW - car::kPumpSize) * 0.5f;
+                const ImVec2 p2 = P(px, car::kPumpY + car::kPumpSize);
+                DrawIcon(dl, Icon::Pump, p2.x, p2.y, car::kPumpSize * k, RingCol(car::kMuted, a * 0.55f));
+            }
+            const ImVec2 eb = P(car::kEX, car::kEFBaseY), fb = P(car::kFX, car::kEFBaseY);
+            RingText(dl, u.carSmall, car::kEFPx * k * em, eb.x, eb.y, RingCol(car::kMuted, a), "E", car::kEFTrack * k);
+            RingText(dl, u.carSmall, car::kEFPx * k * em, fb.x, fb.y, RingCol(car::kMuted, a), "F", car::kEFTrack * k);
+        }
+    }
+    if (aStrip > 0.003f && onFootLock) {
+        // on foot (the lock flash after locking / unlocking a car by key): only the lock chip, on a disc of the strip's glass (no rim: the chip has its own
+        // border), in the corner the strip's right end cap occupies (56 px from the right and the bottom edges)
+        const float a = aStrip;
+        const ImVec2 cc = P(car::kStripX + car::kStripW - car::kStripH * 0.5f, car::kStripY + car::kStripH * 0.5f);
+        const float pad = (car::kStripH - car::kChipD) * 0.5f * k;
+        dl->AddCircleFilled(cc, car::kChipD * 0.5f * k + pad, RingCol(gage::sync::hudring::kStripGlass, a), 64);
+        DrawChip(dl, cc, car::kChipD * k, car::LockChip(cs), cs.locked ? Icon::Lock : Icon::Unlock, a, 1.0f, k);
+        L.rowVisible = true;
+        L.rowX = cc.x - car::kStripH * 0.5f * k; L.rowY = cc.y - car::kStripH * 0.5f * k; L.rowW = L.rowH = car::kStripH * k;
+        L.rowLock = (hud & 256u) ? (cs.locked ? 1 : 0) : -1;
+        aStrip = 0.0f;   // the full strip below is for a car
+    }
+    if (aStrip > 0.003f) {
+        const float a = aStrip;
+        // 10 strip, 11 chips: lock, engine, seatbelt, headlights
+        const ImVec2 s0 = P(car::kStripX, car::kStripY + car::kStripH), s1 = P(car::kStripX + car::kStripW, car::kStripY);
+        const float rr = car::kStripRound * k;
+        dl->AddRectFilled(s0, s1, RingCol(gage::sync::hudring::kStripGlass, a), rr);
+        dl->AddRect(ImVec2(s0.x + 0.5f, s0.y + 0.5f), ImVec2(s1.x - 0.5f, s1.y - 0.5f), RingCol(gage::sync::hudring::kStripBorder, a), std::fmax(0.0f, rr - 0.5f), 0, 1.0f);
+        const car::Chip st[4] = {car::LockChip(cs), car::EngineChip(cs), car::BeltChip(cs), car::LightsChip(cs)};
+        const Icon ic[4] = {cs.locked ? Icon::Lock : Icon::Unlock, Icon::Engine, cs.belted ? Icon::Belt : Icon::BeltOff,
+                            cs.lights > 0 ? Icon::Lights : Icon::LightsOff};
+        for (int i = 0; i < 4; ++i) {
+            const ImVec2 cc = P(car::kChipX[i] + car::kChipD * 0.5f, car::kChipY + car::kChipD * 0.5f);
+            DrawChip(dl, cc, car::kChipD * k, st[i], ic[i], a, i == 2 && st[i] == car::Chip::Warn ? beltPulse : 1.0f, k);
+        }
+    }
+
+    const ImVec2 b0 = P(car::kCompX, car::kCompY + car::kCompH), b1 = P(car::kCompX + car::kCompW, car::kCompY);
+    if (aDial > 0.003f) {
+        L.speedoVisible = true;
+        L.speedoX = b0.x; L.speedoY = b0.y; L.speedoW = b1.x - b0.x; L.speedoH = b1.y - b0.y;
+        L.fuelShown = fuelKnown ? fuel : -1;
+    }
+    if (aStrip > 0.003f) {
+        L.rowVisible = true;
+        const ImVec2 r0 = P(car::kStripX, car::kStripY + car::kStripH);
+        L.rowX = r0.x; L.rowY = r0.y; L.rowW = car::kStripW * k; L.rowH = car::kStripH * k;
+        L.rowLock = (hud & 256u) ? (cs.locked ? 1 : 0) : -1;
+        L.rowBelt = cs.belted; L.rowEngine = cs.engineOn;
+    }
+}
+
 // ---- 0.4.27 the vehicle state row (libs/sync/vehicle_state_row.h): lock, belt, engine ---------------------------------------------------------
 // (the padlock bitmaps sit above DrawSpeedo: 0.4.29 the speedometer strip draws the lock too)
 // The belt and the engine of the speedometer strip, each with a 7 px class in front: the row is the vitals strip's height (11 px at its smallest:
@@ -1542,7 +2327,7 @@ void DrawStateRow(ImDrawList* dl, float W, float H, float a, unsigned hud, doubl
     an.x = c.x;
     an.w = c.w;
     an.rowH = std::fmax(kStripMinH, std::floor(S(14.0f)));
-    an.plateTop = L.speedoVisible ? L.speedoY : (L.vitalsVisible && !c.docked ? L.vitalsY : H - c.gut);
+    an.plateTop = L.speedoVisible ? L.speedoY : (L.vitalsVisible && !c.docked && !L.vitalsRing ? L.vitalsY : H - c.gut);
     an.gap = c.gap;
     const gage::sync::RowRect r = gage::sync::PlaceStateRow(an);
     if (r.where == gage::sync::RowWhere::None)
@@ -2829,6 +3614,41 @@ void UiInit(float scale)
     u.title = load(kSemibold, 3, 30.0f, 22.0f, kLatinRanges);
     u.num   = load(kBoldItalic, 5, 76.0f, 56.0f, kLatinRanges);
     u.numMid = load(kBoldItalic, 5, 22.0f, 17.0f, kLatinRanges);   // the vitals values, in the brand's numerals
+    // 0.4.31 the vitals ring's face, from memory (the atlas must not free our static bytes). Baked at the spec's sizes times the bake scale;
+    // DrawVitalsRing draws them at H / 1080. Missing glyphs / a bad blob fall back to ImGui's default font (never a crash, logged).
+    {
+        const float em = TtfLineToEm(kOverlaySofiaBoldTtf, (std::size_t)kOverlaySofiaBoldTtfLen);
+        u.sofiaEm = em > 0.5f && em < 2.0f ? em : 1.0f;
+    }
+    static const ImWchar kDigitRanges[] = { 0x0030, 0x0039, 0 };   // the 96 px speed: ten glyphs, not a 96 px Latin-1 atlas
+    const auto loadSofia = [&](float design, const ImWchar* ranges = kLatinRanges) {
+        Fnt f;
+        f.design = design;
+        f.base = f.px = std::fmax(8.0f, std::floor(design * u.sofiaEm * scale + 0.5f));   // baked at the size it is drawn at (ImGui px)
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;
+        f.font = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kOverlaySofiaBoldTtf), (int)kOverlaySofiaBoldTtfLen, f.base, &cfg, ranges);
+        f.minPx = f.font ? 1.0f : 0.0f;    // 1 = the embedded face
+        if (!f.font) {
+            GLOGW("overlay: Sofia Sans Bold did not load (%lu bytes); the vitals ring uses ImGui's default font", (unsigned long)kOverlaySofiaBoldTtfLen);
+            ImFontConfig dc;
+            dc.SizePixels = f.base;
+            f.font = io.Fonts->AddFontDefault(&dc);
+        }
+        return f;
+    };
+    u.ringNum = loadSofia(gage::sync::hudring::kNumPx);
+    u.ringLabel = loadSofia(gage::sync::hudring::kLabelPx);
+    u.carBig = loadSofia(gage::sync::hudcar::kSpeedPx, kDigitRanges);
+    u.carMid = loadSofia(gage::sync::hudcar::kFuelPx);
+    u.carSmall = loadSofia(gage::sync::hudcar::kUnitPx);
+    u.sofiaOk = u.ringNum.minPx > 0.0f && u.ringLabel.minPx > 0.0f;
+    // 0.4.31 the car cluster's icon glows, blurred on the CPU into the atlas (IconGlowFill): reserve, build here, fill before the backend uploads
+    IconGlowReserve(io.Fonts, scale);
+    if (io.Fonts->Build())
+        IconGlowFill(io.Fonts, scale);
+    else
+        GLOGW("overlay: the font atlas did not build in UiInit; the icon glows use the stroke stand-in");
     BuildStyle(scale);
     // Ctrl+Tab turns the Tab menu's page (UiFrame), so ImGui must not also take it for its window switcher.
     if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
@@ -3028,11 +3848,22 @@ void UiFrame()
         // palette is a modal layer), then the mark on top so the brand stays at full strength.
         // The name tags belong to the world, so they go first: every plate and the scrim lie over them.
         DrawNameTags(bg, W, H, u.hudA, now, L);
-        if (u.speedA > 0.003f)
+        const bool ringHud = g_hudRing.load();
+        if (ringHud) {
+            // 0.4.31 REV2: the dial follows the car; the strip also carries the on-foot lock flash (then only the lock chip is drawn)
+            const float aStrip = std::fmax(u.speedA, u.rowA);
+            if (aStrip > 0.003f)
+                DrawCarCluster(bg, W, H, u.speedA * u.hudA, aStrip * u.hudA, u.speedA < 0.5f && u.rowA > u.speedA, u.speedSm, rowHud, rowNowMs, L);
+        } else if (u.speedA > 0.003f) {
             DrawSpeedo(bg, W, H, u.speedA * u.hudA, u.speedSm, L);
-        if (u.vitalsA > 0.003f)
-            DrawVitals(bg, W, H, u.vitalsA * u.hudA, L);
-        if (u.rowA > 0.003f)
+        }
+        if (u.vitalsA > 0.003f) {
+            if (g_hudRing.load())
+                DrawVitalsRing(bg, W, H, u.vitalsA * u.hudA, rowNowMs, L);   // 0.4.31 REV1: the ring at the bottom-left
+            else
+                DrawVitals(bg, W, H, u.vitalsA * u.hudA, L);
+        }
+        if (!ringHud && u.rowA > 0.003f)
             DrawStateRow(bg, W, H, u.rowA * u.hudA, rowHud, rowNowMs, L);   // after both: it is placed against their rects
         DrawChat(bg, W, H, now, u.hudA, L);
         if (u.invA > 0.003f)
@@ -3084,6 +3915,8 @@ void SetRadarDock(bool dock, float safeZone, bool safeZoneOk, float scale)
     g_radarScale.store(gage::sync::ClampRadarScale(scale));          // NaN / out of range: 1 = the game's own size, or the nearest end
     g_radarDock.store(dock);
 }
+
+void SetHudRing(bool on) { g_hudRing.store(on); }
 
 void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel)
 {

@@ -841,6 +841,7 @@ namespace {
     std::atomic<bool>  g_miniScaleDirty{false};
     bool               g_miniScaleInit = false;       // script tick only
     float              g_miniAppliedScale = 1.0f;     // what the game's table holds now (read back); the overlay's radar rectangle and the clearance check use it
+    std::atomic<bool>  g_hudRing{true};               // 0.4.31 hud_ring (MinimapReadSwitches)
     void MinimapScaleRead()
     {
         const sync::ParsedScale p = sync::ParseMinimapScale(reg::Get(L"minimap_scale"));
@@ -851,7 +852,13 @@ namespace {
     void MinimapReadSwitches()
     {
         MinimapScaleRead();
-        g_minimap.store(reg::Get(L"minimap") != L"0");
+        // 0.4.31 hud_ring (default on; 0 = the 0.4.30 vitals plate / strip under the radar): GI's REV1 vitals ring at the bottom-left, with GTA's
+        // radar HIDDEN (GI's pick 2026-11-06: the design's place and size, map off, until the radar can be moved into the circle).
+        g_hudRing.store(reg::Get(L"hud_ring") != L"0");
+        game::Overlay::SetHudRing(g_hudRing.load());
+        g_minimap.store(reg::Get(L"minimap") != L"0" && !g_hudRing.load());
+        GLOGI("engine: HUD (0.4.31): hud_ring=%s", g_hudRing.load() ? "on (the REV1 vitals ring bottom-left; GTA's radar hidden, minimap ignored)"
+                                                                     : "OFF (the 0.4.30 vitals and GTA's radar per minimap)");
         const sync::BarsMode bm = sync::ParseBarsMode(reg::Get(L"minimap_bars"));
         g_barsMode.store((int)bm);
         g_barsReset.store(true);
@@ -3743,7 +3750,8 @@ namespace {
 
         // Fuel is server-owned (VehicleState.fuelPermille; no native reads one in 3889: GET_VEHICLE_FUEL_LEVEL is FiveM-only). 0.4.22: the gauge on the
         // speedometer plate shows the level of the networked car we sit in (TickVehicleControls sets g_fuelHud earlier in this tick).
-        game::Overlay::SetVitals(hpFrac, satFrac, g_fuelHud.frac, g_life == Life::Alive, g_fuelHud.show);
+        // 0.4.31: the ring stays up through the death hold (its HP 0 state is designed); the old plate hid at the death as before
+        game::Overlay::SetVitals(hpFrac, satFrac, g_fuelHud.frac, g_life == Life::Alive || (g_hudRing.load() && g_life == Life::Dying), g_fuelHud.show);
     }
 
     // ---- the in-game UI (overlay) -----------------------------------------
@@ -12525,8 +12533,27 @@ namespace {
         }
         if (!tuneOn)
             return;
-        g_world->SetVehicleCheatPowerIncrease(veh, prof->power);   // the game clears it every frame
-        g_shk.power = prof->power;                                 // 0.4.22: the shake line names what is written to the car every tick
+        // 0.4.31 the acceleration curve (sync::AccelPowerAt): the multiplier falls with the car's speed; accel_curve=0 = the flat 0.4.30 power
+        static int accelCurve = -1;
+        if (accelCurve < 0)
+        {
+            accelCurve = reg::Get(L"accel_curve") == L"0" ? 0 : 1;
+            const float tMs = sync::HyperTargetMs(*prof);
+            GLOGI("engine: acceleration curve (0.4.31) %s: %s power x%.2f flat -> x%.2f to 60 km/h, x%.2f at 100, x%.2f at 200, x%.2f at 300, "
+                  "x%.2f at %.0f km/h (accel_curve=0 = flat)", accelCurve ? "ON" : "off", sync::HyperProfileName(*prof), prof->power,
+                  sync::AccelPowerAt(prof->power, tMs, 0.0f), sync::AccelPowerAt(prof->power, tMs, 100.0f / 3.6f),
+                  sync::AccelPowerAt(prof->power, tMs, 200.0f / 3.6f), sync::AccelPowerAt(prof->power, tMs, 300.0f / 3.6f),
+                  sync::AccelPowerAt(prof->power, tMs, tMs), prof->targetKmh);
+        }
+        float power = prof->power;
+        if (accelCurve)
+        {
+            float vx = 0, vy = 0, vz = 0;
+            if (g_world->GetEntityVelocity(veh, vx, vy, vz))   // a failed read keeps the flat power (never a launch boost on no information)
+                power = sync::AccelPowerAt(prof->power, sync::HyperTargetMs(*prof), std::sqrt(vx * vx + vy * vy + vz * vz));
+        }
+        g_world->SetVehicleCheatPowerIncrease(veh, power);         // the game clears it every frame
+        g_shk.power = power;                                       // 0.4.22: the shake line names what is written to the car every tick
         if (st.veh != veh)
         {
             st = HyperState();                         // a new car: its own window, read-back record and mask

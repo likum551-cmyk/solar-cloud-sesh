@@ -68,6 +68,17 @@ find . \
 # loose files directly in .toolchain/ (zips, installers, nupkg) are not part of the source
 tr '\0' '\n' < "$LISTFILE" | grep -v -E '^\./\.toolchain/[^/]+$' | tr '\n' '\0' > "$LISTFILE.2"
 mv -f "$LISTFILE.2" "$LISTFILE"
+# git-ignored files never leave the PC (2026-11-06: the list carried a friend's game log from "gage testing/", stale
+# apps/master/dist builds and .claude/scheduled_tasks.lock). Tracked files are never reported by check-ignore, so they still ship.
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  tr '\0' '\n' < "$LISTFILE" | sed 's|^\./||' > "$SCRATCH/rel.txt"
+  git -C "$ROOT" check-ignore --stdin < "$SCRATCH/rel.txt" > "$SCRATCH/ignored.txt" || [ $? -eq 1 ] || die "git check-ignore failed"
+  if [ -s "$SCRATCH/ignored.txt" ]; then
+    log "leaving out $(wc -l < "$SCRATCH/ignored.txt" | tr -d ' ') git-ignored files"
+    grep -v -x -F -f "$SCRATCH/ignored.txt" "$SCRATCH/rel.txt" | sed 's|^|./|' | tr '\n' '\0' > "$LISTFILE.2"
+    mv -f "$LISTFILE.2" "$LISTFILE"
+  fi
+fi
 
 COUNT=$(tr -cd '\0' < "$LISTFILE" | wc -c)
 [ "$COUNT" -gt 500 ] || die "only $COUNT files in the list: something is wrong with the file selection"

@@ -34,6 +34,9 @@ set(GAGE_OVERLAY_ASSETS
     "scene7|loader/loader-art-stop-and-frisk.jpg|kOverlayScene7Jpg"
     "scene8|loader/loader-art-tao-cheng.jpg|kOverlayScene8Jpg"
     "scene9|loader/loader-art-trevor-firestarter.jpg|kOverlayScene9Jpg"
+    # 0.4.31 the vitals ring (GI's REV1 HUD design): Sofia Sans Bold, SIL OFL 1.1 (brand/fonts/SofiaSans-OFL.txt), the design's Latin-only conversion.
+    # Used from memory by overlay_ui.cpp (the atlas does not own the bytes).
+    "sofia|fonts/SofiaSans-Bold-latin.ttf|kOverlaySofiaBoldTtf"
 )
 set(GAGE_OVERLAY_GENERATED "")
 foreach(asset IN LISTS GAGE_OVERLAY_ASSETS)

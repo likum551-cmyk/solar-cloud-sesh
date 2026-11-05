@@ -58,7 +58,7 @@ namespace gage::server {
         uint16_t vehiclesPerPlayer = 3;          // spawned (and, separately, adopted) per player, 1..64
         uint32_t vehicleEmptyDespawnMs = 600000; // server.json vehicleEmptyDespawnSeconds 0..86400 (0 = never)
         uint32_t vehicleEnterDistance = 10;      // m, 1..100: Enter / Register range from the player
-        uint32_t vehicleMaxSpeed = 170;          // m/s, 10..600: a VehicleUpdate above it is clamped to it up to twice it (T4: a hyper car's overshoot), refused above that. 170 (was 150): the 600 km/h hyper tune (libs/sync/hypertune.h) is 166.7 m/s
+        uint32_t vehicleMaxSpeed = 139;          // m/s, 10..600: a VehicleUpdate above it is clamped to it up to twice it (T4: a hyper car's overshoot), refused above that. 139 = 500.4 km/h (0.4.31, GI: "max speed is 500"; was 170 for the 600 km/h tune, 150 before), libs/sync/hypertune.h kHyperTargetKmh
         uint32_t fuelDrainPerMinute = 10;        // permille per minute while driven with the engine on, 0..1000
         // R3 T5: the contact arbiter places a controller's samples at their TRUE time, not the SampleClock's (sample time + the fastest uplink): each
         // sample is moved back by half the controller's round trip, at most this many ms (0..500, 0 = off; server.json contactLagCapMs).

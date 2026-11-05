@@ -2363,6 +2363,7 @@ static server::VehicleStore::Rules V5Rules()
     r.perIp = 6;
     r.emptyDespawnMs = 600000;
     r.orphanMs = 60000;
+    r.maxSpeed = 150.0f;   // the fixtures' cap, explicit since the default followed Config::vehicleMaxSpeed to 139 (0.4.31)
     return r;
 }
 

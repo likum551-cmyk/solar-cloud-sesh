@@ -10,12 +10,14 @@
 //   MODIFY_VEHICLE_TOP_SPEED(veh, HyperTopSpeedPercent)  once per vehicle, from GET_VEHICLE_ESTIMATED_MAX_SPEED
 //   SET_VEHICLE_MAX_SPEED(veh, target)                   once per vehicle: the cap the game enforces
 //
-// The server's anti-cheat limits a VehicleUpdate to vehicleMaxSpeed (default 170 m/s = 612 km/h since 2026-11-05, was
-// 150), which is above the target here. T4: an overshoot above the cap (a downhill, a jump, the game's enforcement lagging
+// GI 2026-11-06: back to a 500 km/h top speed, and a speed-dependent power (AccelPowerAt: strong off the line, falling with speed).
+//
+// The server's anti-cheat limits a VehicleUpdate to vehicleMaxSpeed (default 139 m/s = 500 km/h since 0.4.31; 170 for the
+// 600 km/h tune, 150 before), which is at the target here. T4: an overshoot above the cap (a downhill, a jump, the game's enforcement lagging
 // a frame) is no longer DROPPED, which froze the car for every other client for as long as it lasted: up to twice the cap
 // the server clamps the replicated velocity to the cap and takes the position (VehicleStore::Rules::maxSpeedSoftFactor);
 // above that it refuses. The same cap is the driver's PlayerState move limit (Server::CheckMove). A server.json that still
-// says "vehicleMaxSpeed": 150 overrides the default: 600 km/h (166.7 m/s) then shows to the others as 540 km/h.
+// says a lower "vehicleMaxSpeed" overrides the default: a car over it shows to the others at that cap.
 //
 // PER-MODEL PROFILES (kHyperProfiles). Both rows carry the same tune: the Jesko is the car it is made for; the Dubsta (a stock
 // 4x4 SUV: tall, soft, brakes, tyres and a body made for 160 km/h) is the stand-in until the Jesko model streams. The tune
@@ -57,10 +59,36 @@
 
 namespace gage::sync {
 
-    constexpr float kHyperTargetKmh = 600.0f;                   // GI 2026-11-05 (was 500)
-    constexpr float kHyperTargetMs = kHyperTargetKmh / 3.6f;   // 166.7 m/s
+    constexpr float kHyperTargetKmh = 500.0f;                   // GI 2026-11-06: "max speed is 500" (2026-11-05: 600, before that 500)
+    constexpr float kHyperTargetMs = kHyperTargetKmh / 3.6f;   // 138.9 m/s; the server's vehicleMaxSpeed default is 139 m/s (apps/server/config.h)
     constexpr float kHyperPower = 2.35f;                        // cheat power multiplier (1 = stock); GI 2026-11-05: 3.5 -> 2.35, acceleration -33 %
     constexpr float kHyperMaxPercent = 400.0f;                  // never more than 5x the stock top speed
+
+    // ---- 0.4.31 the acceleration curve (GI 2026-11-06: "make accel like in real life, 0-100 much faster than 100-200 and so on, lower speed
+    // faster accel") ----------------------------------------------------------------------------------------------------------------------
+    // A real car is traction-limited off the line and power-limited above that: the force at the wheels is about P / v, so each 100 km/h
+    // takes longer than the one before. The flat SET_VEHICLE_CHEAT_POWER_INCREASE of 0.4.30 (on top of a top speed raised 2-5x by
+    // MODIFY_VEHICLE_TOP_SPEED, which stretches the stock force curve) gave nearly the same push at 50 and at 300 km/h. Now the multiplier is
+    //     m(v) = power * (vc / max(v, knee))^gamma,  held to [lo, hi]
+    //   knee  60 km/h          below it: constant (the traction-limited launch)
+    //   gamma 0.8              a little under constant power (1.0): the game's own force curve already falls off near the top
+    //   vc    30 % of the car's top speed: the speed where the multiplier equals the 0.4.30 flat power (150 km/h for a 500 km/h car)
+    //   lo    max(1, power * 0.6)    never below stock, and a hyper car keeps 60 % of its flat power at the top so it still reaches it
+    //   hi    power * 2.2
+    // A 500 km/h hyper car (power 2.35): x4.9 to 60 km/h, x3.2 at 100, x1.9 at 200, x1.41 from 300 up. A 305 km/h road car (power 1.0):
+    // x1.4 to 60 km/h, back to stock (x1.0) from about 90 km/h (cheat power under 1 is not known to be honoured, so above vc it is just stock).
+    // accel_curve=0 in HKCU\Software\GAGE-MP restores the flat 0.4.30 power. None of these numbers has been felt in a game yet.
+    constexpr float kAccelKneeMs = 60.0f / 3.6f, kAccelGamma = 0.8f, kAccelCrossFrac = 0.3f, kAccelLoFrac = 0.6f, kAccelHiFrac = 2.2f;
+    inline float AccelPowerAt(float power, float targetMs, float speedMs)
+    {
+        if (!(power > 0.0f) || !(targetMs > 1.0f))
+            return power > 0.0f ? power : 1.0f;
+        const float v = (speedMs == speedMs && speedMs > kAccelKneeMs) ? speedMs : kAccelKneeMs;   // NaN / standing / reversing = the launch
+        const float m = power * std::pow(kAccelCrossFrac * targetMs / v, kAccelGamma);
+        const float lo = power * kAccelLoFrac > 1.0f ? power * kAccelLoFrac : 1.0f;
+        const float hi = power * kAccelHiFrac > lo ? power * kAccelHiFrac : lo;
+        return m < lo ? lo : (m > hi ? hi : m);
+    }
 
     // MODIFY_VEHICLE_TOP_SPEED takes a percentage added to the handling's top speed (100 = double). From the game's
     // own estimate of the stock top speed (m/s), the percentage that brings it to `targetMs`. An unknown or broken
@@ -259,7 +287,7 @@ namespace gage::sync {
     {
         const char* model;      // the /car name (lower case: the engine hashes it with GET_HASH_KEY, which ignores case);
                                 // nullptr = a pack-wide row (below)
-        float targetKmh;        // top speed the game is made to allow; must stay under the server's vehicleMaxSpeed (612 km/h default)
+        float targetKmh;        // top speed the game is made to allow; must stay at or under the server's vehicleMaxSpeed (139 m/s = 500.4 km/h default)
         float power;            // SET_VEHICLE_CHEAT_POWER_INCREASE, every frame
         bool tough;             // the toughness natives and the health top-up
         HyperAssist assist;     // the driving assists (all zero = none)
@@ -281,7 +309,7 @@ namespace gage::sync {
     constexpr HyperAssist MakeHyperAssist()
     {
         HyperAssist a;
-        a.downRefMs = kHyperTargetMs;
+        a.downRefMs = 600.0f / 3.6f;   // 0.4.31: the curve's reference stays at 600 km/h when the top speed went back to 500 (same k v^2: 9.7 m/s^2 at 500)
         a.downAtRefMs2 = 14.0f;
         a.downCapMs2 = 17.0f;
         a.gripRate = 6.9f;

@@ -3086,6 +3086,8 @@ static void TestSyncD()
 #include "vehcontrols_pure_tests.h"   // 0.4.22 vehicle controls: keys -> indicators / engine / belt, auto-cancel, fuel gauge, wire helpers
 #include "r5_edges_tests.h"   // R5 on-foot telemetry: swim / ragdoll edges, the sender's flag against the puppet's read-back (libs/sync/state_mirror.h)
 #include "r5_swing_tests.h"   // R5 punches: the looped swing plan / ladder order, the explicit stop, the survey with 7 entries, under switchable GTA models
+#include "hud_car_tests.h"    // 0.4.31 the car cluster (GI REV2 design): dial, ticks, fuel row, chips, blink, anchor
+#include "hud_ring_tests.h"   // 0.4.31 the vitals ring (GI REV1 design): state table, rules, pulse, scale
 #include "vehstate_row_tests.h"   // 0.4.27 vehicle state row (lock / belt / engine) and the indicator fallback (needs Check / F above)
 
 int main()
@@ -3146,6 +3148,8 @@ int main()
     r5edge::RunPure();
     std::printf("-- R5: looped punches (plan order, explicit stop, survey of 7, under switchable GTA models)\n");
     r5swing::RunPure();
+    hudring_t::RunPure();                           // 0.4.31 the vitals ring (tests/hud_ring_tests.h)
+    hudcar_t::RunPure();                            // 0.4.31 the car cluster (tests/hud_car_tests.h)
     vehrow::RunPure();                              // 0.4.27 vehicle state row + indicator fallback (tests/vehstate_row_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
@@ -3164,7 +3168,9 @@ int main()
                        + r5edge::kChecks      // + R5 swim / ragdoll edge telemetry
                        + r5swing::kChecks    // + R5 looped punches
                        + vehrow::kChecks      // + 0.4.27 vehicle state row + indicator fallback 31
-                       + 1;                   // + 0.4.30 punch: a melee stagger is a clip (tests W8 block)
+                       + 1                    // + 0.4.30 punch: a melee stagger is a clip (tests W8 block)
+                       + hudring_t::kChecks   // + 0.4.31 the vitals ring 9
+                       + hudcar_t::kChecks;   // + 0.4.31 the car cluster 10
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

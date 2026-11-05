@@ -80,7 +80,7 @@ namespace gage::server {
             uint32_t emptyDespawnMs = 600000;   // 0 = never
             uint32_t orphanMs = 60000;          // an orphan (its spawner left while it was occupied) goes this long after it empties
             float    enterDistance = 10.0f;     // m
-            float    maxSpeed = 150.0f;         // m/s, magnitude
+            float    maxSpeed = 139.0f;         // m/s, magnitude (the server sets it from Config::vehicleMaxSpeed; this default matches it)
             uint32_t fuelDrainPerMinute = 10;   // permille while the engine runs and the vehicle moves
             // replication
             float    enterRadius = 400.0f, leaveRadius = 450.0f;
