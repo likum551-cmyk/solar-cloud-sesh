@@ -156,6 +156,15 @@ namespace gage::server {
         // save; relative = the working directory). Empty = nothing is saved (every player gets the starter kit each session).
         // Guests are never saved either way.
         std::string inventoryDir = "inventories";
+        // 0.5.4 inventory world (libs/sync/inventory_world.h, docs/api/server.md): invWorld 1 = drops go to ground piles that
+        // nearby players can take from, car trunks are containers, and a 0.5.4 client's ped weapons are inventory items; 0 = the
+        // 0.5.3 behaviour (a drop discards, no NEARBY, weapons stay outside the inventory). Reaches in metres, the pile lifetime in
+        // seconds after the last thing was put in it. Piles and trunk contents live in memory only (a restart clears them).
+        uint32_t invWorld = 1;                  // 0 | 1
+        uint32_t invGroundReach = 2;            // 1..20 m
+        uint32_t invTrunkReach = 4;             // 1..20 m
+        uint32_t invGroundExpireSeconds = 600;  // 10..86400
+        uint32_t invMaxPiles = 2048;            // 16..65536
 
         // ---- server.json keys: local admin control channel (admin.h) ----
         // adminPort: loopback-only TCP port for the admin line protocol; 0 (default) =

@@ -662,7 +662,9 @@ namespace gage::proto {
 
     Bytes Encode(const InvOp& m)
     {
-        if (m.seq == 0 || m.op.size() != kInvOpBytes) return {};
+        if (m.seq == 0 || (m.op.size() != kInvOpBytes && m.op.size() != kInvOpBytesExt)) return {};
+        const bool world = (uint8_t)m.op[1] == kInvWhereWorld || (uint8_t)m.op[4] == kInvWhereWorld;
+        if ((m.op.size() == kInvOpBytesExt) != world) return {};   // the long form exactly when a side is the world
         wire::Writer w;
         w.u8((uint8_t)Msg::InvOp);
         w.u32(m.seq);
@@ -677,6 +679,67 @@ namespace gage::proto {
         w.u8((uint8_t)Msg::InvUsed);
         w.u16(m.item);
         w.u8(m.satiety);
+        return w.take();
+    }
+
+    Bytes Encode(const InvSnap& m)
+    {
+        if (m.blob.empty() || m.blob.size() > kMaxInvBlob || m.strip.size() > kMaxInvStrip) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::InvSnap);
+        w.u32(m.ackSeq);
+        w.u32(m.rev);
+        w.u8(m.flags);
+        if (!w.str(m.blob)) return {};
+        w.u8((uint8_t)m.strip.size());
+        for (uint32_t h : m.strip)
+            w.u32(h);
+        return w.take();
+    }
+
+    Bytes Encode(const InvNearby& m)
+    {
+        if (m.boxes.size() > kMaxInvNearby) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::InvNearby);
+        w.u8((uint8_t)m.boxes.size());
+        for (const InvBox& b : m.boxes)
+        {
+            if (b.blob.size() > kMaxInvBlob) return {};
+            w.u32(b.id);
+            w.u8(b.kind);
+            w.u8(b.flags);
+            w.u16(b.veh);
+            w.u32(b.model);
+            w.u8(b.cls);
+            w.u8(b.piles);
+            w.u16(b.distCm);
+            if (!w.str(b.blob)) return {};
+        }
+        return w.take();
+    }
+
+    Bytes Encode(const InvReport& m)
+    {
+        if (m.weapons.size() > kMaxInvReportWeapons || m.vehicles.size() > kMaxInvReportVehicles) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::InvReport);
+        w.u32(m.rev);
+        w.u32(m.current);
+        w.u8(m.flags);
+        w.u8((uint8_t)m.weapons.size());
+        for (const InvPedWeapon& x : m.weapons)
+        {
+            w.u32(x.hash);
+            w.u32(x.ammoType);
+            w.u16(x.ammo);
+        }
+        w.u8((uint8_t)m.vehicles.size());
+        for (const InvVehClass& v : m.vehicles)
+        {
+            w.u16(v.veh);
+            w.u8(v.cls);
+        }
         return w.take();
     }
 
@@ -1251,9 +1314,91 @@ namespace gage::proto {
         if (!Begin(r, Msg::InvOp)) return false;
         InvOp m;
         m.seq = r.u32();
-        uint8_t b[kInvOpBytes] = {};
-        if (!r.bytes(b, sizeof b) || !r.done() || m.seq == 0) return false;
-        m.op.assign((const char*)b, sizeof b);
+        const size_t len = r.remaining();
+        if (m.seq == 0 || (len != kInvOpBytes && len != kInvOpBytesExt)) return false;
+        uint8_t b[kInvOpBytesExt] = {};
+        if (!r.bytes(b, len) || !r.done()) return false;
+        const bool world = b[1] == kInvWhereWorld || b[4] == kInvWhereWorld;
+        if ((len == kInvOpBytesExt) != world) return false;   // the long form exactly when a side is the world (a short world op is a cut-off long one)
+        m.op.assign((const char*)b, len);
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, InvSnap& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::InvSnap)) return false;
+        InvSnap m;
+        m.ackSeq = r.u32();
+        m.rev = r.u32();
+        m.flags = r.u8();
+        m.blob = r.str(kMaxInvBlob);
+        const uint8_t ns = r.u8();
+        if (!r.ok() || m.blob.empty() || (m.flags & ~kInvSnapFromReport) || ns > kMaxInvStrip) return false;
+        for (uint8_t i = 0; i < ns; i++)
+            m.strip.push_back(r.u32());
+        if (!r.done()) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, InvNearby& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::InvNearby)) return false;
+        InvNearby m;
+        const uint8_t count = r.u8();
+        if (!r.ok() || count > kMaxInvNearby) return false;
+        for (uint8_t i = 0; i < count; i++)
+        {
+            InvBox b;
+            b.id = r.u32();
+            b.kind = r.u8();
+            b.flags = r.u8();
+            b.veh = r.u16();
+            b.model = r.u32();
+            b.cls = r.u8();
+            b.piles = r.u8();
+            b.distCm = r.u16();
+            b.blob = r.str(kMaxInvBlob);
+            if (!r.ok() || b.id == 0 || (b.flags & ~kInvBoxLocked)) return false;
+            m.boxes.push_back(std::move(b));
+        }
+        if (!r.done()) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, InvReport& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::InvReport)) return false;
+        InvReport m;
+        m.rev = r.u32();
+        m.current = r.u32();
+        m.flags = r.u8();
+        const uint8_t nw = r.u8();
+        if (!r.ok() || (m.flags & ~kInvReportPedValid) || nw > kMaxInvReportWeapons || r.remaining() < (size_t)nw * 10) return false;
+        for (uint8_t i = 0; i < nw; i++)
+        {
+            InvPedWeapon x;
+            x.hash = r.u32();
+            x.ammoType = r.u32();
+            x.ammo = r.u16();
+            if (x.hash == 0) return false;
+            m.weapons.push_back(x);
+        }
+        const uint8_t nv = r.u8();
+        if (!r.ok() || nv > kMaxInvReportVehicles) return false;
+        for (uint8_t i = 0; i < nv; i++)
+        {
+            InvVehClass v;
+            v.veh = r.u16();
+            v.cls = r.u8();
+            m.vehicles.push_back(v);
+        }
+        if (!r.done()) return false;
         out = std::move(m);
         return true;
     }
@@ -1618,6 +1763,9 @@ namespace gage::proto {
         case Msg::InvState:         return "InvState";
         case Msg::InvOp:            return "InvOp";
         case Msg::InvUsed:          return "InvUsed";
+        case Msg::InvSnap:          return "InvSnap";
+        case Msg::InvNearby:        return "InvNearby";
+        case Msg::InvReport:        return "InvReport";
         }
         return "?";
     }

@@ -106,6 +106,8 @@ namespace gage::net {
             AdminResult,     // v8: the answer to one SendAdminCmd
             InvState,        // v8 (0.6): our whole inventory + the last InvOp seq the server applied
             InvUsed,         // v8 (0.6): the server consumed one item for us (satiety for the client to add)
+            InvSnap,         // v8 (0.5.4 inventory world): InvState with weapons (codec v2), its rev and a strip list
+            InvNearby,       // v8 (0.5.4): the world containers in reach (empty list = none); the first one is also the offer
         };
         Type type = Type::Disconnected;
 
@@ -143,6 +145,8 @@ namespace gage::net {
         proto::AdminResult adminResult;     // v8: the server's answer to one of our AdminCmds
         proto::InvState invState;           // v8 (0.6): blob = sync::inv::Encode(Character), ackSeq = the last InvOp applied or refused
         proto::InvUsed invUsed;             // v8 (0.6): the item used and the satiety it gives
+        proto::InvSnap invSnap;             // v8 (0.5.4): blob = sync::inv::Encode (v2), rev, flags, strip
+        proto::InvNearby invNearby;         // v8 (0.5.4): blobs = sync::inv::EncodeBox
     };
 
     class ClientSession
@@ -209,8 +213,12 @@ namespace gage::net {
         // Event::AdminResult carrying the same seq and op. False when not Joined or the arg is over kMaxAdminArg.
         bool SendAdminCmd(const proto::AdminCmd& c);
         // v8 (0.6): one inventory operation (reliable; `op` = sync::inv::EncodeOp). Every one is answered with an
-        // Event::InvState whose ackSeq is o.seq. False when not Joined, seq is 0 or op is not kInvOpBytes long.
+        // Event::InvState (0.5.4: InvSnap) whose ackSeq is o.seq. False when not Joined, seq is 0 or op is not kInvOpBytes or
+        // (0.5.4, a ground / trunk side) kInvOpBytesExt long.
         bool SendInvOp(const proto::InvOp& o);
+        // v8 (0.5.4 inventory world): what our ped holds (reliable). The first one also tells the server we speak the inventory
+        // world (it answers with InvSnap from then on). False when not Joined or over a cap.
+        bool SendInvReport(const proto::InvReport& r);
         // Sends bytes as they are, bypassing every check. For tools and tests that
         // build deliberately bad packets. False when there is no live connection.
         bool SendRaw(uint8_t channel, const proto::Bytes& bytes, bool reliable);

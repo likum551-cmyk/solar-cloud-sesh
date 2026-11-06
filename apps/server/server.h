@@ -94,6 +94,11 @@
 //    Every InvOp is applied by sync::inv::Apply on the server's copy and answered with InvState (ackSeq = its seq), applied
 //    or not. USE is tried on a copy first: refused when dead, and a health-only item at full health is kept; health effects
 //    are applied here (Vitals), satiety goes back as InvUsed. Saved when the player leaves and every 30 s while changed.
+//  * 0.5.4 inventory world (libs/sync/inventory_world.h; Config::invWorld, docs/api/server.md): a Drop puts the stack into a
+//    ground pile (memory only, gone invGroundExpireSeconds after the last drop into it), car trunks are containers keyed by the
+//    vehicle id, and a 0.5.4 client (it answered the join's empty InvNearby with an InvReport) gets InvSnap (weapons, a rev)
+//    instead of InvState plus InvNearby whenever its ground pile / trunk in reach changes; its InvReports turn the ped's weapons
+//    into inventory items (sync::invw::Reconcile, only for a report stamped with the current rev).
 #pragma once
 
 #include "announce.h"
@@ -105,6 +110,7 @@
 #include "protocol/protocol.h"
 #include "melee.h"
 #include "replication.h"
+#include "sync/inventory_world.h"
 #include "sync/vehicle_impact.h"
 #include "tickclock.h"
 #include "vehicles.h"
@@ -179,6 +185,17 @@ namespace gage::server {
         uint64_t invUses = 0;          // items used (their effect applied)
         uint64_t invSaves = 0;         // saves written
         uint64_t invSaveFailures = 0;  // saves that could not be written (logged)
+        // 0.5.4 inventory world
+        uint64_t invWorldClients = 0;  // players that answered the offer (InvReport): they get InvSnap / InvNearby
+        uint64_t invReports = 0;       // InvReports reconciled (stamped with the current rev, ped valid)
+        uint64_t invReportsStale = 0;  // ... ignored: an older rev, a dead / unsettled ped, or over the rate
+        uint64_t invWeaponGains = 0;   // weapons the ped gained that became items
+        uint64_t invWeaponsConsumed = 0; // thrown weapons used up
+        uint64_t invGroundDrops = 0;   // stacks put on the ground (drops, overflow, despawned trunks)
+        uint64_t invGroundExpired = 0; // piles that timed out
+        uint64_t invWorldOps = 0;      // ops on a ground pile or trunk applied
+        uint64_t invWorldRefused = 0;  // ... refused (out of reach, locked, gone, the rules)
+        uint64_t invNearbySent = 0;    // InvNearby messages
         uint64_t statesAccepted = 0;
         uint64_t statesStale = 0;      // seq not newer than the last accepted
         uint64_t statesInvalid = 0;    // decoded, but outside the world box / limits
@@ -397,6 +414,10 @@ namespace gage::server {
         bool ClearInventory(const std::string& target, std::string* msg = nullptr);
         // The player's inventory as the server holds it (tests): false for an unknown player or a server without inventories.
         bool InventoryOf(const std::string& target, sync::inv::Character& out) const;
+        // 0.5.4 inventory world (tests): the ground piles and trunks as they are; ExpireGround makes every pile count as timed out (as if
+        // invGroundExpireSeconds had passed), so the next world pass removes them.
+        const sync::invw::World& InventoryWorld() const { return invWorld_; }
+        void ExpireGround();
 
         // ---- admin ----
         // These are the programmatic form of the console commands; Execute() calls them.
@@ -470,10 +491,25 @@ namespace gage::server {
         void LoadInventory(Conn& c);                      // at Accept: the save or the starter kit, then the first InvState
         void OnInvOp(Conn& c, const uint8_t* data, size_t len);
         void SendInventory(Conn& c, uint32_t ackSeq);
+        // 0.5.4: InvSnap for a client that speaks the inventory world (fromReport / strip as in proto::InvSnap), else InvState (codec v1).
+        void SendInventoryEx(Conn& c, uint32_t ackSeq, bool fromReport, const std::vector<uint32_t>* strip);
         void SaveInventory(Conn& c, const char* when);    // when dirty and allowed; logs a failure
         void SaveDirtyInventories(uint64_t nowMs);        // every kInvSaveEveryMs
         uint64_t invSaveAtMs_ = 0;
         InventoryStore invStore_;
+        // ---- 0.5.4 inventory world ----
+        void OnInvReport(Conn& c, const uint8_t* data, size_t len);
+        bool WorldOp(Conn& c, const sync::inv::Op& op, uint32_t seq);  // an op on a ground pile / trunk, or any Drop (true = handled)
+        std::vector<sync::invw::VehView> VehicleViews() const;
+        sync::invw::Viewer ViewerOf(const Conn& c) const;
+        void SendNearby(Conn& c, bool force);             // the player's InvNearby when it differs from the last one sent
+        void TickInventoryWorld(uint64_t nowMs);          // every 250 ms: sweep, then every 0.5.4 player's InvNearby
+        void LogInventoryWorld(uint64_t nowMs);           // the `inventory world:` line, every 60 s while something happened
+        sync::invw::World invWorld_;
+        struct VehClass { uint64_t born = 0; int cls = -1; };
+        std::vector<VehClass> vehClass_;                  // per vehicle id: the GTA class a client reported (for the trunk size)
+        uint64_t invWorldAtMs_ = 0, invWorldLogAtMs_ = 0;
+        Stats invLogMark_;
         void OnState(Conn& c, const uint8_t* data, size_t len);
         void OnChat(Conn& c, const uint8_t* data, size_t len);
         void OnLook(Conn& c, const uint8_t* data, size_t len);

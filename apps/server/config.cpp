@@ -202,6 +202,14 @@ namespace gage::server {
             return fail("bansFile path is too long");
         if (cfg.inventoryDir.size() > 200)
             return fail("inventoryDir path is too long");
+        if (cfg.invWorld > 1)
+            return fail("invWorld must be 0 or 1");
+        if (cfg.invGroundReach < 1 || cfg.invGroundReach > 20 || cfg.invTrunkReach < 1 || cfg.invTrunkReach > 20)
+            return fail("invGroundReach and invTrunkReach must be 1..20");
+        if (cfg.invGroundExpireSeconds < 10 || cfg.invGroundExpireSeconds > 86400)
+            return fail("invGroundExpireSeconds must be 10..86400");
+        if (cfg.invMaxPiles < 16 || cfg.invMaxPiles > 65536)
+            return fail("invMaxPiles must be 16..65536");
 
         // ---- world replication ----
         for (const ReplKey& k : kReplKeys)
@@ -467,6 +475,26 @@ namespace gage::server {
             {
                 if (!str(out.inventoryDir)) return false;
             }
+            else if (key == "invWorld")
+            {
+                if (!WholeNumber(v, 0, 1, n)) return fail("\"invWorld\" must be 0 or 1");
+                out.invWorld = n;
+            }
+            else if (key == "invGroundReach" || key == "invTrunkReach")
+            {
+                if (!WholeNumber(v, 1, 20, n)) return fail("\"" + key + "\" must be a whole number 1..20");
+                (key == "invGroundReach" ? out.invGroundReach : out.invTrunkReach) = n;
+            }
+            else if (key == "invGroundExpireSeconds")
+            {
+                if (!WholeNumber(v, 10, 86400, n)) return fail("\"invGroundExpireSeconds\" must be a whole number 10..86400");
+                out.invGroundExpireSeconds = n;
+            }
+            else if (key == "invMaxPiles")
+            {
+                if (!WholeNumber(v, 16, 65536, n)) return fail("\"invMaxPiles\" must be a whole number 16..65536");
+                out.invMaxPiles = n;
+            }
             else if (key == "adminPort")
             {
                 if (!WholeNumber(v, 0, 65535, n)) return fail("\"adminPort\" must be a whole number 0..65535 (0 = off)");
@@ -684,7 +712,8 @@ namespace gage::server {
             else
             {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
-                                    "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, inventoryDir, adminPort, adminToken, "
+                                    "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, inventoryDir, invWorld, invGroundReach, "
+                                    "invTrunkReach, invGroundExpireSeconds, invMaxPiles, adminPort, adminToken, "
                                     "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
                                     "vehicleMaxSpeed, contactLagCapMs, vehicleLocks, vehicleLockDistance, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "

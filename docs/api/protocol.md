@@ -1489,3 +1489,87 @@ the usual `Damage` (attacker `kServerId`).
 Live tests: `tests/inventory_net_tests.h` (in `server_test`: the kit, ops, USE effects, the dead / full-health rules,
 console, a malformed op, saves per verified account against the fake platform, a corrupt save); the codec and rules
 are `tests/inventory_tests.h` (in `gameplay_test`). The in-game screen is live-unverified.
+
+## 0.5.4: inventory world (`InvSnap` 52, `InvNearby` 53, `InvReport` 54; still v8)
+
+Weapons are inventory items, dropped items lie on the ground, vehicles have trunks. The rules are
+`libs/sync/inventory_world.h` (its header comment is the design: piles, trunks, the weapon reconcile and its rev
+gate); the items, the hand and codec v2 are `libs/sync/inventory.h`. A 0.6.0 / 0.5.3 client never sees any of it:
+
+1. **The offer.** Right after the join's `InvState`, a server with `invWorld` on sends an empty `InvNearby`. A 0.5.3
+   client counts the unknown type as malformed and ignores it (it never refuses an unknown type from the server).
+2. **The answer.** A 0.5.4 client answers with its first `InvReport` (rev 0). From then on the server sends that
+   player `InvSnap` instead of `InvState`, `InvNearby` updates, and accepts ops with a `Hand` or `Nearby` side.
+   A client never sends `InvReport` first: an older server would cut it off for an unexpected type.
+3. **Old clients.** A client that never answers gets `InvState` in the codec v1 form (`EncodeLegacy`: weapon slots
+   read as empty) and cannot be given a weapon item (`give` refuses, `/gun` gives locally as before). Its Drop is
+   put on the ground like anyone's.
+
+Saves stay codec v1 while the character carries no weapon (`EncodeForSave`), so a server rolled back to 0.6.0 still
+loads them.
+
+### 50 `InvOp`, the long form: 24 bytes
+
+The op is 19 bytes (`kInvOpBytesExt`) exactly when its src or dst byte is 5 (`Nearby`, `kInvWhereWorld`): the 11 bytes
+above, then `u32` srcBox and `u32` dstBox (the `InvNearby` box ids; 0 for the side that is not `Nearby`). An 11-byte
+op naming `Nearby`, or a 19-byte one that does not, is malformed. `Hand` (4) is an ordinary 11-byte op (index 0).
+
+### 52 `InvSnap` (server to client, reliable): 13 + n + 4k bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 52 |
+| 1 | 4 | `u32` ackSeq (as `InvState`) |
+| 5 | 4 | `u32` rev: +1 each time the encoded character differs from the last one sent to this player |
+| 9 | 1 | `u8` flags: bit 0 `kInvSnapFromReport` (this is the answer to the player's own report); other bits refused |
+| 10 | 2 + n | blob, 1..1024 bytes: `sync::inv::Encode` codec v2 (v1 + each weapon's `u16` ammo + the 9-byte hand) |
+| 12 + n | 1 | `u8` k, 0..16 (`kMaxInvStrip`) |
+| 13 + n | 4k | `u32` weapon hashes to strip from the ped (gained with no room: they went to the ground) |
+
+### 53 `InvNearby` (server to client, reliable): 2 + per box (18 + n) bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 53 |
+| 1 | `u8` count, 0..4 (`kMaxInvNearby`); in practice at most one trunk and one ground pile |
+| 4 | `u32` box id (never 0) |
+| 1 | `u8` kind (`sync::inv::Kind`: 3 Trunk, 5 Ground) |
+| 1 | `u8` flags: bit 0 `kInvBoxLocked` (blob empty, every op on it refused); other bits refused |
+| 2 | `u16` vehicle id of a trunk (`0xFFFF` for a pile) |
+| 4 | `u32` vehicle model of a trunk |
+| 1 | `u8` GTA vehicle class of a trunk (255 = none) |
+| 1 | `u8` piles in reach (ground) |
+| 2 | `u16` distance in cm |
+| 2 + n | blob: `sync::inv::EncodeBox` (the container: kind, slots, weight cap), empty while locked |
+
+Sent (a) as the offer, (b) after each op on a world container and each report that stripped a weapon, (c) from the
+250 ms world pass whenever a player's list changed (compared with the distances zeroed, so walking alone resends
+nothing).
+
+### 54 `InvReport` (client to server, reliable): 12 + 10w + 3v bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 54 |
+| 4 | `u32` rev: the rev of the last `InvSnap` the client applied to its ped (0 before any) |
+| 4 | `u32` the ped's selected weapon (`GET_SELECTED_PED_WEAPON`; `WEAPON_UNARMED` when none) |
+| 1 | `u8` flags: bit 0 `kInvReportPedValid` (alive, settled, every native callable); other bits refused |
+| 1 | `u8` w, 0..64 (`kMaxInvReportWeapons`), then w times: `u32` weapon hash (never 0), `u32` ammo type, `u16` ammo |
+| 1 | `u8` v, 0..8 (`kMaxInvReportVehicles`), then v times: `u16` server vehicle id, `u8` GTA vehicle class |
+
+The server stores the vehicle classes (a trunk's size comes from them) and then reconciles the weapons only when the
+report is valid, the player is alive, it is within the rate (10 at once, then 5 a second) and its rev is the server's
+current one: a report taken before a drop, a move or a give reached the ped is ignored, so it can never put back what
+just left (the dupe race; `tests/inventory_world_tests.h` shows the same sequence without the gate duplicating).
+The client reports when the ped changed (a weapon gained or lost, another selected: at once; ammo only: at most
+every 2 s), when a newer snapshot left the ped still disagreeing, and when a car within 6 m has a class the server
+has not had from it (`sync::invw::ReportGate`). A stable ped that agrees with its inventory sends nothing.
+
+**Trust.** The server takes a valid report's gains as given: a modified client can claim weapons. Admin-only weapons
+need a server-side source (shops, spawns) before such a server goes public; until then, weapon gains are logged
+(`inventory world: id=.. report rev ..: N weapon(s) gained`).
+
+Live tests: `tests/inventory_world_net_tests.h` (in `server_test`: the handshake, `/gun` into the inventory, a
+report's gain into the hand, the rev gate, ground drops and pickups through the real server and session, expiry, trunks with reach and lock,
+`invWorld 0`); the rules are `tests/inventory_world_tests.h` (in `gameplay_test`); every message is in the decode fuzz
+corpus. The engine half (ped natives, the NEARBY panel) is live-unverified.

@@ -9,7 +9,7 @@
 
 namespace invnet {
 
-    constexpr int kChecks = 13;
+    constexpr int kChecks = 14;
     namespace inv = gage::sync::inv;
 
     constexpr inv::ItemId kWater = 5, kSandwich = 6, kMedkit = 7, kBandage = 8;
@@ -132,8 +132,22 @@ namespace invnet {
                   gus.Describe());
         }
 
+        // 0.5.4: the kit's pockets are empty; the console stocks what 0.6.0's kit held (2 water, a sandwich, 2 bandages) for the rest.
+        inv::Character kit;
+        {
+            std::string o1, o2, o3;
+            const int n0 = gus.Count(ET::InvState);
+            const bool g1 = rig.srv.Execute("give Gus water 2", o1) == server::CommandResult::Ok;
+            const bool g2 = rig.srv.Execute("give Gus sandwich", o2) == server::CommandResult::Ok;
+            const bool g3 = rig.srv.Execute("give Gus bandage 2", o3) == server::CommandResult::Ok;
+            rig.Until([&] { gus.Drain(); return gus.Count(ET::InvState) >= n0 + 3; }, 2000);
+            Check("inventory live: the console stocks the empty starter pockets (2 water, a sandwich, 2 bandages; three InvStates)",
+                  g1 && g2 && g3 && g.Latest(kit) && QtyOf(kit, kWater) == 2 && QtyOf(kit, kSandwich) == 1 && QtyOf(kit, kBandage) == 2,
+                  o1 + " | " + o2 + " | " + o3);
+        }
+
         // 2. a move: the answer carries its seq, the client's copy and the server's agree
-        inv::Character kit = inv::StarterKit(), after, srvCopy;
+        inv::Character after, srvCopy;
         const int waterAt = PocketOf(kit, kWater), freeAt = FirstEmptyPocket(kit);
         const bool moved = g.Op(MakeOp(inv::OpKind::Move, inv::Where::Pockets, waterAt, inv::Where::Pockets, freeAt), after);
         const bool held = rig.srv.InventoryOf("Gus", srvCopy);
@@ -273,9 +287,13 @@ namespace invnet {
             const bool in = v8acct::JoinWith(rig, pia, "x", "tok-player");
             Client c{rig, pia};
             rig.Until([&] { pia.Drain(); return pia.Count(ET::InvState) > 0; }, 2000);
-            inv::Character kit;
+            inv::Character kit, stocked;
             const bool gotKit = c.Latest(kit);
-            const bool mv = c.Op(MakeOp(inv::OpKind::Move, inv::Where::Pockets, PocketOf(kit, kWater), inv::Where::Pockets, 15), moved);
+            std::string gave;
+            const int n0 = pia.Count(ET::InvState);
+            const bool give = rig.srv.Execute("give " + std::to_string(v8acct::MyId(pia)) + " water 2", gave) == server::CommandResult::Ok &&
+                              c.NextState(n0, stocked);
+            const bool mv = give && c.Op(MakeOp(inv::OpKind::Move, inv::Where::Pockets, PocketOf(stocked, kWater), inv::Where::Pockets, 15), moved);
             pia.s.Disconnect();
             rig.Until([&] { return rig.srv.Players().empty(); }, 3000);
             const bool saved = fs::exists(paths.PathFor("acc-player"), ec);

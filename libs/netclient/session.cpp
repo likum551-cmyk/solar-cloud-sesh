@@ -19,6 +19,8 @@ namespace gage::net {
 
         uint8_t ChannelFor(proto::Msg t)
         {
+            // Everything not listed here is reliable, including the 0.5.4 inventory world's InvSnap, InvNearby (S->C) and
+            // InvReport (C->S): each carries a whole state the receiver must not miss.
             return t == proto::Msg::WorldState || t == proto::Msg::WorldCoarse || t == proto::Msg::VehicleWorld ||
                            t == proto::Msg::PlayerState || t == proto::Msg::VehicleUpdate || t == proto::Msg::LinkInfo   // R3 T5: LinkInfo rides the state channel
                        ? proto::kChanState
@@ -480,6 +482,16 @@ namespace gage::net {
             if (!proto::Decode(data, len, e.invUsed)) { malformed_++; return; }
             e.type = Event::Type::InvUsed;
             break;
+        case proto::Msg::InvSnap:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.invSnap)) { malformed_++; return; }
+            e.type = Event::Type::InvSnap;
+            break;
+        case proto::Msg::InvNearby:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.invNearby)) { malformed_++; return; }
+            e.type = Event::Type::InvNearby;
+            break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:
             return; // server-to-client types this session does not surface yet: ignored, not an error
@@ -498,6 +510,7 @@ namespace gage::net {
         case proto::Msg::JoinAuth:
         case proto::Msg::AdminCmd:
         case proto::Msg::InvOp:
+        case proto::Msg::InvReport:
             malformed_++; // client-to-server types never arrive here
             return;
         }
@@ -679,9 +692,17 @@ namespace gage::net {
 
     bool ClientSession::SendInvOp(const proto::InvOp& o)
     {
-        if (state_ != SessionState::Joined || o.seq == 0 || o.op.size() != proto::kInvOpBytes)
+        if (state_ != SessionState::Joined || o.seq == 0 || (o.op.size() != proto::kInvOpBytes && o.op.size() != proto::kInvOpBytesExt))
             return false;
         return SendBytes(proto::kChanReliable, proto::Encode(o), true);
+    }
+
+    bool ClientSession::SendInvReport(const proto::InvReport& r)
+    {
+        if (state_ != SessionState::Joined)
+            return false;
+        const proto::Bytes b = proto::Encode(r);
+        return !b.empty() && SendBytes(proto::kChanReliable, b, true);
     }
 
     bool ClientSession::SendRaw(uint8_t channel, const proto::Bytes& bytes, bool reliable)
