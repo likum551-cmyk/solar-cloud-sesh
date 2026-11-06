@@ -71,12 +71,18 @@ namespace gage::sync::hudring {
         return { kCx + r * std::cos(a), kCy + r * std::sin(a) };
     }
 
-    // Design px (y up) to screen px (y down) on a display H px tall: k = H / 1080 for x, y and every size.
-    inline float Scale(float displayH) { return displayH > 0.0f ? displayH / kDesignH : 1.0f; }
+    // 0.4.34 GI after the first live look (2026-11-06): "make map 25% smaller". The whole component (disc, arcs, strip, text) is drawn at kSize of
+    // the design about its own bottom-left corner (kCompX, kCompY), so its 56 px margin to the screen corner stays as designed.
+    constexpr float kSize = 0.75f;
+
+    // Design px (y up) to screen px (y down) on a display H px tall. DesignScale = H / 1080 (the spec's rule); Scale = DesignScale * kSize, the factor
+    // for every size inside the component.
+    inline float DesignScale(float displayH) { return displayH > 0.0f ? displayH / kDesignH : 1.0f; }
+    inline float Scale(float displayH) { return DesignScale(displayH) * kSize; }
     inline Pt ToScreen(Pt p, float displayH)
     {
-        const float k = Scale(displayH);
-        return { p.x * k, displayH - p.y * k };
+        const float d = DesignScale(displayH), k = Scale(displayH);
+        return { kCompX * d + (p.x - kCompX) * k, displayH - (kCompY * d + (p.y - kCompY) * k) };
     }
 
     struct GaugeLook

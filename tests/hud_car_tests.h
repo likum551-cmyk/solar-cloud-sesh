@@ -103,11 +103,14 @@ namespace hudcar_t {
                   ok && Near(a, 1.0f, 1e-6f) && Near(b, 0.2f, 1e-6f) && Near(c, 1.0f, 1e-6f) && Near(d, 1.0f, 1e-6f), F("%.3f %.3f %.3f %.3f", a, b, c, d));
         }
         {
-            // bottom-RIGHT anchor: on 1080p the dial centre is (1684, 772) screen y-down; on a 2560x1080 ultrawide it keeps 236 px from the right edge
+            // bottom-RIGHT anchor; 0.4.34 the cluster at kSize (0.5) about its own bottom-right corner (56 * H / 1080 from the right and the bottom):
+            // on 1080p the dial centre is (1774, 898) screen y-down; on a 2560x1080 ultrawide it keeps 146 px from the right edge
             const Pt c1080 = ToScreen({kCx, kCy}, 1920.0f, 1080.0f), cUw = ToScreen({kCx, kCy}, 2560.0f, 1080.0f), c1440 = ToScreen({kCx, kCy}, 2560.0f, 1440.0f);
-            const bool ok = At(c1080, 1684.0f, 772.0f) && At(cUw, 2324.0f, 772.0f) && At(c1440, 2560.0f - 236.0f * (4.0f / 3.0f), 1440.0f - 308.0f * (4.0f / 3.0f));
-            Check("hud car: the cluster is anchored bottom-right (x from the right edge, scaled by H / 1080)", ok,
-                  F("uw (%.2f, %.2f), 1440 (%.2f, %.2f)", cUw.x, cUw.y, c1440.x, c1440.y));
+            const Pt corner = ToScreen({kCompX + kCompW, kCompY}, 1920.0f, 1080.0f), tl = ToScreen({kCompX, kCompY + kCompH}, 1920.0f, 1080.0f);
+            const bool ok = kSize == 0.5f && At(c1080, 1774.0f, 898.0f) && At(cUw, 2414.0f, 898.0f) && At(c1440, 2365.3333f, 1440.0f - 242.6667f) &&
+                            At(corner, 1864.0f, 1024.0f) && At(tl, 1684.0f, 808.0f) && Near(Scale(1080.0f), 0.5f, 1e-6f);
+            Check("hud car: the cluster is the design at 0.5 about its bottom-right corner (56 * H / 1080 from the right edge and the bottom; box 180 x 216)", ok,
+                  F("1080 (%.2f, %.2f), uw (%.2f, %.2f), 1440 (%.2f, %.2f), top-left (%.2f, %.2f)", c1080.x, c1080.y, cUw.x, cUw.y, c1440.x, c1440.y, tl.x, tl.y));
         }
     }
 

@@ -1751,16 +1751,17 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
     dl->AddRectFilled(s0, s1, RingCol(ring::kStripGlass, a), rr);
     StripBorder(dl, s0, s1, rr, RingCol(ring::kStripBorder, a));
     // 7 labels, numerals, divider
-    const float base = H - ring::kTextBaseY * k;
+    // every text position goes through P (0.4.34: the component is drawn at kSize about its corner, so design x * k is no longer a screen x)
+    const float base = P(0.0f, ring::kTextBaseY).y;
     // css px to ImGui px (line height): the em ratio of the face (TtfLineToEm); the tabular cell and the tracking stay css px
     const float lpx = ring::kLabelPx * k * u.sofiaEm, npx = ring::kNumPx * k * u.sofiaEm, tr = ring::kLabelTrackPx * k;
-    RingText(dl, u.ringLabel, lpx, ring::kHpLabelX * k, base, RingCol(look[0].label, a), "HP", tr);
+    RingText(dl, u.ringLabel, lpx, P(ring::kHpLabelX, 0.0f).x, base, RingCol(look[0].label, a), "HP", tr);
     const float cell = ring::kTabularEm * ring::kNumPx * k;
-    RingNumber(dl, u.ringNum, npx, cell, ring::kHpNumX * k, base, RingCol(look[0].numeral, a), val[0]);
+    RingNumber(dl, u.ringNum, npx, cell, P(ring::kHpNumX, 0.0f).x, base, RingCol(look[0].numeral, a), val[0]);
     const ImVec2 d0 = P(ring::kDividerX, ring::kDividerY + ring::kDividerH), d1 = P(ring::kDividerX + ring::kDividerW, ring::kDividerY);
     dl->AddRectFilled(d0, ImVec2(std::fmax(d1.x, d0.x + 1.0f), d1.y), RingCol(ring::kStripDivider, a));
-    RingText(dl, u.ringLabel, lpx, ring::kSatLabelX * k, base, RingCol(look[1].label, a), "SAT", tr);
-    RingNumber(dl, u.ringNum, npx, cell, ring::kSatNumX * k, base, RingCol(look[1].numeral, a), val[1]);
+    RingText(dl, u.ringLabel, lpx, P(ring::kSatLabelX, 0.0f).x, base, RingCol(look[1].label, a), "SAT", tr);
+    RingNumber(dl, u.ringNum, npx, cell, P(ring::kSatNumX, 0.0f).x, base, RingCol(look[1].numeral, a), val[1]);
 
     const ImVec2 b0 = P(ring::kCompX, ring::kCompY + ring::kCompH), b1 = P(ring::kCompX + ring::kCompW, ring::kCompY);
     L.vitalsVisible = true;
@@ -1775,7 +1776,7 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
     static bool s_logged = false;
     if (!s_logged) {
         s_logged = true;
-        GLOGI("overlay: vitals ring (0.4.31 hud_ring, REV1): component x %.0f-%.0f y %.0f-%.0f at k %.3f (H / 1080), GTA's radar hidden; Sofia Sans %s",
+        GLOGI("overlay: vitals ring (0.4.31 hud_ring, REV1): component x %.0f-%.0f y %.0f-%.0f at k %.3f (H / 1080 x 0.4.34 size), GTA's radar hidden; Sofia Sans %s",
               (double)b0.x, (double)b1.x, (double)b0.y, (double)b1.y, (double)k,
               u.sofiaOk ? "loaded" : "MISSING (ImGui's default font stands in)");
     }
@@ -3642,10 +3643,11 @@ void UiInit(float scale)
     static const ImWchar kDigitRanges[] = { 0x0030, 0x0039, 0 };   // the 96 px speed: ten glyphs, not a 96 px Latin-1 atlas
     // weight: stb_truetype's coverage is linear; the goldens (Skia) boost small text's contrast, so the 12-14 px faces came out 15-20 % lighter
     // at the same peak (the critic's edge measurements): those faces are baked with RasterizerMultiply.
-    const auto loadSofia = [&](float design, const ImWchar* ranges = kLatinRanges, float weight = 1.0f) {
+    // size: the component's kSize (0.4.34: the ring at 0.75, the car cluster at 0.5), so each face is baked at the size it is drawn at
+    const auto loadSofia = [&](float design, float size, const ImWchar* ranges = kLatinRanges, float weight = 1.0f) {
         Fnt f;
         f.design = design;
-        f.base = f.px = std::fmax(8.0f, std::floor(design * u.sofiaEm * scale + 0.5f));   // baked at the size it is drawn at (ImGui px)
+        f.base = f.px = std::fmax(8.0f, std::floor(design * u.sofiaEm * scale * size + 0.5f));   // baked at the size it is drawn at (ImGui px)
         ImFontConfig cfg;
         cfg.FontDataOwnedByAtlas = false;
         cfg.RasterizerMultiply = weight;
@@ -3659,16 +3661,18 @@ void UiInit(float scale)
         }
         return f;
     };
-    u.ringNum = loadSofia(gage::sync::hudring::kNumPx);
-    u.ringLabel = loadSofia(gage::sync::hudring::kLabelPx, kLatinRanges, kSmallTextWeight);
-    u.carBig = loadSofia(gage::sync::hudcar::kSpeedPx, kDigitRanges);
-    u.carMid = loadSofia(gage::sync::hudcar::kFuelPx);
-    u.carSmall = loadSofia(gage::sync::hudcar::kUnitPx, kLatinRanges, kSmallTextWeight);
+    constexpr float kRingSize = gage::sync::hudring::kSize, kCarSize = gage::sync::hudcar::kSize;
+    u.ringNum = loadSofia(gage::sync::hudring::kNumPx, kRingSize);
+    u.ringLabel = loadSofia(gage::sync::hudring::kLabelPx, kRingSize, kLatinRanges, kSmallTextWeight);
+    u.carBig = loadSofia(gage::sync::hudcar::kSpeedPx, kCarSize, kDigitRanges);
+    u.carMid = loadSofia(gage::sync::hudcar::kFuelPx, kCarSize);
+    u.carSmall = loadSofia(gage::sync::hudcar::kUnitPx, kCarSize, kLatinRanges, kSmallTextWeight);
     u.sofiaOk = u.ringNum.minPx > 0.0f && u.ringLabel.minPx > 0.0f;
-    // 0.4.31 the car cluster's icon glows, blurred on the CPU into the atlas (IconGlowFill): reserve, build here, fill before the backend uploads
-    IconGlowReserve(io.Fonts, scale);
+    // 0.4.31 the car cluster's icon glows, blurred on the CPU into the atlas (IconGlowFill): reserve, build here, fill before the backend uploads.
+    // Baked at the cluster's drawn size (bake scale * kCarSize).
+    IconGlowReserve(io.Fonts, scale * kCarSize);
     if (io.Fonts->Build())
-        IconGlowFill(io.Fonts, scale);
+        IconGlowFill(io.Fonts, scale * kCarSize);
     else
         GLOGW("overlay: the font atlas did not build in UiInit; the icon glows use the stroke stand-in");
     BuildStyle(scale);

@@ -61,12 +61,17 @@ namespace gage::sync::hudcar {
     constexpr uint32_t kDialNum = 0xF7F2E8D9u, kDialNumRed = 0xE5603AFFu;
 
     // ---- design to screen -----------------------------------------------------------------------------------------------------------
-    inline float Scale(float displayH) { return hudring::Scale(displayH); }
+    // 0.4.34 GI after the first live look (2026-11-06): "make speedometer and its thing below about 50% smaller". The whole cluster (dial, fuel row,
+    // strip, chips) is drawn at kSize of the design about its own bottom-right corner (kCompX + kCompW, kCompY), so the 56 px margins stay.
+    constexpr float kSize = 0.5f;
+    inline float DesignScale(float displayH) { return hudring::DesignScale(displayH); }
+    inline float Scale(float displayH) { return DesignScale(displayH) * kSize; }
     // x is measured from the RIGHT edge (the component's anchor), y from the bottom.
     inline Pt ToScreen(Pt p, float displayW, float displayH)
     {
-        const float k = Scale(displayH);
-        return { displayW - (kDesignW - p.x) * k, displayH - p.y * k };
+        const float d = DesignScale(displayH), k = Scale(displayH);
+        const float ax = kCompX + kCompW;   // the anchor corner, 56 design px from the right edge
+        return { displayW - (kDesignW - ax) * d + (p.x - ax) * k, displayH - (kCompY * d + (p.y - kCompY) * k) };
     }
     inline Pt OnDial(float deg, float r)
     {

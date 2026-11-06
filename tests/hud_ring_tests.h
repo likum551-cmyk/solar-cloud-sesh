@@ -96,13 +96,18 @@ namespace hudring_t {
             Check("hud ring: the pulse restarts at opacity 1.0 each time the gauge enters critical, and reads 1.0 outside it", ok,
                   F("enter %.3f, +800 %.3f, out %.3f, re-enter %.3f, +400 %.3f", a, b, c, d, e));
         }
-        // D. other displays: H / 1080, origin bottom-left (the component keeps 56 px * k from the left and the bottom)
+        // D. other displays: H / 1080, origin bottom-left; 0.4.34 the component at kSize (0.75) about its own bottom-left corner, which keeps
+        // 56 px * H / 1080 from the left and the bottom
         {
             const Pt c1440 = ToScreen({kCx, kCy}, 1440.0f), b720 = ToScreen({kCompX, kCompY}, 720.0f), c1080 = ToScreen({kCx, kCy}, 1080.0f);
-            const bool ok = At(c1080, 200.0f, 816.0f) && At(c1440, 266.6667f, 1440.0f - 352.0f) && At(b720, 37.3333f, 720.0f - 37.3333f) &&
-                            Near(Scale(1440.0f), 1.3333333f, 1e-5f) && Scale(0.0f) == 1.0f;
-            Check("hud ring: screen placement is the design point times H / 1080 from the bottom-left (the centre at (200, 816) on 1080p, (266.67, 1088) on 1440p)",
-                  ok, F("1440 centre (%.2f, %.2f), 720 corner (%.2f, %.2f)", c1440.x, c1440.y, b720.x, b720.y));
+            const Pt tr1080 = ToScreen({kCompX + kCompW, kCompY + kCompH}, 1080.0f);
+            const bool ok = kSize == 0.75f && At(c1080, 164.0f, 868.0f) && At(c1440, 218.6667f, 1440.0f - 282.6667f) &&
+                            At(b720, 37.3333f, 720.0f - 37.3333f) && At(tr1080, 272.0f, 760.0f) &&
+                            Near(Scale(1440.0f), 1.0f, 1e-5f) && Near(DesignScale(1440.0f), 1.3333333f, 1e-5f) && Scale(0.0f) == 0.75f;
+            Check("hud ring: the component is the design at 0.75 about its bottom-left corner, which sits at 56 * H / 1080 (centre (164, 868) on 1080p, "
+                  "(218.67, 1157.33) on 1440p; box 216 x 264)",
+                  ok, F("1080 centre (%.2f, %.2f), 1440 centre (%.2f, %.2f), 720 corner (%.2f, %.2f), 1080 top-right (%.2f, %.2f)", c1080.x, c1080.y,
+                        c1440.x, c1440.y, b720.x, b720.y, tr1080.x, tr1080.y));
         }
     }
 
