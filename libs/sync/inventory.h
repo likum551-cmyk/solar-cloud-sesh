@@ -89,11 +89,13 @@ namespace gage::sync::inv {
             {45, "watch", "Watch", "watch", 100, 1, Category::Clothing, false, Equip::Watch, 0, "Tells the time."},
             {46, "bracelet", "Bracelet", "bracelet", 40, 1, Category::Clothing, false, Equip::Wrist, 0, "A wrist bracelet."},
             {47, "jacket", "Jacket", "jacket", 900, 1, Category::Clothing, false, Equip::Jacket, 0, "A warm jacket."},
-            {48, "tshirt", "T-shirt", "tee", 200, 1, Category::Clothing, false, Equip::Shirt, 0, "A cotton tee."},
+            // 0.5.4 outfit_items: tshirt / jeans / sneakers are the spawn outfit's own pieces (libs/sync/outfit.h Worn): taking one off
+            // really takes it off the ped. Keys stay (saves and the starter kit name them); the shown names say what the ped wears.
+            {48, "tshirt", "T-shirt", "tee", 200, 1, Category::Clothing, false, Equip::Shirt, 0, "A sky-blue tee."},
             {49, "vest", "Vest", "vest", 3000, 1, Category::Clothing, true, Equip::Armor, 0, "Body armour."},
             {50, "gloves", "Gloves", "gloves", 150, 1, Category::Clothing, false, Equip::Gloves, 0, "Work gloves."},
-            {51, "jeans", "Jeans", "pants", 600, 1, Category::Clothing, false, Equip::Pants, 0, "Blue jeans."},
-            {52, "sneakers", "Sneakers", "shoe", 700, 1, Category::Clothing, false, Equip::Shoes, 0, "Everyday shoes."},
+            {51, "jeans", "Black pants", "pants", 600, 1, Category::Clothing, false, Equip::Pants, 0, "Plain black trousers."},
+            {52, "sneakers", "Sneakers", "shoe", 700, 1, Category::Clothing, false, Equip::Shoes, 0, "White athletic shoes."},
         };
         return k;
     }
@@ -904,8 +906,9 @@ namespace gage::sync::inv {
             in += Add(ch.pack, item, n - in);
         return in;
     }
-    // A new character: phone and ID in the pockets, a little food and two bandages, and plain clothes worn (looks on the ped come later; the
-    // clothing items exist so the CHARACTER panel is not empty and the player can take them off). No backpack: one is an item to find or buy.
+    // A new character: phone and ID in the pockets, a little food and two bandages, and the spawn outfit worn as items (0.5.4 outfit_items:
+    // the tee, pants and shoes the ped spawns in; taking one off takes it off the ped, libs/sync/outfit.h). No backpack: one is an item to find
+    // or buy.
     inline Character StarterKit()
     {
         Character ch;

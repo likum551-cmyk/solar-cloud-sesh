@@ -3091,6 +3091,8 @@ static void TestSyncD()
 #include "vehstate_row_tests.h"   // 0.4.27 vehicle state row (lock / belt / engine) and the indicator fallback (needs Check / F above)
 #include "inventory_tests.h"   // 0.6 the inventory rules (GI REV3 design): catalog, moves, caps, packs, equipment, quick slots, Apply, codec
 #include "overlay_input_tests.h"   // 0.5.4 overlay_combat_block: the controls held while an overlay panel is open
+#include "outfit_tests.h"      // 0.5.4 outfit_items: worn shirt / pants / shoes -> the ped's components (bare table, spawn outfit, take off / on)
+#include "ped_view_tests.h"    // 0.5.4 inv_ped_view: the CHARACTER panel's window and the camera framing the ped in it
 
 int main()
 {
@@ -3156,6 +3158,9 @@ int main()
     std::printf("-- 0.6 inventory rules (catalog, moves, caps, packs, equipment, quick slots, Apply, codec)\n");
     invtest::RunPure();                             // 0.6 the inventory (tests/inventory_tests.h)
     overlayinput_t::RunPure();                      // 0.5.4 overlay input (tests/overlay_input_tests.h)
+    std::printf("-- 0.5.4 outfit items and the inventory ped view\n");
+    outfitt::RunPure();                             // 0.5.4 outfit_items (tests/outfit_tests.h)
+    pedview_t::RunPure();                           // 0.5.4 inv_ped_view (tests/ped_view_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3177,7 +3182,9 @@ int main()
                        + hudring_t::kChecks   // + 0.4.31 the vitals ring 9
                        + hudcar_t::kChecks    // + 0.4.31 the car cluster 10
                        + invtest::kChecks     // + 0.6 the inventory rules 14
-                       + overlayinput_t::kChecks;   // + 0.5.4 overlay input 5
+                       + overlayinput_t::kChecks   // + 0.5.4 overlay input 5
+                       + outfitt::kChecks     // + 0.5.4 outfit items 9
+                       + pedview_t::kChecks;  // + 0.5.4 inventory ped view 7
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

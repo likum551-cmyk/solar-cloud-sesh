@@ -11,7 +11,8 @@
 #include "overlay.h"
 #include "common/logger.h"
 #include "sync/inventory.h"
-#include "overlay_sofia3b.h"    // kOverlaySofia3BoldTtf: Sofia Sans Bold (REV3's conversion, SIL OFL 1.1, brand/fonts/rev3)
+#include "sync/ped_view.h"      // 0.5.4 inv_ped_view: the CHARACTER panel's window (shared with the engine's camera framing)
+#include "overlay_sofia3b.h"   // kOverlaySofia3BoldTtf: Sofia Sans Bold (REV3's conversion, SIL OFL 1.1, brand/fonts/rev3)
 #include "overlay_sofia3s.h"    // kOverlaySofia3SemiTtf: SemiBold
 #include "overlay_sofia3m.h"    // kOverlaySofia3MediumTtf: Medium
 #include "overlay_inv_icons.h"  // kInvIcons[]: the 46 REV3 glyphs (brand/icons/inventory/*.png, 96 x 96 white + alpha)
@@ -23,6 +24,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -102,6 +104,39 @@ bool PopInventoryOp(std::string* encodedOp, uint32_t* seq)
         *encodedOp = std::move(s.out.front().second);
     s.out.pop_front();
     return true;
+}
+
+// ---- 0.5.4 inv_ped_view: the CHARACTER panel's window onto the player's own ped (libs/sync/ped_view.h) ------------------------------------------
+// The render thread stamps every frame it draws the page (and the display size); the engine's script tick reads the stamp to know the page is
+// really on screen, and says back whether its scripted camera is rendering (then the panel shows the window instead of the mannequin).
+namespace {
+    std::atomic<unsigned long long> g_pedViewDrawnAt{0};   // GetTickCount64 of the last frame that drew the page; 0 = never
+    std::atomic<int> g_pedViewW{0}, g_pedViewH{0};
+    std::atomic<bool> g_pedViewLive{false};
+    std::atomic<unsigned long long> g_pedViewLiveAt{0};    // GetTickCount64 of the engine's last report (it reports every script tick)
+    // The engine's word counts only while fresh: a script tick that stopped (focus lost, a hang) must not leave a window over a frame its
+    // camera no longer renders.
+    bool PedViewFresh()
+    {
+        const unsigned long long at = g_pedViewLiveAt.load(), now = GetTickCount64();
+        return g_pedViewLive.load() && at && now >= at && now - at < 500;
+    }
+}
+bool InventoryPedViewFrame(float* W, float* H, double* agoMs)
+{
+    const unsigned long long at = g_pedViewDrawnAt.load();
+    if (!at)
+        return false;
+    const unsigned long long now = GetTickCount64();
+    if (W) *W = (float)g_pedViewW.load();
+    if (H) *H = (float)g_pedViewH.load();
+    if (agoMs) *agoMs = now > at ? (double)(now - at) : 0.0;
+    return true;
+}
+void SetInventoryPedView(bool live)
+{
+    g_pedViewLive.store(live);
+    g_pedViewLiveAt.store(GetTickCount64());
 }
 
 }  // namespace gage::game::Overlay
@@ -1300,10 +1335,82 @@ void DrawWeightPill()
     }
 }
 
+// ---- 0.5.4 inv_ped_view: the CHARACTER panel with a window onto the player's own ped --------------------------------------------------------------
+// While the engine's scripted camera renders (Overlay::SetInventoryPedView), the panel and the world dim leave out the window
+// (libs/sync/ped_view.h kHole*): the game draws the ped there. Otherwise (switch off, camera not rendering yet, in a vehicle, dead) the panel is
+// the 0.6 one with the mannequin.
+namespace pv = gage::sync::pedview;
+bool g_pedViewThisFrame = false;   // read once per frame (DrawScreen): the dim and the panel agree even if the engine flips it mid-frame
+bool PedViewLive() { return g_pedViewThisFrame; }
+Rc HoleRc() { return Box(pv::kHoleX, pv::kHoleY, pv::kHoleW, pv::kHoleH); }
+// The corner square at `corner` minus the quarter disc of radius r around `centre` (screen px), from angle a0 over 90 degrees (RRPath's
+// order): fills the window's rounded corner with the panel (or the dim) around it.
+void Fillet(ImVec2 corner, ImVec2 centre, float r, float a0, ImU32 col)
+{
+    constexpr int kSeg = 12;
+    const ImVec2 uv = ImGui::GetDrawListSharedData()->TexUvWhitePixel;
+    ImDrawList* dl = g.dl;
+    dl->PrimReserve(kSeg * 3, kSeg + 2);
+    const unsigned base = dl->_VtxCurrentIdx;
+    dl->PrimWriteVtx(corner, uv, col);
+    for (int j = 0; j <= kSeg; ++j) {
+        const float t = a0 + 0.5f * kPi * (float)j / (float)kSeg;
+        dl->PrimWriteVtx(ImVec2(centre.x + r * std::cos(t), centre.y + r * std::sin(t)), uv, col);
+    }
+    for (int j = 0; j < kSeg; ++j) {
+        dl->PrimWriteIdx((ImDrawIdx)base);
+        dl->PrimWriteIdx((ImDrawIdx)(base + 1 + j));
+        dl->PrimWriteIdx((ImDrawIdx)(base + 2 + j));
+    }
+}
+void HoleFillets(const Rc& h, ImU32 col)
+{
+    const float r = std::min(pv::kHoleR * g.s, std::min(h.b.x - h.a.x, h.b.y - h.a.y) * 0.5f);
+    Fillet(h.a, ImVec2(h.a.x + r, h.a.y + r), r, kPi, col);
+    Fillet(ImVec2(h.b.x, h.a.y), ImVec2(h.b.x - r, h.a.y + r), r, 1.5f * kPi, col);
+    Fillet(h.b, ImVec2(h.b.x - r, h.b.y - r), r, 0.0f, col);
+    Fillet(ImVec2(h.a.x, h.b.y), ImVec2(h.a.x + r, h.b.y - r), r, 0.5f * kPi, col);
+}
+// The world dim over the whole display, the window left out.
+void DrawDim(const FrameIn& in)
+{
+    const ImU32 col = C(kDim, in.a);
+    if (!PedViewLive()) {
+        g.dl->AddRectFilled(ImVec2(0, 0), ImVec2(in.W, in.H), col);
+        return;
+    }
+    const Rc h = HoleRc();
+    g.dl->AddRectFilled(ImVec2(0, 0), ImVec2(in.W, h.a.y), col);
+    g.dl->AddRectFilled(ImVec2(0, h.b.y), ImVec2(in.W, in.H), col);
+    g.dl->AddRectFilled(ImVec2(0, h.a.y), ImVec2(h.a.x, h.b.y), col);
+    g.dl->AddRectFilled(ImVec2(h.b.x, h.a.y), ImVec2(in.W, h.b.y), col);
+    HoleFillets(h, col);
+}
+// The panel glass around the window (four bands + the window's corners), its outer border, and the window's light tint and border.
+void PanelWithWindow()
+{
+    const Rc p = Box(pv::kPanelX, pv::kPanelY, pv::kPanelW, pv::kPanelH);
+    const Rc h = HoleRc();
+    const ImU32 col = C(kPanelGlass, g.a);
+    const float rad = 32.0f * g.s;
+    g.dl->AddRectFilled(p.a, ImVec2(p.b.x, h.a.y), col, rad, ImDrawFlags_RoundCornersTop);
+    g.dl->AddRectFilled(ImVec2(p.a.x, h.b.y), p.b, col, rad, ImDrawFlags_RoundCornersBottom);
+    g.dl->AddRectFilled(ImVec2(p.a.x, h.a.y), ImVec2(h.a.x, h.b.y), col);
+    g.dl->AddRectFilled(ImVec2(h.b.x, h.a.y), ImVec2(p.b.x, h.b.y), col);
+    HoleFillets(h, col);
+    Border(p, 32.0f, kGlassBorder, 1.0f);
+    Fill(h, pv::kHoleR, 0x0A09071F);   // a light tint: the ped reads as part of the panel, the world behind it stays visible
+    Border(h, pv::kHoleR, kGlassBorder, 1.0f);
+}
+
 void DrawCharacter()
 {
     Ui& u = U();
-    Panel(64, 172, 448, 800, 32, kPanelGlass);
+    const bool pedView = PedViewLive();
+    if (pedView)
+        PanelWithWindow();
+    else
+        Panel(64, 172, 448, 800, 32, kPanelGlass);
     Text(B28, 97, 923, kCream, "CHARACTER", 0.28f);
     {
         std::string nm = !u.name.empty() ? u.name : (!u.fallbackName.empty() ? u.fallbackName : std::string("PLAYER"));
@@ -1313,8 +1420,8 @@ void DrawCharacter()
         ChipBox(481.0f - w, 914, w, 34, Chip::Ghost);
         Text(B12, 481.0f - w * 0.5f, 928, kMuted, nm.c_str(), 1.44f, kCenter);
     }
-    RadialGlow(139, 477, 300, 0xF2B13421);
-    {
+    if (!pedView) {   // the 0.6 mannequin and its halo; with the ped view the game draws the real ped in the window
+        RadialGlow(139, 477, 300, 0xF2B13421);
         const Rc m = Box(177, 355, 224, 532);
         if (B().manikin.rect >= 0)
             AtlasImage(B().manikin, m.a.x, m.a.y, (m.b.x - m.a.x), C(kCream, g.a * 0.085f));
@@ -2352,8 +2459,13 @@ FrameOut DrawScreen(const FrameIn& in)
                                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav;
     if (ImGui::Begin("##gage_inventory_rev3", nullptr, wf)) {
         g.dl = ImGui::GetWindowDrawList();
+        // 0.5.4 inv_ped_view: the page is on screen (the engine's camera follows this stamp); the dim leaves the ped's window out
+        g_pedViewDrawnAt.store(GetTickCount64());
+        g_pedViewW.store((int)in.W);
+        g_pedViewH.store((int)in.H);
+        g_pedViewThisFrame = PedViewFresh();
         // the overlays first take this frame's clicks (they are drawn last, on top)
-        g.dl->AddRectFilled(ImVec2(0, 0), ImVec2(in.W, in.H), C(kDim, in.a));
+        DrawDim(in);
         HandleInput(in);
         DrawHintBar();
         DrawCharacter();
