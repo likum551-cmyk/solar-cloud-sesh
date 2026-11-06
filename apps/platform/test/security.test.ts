@@ -9,6 +9,8 @@
 //   R4  password-reset budget burned from a rate-limited IP; lockout DoS from one address
 //   R5  cross-server grant ack; a banned account keeping its game session (and wallet)
 //   R6  banned staff keeping their powers and lifting their own ban
+//   R7  a Discord link started on the website: the starter must not get the approver's Discord
+//       (and R1 now holds with a password re-authentication instead of a verified email)
 import { createHash, randomBytes } from 'node:crypto';
 import { and, eq, isNull } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -104,25 +106,56 @@ async function signUpWithDiscord(profile: DiscordProfile, username: string): Pro
 
 // ---------------------------------------------------------------------------------------------
 describe('R1 pre-hijack of an unverified account through a Discord link', () => {
-  it('an account whose email is not verified cannot start a Discord link', async () => {
+  // Solar RP sends no email, so a verified email can no longer be what a link change needs (nobody
+  // could link). The proof is the current password; what must still hold is that a squatter's link
+  // never outlives the real owner's reset, including a link that is in flight when the reset lands.
+  it('starting a Discord link needs the current password, whatever the email state (a stolen session is not enough)', async () => {
     const squatter = await makeUser(env, { verified: false });
-    const link = await env.call<Flow & ErrBody>('/v1/me/discord/link', { method: 'POST', token: squatter.token, ip: freshIp() });
-    expect(link.status).toBe(403);
-    expect(link.body.error.code).toBe('email_not_verified');
+    const ip = freshIp();
+    const noPassword = await env.call<ErrBody>('/v1/me/discord/link', { method: 'POST', token: squatter.token, ip });
+    expect(noPassword.status).toBe(400);
+    const wrong = await env.call<ErrBody>('/v1/me/discord/link', { json: { password: 'stolen-session-guess-1' }, token: squatter.token, ip });
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error.code).toBe('invalid_credentials');
     expect(await env.handle.db.select().from(schema.oauthFlows).where(eq(schema.oauthFlows.accountId, squatter.accountId))).toHaveLength(0);
 
-    // Control: the same request from a verified account is accepted.
-    const owner = await makeUser(env);
-    expect((await env.call('/v1/me/discord/link', { method: 'POST', token: owner.token, ip: freshIp() })).status).toBe(200);
+    // Control: with the password the same account may start one (the email gate is gone for linking).
+    expect((await env.call('/v1/me/discord/link', { json: { password: squatter.password }, token: squatter.token, ip })).status).toBe(200);
   });
 
-  it('every other login-method change is refused while the email is unverified (unlink)', async () => {
+  it('a link the squatter has in flight is refused once the real owner has reset the password', async () => {
+    const victimEmail = 'victim-inflight@example.test';
+    const attackerIp = freshIp();
+    const reg = await env.call('/v1/auth/register', { json: { email: victimEmail, username: 'squatter_inflight', password: STRONG_PASSWORD + 'sq' }, ip: attackerIp });
+    expect(reg.status).toBe(201);
+    const login = await env.call<{ token: string; account: { id: string } }>('/v1/auth/login', { json: { identifier: victimEmail, password: STRONG_PASSWORD + 'sq' }, ip: attackerIp });
+    const accountId = login.body.account.id;
+    const link = (await env.call<Flow>('/v1/me/discord/link', { json: { password: STRONG_PASSWORD + 'sq' }, token: login.body.token, ip: attackerIp })).body;
+    const cb = await approveAndCallback(link, newProfile({ username: 'squatter_dc' }));
+    expect(cb.handoff).not.toBeNull();
+
+    // The real owner resets the password before the squatter's launcher presents the claim.
+    env.clock.advanceSeconds(5);
+    expect((await env.call('/v1/auth/forgot-password', { json: { email: victimEmail }, ip: freshIp() })).status).toBe(202);
+    const resetToken = await mailToken(env, victimEmail, 'password_reset');
+    expect((await env.call('/v1/auth/reset-password', { json: { token: resetToken, password: STRONG_PASSWORD + 'owner' }, ip: freshIp() })).status).toBe(200);
+
+    expect((await poll(link, cb.handoff?.claim, attackerIp)).body).toEqual({ status: 'failed', code: 'password_changed' });
+    expect(await identitiesOf(accountId)).toHaveLength(0);
+  });
+
+  it('unlinking re-authenticates too: no password or a wrong one removes nothing', async () => {
     const squatter = await makeUser(env, { verified: false });
     await env.handle.db.insert(schema.oauthIdentities).values({ accountId: squatter.accountId, provider: 'discord', providerUserId: String(newProfile().id), providerUsername: 'planted', providerEmail: null, emailVerified: false });
-    const res = await env.call<ErrBody>('/v1/me/discord', { method: 'DELETE', token: squatter.token, ip: freshIp() });
-    expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('email_not_verified');
+    const ip = freshIp();
+    expect((await env.call<ErrBody>('/v1/me/discord', { method: 'DELETE', token: squatter.token, ip })).status).toBe(400);
+    const wrong = await env.call<ErrBody>('/v1/me/discord', { method: 'DELETE', json: { password: 'stolen-session-guess-2' }, token: squatter.token, ip });
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error.code).toBe('invalid_credentials');
     expect(await identitiesOf(squatter.accountId)).toHaveLength(1);
+    // Control: the password removes it.
+    expect((await env.call('/v1/me/discord', { method: 'DELETE', json: { password: squatter.password }, token: squatter.token, ip })).status).toBe(204);
+    expect(await identitiesOf(squatter.accountId)).toHaveLength(0);
   });
 
   it('a Discord identity on an unverified account does not survive the real owner resetting the password', async () => {
@@ -161,14 +194,14 @@ describe('R1 pre-hijack of an unverified account through a Discord link', () => 
   it('linking and unlinking Discord mail the account owner', async () => {
     const owner = await makeUser(env);
     const profile = newProfile({ username: 'mailed_link' });
-    const link = (await env.call<Flow>('/v1/me/discord/link', { method: 'POST', token: owner.token, ip: freshIp() })).body;
+    const link = (await env.call<Flow>('/v1/me/discord/link', { json: { password: owner.password }, token: owner.token, ip: freshIp() })).body;
     const cb = await approveAndCallback(link, profile);
     expect((await poll(link, cb.handoff?.claim)).body.status).toBe('linked');
     const linked = await latestMail(env, owner.email, 'discord_linked');
     expect(linked, 'a discord_linked email to the owner').toBeDefined();
     expect(await latestMail(env, owner.email, 'discord_unlinked')).toBeUndefined();
 
-    expect((await env.call('/v1/me/discord', { method: 'DELETE', token: owner.token, ip: freshIp() })).status).toBe(204);
+    expect((await env.call('/v1/me/discord', { method: 'DELETE', json: { password: owner.password }, token: owner.token, ip: freshIp() })).status).toBe(204);
     expect(await latestMail(env, owner.email, 'discord_unlinked'), 'a discord_unlinked email to the owner').toBeDefined();
   });
 });
@@ -286,7 +319,7 @@ describe('R2 Discord login phishing', () => {
     // victim's Discord ends up on the attacker's account.
     const attacker = await makeUser(env);
     const victimDiscord = newProfile({ username: 'victim_link' });
-    const link = (await env.call<Flow>('/v1/me/discord/link', { method: 'POST', token: attacker.token, ip: freshIp() })).body;
+    const link = (await env.call<Flow>('/v1/me/discord/link', { json: { password: attacker.password }, token: attacker.token, ip: freshIp() })).body;
     const victimsBrowser = await approveAndCallback(link, victimDiscord);
 
     expect((await poll(link)).body.status).toBe('pending');
@@ -298,6 +331,64 @@ describe('R2 Discord login phishing', () => {
     const done = await poll(link, victimsBrowser.handoff?.claim);
     expect(done.body.status).toBe('linked');
     expect((await identitiesOf(attacker.accountId))[0]?.providerUserId).toBe(victimDiscord.id);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('R7 Discord link from the website: whoever starts the flow cannot get somebody else\'s Discord', () => {
+  const finish = (token: string, body: { flowId: string; pollSecret: string; claim: string }) =>
+    env.call<PollBody>('/v1/me/discord/link/finish', { json: body, token, ip: freshIp() });
+
+  it('an attacker who sends their web link\'s authorize URL to a victim links nothing; the victim\'s page cannot finish it either', async () => {
+    const attacker = await makeUser(env);
+    const victim = await makeUser(env);
+    const victimDiscord = newProfile({ username: 'victim_web' });
+
+    // The attacker starts a WEB link on their own account (their tab keeps the poll secret) and sends
+    // the authorize URL to the victim, who approves it with their Discord.
+    const atk = (await env.call<Flow>('/v1/me/discord/link', { json: { password: attacker.password, handoff: 'web' }, token: attacker.token, ip: freshIp() })).body;
+    const { code, state } = discord.approve(atk.authorizeUrl, victimDiscord);
+    const cb = await env.call('/v1/auth/discord/callback?' + new URLSearchParams({ code, state }).toString(), { ip: freshIp() });
+    // The claim lands in the VICTIM's browser, on the account page's fragment.
+    expect(cb.status).toBe(303);
+    const landing = new URL(cb.headers.get('location') ?? 'about:blank');
+    const fragment = new URLSearchParams(landing.hash.slice(1));
+    expect(landing.origin + landing.pathname).toBe('https://solar-rp.com/account/');
+    expect(fragment.get('discord_flow')).toBe(atk.flowId);
+    const victimsClaim = fragment.get('discord_claim') as string;
+    expect(victimsClaim).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    // The attacker holds the poll secret and their own session, but not the claim.
+    expect((await finish(attacker.token, { flowId: atk.flowId, pollSecret: atk.pollSecret, claim: randomToken(32) })).status).toBe(404);
+    expect((await env.call('/v1/me/discord/link/finish', { json: { flowId: atk.flowId, pollSecret: atk.pollSecret }, token: attacker.token, ip: freshIp() })).status).toBe(400);
+    // The unauthenticated poll does not read web flows at all (not even with both secrets).
+    expect((await poll(atk)).status).toBe(404);
+    expect((await poll(atk, victimsClaim)).status).toBe(404);
+
+    // The victim's account page holds the claim and the victim's session, but not the poll secret ...
+    expect((await finish(victim.token, { flowId: atk.flowId, pollSecret: randomToken(32), claim: victimsClaim })).status).toBe(404);
+    // ... and even with the attacker's poll secret (had it leaked) the session is the victim's, not the flow's account.
+    expect((await finish(victim.token, { flowId: atk.flowId, pollSecret: atk.pollSecret, claim: victimsClaim })).status).toBe(404);
+
+    // Nothing was linked to anyone, and nothing was spent.
+    expect(await identitiesOf(attacker.accountId)).toHaveLength(0);
+    expect(await identitiesOf(victim.accountId)).toHaveLength(0);
+    expect(await env.handle.db.select().from(schema.oauthIdentities).where(eq(schema.oauthIdentities.providerUserId, victimDiscord.id))).toHaveLength(0);
+    expect((await flowRow(atk.flowId))?.status).toBe('link_ready');
+
+    // Control: all three pieces together (the starting tab's poll secret, the starting account's
+    // session and the claim of the browser that approved) do link, so the refusals above are the guard.
+    expect((await finish(attacker.token, { flowId: atk.flowId, pollSecret: atk.pollSecret, claim: victimsClaim })).body).toEqual({ status: 'linked' });
+    expect((await identitiesOf(attacker.accountId))[0]?.providerUserId).toBe(victimDiscord.id);
+  });
+
+  it('a launcher link flow cannot be finished through the web finish (handoffs do not mix)', async () => {
+    const user = await makeUser(env);
+    const link = (await env.call<Flow>('/v1/me/discord/link', { json: { password: user.password }, token: user.token, ip: freshIp() })).body;
+    const cb = await approveAndCallback(link, newProfile());
+    expect(cb.handoff).not.toBeNull();
+    expect((await finish(user.token, { flowId: link.flowId, pollSecret: link.pollSecret, claim: cb.handoff?.claim as string })).status).toBe(404);
+    expect((await poll(link, cb.handoff?.claim)).body.status).toBe('linked');
   });
 });
 

@@ -17,6 +17,7 @@
     "db:migrate": "tsx --env-file-if-exists=.env scripts/migrate.ts",
     "admin:grant-role": "tsx --env-file-if-exists=.env scripts/grant-role.ts",
     "admin:create-server": "tsx --env-file-if-exists=.env scripts/create-server.ts",
+    "admin:quests": "tsx --env-file-if-exists=.env scripts/quests.ts",
     "docs:reference": "tsx scripts/gen-reference.ts",
     "docs:check": "tsx scripts/check-docs.ts"
   },

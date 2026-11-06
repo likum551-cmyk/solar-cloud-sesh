@@ -10,6 +10,8 @@
 //   - the wallet balance is maintained only by a trigger on the append-only wallet ledger; a spend
 //     that would overdraw is rejected by the database
 //   - order status changes follow a transition table enforced by a trigger
+//   - a quest pays once per account (ledger key quest:<quest>:<account>, one progress row per pair)
+//     and once per Discord account (quest_progress_discord_uq)
 import { sql } from 'drizzle-orm';
 import {
   bigint,
@@ -170,6 +172,12 @@ export const oauthFlows = pgTable(
     claimHash: text('claim_hash'),
     /** The account to link to (intent = link). */
     accountId: uuid('account_id').references(() => accounts.id, { onDelete: 'cascade' }),
+    /**
+     * Where the callback hands the claim: `launcher` (the gage-mp:// URL scheme, finished by the
+     * unauthenticated poll) or `web` (a redirect to the website's account page, finished there with
+     * the account's session; link flows only).
+     */
+    handoff: text('handoff').notNull().default('launcher'),
     status: text('status').notNull().default('pending'),
     resultAccountId: uuid('result_account_id').references(() => accounts.id, { onDelete: 'cascade' }),
     /** Discord profile held while a new user picks a username (status needs_username). */
@@ -188,6 +196,8 @@ export const oauthFlows = pgTable(
       sql`${t.status} in ('pending', 'login_ready', 'needs_username', 'link_ready', 'linked', 'failed', 'consumed')`,
     ),
     check('oauth_flows_link_needs_account', sql`${t.intent} <> 'link' or ${t.accountId} is not null`),
+    check('oauth_flows_handoff', sql`${t.handoff} in ('launcher', 'web')`),
+    check('oauth_flows_web_is_link', sql`${t.handoff} <> 'web' or ${t.intent} = 'link'`),
   ],
 );
 
@@ -556,10 +566,10 @@ export const walletLedger = pgTable(
     index('wallet_ledger_account_idx').on(t.accountId, t.currency, t.id),
     check('wallet_ledger_delta_nonzero', sql`${t.delta} <> 0`),
     check('wallet_ledger_currency', sql`${t.currency} ~ '^[a-z][a-z0-9_]{1,15}$'`),
-    check('wallet_ledger_reason', sql`${t.reason} in ('purchase', 'revoke', 'spend')`),
+    check('wallet_ledger_reason', sql`${t.reason} in ('purchase', 'revoke', 'spend', 'quest')`),
     check(
       'wallet_ledger_sign',
-      sql`(${t.reason} = 'purchase' and ${t.delta} > 0) or (${t.reason} in ('revoke', 'spend') and ${t.delta} < 0)`,
+      sql`(${t.reason} in ('purchase', 'quest') and ${t.delta} > 0) or (${t.reason} in ('revoke', 'spend') and ${t.delta} < 0)`,
     ),
   ],
 );
@@ -576,6 +586,80 @@ export const walletBalances = pgTable(
     updatedAt: tstz('updated_at').notNull().defaultNow(),
   },
   (t) => [primaryKey({ columns: [t.accountId, t.currency] })],
+);
+
+// ---------------------------------------------------------------------------------------------
+// Quests (rewards paid into the wallet)
+
+/**
+ * discord_link   pays when the account has a linked Discord identity (verifiable)
+ * discord_guild  membership of the Solar RP Discord server (not available yet: needs a Discord re-check flow)
+ * visit          honor system: open a URL, claim after QUEST_VISIT_MIN_SECONDS; Discord-gated
+ */
+export const QUEST_KINDS = ['discord_link', 'discord_guild', 'visit'] as const;
+export type QuestKind = (typeof QUEST_KINDS)[number];
+
+export const quests = pgTable(
+  'quests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    /** Stable public id used in URLs and by the admin script, e.g. "youtube_subscribe". */
+    slug: text('slug').notNull(),
+    kind: text('kind').notNull(),
+    title: text('title').notNull(),
+    description: text('description').notNull().default(''),
+    /** The page a visit quest opens (https only). NULL for the other kinds, and for a visit quest nobody has given a URL yet. */
+    url: text('url'),
+    rewardAmount: bigint('reward_amount', { mode: 'number' }).notNull(),
+    currency: text('currency').notNull().default('coins'),
+    active: boolean('active').notNull().default(false),
+    sort: integer('sort').notNull().default(0),
+    createdAt: createdAt(),
+    updatedAt: tstz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('quests_slug_uq').on(t.slug),
+    check('quests_slug_format', sql`${t.slug} ~ '^[a-z0-9][a-z0-9_]{1,47}$'`),
+    check('quests_kind', sql`${t.kind} in ('discord_link', 'discord_guild', 'visit')`),
+    check('quests_title_len', sql`length(${t.title}) between 1 and 80`),
+    check('quests_description_len', sql`length(${t.description}) <= 500`),
+    check('quests_url_format', sql`${t.url} is null or (${t.url} ~ '^https://[^[:space:]]+$' and length(${t.url}) <= 2048)`),
+    check('quests_url_only_visit', sql`${t.kind} = 'visit' or ${t.url} is null`),
+    check('quests_active_visit_has_url', sql`not ${t.active} or ${t.kind} <> 'visit' or ${t.url} is not null`),
+    check('quests_reward_range', sql`${t.rewardAmount} between 1 and 1000000`),
+    check('quests_currency', sql`${t.currency} ~ '^[a-z][a-z0-9_]{1,15}$'`),
+  ],
+);
+
+/**
+ * One row per (account, quest) the account has touched. A claim fills claimed_at, the Discord user
+ * id the claim was made under and the ledger entry that paid it, all in the transaction that writes
+ * that ledger entry.
+ */
+export const questProgress = pgTable(
+  'quest_progress',
+  {
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    questId: uuid('quest_id')
+      .notNull()
+      .references(() => quests.id, { onDelete: 'restrict' }),
+    /** When a visit quest was started (its URL opened). The claim waits QUEST_VISIT_MIN_SECONDS from here. */
+    startedAt: tstz('started_at'),
+    claimedAt: tstz('claimed_at'),
+    /** The Discord user id linked to the account at claim time: one Discord account claims a quest once, whatever account it is linked to. */
+    discordUserId: text('discord_user_id'),
+    ledgerId: bigint('ledger_id', { mode: 'number' }).references(() => walletLedger.id, { onDelete: 'restrict' }),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.accountId, t.questId] }),
+    // Leads with the Discord id: it also serves "which quests did this Discord account claim".
+    uniqueIndex('quest_progress_discord_uq').on(t.discordUserId, t.questId).where(sql`${t.discordUserId} is not null`),
+    uniqueIndex('quest_progress_ledger_uq').on(t.ledgerId).where(sql`${t.ledgerId} is not null`),
+    check('quest_progress_claim_complete', sql`(${t.claimedAt} is null) = (${t.ledgerId} is null) and (${t.claimedAt} is null) = (${t.discordUserId} is null)`),
+  ],
 );
 
 // ---------------------------------------------------------------------------------------------

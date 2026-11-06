@@ -22,6 +22,20 @@
       "when": 1793243872207,
       "tag": "0002_security_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793951897644,
+      "tag": "0003_quests",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793955015831,
+      "tag": "0004_discord_web_link",
+      "breakpoints": true
     }
   ]
 }

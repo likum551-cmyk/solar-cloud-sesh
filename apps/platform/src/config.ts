@@ -42,6 +42,8 @@ export interface Config {
   emailLinkBaseUrl: string;
 
   discord: { clientId: string; clientSecret: string; redirectUri: string; apiBase: string; flowTtlSeconds: number } | null;
+  /** The website's public origin (scheme://host[:port]). A web Discord link flow returns to <siteOrigin>/account/; never taken from a request. */
+  siteOrigin: string;
 
   paymentProvider: 'fake';
   fakeWebhookSecret: string;
@@ -132,6 +134,7 @@ export const envSchema = z.object({
   DISCORD_REDIRECT_URI: urlVar.optional(),
   DISCORD_API_BASE: urlVar.default('https://discord.com/api/v10'),
   DISCORD_FLOW_TTL_SECONDS: intVar(60, 3600).default(600),
+  SITE_ORIGIN: z.string().default('https://solar-rp.com'),
 
   PAYMENT_PROVIDER: z.enum(['fake']).default('fake'),
   ALLOW_FAKE_PAYMENTS_IN_PRODUCTION: flagVar.default(false),
@@ -175,6 +178,11 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     // An origin is scheme://host[:port] with nothing else; "*" would defeat the restriction.
     if (!/^https?:\/\/[^/\s*]+$/i.test(o)) issues.push(`CORS_ORIGINS: "${o}" is not an origin (scheme://host[:port], no path, no wildcard)`);
   }
+
+  // The web Discord link redirects the browser here with the claim: an origin and nothing else, https in production.
+  const siteOrigin = e.SITE_ORIGIN.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\/[^/\s*?#@]+$/i.test(siteOrigin)) issues.push(`SITE_ORIGIN: "${siteOrigin}" is not an origin (scheme://host[:port], no path)`);
+  else if (e.NODE_ENV === 'production' && !/^https:\/\//i.test(siteOrigin)) issues.push('SITE_ORIGIN must be https when NODE_ENV=production');
 
   if (e.SESSION_TTL_DAYS > e.SESSION_MAX_DAYS) issues.push('SESSION_TTL_DAYS must not exceed SESSION_MAX_DAYS');
   if (e.LOGIN_LOCKOUT_BASE_SECONDS > e.LOGIN_LOCKOUT_MAX_SECONDS) {
@@ -270,6 +278,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
             flowTtlSeconds: e.DISCORD_FLOW_TTL_SECONDS,
           }
         : null,
+    siteOrigin: siteOrigin.toLowerCase(),
 
     paymentProvider: e.PAYMENT_PROVIDER,
     fakeWebhookSecret: e.FAKE_WEBHOOK_SECRET ?? DEV_FAKE_WEBHOOK_SECRET,

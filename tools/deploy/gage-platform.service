@@ -1,0 +1,89 @@
+# Solar RP platform API (apps/platform: accounts, login, join tokens, roles, shop). Hono + PostgreSQL on this host.
+# Installed to /etc/systemd/system/gage-platform.service by tools/deploy/deploy-platform.sh, which builds a release,
+# migrates the database, swaps the `current` symlink and restarts this unit.
+#
+#   code      /opt/gage/platform/current/                 (symlink -> releases/<UTC stamp>/, root-owned, read-only to the service)
+#   settings  /opt/gage/platform.env                       (owner gage-platform, mode 0600; DATABASE_URL and FAKE_WEBHOOK_SECRET
+#                                                           are secrets: never print it. Template tools/deploy/platform.env.example)
+#   listeners 127.0.0.1:8787 public API (Caddy proxies https://solar-rp.com/api/* to it)
+#             127.0.0.1:8788 game-server API (/internal/*): loopback only, NEVER proxied
+#   database  PostgreSQL on 127.0.0.1:5432, database and role gage_platform
+# Its own user (gage-platform), not gage: the game server runs as gage, and a process can read the environment of
+# another process of the same user (/proc/<pid>/environ), which here holds the database password.
+# Schema migrations are NOT run by this unit: deploy-platform.sh runs dist/scripts/migrate.js before every switch
+# (the platform never migrates PostgreSQL by itself).
+# Check:   systemd-analyze verify /etc/systemd/system/gage-platform.service
+#          systemd-analyze security gage-platform
+# Logs:    journalctl -u gage-platform -f        (one JSON object per line)
+[Unit]
+Description=Solar RP platform API (gage-platform)
+Documentation=file:///opt/gage/src/docs/OPS.md
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
+# Assert, not Condition: a missing release must fail the start loudly instead of skipping it silently.
+AssertPathExists=/opt/gage/platform/current/dist/src/index.js
+# At most 5 starts in 5 minutes (StartLimit* belongs in [Unit]).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# exec: `systemctl start` reports failure when node cannot be executed, not just when fork succeeded.
+Type=exec
+User=gage-platform
+Group=gage-platform
+WorkingDirectory=/opt/gage/platform/current
+# Read by systemd as root. Not optional: without it the process has no DATABASE_URL and refuses to start.
+EnvironmentFile=/opt/gage/platform.env
+# Production mode refuses the in-memory database, a missing DATABASE_URL and the dev routes. A NODE_ENV line in
+# the EnvironmentFile overrides this one, so platform.env says NODE_ENV=production too.
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=512
+ExecStart=/usr/bin/node /opt/gage/platform/current/dist/src/index.js
+# Exit 1 at boot = invalid configuration or the database is unreachable; the first journal line says which.
+Restart=on-failure
+RestartSec=3
+# SIGTERM = in-flight requests finish within SHUTDOWN_GRACE_SECONDS (10), then the process exits.
+KillSignal=SIGTERM
+TimeoutStopSec=25
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gage-platform
+
+# Resources
+LimitNOFILE=65536
+MemoryMax=768M
+TasksMax=256
+
+# Sandbox
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Nothing on disk is written: logs go to the journal, data to PostgreSQL.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+# AF_INET/AF_INET6: PostgreSQL on 127.0.0.1, the two listeners, UDP queries to game servers, HTTPS to Discord.
+# AF_UNIX: journald and name resolution.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# V8 compiles to writable+executable memory (JIT): MemoryDenyWriteExecute stays off for Node.
+SystemCallArchitectures=native
+# A denied syscall returns EPERM instead of killing the process (degrade, not crash-loop); strace shows what was denied.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

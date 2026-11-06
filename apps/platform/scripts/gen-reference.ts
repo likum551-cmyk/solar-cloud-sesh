@@ -46,6 +46,7 @@ const GROUPS: Group[] = [
   { title: 'Settings', match: (r) => r.path === '/v1/me/settings' },
   { title: 'Servers and joining', match: (r) => r.path === '/v1/servers' || r.path === '/v1/game/join' },
   { title: 'Shop, orders, wallet and items', match: (r) => r.path.startsWith('/v1/shop/') || r.path.startsWith('/v1/me/wallet') || r.path === '/v1/me/items' },
+  { title: 'Quests', match: (r) => r.path.startsWith('/v1/me/quests') },
   { title: 'Payment webhooks and the dev checkout', match: (r) => r.path.startsWith('/v1/webhooks/') || r.path.startsWith('/v1/dev/') },
   { title: 'Moderation and administration', match: (r) => r.path.startsWith('/v1/admin/') },
   { title: 'Game server API (internal listener)', match: (r) => r.path.startsWith('/internal/') },

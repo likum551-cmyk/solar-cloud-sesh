@@ -3,10 +3,15 @@ import { getAccountView } from '../../auth/accounts.js';
 import {
   completeDiscordSignup,
   discordCompleteSchema,
+  discordLinkSchema,
   discordPollSchema,
+  discordUnlinkSchema,
+  discordWebFinishSchema,
+  finishWebLink,
   handleDiscordCallback,
   pollDiscordFlow,
-  startDiscordFlow,
+  startDiscordLink,
+  startDiscordLogin,
   unlinkDiscord,
 } from '../../auth/discord.js';
 import {
@@ -57,6 +62,16 @@ function callbackPage(ok: boolean, handoff: { flowId: string; claim: string } | 
   const refresh = url === null ? '' : `<meta http-equiv="refresh" content="0;url=${url}">`;
   const button = url === null ? '' : `<p><a class="btn" href="${url}">Return to GAGE</a></p>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">${refresh}<title>GAGE-MP</title><style>body{font:16px system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#111;color:#eee}main{max-width:28rem;padding:2rem;text-align:center}h1{font-size:1.25rem}.btn{display:inline-block;padding:.7rem 1.4rem;border-radius:.5rem;background:#eee;color:#111;text-decoration:none;font-weight:600}</style></head><body><main><h1>${heading}</h1><p>${body}</p>${button}</main></body></html>`;
+}
+
+/**
+ * Where a web link flow's callback sends the browser: the website's account page on the CONFIGURED
+ * origin (SITE_ORIGIN; nothing from the request), flow and claim in the fragment so no server or
+ * proxy log ever sees the claim. Null when the handoff does not have the expected shape.
+ */
+export function webHandoffUrl(siteOrigin: string, handoff: { flowId: string; claim: string }): string | null {
+  if (!FLOW_ID_SHAPE.test(handoff.flowId) || !CLAIM_SHAPE.test(handoff.claim)) return null;
+  return `${siteOrigin}/account/#discord_flow=${handoff.flowId}&discord_claim=${handoff.claim}`;
 }
 
 export function registerAuthRoutes(r: Router, deps: Deps): void {
@@ -151,29 +166,33 @@ export function registerAuthRoutes(r: Router, deps: Deps): void {
       response: '200 { flowId, authorizeUrl, pollSecret, expiresAt }', errors: ['discord_disabled'],
       limits: [{ name: 'discord-start', scope: 'ip', limit: 20, windowSeconds: 600 }],
     },
-    async (c) => c.json(await startDiscordFlow(deps, 'login', null)),
+    async (c) => c.json(await startDiscordLogin(deps)),
   );
 
   r.add(
     {
       method: 'get', path: '/v1/auth/discord/callback', summary: 'Discord redirect target (browser page)', auth: 'none', tags: ['auth', 'discord'], query: callbackQuery,
-      description: 'Discord sends the player\'s browser here. Validates the single-use state, redeems the code with the PKCE verifier, records the outcome for the launcher and puts a random claim on the flow (only its hash is stored). Returns a small HTML page (200 when the sign-in was approved, 400 otherwise) that redirects to gage-mp://auth/discord?flow=<flowId>&claim=<claim> and shows a "Return to GAGE" button for the same URL. The claim is never displayed. A callback whose state is invalid, used or expired is 400 with no handoff.',
-      response: '200 text/html',
+      description: 'Discord sends the player\'s browser here. Validates the single-use state, redeems the code with the PKCE verifier, records the outcome and puts a random claim on the flow (only its hash is stored). A launcher flow gets a small HTML page (200 when the sign-in was approved, 400 otherwise) that redirects to gage-mp://auth/discord?flow=<flowId>&claim=<claim> and shows a "Return to GAGE" button for the same URL. A web link flow (started with handoff "web") gets 303 to <SITE_ORIGIN>/account/#discord_flow=<flowId>&discord_claim=<claim>, whatever the outcome (the account page reads why it failed); the target origin is configuration, never taken from the request, and the claim is in the fragment so no server log sees it. The claim is never displayed. A callback whose state is invalid, used or expired is 400 with no handoff.',
+      response: '200 text/html | 303 Location: <SITE_ORIGIN>/account/#discord_flow&discord_claim',
       limits: [{ name: 'discord-callback', scope: 'ip', limit: 60, windowSeconds: 600 }],
     },
     async (c, { query }) => {
       const outcome = await handleDiscordCallback(deps, query);
-      c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
       c.header('Referrer-Policy', 'no-referrer');
       c.header('Cache-Control', 'no-store');
-      return c.html(callbackPage(outcome.ok, outcome.handoff), outcome.ok ? 200 : 400);
+      if (outcome.handoff?.to === 'web') {
+        const target = webHandoffUrl(deps.config.siteOrigin, outcome.handoff);
+        if (target !== null) return c.redirect(target, 303);
+      }
+      c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+      return c.html(callbackPage(outcome.ok, outcome.handoff?.to === 'launcher' ? outcome.handoff : undefined), outcome.ok ? 200 : 400);
     },
   );
 
   r.add(
     {
       method: 'post', path: '/v1/auth/discord/poll', summary: 'Poll a Discord flow', auth: 'none', tags: ['auth', 'discord'], body: discordPollSchema,
-      description: 'status pending | failed {code} | needs_username {suggestedUsername, discordUsername} | linked | complete {token, account}. Send the claim from the gage-mp:// URL: without it (or with a wrong one) the answer is always {status: "pending"}, exactly as for a flow nobody approved. complete and linked are returned once and spend the flow and its claim; a link is attached to the account only by this call.',
+      description: 'status pending | failed {code} | needs_username {suggestedUsername, discordUsername} | linked | complete {token, account}. Send the claim from the gage-mp:// URL: without it (or with a wrong one) the answer is always {status: "pending"}, exactly as for a flow nobody approved. complete and linked are returned once and spend the flow and its claim; a link is attached to the account only by this call. A web link flow (handoff "web") is not readable here (404 flow_not_found): the account page finishes it with POST /v1/me/discord/link/finish.',
       response: '200 { status, ... }', errors: ['flow_not_found', 'flow_expired', 'flow_used'],
       limits: [{ name: 'discord-poll', scope: 'ip', limit: 300, windowSeconds: 600 }],
     },
@@ -201,22 +220,33 @@ export function registerAuthRoutes(r: Router, deps: Deps): void {
 
   r.add(
     {
-      method: 'post', path: '/v1/me/discord/link', summary: 'Start linking Discord to the signed-in account', auth: 'session', tags: ['me', 'discord'], body: z.object({}).optional().default({}),
-      description: 'Refused (403 email_not_verified) while the account\'s email is unverified. Same flow, claim and poll as a Discord login; the identity is attached when the claimed poll returns "linked", and the owner is emailed.',
-      response: '200 { flowId, authorizeUrl, pollSecret, expiresAt }', errors: ['discord_disabled', 'email_not_verified'],
+      method: 'post', path: '/v1/me/discord/link', summary: 'Start linking Discord to the signed-in account', auth: 'session', tags: ['me', 'discord'], body: discordLinkSchema,
+      description: 'Re-authenticates with the account\'s current password (`password`; wrong passwords count towards the same lockout as a password change, keyed on the account and the client address: 401 invalid_credentials, then 429 rate_limited). `handoff` "launcher" (default) finishes like a Discord login (callback, gage-mp:// handoff, claimed poll answering "linked"); "web" makes the callback redirect to the website\'s account page, which finishes with POST /v1/me/discord/link/finish. The identity is attached only by that last step, and is refused there (failed, code password_changed) when the password changed after the start. The owner is emailed.',
+      response: '200 { flowId, authorizeUrl, pollSecret, expiresAt }', errors: ['discord_disabled', 'already_has_discord', 'password_required', 'invalid_credentials', 'rate_limited', 'busy'],
       limits: [{ name: 'discord-link', scope: 'account', limit: 10, windowSeconds: 600 }],
     },
-    async (c) => c.json(await startDiscordFlow(deps, 'link', requireSession(c).account.id)),
+    async (c, { body }) => c.json(await startDiscordLink(deps, requireSession(c).account.id, body, reqCtx(c))),
   );
 
   r.add(
     {
-      method: 'delete', path: '/v1/me/discord', summary: 'Unlink Discord', auth: 'session', tags: ['me', 'discord'],
-      description: 'Refused (403 email_not_verified) while the account\'s email is unverified. The owner is emailed.',
-      response: '204 (no body)', successStatus: 204, errors: ['last_login_method', 'not_linked', 'email_not_verified'],
+      method: 'post', path: '/v1/me/discord/link/finish', summary: 'Finish a web Discord link on the account page', auth: 'session', tags: ['me', 'discord'], body: discordWebFinishSchema,
+      description: 'For a flow started with handoff "web": `flowId` and `claim` come from the account page\'s URL fragment (#discord_flow&discord_claim), `pollSecret` from the tab that started the flow. The session must belong to the account that started it. Any mismatch (wrong or missing secret, claim of another flow, another account\'s session, a launcher flow) is 404 flow_not_found. Answers { status: "linked" } once (the identity is attached by this call; the same pair again is a harmless no-op) or { status: "failed", code } (access_denied, discord_error, invalid_request, discord_already_linked, already_has_discord, password_changed).',
+      response: '200 { status: "linked" } | { status: "failed", code }', errors: ['flow_not_found', 'flow_expired', 'flow_used'],
+      limits: [{ name: 'discord-link-finish', scope: 'account', limit: 30, windowSeconds: 600 }],
     },
-    async (c) => {
-      await unlinkDiscord(deps, requireSession(c).account.id);
+    async (c, { body }) => c.json(await finishWebLink(deps, requireSession(c).account.id, body)),
+  );
+
+  r.add(
+    {
+      method: 'delete', path: '/v1/me/discord', summary: 'Unlink Discord', auth: 'session', tags: ['me', 'discord'], body: discordUnlinkSchema,
+      description: 'Refused (409 last_login_method) when Discord is the account\'s only way in (no password). Re-authenticates with the current password (`password`; the same lockout as linking and changing the password). The owner is emailed.',
+      response: '204 (no body)', successStatus: 204, errors: ['last_login_method', 'not_linked', 'invalid_credentials', 'rate_limited', 'busy'],
+      limits: [{ name: 'discord-unlink', scope: 'account', limit: 10, windowSeconds: 600 }],
+    },
+    async (c, { body }) => {
+      await unlinkDiscord(deps, requireSession(c).account.id, body, reqCtx(c));
       return c.body(null, 204);
     },
   );

@@ -15,11 +15,19 @@ import {
   listOwned,
   listProducts,
 } from '../../shop/service.js';
+import { claimQuest, listQuests, QUEST_SLUG_PATTERN, QUEST_VISIT_MIN_SECONDS, startQuest } from '../../quests/service.js';
 import { ApiError } from '../../util/errors.js';
 import { requireSession } from '../helpers.js';
-import { uuidParam, type Router } from '../router.js';
+import { uuidParam, type Ctx, type Router } from '../router.js';
 
-/** Routes a signed-in player (or the launcher before login) uses: settings, wallet, server list, join, shop. */
+/** A quest slug path parameter, or 400. */
+function slugParam(c: Ctx): string {
+  const v = c.req.param('slug');
+  if (v === undefined || !QUEST_SLUG_PATTERN.test(v)) throw new ApiError(400, 'invalid_request', 'Path parameter "slug" must be a quest slug.');
+  return v;
+}
+
+/** Routes a signed-in player (or the launcher before login) uses: settings, wallet, quests, server list, join, shop. */
 export function registerPlayerRoutes(r: Router, deps: Deps): void {
   const { db, config } = deps;
 
@@ -53,6 +61,36 @@ export function registerPlayerRoutes(r: Router, deps: Deps): void {
       response: '200 { entries: [{ id, currency, delta, reason, memo, createdAt }] } (page with ?before=<last id>)',
     },
     async (c, { query }) => c.json({ entries: await listLedger(db, requireSession(c).account.id, query) }),
+  );
+
+  r.add(
+    {
+      method: 'get', path: '/v1/me/quests', summary: 'Quests that pay coins, with this account\'s status', auth: 'session', tags: ['quests'],
+      description: `Active quests in display order. status: available (a visit quest not started yet), started (waiting: waitSeconds left), claimable, claimed, locked (lockReason discord_required = link Discord first; discord_already_claimed = this Discord account already claimed it on another Solar RP account; not_available = cannot be completed yet). A visit quest is claimable ${QUEST_VISIT_MIN_SECONDS} s after its start and only with a linked Discord account; each quest pays once per account and once per Discord account.`,
+      response: '200 { discordLinked, visitMinSeconds, quests: [{ slug, kind, title, description, url, reward: { currency, amount }, sort, status, lockReason, startedAt, claimableAt, waitSeconds, claimedAt }] }',
+    },
+    async (c) => c.json(await listQuests(deps, requireSession(c).account.id)),
+  );
+
+  r.add(
+    {
+      method: 'post', path: '/v1/me/quests/:slug/start', summary: 'Start a visit quest (then open its url)', auth: 'session', tags: ['quests'],
+      description: `Records when the quest was started; the claim opens ${QUEST_VISIT_MIN_SECONDS} s later. Idempotent: a repeated start keeps the first time. Returns the quest with its url for the client to open.`,
+      response: '200 { quest }', errors: ['quest_not_found', 'quest_inactive', 'not_a_visit_quest'],
+      limits: [{ name: 'quest-start', scope: 'account', limit: 60, windowSeconds: 600 }],
+    },
+    async (c) => c.json({ quest: await startQuest(deps, requireSession(c).account.id, slugParam(c)) }),
+  );
+
+  r.add(
+    {
+      method: 'post', path: '/v1/me/quests/:slug/claim', summary: 'Claim a quest\'s reward into the wallet', auth: 'session', tags: ['quests'],
+      description: 'Pays the reward once (ledger reason quest). The credit and the claim are one transaction, and the database refuses a second credit for the same account or Discord account, so concurrent claims pay once.',
+      response: '200 { quest, credited: { currency, amount }, balance }',
+      errors: ['quest_not_found', 'quest_inactive', 'already_claimed', 'quest_unavailable', 'quest_not_started', 'discord_required', 'discord_already_claimed', 'quest_wait', 'account_banned'],
+      limits: [{ name: 'quest-claim', scope: 'account', limit: 30, windowSeconds: 600 }],
+    },
+    async (c) => c.json(await claimQuest(deps, requireSession(c).account.id, slugParam(c))),
   );
 
   r.add(

@@ -6,8 +6,8 @@ import { discordLinkedMessage, discordUnlinkedMessage } from '../email.js';
 import { ApiError, isUniqueViolation } from '../util/errors.js';
 import { errorFields } from '../util/logger.js';
 import { hashToken, pkceChallenge, randomToken, safeEqual } from '../util/tokens.js';
-import { findAccountByEmail, findAccountById, findAccountByUsername, isReservedUsername, usernameSchema } from './accounts.js';
-import { assertEmailVerifiedForLoginChange, createAccountRow, sendSafely, startSession, type LoginResult } from './service.js';
+import { findAccountByEmail, findAccountById, findAccountByUsername, isReservedUsername, passwordSchema, usernameSchema } from './accounts.js';
+import { createAccountRow, sendSafely, startSession, verifyCurrentPassword, type LoginResult, type ReqCtx } from './service.js';
 import type { SessionMeta } from './sessions.js';
 import type { DiscordUser } from './discord-client.js';
 
@@ -33,6 +33,23 @@ import type { DiscordUser } from './discord-client.js';
 // single use (cleared when the flow is consumed), compared in constant time and dies with the flow.
 // docs/launcher-discord-flow.md says what the launcher has to do.
 //
+// Linking from the website (handoff "web", link flows only) is the same flow with the same two
+// secrets; only the handoff channel differs:
+//
+//   1. website   POST /v1/me/discord/link {password, handoff: "web"} with the session
+//                -> flowId, pollSecret, authorizeUrl; the poll secret stays in the tab's sessionStorage
+//   2. player    the tab navigates to authorizeUrl and approves
+//   3. platform  the callback redirects (303) to <SITE_ORIGIN>/account/#discord_flow=<id>&discord_claim=<claim>.
+//                SITE_ORIGIN is configuration, never a request parameter (no open redirect); the claim
+//                rides in the FRAGMENT, which browsers never send to a server, so no access log holds it
+//   4. website   POST /v1/me/discord/link/finish {flowId, pollSecret, claim} with the SAME account's session
+//
+// A web flow cannot be read through the unauthenticated poll, and the finish needs the claim (only the
+// approving browser has it), the poll secret (only the starting tab has it) AND a session of the
+// account that started the flow. Whoever starts a web flow and sends the authorize URL to a victim
+// gets the claim delivered to the victim's browser, where there is no poll secret and the session (if
+// any) is the victim's: nothing gets linked.
+//
 // Account safety rules:
 //   - A Discord identity is matched on its immutable Discord user id, never on email or name.
 //   - Never auto-merge by email: if the Discord email (verified or not) belongs to an existing
@@ -40,9 +57,14 @@ import type { DiscordUser } from './discord-client.js';
 //     links Discord from settings (intent "link").
 //   - An unverified Discord email is never stored on the account; a verified one is stored and
 //     counts as verified.
-//   - Linking changes how the account can be signed in to, so it needs a verified email address,
-//     and it happens only when the claimed poll finishes it (never as a side effect of somebody
-//     else's approval). The owner is emailed whenever an identity is linked or unlinked.
+//   - Linking and unlinking change how the account can be signed in to, so both re-authenticate with
+//     the account's current password (throttled like a login; Solar RP sends no email, so a verified
+//     email cannot be the proof). A link happens only when the claimed poll / web finish completes
+//     it (never as a side effect of somebody else's approval), and is refused there when the
+//     password changed after the flow started (a reset by the real owner of a squatted address
+//     voids every link the squatter had in flight; the reset itself strips identities from an
+//     account whose email was never verified). The owner is emailed whenever an identity is linked
+//     or unlinked.
 //   - The state is random, hashed at rest and consumed by one conditional UPDATE, so a replayed or
 //     forged callback matches nothing.
 
@@ -52,10 +74,19 @@ const flowRef = {
 };
 const claimField = z.string().min(16).max(200);
 
-export const discordStartSchema = z.object({ intent: z.enum(['login', 'link']).default('login') });
 /** `claim` is optional on purpose: a poll without it (or with a wrong one) is answered "pending". */
 export const discordPollSchema = z.object({ ...flowRef, claim: claimField.optional() });
 export const discordCompleteSchema = z.object({ ...flowRef, claim: claimField, username: usernameSchema });
+/** Start a link: the current password (re-authentication) and where the claim goes back to. */
+export const discordLinkSchema = z.object({
+  password: passwordSchema,
+  handoff: z.enum(['launcher', 'web']).default('launcher'),
+});
+/** Finish a web link from the account page: both secrets, with the session of the account that started it. */
+export const discordWebFinishSchema = z.object({ ...flowRef, claim: claimField });
+export const discordUnlinkSchema = z.object({ password: passwordSchema });
+
+export type Handoff = 'launcher' | 'web';
 
 export interface DiscordStart {
   flowId: string;
@@ -69,15 +100,41 @@ function requireDiscord(deps: Deps): NonNullable<Deps['discord']> {
   return deps.discord;
 }
 
-/** Begin a flow. `accountId` is the signed-in account for intent "link" (its email must be verified). */
-export async function startDiscordFlow(deps: Deps, intent: 'login' | 'link', accountId: string | null): Promise<DiscordStart> {
+/** Begin a Discord login (launcher only). */
+export async function startDiscordLogin(deps: Deps): Promise<DiscordStart> {
+  return createFlow(deps, { intent: 'login', accountId: null, handoff: 'launcher' });
+}
+
+/**
+ * Begin linking Discord to the signed-in account. Refused when the account already has a Discord
+ * identity (409 `already_has_discord`) or has no password to re-authenticate with (409
+ * `password_required`; such an account signs in through its Discord already), then the current
+ * password is checked (401 `invalid_credentials`, 429 `rate_limited`; see verifyCurrentPassword).
+ */
+export async function startDiscordLink(
+  deps: Deps,
+  accountId: string,
+  input: z.infer<typeof discordLinkSchema>,
+  ctx: ReqCtx,
+): Promise<DiscordStart> {
+  requireDiscord(deps);
+  const account = await findAccountById(deps.db, accountId);
+  if (!account) throw new ApiError(404, 'account_not_found', 'No such account.');
+  const [mine] = await deps.db
+    .select({ id: oauthIdentities.id })
+    .from(oauthIdentities)
+    .where(and(eq(oauthIdentities.accountId, accountId), eq(oauthIdentities.provider, 'discord')))
+    .limit(1);
+  if (mine) throw new ApiError(409, 'already_has_discord', 'A Discord account is already linked. Unlink it first.');
+  if (account.passwordHash === null) throw new ApiError(409, 'password_required', 'Set a password before linking Discord.');
+  await verifyCurrentPassword(deps, { id: account.id, passwordHash: account.passwordHash }, input.password, ctx, deps.clock());
+  return createFlow(deps, { intent: 'link', accountId, handoff: input.handoff });
+}
+
+async function createFlow(deps: Deps, f: { intent: 'login' | 'link'; accountId: string | null; handoff: Handoff }): Promise<DiscordStart> {
   const discord = requireDiscord(deps);
-  if (intent === 'link') {
-    if (accountId === null) throw new ApiError(401, 'unauthorized', 'Sign in to link Discord.');
-    const account = await findAccountById(deps.db, accountId);
-    if (!account) throw new ApiError(404, 'account_not_found', 'No such account.');
-    assertEmailVerifiedForLoginChange(account);
-  }
+  const { intent, accountId } = f;
+  if (f.handoff === 'web' && intent !== 'link') throw new Error('a web handoff is for link flows only');
   const now = deps.clock();
   const state = randomToken(32);
   const verifier = randomToken(48); // 64 chars, inside RFC 7636's 43..128
@@ -92,6 +149,7 @@ export async function startDiscordFlow(deps: Deps, intent: 'login' | 'link', acc
       codeVerifier: verifier,
       pollSecretHash: hashToken(pollSecret),
       accountId: intent === 'link' ? accountId : null,
+      handoff: f.handoff,
       createdAt: now,
       expiresAt,
     })
@@ -104,8 +162,12 @@ export interface CallbackOutcome {
   ok: boolean;
   /** Stable code for the browser page and logs. */
   code: string;
-  /** What the browser page hands to the launcher (gage-mp://auth/discord?flow&claim). Absent when the state was not valid. Never logged, never shown. */
-  handoff?: { flowId: string; claim: string };
+  /**
+   * What the browser is handed: to the launcher (gage-mp://auth/discord?flow&claim) or, for a web
+   * flow, to the website's account page (a redirect with flow and claim in the fragment). Absent
+   * when the state was not valid. Never logged, never shown.
+   */
+  handoff?: { flowId: string; claim: string; to: Handoff };
 }
 
 interface StoredProfile {
@@ -151,7 +213,7 @@ export async function handleDiscordCallback(
 
   const claim = randomToken(32);
   const claimHash = hashToken(claim);
-  const handoff = { flowId: flow.id, claim };
+  const handoff = { flowId: flow.id, claim, to: flow.handoff === 'web' ? ('web' as const) : ('launcher' as const) };
 
   const fail = async (code: string): Promise<CallbackOutcome> => {
     await deps.db.update(oauthFlows).set({ status: 'failed', errorCode: code, codeVerifier: null, claimHash }).where(eq(oauthFlows.id, flow.id));
@@ -245,6 +307,8 @@ function claimMatches(flow: { claimHash: string | null }, claim: string | undefi
  */
 export async function pollDiscordFlow(deps: Deps, input: z.infer<typeof discordPollSchema>, meta: SessionMeta): Promise<PollResult> {
   const flow = await loadFlow(deps, input.flowId, input.pollSecret);
+  // A web flow is finished only on the account page, with the account's session (finishWebLink).
+  if (flow.handoff !== 'launcher') throw new ApiError(404, 'flow_not_found', 'No such login flow.');
   if (!claimMatches(flow, input.claim)) return { status: 'pending' };
   const now = deps.clock();
   switch (flow.status) {
@@ -273,11 +337,40 @@ export async function pollDiscordFlow(deps: Deps, input: z.infer<typeof discordP
   }
 }
 
+export type WebFinishResult = { status: 'linked' } | { status: 'failed'; code: string };
+
+/**
+ * The account page finishes a web link flow: the poll secret (kept by the tab that started it), the
+ * claim (handed to the browser that approved it) and a session of the account that started it. Any
+ * mismatch is 404 `flow_not_found`, the same answer as for an unknown flow: the victim of a phished
+ * authorize URL holds the claim but neither the attacker's poll secret nor the attacker's session,
+ * and the attacker holds the poll secret and the session but not the claim.
+ */
+export async function finishWebLink(deps: Deps, accountId: string, input: z.infer<typeof discordWebFinishSchema>): Promise<WebFinishResult> {
+  const flow = await loadFlow(deps, input.flowId, input.pollSecret);
+  if (flow.handoff !== 'web' || flow.intent !== 'link' || flow.accountId !== accountId || !claimMatches(flow, input.claim)) {
+    throw new ApiError(404, 'flow_not_found', 'No such login flow.');
+  }
+  switch (flow.status) {
+    case 'failed':
+      return { status: 'failed', code: flow.errorCode ?? 'discord_error' };
+    case 'link_ready': {
+      const result = await finishLink(deps, flow, deps.clock());
+      if (result.status === 'linked' || result.status === 'failed') return result;
+      throw new Error(`finishLink answered ${result.status}`);
+    }
+    default:
+      // A claim exists only once the callback ran, so pending cannot carry one; anything else is spent.
+      throw new ApiError(410, 'flow_used', 'This login flow was already completed.');
+  }
+}
+
 /**
  * Attach the approved Discord identity to the account that started the link flow. Runs under the
- * account row lock (the same one a password reset takes) and re-checks that the email is still
- * verified. The flow is spent in the same transaction; a refusal is reported as `failed` with a
- * stable code and also spends it. The owner is emailed after the commit.
+ * account row lock (the same one a password reset takes) and refuses (`password_changed`) when the
+ * password changed after the flow started: the re-authentication that started it no longer holds.
+ * The flow is spent in the same transaction; a refusal is reported as `failed` with a stable code
+ * and also spends it. The owner is emailed after the commit.
  */
 async function finishLink(deps: Deps, flow: typeof oauthFlows.$inferSelect, now: Date): Promise<PollResult> {
   const profile = flow.profile as StoredProfile | null;
@@ -302,7 +395,9 @@ async function finishLink(deps: Deps, flow: typeof oauthFlows.$inferSelect, now:
 
       const [account] = await tx.select().from(accounts).where(eq(accounts.id, accountId)).for('update');
       if (!account) return refused('invalid_request');
-      if (account.email !== null && account.emailVerifiedAt === null) return refused('email_not_verified');
+      // The flow was started with the password of that moment. A change since then (the owner's
+      // reset of a squatted address, or a change after a stolen session) voids it.
+      if (account.passwordChangedAt !== null && account.passwordChangedAt.getTime() > flow.createdAt.getTime()) return refused('password_changed');
 
       const [identity] = await tx
         .select()
@@ -393,16 +488,17 @@ export async function completeDiscordSignup(
 }
 
 /**
- * Remove the Discord link. Refused when it is the account's only way to log in, and while the
- * account's email is unverified (a login-method change). The owner is emailed.
+ * Remove the Discord link. Refused when it is the account's only way to log in (no password: 409
+ * `last_login_method`, checked first), then re-authenticated with the current password (a
+ * login-method change; 401 `invalid_credentials`, 429 `rate_limited`). The owner is emailed.
  */
-export async function unlinkDiscord(deps: Deps, accountId: string): Promise<void> {
+export async function unlinkDiscord(deps: Deps, accountId: string, input: z.infer<typeof discordUnlinkSchema>, ctx: ReqCtx): Promise<void> {
   const account = await findAccountById(deps.db, accountId);
   if (!account) throw new ApiError(404, 'account_not_found', 'No such account.');
-  assertEmailVerifiedForLoginChange(account);
   if (account.passwordHash === null) {
     throw new ApiError(409, 'last_login_method', 'Set a password before unlinking Discord: it is your only way to log in.');
   }
+  await verifyCurrentPassword(deps, { id: account.id, passwordHash: account.passwordHash }, input.password, ctx, deps.clock());
   const removed = await deps.db
     .delete(oauthIdentities)
     .where(and(eq(oauthIdentities.accountId, accountId), eq(oauthIdentities.provider, 'discord')))

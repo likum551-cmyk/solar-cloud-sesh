@@ -56,7 +56,8 @@ export const TABLE_NOTES: Record<string, TableNote> = {
       'The state hash is unique and consumed by a conditional UPDATE (status pending, not yet called back, not expired), so a replayed or forged callback matches nothing.',
       '`claim_hash` is the SHA-256 of the random claim the callback page hands to the approving browser (`gage-mp://auth/discord?flow&claim`). Poll and complete show nothing without it; it is cleared when the flow is consumed.',
       'The PKCE verifier and the stored Discord profile are cleared as soon as they are no longer needed; rows are purged a day after expiry.',
-      'Status is one of `pending`, `login_ready`, `needs_username`, `link_ready`, `linked` (legacy, no longer written), `failed`, `consumed`. A link flow stops at `link_ready`: the identity is attached by the claimed poll, never by the callback.',
+      'Status is one of `pending`, `login_ready`, `needs_username`, `link_ready`, `linked` (legacy, no longer written), `failed`, `consumed`. A link flow stops at `link_ready`: the identity is attached by the claimed poll (or the web finish), never by the callback.',
+      '`handoff` is `launcher` (the gage-mp:// URL, finished by the unauthenticated poll) or `web` (a redirect to the website\'s account page, finished there with a session of `account_id`); only a link flow can be `web` (`oauth_flows_web_is_link`), and the poll refuses web flows.',
     ],
   },
   oauth_identities: {
@@ -147,14 +148,31 @@ export const TABLE_NOTES: Record<string, TableNote> = {
     purpose: 'The in-game currency ledger. The balance of an account is the sum of its deltas.',
     invariants: [
       'Append-only: a trigger rejects UPDATE and DELETE.',
-      '`idempotency_key` is unique (`grant:<id>`, `revoke:<grantId>`, `spend:<serverId>:<key>`): replaying an operation is a no-op.',
-      'Purchases are positive, spends and revokes negative, never zero (`wallet_ledger_sign`).',
+      '`idempotency_key` is unique (`grant:<id>`, `revoke:<grantId>`, `spend:<serverId>:<key>`, `quest:<questId>:<accountId>`): replaying an operation is a no-op, and a quest can credit an account once.',
+      'Purchases and quest rewards are positive, spends and revokes negative, never zero (`wallet_ledger_sign`).',
       'A trigger updates `wallet_balances` in the same statement and rejects an insert that would take the balance below zero (`insufficient_funds`), except a `revoke` (a refund may leave a debt that later purchases pay off).',
     ],
   },
   wallet_balances: {
     purpose: 'The derived balance per account and currency.',
     invariants: ['Written only by the ledger trigger: a guard trigger rejects every other INSERT, UPDATE and DELETE, so a balance cannot exist without ledger entries that add up to it.'],
+  },
+  quests: {
+    purpose: 'The quest catalogue: tasks that pay coins (`discord_link`, `discord_guild`, `visit`). Changed with `npm run admin:quests`.',
+    invariants: [
+      '`slug` is unique and matches `[a-z0-9][a-z0-9_]{1,47}`; `kind` is one of the three.',
+      'Only a `visit` quest has a `url`, it is `https://` (at most 2048 characters), and an active visit quest must have one (`quests_active_visit_has_url`).',
+      'The reward is 1 to 1 000 000 of `currency` (`coins`).',
+    ],
+  },
+  quest_progress: {
+    purpose: 'Per account and quest: when a visit quest was started and the claim (time, the Discord account it was made under, the ledger entry that paid it).',
+    invariants: [
+      'One row per (account, quest): the primary key.',
+      'One claim per (Discord user id, quest) whatever account the Discord account is linked to (`quest_progress_discord_uq`), so unlinking and relinking Discord elsewhere cannot farm a quest again.',
+      'A claim is complete or absent: `claimed_at`, `discord_user_id` and `ledger_id` are set together (`quest_progress_claim_complete`). The ledger entry and the claim are written in one transaction.',
+      'A quest with progress cannot be deleted (deactivate it instead).',
+    ],
   },
   account_settings: {
     purpose: 'The launcher\'s per-account settings object.',
@@ -203,6 +221,7 @@ export const ENV_NOTES: Record<string, string> = {
   DISCORD_REDIRECT_URI: 'The redirect URI registered with Discord. Defaults to `<PUBLIC_API_URL>/v1/auth/discord/callback`.',
   DISCORD_API_BASE: 'Discord API base URL (only changed in tests).',
   DISCORD_FLOW_TTL_SECONDS: 'How long a Discord login may take from start to callback (60 to 3600).',
+  SITE_ORIGIN: 'The website\'s public origin (`scheme://host[:port]`, no path; https in production). A Discord link started on the website (handoff `web`) returns the browser to `<SITE_ORIGIN>/account/#discord_flow&discord_claim`. Configuration only: the redirect target is never read from a request.',
   PAYMENT_PROVIDER: 'The provider used for new checkouts. Only `fake` exists today; real ones implement `PaymentProvider` and are registered in `buildDeps()`.',
   ALLOW_FAKE_PAYMENTS_IN_PRODUCTION: '`1` lets a staging box run the fake provider with `NODE_ENV=production`. The fake provider grants items without charging anyone.',
   FAKE_WEBHOOK_SECRET: 'HMAC secret of the fake provider (at least 16 characters). Required whenever the fake provider is used, unless `ENABLE_DEV_ROUTES=1` (only then does it fall back to a public constant).',

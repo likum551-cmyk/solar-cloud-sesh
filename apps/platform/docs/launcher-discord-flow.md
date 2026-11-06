@@ -66,17 +66,18 @@ POST /v1/auth/discord/complete { flowId, pollSecret, claim, username }   -> sess
 - **After the URL arrives** poll once with the claim. Results:
   - `{ "status": "complete", "token", "expiresAt", "sessionId", "account" }`: logged in; the flow and the claim are spent (a second poll is 410 `flow_used`);
   - `{ "status": "needs_username", "suggestedUsername", "discordUsername" }`: a new player. Ask for the in-game name (3 to 20 of `[A-Za-z0-9_]`), then `complete` with the same `flowId`, `pollSecret` and `claim`. A taken or reserved name is 409 `username_taken` and does not spend the flow; ask again. `complete` without the claim is 400, with a wrong one 404 `flow_not_found`;
-  - `{ "status": "failed", "code": ... }`: show the reason (`access_denied`, `email_in_use`, `discord_error`, `invalid_request`; for a link also `discord_already_linked`, `already_has_discord`, `email_not_verified`). A refused sign-in still hands over a claim so the launcher can read why;
+  - `{ "status": "failed", "code": ... }`: show the reason (`access_denied`, `email_in_use`, `discord_error`, `invalid_request`; for a link also `discord_already_linked`, `already_has_discord`, `password_changed`). A refused sign-in still hands over a claim so the launcher can read why;
   - `{ "status": "linked" }` (link flows): done.
 - `email_in_use` means the Discord email belongs to a GAGE account. Tell the player to log in with their password and link Discord from the settings: there is no automatic merge.
 - The `flow`/`claim` URL can arrive **more than once** (a refresh of the page, a second click on "Return to GAGE"). Handle it idempotently: after the flow ended, ignore it.
 
 ## 5. Linking from the settings
 
-`POST /v1/me/discord/link` (signed in) returns the same `{ flowId, authorizeUrl, pollSecret, expiresAt }` and the rest is identical, with two differences:
+`POST /v1/me/discord/link { password }` (signed in; `handoff` defaults to `"launcher"`) returns the same `{ flowId, authorizeUrl, pollSecret, expiresAt }` and the rest is identical, with these differences:
 
-- It is refused with 403 `email_not_verified` while the account's email is unverified. Show "verify your email first" with a resend button (`POST /v1/auth/resend-verification`); the same applies to `DELETE /v1/me/discord` and to setting a first password.
-- The identity is attached by the **claimed poll** (`linked`), not by the browser. If the player closes the browser before "Return to GAGE" nothing is linked; start again.
+- It re-authenticates: ask the player for their current password and send it as `password`. A wrong one is 401 `invalid_credentials` ("that isn't your password", NOT a sign-out), repeated failures 429 `rate_limited` (with `Retry-After`). 409 `already_has_discord`: Discord is already linked; 409 `password_required`: a Discord-only account (it has Discord already). `DELETE /v1/me/discord { password }` re-authenticates the same way.
+- The identity is attached by the **claimed poll** (`linked`), not by the browser. If the player closes the browser before "Return to GAGE" nothing is linked; start again. A poll can also read `failed` with `password_changed` (the password changed after the start): start again.
+- The website links Discord on its own (`handoff: "web"`, finished on its account page); a web flow is not readable through `poll`.
 
 The platform emails the account owner when Discord is linked or unlinked; the launcher does not need to.
 
@@ -93,5 +94,5 @@ A failed or refused sign-in is HTTP 400 with the same button (so the launcher ca
 - [ ] The URL is validated as in section 3 and matched against a flow this launcher started.
 - [ ] `pollSecret` and `claim` live in native memory only; neither is logged or given to the web UI.
 - [ ] `claim` is sent with every poll after the URL arrived and with `complete`.
-- [ ] `flow_expired` and `flow_used` end the flow in the UI; `needs_username`, `failed` and `email_not_verified` have screens.
+- [ ] `flow_expired` and `flow_used` end the flow in the UI; `needs_username` and `failed` have screens; linking and unlinking ask for the current password.
 - [ ] Manual test on a clean Windows user profile: click login, approve in the browser, the launcher comes to the front, logged in. Repeat with the launcher closed (the URL starts it) and with Discord approval opened on a different machine (the launcher must NOT log in).

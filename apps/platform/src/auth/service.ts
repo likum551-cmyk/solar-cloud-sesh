@@ -81,10 +81,15 @@ export async function sendSafely(deps: Deps, send: () => Promise<void>, what: st
 }
 
 /**
- * Changing how an account can be signed in to (linking or unlinking Discord, setting a first
- * password) is refused while its email address is unverified. Whoever registers an address they do
- * not own must not be able to attach a way in that outlives the real owner's claim on the account.
- * An account with no email (Discord only) has nothing to verify.
+ * Setting a FIRST password (a Discord-only account) is refused while the account's email address is
+ * unverified: whoever holds an address they do not own must not attach a way in that outlives the
+ * real owner's claim. An account with no email has nothing to verify. (In practice a Discord-only
+ * account's email is always verified or absent: Discord signup stores only a verified one.)
+ *
+ * Linking and unlinking Discord no longer use this gate (Solar RP sends no email, so nobody could
+ * verify): they re-authenticate with the current password instead (verifyCurrentPassword), and a link
+ * started before the password changed is refused when it finishes (discord.ts finishLink). The real
+ * owner's reset still strips every identity from an account whose email was never verified.
  */
 export function assertEmailVerifiedForLoginChange(account: AccountRow): void {
   if (account.email !== null && account.emailVerifiedAt === null) {
@@ -409,8 +414,35 @@ export async function resetPassword(deps: Deps, input: z.infer<typeof resetPassw
   }
 }
 
-/** The throttle identifier of failed current-password checks: the account, not its login names. */
-const changePasswordIdentifier = (accountId: string): string => `chpw:${accountId}`;
+/**
+ * The throttle identifier of failed current-password checks: the account, not its login names. One
+ * budget for every re-authentication (changing the password, linking and unlinking Discord), so a
+ * stolen session gets no extra guesses by spreading them over several endpoints.
+ */
+const reauthIdentifier = (accountId: string): string => `chpw:${accountId}`;
+
+/**
+ * Re-authentication of a signed-in account: its CURRENT password, throttled like a login (per client
+ * address and per account, the same lockout policy; a locked key is 429 `rate_limited` before the
+ * password is checked). A wrong password is 401 `invalid_credentials` and counts as a failure; a right
+ * one clears this account's re-authentication counters (not the address-wide one, as in login).
+ */
+export async function verifyCurrentPassword(
+  deps: Deps,
+  account: { id: string; passwordHash: string },
+  password: string,
+  ctx: ReqCtx,
+  now: Date,
+): Promise<void> {
+  const keys = loginKeys(deps.config.login, ctx.ipGroup, ipLockGroup(ctx.ip), reauthIdentifier(account.id));
+  await assertNotLocked(deps.db, keys, now);
+  if (!(await verifyPassword(account.passwordHash, password))) {
+    await recordFailure(deps.db, deps.config.login, keys, now);
+    deps.logger.info('re-authentication failed', { ip: ctx.ip, requestId: ctx.requestId });
+    throw new ApiError(401, 'invalid_credentials', 'The current password is wrong.');
+  }
+  await clearFailures(deps.db, identifierKeyNames(keys));
+}
 
 /**
  * Change (or, for a Discord-only account, set) the password. Requires the current password when
@@ -433,12 +465,7 @@ export async function changePassword(
 
   if (account.passwordHash !== null) {
     if (input.currentPassword === undefined) throw new ApiError(400, 'current_password_required', 'The current password is required.');
-    const keys = loginKeys(deps.config.login, ctx.ipGroup, ipLockGroup(ctx.ip), changePasswordIdentifier(account.id));
-    await assertNotLocked(deps.db, keys, now);
-    if (!(await verifyPassword(account.passwordHash, input.currentPassword))) {
-      await recordFailure(deps.db, deps.config.login, keys, now);
-      throw new ApiError(401, 'invalid_credentials', 'The current password is wrong.');
-    }
+    await verifyCurrentPassword(deps, { id: account.id, passwordHash: account.passwordHash }, input.currentPassword, ctx, now);
     if (input.currentPassword === input.newPassword) {
       throw new ApiError(400, 'weak_password', 'The new password must differ from the current one.', { details: { problem: 'unchanged' } });
     }
@@ -461,7 +488,7 @@ export async function changePassword(
       .where(and(eq(authTokens.accountId, accountId), eq(authTokens.kind, 'password_reset'), isNull(authTokens.usedAt)));
     return revokeAllSessions(tx, accountId, { exceptSessionId: currentSessionId, reason: 'password_changed' }, now);
   });
-  await clearIdentifierFailures(deps.db, [changePasswordIdentifier(accountId), account.username, ...(account.email === null ? [] : [account.email])]);
+  await clearIdentifierFailures(deps.db, [reauthIdentifier(accountId), account.username, ...(account.email === null ? [] : [account.email])]);
   if (account.email !== null) {
     await sendSafely(deps, () => deps.email.send(passwordChangedMessage(account.email as string, account.username)), 'password_changed');
   }

@@ -144,4 +144,15 @@ describe('Discord', () => {
     const custom = load({ DISCORD_CLIENT_ID: 'id', DISCORD_CLIENT_SECRET: 'secret', DISCORD_REDIRECT_URI: 'https://other.example/cb', DISCORD_FLOW_TTL_SECONDS: '120' });
     expect(custom.discord).toMatchObject({ redirectUri: 'https://other.example/cb', flowTtlSeconds: 120 });
   });
+
+  it('SITE_ORIGIN (where a web link returns) defaults to https://solar-rp.com and must be a bare origin, https in production', () => {
+    expect(load({}).siteOrigin).toBe('https://solar-rp.com');
+    expect(load({ SITE_ORIGIN: 'https://Site.Example.test/' }).siteOrigin).toBe('https://site.example.test');
+    expect(load({ SITE_ORIGIN: 'http://localhost:5173' }).siteOrigin).toBe('http://localhost:5173');
+    for (const bad of ['https://solar-rp.com/account', 'solar-rp.com', 'javascript:alert(1)', 'https://evil.test#x', 'https://a@evil.test', 'https://solar-rp.com?x=1', 'gage-mp://auth']) {
+      expect(issuesOf({ SITE_ORIGIN: bad }), bad).toHaveLength(1);
+    }
+    expect(loadConfig({ ...PRODUCTION }).siteOrigin).toBe('https://solar-rp.com');
+    expect(() => loadConfig({ ...PRODUCTION, SITE_ORIGIN: 'http://solar-rp.com' })).toThrow(/SITE_ORIGIN must be https/);
+  });
 });

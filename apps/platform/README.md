@@ -47,6 +47,7 @@ With `NODE_ENV=development`, `EMAIL_DRIVER=console` prints each outgoing mail (v
 | `npm run db:migrate` | apply pending migrations to `DATABASE_URL` |
 | `npm run admin:grant-role` | give or remove a role from the shell (first admin) |
 | `npm run admin:create-server` | register a game server and print its secret once |
+| `npm run admin:quests` | list, add, set the URL or reward of, and switch on or off the quests that pay coins |
 | `npm run docs:reference -- --write` | regenerate the reference block of `docs/api.md` from the code |
 | `npm run docs:check` | fail when the docs and the code disagree (also part of `npm test`) |
 
@@ -57,6 +58,7 @@ Schema source: `src/db/schema.ts`. Migrations are plain SQL in `drizzle/`, appli
 - `drizzle/0000_init.sql` creates the tables.
 - `drizzle/0001_invariants.sql` is hand-written: the append-only triggers on `wallet_ledger` and `audit_log`, the wallet balance trigger (no overdraw except a `revoke`), the order state machine trigger and the immutable `order_items`. The server's guarantees rest on these.
 - `drizzle/0002_security_hardening.sql` binds a grant's ack to the server it was delivered to (`grants.delivering_server`, checked by `grants_ack_matches_binding`) and adds the Discord flow's claim (`oauth_flows.claim_hash`, status `link_ready`).
+- `drizzle/0003_quests.sql` adds the quests (`quests`, `quest_progress`), the ledger reason `quest` and a seed: "Link your Discord" on at 500 coins; the social quests (YouTube, Facebook, Instagram, TikTok, X) off with no URL; "Join the Solar RP Discord" off (not available yet).
 
 ```bash
 # change src/db/schema.ts, then:
@@ -84,7 +86,19 @@ npm run admin:create-server -- --id eu-1 --name "GAGE EU 1" --region eu \
     --host 203.0.113.10 --port 24800 --allowed-ip 203.0.113.10
 ```
 
-`admin:create-server` prints the server secret once (only a hash is stored). Put it in the game server's environment. Both commands accept `--dry-run`, are audited as `cli:<os user>`, and need `DATABASE_URL`. Roles are `player`, `mod`, `admin`; the last admin cannot be removed.
+Quests (coins for linking Discord and for following the Solar RP channels; [docs/api.md](docs/api.md#quests)). A social quest goes live once it has its channel URL:
+
+```bash
+npm run admin:quests -- list
+npm run admin:quests -- set-url --slug youtube_subscribe --url https://www.youtube.com/@<channel> --dry-run
+npm run admin:quests -- set-url --slug youtube_subscribe --url https://www.youtube.com/@<channel>
+npm run admin:quests -- activate --slug youtube_subscribe
+npm run admin:quests -- set-reward --slug link_discord --amount 500
+npm run admin:quests -- add --slug discord_event --kind visit --title "..." --url https://... --reward 100 --sort 70
+# release build: node --env-file=/opt/gage/platform.env dist/scripts/quests.js <command> [flags]
+```
+
+`admin:create-server` prints the server secret once (only a hash is stored). Put it in the game server's environment. All three commands accept `--dry-run`, are audited as `cli:<os user>`, and need `DATABASE_URL`. Roles are `player`, `mod`, `admin`; the last admin cannot be removed.
 
 ## Configuration
 
@@ -160,9 +174,11 @@ Before launch:
 - The launcher side of Discord login (the `gage-mp://` URL scheme and passing the claim on) is in [docs/launcher-discord-flow.md](docs/launcher-discord-flow.md); without it a Discord login cannot finish.
 - Put a breached-password check in front of `checkPassword` (`src/auth/password.ts`): the bundled common-password list is short.
 
-## Deploy on the VPS (notes only; nothing here has been run)
+## Deploy on the VPS
 
-The repository's `deploy/` folder holds the systemd unit (`deploy/systemd/gage-platform.service`), the Caddy site (`deploy/caddy/Caddyfile`) and `deploy/scripts/release.sh`, which builds, backs up, migrates and switches a release. The shape it expects:
+The Solar RP VPS is deployed by `tools/deploy/deploy-platform.sh` (run it with `--dry-run` first; `docs/OPS.md`, section "Platform API"): PostgreSQL on the same host, settings in `/opt/gage/platform.env` (template `tools/deploy/platform.env.example`), unit `tools/deploy/gage-platform.service`, and Caddy's `https://solar-rp.com/api/*` route to the public listener. The notes below are the general shape it follows.
+
+The repository's older `deploy/` folder holds the systemd unit (`deploy/systemd/gage-platform.service`), the Caddy site (`deploy/caddy/Caddyfile`) and `deploy/scripts/release.sh`, which builds, backs up, migrates and switches a release. The shape it expects:
 
 1. PostgreSQL 15+ on the same host or a private network; a database and a role for the platform (`createdb gage_platform`, a role with `LOGIN` that owns it). Back it up with `pg_dump` (`deploy/scripts/backup-db.sh`).
 2. `/etc/gage/platform.env` (mode 600, owned by the service user) with the variables above and `NODE_ENV=production`.
@@ -189,6 +205,7 @@ src/
   servers/         server table, credentials, UDP query probe and status cache
   game/            join tokens, verify, game sessions
   shop/            products, orders, state machine, providers, webhooks, grants, wallet
+  quests/          quests that pay coins (player service, admin operations)
   settings.ts      per-account launcher settings
   maintenance.ts   housekeeping
   http/            router and middleware, route files per area, OpenAPI generation

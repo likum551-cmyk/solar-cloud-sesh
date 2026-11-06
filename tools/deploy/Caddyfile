@@ -6,6 +6,10 @@
 #   https://solar-rp.com/update/*     the launcher's update feed: version.json (signed) and the installers, from
 #                                     /var/www/gage/update, written by tools/deploy/publish-client.sh. Launchers from
 #                                     0.4.0 on have https://solar-rp.com/update/version.json baked in.
+#   https://solar-rp.com/api/*        the platform API (apps/platform: accounts, login, join tokens, shop), proxied to its
+#                                     public listener 127.0.0.1:8787 with /api stripped; tools/deploy/deploy-platform.sh
+#                                     deploys it. HTTPS only: never on the bare IP or plain HTTP (login and tokens would
+#                                     travel in clear). The game-server listener is not proxied.
 #   https://solar-rp.com/* (the rest) the website (apps/website) from /var/www/gage/site, a symlink to the live release
 #                                     that tools/deploy/deploy-site.sh switches. Also on the bare IP over plain HTTP.
 #   https://www.solar-rp.com/*        permanent redirect to the apex.
@@ -60,8 +64,9 @@
 	# Footage, stills and screenshots keep their names across deploys: a day, then revalidate.
 	@media path /media/* /shots/* /og.png /apple-touch-icon.png /favicon.svg /favicon-32.png /mark.svg
 	header @media Cache-Control "public, max-age=86400"
-	# The page itself names the hashed files: always revalidate it, so a deploy is seen at once.
-	@page path / /index.html
+	# Every page names the hashed files: always revalidate them, so a deploy is seen at once (a cached page would point at
+	# assets the deploy removed). The home page and the account pages (folders served by their index.html).
+	@page path / /index.html /signup/ /signup/index.html /login/ /login/index.html /account/ /account/index.html
 	header @page Cache-Control "no-cache"
 
 	# Everything the page loads is its own: scripts and fonts from /assets, footage from /media, the release manifest from
@@ -74,6 +79,15 @@
 		Strict-Transport-Security "max-age=31536000"
 	}
 	file_server
+}
+
+(gage_api) {
+	# The platform API (apps/platform, tools/deploy/deploy-platform.sh): only its PUBLIC listener. handle_path strips the
+	# /api prefix, so /api/v1/auth/login reaches /v1/auth/login. reverse_proxy ignores an X-Forwarded-For the client
+	# sent (no trusted_proxies here) and sets it to the client address, which the platform reads with TRUST_PROXY=1.
+	# The game-server listener (127.0.0.1:8788, /internal/*) is NEVER proxied: game servers call it on loopback.
+	# The platform sets its own Cache-Control: no-store, nosniff and CORS (only the launcher's https://app.gage).
+	reverse_proxy 127.0.0.1:8787
 }
 
 # ---- https://solar-rp.com --------------------------------------------------------------------------------------
@@ -92,6 +106,10 @@
 	# 	reverse_proxy 127.0.0.1:8080
 	# }
 	# Then set list_url=https://solar-rp.com/servers in gage_mp.cfg, or change kDefaultListUrl in libs/net/serverfinder.h.
+
+	handle_path /api/* {
+		import gage_api
+	}
 
 	# Everything else is the website.
 	handle {
@@ -113,6 +131,8 @@ www.{$DOMAIN:solar-rp.com} {
 	handle /healthz {
 		respond "ok" 200
 	}
+	# No platform API here: over plain HTTP it would carry passwords and session tokens in clear. The launcher's baked
+	# API base is https://solar-rp.com/api; /api/* on the bare IP falls through to the website (its 404).
 	# The website on the bare IP too (plain HTTP; the browser ignores HSTS sent over http).
 	handle {
 		import gage_site

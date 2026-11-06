@@ -334,10 +334,10 @@ describe('never auto-merge by email', () => {
     const u = await owner();
     const profile = newProfile({ username: 'linker', email: u.email, verified: true });
 
-    expect((await env.call('/v1/me/discord/link', { method: 'POST', ip: freshIp() })).status).toBe(401);
-    const link = await env.call<FlowStart>('/v1/me/discord/link', { method: 'POST', token: u.token });
+    expect((await env.call('/v1/me/discord/link', { json: { password: u.password }, ip: freshIp() })).status).toBe(401);
+    const link = await env.call<FlowStart>('/v1/me/discord/link', { json: { password: u.password }, token: u.token });
     expect(link.status).toBe(200);
-    expect((await flowRow(link.body.flowId))).toMatchObject({ intent: 'link', accountId: u.accountId });
+    expect((await flowRow(link.body.flowId))).toMatchObject({ intent: 'link', accountId: u.accountId, handoff: 'launcher' });
     const { code, state } = discord.approve(link.body.authorizeUrl, profile);
     expect((await callback({ code, state })).status).toBe(200);
     expect((await poll(link.body)).body).toEqual({ status: 'linked' });
@@ -357,16 +357,24 @@ describe('never auto-merge by email', () => {
     const a = await owner();
     const b = await owner();
     const profile = newProfile();
-    const linkWith = async (user: TestUser, p: DiscordProfile) => {
-      const link = await env.call<FlowStart>('/v1/me/discord/link', { method: 'POST', token: user.token });
-      const { code, state } = discord.approve(link.body.authorizeUrl, p);
+    const startLink = (user: TestUser) => env.call<FlowStart>('/v1/me/discord/link', { json: { password: user.password }, token: user.token });
+    const linkWith = async (user: TestUser, p: DiscordProfile, flow?: FlowStart) => {
+      const link = flow ?? (await startLink(user)).body;
+      const { code, state } = discord.approve(link.authorizeUrl, p);
       await callback({ code, state });
-      return poll(link.body);
+      return poll(link);
     };
+    // Two flows of A started before anything is linked: they finish after the first link landed.
+    const second = (await startLink(a)).body;
+    const third = (await startLink(a)).body;
     expect((await linkWith(a, profile)).body.status).toBe('linked');
     expect((await linkWith(b, profile)).body).toEqual({ status: 'failed', code: 'discord_already_linked' });
-    expect((await linkWith(a, newProfile())).body).toEqual({ status: 'failed', code: 'already_has_discord' });
-    expect((await linkWith(a, profile)).body.status).toBe('linked'); // the same pair again is a harmless no-op
+    expect((await linkWith(a, newProfile(), second)).body).toEqual({ status: 'failed', code: 'already_has_discord' });
+    expect((await linkWith(a, profile, third)).body.status).toBe('linked'); // the same pair again is a harmless no-op
+    // Once linked, a new start is refused before anyone is sent to Discord.
+    const again = await startLink(a);
+    expect(again.status).toBe(409);
+    expect((again.body as unknown as { error: { code: string } }).error.code).toBe('already_has_discord');
     const rows = await env.handle.db.select().from(schema.oauthIdentities).where(eq(schema.oauthIdentities.providerUserId, profile.id));
     expect(rows).toHaveLength(1);
     expect(rows[0]?.accountId).toBe(a.accountId);
@@ -383,15 +391,21 @@ describe('never auto-merge by email', () => {
 });
 
 describe('unlinking', () => {
-  const unlink = (u: TestUser) => env.call<{ error?: { code: string } }>('/v1/me/discord', { method: 'DELETE', token: u.token });
+  const unlink = (u: TestUser, password = u.password) => env.call<{ error?: { code: string } }>('/v1/me/discord', { method: 'DELETE', json: { password }, token: u.token, ip: freshIp() });
 
-  it('a password account can unlink; unlinking twice is a 404', async () => {
+  it('a password account can unlink with its current password; unlinking twice is a 404', async () => {
     const u = await makeUser(env);
     const profile = newProfile();
-    const link = await env.call<FlowStart>('/v1/me/discord/link', { method: 'POST', token: u.token });
+    const link = await env.call<FlowStart>('/v1/me/discord/link', { json: { password: u.password }, token: u.token });
     const { code, state } = discord.approve(link.body.authorizeUrl, profile);
     await callback({ code, state });
     expect((await poll(link.body)).body.status).toBe('linked');
+    // Re-authentication: no password is a 400, a wrong one 401 (and nothing is removed).
+    expect((await env.call('/v1/me/discord', { method: 'DELETE', token: u.token })).status).toBe(400);
+    const wrong = await unlink(u, 'not-the-password-123');
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error?.code).toBe('invalid_credentials');
+    expect((await env.call<{ account: { discord: unknown } }>('/v1/me', { token: u.token })).body.account.discord).not.toBeNull();
     expect((await unlink(u)).status).toBe(204);
     const me = await env.call<{ account: { discord: unknown } }>('/v1/me', { token: u.token });
     expect(me.body.account.discord).toBeNull();
@@ -402,13 +416,13 @@ describe('unlinking', () => {
     const profile = newProfile({ email: 'discord.only@example.test', verified: true });
     const { done } = await signUpWithDiscord(profile, 'Discord_Only_1');
     const token = done.token as string;
-    const res = await env.call<{ error: { code: string } }>('/v1/me/discord', { method: 'DELETE', token });
+    const res = await env.call<{ error: { code: string } }>('/v1/me/discord', { method: 'DELETE', json: { password: 'any-password-at-all' }, token });
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('last_login_method');
 
     const set = await env.call('/v1/me/password', { json: { newPassword: 'first-ever-password-42' }, token });
     expect(set.status, JSON.stringify(set.body)).toBe(200);
-    expect((await env.call('/v1/me/discord', { method: 'DELETE', token })).status).toBe(204);
+    expect((await env.call('/v1/me/discord', { method: 'DELETE', json: { password: 'first-ever-password-42' }, token })).status).toBe(204);
     const login = await env.call('/v1/auth/login', { json: { identifier: 'discord.only@example.test', password: 'first-ever-password-42' }, ip: freshIp() });
     expect(login.status).toBe(200);
   });
@@ -420,7 +434,7 @@ describe('unlinking', () => {
     const set = await env.call<{ error: { code: string } }>('/v1/me/password', { json: { newPassword: 'first-ever-password-43' }, token });
     expect(set.status).toBe(409);
     expect(set.body.error.code).toBe('email_required');
-    expect((await env.call('/v1/me/discord', { method: 'DELETE', token })).status).toBe(409);
+    expect((await env.call('/v1/me/discord', { method: 'DELETE', json: { password: 'any-password-at-all' }, token })).status).toBe(409);
   });
 
   it('a Discord-only account can also reach a password through the emailed reset', async () => {
@@ -433,7 +447,168 @@ describe('unlinking', () => {
     const login = await env.call<{ token: string; account: { id: string } }>('/v1/auth/login', { json: { identifier: 'Discord_Reset_1', password: 'reset-through-mail-99' }, ip: freshIp() });
     expect(login.status).toBe(200);
     expect(login.body.account.id).toBe(done.account?.id);
-    expect((await env.call('/v1/me/discord', { method: 'DELETE', token: login.body.token })).status).toBe(204);
+    expect((await env.call('/v1/me/discord', { method: 'DELETE', json: { password: 'reset-through-mail-99' }, token: login.body.token })).status).toBe(204);
+  });
+});
+
+describe('linking from the website (handoff "web")', () => {
+  type Err = { error?: { code: string } };
+  const startWeb = (u: TestUser, password = u.password, ip = freshIp()) =>
+    env.call<FlowStart & Err>('/v1/me/discord/link', { json: { password, handoff: 'web' }, token: u.token, ip });
+  /** The approving browser hits the callback; a web flow answers with a redirect to the account page. */
+  async function webCallback(q: { code?: string; state?: string; error?: string }, app = env.app) {
+    const qs = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined) as [string, string][]).toString();
+    const res = await app.request(`/v1/auth/discord/callback?${qs}`, {}, { incoming: { socket: { remoteAddress: freshIp() } } });
+    const location = res.headers.get('location');
+    const url = location === null ? null : new URL(location);
+    const fragment = new URLSearchParams(url?.hash.slice(1) ?? '');
+    return { status: res.status, location, url, flowId: fragment.get('discord_flow'), claim: fragment.get('discord_claim'), body: await res.text() };
+  }
+  const finish = (u: TestUser, body: Record<string, unknown>) => env.call<Poll>('/v1/me/discord/link/finish', { json: body, token: u.token, ip: freshIp() });
+  const coins = async (u: TestUser) =>
+    (await env.call<{ balances: { currency: string; balance: number }[] }>('/v1/me/wallet', { token: u.token })).body.balances.find((b) => b.currency === 'coins')?.balance ?? 0;
+  const linkQuest = async (u: TestUser) =>
+    (await env.call<{ discordLinked: boolean; quests: { slug: string; status: string; lockReason: string | null }[] }>('/v1/me/quests', { token: u.token })).body;
+
+  it('start (password) -> Discord -> 303 to the account page with flow and claim in the fragment -> finish links; the link quest then pays 500', async () => {
+    const u = await makeUser(env);
+    const before = await linkQuest(u);
+    expect(before.discordLinked).toBe(false);
+    expect(before.quests.find((q) => q.slug === 'link_discord')).toMatchObject({ status: 'locked', lockReason: 'discord_required' });
+    expect((await env.call<Err>('/v1/me/quests/link_discord/claim', { method: 'POST', token: u.token })).body.error?.code).toBe('discord_required');
+
+    const start = await startWeb(u);
+    expect(start.status, JSON.stringify(start.body)).toBe(200);
+    expect(await flowRow(start.body.flowId)).toMatchObject({ intent: 'link', handoff: 'web', accountId: u.accountId, status: 'pending' });
+
+    const profile = newProfile({ username: 'web.linker' });
+    const { code, state } = discord.approve(start.body.authorizeUrl, profile);
+    const cb = await webCallback({ code, state });
+    expect(cb.status).toBe(303);
+    // The configured site origin, the account page, nothing in the query (so nothing in any access log), flow and claim in the fragment.
+    expect(cb.url?.origin).toBe('https://solar-rp.com');
+    expect(cb.url?.pathname).toBe('/account/');
+    expect(cb.url?.search).toBe('');
+    expect(cb.flowId).toBe(start.body.flowId);
+    expect(cb.claim).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(cb.location).not.toContain(code);
+    expect(cb.location).not.toContain(state);
+    expect(cb.body).not.toContain('gage-mp://');
+    expect((await flowRow(start.body.flowId))?.claimHash).toBe(hashToken(cb.claim as string));
+
+    const done = await finish(u, { flowId: start.body.flowId, pollSecret: start.body.pollSecret, claim: cb.claim });
+    expect(done.status, JSON.stringify(done.body)).toBe(200);
+    expect(done.body).toEqual({ status: 'linked' });
+    const me = await env.call<{ account: { discord: { id: string; username: string } | null } }>('/v1/me', { token: u.token });
+    expect(me.body.account.discord).toEqual({ id: profile.id, username: 'web.linker' });
+    // Spent: a second finish is 410.
+    expect((await finish(u, { flowId: start.body.flowId, pollSecret: start.body.pollSecret, claim: cb.claim })).status).toBe(410);
+
+    // The quest the link unlocks is now claimable and pays.
+    const after = await linkQuest(u);
+    expect(after.discordLinked).toBe(true);
+    expect(after.quests.find((q) => q.slug === 'link_discord')?.status).toBe('claimable');
+    const paid = await env.call<{ credited: { currency: string; amount: number }; balance: number }>('/v1/me/quests/link_discord/claim', { method: 'POST', token: u.token });
+    expect(paid.status, JSON.stringify(paid.body)).toBe(200);
+    expect(paid.body.credited).toEqual({ currency: 'coins', amount: 500 });
+    expect(await coins(u)).toBe(500);
+  });
+
+  it('a refusal also comes back to the account page, and the page reads its code: Discord already linked to another account, access denied', async () => {
+    const owner = await makeUser(env);
+    const other = await makeUser(env);
+    const profile = newProfile();
+    const first = (await startWeb(owner)).body;
+    const a = discord.approve(first.authorizeUrl, profile);
+    const cbA = await webCallback(a);
+    expect((await finish(owner, { flowId: first.flowId, pollSecret: first.pollSecret, claim: cbA.claim })).body).toEqual({ status: 'linked' });
+
+    const taken = (await startWeb(other)).body;
+    const cbB = await webCallback(discord.approve(taken.authorizeUrl, profile));
+    expect(cbB.status).toBe(303);
+    expect((await finish(other, { flowId: taken.flowId, pollSecret: taken.pollSecret, claim: cbB.claim })).body).toEqual({ status: 'failed', code: 'discord_already_linked' });
+    expect((await env.call<{ account: { discord: unknown } }>('/v1/me', { token: other.token })).body.account.discord).toBeNull();
+    const rows = await env.handle.db.select().from(schema.oauthIdentities).where(eq(schema.oauthIdentities.providerUserId, profile.id));
+    expect(rows.map((r) => r.accountId)).toEqual([owner.accountId]);
+
+    const denied = (await startWeb(other)).body;
+    const cbD = await webCallback({ error: 'access_denied', state: new URL(denied.authorizeUrl).searchParams.get('state') as string });
+    expect(cbD.status).toBe(303);
+    expect((await finish(other, { flowId: denied.flowId, pollSecret: denied.pollSecret, claim: cbD.claim })).body).toEqual({ status: 'failed', code: 'access_denied' });
+  });
+
+  it('a wrong password is refused, counted and then locked like a login (shared with the password change); another address block is not locked out', async () => {
+    const u = await makeUser(env);
+    const ip = '192.0.2.10';
+    for (let i = 0; i < 3; i++) {
+      const wrong = await startWeb(u, `wrong-password-${i}-xx`, ip);
+      expect(wrong.status).toBe(401);
+      expect(wrong.body.error?.code).toBe('invalid_credentials');
+    }
+    // Two more wrong guesses through the password change: one budget for every re-authentication.
+    for (let i = 0; i < 2; i++) {
+      expect((await env.call('/v1/me/password', { json: { currentPassword: `wrong-password-cp-${i}`, newPassword: 'a-brand-new-password-1' }, token: u.token, ip })).status).toBe(401);
+    }
+    expect(await env.handle.db.select().from(schema.oauthFlows).where(eq(schema.oauthFlows.accountId, u.accountId))).toHaveLength(0);
+    // Locked from this block: even the right password is refused before it is checked.
+    const locked = await startWeb(u, u.password, ip);
+    expect(locked.status).toBe(429);
+    expect(locked.body.error?.code).toBe('rate_limited');
+    expect(Number(locked.headers.get('retry-after'))).toBeGreaterThan(0);
+    // The account's owner elsewhere is not locked out by somebody else's guesses.
+    expect((await startWeb(u, u.password, '203.0.113.200')).status).toBe(200);
+  });
+
+  it('a link finished after the password changed is refused (password_changed), and nothing is linked', async () => {
+    const u = await makeUser(env);
+    const start = (await startWeb(u)).body;
+    const cb = await webCallback(discord.approve(start.authorizeUrl, newProfile()));
+    env.clock.advanceSeconds(2);
+    const changed = await env.call('/v1/me/password', { json: { currentPassword: u.password, newPassword: 'changed-after-start-77' }, token: u.token, ip: freshIp() });
+    expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+    expect((await finish(u, { flowId: start.flowId, pollSecret: start.pollSecret, claim: cb.claim })).body).toEqual({ status: 'failed', code: 'password_changed' });
+    expect((await env.call<{ account: { discord: unknown } }>('/v1/me', { token: u.token })).body.account.discord).toBeNull();
+  });
+
+  it('the redirect target is configuration only: a query parameter cannot move it, SITE_ORIGIN does', async () => {
+    const u = await makeUser(env);
+    const start = (await startWeb(u)).body;
+    const { code, state } = discord.approve(start.authorizeUrl, newProfile());
+    const params = new URLSearchParams({ code, state, redirect_uri: 'https://evil.test/', return_to: 'https://evil.test/', next: '//evil.test' });
+    const res = await env.app.request(`/v1/auth/discord/callback?${params.toString()}`, {}, { incoming: { socket: { remoteAddress: freshIp() } } });
+    expect(res.status).toBe(303);
+    expect(new URL(res.headers.get('location') ?? '').origin).toBe('https://solar-rp.com');
+
+    // Another deployment's origin comes from its configuration.
+    const elsewhere = createApp({ ...env.deps, config: { ...env.config, siteOrigin: 'https://staging.solar-rp.test' } }, 'all').app;
+    const s2 = (await startWeb(u)).body;
+    const cb2 = await webCallback(discord.approve(s2.authorizeUrl, newProfile()), elsewhere);
+    expect(cb2.url?.origin).toBe('https://staging.solar-rp.test');
+    expect(cb2.url?.pathname).toBe('/account/');
+  });
+
+  it('needs a session, a password and a known handoff; a Discord-only account is told it already has Discord', async () => {
+    const u = await makeUser(env);
+    expect((await env.call('/v1/me/discord/link', { json: { password: u.password, handoff: 'web' }, ip: freshIp() })).status).toBe(401);
+    expect((await env.call('/v1/me/discord/link', { json: { handoff: 'web' }, token: u.token, ip: freshIp() })).status).toBe(400);
+    expect((await env.call('/v1/me/discord/link', { json: { password: u.password, handoff: 'https://evil.test' }, token: u.token, ip: freshIp() })).status).toBe(400);
+    expect((await env.call('/v1/me/discord/link/finish', { json: { flowId: '11111111-1111-4111-8111-111111111111', pollSecret: randomToken(32), claim: randomToken(32) }, ip: freshIp() })).status).toBe(401);
+
+    const { done } = await signUpWithDiscord(newProfile({ email: null }), `WebDcOnly_${String(discordIdCounter).slice(-5)}`);
+    const res = await env.call<Err>('/v1/me/discord/link', { json: { password: 'whatever-password-1', handoff: 'web' }, token: done.token as string, ip: freshIp() });
+    expect(res.status).toBe(409);
+    expect(res.body.error?.code).toBe('already_has_discord');
+  });
+
+  it('the database refuses a web handoff on a login flow, and any handoff it does not know', async () => {
+    const row = (over: Partial<typeof schema.oauthFlows.$inferInsert>) =>
+      env.handle.db.insert(schema.oauthFlows).values({ provider: 'discord', intent: 'login', stateHash: hashToken(randomToken(32)), pollSecretHash: hashToken(randomToken(32)), expiresAt: env.clock.now(), ...over });
+    await expect(row({ handoff: 'web' })).rejects.toThrow();
+    await expect(row({ handoff: 'browser' })).rejects.toThrow();
+    // Controls: the same row as a launcher login, and as a web link, are accepted.
+    await expect(row({ handoff: 'launcher' })).resolves.toBeDefined();
+    const u = await makeUser(env);
+    await expect(row({ intent: 'link', accountId: u.accountId, handoff: 'web' })).resolves.toBeDefined();
   });
 });
 

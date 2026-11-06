@@ -55,7 +55,7 @@ Money is always an integer in minor units (cents) with an ISO 4217 code. Ids are
 - Stored as argon2id (`@node-rs/argon2`) with a random salt in a PHC string. Defaults are OWASP's: `m=19456` KiB, `t=2`, `p=1` (`ARGON2_*`). A hash made with weaker parameters is replaced after the next successful login. A malformed stored hash never throws: it just does not verify.
 - **Load limit.** Every hash and verify in the process (login, register, reset, password change) goes through one limiter: at most `ARGON2_MAX_CONCURRENT` (2) run at once and `ARGON2_MAX_QUEUE` (64) wait; the next one is refused immediately with 503 `busy` and `Retry-After`, so a burst of password attempts cannot exhaust memory or the thread pool. A refused request is not counted against the caller (it is not a wrong password) and does not spend a reset or verification token. `POST /v1/me/password` is additionally limited to 10 calls per hour per account.
 
-**Email verification and password reset.** Both use random 256-bit tokens of which only the SHA-256 is stored. A token is single use (consumption is one conditional UPDATE, so concurrent attempts cannot both succeed), expires (`EMAIL_VERIFY_TTL_HOURS`, `PASSWORD_RESET_TTL_MINUTES`), is of one kind only, and a newer token voids the older. A verification token is void if the account's email changed after it was issued. Tokens are redeemed by **POST** so mail scanners that open links cannot consume them; the mail links to `EMAIL_LINK_BASE_URL` (by default the launcher's `gage-mp://auth`). A rejected weak password during reset leaves the token usable. A successful reset revokes every session, marks the email verified and clears the login lockout; **if the email was not verified before, every Discord identity attached to the account is deleted in the same transaction** (whoever registered an address they do not own must not keep a way in) and the owner is mailed. Changing the password with `POST /v1/me/password` voids every outstanding reset token. `forgot-password` always answers 202 and is limited to 10 requests per hour per client IP (`forgot-password`, checked first) and 3 per hour per email address, in that order: a client that is already limited cannot spend the address's budget and so cannot keep its owner from getting a reset mail. Verification gates joining and buying (`REQUIRE_VERIFIED_EMAIL`), never logging in. **Changing how an account can be signed in to needs a verified email:** starting a Discord link, unlinking Discord and setting a first password are refused with 403 `email_not_verified` until then. Linking or unlinking a Discord identity mails the owner (`discord_linked`, `discord_unlinked`).
+**Email verification and password reset.** Both use random 256-bit tokens of which only the SHA-256 is stored. A token is single use (consumption is one conditional UPDATE, so concurrent attempts cannot both succeed), expires (`EMAIL_VERIFY_TTL_HOURS`, `PASSWORD_RESET_TTL_MINUTES`), is of one kind only, and a newer token voids the older. A verification token is void if the account's email changed after it was issued. Tokens are redeemed by **POST** so mail scanners that open links cannot consume them; the mail links to `EMAIL_LINK_BASE_URL` (by default the launcher's `gage-mp://auth`). A rejected weak password during reset leaves the token usable. A successful reset revokes every session, marks the email verified and clears the login lockout; **if the email was not verified before, every Discord identity attached to the account is deleted in the same transaction** (whoever registered an address they do not own must not keep a way in) and the owner is mailed. Changing the password with `POST /v1/me/password` voids every outstanding reset token. `forgot-password` always answers 202 and is limited to 10 requests per hour per client IP (`forgot-password`, checked first) and 3 per hour per email address, in that order: a client that is already limited cannot spend the address's budget and so cannot keep its owner from getting a reset mail. Verification gates joining and buying (`REQUIRE_VERIFIED_EMAIL`), never logging in. **Setting a first password needs a verified email** (403 `email_not_verified`; a Discord-only account's email is verified or absent in practice). Linking and unlinking Discord re-authenticate with the current password instead (see [Discord](#discord-login-and-linking)). Linking or unlinking a Discord identity mails the owner (`discord_linked`, `discord_unlinked`).
 
 **Mail delivery.** The platform talks to an `EmailSender` interface (`src/email.ts`). The shipped implementations are the dev outbox (rows in `email_outbox`) and a console logger. Neither delivers mail, and neither keeps a working token: the outbox stores the body, subject and meta with every live token replaced by `[redacted]`, and the full link is logged only when `NODE_ENV=development`. Implement the interface with your provider and pass it to `buildDeps({ email })` before launch; a real sender receives the whole message, tokens included (`EmailMessage.secrets` lists them). The server logs a warning at start in production while this is not done.
 
@@ -93,7 +93,8 @@ Rules:
 
 - **State and PKCE.** The `state` is random, stored only as a hash, valid `DISCORD_FLOW_TTL_SECONDS` (600) and consumed by one conditional UPDATE, so a forged, expired or replayed callback matches nothing and causes no request to Discord. The PKCE verifier never leaves the server and is erased as soon as the callback finished.
 - **Two secrets, two channels (no login phishing).** The poll secret never leaves the launcher that started the flow; the claim only ever reaches the browser of whoever approved on Discord, and from there the launcher on the same machine. Without the claim, `poll` answers `{"status":"pending"}` exactly as it does for a flow nobody approved, and `complete` is refused (400 without a `claim` field, 404 `flow_not_found` with a wrong one), so someone who starts a flow and sends the authorize URL to a victim cannot read or take the victim's approval: the victim's browser holds the claim, the attacker's launcher holds the poll secret, and only the same machine has both. The claim is compared in constant time, is single use (cleared when the flow is consumed, so a repeat is 410 `flow_used`) and dies with the flow (`flow_expired`). Results (`complete`, `linked`) are delivered once. A wrong poll secret looks exactly like an unknown flow. A refused sign-in (`access_denied`, `email_in_use`, a Discord error) also carries a claim in the handoff URL, so the launcher can show the reason and nobody else can read it.
-- **Linking is two-sided too.** `POST /v1/me/discord/link` needs a verified email (403 `email_not_verified`) and starts the same flow with the signed-in account on it. The callback attaches nothing: the identity is attached when the launcher that started the flow presents the claim (`poll` returns `linked`), under a lock on the account row that re-checks the email, so approving someone else's link flow can never put your Discord on their account or theirs on yours. The owner is mailed (`discord_linked`; `discord_unlinked` on `DELETE /v1/me/discord`, which also needs a verified email).
+- **Linking is two-sided too, and re-authenticated.** `POST /v1/me/discord/link` takes the account's current `password` (Solar RP sends no email, so a verified email cannot be the proof; wrong passwords share one lockout with `POST /v1/me/password` and `DELETE /v1/me/discord`, keyed on the account and the client address like a login: 401 `invalid_credentials`, then 429 `rate_limited`) and starts the same flow with the signed-in account on it. The callback attaches nothing: the identity is attached when the party that started the flow presents the claim, under a lock on the account row (the one a password reset takes), and is refused (`failed`, `password_changed`) when the password changed after the start, so approving someone else's link flow can never put your Discord on their account or theirs on yours, and the real owner's reset voids a squatter's link in flight (the reset also deletes identities from an account whose email was never verified). The owner is mailed (`discord_linked`; `discord_unlinked` on `DELETE /v1/me/discord`, which re-authenticates the same way).
+- **Linking from the website** (`handoff: "web"`): the account page keeps `pollSecret` in the tab's sessionStorage and navigates to `authorizeUrl`. The callback answers 303 to `<SITE_ORIGIN>/account/#discord_flow=<flowId>&discord_claim=<claim>`: the origin is configuration (never from the request, so no open redirect) and the claim rides in the fragment, which browsers never send to a server, so no access log holds it. The page finishes with `POST /v1/me/discord/link/finish { flowId, pollSecret, claim }` under the session of the account that started the flow; any other combination is 404 `flow_not_found`. A web flow is not readable through `poll`. Someone who starts a web link and sends the authorize URL to a victim gets the claim delivered to the victim's browser, which has neither the poll secret nor the attacker's session: nothing is linked.
 - **Identity** is the immutable Discord user id, never the email or name.
 - **No auto-merge.** If the Discord email, verified or not, belongs to an existing GAGE account, login fails with `email_in_use`. That player logs in with their password and links Discord from the settings (`POST /v1/me/discord/link`), which is the only way to attach Discord to an existing account.
 - **Unverified Discord emails are never trusted:** they are not stored on the account and do not count as verified. A verified one is stored and counts as verified.
@@ -163,9 +164,19 @@ A currency pack may only contain wallet credits, a VIP only entitlements, a cosm
 
 ## Wallet
 
-In-game currency is a **ledger**, not a mutable number. `wallet_ledger` is append-only (a trigger rejects UPDATE and DELETE); each entry is a signed `delta` with a reason (`purchase`, `spend`, `revoke`) and a unique idempotency key. `wallet_balances` is derived: a trigger on the ledger updates it in the same statement, a guard trigger rejects every other write to it, and an insert that would take a balance below zero is rejected by the database (`insufficient_funds`), except a `revoke`. Every balance therefore equals the sum of its ledger entries, and two concurrent spends can never overdraw.
+In-game currency is a **ledger**, not a mutable number. `wallet_ledger` is append-only (a trigger rejects UPDATE and DELETE); each entry is a signed `delta` with a reason (`purchase`, `quest`, `spend`, `revoke`) and a unique idempotency key. `wallet_balances` is derived: a trigger on the ledger updates it in the same statement, a guard trigger rejects every other write to it, and an insert that would take a balance below zero is rejected by the database (`insufficient_funds`), except a `revoke`. Every balance therefore equals the sum of its ledger entries, and two concurrent spends can never overdraw.
 
 The game server spends with `POST /internal/game/wallet/spend` (needs an open session of the account on that server). The `idempotencyKey` is chosen by the game server per spend and scoped to the server: resending the same request after a timeout is applied once (`replayed: true`), the same key with different parameters is 409 `idempotency_mismatch`. Players read their balances and history with `GET /v1/me/wallet` and `/v1/me/wallet/ledger`.
+
+## Quests
+
+Quests pay coins into the wallet (ledger reason `quest`). `GET /v1/me/quests` lists the active ones with this account's status; `POST /v1/me/quests/:slug/start` starts a visit quest and `POST /v1/me/quests/:slug/claim` pays. Kinds (tables `quests` and `quest_progress`):
+
+- `discord_link` pays when the account has a linked Discord identity (seeded on, 500 coins).
+- `visit` (YouTube, Facebook, Instagram, TikTok, X ...) cannot be verified by any API, so it is an **honor system gated by Discord**: the player starts it (the client opens its `url`), and may claim it 30 s later (`visitMinSeconds`), only with a linked Discord account. Seeded off and without a URL; the owner sets each URL and switches it on with `npm run admin:quests`.
+- `discord_guild` (membership of the Solar RP Discord server) is **not available yet**: it lists as `locked` / `not_available`, a claim is 409 `quest_unavailable` and the admin script refuses to switch it on. Checking membership needs a Discord authorization with the `guilds.members.read` scope at claim time (the platform keeps no Discord tokens), which needs a Discord flow a browser can finish; today only the launcher's `gage-mp://` claim finishes one, and the launcher does not handle that link yet.
+
+Each quest pays once per account and once per Discord account: the ledger entry's idempotency key is `quest:<questId>:<accountId>`, `quest_progress` has one row per (account, quest) and one claim per (Discord user id, quest), and the credit and the claim are one transaction, so concurrent or repeated claims pay once and unlinking Discord to link it elsewhere pays nothing more. A banned account cannot claim.
 
 ## Settings rules
 
@@ -722,12 +733,12 @@ HTTP 200
 
 Discord redirect target (browser page).
 
-Discord sends the player's browser here. Validates the single-use state, redeems the code with the PKCE verifier, records the outcome for the launcher and puts a random claim on the flow (only its hash is stored). Returns a small HTML page (200 when the sign-in was approved, 400 otherwise) that redirects to gage-mp://auth/discord?flow=<flowId>&claim=<claim> and shows a "Return to GAGE" button for the same URL. The claim is never displayed. A callback whose state is invalid, used or expired is 400 with no handoff.
+Discord sends the player's browser here. Validates the single-use state, redeems the code with the PKCE verifier, records the outcome and puts a random claim on the flow (only its hash is stored). A launcher flow gets a small HTML page (200 when the sign-in was approved, 400 otherwise) that redirects to gage-mp://auth/discord?flow=<flowId>&claim=<claim> and shows a "Return to GAGE" button for the same URL. A web link flow (started with handoff "web") gets 303 to <SITE_ORIGIN>/account/#discord_flow=<flowId>&discord_claim=<claim>, whatever the outcome (the account page reads why it failed); the target origin is configuration, never taken from the request, and the claim is in the fragment so no server log sees it. The claim is never displayed. A callback whose state is invalid, used or expired is 400 with no handoff.
 
 - **Auth:** none (public)
 - **Listener:** public
 - **Rate limits:** `discord-callback` per client IP (IPv6: /64): 60 per 10 min
-- **Success:** HTTP 200, text/html
+- **Success:** HTTP 200, text/html | 303 Location: <SITE_ORIGIN>/account/#discord_flow&discord_claim
 - **Errors:** only the generic ones
 
 **Query string**
@@ -756,7 +767,7 @@ The page redirects to the launcher's `gage-mp://auth/discord?flow=<flowId>&claim
 
 Poll a Discord flow.
 
-status pending | failed {code} | needs_username {suggestedUsername, discordUsername} | linked | complete {token, account}. Send the claim from the gage-mp:// URL: without it (or with a wrong one) the answer is always {status: "pending"}, exactly as for a flow nobody approved. complete and linked are returned once and spend the flow and its claim; a link is attached to the account only by this call.
+status pending | failed {code} | needs_username {suggestedUsername, discordUsername} | linked | complete {token, account}. Send the claim from the gage-mp:// URL: without it (or with a wrong one) the answer is always {status: "pending"}, exactly as for a flow nobody approved. complete and linked are returned once and spend the flow and its claim; a link is attached to the account only by this call. A web link flow (handoff "web") is not readable here (404 flow_not_found): the account page finishes it with POST /v1/me/discord/link/finish.
 
 - **Auth:** none (public)
 - **Listener:** public
@@ -795,7 +806,7 @@ HTTP 200
 }
 ```
 
-`claim` comes from the `gage-mp://` URL; without it, or with a wrong one, the answer is always `{ "status": "pending" }`. Other results: `{ "status": "failed", "code": "email_in_use" }` (also `access_denied`, `discord_error`, `invalid_request`; for a link: `discord_already_linked`, `already_has_discord`, `email_not_verified`), `{ "status": "linked" }` (link flows) and `{ "status": "complete", "token", "expiresAt", "sessionId", "account" }`. `complete` and `linked` are returned once and spend the claim.
+`claim` comes from the `gage-mp://` URL; without it, or with a wrong one, the answer is always `{ "status": "pending" }`. Other results: `{ "status": "failed", "code": "email_in_use" }` (also `access_denied`, `discord_error`, `invalid_request`; for a link: `discord_already_linked`, `already_has_discord`, `password_changed`), `{ "status": "linked" }` (link flows) and `{ "status": "complete", "token", "expiresAt", "sessionId", "account" }`. `complete` and `linked` are returned once and spend the claim.
 
 ### POST /v1/auth/discord/complete
 
@@ -862,23 +873,32 @@ HTTP 200
 
 Start linking Discord to the signed-in account.
 
-Refused (403 email_not_verified) while the account's email is unverified. Same flow, claim and poll as a Discord login; the identity is attached when the claimed poll returns "linked", and the owner is emailed.
+Re-authenticates with the account's current password (`password`; wrong passwords count towards the same lockout as a password change, keyed on the account and the client address: 401 invalid_credentials, then 429 rate_limited). `handoff` "launcher" (default) finishes like a Discord login (callback, gage-mp:// handoff, claimed poll answering "linked"); "web" makes the callback redirect to the website's account page, which finishes with POST /v1/me/discord/link/finish. The identity is attached only by that last step, and is refused there (failed, code password_changed) when the password changed after the start. The owner is emailed.
 
 - **Auth:** session (`Authorization: Bearer <session token>`)
 - **Listener:** public
 - **Rate limits:** `discord-link` per account: 10 per 10 min
 - **Success:** HTTP 200, { flowId, authorizeUrl, pollSecret, expiresAt }
-- **Errors:** `discord_disabled`, `email_not_verified`
+- **Errors:** `discord_disabled`, `already_has_discord`, `password_required`, `invalid_credentials`, `rate_limited`, `busy`
 
-**Request body**
+**Request body (JSON)**
 
-A JSON object (see the description above).
+| field | type | required | rules |
+| --- | --- | --- | --- |
+| `password` | string | yes | 1..1024 chars |
+| `handoff` | "launcher" \| "web" | no | default `"launcher"` |
 
 **Example**
 
 ```http
 POST /v1/me/discord/link
 Authorization: Bearer <session token>
+Content-Type: application/json
+
+{
+  "password": "correct-horse-battery-staple",
+  "handoff": "web"
+}
 ```
 
 ```http
@@ -892,25 +912,80 @@ HTTP 200
 }
 ```
 
-Finish exactly like a login flow (callback, `gage-mp://` handoff, then poll with the claim); the poll answers `{ "status": "linked" }` and only then is the identity attached. Needs a verified email (403 `email_not_verified`). The owner is emailed when the link is made.
+With `handoff: "launcher"` (the default) finish exactly like a login flow (callback, `gage-mp://` handoff, then poll with the claim; the poll answers `{ "status": "linked" }`). With `handoff: "web"` the website keeps `pollSecret` in the tab (sessionStorage), navigates to `authorizeUrl`, and the callback redirects to `<SITE_ORIGIN>/account/#discord_flow=<flowId>&discord_claim=<claim>`; the page then calls `POST /v1/me/discord/link/finish`. Only that last step attaches the identity. The owner is emailed when the link is made.
+
+### POST /v1/me/discord/link/finish
+
+Finish a web Discord link on the account page.
+
+For a flow started with handoff "web": `flowId` and `claim` come from the account page's URL fragment (#discord_flow&discord_claim), `pollSecret` from the tab that started the flow. The session must belong to the account that started it. Any mismatch (wrong or missing secret, claim of another flow, another account's session, a launcher flow) is 404 flow_not_found. Answers { status: "linked" } once (the identity is attached by this call; the same pair again is a harmless no-op) or { status: "failed", code } (access_denied, discord_error, invalid_request, discord_already_linked, already_has_discord, password_changed).
+
+- **Auth:** session (`Authorization: Bearer <session token>`)
+- **Listener:** public
+- **Rate limits:** `discord-link-finish` per account: 30 per 10 min
+- **Success:** HTTP 200, { status: "linked" } | { status: "failed", code }
+- **Errors:** `flow_not_found`, `flow_expired`, `flow_used`
+
+**Request body (JSON)**
+
+| field | type | required | rules |
+| --- | --- | --- | --- |
+| `flowId` | string (uuid) | yes | matches `^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$` |
+| `pollSecret` | string | yes | 16..200 chars |
+| `claim` | string | yes | 16..200 chars |
+
+**Example**
+
+```http
+POST /v1/me/discord/link/finish
+Authorization: Bearer <session token>
+Content-Type: application/json
+
+{
+  "flowId": "a8d3f5b2-7e61-4c09-9b24-1d6e8f0a3c57",
+  "pollSecret": "cG9sbF9zZWNyZXRfc2FtcGxlX25vdF9yZWFsXzAxMjM0NTY",
+  "claim": "Y2xhaW1fc2FtcGxlX25vdF9yZWFsX2Zvcl9kb2NzXzA"
+}
+```
+
+```http
+HTTP 200
+
+{
+  "status": "linked"
+}
+```
+
+A refusal reads `{ "status": "failed", "code": "discord_already_linked" }` (also `access_denied`, `discord_error`, `invalid_request`, `already_has_discord`, `password_changed`).
 
 ### DELETE /v1/me/discord
 
 Unlink Discord.
 
-Refused (403 email_not_verified) while the account's email is unverified. The owner is emailed.
+Refused (409 last_login_method) when Discord is the account's only way in (no password). Re-authenticates with the current password (`password`; the same lockout as linking and changing the password). The owner is emailed.
 
 - **Auth:** session (`Authorization: Bearer <session token>`)
 - **Listener:** public
-- **Rate limits:** none beyond the global body limit
+- **Rate limits:** `discord-unlink` per account: 10 per 10 min
 - **Success:** HTTP 204, (no body)
-- **Errors:** `last_login_method`, `not_linked`, `email_not_verified`
+- **Errors:** `last_login_method`, `not_linked`, `invalid_credentials`, `rate_limited`, `busy`
+
+**Request body (JSON)**
+
+| field | type | required | rules |
+| --- | --- | --- | --- |
+| `password` | string | yes | 1..1024 chars |
 
 **Example**
 
 ```http
 DELETE /v1/me/discord
 Authorization: Bearer <session token>
+Content-Type: application/json
+
+{
+  "password": "correct-horse-battery-staple"
+}
 ```
 
 ```http
@@ -1467,6 +1542,181 @@ HTTP 200
   }
 }
 ```
+
+## Quests
+
+### GET /v1/me/quests
+
+Quests that pay coins, with this account's status.
+
+Active quests in display order. status: available (a visit quest not started yet), started (waiting: waitSeconds left), claimable, claimed, locked (lockReason discord_required = link Discord first; discord_already_claimed = this Discord account already claimed it on another Solar RP account; not_available = cannot be completed yet). A visit quest is claimable 30 s after its start and only with a linked Discord account; each quest pays once per account and once per Discord account.
+
+- **Auth:** session (`Authorization: Bearer <session token>`)
+- **Listener:** public
+- **Rate limits:** none beyond the global body limit
+- **Success:** HTTP 200, { discordLinked, visitMinSeconds, quests: [{ slug, kind, title, description, url, reward: { currency, amount }, sort, status, lockReason, startedAt, claimableAt, waitSeconds, claimedAt }] }
+- **Errors:** only the generic ones
+
+**Example**
+
+```http
+GET /v1/me/quests
+Authorization: Bearer <session token>
+```
+
+```http
+HTTP 200
+
+{
+  "discordLinked": true,
+  "visitMinSeconds": 30,
+  "quests": [
+    {
+      "slug": "link_discord",
+      "kind": "discord_link",
+      "title": "Link your Discord",
+      "description": "Connect your Discord account to your Solar RP account.",
+      "url": null,
+      "reward": {
+        "currency": "coins",
+        "amount": 500
+      },
+      "sort": 0,
+      "status": "claimed",
+      "lockReason": null,
+      "startedAt": null,
+      "claimableAt": null,
+      "waitSeconds": null,
+      "claimedAt": "2026-11-06T11:58:40.000Z"
+    },
+    {
+      "slug": "youtube_subscribe",
+      "kind": "visit",
+      "title": "Subscribe on YouTube",
+      "description": "Subscribe to the Solar RP YouTube channel.",
+      "url": "https://www.youtube.example/@solar-rp",
+      "reward": {
+        "currency": "coins",
+        "amount": 100
+      },
+      "sort": 20,
+      "status": "started",
+      "lockReason": null,
+      "startedAt": "2026-11-06T11:59:50.000Z",
+      "claimableAt": "2026-10-29T12:00:00.000Z",
+      "waitSeconds": 12,
+      "claimedAt": null
+    }
+  ]
+}
+```
+
+Without a linked Discord account a visit quest that was started reads `status: "locked", lockReason: "discord_required"`, and so does the Discord link quest.
+
+### POST /v1/me/quests/:slug/start
+
+Start a visit quest (then open its url).
+
+Records when the quest was started; the claim opens 30 s later. Idempotent: a repeated start keeps the first time. Returns the quest with its url for the client to open.
+
+- **Auth:** session (`Authorization: Bearer <session token>`)
+- **Listener:** public
+- **Rate limits:** `quest-start` per account: 60 per 10 min
+- **Success:** HTTP 200, { quest }
+- **Errors:** `quest_not_found`, `quest_inactive`, `not_a_visit_quest`
+
+**Path parameters**
+
+- `slug`: UUID
+
+**Example**
+
+```http
+POST /v1/me/quests/youtube_subscribe/start
+Authorization: Bearer <session token>
+```
+
+```http
+HTTP 200
+
+{
+  "quest": {
+    "slug": "youtube_subscribe",
+    "kind": "visit",
+    "title": "Subscribe on YouTube",
+    "description": "Subscribe to the Solar RP YouTube channel.",
+    "url": "https://www.youtube.example/@solar-rp",
+    "reward": {
+      "currency": "coins",
+      "amount": 100
+    },
+    "sort": 20,
+    "status": "started",
+    "lockReason": null,
+    "startedAt": "2026-10-29T12:00:00.000Z",
+    "claimableAt": "2026-11-06T12:00:30.000Z",
+    "waitSeconds": 30,
+    "claimedAt": null
+  }
+}
+```
+
+Open `quest.url` after this call. Starting again keeps the first `startedAt`.
+
+### POST /v1/me/quests/:slug/claim
+
+Claim a quest's reward into the wallet.
+
+Pays the reward once (ledger reason quest). The credit and the claim are one transaction, and the database refuses a second credit for the same account or Discord account, so concurrent claims pay once.
+
+- **Auth:** session (`Authorization: Bearer <session token>`)
+- **Listener:** public
+- **Rate limits:** `quest-claim` per account: 30 per 10 min
+- **Success:** HTTP 200, { quest, credited: { currency, amount }, balance }
+- **Errors:** `quest_not_found`, `quest_inactive`, `already_claimed`, `quest_unavailable`, `quest_not_started`, `discord_required`, `discord_already_claimed`, `quest_wait`, `account_banned`
+
+**Path parameters**
+
+- `slug`: UUID
+
+**Example**
+
+```http
+POST /v1/me/quests/link_discord/claim
+Authorization: Bearer <session token>
+```
+
+```http
+HTTP 200
+
+{
+  "quest": {
+    "slug": "link_discord",
+    "kind": "discord_link",
+    "title": "Link your Discord",
+    "description": "Connect your Discord account to your Solar RP account.",
+    "url": null,
+    "reward": {
+      "currency": "coins",
+      "amount": 500
+    },
+    "sort": 0,
+    "status": "claimed",
+    "lockReason": null,
+    "startedAt": null,
+    "claimableAt": null,
+    "waitSeconds": null,
+    "claimedAt": "2026-10-29T12:00:00.000Z"
+  },
+  "credited": {
+    "currency": "coins",
+    "amount": 500
+  },
+  "balance": 500
+}
+```
+
+A claim too early is 409 `quest_wait` with `Retry-After` and `details: { waitSeconds, claimableAt }`.
 
 ## Payment webhooks and the dev checkout
 
@@ -2911,22 +3161,26 @@ HTTP 200
 
 | code | meaning | returned by |
 | --- | --- | --- |
-| `account_banned` | The account is banned. `details` has `reason` and `expiresAt` (null = permanent). Also returned to a banned mod or admin by every admin route, and to a game server for a banned account on spend and pull. | `POST /v1/game/join`<br>`POST /v1/shop/checkout`<br>`GET /internal/game/grants`<br>`POST /internal/game/grants/pull`<br>`POST /internal/game/wallet/spend` |
+| `account_banned` | The account is banned. `details` has `reason` and `expiresAt` (null = permanent). Also returned to a banned mod or admin by every admin route, and to a game server for a banned account on spend and pull. | `POST /v1/me/quests/:slug/claim`<br>`POST /v1/game/join`<br>`POST /v1/shop/checkout`<br>`GET /internal/game/grants`<br>`POST /internal/game/grants/pull`<br>`POST /internal/game/wallet/spend` |
 | `account_not_found` | No such account. | `GET /v1/admin/accounts/:id`<br>`POST /v1/admin/accounts/:id/ban`<br>`PUT /v1/admin/accounts/:id/roles` |
 | `already_banned` | The account already has a ban in force; unban first to change it. | `POST /v1/admin/accounts/:id/ban` |
+| `already_claimed` | This account already claimed the quest (each quest pays once per account). | `POST /v1/me/quests/:slug/claim` |
+| `already_has_discord` | This account already has a Discord account linked. Unlink it first. | `POST /v1/me/discord/link` |
 | `already_verified` | The email address is already verified. | `POST /v1/auth/resend-verification` |
-| `busy` | The server is busy checking passwords (ARGON2_MAX_CONCURRENT running, ARGON2_MAX_QUEUE waiting). Nothing was counted against you; retry after `Retry-After` seconds. | `POST /v1/auth/register`<br>`POST /v1/auth/login`<br>`POST /v1/auth/reset-password`<br>`POST /v1/me/password` |
+| `busy` | The server is busy checking passwords (ARGON2_MAX_CONCURRENT running, ARGON2_MAX_QUEUE waiting). Nothing was counted against you; retry after `Retry-After` seconds. | `POST /v1/auth/register`<br>`POST /v1/auth/login`<br>`POST /v1/auth/reset-password`<br>`POST /v1/me/discord/link`<br>`DELETE /v1/me/discord`<br>`POST /v1/me/password` |
 | `current_password_required` | The account has a password, so the current one must be sent. | `POST /v1/me/password` |
 | `database_unavailable` | The database did not answer (health check). | `GET /health` |
+| `discord_already_claimed` | The Discord account linked here already claimed this quest on another Solar RP account (one Discord account, one claim). | `POST /v1/me/quests/:slug/claim` |
 | `discord_already_linked` | That Discord account is linked to another GAGE account. | any route (generic) |
 | `discord_disabled` | Discord login is not configured on this server. | `POST /v1/auth/discord/start`<br>`POST /v1/me/discord/link` |
+| `discord_required` | The account has no linked Discord account. Quests that pay are Discord-gated: link Discord first. | `POST /v1/me/quests/:slug/claim` |
 | `email_in_use` | The Discord email belongs to an existing GAGE account. Log in with the password and link Discord from the account settings. | `POST /v1/auth/discord/complete` |
-| `email_not_verified` | Verify the email address first: to join or buy (while REQUIRE_VERIFIED_EMAIL=1), and always before linking or unlinking Discord or setting a first password. | `POST /v1/me/discord/link`<br>`DELETE /v1/me/discord`<br>`POST /v1/me/password`<br>`POST /v1/game/join`<br>`POST /v1/shop/checkout` |
+| `email_not_verified` | Verify the email address first: to join or buy (while REQUIRE_VERIFIED_EMAIL=1), and before a Discord-only account sets its first password. (Linking and unlinking Discord re-authenticate with the password instead.) | `POST /v1/me/password`<br>`POST /v1/game/join`<br>`POST /v1/shop/checkout` |
 | `email_required` | Add an email address before setting a password. | `POST /v1/me/password` |
-| `flow_expired` | The Discord flow is older than DISCORD_FLOW_TTL_SECONDS. | `POST /v1/auth/discord/poll`<br>`POST /v1/auth/discord/complete` |
-| `flow_not_found` | No such Discord flow, or the poll secret is wrong, or (for `complete`) the claim is wrong: all look the same. | `POST /v1/auth/discord/poll`<br>`POST /v1/auth/discord/complete` |
+| `flow_expired` | The Discord flow is older than DISCORD_FLOW_TTL_SECONDS. | `POST /v1/auth/discord/poll`<br>`POST /v1/auth/discord/complete`<br>`POST /v1/me/discord/link/finish` |
+| `flow_not_found` | No such Discord flow, or the poll secret is wrong, or (for `complete` and the web link finish) the claim is wrong, or (web link finish) the session belongs to another account, or the flow was started for the other handoff: all look the same. | `POST /v1/auth/discord/poll`<br>`POST /v1/auth/discord/complete`<br>`POST /v1/me/discord/link/finish` |
 | `flow_state` | `complete` was called on a flow that is not waiting for a username. | `POST /v1/auth/discord/complete` |
-| `flow_used` | The result of this Discord flow was already delivered. | `POST /v1/auth/discord/poll`<br>`POST /v1/auth/discord/complete` |
+| `flow_used` | The result of this Discord flow was already delivered. | `POST /v1/auth/discord/poll`<br>`POST /v1/auth/discord/complete`<br>`POST /v1/me/discord/link/finish` |
 | `forbidden` | The account lacks the role this route needs. | any route (generic) |
 | `forbidden_target` | You may not ban this account (yourself, an admin, or a mod unless you are an admin), or lift this ban (your own, or that of a mod or admin unless you are an admin). Refused unbans are audited. | `POST /v1/admin/accounts/:id/ban`<br>`POST /v1/admin/accounts/:id/unban` |
 | `grant_not_found` | No such grant for this server. | `POST /internal/game/grants/:id/ack` |
@@ -2934,7 +3188,7 @@ HTTP 200
 | `idempotency_mismatch` | The Idempotency-Key (checkout, 422) or idempotencyKey (spend, 409) was already used for a different request. | `POST /v1/shop/checkout`<br>`POST /internal/game/wallet/spend` |
 | `insufficient_funds` | The balance is lower than the amount. `details.balance` has the balance. | `POST /internal/game/wallet/spend` |
 | `internal_error` | An unexpected failure on the server (logged with the request id). | any route (generic) |
-| `invalid_credentials` | Wrong identifier or password (the same answer for an unknown account). | `POST /v1/auth/login`<br>`POST /v1/me/password` |
+| `invalid_credentials` | Wrong identifier or password (the same answer for an unknown account). | `POST /v1/auth/login`<br>`POST /v1/me/discord/link`<br>`DELETE /v1/me/discord`<br>`POST /v1/me/password` |
 | `invalid_json` | The body is not valid JSON. | any route (generic) |
 | `invalid_request` | The body, query string or a path parameter failed validation. `details.issues` lists `{ path, message }` (at most 10). | any route (generic) |
 | `invalid_server_credentials` | Unknown server id or wrong secret. | any route (generic) |
@@ -2947,18 +3201,25 @@ HTTP 200
 | `mixed_currency` | The basket mixes currencies. | `POST /v1/shop/checkout` |
 | `no_active_session` | The account has no open game session on this server (call verify first). | `GET /internal/game/grants`<br>`POST /internal/game/grants/pull`<br>`GET /internal/game/wallet`<br>`POST /internal/game/wallet/balance`<br>`POST /internal/game/wallet/spend` |
 | `no_email` | The account has no email address. | `POST /v1/auth/resend-verification` |
+| `not_a_visit_quest` | Only visit quests are started; the other kinds are claimed directly. | `POST /v1/me/quests/:slug/start` |
 | `not_banned` | The account has no ban to lift. | `POST /v1/admin/accounts/:id/unban` |
 | `not_found` | No such route. | any route (generic) |
 | `not_linked` | No Discord account is linked. | `DELETE /v1/me/discord` |
 | `order_not_found` | No such order (an order of another account looks the same). | `GET /v1/shop/orders/:id`<br>`GET /v1/dev/fake-checkout/:orderId`<br>`POST /v1/dev/fake-checkout/:orderId/complete`<br>`GET /v1/admin/orders/:id`<br>`POST /v1/admin/orders/:id/refund` |
 | `order_not_refundable` | Only paid or fulfilled orders with a provider payment can be refunded. | `POST /v1/admin/orders/:id/refund` |
+| `password_required` | The account has no password to re-authenticate with (it signs in through Discord). Set a password first. | `POST /v1/me/discord/link` |
 | `payload_too_large` | The body is larger than the route's limit. | any route (generic) |
 | `payment_unavailable` | The payment provider could not create the checkout. The order is marked failed; try again. | `POST /v1/shop/checkout` |
 | `product_in_use` | Orders reference the product: deactivate it instead of deleting it. | `DELETE /v1/admin/products/:id` |
 | `product_inactive` | The product is not on sale. | `POST /v1/shop/checkout` |
 | `product_not_found` | No such product. | `POST /v1/shop/checkout`<br>`PATCH /v1/admin/products/:id`<br>`DELETE /v1/admin/products/:id` |
 | `quantity_exceeds_limit` | More than the product's `maxQuantity` in one order. | `POST /v1/shop/checkout` |
-| `rate_limited` | Too many requests or failed attempts. `Retry-After` says how many seconds to wait. | any route (generic) |
+| `quest_inactive` | The quest exists but is switched off: it cannot be started or claimed. | `POST /v1/me/quests/:slug/start`<br>`POST /v1/me/quests/:slug/claim` |
+| `quest_not_found` | No quest has this slug. | `POST /v1/me/quests/:slug/start`<br>`POST /v1/me/quests/:slug/claim` |
+| `quest_not_started` | A visit quest must be started (`POST /v1/me/quests/:slug/start`) before it is claimed. | `POST /v1/me/quests/:slug/claim` |
+| `quest_unavailable` | The quest cannot be completed yet (the Discord server quest: its membership check is not built). | `POST /v1/me/quests/:slug/claim` |
+| `quest_wait` | Too early: a visit quest is claimable `visitMinSeconds` (30) after its start. `Retry-After` and `details.waitSeconds` say how long; `details.claimableAt` says when. | `POST /v1/me/quests/:slug/claim` |
+| `rate_limited` | Too many requests or failed attempts. `Retry-After` says how many seconds to wait. | `POST /v1/me/discord/link`<br>`DELETE /v1/me/discord` |
 | `refund_failed` | The provider refused or could not be reached; nothing was changed. | `POST /v1/admin/orders/:id/refund` |
 | `server_exists` | A server with that id already exists. | `POST /v1/admin/servers` |
 | `server_maintenance` | The server is in maintenance; staff may still join. | `POST /v1/game/join` |
@@ -3327,6 +3588,7 @@ In-flight Discord OAuth2 logins and links: state hash, PKCE verifier, poll-secre
 | `poll_secret_hash` | text | no |  |
 | `claim_hash` | text | yes |  |
 | `account_id` | uuid | yes |  |
+| `handoff` | text | no | default `"launcher"` |
 | `status` | text | no | default `"pending"` |
 | `result_account_id` | uuid | yes |  |
 | `profile` | jsonb | yes |  |
@@ -3344,13 +3606,16 @@ Constraints and indexes
 - check `oauth_flows_intent`: intent in ('login', 'link')
 - check `oauth_flows_status`: status in ('pending', 'login_ready', 'needs_username', 'link_ready', 'linked', 'failed', 'consumed')
 - check `oauth_flows_link_needs_account`: intent <> 'link' or account_id is not null
+- check `oauth_flows_handoff`: handoff in ('launcher', 'web')
+- check `oauth_flows_web_is_link`: handoff <> 'web' or intent = 'link'
 
 Invariants
 
 - The state hash is unique and consumed by a conditional UPDATE (status pending, not yet called back, not expired), so a replayed or forged callback matches nothing.
 - `claim_hash` is the SHA-256 of the random claim the callback page hands to the approving browser (`gage-mp://auth/discord?flow&claim`). Poll and complete show nothing without it; it is cleared when the flow is consumed.
 - The PKCE verifier and the stored Discord profile are cleared as soon as they are no longer needed; rows are purged a day after expiry.
-- Status is one of `pending`, `login_ready`, `needs_username`, `link_ready`, `linked` (legacy, no longer written), `failed`, `consumed`. A link flow stops at `link_ready`: the identity is attached by the claimed poll, never by the callback.
+- Status is one of `pending`, `login_ready`, `needs_username`, `link_ready`, `linked` (legacy, no longer written), `failed`, `consumed`. A link flow stops at `link_ready`: the identity is attached by the claimed poll (or the web finish), never by the callback.
+- `handoff` is `launcher` (the gage-mp:// URL, finished by the unauthenticated poll) or `web` (a redirect to the website's account page, finished there with a session of `account_id`); only a link flow can be `web` (`oauth_flows_web_is_link`), and the poll refuses web flows.
 
 #### `oauth_identities`
 
@@ -3513,6 +3778,75 @@ Invariants
 - SKU unique and URL-safe; price positive and at most 100 000 000 minor units; currency is an ISO 4217 code; `kind` is `currency_pack`, `vip`, `cosmetic` or `bundle`.
 - `grant_payload` is validated against the kind before it is stored (a currency pack may only credit currency, a VIP only grants entitlements, and so on).
 
+#### `quest_progress`
+
+Per account and quest: when a visit quest was started and the claim (time, the Discord account it was made under, the ledger entry that paid it).
+
+| column | type | null | notes |
+| --- | --- | --- | --- |
+| `account_id` | uuid | no |  |
+| `quest_id` | uuid | no |  |
+| `started_at` | timestamp with time zone | yes |  |
+| `claimed_at` | timestamp with time zone | yes |  |
+| `discord_user_id` | text | yes |  |
+| `ledger_id` | bigint | yes |  |
+| `created_at` | timestamp with time zone | no | default `now()` |
+
+Constraints and indexes
+
+- primary key (account_id, quest_id)
+- unique index `quest_progress_discord_uq` (discord_user_id, quest_id) where discord_user_id is not null
+- unique index `quest_progress_ledger_uq` (ledger_id) where ledger_id is not null
+- foreign key `quest_progress_account_id_accounts_id_fk` (account_id) references accounts (id) on delete cascade
+- foreign key `quest_progress_quest_id_quests_id_fk` (quest_id) references quests (id) on delete restrict
+- foreign key `quest_progress_ledger_id_wallet_ledger_id_fk` (ledger_id) references wallet_ledger (id) on delete restrict
+- check `quest_progress_claim_complete`: (claimed_at is null) = (ledger_id is null) and (claimed_at is null) = (discord_user_id is null)
+
+Invariants
+
+- One row per (account, quest): the primary key.
+- One claim per (Discord user id, quest) whatever account the Discord account is linked to (`quest_progress_discord_uq`), so unlinking and relinking Discord elsewhere cannot farm a quest again.
+- A claim is complete or absent: `claimed_at`, `discord_user_id` and `ledger_id` are set together (`quest_progress_claim_complete`). The ledger entry and the claim are written in one transaction.
+- A quest with progress cannot be deleted (deactivate it instead).
+
+#### `quests`
+
+The quest catalogue: tasks that pay coins (`discord_link`, `discord_guild`, `visit`). Changed with `npm run admin:quests`.
+
+| column | type | null | notes |
+| --- | --- | --- | --- |
+| `id` | uuid | no | primary key; default `gen_random_uuid()` |
+| `slug` | text | no |  |
+| `kind` | text | no |  |
+| `title` | text | no |  |
+| `description` | text | no | default `""` |
+| `url` | text | yes |  |
+| `reward_amount` | bigint | no |  |
+| `currency` | text | no | default `"coins"` |
+| `active` | boolean | no | default `false` |
+| `sort` | integer | no | default `0` |
+| `created_at` | timestamp with time zone | no | default `now()` |
+| `updated_at` | timestamp with time zone | no | default `now()` |
+
+Constraints and indexes
+
+- unique index `quests_slug_uq` (slug)
+- check `quests_slug_format`: slug ~ '^[a-z0-9][a-z0-9_]{1,47}$'
+- check `quests_kind`: kind in ('discord_link', 'discord_guild', 'visit')
+- check `quests_title_len`: length(title) between 1 and 80
+- check `quests_description_len`: length(description) <= 500
+- check `quests_url_format`: url is null or (url ~ '^https://[^[:space:]]+$' and length(url) <= 2048)
+- check `quests_url_only_visit`: kind = 'visit' or url is null
+- check `quests_active_visit_has_url`: not active or kind <> 'visit' or url is not null
+- check `quests_reward_range`: reward_amount between 1 and 1000000
+- check `quests_currency`: currency ~ '^[a-z][a-z0-9_]{1,15}$'
+
+Invariants
+
+- `slug` is unique and matches `[a-z0-9][a-z0-9_]{1,47}`; `kind` is one of the three.
+- Only a `visit` quest has a `url`, it is `https://` (at most 2048 characters), and an active visit quest must have one (`quests_active_visit_has_url`).
+- The reward is 1 to 1 000 000 of `currency` (`coins`).
+
 #### `rate_limits`
 
 Fixed-window counters behind every per-route rate limit that is not a login failure.
@@ -3604,14 +3938,14 @@ Constraints and indexes
 - foreign key `wallet_ledger_grant_id_grants_id_fk` (grant_id) references grants (id) on delete restrict
 - check `wallet_ledger_delta_nonzero`: delta <> 0
 - check `wallet_ledger_currency`: currency ~ '^[a-z][a-z0-9_]{1,15}$'
-- check `wallet_ledger_reason`: reason in ('purchase', 'revoke', 'spend')
-- check `wallet_ledger_sign`: (reason = 'purchase' and delta > 0) or (reason in ('revoke', 'spend') and delta < 0)
+- check `wallet_ledger_reason`: reason in ('purchase', 'revoke', 'spend', 'quest')
+- check `wallet_ledger_sign`: (reason in ('purchase', 'quest') and delta > 0) or (reason in ('revoke', 'spend') and delta < 0)
 
 Invariants
 
 - Append-only: a trigger rejects UPDATE and DELETE.
-- `idempotency_key` is unique (`grant:<id>`, `revoke:<grantId>`, `spend:<serverId>:<key>`): replaying an operation is a no-op.
-- Purchases are positive, spends and revokes negative, never zero (`wallet_ledger_sign`).
+- `idempotency_key` is unique (`grant:<id>`, `revoke:<grantId>`, `spend:<serverId>:<key>`, `quest:<questId>:<accountId>`): replaying an operation is a no-op, and a quest can credit an account once.
+- Purchases and quest rewards are positive, spends and revokes negative, never zero (`wallet_ledger_sign`).
 - A trigger updates `wallet_balances` in the same statement and rejects an insert that would take the balance below zero (`insufficient_funds`), except a `revoke` (a refund may leave a debt that later purchases pay off).
 
 ## Environment variables
@@ -3659,6 +3993,7 @@ Unset and empty variables take the default. Integers are plain base-10 digits; f
 | `DISCORD_REDIRECT_URI` | _unset_ | The redirect URI registered with Discord. Defaults to `<PUBLIC_API_URL>/v1/auth/discord/callback`. |
 | `DISCORD_API_BASE` | `https://discord.com/api/v10` | Discord API base URL (only changed in tests). |
 | `DISCORD_FLOW_TTL_SECONDS` | `600` | How long a Discord login may take from start to callback (60 to 3600). |
+| `SITE_ORIGIN` | `https://solar-rp.com` | The website's public origin (`scheme://host[:port]`, no path; https in production). A Discord link started on the website (handoff `web`) returns the browser to `<SITE_ORIGIN>/account/#discord_flow&discord_claim`. Configuration only: the redirect target is never read from a request. |
 | `PAYMENT_PROVIDER` | `fake` | The provider used for new checkouts. Only `fake` exists today; real ones implement `PaymentProvider` and are registered in `buildDeps()`. |
 | `ALLOW_FAKE_PAYMENTS_IN_PRODUCTION` | `0` | `1` lets a staging box run the fake provider with `NODE_ENV=production`. The fake provider grants items without charging anyone. |
 | `FAKE_WEBHOOK_SECRET` | _unset_ | HMAC secret of the fake provider (at least 16 characters). Required whenever the fake provider is used, unless `ENABLE_DEV_ROUTES=1` (only then does it fall back to a public constant). |

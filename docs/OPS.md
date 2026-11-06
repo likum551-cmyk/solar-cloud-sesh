@@ -28,6 +28,7 @@ Player-facing name is **Solar RP**: installer `SolarRP-Setup-<ver>.exe`, launche
 | `release.sh` | VPS | **client + server together**: build both, publish the client mandatory, in-game countdown, activate the server, verify the live protocol (section "Release (client + server together)") |
 | `deploy-server.sh` | VPS | build, test, canary, roll out and roll back `gage-server` |
 | `deploy-site.sh` | VPS | build `apps/website` (`npm ci`, tests, build), release to `/var/www/gage/site-releases/<stamp>`, switch the live symlink, HTTP check; `--rollback` |
+| `deploy-platform.sh` | VPS | the platform API (`apps/platform`): PostgreSQL (installed if missing), role + database, `/opt/gage/platform.env` (created once, secrets generated, never printed), build + tests, release to `/opt/gage/platform/releases/<stamp>`, dump + migrate, unit `gage-platform`, switch, Caddy `/api` route, health checks; `--rollback` (section "Platform API") |
 | `pack-vps-kit.sh` | PC (Git Bash) | ONE self-extracting `solar-rp-vps-kit-<stamp>.run`: the source (via `pack-source.sh`) + GI's Claude setup (skills, rules, agents, memory, sanitised settings, plugin list) + `vps-kit/install.sh`; refuses keys, `.env`, `.pem`, credentials; prints the scp/ssh lines |
 | `solar-rp-vps-kit-<stamp>.run` (runs `vps-kit/install.sh`) | VPS, as root | checks its SHA-256, unpacks to `/root/solar-rp-kit/<stamp>/`, installs `/root/.claude` (backups, settings merge), the plugins, and the source via `unpack-source.sh`; `--dry-run` first; never bootstraps or deploys; run it again with a newer kit to refresh |
 
@@ -172,6 +173,38 @@ The game server currently runs by hand in tmux (as root, from `~/gage-v3`). The 
 
 `server.json` is `root:gage` mode 0640 and the unit's `ProtectSystem=strict` makes everything but `/opt/gage/server/data` read-only: a bans file anywhere else is refused by the script before it can crash-loop the service. A config edit is `edit server.json` then `systemctl restart gage-server` (with players online: ask GI first).
 
+## Platform API (accounts, login, join tokens)
+
+`apps/platform` (Hono + PostgreSQL) serves the website and the launcher at **`https://solar-rp.com/api/*`**: Caddy's `gage_api` snippet (`handle_path /api/*`, so `/api/v1/auth/login` reaches `/v1/auth/login`) proxies to the public listener `127.0.0.1:8787`, on the HTTPS domain only (the bare-IP `:80` block has no `/api`: it would carry passwords in clear). The game-server listener `127.0.0.1:8788` (`/internal/*`) is loopback only and never proxied. Same origin as the website, so it needs no CORS; `CORS_ORIGINS=https://app.gage` is the launcher's WebView2 origin.
+
+| What | Where |
+| --- | --- |
+| releases | `/opt/gage/platform/releases/<UTC stamp>/` (dist, drizzle, production `node_modules`; root-owned), live = symlink `/opt/gage/platform/current` |
+| settings | `/opt/gage/platform.env` (owner `gage-platform`, 0600; template `tools/deploy/platform.env.example`). Holds `DATABASE_URL` (password) and `FAKE_WEBHOOK_SECRET`: never print it |
+| database | PostgreSQL 16 from Ubuntu on 127.0.0.1:5432, role and database `gage_platform`; dumps before each migration in `/opt/gage/platform/backups/<stamp>.dump` (root, 0700; newest 10 kept) |
+| service | `gage-platform.service` (`tools/deploy/gage-platform.service`), user `gage-platform`: not `gage`, which runs the game server, because a process can read the environment of another process of the same user |
+
+```
+bash tools/deploy/deploy-platform.sh --dry-run     # read-only checks, every change printed (Caddyfile and unit diffs included)
+bash tools/deploy/deploy-platform.sh               # 1 preflight 2 PostgreSQL 3 user + settings 4 role + database 5 build (npm ci, npm test, npm run build)
+                                                   # 6 release (npm ci --omit=dev) 7 pg_dump + migrate 8 unit, switch, restart, /health
+                                                   # 9 Caddyfile (validated copy first) 10 /api/health through Caddy 11 prune
+bash tools/deploy/deploy-platform.sh --rollback    # previous release, restart, checks; the schema is NOT rolled back
+```
+
+- The settings file is written once; a later run never changes a value in it and only appends the template's missing non-secret keys (it names them, and names keys whose values differ from the template). Values decided by GI on 2026-11-06: `PUBLIC_API_URL=https://solar-rp.com/api`, `TRUST_PROXY=1` (Caddy replaces any client-sent `X-Forwarded-For`; the script refuses `TRUST_PROXY=1` with a non-loopback `HOST`), `EMAIL_DRIVER=outbox`, `REQUIRE_VERIFIED_EMAIL=0`, Discord off.
+- Production refuses to start without a payment provider and only the fake one exists, so the file sets `PAYMENT_PROVIDER=fake`, `ALLOW_FAKE_PAYMENTS_IN_PRODUCTION=1` and a random `FAKE_WEBHOOK_SECRET` that never leaves the file: `/v1/dev/*` is not mounted in production, so an order can be created but never paid. Replace the three lines when a real provider exists.
+- Migrations run with the new release BEFORE the switch (the migrate script also loads and checks the whole configuration, so a bad setting stops there). A failed migration or health check leaves the previous release live and removes the new one (exit 4 = switched back, 5 = the switch back failed too).
+- The checks: `127.0.0.1:8787/health` answers `"status":"ok"` from the NEW release (the process's working directory), `:8788` listens on loopback only, `https://solar-rp.com/api/health` answers through Caddy, `POST /api/internal/game/verify` is 404 through Caddy, and the platform logged no "X-Forwarded-For is missing" for the proxied request.
+- First admin (GI registers first, in the launcher or on the site):
+  ```
+  node --env-file=/opt/gage/platform.env /opt/gage/platform/current/dist/scripts/grant-role.js --user <name-or-email> --role admin --dry-run
+  node --env-file=/opt/gage/platform.env /opt/gage/platform/current/dist/scripts/grant-role.js --user <name-or-email> --role admin
+  ```
+  That is `npm run admin:grant-role` compiled (a release has no `tsx`); audited as `cli:root`. `dist/scripts/create-server.js` registers a game server the same way and prints its secret once.
+- Logs: `journalctl -u gage-platform -n 50` (one JSON object per line). `GET /health` is 503 when the database does not answer.
+- Not verified before the first VPS run: the suite runs on PGlite only, so the first `migrate.js` against a real PostgreSQL is on the VPS (the script dumps nothing then, because the database is empty).
+
 ## 4. The domain and HTTPS
 
 HTTPS is live from the first bootstrap: `solar-rp.com` and `www.solar-rp.com` (permanent redirect to the apex) get automatic Let's Encrypt certificates from Caddy; plain HTTP on the bare IP `http://5.175.253.187/update/` keeps serving the same files as a fallback and is what the publish script checks through (`http://127.0.0.1`). Launcher 0.4.0 bakes `https://solar-rp.com/update/version.json`.
@@ -211,10 +244,11 @@ bash tools/deploy/publish-client.sh 0.4.2 --rollback-from 0.4.0 --notes "Rollbac
 | build and test logs | `/opt/gage/logs/<UTC stamp>-<step>.log` (ui-build, configure, build, tests, installer, pe-imports) |
 | game server | `journalctl -u gage-server -f`; release metadata `/opt/gage/server/releases/<stamp>/BUILD-INFO` |
 | Caddy | `journalctl -u caddy`; access log to the journal (`log` in the Caddyfile) |
+| platform API | `journalctl -u gage-platform -f`; database dumps `/opt/gage/platform/backups/` |
 | what is published | `/var/www/gage/update/` and `curl https://solar-rp.com/update/version.json` |
 | bootstrap versions | `/etc/gage/bootstrap-versions.txt` (compiler, wine, node, caddy as installed) |
 | unpack history | `/opt/gage/src.info` (UTC time, sha256, tarball name, kClientVersion per line) |
-| locks | `${TMPDIR:-/tmp}/gage-{build,publish,deploy-server}.lock` (a stale one is removed automatically when its pid is gone) |
+| locks | `${TMPDIR:-/tmp}/gage-{build,publish,deploy-server,deploy-site,deploy-platform}.lock` (a stale one is removed automatically when its pid is gone) |
 
 ## 8. Pending CMake changes
 
@@ -254,7 +288,7 @@ So the only difference is the gcc patch level (13.2 vs 13.3), with the same C ru
 
 - This VPS runs **SOL**: `"name": "SOL"`, `"port": 24800`, `"adminPort": 24900` in `/opt/gage/server/server.json`. The launcher's list shows `name`.
 - **LUNA** and **TERRA** are not built here; this is how they would be added (documented only). A second instance needs its own UDP port (a ufw rule, plus a provider firewall rule if the host has one), its own config and its own writable `data/`. With the unit as it is, the simplest shape is a templated unit `gage-server@.service`: a copy of `gage-server.service` with `WorkingDirectory=/opt/gage/instances/%i`, `ExecStart=/opt/gage/server/current/gage-server --config /opt/gage/instances/%i/server.json`, `ReadWritePaths=/opt/gage/instances/%i/data`, and per instance `server.json` with its own `name` (`LUNA`), `port` (e.g. 24801), `adminPort` (e.g. 24901) and `"bansFile": "data/bans.json"`. `deploy-server.sh` knows exactly one unit (`gage-server`) and one directory; to roll the binary out to instances it needs a loop over `systemctl restart gage-server@<name>` plus a health check per port. That extension is not written; do not improvise it on a live server.
-- The separate repository folder `deploy/` (top level, not `tools/deploy/`) is an older, larger plan for the whole backend (PostgreSQL, master list, platform API, numbered instances `gage-server@1`, `@test`). It is not what runs on this VPS. If that backend is ever deployed here, reconcile the two instance schemes first and decide which kit owns Caddy and the unit; the two kits must not both install a Caddyfile.
+- The separate repository folder `deploy/` (top level, not `tools/deploy/`) is an older, larger plan for the whole backend (PostgreSQL, master list, platform API, numbered instances `gage-server@1`, `@test`). It is not what runs on this VPS. The platform API is deployed by `tools/deploy/deploy-platform.sh` (section "Platform API"), which owns its unit and the `/api` route in `tools/deploy/Caddyfile`; nothing from `deploy/` is installed. If the rest of that backend (master list, numbered instances) is ever deployed here, reconcile the two instance schemes first; the two kits must not both install a Caddyfile.
 - Gamemode scripts: the server loads `resources/` from its working directory (`/opt/gage/server/resources/`) and persists to `data/`.
 
 ## 11. Recommendation (needs GI's OK): `git init` the source on the VPS
