@@ -144,6 +144,10 @@ namespace gage::join {
         // and an item the server used for us (the satiety to add).
         std::function<void(const proto::InvState&)> onInvState;
         std::function<void(const proto::InvUsed&)> onInvUsed;
+        // v8 (0.5.4 inventory world): our inventory with weapons (instead of onInvState once we sent an InvReport), and the
+        // world containers in reach (the first one, an empty list, is the server's offer of the inventory world).
+        std::function<void(const proto::InvSnap&)> onInvSnap;
+        std::function<void(const proto::InvNearby&)> onInvNearby;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;
@@ -174,6 +178,8 @@ namespace gage::join {
     bool SendAdminCmd(const proto::AdminCmd& c);
     // v8 (0.6): one inventory operation (reliable, in order, at most 64 waiting). Answered by onInvState (ackSeq = o.seq).
     bool SendInvOp(const proto::InvOp& o);
+    // v8 (0.5.4): what our ped holds (reliable; latest-wins: a newer call before the worker sends replaces the pending one).
+    bool SendInvReport(const proto::InvReport& r);
 
     // Our own movement and on-foot state (protocol v3 PedState), unreliable and
     // latest-wins: a newer call before the worker sends replaces the pending one.

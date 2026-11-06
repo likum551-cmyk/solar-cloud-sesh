@@ -52,6 +52,8 @@ namespace {
         std::deque<Emote> emotes;
         std::deque<proto::AdminCmd> adminCmds;   // v8
         std::deque<proto::InvOp> invOps;         // v8 (0.6)
+        bool haveInvReport = false;              // v8 (0.5.4): the newest unsent InvReport (a newer one replaces it)
+        proto::InvReport invReport;
 
         // Sinks, set before Connect() and copied into the worker at its start.
         join::EventSink events;
@@ -206,10 +208,16 @@ namespace {
                 std::deque<Shared::Emote> emotes;
                 std::deque<proto::AdminCmd> adminCmds;
                 std::deque<proto::InvOp> invOps;
+                bool haveInvReport = false;
+                proto::InvReport invReport;
                 {
                     std::lock_guard<std::mutex> lk(S.mu);
                     adminCmds.swap(S.adminCmds);
                     invOps.swap(S.invOps);
+                    haveInvReport = S.haveInvReport;
+                    if (haveInvReport)
+                        invReport = std::move(S.invReport);
+                    S.haveInvReport = false;
                     haveState = S.haveState;
                     k = S.state;
                     ped = S.statePed;
@@ -233,6 +241,8 @@ namespace {
                 for (const proto::InvOp& o : invOps)
                     if (!session.SendInvOp(o))
                         GLOGW("join: inventory op seq %u not sent", (unsigned)o.seq);
+                if (haveInvReport && !session.SendInvReport(invReport))
+                    GLOGW("join: inventory report (rev %u) not sent", (unsigned)invReport.rev);
                 // v4, reliable ones first (they are ordered on their own channel anyway).
                 for (const proto::VehicleCmd& c : vehCmds)
                     if (!session.SendVehicleCmd(c))
@@ -446,6 +456,14 @@ namespace {
                     if (peers.onInvUsed)
                         timed("invUsed", [&] { peers.onInvUsed(e.invUsed); });
                     break;
+                case net::Event::Type::InvSnap:
+                    if (peers.onInvSnap)
+                        timed("invSnap", [&] { peers.onInvSnap(e.invSnap); });
+                    break;
+                case net::Event::Type::InvNearby:
+                    if (peers.onInvNearby)
+                        timed("invNearby", [&] { peers.onInvNearby(e.invNearby); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())
@@ -620,6 +638,17 @@ namespace gage::join {
         if (S.invOps.size() >= 64)
             return false;
         S.invOps.push_back(o);
+        return true;
+    }
+
+    bool SendInvReport(const proto::InvReport& r)
+    {
+        Shared& S = Sh();
+        if (!S.live.load() || proto::Encode(r).empty())
+            return false;
+        std::lock_guard<std::mutex> lk(S.mu);
+        S.invReport = r;
+        S.haveInvReport = true;
         return true;
     }
 
@@ -807,6 +836,7 @@ namespace gage::join {
             S.emotes.clear();
             S.adminCmds.clear();
             S.invOps.clear();
+            S.haveInvReport = false;
             S.stop.store(false);
             S.live.store(false);
             S.myId.store(0);

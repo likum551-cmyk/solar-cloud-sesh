@@ -67,6 +67,10 @@ namespace {
         std::string name;          // the character's name (the CHARACTER chip)
         std::deque<std::pair<uint32_t, std::string>> out;   // seq, inv::EncodeOp bytes
         uint32_t nextSeq = 1;
+        // 0.5.4 inventory world
+        bool world = false;
+        std::vector<InvNearbyBox> boxes;
+        uint32_t nearSeq = 0;      // +1 per SetNearby / SetInventoryWorld / ClearInventory
     };
     Store& St() { static Store* s = new Store; return *s; }   // never freed (the render thread may outlive static destruction)
 }
@@ -90,6 +94,27 @@ void ClearInventory()
     s.available = false;
     s.out.clear();
     ++s.snapSeq;
+    s.world = false;
+    s.boxes.clear();
+    ++s.nearSeq;
+}
+
+void SetInventoryWorld(bool on)
+{
+    Store& s = St();
+    std::lock_guard<std::mutex> lk(s.m);
+    s.world = on;
+    if (!on)
+        s.boxes.clear();
+    ++s.nearSeq;
+}
+
+void SetNearby(const std::vector<InvNearbyBox>& boxes)
+{
+    Store& s = St();
+    std::lock_guard<std::mutex> lk(s.m);
+    s.boxes = boxes;
+    ++s.nearSeq;
 }
 
 bool PopInventoryOp(std::string* encodedOp, uint32_t* seq)
@@ -800,7 +825,47 @@ void Icon(int ic, float x, float y, float size, uint32_t rgba, float a = 1.0f, u
     // the first bake at least as large as the drawn size (34.56 for the drag ghost draws the 36 scaled down)
     AtlasImage(B().icon[ic][si], x0, y0, drawPx, C(rgba, g.a * a));
 }
-void Icon(const char* name, float x, float y, float size, uint32_t rgba, float a = 1.0f, uint32_t glow = 0) { Icon(IconIndex(name), x, y, size, rgba, a, glow); }
+// 0.5.4: the weapon items' glyphs ("gun", "blade", "grenade": inventory.h WeaponCatalog) are drawn shapes (REV3 has no weapon PNGs), in the
+// glyph's design box (x, y, size), unit coordinates with v up. false = not a weapon glyph.
+bool WeaponGlyph(const char* name, float x, float y, float size, uint32_t rgba, float a)
+{
+    const bool gun = std::strcmp(name, "gun") == 0, blade = std::strcmp(name, "blade") == 0, grenade = std::strcmp(name, "grenade") == 0;
+    if (!gun && !blade && !grenade)
+        return false;
+    const ImU32 col = C(rgba, g.a * a);
+    const auto P = [&](float u, float v) { return ImVec2(Sx(x + u * size), Sy(y + v * size)); };
+    const auto poly = [&](std::initializer_list<ImVec2> pts) {
+        ImVec2 b[8];
+        int n = 0;
+        for (const ImVec2& p : pts)
+            if (n < 8) b[n++] = p;
+        g.dl->AddConvexPolyFilled(b, n, col);
+    };
+    if (gun) {
+        poly({P(0.08f, 0.56f), P(0.92f, 0.56f), P(0.92f, 0.76f), P(0.08f, 0.76f)});   // slide and barrel
+        poly({P(0.14f, 0.56f), P(0.40f, 0.56f), P(0.33f, 0.14f), P(0.08f, 0.14f)});   // grip
+        const float t = std::max(1.0f, 0.06f * size * g.s);
+        const ImVec2 guard[4] = {P(0.40f, 0.56f), P(0.42f, 0.40f), P(0.58f, 0.40f), P(0.60f, 0.56f)};
+        g.dl->AddPolyline(guard, 4, col, 0, t);                                         // trigger guard
+    } else if (blade) {
+        poly({P(0.08f, 0.22f), P(0.22f, 0.08f), P(0.38f, 0.24f), P(0.24f, 0.38f)});    // handle
+        poly({P(0.20f, 0.44f), P(0.44f, 0.20f), P(0.50f, 0.26f), P(0.26f, 0.50f)});    // guard
+        poly({P(0.32f, 0.46f), P(0.46f, 0.32f), P(0.80f, 0.62f), P(0.92f, 0.92f), P(0.62f, 0.80f)});   // blade
+    } else {
+        g.dl->AddCircleFilled(P(0.46f, 0.40f), 0.30f * size * g.s, col, 24);           // body
+        poly({P(0.35f, 0.64f), P(0.57f, 0.64f), P(0.57f, 0.80f), P(0.35f, 0.80f)});    // cap
+        poly({P(0.57f, 0.80f), P(0.86f, 0.70f), P(0.86f, 0.62f), P(0.57f, 0.70f)});    // lever
+        g.dl->AddCircle(P(0.26f, 0.84f), 0.08f * size * g.s, col, 12, std::max(1.0f, 0.05f * size * g.s));   // pin ring
+    }
+    return true;
+}
+void Icon(const char* name, float x, float y, float size, uint32_t rgba, float a = 1.0f, uint32_t glow = 0)
+{
+    const int ic = IconIndex(name);
+    if (ic < 0 && name && WeaponGlyph(name, x, y, size, rgba, a))
+        return;
+    Icon(ic, x, y, size, rgba, a, glow);
+}
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // Components (section 5)
@@ -844,7 +909,15 @@ void SlotItem(float x, float y, float size, const inv::Slot& s, Look l, float a 
     const float gs = size * 0.5f;
     Icon(d->glyph, x + size * 0.25f, y + size * 0.25f, gs, ld.glyph, a, ld.glyphGlow);
     const uint32_t q = qtyOverride ? qtyOverride : s.qty;
-    const std::string tag = inv::QtyTag(q);
+    std::string tag = inv::QtyTag(q);
+    if (d->weapon) {
+        // 0.5.4: a weapon is one item; its tag is the rounds it holds (a thrown weapon's count: "x5"), nothing for none
+        char b[16] = {};
+        if (inv::IsThrown(*d))
+            tag = inv::QtyTag(s.ammo);
+        else if (s.ammo > 0)
+            std::snprintf(b, sizeof b, "%u", (unsigned)s.ammo), tag = b;
+    }
     if (!tag.empty())
         Text(B13, x + size - 8.0f, y + 9.0f, kCream, tag.c_str(), 0.0f, kRight, true, a, true);
     if (d->condition && s.cond <= 99) {
@@ -912,7 +985,7 @@ float KeycapW(const char* label) { return TextWDesign(B11, label, 0.88f) + 18.0f
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------------------------------------------------------------------------
-enum class BoxK : uint8_t { None, Pockets, Pack, Equip, Quick };
+enum class BoxK : uint8_t { None, Pockets, Pack, Equip, Quick, Hand /* 0.5.4 */, Near /* 0.5.4: the NEARBY box shown */ };
 struct Ref {
     BoxK box = BoxK::None;
     int i = -1;
@@ -926,6 +999,8 @@ inv::Where WhereOf(BoxK b)
     case BoxK::Pack: return inv::Where::Pack;
     case BoxK::Equip: return inv::Where::Equip;
     case BoxK::Quick: return inv::Where::Quick;
+    case BoxK::Hand: return inv::Where::Hand;
+    case BoxK::Near: return inv::Where::Nearby;
     default: return inv::Where::Pockets;
     }
 }
@@ -970,6 +1045,53 @@ struct Ui {
 };
 Ui& U() { static Ui* u = new Ui; return *u; }
 
+// 0.5.4 inventory world: the server's NEARBY boxes and their prediction (what is drawn: the server's + the pending ops on top, like Ui::ch)
+struct NearC {
+    InvNearbyBox meta;
+    inv::Container box;
+    bool ok = false;                        // `meta.encoded` decoded (a locked box has none)
+};
+struct NearUi {
+    bool world = false;                     // SetInventoryWorld: the hand, weapons and NEARBY are live
+    std::vector<NearC> server, pred;
+    uint32_t seen = ~0u;
+    int tab = -1;                           // the tab the player picked: 0 VEHICLE, 1 GROUND (-1 = none yet: the vehicle when there is one)
+};
+NearUi& NU() { static NearUi* n = new NearUi; return *n; }
+constexpr uint8_t kKindTrunk = (uint8_t)inv::Kind::Trunk, kKindGround = (uint8_t)inv::Kind::Ground;
+// The box of `kind` in the predicted list (null = none in reach).
+NearC* NearOf(uint8_t kind)
+{
+    for (NearC& n : NU().pred)
+        if (n.meta.kind == kind)
+            return &n;
+    return nullptr;
+}
+// The box the NEARBY panel shows: the picked tab's, else the other one.
+NearC* NearShown()
+{
+    NearUi& n = NU();
+    NearC* v = NearOf(kKindTrunk);
+    NearC* gr = NearOf(kKindGround);
+    if (n.tab == 1) return gr ? gr : v;
+    if (n.tab == 0) return v ? v : gr;
+    return v ? v : gr;
+}
+// The open (unlocked, decoded) container with `id` in a list, for ApplyEx.
+inv::Container* NearBox(std::vector<NearC>& list, uint32_t id)
+{
+    for (NearC& n : list)
+        if (n.meta.id == id && n.ok && !n.meta.locked)
+            return &n.box;
+    return nullptr;
+}
+inv::ApplyOut ApplyNear(inv::Character& ch, std::vector<NearC>& list, const inv::Op& op)
+{
+    inv::Container* s = op.src == inv::Where::Nearby ? NearBox(list, op.srcBox) : nullptr;
+    inv::Container* d = op.dst == inv::Where::Nearby ? NearBox(list, op.dstBox) : nullptr;
+    return inv::ApplyEx(ch, op, s, d);
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // Data: the store -> the prediction; ops out
 // ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -977,7 +1099,7 @@ void Sync()
 {
     Ui& u = U();
     Store& s = St();
-    bool fresh = false;
+    bool fresh = false, nearFresh = false;
     uint32_t ack = 0;
     {
         std::lock_guard<std::mutex> lk(s.m);
@@ -999,20 +1121,36 @@ void Sync()
             }
             ack = s.ack;
         }
+        // 0.5.4: the NEARBY boxes
+        if (s.nearSeq != NU().seen) {
+            NearUi& n = NU();
+            n.seen = s.nearSeq;
+            n.world = s.world;
+            n.server.clear();
+            for (const InvNearbyBox& b : s.boxes) {
+                NearC c;
+                c.meta = b;
+                c.meta.encoded.clear();
+                c.ok = !b.locked && inv::DecodeBox(b.encoded, c.box);
+                n.server.push_back(std::move(c));
+            }
+            nearFresh = true;
+        }
     }
     // a prediction the server never answered (3 s) is dropped: the server's state is the truth
     bool stale = false;
     for (const Ui::Pending& p : u.pending)
         stale |= u.now - p.at > 3.0;
-    if (!fresh && !stale)
+    if (!fresh && !stale && !nearFresh)
         return;
     if (fresh)
         u.pending.erase(std::remove_if(u.pending.begin(), u.pending.end(), [&](const Ui::Pending& p) { return p.seq <= ack; }), u.pending.end());
     if (stale)
         u.pending.clear();
     u.ch = u.server;
+    NU().pred = NU().server;
     for (const Ui::Pending& p : u.pending)
-        inv::Apply(u.ch, p.op);
+        ApplyNear(u.ch, NU().pred, p.op);
 }
 
 void Deny(Ref r)
@@ -1028,12 +1166,14 @@ bool Send(const inv::Op& op, Ref flash = Ref())
     if (!u.have)
         return false;
     inv::Character t = u.ch;
-    const inv::ApplyOut r = inv::Apply(t, op);
+    std::vector<NearC> tn = NU().pred;
+    const inv::ApplyOut r = ApplyNear(t, tn, op);
     if (!inv::Ok(r.r)) {
         Deny(flash);
         return false;
     }
     u.ch = t;
+    NU().pred = std::move(tn);
     Store& s = St();
     uint32_t seq;
     {
@@ -1053,12 +1193,21 @@ inv::Op MakeOp(inv::OpKind k, Ref src, Ref dst = Ref(), uint32_t qty = 0)
     o.dst = WhereOf(dst.box);
     o.di = (int16_t)dst.i;
     o.qty = qty;
+    // 0.5.4: a Nearby side names the box the panel shows; the hand is index 0
+    if (src.box == BoxK::Near || dst.box == BoxK::Near) {
+        const NearC* n = NearShown();
+        if (src.box == BoxK::Near) o.srcBox = n ? n->meta.id : 0;
+        if (dst.box == BoxK::Near) o.dstBox = n ? n->meta.id : 0;
+    }
+    if (src.box == BoxK::Hand) o.si = 0;
+    if (dst.box == BoxK::Hand) o.di = 0;
     return o;
 }
 bool Allowed(const inv::Op& op)
 {
     inv::Character t = U().ch;
-    return inv::Ok(inv::Apply(t, op).r);
+    std::vector<NearC> tn = NU().pred;
+    return inv::Ok(ApplyNear(t, tn, op).r);
 }
 
 const inv::Slot* SlotOf(Ref r)
@@ -1066,6 +1215,10 @@ const inv::Slot* SlotOf(Ref r)
     Ui& u = U();
     if (r.box == BoxK::Quick || !r.Valid())
         return nullptr;
+    if (r.box == BoxK::Near) {   // 0.5.4
+        const NearC* n = NearShown();
+        return n && n->ok && !n->meta.locked && r.i < (int)n->box.slots.size() ? &n->box.slots[(size_t)r.i] : nullptr;
+    }
     return inv::SlotAt(u.ch, WhereOf(r.box), r.i);
 }
 bool Filled(Ref r) { const inv::Slot* s = SlotOf(r); return s && !s->Empty(); }
@@ -1074,6 +1227,9 @@ bool Filled(Ref r) { const inv::Slot* s = SlotOf(r); return s && !s->Empty(); }
 // Layout (section 4): where every slot is
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 constexpr float kGridX = 571.0f, kPocketY0 = 725.0f, kPackY0 = 523.0f, kPitch = 74.0f, kSlot = 64.0f;
+// 0.5.4: the HAND pill in the INVENTORY header (between the title and the weight pill) and the NEARBY grids (panel_right_*.txt)
+constexpr float kHandX = 761.0f, kHandY = 911.0f, kHandW = 144.0f, kHandH = 40.0f;
+constexpr float kNearGridX = 1243.0f, kNearTrunkY0 = 687.0f, kNearGroundY0 = 699.0f;
 void SlotPos(Ref r, float& x, float& y, float& size)
 {
     size = kSlot;
@@ -1082,6 +1238,14 @@ void SlotPos(Ref r, float& x, float& y, float& size)
     case BoxK::Pack: x = kGridX + kPitch * (float)(r.i % 8); y = kPackY0 - kPitch * (float)(r.i / 8); break;
     case BoxK::Equip: x = r.i < 7 ? 97.0f : 417.0f; y = 823.0f - 78.0f * (float)(r.i % 7); break;
     case BoxK::Quick: x = 110.0f + 96.0f * (float)r.i; y = 214.0f; size = 72.0f; break;
+    case BoxK::Hand: x = kHandX; y = kHandY; size = kHandH; break;   // 0.5.4: the HAND pill's left square (the hit test takes the whole pill)
+    case BoxK::Near: {                                                // 0.5.4: the NEARBY grid (a trunk under its card, a pile under its title)
+        const NearC* n = NearShown();
+        const float y0 = n && n->meta.kind == kKindGround ? kNearGroundY0 : kNearTrunkY0;
+        x = kNearGridX + kPitch * (float)(r.i % 8);
+        y = y0 - kPitch * (float)(r.i / 8);
+        break;
+    }
     default: x = y = 0.0f; break;
     }
 }
@@ -1101,6 +1265,14 @@ Ref HitSlot(ImVec2 d)
     if (!r.Valid() && u.ch.HasPack()) r = test(BoxK::Pack, (int)u.ch.pack.slots.size());
     if (!r.Valid()) r = test(BoxK::Equip, inv::kEquipCount);
     if (!r.Valid()) r = test(BoxK::Quick, 4);
+    // 0.5.4: the HAND pill and the NEARBY box shown (a locked trunk's slots too: a drop there is refused, visibly)
+    if (!r.Valid() && NU().world && In(d, kHandX, kHandY, kHandW, kHandH))
+        r = Ref{BoxK::Hand, 0};
+    if (!r.Valid() && NU().world)
+        if (const NearC* n = NearShown()) {
+            const int count = n->ok ? (int)n->box.slots.size() : (n->meta.kind == kKindTrunk ? inv::StorageForClass(n->meta.cls).trunkSlots : 0);
+            r = test(BoxK::Near, std::min(count, 48));
+        }
     return r;
 }
 
@@ -1187,9 +1359,15 @@ const char* UseLabel(Ref r)
 {
     if (r.box == BoxK::Equip)
         return "TAKE OFF";
+    if (r.box == BoxK::Hand)
+        return "HOLSTER";   // 0.5.4
+    if (r.box == BoxK::Near)
+        return "TAKE";      // 0.5.4: off the ground / out of the trunk
     const inv::Slot* s = SlotOf(r);
     if (s && inv::Wearable(s->item))
         return "EQUIP";
+    if (s && inv::IsWeapon(s->item))
+        return "HOLD";      // 0.5.4: into the hand
     return "USE";
 }
 bool CanUse(Ref r)
@@ -1197,10 +1375,16 @@ bool CanUse(Ref r)
     const inv::Slot* s = SlotOf(r);
     if (!s || s->Empty())
         return false;
+    if (r.box == BoxK::Near)
+        return Allowed(MakeOp(inv::OpKind::QuickMove, r));
     return Allowed(MakeOp(inv::OpKind::Use, r));
 }
 void DoUse(Ref r)
 {
+    if (r.box == BoxK::Near) {   // 0.5.4: TAKE
+        Send(MakeOp(inv::OpKind::QuickMove, r), r);
+        return;
+    }
     if (r.box == BoxK::Quick) {
         U().quickFlash[r.i] = U().now;
         Send(MakeOp(inv::OpKind::UseQuick, r), r);
@@ -1595,7 +1779,9 @@ void DrawDetailCard()
         std::snprintf(third, sizeof third, "%u %%", (unsigned)s->cond);
     else
         kg((uint64_t)d->unitGrams * s->qty, third, sizeof third);
-    Text(B10, 684, 308, kMuted, "QUANTITY", 1.6f);
+    if (d->weapon)   // 0.5.4: a weapon's count is its rounds (a thrown weapon's: how many)
+        std::snprintf(q, sizeof q, "%u", (unsigned)s->ammo);
+    Text(B10, 684, 308, kMuted, d->weapon ? (inv::IsThrown(*d) ? "COUNT" : "AMMO") : "QUANTITY", 1.6f);
     Text(B16, 684, 290, kCream, q, 0.0f, kLeft, true);
     Text(B10, 784, 308, kMuted, "UNIT", 1.6f);
     Text(B16, 784, 290, kCream, unit, 0.0f, kLeft, true);
@@ -1639,12 +1825,13 @@ void DrawActionBar()
     const bool canUse = has && CanUse(u.sel);
     ButtonSolid(718, 216, 118, 40, has ? UseLabel(u.sel) : "USE", canUse, canUse && hot(718, 118));
     ButtonGhost(846, 216, 92, 40, "GIVE", 0.35f);   // round 1: no one to give to yet (players nearby arrive with the NEARBY panel)
-    const bool canDrop = has;
+    const bool canDrop = has && u.sel.box != BoxK::Near;   // 0.5.4: what lies nearby is taken, not dropped
     ButtonGhost(948, 216, 92, 40, "DROP", canDrop ? 1.0f : 0.35f, canDrop && hot(948, 92));
     const bool canSplit = has && CanSplit(u.sel);
     ButtonGhost(1050, 216, 96, 40, "SPLIT", canSplit ? 1.0f : 0.35f, canSplit && hot(1050, 96));
 }
 
+void DrawHandPill();   // 0.5.4 (with the NEARBY panel below)
 void DrawInventoryPanel()
 {
     Ui& u = U();
@@ -1655,6 +1842,7 @@ void DrawInventoryPanel()
     if (!u.have)
         g.a *= 0.55f;
     DrawWeightPill();
+    DrawHandPill();   // 0.5.4
     // search
     {
         const Rc r = Box(571, 857, 160, 36);
@@ -1725,18 +1913,230 @@ void DrawInventoryPanel()
     DrawActionBar();
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// 0.5.4 inventory world: the HAND pill and the NEARBY panel's trunk / ground boxes (panel_right_vehicle-suv / -locked / ground.txt). No
+// glovebox, stash or GIVE TO NEARBY yet: those parts of the design are left out rather than drawn inert.
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+void DrawHandPill()
+{
+    Ui& u = U();
+    if (!NU().world || !u.have)
+        return;
+    const Ref r{BoxK::Hand, 0};
+    const inv::Slot& s = u.ch.hand;
+    const inv::ItemDef* d = s.Empty() ? nullptr : inv::Find(s.item);
+    if (u.dragging && u.hover == r && u.press != r)
+        return;   // the ghost carries the drop's state here (as on the grid slots)
+    const Look l = SlotLookNow(r, d != nullptr);
+    const LookDef ld = LookOf(l);
+    const Rc pill = Box(kHandX, kHandY, kHandW, kHandH);
+    if (ld.shadow)
+        Shadow(pill, 20.0f, ld.shadow, 8.0f);
+    Fill(pill, 20.0f, ld.fill, l == Look::Source ? 0.55f : 1.0f);
+    if (ld.dashed)
+        Dashed(pill, 20.0f, ld.border, ld.bw);
+    else
+        Border(pill, 20.0f, ld.border, ld.bw);
+    if (!d) {
+        Text(B10, kHandX + 16.0f, kHandY + 23.0f, kMuted, "HAND", 1.6f);
+        Text(B12, kHandX + 16.0f, kHandY + 9.0f, kMuted, l == Look::Target ? "HOLD IT" : "UNARMED", 1.2f);
+        return;
+    }
+    Icon(d->glyph, kHandX + 11.0f, kHandY + 9.0f, 22.0f, ld.glyph, l == Look::Source ? 0.55f : 1.0f);
+    std::string name = d->name;
+    while (name.size() > 3 && TextWDesign(B12, name.c_str(), 0.6f) > kHandW - 52.0f)
+        name.pop_back();
+    if (name.size() < std::strlen(d->name))
+        name += "\xE2\x80\xA6";
+    Text(B12, kHandX + 41.0f, kHandY + 22.0f, kCream, name.c_str(), 0.6f);
+    char am[24];
+    if (inv::IsThrown(*d))
+        std::snprintf(am, sizeof am, "\xC3\x97%u", (unsigned)s.ammo);
+    else
+        std::snprintf(am, sizeof am, "%u RDS", (unsigned)s.ammo);
+    Text(B10, kHandX + 41.0f, kHandY + 8.0f, kMuted, am, 1.2f, kLeft, true);
+}
+
+const char* VehicleClassName(int cls)
+{
+    static const char* const k[23] = {"Compact", "Sedan", "SUV", "Coupe", "Muscle", "Sports classic", "Sports", "Super", "Motorcycle",
+                                      "Off-road", "Industrial", "Utility", "Van", "Cycle", "Boat", "Helicopter", "Plane", "Service",
+                                      "Emergency", "Military", "Commercial", "Train", "Open wheel"};
+    return cls >= 0 && cls < 23 ? k[cls] : "Vehicle";
+}
+const char* VehicleGlyph(int cls) { return cls == 8 ? "moto" : (cls == 10 || cls == 12 || cls == 20 ? "van" : "car"); }
+
+void DrawNearSlots(const NearC& n, int count)
+{
+    for (int i = 0; i < count && i < 48; ++i) {
+        const Ref r{BoxK::Near, i};
+        float x, y, sz;
+        SlotPos(r, x, y, sz);
+        if (!n.ok || n.meta.locked) {
+            const bool deny = U().denyRef == r && U().now - U().denyAt < 0.35;
+            SlotFrame(x, y, sz, 16.0f, deny ? Look::Deny : Look::Locked);
+            Icon("lock", x + 20.5f, y + 20.5f, 23.0f, kMuted, 0.35f);
+            continue;
+        }
+        DrawGridSlot(r, n.box.slots[(size_t)i]);
+    }
+}
+
+void DrawNearTabs(const NearC* shown)
+{
+    const bool hasV = NearOf(kKindTrunk) != nullptr, hasG = NearOf(kKindGround) != nullptr;
+    const Rc pill = Box(1589, 911, 236, 40);
+    Fill(pill, 20, kCardFill);
+    Border(pill, 20, kCardBorder, 1.0f);
+    const ImVec2 m = DesignOf(ImGui::GetIO().MousePos);
+    struct Tab { const char* glyph; const char* label; uint8_t kind; bool has; float x; };
+    const Tab tabs[2] = {{"car", "VEHICLE", kKindTrunk, hasV, 1594}, {"drop", "GROUND", kKindGround, hasG, 1708}};
+    for (const Tab& t : tabs) {
+        const bool on = shown && shown->meta.kind == t.kind;
+        if (on) {
+            const Rc r = Box(t.x, 914, 114, 32);
+            Fill(r, 16, 0xF2B13424);
+            Border(r, 16, 0xF2B13499, 1.5f);
+        }
+        const bool hv = t.has && !on && In(m, t.x, 914, 114, 32);
+        const uint32_t col = on ? kAmber : (hv ? kBone : kMuted);
+        const float lw = TextWDesign(B12, t.label, 1.44f), cx = t.x + (114.0f - (16.0f + 7.0f + lw)) * 0.5f;
+        const float al = t.has ? 1.0f : 0.4f;
+        Icon(t.glyph, cx, 922, 16, col, al);
+        Text(B12, cx + 23.0f, 927, col, t.label, 1.44f, kLeft, false, al);
+    }
+}
+
 void DrawNearby()
 {
     Panel(1210, 172, 646, 800, 32, kPanelGlass);
     Text(B28, 1243, 923, kCream, "NEARBY", 0.28f);
-    // round 1 has no vehicle, ground or stash storage: no VEHICLE / GROUND / STASH tabs to advertise, just the designed "nothing in reach"
-    // state (its line about a later update read like a developer note)
-    const Rc circle = Box(1486, 625, 96, 96);
-    Fill(circle, 48, 0xF7F2E808);
-    Dashed(circle, 48, 0xF7F2E829, 1.5f);
-    Icon("car", 1515, 652, 40, kMuted, 0.5f);
-    Text(B18, 1534, 581, kMuted, "NOTHING IN REACH", 2.88f, kCenter);
-    Text(M14, 1534, 550, kMuted, "No vehicle, drop or stash within 2 m.", 0.0f, kCenter);
+    NearC* n = NU().world && U().have ? NearShown() : nullptr;
+    if (!n) {
+        // nothing in reach (or a 0.5.3 server / inv_world off: no world containers at all): the designed "nothing in reach" state, no tabs
+        const Rc circle = Box(1486, 625, 96, 96);
+        Fill(circle, 48, 0xF7F2E808);
+        Dashed(circle, 48, 0xF7F2E829, 1.5f);
+        Icon("car", 1515, 652, 40, kMuted, 0.5f);
+        Text(B18, 1534, 581, kMuted, "NOTHING IN REACH", 2.88f, kCenter);
+        Text(M14, 1534, 550, kMuted, NU().world ? "Stand by a vehicle or a drop to open it here." : "No vehicle, drop or stash within 2 m.", 0.0f,
+             kCenter);
+        return;
+    }
+    DrawNearTabs(n);
+    const ImVec2 m = DesignOf(ImGui::GetIO().MousePos);
+    const bool free = !U().menuOpen && !U().splitOpen && !U().dragging;
+    if (n->meta.kind == kKindTrunk) {
+        const inv::VehicleStorage st = inv::StorageForClass(n->meta.cls);
+        // the vehicle card
+        Fill(Box(1243, 811, 582, 76), 24, kCardFill);
+        Border(Box(1243, 811, 582, 76), 24, kCardBorder, 1.0f);
+        SlotFrame(1256, 822, 52, 16, Look::Filled);
+        Icon(VehicleGlyph(n->meta.cls), 1268, 834, 28, kBone);
+        Text(B20, 1324, 856, kCream, VehicleClassName(n->meta.cls));
+        char idt[24];
+        std::snprintf(idt, sizeof idt, "#%u", (unsigned)n->meta.veh);
+        const float iw = std::round(TextWDesign(B11, idt, 1.32f) + 32.0f);
+        ChipBox(1324, 820, iw, 22, Chip::Ghost);
+        Text(B11, 1324 + iw * 0.5f, 827.5f, kMuted, idt, 1.32f, kCenter);
+        char dist[24];
+        std::snprintf(dist, sizeof dist, n->meta.distM < 0.05f ? "IN IT" : "%.1f M", n->meta.distM);
+        const float dw = std::round(TextWDesign(B11, dist, 1.32f) + 32.0f);
+        ChipBox(1324 + iw + 8.0f, 820, dw, 22, Chip::Ghost);
+        Text(B11, 1324 + iw + 8.0f + dw * 0.5f, 827.5f, kMuted, dist, 1.32f, kCenter);
+        const bool locked = n->meta.locked;
+        ChipBox(1678, 832, 136, 32, locked ? Chip::Amber : Chip::Bone);
+        const char* lt = locked ? "LOCKED" : "UNLOCKED";
+        const float lw = TextWDesign(B12, lt, 1.44f), lx = 1678.0f + (136.0f - (14.0f + 6.0f + lw)) * 0.5f;
+        Icon(locked ? "lock" : "unlock", lx, 841, 14, locked ? kAmber : kBone);
+        Text(B12, lx + 20.0f, 845, locked ? kAmber : kBone, lt, 1.44f);
+        // the trunk
+        char lab[48];
+        std::snprintf(lab, sizeof lab, "%s \xC2\xB7 %d SLOTS", st.trunkLabel[0] ? st.trunkLabel : "TRUNK", st.trunkSlots);
+        Text(B12, 1243, 778, kMuted, lab, 2.4f);
+        const Rc track = Box(1243, 763, 582, 4);
+        Fill(track, 2, kTrack);
+        if (locked || !n->ok) {
+            const std::string unk = "\xE2\x80\x94 / " + inv::KgCap(st.trunkGrams) + " KG";
+            Text(B12, 1825, 778, kMuted, unk.c_str(), 1.68f, kRight);
+        } else {
+            const uint64_t grams = inv::Grams(n->box);
+            char w[48];
+            std::snprintf(w, sizeof w, "%s / %s KG", inv::Kg(grams).c_str(), inv::KgCap(n->box.maxGrams).c_str());
+            Text(B12, 1825, 778, kBone, w, 1.2f, kRight);
+            const float frac = n->box.maxGrams ? std::min(1.0f, (float)grams / (float)n->box.maxGrams) : 0.0f;
+            if (frac > 0.0f)
+                Fill(Box(1243, 763, std::max(2.0f, 582.0f * frac), 4), 2, kBone);
+        }
+        const int count = n->ok ? (int)n->box.slots.size() : st.trunkSlots;
+        DrawNearSlots(*n, count);
+        if (locked) {
+            const Rc card = Box(1322, 499, 424, 120);
+            Fill(card, 24, 0x0A0907E6);
+            Border(card, 24, kGlassBorder, 1.0f);
+            Icon("lock", 1520, 566.5f, 28, kAmber, 1.0f, 0xF2B134CC);
+            Text(B14, 1534, 547.5f, kCream, "VEHICLE LOCKED", 2.24f, kCenter);
+            Text(M13, 1534, 526.5f, kMuted, "Unlock it with your key to open storage.", 0.0f, kCenter);
+        }
+        // the action pill
+        Fill(Box(1243, 209, 582, 56), 28, kCardFill);
+        Border(Box(1243, 209, 582, 56), 28, kCardBorder, 1.0f);
+        if (locked) {
+            Text(B11, 1814, 233, kMuted, "KEY REQUIRED", 1.54f, kRight);
+        } else {
+            const bool any = n->ok && inv::UsedSlots(n->box) > 0;
+            ButtonGhost(1252, 216, 124, 40, "TAKE ALL", any ? 1.0f : 0.35f, any && free && In(m, 1252, 216, 124, 40));
+            Text(B11, 1814, 233, kMuted, "SHIFT + CLICK TO MOVE", 1.54f, kRight);
+        }
+        return;
+    }
+    // the ground
+    Fill(Box(1243, 811, 582, 76), 24, kCardFill);
+    Border(Box(1243, 811, 582, 76), 24, kCardBorder, 1.0f);
+    SlotFrame(1256, 822, 52, 16, Look::Filled);
+    Icon("drop", 1268, 834, 28, kBone);
+    Text(B20, 1324, 854, kCream, "On the ground");
+    uint32_t items = 0;
+    if (n->ok)
+        for (const inv::Slot& s : n->box.slots)
+            if (!s.Empty()) items += s.qty;
+    char sub[64];
+    if (n->meta.piles > 1)
+        std::snprintf(sub, sizeof sub, "NEAREST OF %d DROPS \xC2\xB7 %u ITEMS \xC2\xB7 %.1f M", n->meta.piles, (unsigned)items, n->meta.distM);
+    else
+        std::snprintf(sub, sizeof sub, "%u ITEMS \xC2\xB7 %.1f M AWAY", (unsigned)items, n->meta.distM);
+    Text(B11, 1324, 831, kMuted, sub, 1.54f);
+    const bool any = items > 0;
+    ButtonSolid(1694, 828, 120, 40, "TAKE ALL", any, any && free && In(m, 1694, 828, 120, 40));
+    Text(B12, 1243, 778, kMuted, "DROPPED ITEMS", 2.4f);
+    char it[24];
+    std::snprintf(it, sizeof it, "%u ITEMS", (unsigned)items);
+    Text(B12, 1825, 778, kBone, it, 1.2f, kRight);
+    DrawNearSlots(*n, n->ok ? (int)n->box.slots.size() : 0);
+    Fill(Box(1243, 209, 582, 56), 28, kCardFill);
+    Border(Box(1243, 209, 582, 56), 28, kCardBorder, 1.0f);
+    Text(B11, 1814, 233, kMuted, "SHIFT + CLICK TO TAKE", 1.54f, kRight);
+}
+
+// The NEARBY panel's clicks: a tab, TAKE ALL (every stack, one QuickMove each, pockets then the pack; a stack that does not fit stays).
+void NearClicks(ImVec2 d)
+{
+    NearUi& nu = NU();
+    if (In(d, 1594, 914, 114, 32) && NearOf(kKindTrunk)) nu.tab = 0;
+    if (In(d, 1708, 914, 114, 32) && NearOf(kKindGround)) nu.tab = 1;
+    NearC* n = NearShown();
+    if (!n || !n->ok || n->meta.locked)
+        return;
+    const bool takeAll = n->meta.kind == kKindTrunk ? In(d, 1252, 216, 124, 40) : In(d, 1694, 828, 120, 40);
+    if (!takeAll)
+        return;
+    const int count = (int)n->box.slots.size();
+    for (int i = 0; i < count; ++i) {
+        NearC* cur = NearShown();   // Send replaces the prediction (NU().near): look the box up again each time
+        if (!cur || i >= (int)cur->box.slots.size() || cur->box.slots[(size_t)i].Empty())
+            continue;
+        Send(MakeOp(inv::OpKind::QuickMove, Ref{BoxK::Near, i}));
+    }
 }
 
 void DrawHintBar()
@@ -1829,9 +2229,9 @@ void DrawMenu(float W, float H)
     const MenuRow rows[5] = {
         {d ? d->glyph : "box", UseLabel(u.menuRef), CanUse(u.menuRef), false, kMUse},
         {"person", "GIVE", false, true, kMGive},
-        {"drop", "DROP", true, false, kMDrop},
+        {"drop", "DROP", u.menuRef.box != BoxK::Near, false, kMDrop},
         {"box", "SPLIT", CanSplit(u.menuRef), false, kMSplit},
-        {"ring", "BIND TO SLOT", !worn, true, kMBind},
+        {"ring", "BIND TO SLOT", !worn && u.menuRef.box != BoxK::Near && u.menuRef.box != BoxK::Hand, true, kMBind},
     };
     const Geo save = g;
     ImVec2 p = u.menuPos;
@@ -2160,9 +2560,11 @@ void HandleInput(const FrameIn& in)
             if (In(d, 580, 216, 40, 40) && u.actQty > 1) u.actQty--;
             if (In(d, 664, 216, 40, 40) && u.actQty < s->qty) u.actQty++;
             if (In(d, 718, 216, 118, 40) && CanUse(u.sel)) DoUse(u.sel);
-            if (In(d, 948, 216, 92, 40)) DoDrop(u.sel, u.actQty >= s->qty ? 0 : u.actQty);
+            if (In(d, 948, 216, 92, 40) && u.sel.box != BoxK::Near) DoDrop(u.sel, u.actQty >= s->qty ? 0 : u.actQty);
             if (In(d, 1050, 216, 96, 40) && CanSplit(u.sel)) OpenSplit(u.sel, SplitTarget(u.sel));
         }
+        if (NU().world)
+            NearClicks(d);   // 0.5.4: the NEARBY tabs and TAKE ALL
     }
 
     // slots: press, drag, release
@@ -2220,7 +2622,10 @@ void HandleInput(const FrameIn& in)
                 u.actQty = 1;
             }
         } else if (u.pressShift) {
-            Send(MakeOp(inv::OpKind::QuickMove, src), src);
+            // 0.5.4: with a trunk / pile open in NEARBY, Shift+click on what the player carries puts it there (the panel's SHIFT + CLICK)
+            const NearC* open = NU().world ? NearShown() : nullptr;
+            const bool intoNear = open && open->ok && !open->meta.locked && (src.box == BoxK::Pockets || src.box == BoxK::Pack);
+            Send(MakeOp(inv::OpKind::QuickMove, src, intoNear ? Ref{BoxK::Near, -1} : Ref()), src);
         } else {
             if (u.sel != src) u.actQty = 1;
             u.sel = src;

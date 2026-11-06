@@ -60,6 +60,7 @@
 #include "sync/inventory.h"    // 0.5.4 outfit_items: the server's inventory, decoded for the ped's clothes
 #include "sync/outfit.h"       // 0.5.4 outfit_items: worn items -> ped components
 #include "sync/ped_view.h"     // 0.5.4 inv_ped_view: the CHARACTER panel's camera
+#include "sync/inventory_world.h"   // 0.5.4 inventory world: PlanSnapshot / PlanRestore / BuildReport
 #include "common/registry.h"
 
 #include <windows.h>
@@ -1347,6 +1348,20 @@ namespace {
         ++g_outfitSeq;
     }
 
+    // 0.5.4 inventory world (libs/sync/inventory_world.h, docs/api/protocol.md "0.5.4"): weapons are inventory items (the ped's weapon wheel
+    // follows the server's inventory and the inventory follows the ped), dropped items lie on the ground, trunks hold items. inv_world
+    // (HKCU\Software\GAGE-MP, read at every Welcome, default on; 0 = the 0.5.3 behaviour: the server's offer is never answered, so the
+    // server keeps treating us as a 0.5.3 client and /gun gives the weapon locally). The join worker writes, the script tick reads.
+    std::atomic<bool> g_invWorldOn{true};
+    std::atomic<bool> g_invWorldOffered{false};   // this session's server sent its offer (an InvNearby): it speaks 0.5.4
+    std::atomic<bool> g_invWorldLive{false};      // we answered it (our first InvReport went out): the server sends InvSnap, /gun is the server's
+    std::atomic<bool> g_invwReset{true};          // a session began or ended: the script tick drops its state
+    std::mutex g_invwMtx;                         // guards the two below
+    bool g_invwSnapFresh = false;
+    proto::InvSnap g_invwSnap;                    // the newest InvSnap not yet applied to the ped (strips merged)
+    std::atomic<uint32_t> g_invwSnaps{0}, g_invwNearby{0}, g_invwReports{0}, g_invwReportsUnsent{0}, g_invwGives{0}, g_invwRemoves{0},
+        g_invwAmmoSets{0}, g_invwSelects{0}, g_invwRestores{0};
+
     // With stock scripts off the per-tick entry-boot suppression has no script to kill; it then runs
     // once per entry (for its FORCE_GAME_STATE_PLAYING). Script tick only; EnterServer re-arms it.
     bool g_entryBootOnce = false;
@@ -2204,6 +2219,16 @@ namespace {
         }
         MapReadSwitches();                                           // 0.4.20: map_clear_blips / map_reveal
         MinimapReadSwitches();                                       // 0.4.22: minimap / minimap_bars
+        {
+            // 0.5.4 inv_world (default on; 0 = 0.5.3: the server's offer is not answered, weapons stay off the inventory)
+            const bool on = reg::Get(L"inv_world") != L"0";
+            g_invWorldOn.store(on);
+            g_invWorldOffered.store(false);
+            g_invWorldLive.store(false);
+            g_invwReset.store(true);
+            GLOGI("engine: inventory world (0.5.4): inv_world=%s", on ? "on (weapons as items, ground drops, trunks when the server offers them)"
+                                                                       : "OFF (0.5.3: the offer is ignored, /gun gives locally)");
+        }
         g_peerEnterTask.store(reg::Get(L"puppet_enter") == L"task");   // Sync D: the W6 door walk back (default: follow the pose)
         g_seatIntentOn.store(reg::Get(L"seat_intent") != L"0");        // T1 seats: 0 = the pre-v6 entry (walk + teleport-in; follow + seat warp)
         g_vehRearSeats.store(reg::Get(L"veh_rear_seats") != L"0");     // 0.4.22: F / G may pick the rear seats (0 = driver + front passenger only)
@@ -2364,6 +2389,18 @@ namespace {
         g_satietyAdd.store(0);
         GLOGI("engine: inventory (0.6) this session: %u states received, %u ops sent, %u not sent, %u food used", g_invStates.exchange(0),
               g_invOpsSent.exchange(0), g_invOpsUnsent.exchange(0), g_invUsed.exchange(0));
+        if (g_invWorldOffered.exchange(false) || g_invwSnaps.load())
+            GLOGI("engine: inventory world (0.5.4) this session: %s, %u snapshots, %u nearby updates, %u reports (%u not sent); ped: %u gives, "
+                  "%u removes, %u ammo sets, %u selects, %u restores", g_invWorldLive.load() ? "answered" : "NOT answered", g_invwSnaps.exchange(0),
+                  g_invwNearby.exchange(0), g_invwReports.exchange(0), g_invwReportsUnsent.exchange(0), g_invwGives.exchange(0),
+                  g_invwRemoves.exchange(0), g_invwAmmoSets.exchange(0), g_invwSelects.exchange(0), g_invwRestores.exchange(0));
+        g_invWorldLive.store(false);
+        g_invwReset.store(true);
+        {
+            std::lock_guard<std::mutex> lk(g_invwMtx);
+            g_invwSnapFresh = false;
+            g_invwSnap = proto::InvSnap();
+        }
         g_entry.store(Entry::Waiting);
         g_entryStarted.store(0);
         g_entryReadyAt.store(0);
@@ -3778,6 +3815,296 @@ namespace {
         g_satietyAdd.fetch_add((int)u.satiety);
     }
 
+    // ---- 0.5.4 inventory world (engine side; the rules are libs/sync/inventory_world.h) ----------------------------------------------------
+    // Join worker thread: our inventory WITH weapons (the server sends InvSnap instead of InvState once we answered its offer). The overlay
+    // takes it like an InvState; the script tick applies its weapons to the ped (TickInventoryWorld). A snapshot the tick has not applied yet
+    // is replaced by the newer one, keeping its strip list and its "not from our report" (both must still reach the ped).
+    void OnInvSnap(const proto::InvSnap& s) {
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lk(g_invMtx);
+            name = g_invName;
+        }
+        if (g_invwSnaps.fetch_add(1) == 0)
+            GLOGI("engine: inventory world (0.5.4): first InvSnap, %zu bytes, rev %u", s.blob.size(), (unsigned)s.rev);
+        game::Overlay::SetInventory(s.blob, s.ackSeq, name.c_str());
+        std::lock_guard<std::mutex> lk(g_invwMtx);
+        if (g_invwSnapFresh) {
+            proto::InvSnap merged = s;
+            for (uint32_t h : g_invwSnap.strip)
+                if (std::find(merged.strip.begin(), merged.strip.end(), h) == merged.strip.end())
+                    merged.strip.push_back(h);
+            if (!(g_invwSnap.flags & proto::kInvSnapFromReport))
+                merged.flags &= (uint8_t)~proto::kInvSnapFromReport;
+            g_invwSnap = std::move(merged);
+        } else {
+            g_invwSnap = s;
+        }
+        g_invwSnapFresh = true;
+    }
+
+    // Join worker thread: what is in reach (the first one, empty, is the server's offer). inv_world=0 ignores it: no answer, so the server
+    // goes on treating us as a 0.5.3 client.
+    void OnInvNearby(const proto::InvNearby& n) {
+        if (!g_invWorldOn.load()) {
+            if (!g_invWorldOffered.exchange(true))
+                GLOGI("engine: inventory world (0.5.4): the server offers it; inv_world=0, not answered (0.5.3 behaviour)");
+            return;
+        }
+        if (!g_invWorldOffered.exchange(true))
+            GLOGI("engine: inventory world (0.5.4): the server offers it; the first report answers it");
+        g_invwNearby.fetch_add(1);
+        std::vector<game::Overlay::InvNearbyBox> v;
+        for (const proto::InvBox& b : n.boxes) {
+            game::Overlay::InvNearbyBox o;
+            o.id = b.id;
+            o.kind = b.kind;
+            o.locked = (b.flags & proto::kInvBoxLocked) != 0;
+            o.veh = b.veh;
+            o.model = b.model;
+            o.cls = b.cls == 255 ? -1 : (int)b.cls;
+            o.piles = b.piles;
+            o.distM = (float)b.distCm / 100.0f;
+            o.encoded = b.blob;
+            v.push_back(std::move(o));
+        }
+        game::Overlay::SetNearby(v);
+    }
+
+    // Script tick only.
+    struct InvWorldTick {
+        bool haveSnap = false;              // `cur` holds a snapshot applied to the ped
+        sync::inv::Character cur;           // the newest snapshot applied to the ped: what the ped must carry
+        uint32_t rev = 0;                   // its rev (every report carries it: the server reconciles only a report of its current rev)
+        bool havePending = false;           // a snapshot arrived while the ped could not take it (dead, new): applied once it can
+        proto::InvSnap pending;
+        sync::invw::AmmoTypes types;        // weapon -> ammo type (GET_PED_AMMO_TYPE_FROM_WEAPON), learned once per weapon
+        std::vector<uint32_t> typeAsked;
+        sync::invw::ReportGate gate;        // when to report (inventory_world.h)
+        double readAtMs = -1e9, appliedAtMs = -1e9;
+        int32_t ped = 0;
+        double pedSinceMs = 0;              // when this ped handle (or its life after a death) began
+        bool wasDead = false;
+        bool afterRespawn = false;          // the next restore may also give back thrown weapons (GTA cleared the ped)
+        std::map<uint32_t, double> missingSince, restoredAt;   // weapon -> when the ped was first seen lacking it / last given it back
+        std::map<uint16_t, std::pair<int32_t, int>> cls;      // server vehicle id -> (handle, GET_VEHICLE_CLASS) read for the trunk
+        std::set<uint16_t> clsSent;         // vehicle ids whose class went out in a report this session
+    };
+    InvWorldTick g_invw;
+    constexpr double kInvwReadEveryMs = 250, kInvwPedSettleMs = 3000, kInvwRestoreAfterMs = 1000, kInvwRestoreGapMs = 2000, kInvwVehReachM = 6.0;
+
+    uint32_t InvwAmmoType(int32_t lp, uint32_t hash) {
+        if (std::find(g_invw.typeAsked.begin(), g_invw.typeAsked.end(), hash) == g_invw.typeAsked.end()) {
+            g_invw.typeAsked.push_back(hash);
+            g_invw.types.Learn(hash, g_world->GetPedAmmoTypeFromWeapon(lp, hash));
+        }
+        return g_invw.types.Of(hash);
+    }
+
+    // The ped as a report sees it: every catalog weapon it has, with its ammo (and type), and the selected weapon. Not valid while dead,
+    // within kInvwPedSettleMs of a new ped / a respawn, or when a native cannot be called (nothing in an invalid read is used).
+    sync::invw::PedState InvwReadPed(int32_t lp, bool dead, double nowMs) {
+        sync::invw::PedState st;
+        if (!lp || dead || nowMs - g_invw.pedSinceMs < kInvwPedSettleMs)
+            return st;
+        st.current = g_world->GetSelectedPedWeapon(lp);
+        if (!st.current)
+            return st;
+        for (const sync::inv::ItemDef& d : sync::inv::WeaponCatalog()) {
+            const int has = g_world->HasPedGotWeapon(lp, d.weapon);
+            if (has < 0)
+                return sync::invw::PedState();
+            if (!has)
+                continue;
+            sync::invw::PedWeapon w;
+            w.hash = d.weapon;
+            w.ammoType = InvwAmmoType(lp, d.weapon);
+            const int a = g_world->GetAmmoInPedWeapon(lp, d.weapon);
+            w.ammo = (uint16_t)std::max(0, std::min(a, 65535));
+            st.have.push_back(w);
+        }
+        st.valid = true;
+        return st;
+    }
+
+    void InvwExecute(int32_t lp, const std::vector<sync::invw::Act>& acts) {
+        for (const sync::invw::Act& a : acts) {
+            switch (a.k) {
+            case sync::invw::ActK::Remove: g_world->RemoveWeaponFromPed(lp, a.hash); g_invwRemoves.fetch_add(1); break;
+            case sync::invw::ActK::Give: g_world->GiveWeaponHolstered(lp, a.hash, 0); g_invwGives.fetch_add(1); break;
+            case sync::invw::ActK::SetAmmo: g_world->SetPedAmmo(lp, a.hash, a.ammo); g_invwAmmoSets.fetch_add(1); break;
+            case sync::invw::ActK::Select: g_world->SetCurrentPedWeapon(lp, a.hash, true); g_invwSelects.fetch_add(1); break;
+            }
+        }
+    }
+
+    // Server vehicles within kInvwVehReachM whose class the server has not had from us this session: the trunk needs it.
+    std::vector<proto::InvVehClass> InvwVehicleClasses(int32_t lp, bool& anyNew) {
+        anyNew = false;
+        std::vector<proto::InvVehClass> out;
+        float px = 0, py = 0, pz = 0;
+        if (!g_world->GetEntityCoords(lp, px, py, pz))
+            return out;
+        for (auto& kv : g_vehs) {
+            const int32_t h = kv.second.handle;
+            if (!h || out.size() >= proto::kMaxInvReportVehicles)
+                continue;
+            float x = 0, y = 0, z = 0;
+            if (!g_world->GetEntityCoords(h, x, y, z))
+                continue;
+            const float dx = x - px, dy = y - py, dz = z - pz;
+            if (dx * dx + dy * dy + dz * dz > kInvwVehReachM * kInvwVehReachM)
+                continue;
+            auto it = g_invw.cls.find(kv.first);
+            if (it == g_invw.cls.end() || it->second.first != h) {
+                g_invw.cls[kv.first] = {h, g_world->GetVehicleClass(h)};
+                g_invw.clsSent.erase(kv.first);   // a recycled id is another car
+                it = g_invw.cls.find(kv.first);
+            }
+            const int c = it->second.second;
+            if (c < 0 || c > 22)
+                continue;
+            proto::InvVehClass v;
+            v.veh = kv.first;
+            v.cls = (uint8_t)c;
+            out.push_back(v);
+            if (!g_invw.clsSent.count(kv.first))
+                anyNew = true;
+        }
+        return out;
+    }
+
+    // Script tick: the ped <-> inventory loop (inventory_world.h section 3). Applies the newest snapshot to the ped, gives back carried
+    // weapons the ped lost (death, a script), and reports the ped when it changed. Runs only once the server offered the inventory world.
+    void TickInventoryWorld(int32_t lp, bool dead, double nowMs) {
+        if (g_invwReset.exchange(false)) {
+            g_invw = InvWorldTick();
+            game::Overlay::SetInventoryWorld(false);
+        }
+        if (!g_invWorldOn.load() || !g_invWorldOffered.load() || !lp)
+            return;
+        if (lp != g_invw.ped) {
+            g_invw.ped = lp;
+            g_invw.pedSinceMs = nowMs;
+            g_invw.afterRespawn = true;
+        }
+        if (g_invw.wasDead && !dead) {
+            g_invw.pedSinceMs = nowMs;   // a respawn: GTA may have cleared the weapons
+            g_invw.afterRespawn = true;
+        }
+        g_invw.wasDead = dead;
+        {
+            std::lock_guard<std::mutex> lk(g_invwMtx);
+            if (g_invwSnapFresh) {
+                if (g_invw.havePending) {   // two in a row before the ped could take either: keep both strips, the stronger flag
+                    for (uint32_t h : g_invw.pending.strip)
+                        if (std::find(g_invwSnap.strip.begin(), g_invwSnap.strip.end(), h) == g_invwSnap.strip.end())
+                            g_invwSnap.strip.push_back(h);
+                    if (!(g_invw.pending.flags & proto::kInvSnapFromReport))
+                        g_invwSnap.flags &= (uint8_t)~proto::kInvSnapFromReport;
+                }
+                g_invw.pending = std::move(g_invwSnap);
+                g_invwSnap = proto::InvSnap();
+                g_invw.havePending = true;
+                g_invwSnapFresh = false;
+            }
+        }
+        if (!g_invw.havePending && nowMs - g_invw.readAtMs < kInvwReadEveryMs)
+            return;
+        g_invw.readAtMs = nowMs;
+        sync::invw::PedState ped = InvwReadPed(lp, dead, nowMs);
+
+        // 1. a new snapshot reaches the ped (only a ped that can take it: a removal missed now would come back as a "gain")
+        if (g_invw.havePending && ped.valid) {
+            sync::inv::Character c;
+            if (sync::inv::Decode(g_invw.pending.blob, c)) {
+                for (uint32_t h : sync::invw::CarriedHashes(c))
+                    InvwAmmoType(lp, h);
+                const bool fromReport = (g_invw.pending.flags & proto::kInvSnapFromReport) != 0;
+                InvwExecute(lp, sync::invw::PlanSnapshot(g_invw.haveSnap ? &g_invw.cur : nullptr, c, fromReport, g_invw.pending.strip, ped, g_invw.types));
+                g_invw.cur = std::move(c);
+                g_invw.haveSnap = true;
+                g_invw.rev = g_invw.pending.rev;
+                g_invw.appliedAtMs = nowMs;
+                g_invw.missingSince.clear();
+            } else {
+                GLOGW("engine: inventory world (0.5.4): an InvSnap did not decode (%zu bytes); kept the last one", g_invw.pending.blob.size());
+            }
+            g_invw.havePending = false;
+            g_invw.pending = proto::InvSnap();
+            return;   // the ped is read again next time, after GTA took the changes
+        }
+        if (!ped.valid || g_invw.havePending)
+            return;
+
+        // 2. carried weapons the ped lost come back (after kInvwRestoreAfterMs, at most every kInvwRestoreGapMs each). A thrown weapon only
+        //    after a respawn: otherwise its loss is the last one thrown, which the next report tells the server (it is used up there).
+        if (g_invw.haveSnap) {
+            std::vector<sync::invw::Act> acts;
+            std::vector<uint32_t> held;   // weapons whose give-back waits (both its Give and its SetAmmo)
+            for (const sync::invw::Act& a : sync::invw::PlanRestore(g_invw.cur, ped, g_invw.types)) {
+                if (a.k == sync::invw::ActK::Give) {
+                    const sync::inv::ItemDef* d = sync::inv::FindWeapon(a.hash);
+                    auto ms = g_invw.missingSince.emplace(a.hash, nowMs).first;
+                    auto ra = g_invw.restoredAt.find(a.hash);
+                    const bool wait = (d && sync::inv::IsThrown(*d) && !g_invw.afterRespawn) ||
+                                      (nowMs - ms->second < kInvwRestoreAfterMs && !g_invw.afterRespawn) ||
+                                      (ra != g_invw.restoredAt.end() && nowMs - ra->second < kInvwRestoreGapMs);
+                    if (wait) {
+                        held.push_back(a.hash);
+                        continue;
+                    }
+                    g_invw.restoredAt[a.hash] = nowMs;
+                    g_invwRestores.fetch_add(1);
+                } else if (std::find(held.begin(), held.end(), a.hash) != held.end()) {
+                    continue;
+                }
+                acts.push_back(a);
+            }
+            for (auto it = g_invw.missingSince.begin(); it != g_invw.missingSince.end();)
+                it = ped.Has(it->first) ? g_invw.missingSince.erase(it) : std::next(it);
+            g_invw.afterRespawn = false;
+            if (!acts.empty()) {
+                InvwExecute(lp, acts);
+                return;   // read again before reporting: the ped just changed
+            }
+        }
+
+        // 3. the report (sync::invw::ReportGate): the first one answers the offer; then a ped that changed since the last report, or one that
+        //    still differs from a newer snapshot; also when a car came near whose class the server lacks (its trunk).
+        bool newVeh = false;
+        const std::vector<proto::InvVehClass> vehs = InvwVehicleClasses(lp, newVeh);
+        bool send = g_invw.gate.Due(ped, g_invw.rev, g_invw.haveSnap ? &g_invw.cur : nullptr, g_invw.appliedAtMs, g_invw.types, nowMs);
+        if (!send && newVeh && nowMs - g_invw.gate.lastSentMs >= sync::invw::ReportGate::kPresenceGapMs)
+            send = true;
+        if (!send)
+            return;
+        const sync::invw::Report r = sync::invw::BuildReport(g_invw.rev, ped);
+        proto::InvReport m;
+        m.rev = r.rev;
+        m.current = r.current;
+        m.flags = r.valid ? proto::kInvReportPedValid : 0;
+        for (const sync::invw::PedWeapon& w : r.weapons)
+            if (m.weapons.size() < proto::kMaxInvReportWeapons)
+                m.weapons.push_back({w.hash, w.ammoType, w.ammo});
+        m.vehicles = vehs;
+        if (!join::SendInvReport(m)) {
+            if (g_invwReportsUnsent.fetch_add(1) < 4)
+                GLOGW("engine: inventory world (0.5.4): report not sent (no live session)");
+            return;
+        }
+        g_invwReports.fetch_add(1);
+        for (const proto::InvVehClass& v : vehs)
+            g_invw.clsSent.insert(v.veh);
+        if (!g_invw.gate.sentOnce) {
+            g_invWorldLive.store(true);
+            game::Overlay::SetInventoryWorld(true);
+            GLOGI("engine: inventory world (0.5.4): answered (rev %u, %zu weapon(s) on the ped, current 0x%08X)", (unsigned)m.rev,
+                  m.weapons.size(), (unsigned)m.current);
+        }
+        g_invw.gate.Sent(ped, g_invw.rev, nowMs);
+    }
+
     // 0.6, script tick: the ops the player made on the inventory page, to the server in order. Without a live session there is no
     // inventory to change (the page shows "unavailable"), so an op left over from a session that just ended is dropped.
     void PumpInventoryOps() {
@@ -3891,6 +4218,11 @@ namespace {
                 std::string name = c.arg;
                 AsciiLower(name);
                 if (name.rfind("weapon_", 0) != 0) name = "weapon_" + name;
+                if (g_invWorldLive.load()) {
+                    // 0.5.4: the server put it into the inventory (the hand when free); its InvSnap gives it to the ped
+                    GLOGI("engine: /gun %s: through the inventory (0.5.4), not given locally", name.c_str());
+                    break;
+                }
                 g_world->GiveWeapon(lp, g_world->HashKey(name.c_str()), 250);
                 GLOGI("engine: /gun %s", name.c_str());
                 break;
@@ -14922,6 +15254,7 @@ namespace {
                     TickDoorsSeats(lp, lpVeh, dead, nowMs);     // 0.4.22: the L key, the lock read-back on the copies, the seat read-back of a pick
                 }
                 TickVehicleControls(lp, lpVeh, dead, nowMs);    // 0.4.22: indicators, engine, belt keys + the strip and the fuel gauge (server or not)
+                TickInventoryWorld(lp, dead, nowMs);            // 0.5.4: ped weapons <-> inventory (only once the server offered it)
                 TickIndicatorFallback(lp, lpVeh, nowMs);        // 0.4.27: our own blinking light on cars whose indicators the game does not show
             }
             if (lp)
@@ -15175,6 +15508,8 @@ namespace gage::engine {
         sinks.onAdminResult = OnAdminResult;       // v8
         sinks.onInvState = OnInvState;             // 0.6 inventory
         sinks.onInvUsed = OnInvUsed;
+        sinks.onInvSnap = OnInvSnap;               // 0.5.4 inventory world
+        sinks.onInvNearby = OnInvNearby;
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

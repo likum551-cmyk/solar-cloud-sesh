@@ -30,11 +30,11 @@ static void T4NetworkTests()
         const bool dec = proto::Decode(b.data(), b.size(), back);
         proto::Msg t;
         Check("T4 wire: VehicleImpact is message 40, 21 bytes laid out byte for byte (seq, ids, the contact time on the receiver's clock, dv in 1/64 m/s, yaw in 1/256 rad/s, the normal in 1/127, "
-              "closing in 0.25 m/s, depth in cm); it decodes back; PeekType knows 40 and not 52 (R3 T5 added 44 LinkInfo, v8 45..51); the name is VehicleImpact",
+              "closing in 0.25 m/s, depth in cm); it decodes back; PeekType knows 40 and not 55 (R3 T5 added 44 LinkInfo, v8 45..51, 0.5.4 52..54); the name is VehicleImpact",
               b == want && b.size() == proto::kVehicleImpactBytes && dec && back.seq == m.seq && back.vehId == 5 && back.otherId == 9 && back.sampleMs == 0xA1B2 &&
                   back.dvx == -1.0f && back.dvy == 24.5f && back.dyaw == -2.0f && back.nx == 1.0f && back.ny == -1.0f && back.closing == 40.0f && back.depth == 0.25f &&
                   proto::PeekType(b.data(), b.size(), t) && t == proto::Msg::VehicleImpact && std::string(proto::ToString(t)) == "VehicleImpact" &&
-                  proto::kMsgLast == 51 && []{ const uint8_t x = 52; proto::Msg y; return !proto::PeekType(&x, 1, y); }(),
+                  proto::kMsgLast == 54 && []{ const uint8_t x = 55; proto::Msg y; return !proto::PeekType(&x, 1, y); }(),
               Hex(b));
     }
 

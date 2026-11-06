@@ -100,7 +100,7 @@ namespace gage::server {
         }
         if (!EnsureDir(why))
             return false;
-        return AtomicWriteFile(PathFor(accountId), sync::inv::Encode(ch), why);
+        return AtomicWriteFile(PathFor(accountId), sync::inv::EncodeForSave(ch), why);
     }
 
 } // namespace gage::server

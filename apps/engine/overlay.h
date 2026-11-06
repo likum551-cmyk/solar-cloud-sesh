@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace gage::game::Overlay {
 
@@ -102,6 +103,23 @@ namespace gage::game::Overlay {
     // 0.6 inv_rev3 (HKCU\Software\GAGE-MP, default on): the Tab menu opens on the REV3 inventory, admins also get the old menu as ADMIN;
     // off = the old Tab menu only (0.5.2). Any thread.
     void SetInventoryScreen(bool on);
+    // 0.5.4 inventory world (overlay_inventory.cpp; rules in libs/sync/inventory_world.h). SetInventoryWorld: the server speaks it and the
+    // engine answered (inv_world on): the screen shows the HAND pill, weapons, and the NEARBY panel's trunk / ground boxes, and sends ops
+    // on them. SetNearby: the server's InvNearby (at most one trunk and one ground pile; `encoded` = sync::inv::EncodeBox, empty while locked).
+    // ClearInventory also clears both. Any thread.
+    struct InvNearbyBox {
+        uint32_t id = 0;
+        uint8_t kind = 0;          // sync::inv::Kind (Trunk 3, Ground 5)
+        bool locked = false;
+        uint16_t veh = 0xFFFF;     // a trunk's server vehicle id
+        uint32_t model = 0;
+        int cls = -1;              // GET_VEHICLE_CLASS of the trunk's vehicle
+        int piles = 0;             // ground: piles in reach (the nearest is this box)
+        float distM = 0;
+        std::string encoded;
+    };
+    void SetInventoryWorld(bool on);
+    void SetNearby(const std::vector<InvNearbyBox>& boxes);
 
     // 0.5.2 round-map probe: the next frame's bottom-left (the radar's quarter, before the overlay draws on it) is saved to
     // %LOCALAPPDATA%\GAGE-MP\radar_probe_<n>.bmp and logged, so the radar's landing place can be measured. D3D11 (Legacy) only; on D3D12 one line

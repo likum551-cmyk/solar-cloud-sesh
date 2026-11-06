@@ -351,6 +351,11 @@ namespace gage::game {
         constexpr uint64_t GET_ENTITY_BONE_INDEX_BY_NAME          = 0xFB71170B7E76ACBA;
         constexpr uint64_t GET_WORLD_POSITION_OF_ENTITY_BONE      = 0x44A8FCB8ED227738;
         constexpr uint64_t GET_AMMO_IN_PED_WEAPON                 = 0x015A522136D7F951;
+        // 0.5.4 inventory world (alloc8or public hashes; b3889 in kCrossmap3889)
+        constexpr uint64_t HAS_PED_GOT_WEAPON                     = 0x8DECB02F88F428BC;
+        constexpr uint64_t REMOVE_WEAPON_FROM_PED                 = 0x4899CB088EDF59B8;
+        constexpr uint64_t SET_PED_AMMO                           = 0x14E56BC5B5DB6A19;
+        constexpr uint64_t GET_PED_AMMO_TYPE_FROM_WEAPON          = 0x7FEAD38B326B9F74;
         constexpr uint64_t SET_PED_INFINITE_AMMO_CLIP             = 0x183DADC6AA953186;
 
         // camera / aim and the synchronous line-of-sight probe (same sourcing as above).
@@ -1235,6 +1240,14 @@ namespace gage::game {
         bool     GetWeaponMuzzlePos(int32_t ped, float& x, float& y, float& z);
         int      GetAmmoInPedWeapon(int32_t ped, uint32_t weaponHash);  // total ammo; -1 = cannot call
         bool     SetPedInfiniteAmmoClip(int32_t ped, bool on);
+        // 0.5.4 inventory world (weapons as inventory items). Each returns false / -1 / 0 when the
+        // native cannot be called, so a caller never mistakes "unknown" for "no".
+        int      HasPedGotWeapon(int32_t ped, uint32_t weaponHash);       // 1 / 0; -1 = cannot call
+        bool     RemoveWeaponFromPed(int32_t ped, uint32_t weaponHash);
+        bool     SetPedAmmo(int32_t ped, uint32_t weaponHash, int ammo);  // the weapon's whole pool
+        uint32_t GetPedAmmoTypeFromWeapon(int32_t ped, uint32_t weaponHash);  // 0 = unknown / cannot call
+        // GIVE_WEAPON_TO_PED with equipNow = false (the inventory decides what is in the hand).
+        bool     GiveWeaponHolstered(int32_t ped, uint32_t weaponHash, int ammo);
 
         // -- camera and aim (script tick) --------------------------------------
         bool     GetGameplayCamCoord(float& x, float& y, float& z);

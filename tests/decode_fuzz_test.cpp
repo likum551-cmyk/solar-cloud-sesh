@@ -361,6 +361,21 @@ static std::vector<Case> Corpus()
     { InvState m; m.ackSeq = 70001; m.blob = std::string("\x01\x05\x00\x02\x00\x00\x00\xff", 8) + std::string(200, '\0'); v.push_back(Make("InvState", m)); }
     { InvOp m; m.seq = 70002; m.op = std::string("\x00\x00\x03\x00\x01\x05\x00\x00\x00\x00\x00", 11); v.push_back(Make("InvOp", m)); }
     { InvUsed m; m.item = 6; m.satiety = 40; v.push_back(Make("InvUsed", m)); }
+    // 0.5.4 inventory world: the long op (a ground pile / trunk side), the snapshot with a strip list, the nearby boxes, the ped report
+    { InvOp m; m.seq = 70003; m.op = std::string("\x00\x05\x02\x00\x00\x03\x00\x00\x00\x00\x00\xEF\xBE\xAD\xDE\x00\x00\x00\x00", 19); v.push_back(Make("InvOp world", m)); }
+    { InvSnap m; m.ackSeq = 70004; m.rev = 9; m.flags = kInvSnapFromReport; m.blob = std::string("\x02\x05\x00", 3) + std::string(120, '\0');
+      m.strip = {0x1B06D571u, 0x99B507EAu}; v.push_back(Make("InvSnap", m)); }
+    {
+        InvNearby m;
+        InvBox t; t.id = 41; t.kind = 3; t.flags = 0; t.veh = 12; t.model = 0xB779A091u; t.cls = 1; t.piles = 0; t.distCm = 250;
+        t.blob = std::string("\x02\x03\x80\x38\x01\x00\x02", 7) + std::string(14, '\0');
+        InvBox g; g.id = 42; g.kind = 5; g.flags = 0; g.piles = 3; g.distCm = 90; g.blob = std::string("\x02\x05\x00\x00\x00\x00\x01", 7) + std::string(7, '\0');
+        InvBox l; l.id = 43; l.kind = 3; l.flags = kInvBoxLocked; l.veh = 13; l.cls = 2;
+        m.boxes = {t, g, l};
+        v.push_back(Make("InvNearby", m));
+    }
+    { InvReport m; m.rev = 9; m.current = 0x1B06D571u; m.flags = kInvReportPedValid; m.weapons = {{0x1B06D571u, 0x743D4F54u, 120}, {0x99B507EAu, 0, 0}};
+      m.vehicles = {{12, 1}, {13, 2}}; v.push_back(Make("InvReport", m)); }
     for (Case& c : v)
         if (c.name.rfind("VehicleWorld", 0) == 0 || c.name.rfind("VehicleUpdate", 0) == 0 || c.name == "VehicleCmd register") c.lossy = true;
     return v;

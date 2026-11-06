@@ -815,6 +815,10 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_ENTITY_BONE_INDEX_BY_NAME,                    0x365DC1E8054AF31A},
     {native::GET_WORLD_POSITION_OF_ENTITY_BONE,                0x75DF72FC74EED046},
     {native::GET_AMMO_IN_PED_WEAPON,                           0x1149D67DB429787A},
+    {native::HAS_PED_GOT_WEAPON,                               0x66B90BA528CFEBCE},
+    {native::REMOVE_WEAPON_FROM_PED,                           0x4F07124B9C56ED6F},
+    {native::SET_PED_AMMO,                                     0x45FC566246B3511B},
+    {native::GET_PED_AMMO_TYPE_FROM_WEAPON,                    0xA239630C4686BC6E},
     {native::SET_PED_INFINITE_AMMO_CLIP,                       0x53A38286A3AC16C1},
     {native::GET_GAMEPLAY_CAM_COORD,                           0xCF141FCD0940B0A3},
     {native::GET_GAMEPLAY_CAM_ROT,                             0xD84A545408A3099A},
@@ -5781,6 +5785,44 @@ bool World::SetPedInfiniteAmmoClip(int32_t ped, bool on) {
     return callPedToggle(*this, native::SET_PED_INFINITE_AMMO_CLIP, ped, on);
 }
 
+// -- 0.5.4 inventory world: weapons as inventory items ------------------------
+int World::HasPedGotWeapon(int32_t ped, uint32_t weaponHash) {
+    if (!ped || !weaponHash) return -1;
+    // HAS_PED_GOT_WEAPON(Ped ped, Hash weaponHash, BOOL p2) -> BOOL; p2 = false (not GADGETs only)
+    uint64_t args[] = { entArg(ped), weaponHash, 0 };
+    uint64_t r[4] = {};
+    if (!CallNative(native::HAS_PED_GOT_WEAPON, args, 3, r)) return -1;
+    return (r[0] & 0xffffffffu) != 0 ? 1 : 0;
+}
+
+bool World::RemoveWeaponFromPed(int32_t ped, uint32_t weaponHash) {
+    if (!ped || !weaponHash) return false;
+    uint64_t args[] = { entArg(ped), weaponHash };   // REMOVE_WEAPON_FROM_PED(Ped, Hash)
+    return CallNative(native::REMOVE_WEAPON_FROM_PED, args, 2, nullptr);
+}
+
+bool World::SetPedAmmo(int32_t ped, uint32_t weaponHash, int ammo) {
+    if (!ped || !weaponHash || ammo < 0) return false;
+    // SET_PED_AMMO(Ped, Hash, int ammo, BOOL p3); p3 = false as in the stock scripts
+    uint64_t args[] = { entArg(ped), weaponHash, (uint64_t)(uint32_t)ammo, 0 };
+    return CallNative(native::SET_PED_AMMO, args, 4, nullptr);
+}
+
+uint32_t World::GetPedAmmoTypeFromWeapon(int32_t ped, uint32_t weaponHash) {
+    if (!ped || !weaponHash) return 0;
+    uint64_t args[] = { entArg(ped), weaponHash };   // GET_PED_AMMO_TYPE_FROM_WEAPON(Ped, Hash) -> Hash
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_PED_AMMO_TYPE_FROM_WEAPON, args, 2, r)) return 0;
+    return (uint32_t)(r[0] & 0xffffffffu);
+}
+
+bool World::GiveWeaponHolstered(int32_t ped, uint32_t weaponHash, int ammo) {
+    if (!ped || !weaponHash) return false;
+    // GIVE_WEAPON_TO_PED(ped, weapon, ammo, isHidden, equipNow = false)
+    uint64_t args[] = { entArg(ped), weaponHash, (uint64_t)(uint32_t)(ammo < 0 ? 0 : ammo), 0, 0 };
+    return CallNative(native::GIVE_WEAPON_TO_PED, args, 5, nullptr);
+}
+
 bool World::GetGameplayCamCoord(float& x, float& y, float& z) {
     uint64_t r[4] = {};
     if (!CallNative(native::GET_GAMEPLAY_CAM_COORD, nullptr, 0, r)) return false;
@@ -6933,6 +6975,10 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_ENTITY_BONE_INDEX_BY_NAME),
         GAGE_NEW_NATIVE(GET_WORLD_POSITION_OF_ENTITY_BONE),
         GAGE_NEW_NATIVE(GET_AMMO_IN_PED_WEAPON),
+        GAGE_NEW_NATIVE(HAS_PED_GOT_WEAPON),
+        GAGE_NEW_NATIVE(REMOVE_WEAPON_FROM_PED),
+        GAGE_NEW_NATIVE(SET_PED_AMMO),
+        GAGE_NEW_NATIVE(GET_PED_AMMO_TYPE_FROM_WEAPON),
         GAGE_NEW_NATIVE(SET_PED_INFINITE_AMMO_CLIP),
         GAGE_NEW_NATIVE(GET_GAMEPLAY_CAM_COORD),
         GAGE_NEW_NATIVE(GET_GAMEPLAY_CAM_ROT),

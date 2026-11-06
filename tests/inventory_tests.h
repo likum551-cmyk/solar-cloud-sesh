@@ -288,7 +288,7 @@ namespace invtest {
             Character worn;
             worn.equip[EquipIndex(Equip::Shoes)] = Slot{Id("cap"), 1, kNoCondition};
             Character x;
-            const bool refuses = !Decode(Encode(over), x) && !Decode(Encode(unknown), x) && !Decode(Encode(worn), x) && bad(0, 2) &&
+            const bool refuses = !Decode(Encode(over), x) && !Decode(Encode(unknown), x) && !Decode(Encode(worn), x) && bad(0, 3) &&
                                  bad(1 + 16 * 7 + 14 * 7, 8) && !Decode(b + std::string(1, '\0'), x) && !Decode(b.substr(0, b.size() - 1), x);
             Op o;
             o.kind = OpKind::Split; o.src = Where::Pack; o.si = 3; o.dst = Where::Pockets; o.di = 15; o.qty = 4;
@@ -301,11 +301,11 @@ namespace invtest {
         }
         {
             // Grants (admin /give, the starter kit): the starter kit decodes (it is a state the rules accept) and has no pack; Give fills the
-            // pockets first, then a worn pack, and stops at the weight cap (20 fuel cans of 4 kg: 3 fit in 15 kg of pockets with the kit's 1.62 kg,
-            // 6 more in a rucksack's 25 kg); a pack is never given into the pack
+            // pockets first, then a worn pack, and stops at the weight cap (20 fuel cans of 4 kg: 3 fit in 15 kg of pockets, 6 more in a
+            // rucksack's 25 kg); a pack is never given into the pack. 0.5.4 (GI: "remove dummy items from inventory"): the pockets start EMPTY.
             Character kit = StarterKit();
             Character back;
-            const bool kitOk = Decode(Encode(kit), back) && !kit.HasPack() && UsedSlots(kit.pockets) == 5 &&
+            const bool kitOk = Decode(Encode(kit), back) && !kit.HasPack() && UsedSlots(kit.pockets) == 0 &&
                                kit.equip[EquipIndex(Equip::Shirt)].item == Id("tshirt") && kit.equip[EquipIndex(Equip::Shoes)].item == Id("sneakers");
             const uint32_t noPack = Give(kit, Id("fuel_can"), 20);
             Character big = StarterKit();
@@ -319,7 +319,7 @@ namespace invtest {
                 if (p2.pockets.slots[(size_t)i].Empty())
                     p2.pockets.slots[(size_t)i] = Slot{Id("notebook"), 1, kNoCondition};
             const uint32_t packInPack = Give(p2, Id("daypack"), 1);
-            Check("inventory: the starter kit is a valid state (5 pocket stacks, tee / jeans / sneakers worn, no pack); Give fills pockets then the pack "
+            Check("inventory: the starter kit is a valid state (empty pockets, tee / jeans / sneakers worn, no pack); Give fills pockets then the pack "
                   "within weight (20 fuel cans: 3 without a pack, 9 with a rucksack) and never puts a pack in the pack",
                   kitOk && noPack == 3 && withPack == 9 && packInPack == 0, F("kit %d noPack %u withPack %u packInPack %u", (int)kitOk, noPack, withPack, packInPack));
         }

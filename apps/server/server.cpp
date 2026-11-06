@@ -69,6 +69,12 @@ namespace gage::server {
         constexpr double kInvBurst = 20.0, kInvPerSec = 10.0;
         // Changed inventories are written at least this often (and always when the player leaves).
         constexpr uint64_t kInvSaveEveryMs = 30000;
+        // 0.5.4 InvReport per player: the client sends one on a change of its ped's weapons (at most ~4 a second); 10 at once, then 5 a
+        // second. Over it the report is ignored (the client sends again while its ped still differs).
+        constexpr double kInvReportBurst = 10.0, kInvReportPerSec = 5.0;
+        // The inventory world's pass (sweep + every 0.5.4 player's InvNearby) and its log line.
+        constexpr uint64_t kInvWorldEveryMs = 250;
+        constexpr uint64_t kInvWorldLogEveryMs = 60000;
         // A VehicleCmd over its rate limit is answered RateLimited at most this often per player ...
         constexpr uint64_t kRateLimitedReplyEveryMs = 1000;
         // ... and every one over the limit also draws on this bucket (burst, per second): a client that keeps
@@ -142,6 +148,15 @@ namespace gage::server {
         bool invSave = false;
         bool invDirty = false;
         TokenBucket invRate;
+        // 0.5.4 inventory world: `invCaps` = this client answered the offer with an InvReport (it gets InvSnap, InvNearby and may
+        // send the 19-byte op form); `invRev` counts the distinct InvSnap blobs sent (a report is reconciled only when stamped with
+        // it); `invAmmo` = the ammo type of each weapon, learned from its reports; `invNearSent` = the last InvNearby bytes.
+        bool invCaps = false;
+        uint32_t invRev = 0;
+        std::string invLastBlob;
+        sync::invw::AmmoTypes invAmmo;
+        proto::Bytes invNearSent;
+        TokenBucket invReportRate;
 
         // valid once Joined
         uint16_t id = 0;
@@ -393,8 +408,17 @@ namespace gage::server {
         cfg_ = cfg;
         if (!bans_.Load(cfg_.bansFile, &why)) return fail("ban list: " + why);
         invStore_.SetDir(cfg_.inventoryDir);
+        {
+            sync::invw::Rules r;
+            r.groundReach = (float)cfg_.invGroundReach;
+            r.trunkReach = (float)cfg_.invTrunkReach;
+            r.groundLifeMs = (uint64_t)cfg_.invGroundExpireSeconds * 1000;
+            r.maxPiles = cfg_.invMaxPiles;
+            invWorld_ = sync::invw::World(r);
+            vehClass_.assign(proto::kMaxVehicles, VehClass());
+        }
 
-        enet_ = std::make_unique<net::EnetScope>();
+        enet_ =std::make_unique<net::EnetScope>();
         if (!enet_->ok()) return fail("ENet failed to initialise");
 
         ENetAddress addr;
@@ -732,6 +756,7 @@ namespace gage::server {
             if (cfg_.meleeAdjudicate) JudgeMelee(nowMs);   // R3 T6: the swings whose blow time has come
             BroadcastWorld();
             BroadcastVehicles(nowMs);
+            TickInventoryWorld(nowMs);   // 0.5.4: after the vehicles moved (trunk positions, despawns)
             stats_.ticks++;
             metrics_.ticks++;
             if (host_) enet_host_flush(host_);
@@ -988,6 +1013,8 @@ namespace gage::server {
             OnAdminCmd(c, data, len);
         else if (type == proto::Msg::InvOp && rel)
             OnInvOp(c, data, len);
+        else if (type == proto::Msg::InvReport && rel)
+            OnInvReport(c, data, len);   // 0.5.4: a client sends it only after the server's InvNearby offer (an older server refuses it here)
         else
             Refuse(c, proto::RefuseReason::Protocol,
                    std::string("unexpected ") + proto::ToString(type) + " on channel " + std::to_string(channel));
@@ -1271,6 +1298,51 @@ namespace gage::server {
                         res.text = c.dead ? "You are dead: wait for the respawn." : "Heal failed.";
                     }
                 }
+                else if (m.op == proto::AdminOp::Gun && c.invCaps && cfg_.invWorld)
+                {
+                    // 0.5.4 (GI: "any gun ... given to player even with admin menu goes into inventory"): the server puts the weapon in
+                    // the inventory (in hand when the hand is free) and the client's reconcile gives it to the ped; the client does not
+                    // give it itself (it skips its local GiveWeapon for an inventory-world session).
+                    std::string key = m.arg;
+                    for (char& ch : key) ch = (char)std::tolower((unsigned char)ch);
+                    if (key.rfind("weapon_", 0) != 0) key = "weapon_" + key;
+                    const sync::inv::ItemDef* d = sync::inv::FindKey(key);
+                    if (!d || !d->weapon)
+                    {
+                        res.code = proto::AdminCode::BadArg;
+                        res.text = "No weapon \"" + m.arg + "\".";
+                    }
+                    else
+                    {
+                        sync::inv::Slot s;
+                        s.item = d->id;
+                        s.qty = 1;
+                        s.ammo = sync::inv::IsThrown(*d) ? 5 : 250;   // the old /gun gave 250 rounds; thrown weapons come as 5
+                        bool placed = false;
+                        if (c.inv.hand.Empty()) { c.inv.hand = s; placed = true; }
+                        else placed = sync::inv::Add(c.inv.pockets, d->id, 1, sync::inv::kNoCondition, s.ammo) == 1 ||
+                                      (c.inv.HasPack() && sync::inv::Add(c.inv.pack, d->id, 1, sync::inv::kNoCondition, s.ammo) == 1);
+                        if (!placed && c.hasState && invWorld_.Drop({c.k.x, c.k.y, c.k.z}, s, net::NowMs()))
+                        {
+                            stats_.invGroundDrops++;
+                            res.text = "No room: it is on the ground at your feet.";
+                            placed = true;
+                        }
+                        if (!placed)
+                        {
+                            res.code = proto::AdminCode::Failed;
+                            res.text = "No room for it.";
+                        }
+                        else
+                        {
+                            sync::invw::NormaliseAmmo(c.inv, c.invAmmo);
+                            c.invDirty = c.invSave;
+                            SendInventory(c, 0);
+                            SendNearby(c, false);
+                            Log(std::string("inventory world: /gun ") + d->key + " for id=" + std::to_string(c.id) + " " + c.name + " via the inventory");
+                        }
+                    }
+                }
             }
         }
         SendTo(c, proto::kChanReliable, proto::Encode(res), true);
@@ -1293,13 +1365,48 @@ namespace gage::server {
             Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " " + InventoryStore::ToString(l) +
                 (invStore_.Enabled() ? "" : " (inventoryDir empty: not saved)"));
         SendInventory(c, 0);
+        // 0.5.4: the offer of the inventory world (what is in reach, usually nothing yet). A 0.5.3 client ignores the unknown type;
+        // a 0.5.4 one answers with an InvReport, which switches this connection to InvSnap.
+        if (cfg_.invWorld)
+            SendNearby(c, true);
     }
 
     void Server::SendInventory(Conn& c, uint32_t ackSeq)
     {
+        SendInventoryEx(c, ackSeq, false, nullptr);
+    }
+
+    void Server::SendInventoryEx(Conn& c, uint32_t ackSeq, bool fromReport, const std::vector<uint32_t>* strip)
+    {
+        if (c.invCaps)
+        {
+            // 0.5.4: codec v2 (weapons, ammo, the hand) and the revision the client stamps its next report with.
+            proto::InvSnap s;
+            s.ackSeq = ackSeq;
+            s.blob = sync::inv::Encode(c.inv);
+            if (s.blob != c.invLastBlob)
+            {
+                c.invRev++;
+                c.invLastBlob = s.blob;
+            }
+            s.rev = c.invRev;
+            s.flags = fromReport ? proto::kInvSnapFromReport : 0;
+            if (strip)
+                for (uint32_t h : *strip)
+                    if (s.strip.size() < proto::kMaxInvStrip) s.strip.push_back(h);
+            const proto::Bytes b = proto::Encode(s);
+            if (b.empty())
+            {
+                Log("inventory: id=" + std::to_string(c.id) + " encodes to " + std::to_string(s.blob.size()) + " bytes, over kMaxInvBlob: not sent");
+                return;
+            }
+            SendTo(c, proto::kChanReliable, b, true);
+            return;
+        }
+        // A 0.6.0 / 0.5.3 client decodes codec v1 only: weapons (which only a 0.5.4 client's reports or /gun put there) are left out.
         proto::InvState s;
         s.ackSeq = ackSeq;
-        s.blob = sync::inv::Encode(c.inv);
+        s.blob = sync::inv::EncodeLegacy(c.inv);
         const proto::Bytes b = proto::Encode(s);
         if (b.empty())
         {
@@ -1324,6 +1431,9 @@ namespace gage::server {
             SendInventory(c, m.seq);
             return;
         }
+        // 0.5.4: an op on a ground pile / trunk, and every Drop (onto the ground) while the inventory world is on.
+        if (WorldOp(c, op, m.seq))
+            return;
         // On a copy first: USE consumes the item inside Apply, and a use the server cannot honour must leave it where it was.
         sync::inv::Character trial = c.inv;
         const sync::inv::ApplyOut out = sync::inv::Apply(trial, op);
@@ -1343,6 +1453,8 @@ namespace gage::server {
             return;
         }
         c.inv = trial;
+        if (c.invCaps)
+            sync::invw::NormaliseAmmo(c.inv, c.invAmmo);   // a weapon moved: its type's rounds stay on the first carried one
         c.invDirty = c.invSave;
         stats_.invOpsApplied++;
         if (out.r == sync::inv::Result::Used)
@@ -1398,8 +1510,15 @@ namespace gage::server {
         const sync::inv::ItemDef* d = sync::inv::FindKey(item);
         if (!d) { say("no item \"" + item + "\" (keys are the catalog's, e.g. water, medkit, rucksack)"); return false; }
         if (qty == 0) { say("qty must be 1 or more"); return false; }
+        if (d->weapon && !c->invCaps)
+        {
+            // A 0.5.3 client cannot see a weapon item (its codec has none) and its ped would never get it.
+            say(c->name + "'s client does not carry weapons in the inventory (it is not 0.5.4, or invWorld is 0)");
+            return false;
+        }
         const uint32_t in = sync::inv::Give(c->inv, d->id, qty);
         if (in == 0) { say(c->name + " has no room for " + d->key); return false; }
+        if (c->invCaps) sync::invw::NormaliseAmmo(c->inv, c->invAmmo);
         c->invDirty = c->invSave;
         SendInventory(*c, 0);
         enet_host_flush(host_);
@@ -1427,6 +1546,231 @@ namespace gage::server {
         if (!c) return false;
         out = c->inv;
         return true;
+    }
+
+    // ---- 0.5.4 inventory world ------------------------------------------------------------------------------
+
+    std::vector<sync::invw::VehView> Server::VehicleViews() const
+    {
+        std::vector<sync::invw::VehView> out;
+        for (uint16_t id = 0; id < proto::kMaxVehicles; id++)
+        {
+            const VehicleStore::Vehicle* V = vehicles_.Get(id);
+            if (!V) continue;
+            sync::invw::VehView v;
+            v.id = id;
+            v.born = V->createdMs;
+            v.pos = {V->s.k.x, V->s.k.y, V->s.k.z};
+            v.model = V->s.model;
+            if (id < vehClass_.size() && vehClass_[id].born == V->createdMs) v.cls = vehClass_[id].cls;
+            v.locked = (V->s.flags & proto::kVehLocked) != 0;
+            v.spawner = V->spawner;
+            v.lastDriver = V->lastDriver;
+            out.push_back(v);
+        }
+        return out;
+    }
+
+    sync::invw::Viewer Server::ViewerOf(const Conn& c) const
+    {
+        sync::invw::Viewer w;
+        w.id = c.id;
+        // No position yet (no PlayerState): nothing on the ground is in reach (far outside the map).
+        w.pos = c.hasState ? sync::invw::Vec3{c.k.x, c.k.y, c.k.z} : sync::invw::Vec3{1e9f, 1e9f, 1e9f};
+        w.seatedIn = vehicles_.Occupancy(c.id).veh;
+        return w;
+    }
+
+    void Server::SendNearby(Conn& c, bool force)
+    {
+        if (!cfg_.invWorld || c.st != Conn::St::Joined || (!c.invCaps && !force)) return;
+        proto::InvNearby m;
+        const std::vector<sync::invw::NearBox> boxes = invWorld_.Nearby(ViewerOf(c), VehicleViews());
+        for (const sync::invw::NearBox& nb : boxes)
+        {
+            if (m.boxes.size() >= proto::kMaxInvNearby) break;
+            proto::InvBox b;
+            b.id = nb.id;
+            b.kind = (uint8_t)nb.kind;
+            b.flags = nb.locked ? proto::kInvBoxLocked : 0;
+            b.veh = nb.veh;
+            b.model = nb.model;
+            b.cls = nb.cls < 0 || nb.cls > 254 ? 255 : (uint8_t)nb.cls;
+            b.piles = nb.piles;
+            b.distCm = (uint16_t)std::min(65535.0f, nb.dist * 100.0f);
+            if (nb.box) b.blob = sync::inv::EncodeBox(*nb.box);
+            m.boxes.push_back(std::move(b));
+        }
+        proto::Bytes bytes = proto::Encode(m);
+        if (bytes.empty()) return;
+        // The distance moves with every step: compare without it, so walking around a pile does not resend it 4 times a second.
+        proto::InvNearby cmp = m;
+        for (proto::InvBox& b : cmp.boxes) b.distCm = 0;
+        proto::Bytes key = proto::Encode(cmp);
+        if (!force && key == c.invNearSent) return;
+        c.invNearSent = std::move(key);
+        stats_.invNearbySent++;
+        SendTo(c, proto::kChanReliable, bytes, true);
+    }
+
+    bool Server::WorldOp(Conn& c, const sync::inv::Op& op, uint32_t seq)
+    {
+        namespace inv = sync::inv;
+        namespace invw = sync::invw;
+        const bool world = op.src == inv::Where::Nearby || op.dst == inv::Where::Nearby;
+        if (!world && op.kind != inv::OpKind::Drop) return false;
+        if (!cfg_.invWorld && !world) return false;   // 0.5.3: a Drop discards
+        auto refuse = [&](const char* why) {
+            stats_.invOpsRefused++;
+            if (world) stats_.invWorldRefused++;
+            if (world) Log("inventory world: op of id=" + std::to_string(c.id) + " " + c.name + " refused: " + why);
+            SendInventory(c, seq);
+            SendNearby(c, true);   // the client's prediction of the box is dropped with the truth
+            return true;
+        };
+        if (!cfg_.invWorld) return refuse("the inventory world is off (invWorld 0)");
+        if (world && !c.invCaps) return refuse("the client never answered the offer");
+        if (!c.hasState) return refuse("no position yet");
+        if (world && c.dead) return refuse("dead");
+        const uint64_t nowMs = net::NowMs();
+        const std::vector<invw::NearBox> reach = invWorld_.Nearby(ViewerOf(c), VehicleViews());
+        auto resolve = [&](inv::Where w, uint32_t id, const char** why) -> inv::Container* {
+            if (w != inv::Where::Nearby) return nullptr;
+            const invw::NearBox* b = invw::World::InReach(reach, id);
+            if (!b) { *why = "the box is out of reach or gone"; return nullptr; }
+            if (b->locked) { *why = "the vehicle is locked"; return nullptr; }
+            return invWorld_.Box(id);
+        };
+        const char* why = "";
+        inv::Container* srcBox = resolve(op.src, op.srcBox, &why);
+        if (op.src == inv::Where::Nearby && !srcBox) return refuse(why);
+        inv::Container* dstBox = resolve(op.dst, op.dstBox, &why);
+        if (op.dst == inv::Where::Nearby && !dstBox) return refuse(why);
+        // Everything on copies; committed only when the rules and the ground both take it.
+        inv::Character trial = c.inv;
+        inv::Container sCopy = srcBox ? *srcBox : inv::Container();
+        inv::Container dCopy = dstBox && dstBox != srcBox ? *dstBox : inv::Container();
+        inv::Container* dTrial = dstBox ? (dstBox == srcBox ? &sCopy : &dCopy) : nullptr;
+        const inv::ApplyOut out = inv::ApplyEx(trial, op, srcBox ? &sCopy : nullptr, dTrial);
+        if (!inv::Ok(out.r)) return refuse(inv::ResultName(out.r));
+        const invw::Vec3 at{c.k.x, c.k.y, c.k.z};
+        if (out.r == inv::Result::Dropped && !invWorld_.CanDrop(at, out.dropped)) return refuse("too many piles on the ground");
+        c.inv = trial;
+        if (srcBox) *srcBox = sCopy;
+        if (dstBox && dstBox != srcBox) *dstBox = dCopy;
+        // (srcBox / dstBox point into the world's vectors: not used past this line, Drop may grow them)
+        if (out.r == inv::Result::Dropped)
+        {
+            const uint32_t pile = invWorld_.Drop(at, out.dropped, nowMs);
+            stats_.invGroundDrops++;
+            const inv::ItemDef* d = inv::Find(out.dropped.item);
+            Log("inventory world: id=" + std::to_string(c.id) + " " + c.name + " dropped " + std::to_string(out.dropped.qty) + "x " +
+                (d ? d->key : "?") + " into pile #" + std::to_string(pile));
+        }
+        if (op.src == inv::Where::Nearby) invWorld_.DropIfEmpty(op.srcBox);
+        if (c.invCaps) invw::NormaliseAmmo(c.inv, c.invAmmo);
+        c.invDirty = c.invSave;
+        stats_.invOpsApplied++;
+        if (world) stats_.invWorldOps++;
+        SendInventory(c, seq);
+        SendNearby(c, true);
+        // Everyone else near the box sees the change at the next world pass (within kInvWorldEveryMs).
+        return true;
+    }
+
+    void Server::OnInvReport(Conn& c, const uint8_t* data, size_t len)
+    {
+        proto::InvReport m;
+        if (!proto::Decode(data, len, m))
+        {
+            Refuse(c, proto::RefuseReason::Protocol, "malformed InvReport");
+            return;
+        }
+        if (!cfg_.invWorld) return;   // never offered: a stray report changes nothing
+        const uint64_t nowMs = net::NowMs();
+        const bool first = !c.invCaps;
+        if (first)
+        {
+            c.invCaps = true;
+            c.invReportRate.Configure(kInvReportBurst, kInvReportPerSec);
+            stats_.invWorldClients++;
+            Log("inventory world: id=" + std::to_string(c.id) + " " + c.name + " speaks 0.5.4 (InvSnap, NEARBY, weapons as items)");
+        }
+        for (const proto::InvVehClass& v : m.vehicles)
+            if (const VehicleStore::Vehicle* V = vehicles_.Get(v.veh))
+                if (v.cls <= 22 && v.veh < vehClass_.size()) vehClass_[v.veh] = {V->createdMs, (int)v.cls};
+        bool send = first;
+        std::vector<uint32_t> strip;
+        const bool rated = c.invReportRate.Take(nowMs);
+        if (!rated || !(m.flags & proto::kInvReportPedValid) || c.dead || m.rev != c.invRev)
+        {
+            stats_.invReportsStale++;
+        }
+        else
+        {
+            sync::invw::Report r;
+            r.rev = m.rev;
+            r.current = m.current;
+            r.valid = true;
+            for (const proto::InvPedWeapon& w : m.weapons) r.weapons.push_back({w.hash, w.ammoType, w.ammo});
+            const sync::invw::ReconcileOut out = sync::invw::Reconcile(c.inv, r, c.invAmmo);
+            stats_.invReports++;
+            stats_.invWeaponGains += (uint64_t)out.gains;
+            stats_.invWeaponsConsumed += (uint64_t)out.consumed;
+            for (const sync::inv::Slot& s : out.overflow)
+                if (c.hasState && invWorld_.Drop({c.k.x, c.k.y, c.k.z}, s, nowMs)) stats_.invGroundDrops++;
+            strip = out.strip;
+            if (out.changed) c.invDirty = c.invSave;
+            if (out.gains || out.consumed)
+                Log("inventory world: id=" + std::to_string(c.id) + " " + c.name + " report rev " + std::to_string(m.rev) + ": " +
+                    std::to_string(out.gains) + " weapon(s) gained, " + std::to_string(out.consumed) + " used up, " +
+                    std::to_string(out.overflow.size()) + " to the ground (no room)");
+            send = send || out.changed || !strip.empty();
+        }
+        if (send) SendInventoryEx(c, 0, true, &strip);
+        if (first || !strip.empty()) SendNearby(c, true);
+    }
+
+    void Server::TickInventoryWorld(uint64_t nowMs)
+    {
+        if (!cfg_.invWorld || nowMs < invWorldAtMs_) return;
+        invWorldAtMs_ = nowMs + kInvWorldEveryMs;
+        const sync::invw::World::SweepOut sw = invWorld_.Sweep(nowMs, VehicleViews());
+        stats_.invGroundExpired += (uint64_t)sw.expired;
+        stats_.invGroundDrops += (uint64_t)sw.stacksDumped;
+        if (sw.trunksDumped)
+            Log("inventory world: " + std::to_string(sw.trunksDumped) + " trunk(s) of gone vehicles emptied onto the ground (" +
+                std::to_string(sw.stacksDumped) + " stacks" + (sw.stacksLost ? ", " + std::to_string(sw.stacksLost) + " lost: too many piles" : "") + ")");
+        for (auto& kv : players_)
+            if (kv.second->invCaps) SendNearby(*kv.second, false);
+        LogInventoryWorld(nowMs);
+    }
+
+    void Server::LogInventoryWorld(uint64_t nowMs)
+    {
+        if (nowMs < invWorldLogAtMs_) return;
+        invWorldLogAtMs_ = nowMs + kInvWorldLogEveryMs;
+        const Stats& s = stats_;
+        const Stats& o = invLogMark_;
+        if (s.invReports == o.invReports && s.invGroundDrops == o.invGroundDrops && s.invWorldOps == o.invWorldOps &&
+            s.invWorldRefused == o.invWorldRefused && s.invGroundExpired == o.invGroundExpired && s.invReportsStale == o.invReportsStale)
+            return;
+        size_t stacks = 0;
+        for (const sync::invw::Pile& p : invWorld_.Piles()) stacks += (size_t)sync::inv::UsedSlots(p.box);
+        Log("inventory world: last 60 s: reports " + std::to_string(s.invReports - o.invReports) + " (stale " +
+            std::to_string(s.invReportsStale - o.invReportsStale) + "), weapons gained " + std::to_string(s.invWeaponGains - o.invWeaponGains) +
+            ", used up " + std::to_string(s.invWeaponsConsumed - o.invWeaponsConsumed) + ", ground drops " +
+            std::to_string(s.invGroundDrops - o.invGroundDrops) + ", box ops " + std::to_string(s.invWorldOps - o.invWorldOps) + " (refused " +
+            std::to_string(s.invWorldRefused - o.invWorldRefused) + "), piles expired " + std::to_string(s.invGroundExpired - o.invGroundExpired) +
+            "; now " + std::to_string(invWorld_.Piles().size()) + " piles (" + std::to_string(stacks) + " stacks), " +
+            std::to_string(invWorld_.Trunks().size()) + " trunks, " + std::to_string(s.invWorldClients) + " 0.5.4 clients so far");
+        invLogMark_ = stats_;
+    }
+
+    void Server::ExpireGround()
+    {
+        invWorld_.ExpireAll();
+        invWorldAtMs_ = 0;   // the next tick sweeps
     }
 
     void Server::EndPlatformSession(Conn& c, const char* reason)

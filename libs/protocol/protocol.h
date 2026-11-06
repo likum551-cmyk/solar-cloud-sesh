@@ -73,6 +73,9 @@
 //   * RefuseReason AccountRequired (9), AuthFailed (10), AuthUnavailable (11).
 //   * 0.6 inventory (still v8: no v8 client was ever released without it): Msg::InvState (49, S->C), InvOp (50, C->S),
 //     InvUsed (51, S->C), all reliable; the bytes inside are libs/sync/inventory.h's codec.
+//   * 0.5.4 inventory world (still v8, additive and negotiated): InvSnap (52, S->C), InvNearby (53, S->C), InvReport (54, C->S),
+//     all reliable, and InvOp's op may be 19 bytes (a ground pile or trunk side). A 0.5.3 client counts 52/53 as malformed
+//     and ignores them; the server sends InvSnap / the 19-byte form only to a client that answered with an InvReport.
 //
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
@@ -220,8 +223,11 @@ namespace gage::proto {
         InvState         = 49, // S->C reliable (v8, 0.6 inventory): the player's whole inventory + the last op the server applied
         InvOp            = 50, // C->S reliable (v8, 0.6 inventory): one inventory operation (move, split, use, drop, bind, ...)
         InvUsed          = 51, // S->C reliable (v8, 0.6 inventory): an item the player used; the client applies its satiety
+        InvSnap          = 52, // S->C reliable (v8, 0.5.4 inventory world): InvState with weapons (codec v2), a revision, a strip list
+        InvNearby        = 53, // S->C reliable (v8, 0.5.4): the world containers in reach (a ground pile, a trunk); empty = none
+        InvReport        = 54, // C->S reliable (v8, 0.5.4): the ped's weapons, current weapon and nearby vehicle classes
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::InvUsed;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::InvReport;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -925,6 +931,40 @@ namespace gage::proto {
     // satiety (0..100; health effects are applied by the server itself and arrive as Vitals).
     struct InvUsed { uint16_t item = 0; uint8_t satiety = 0; };
 
+    // ---- v8, 0.5.4 inventory world (docs/api/protocol.md "0.5.4"; the rules are libs/sync/inventory_world.h) ----
+    // The handshake: right after the join's InvState the server sends an InvNearby (empty). A 0.5.3 client ignores message
+    // types it does not know; a 0.5.4 client answers with an InvReport, and from then on the server sends that player InvSnap
+    // (instead of InvState), InvNearby whenever what is in reach changes, and accepts the 19-byte InvOp form.
+    // InvOp's op is kInvOpBytes (11) or kInvOpBytesExt (19: srcBox u32, dstBox u32 appended). The long form is legal exactly when the
+    // op's src (byte 1) or dst (byte 4) is kInvWhereWorld (sync::inv::Where::Nearby), so 8 stray bytes after a plain op stay an error.
+    constexpr size_t kInvOpBytesExt = 19;
+    constexpr uint8_t kInvWhereWorld = 5;
+    // InvSnap (S->C reliable): `blob` is sync::inv::Encode (codec v2: weapons, ammo, the hand). `rev` counts the server's
+    // changes of this inventory (the client stamps its next InvReport with the last rev it applied). flags bit 0 = this
+    // snapshot answers the client's own report (the client then leaves its ped's ammo and current weapon alone). `strip`:
+    // weapon hashes the client must take off its ped (gained with no room: they went to the ground).
+    constexpr size_t kMaxInvStrip = 16;
+    constexpr uint8_t kInvSnapFromReport = 0x01;
+    struct InvSnap { uint32_t ackSeq = 0; uint32_t rev = 0; uint8_t flags = 0; std::string blob; std::vector<uint32_t> strip; };
+    // InvNearby (S->C reliable): up to kMaxInvNearby boxes in reach, in display order. `blob` is sync::inv::EncodeBox (empty
+    // when locked). veh is the server vehicle id (kInvNoVehicle for a ground pile), cls its GTA class (255 = none), piles the
+    // number of ground piles in reach (the nearest is the one sent), distCm the distance (0 when seated in the vehicle).
+    constexpr size_t kMaxInvNearby = 4;
+    constexpr uint16_t kInvNoVehicle = 0xFFFF;
+    constexpr uint8_t kInvBoxLocked = 0x01;
+    struct InvBox { uint32_t id = 0; uint8_t kind = 0; uint8_t flags = 0; uint16_t veh = kInvNoVehicle; uint32_t model = 0; uint8_t cls = 255;
+                    uint8_t piles = 0; uint16_t distCm = 0; std::string blob; };
+    struct InvNearby { std::vector<InvBox> boxes; };
+    // InvReport (C->S reliable): what the client read off its ped after applying InvSnap `rev`. flags bit 0 = the ped is alive
+    // and settled (without it the server reads only the vehicle classes). weapons: catalog weapons the ped has, each with its
+    // GTA ammo type and that type's rounds. vehicles: the GTA class of server vehicles near the client (for trunk sizes).
+    constexpr size_t kMaxInvReportWeapons = 64;
+    constexpr size_t kMaxInvReportVehicles = 8;
+    constexpr uint8_t kInvReportPedValid = 0x01;
+    struct InvPedWeapon { uint32_t hash = 0; uint32_t ammoType = 0; uint16_t ammo = 0; };
+    struct InvVehClass { uint16_t veh = 0; uint8_t cls = 0; };
+    struct InvReport { uint32_t rev = 0; uint32_t current = 0; uint8_t flags = 0; std::vector<InvPedWeapon> weapons; std::vector<InvVehClass> vehicles; };
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -982,8 +1022,11 @@ namespace gage::proto {
     Bytes Encode(const AdminCmd& m);     // v8
     Bytes Encode(const AdminResult& m);  // v8
     Bytes Encode(const InvState& m);     // v8 inventory: {} when the blob is empty or over kMaxInvBlob
-    Bytes Encode(const InvOp& m);        // v8 inventory: {} unless op is exactly kInvOpBytes
+    Bytes Encode(const InvOp& m);        // v8 inventory: {} unless op is exactly kInvOpBytes or kInvOpBytesExt
     Bytes Encode(const InvUsed& m);      // v8 inventory: {} for item 0 or satiety over 100
+    Bytes Encode(const InvSnap& m);      // v8 0.5.4: {} for an empty / over-cap blob or more than kMaxInvStrip strips
+    Bytes Encode(const InvNearby& m);    // v8 0.5.4: {} for more than kMaxInvNearby boxes or a blob over kMaxInvBlob
+    Bytes Encode(const InvReport& m);    // v8 0.5.4: {} for more than kMaxInvReportWeapons / kMaxInvReportVehicles
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -1039,8 +1082,11 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, AdminCmd& out);    // v8: an unknown op, an arg over kMaxAdminArg or with control bytes
     bool Decode(const uint8_t* p, size_t n, AdminResult& out); // v8: an unknown op or code, a text over kMaxRefuseText
     bool Decode(const uint8_t* p, size_t n, InvState& out);    // v8: an empty blob or one over kMaxInvBlob
-    bool Decode(const uint8_t* p, size_t n, InvOp& out);       // v8: seq 0, an op that is not exactly kInvOpBytes
+    bool Decode(const uint8_t* p, size_t n, InvOp& out);       // v8: seq 0, an op that is not kInvOpBytes or kInvOpBytesExt
     bool Decode(const uint8_t* p, size_t n, InvUsed& out);     // v8: item 0, satiety over 100
+    bool Decode(const uint8_t* p, size_t n, InvSnap& out);     // v8 0.5.4: empty / over-cap blob, unknown flags, too many strips
+    bool Decode(const uint8_t* p, size_t n, InvNearby& out);   // v8 0.5.4: too many boxes, box id 0, unknown flags, over-cap blob
+    bool Decode(const uint8_t* p, size_t n, InvReport& out);   // v8 0.5.4: unknown flags, too many weapons or vehicles, hash 0
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would
