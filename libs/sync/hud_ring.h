@@ -86,6 +86,20 @@ namespace gage::sync::hudring {
         return { kCompX * d + (p.x - kCompX) * k, displayH - (kCompY * d + (p.y - kCompY) * k) };
     }
 
+    // 0.5.2 ring_map (GI 2026-11-06: "do the real round map"): GTA's own radar is moved into the disc (libs/sync/minimap_size.h RingPlacement). Its
+    // visible map is a SQUARE whose corners stay inside the disc (half-diagonal = disc radius - kMapCornerClear), so the map shows as that square's
+    // inscribed circle and an opaque annulus out to the disc hides the corners. Round 1 of the round map: the circle is smaller than the spec's r 120
+    // (about r 97 design px); the later rounds magnify GTA's square or give it a round mask.
+    constexpr float kMapCornerClear = 3.0f;                 // design px between the square's corner and the disc's edge
+    constexpr uint32_t kMapAnnulus = 0x0A0907F0u;           // the annulus over the square's corners: the ground at 94 % (the glass would show them)
+    // 3.4 at the hole's edge, as specified: the vignette (transparent to 78 % of the radius, then to #0A09076B at the edge), the 1.5 px amber ring
+    // just outside the map and its glow (sigma 11, outside only)
+    constexpr float kMapVignetteFrom = 0.78f, kMapRingW = 1.5f, kMapGlowSigma = 11.0f;
+    constexpr uint32_t kMapVignette = 0x0A09076Bu, kMapRing = 0xF2B134D9u, kMapRingGlow = 0xF2B1344Du;
+    inline float MapSquarePx(float displayH) { return (kDiscR - kMapCornerClear) * Scale(displayH) * 1.41421356f; }
+    inline float MapRadiusPx(float displayH) { return MapSquarePx(displayH) * 0.5f; }
+    inline Pt MapCentrePx(float displayH) { return ToScreen({kCx, kCy}, displayH); }
+
     struct GaugeLook
     {
         uint32_t arc, glow, label, numeral;

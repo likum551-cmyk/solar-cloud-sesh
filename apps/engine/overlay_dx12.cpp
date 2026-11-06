@@ -630,6 +630,8 @@ void RenderFrame(IDXGISwapChain* scBase)
         g.wantKeyboard.store(io.WantCaptureKeyboard);
     }
     ++g.frameNo;
+    if (const int probe = detail::TakeProbeRequest())
+        GLOGI("overlay: radar probe %d skipped on D3D12 (the probe reads a D3D11 back buffer only)", probe);
     detail::UiFrame();
     {
         // An open panel owns the keyboard and mouse even where ImGui has no widget under the pointer.

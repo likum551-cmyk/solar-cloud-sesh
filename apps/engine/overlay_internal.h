@@ -54,6 +54,10 @@ namespace gage::game::Overlay::detail {
     // (Until 0.4.32 the DX12 WndProc had no such step: Alt+F4 on Enhanced reached GTA's own pausing quit screen and
     // the server only learnt of the leave by timeout.) Defined in overlay.cpp; msg / wp / lp are the Win32 values.
     bool QuitGate(unsigned msg, unsigned long long wp, long long lp, bool overlayReady);
+
+    // 0.5.2 round-map probe: the pending Overlay::RequestRadarProbe number (0 = none), cleared by the read. The D3D11 backend saves the
+    // frame; the D3D12 backend takes it and logs a skip. Defined in overlay.cpp.
+    int TakeProbeRequest();
 }
 
 // DX12 backend (overlay_dx12.cpp), for GTA V Enhanced. The public Overlay::Init/Render/

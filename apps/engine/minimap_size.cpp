@@ -279,12 +279,36 @@ void LogApplied(const MinimapTrio& before, const MinimapTrio& after) {
     for (int r = 0; r < 3; ++r) {
         line += std::string(r ? "; " : "") + RoleName(r) + " " + before.c[r].alignX + "/" + before.c[r].alignY + " " + Geo(before.c[r]) + " -> " + Geo(after.c[r]);
     }
+    if (g_gate.Placed()) {
+        const MinimapPlacement& p = g_gate.Placement();
+        GLOGI("engine: minimap size (0.5.2 ring_map): placement (%s: per-axis scale %.4f x %.4f about (%.4f, %.4f), moved to (%.4f, %.4f), blur = the visible "
+              "square pos (%.4f, %.4f) size (%.4f, %.4f)) APPLIED to the game's table (slots %d, %d, %d), read back identical: %s; the radar movie is flipped "
+              "(held) so the minimap component is re-laid out",
+              g_src.c_str(), (double)p.sx, (double)p.sy, (double)p.ax, (double)p.ay, (double)p.tx, (double)p.ty, (double)p.vx, (double)p.vy, (double)p.vw,
+              (double)p.vh, after.index[0], after.index[1], after.index[2], line.c_str());
+        return;
+    }
     GLOGI("engine: minimap size (0.4.25): scale %.2f (%s) APPLIED to the game's table (slots %d, %d, %d), read back identical: %s; the vitals strip follows this "
           "scale; the radar movie is flipped once so the minimap component is re-read",
           (double)g_gate.Scale(), g_src.c_str(), after.index[0], after.index[1], after.index[2], line.c_str());
 }
 
 } // namespace
+
+void ConfigurePlacement(const MinimapPlacement& p, const char* sourceName) {
+    const bool first = !g_configured || !g_gate.Placed();
+    const bool same = g_gate.Placed() && g_gate.Placement() == p;
+    g_src = sourceName ? sourceName : "";
+    g_configured = true;
+    if (same) return;
+    g_gate.ConfigurePlacement(p);
+    if (first)
+        GLOGI("engine: minimap size (0.5.2 ring_map): the radar's visible map goes into the vitals ring (%s) once the game's table is populated", g_src.c_str());
+}
+
+bool PlacementApplied() {
+    return g_res == Res::Ready && g_verified && g_gate.Placed() && g_gate.PhaseNow() == MinimapSizeGate::Phase::Applied;
+}
 
 void Configure(float scale, const char* sourceName) {
     g_scale = ClampRadarScale(scale);
@@ -382,8 +406,12 @@ std::string Status() {
     case MinimapSizeGate::Phase::Waiting:
         return g_res == Res::Ready ? "size: waiting for the table to fill (" + g_gate.Why() + ")" : "size: looking for the table";
     case MinimapSizeGate::Phase::Applied: {
-        std::snprintf(b, sizeof(b), "size: scale %.2f %s, checks %u, re-asserts %u, adopted %u, write failures %u", (double)g_gate.Scale(),
-                      g_verified ? "in the table (read back)" : "NOT verified", s.checks, s.reasserts, s.adopted, s.writeFailures);
+        if (g_gate.Placed())
+            std::snprintf(b, sizeof(b), "size: ring placement (0.5.2) %s, checks %u, re-asserts %u, adopted %u, write failures %u",
+                          g_verified ? "in the table (read back)" : "NOT verified", s.checks, s.reasserts, s.adopted, s.writeFailures);
+        else
+            std::snprintf(b, sizeof(b), "size: scale %.2f %s, checks %u, re-asserts %u, adopted %u, write failures %u", (double)g_gate.Scale(),
+                          g_verified ? "in the table (read back)" : "NOT verified", s.checks, s.reasserts, s.adopted, s.writeFailures);
         // The live table, read now: the minimap frame and its mask are what the radar is drawn from.
         MinimapComp all[kMinimapEntries];
         std::string live;

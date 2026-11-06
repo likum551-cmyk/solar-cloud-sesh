@@ -495,6 +495,102 @@ bool Acquire(IDXGISwapChain* sc)
     return false;
 }
 
+// 0.5.2 round-map probe (RequestRadarProbe): the next frame's bottom-left before the overlay draws on it, as a 24-bit BMP.
+std::atomic<int> g_probeReq{0};
+
+// One pixel of the back buffer to B, G, R; false = a format the probe does not read.
+bool ProbePixel(DXGI_FORMAT f, const uint8_t* p, uint8_t* bgr)
+{
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+        bgr[0] = p[0]; bgr[1] = p[1]; bgr[2] = p[2];
+        return true;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        bgr[0] = p[2]; bgr[1] = p[1]; bgr[2] = p[0];
+        return true;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS: {
+        uint32_t v;
+        std::memcpy(&v, p, 4);
+        bgr[0] = (uint8_t)(((v >> 20) & 0x3FFu) >> 2); bgr[1] = (uint8_t)(((v >> 10) & 0x3FFu) >> 2); bgr[2] = (uint8_t)((v & 0x3FFu) >> 2);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// The bottom-left 30 % x 45 % of the back buffer (the radar's quarter and the ring) to %LOCALAPPDATA%\GAGE-MP\radar_probe_<n>.bmp.
+// Every way out logs one line; a failure here never touches the frame.
+void SaveRadarProbe(ID3D11Texture2D* bb, const D3D11_TEXTURE2D_DESC& td, int n)
+{
+    uint8_t probe[3];
+    const uint8_t zero[4] = {0, 0, 0, 0};
+    if (td.SampleDesc.Count > 1 || !ProbePixel(td.Format, zero, probe)) {
+        GLOGW("overlay: radar probe %d skipped (back buffer format %u, %u samples)", n, (unsigned)td.Format, (unsigned)td.SampleDesc.Count);
+        return;
+    }
+    const UINT w = (UINT)std::ceil((double)td.Width * 0.30), h = (UINT)std::ceil((double)td.Height * 0.45);
+    if (w == 0 || h == 0 || w > td.Width || h > td.Height) {
+        GLOGW("overlay: radar probe %d skipped (back buffer %ux%u)", n, td.Width, td.Height);
+        return;
+    }
+    const UINT y0 = td.Height - h;
+    D3D11_TEXTURE2D_DESC sd = {};
+    sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1; sd.Format = td.Format; sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* st = nullptr;
+    HRESULT hr = g.dev->CreateTexture2D(&sd, nullptr, &st);
+    if (FAILED(hr) || !st) {
+        GLOGW("overlay: radar probe %d: staging texture failed (0x%08lx)", n, (unsigned long)hr);
+        return;
+    }
+    const D3D11_BOX box = {0, y0, 0, w, td.Height, 1};
+    g.ctx->CopySubresourceRegion(st, 0, 0, 0, 0, bb, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    hr = g.ctx->Map(st, 0, D3D11_MAP_READ, 0, &m);
+    if (FAILED(hr) || !m.pData) {
+        GLOGW("overlay: radar probe %d: Map failed (0x%08lx)", n, (unsigned long)hr);
+        st->Release();
+        return;
+    }
+    const UINT row = (w * 3u + 3u) & ~3u;
+    std::vector<uint8_t> px((size_t)row * h, 0);
+    for (UINT y = 0; y < h; ++y) {      // a BMP is stored bottom row first
+        const uint8_t* src = (const uint8_t*)m.pData + (size_t)(h - 1 - y) * m.RowPitch;
+        uint8_t* dst = px.data() + (size_t)y * row;
+        for (UINT x = 0; x < w; ++x)
+            ProbePixel(td.Format, src + (size_t)x * 4u, dst + (size_t)x * 3u);
+    }
+    g.ctx->Unmap(st, 0);
+    st->Release();
+
+    wchar_t la[MAX_PATH] = {};
+    const DWORD ln = GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH);
+    if (ln == 0 || ln >= MAX_PATH) {
+        GLOGW("overlay: radar probe %d: no LOCALAPPDATA", n);
+        return;
+    }
+    wchar_t dir[MAX_PATH + 16], path[MAX_PATH + 48];
+    std::swprintf(dir, MAX_PATH + 16, L"%ls\\GAGE-MP", la);
+    CreateDirectoryW(dir, nullptr);   // best effort: it exists when the engine has run before
+    std::swprintf(path, MAX_PATH + 48, L"%ls\\radar_probe_%d.bmp", dir, n);
+    uint8_t hd[54] = {'B', 'M'};
+    const auto put = [&](int at, uint32_t v) { std::memcpy(hd + at, &v, 4); };
+    put(2, 54u + (uint32_t)px.size()); put(10, 54u); put(14, 40u); put(18, w); put(22, h);
+    hd[26] = 1; hd[28] = 24;
+    put(34, (uint32_t)px.size());
+    FILE* f = _wfopen(path, L"wb");
+    const bool ok = f && std::fwrite(hd, 1, 54, f) == 54 && std::fwrite(px.data(), 1, px.size(), f) == px.size();
+    if (f)
+        std::fclose(f);
+    if (ok)
+        GLOGI("overlay: radar probe %d saved: %ux%u px from (0, %u) of a %ux%u back buffer (format %u) to %%LOCALAPPDATA%%\\GAGE-MP\\radar_probe_%d.bmp",
+              n, w, h, y0, td.Width, td.Height, (unsigned)td.Format, n);
+    else
+        GLOGW("overlay: radar probe %d: writing radar_probe_%d.bmp failed", n, n);
+}
+
 void RenderFrame(IDXGISwapChain* sc)
 {
     if (!g.ready.load() || !SameTarget(sc)) {
@@ -511,6 +607,8 @@ void RenderFrame(IDXGISwapChain* sc)
     }
     D3D11_TEXTURE2D_DESC td = {};
     bb->GetDesc(&td);
+    if (const int probe = g_probeReq.exchange(0))
+        SaveRadarProbe(bb, td, probe);   // the game's frame, before the overlay draws on it
     D3D11_RENDER_TARGET_VIEW_DESC rd = {};
     const D3D11_RENDER_TARGET_VIEW_DESC* prd = nullptr;
     const DXGI_FORMAT viewFmt = RtvFormatFor(td.Format);
@@ -617,9 +715,13 @@ bool detail::QuitGate(unsigned msg, unsigned long long wp, long long lp, bool ov
     return false;
 }
 
+int detail::TakeProbeRequest() { return g_probeReq.exchange(0); }
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+void RequestRadarProbe(int n) { g_probeReq.store(n > 0 ? n : 1); }
+
 void SetQuitHandler(void (*handler)())
 {
     g_quitHandler.store(handler);

@@ -69,6 +69,16 @@ namespace gage::game::Overlay {
     // gutter. The engine hides GTA's radar while it is on (the design's "map off" state). false = the 0.4.30 plate / radar strip. Any thread.
     void SetHudRing(bool on);
 
+    // 0.5.2 ring_map: true = GTA's radar sits in the ring now (the engine checked the table, the radar and the big radar): the disc becomes an opaque
+    // annulus over the radar square's corners (hudring::MapRadiusPx out to the disc) and the map shows through the hole, with the design's vignette
+    // and amber map ring at the hole's edge. false = the full glass disc (map off). Any thread.
+    void SetRingMap(bool open);
+
+    // 0.5.2 round-map probe: the next frame's bottom-left (the radar's quarter, before the overlay draws on it) is saved to
+    // %LOCALAPPDATA%\GAGE-MP\radar_probe_<n>.bmp and logged, so the radar's landing place can be measured. D3D11 (Legacy) only; on D3D12 one line
+    // says it was skipped. Any thread.
+    void RequestRadarProbe(int n);
+
     // 0.4.22 vehicle controls (libs/sync/vehicle_controls.h). The keys are read in UiFrame from ImGui's key events, the same source as Tab / T /
     // Enter: Left / Right Arrow (indicators), Down Arrow (hazards), Y (engine), B (seatbelt); H is GTA's own headlight control and is not read here.
     // Nothing is taken while the chat, the Tab menu, a text box or the quit card has the keyboard. TakeVehicleKeys returns the bits pressed since

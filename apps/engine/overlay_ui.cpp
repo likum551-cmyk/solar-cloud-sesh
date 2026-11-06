@@ -157,6 +157,8 @@ std::atomic<bool>     g_radarSafeZoneOk{false};
 std::atomic<float>    g_radarScale{1.0f};   // 0.4.25 minimap_scale: the factor the game's radar was shrunk by (1 = the game's own size)
 // 0.4.31 hud_ring (SetHudRing): the vitals are the REV1 ring at the bottom-left (DrawVitalsRing) instead of the plate / the strip under the radar.
 std::atomic<bool>     g_hudRing{false};
+// 0.5.2 ring_map (SetRingMap): GTA's radar sits in the ring, so the disc is an annulus and the map shows through its hole.
+std::atomic<bool>     g_ringMapOpen{false};
 // 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
 // one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown;
 // 0.4.27 state row: 8 lock known, 9 locked, 10 the on-foot lock flash.
@@ -1629,6 +1631,38 @@ int GlowProfile(float w, float sigma, float* rho, float* alpha)
     return nr;
 }
 
+// 0.5.2 ring_map: concentric closed rings about c (radius rr[j], alpha al[j] of col), the strips between them filled: an annulus, a radial
+// gradient (the map's vignette) or a one-sided glow, with no seam (a full circle through RingCapsule would overlap its own caps).
+void RadialBand(ImDrawList* dl, ImVec2 c, const float* rr, const float* al, int nr, ImU32 col)
+{
+    const unsigned colA = (col >> IM_COL32_A_SHIFT) & 0xFFu;
+    if (colA == 0u || nr < 2 || nr > kRingMaxRings)
+        return;
+    constexpr int n = 120;   // 3 degrees a segment
+    float ca[n], sa[n];
+    for (int i = 0; i < n; ++i) {
+        const float d = 2.0f * ring::kPi * (float)i / (float)n;
+        ca[i] = std::cos(d); sa[i] = std::sin(d);
+    }
+    const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+    const ImU32 rgb = col & ~IM_COL32_A_MASK;
+    dl->PrimReserve((nr - 1) * n * 6, nr * n);
+    const ImDrawIdx base = (ImDrawIdx)dl->_VtxCurrentIdx;
+    for (int j = 0; j < nr; ++j) {
+        const ImU32 cj = rgb | ((ImU32)std::floor((float)colA * Clamp01(al[j]) + 0.5f) << IM_COL32_A_SHIFT);
+        for (int i = 0; i < n; ++i)
+            dl->PrimWriteVtx(ImVec2(c.x + rr[j] * ca[i], c.y + rr[j] * sa[i]), uv, cj);
+    }
+    for (int j = 0; j + 1 < nr; ++j)
+        for (int i = 0; i < n; ++i) {
+            const int i1 = (i + 1) % n;
+            const ImDrawIdx a = (ImDrawIdx)(base + j * n + i), b = (ImDrawIdx)(base + j * n + i1);
+            const ImDrawIdx a2 = (ImDrawIdx)(base + (j + 1) * n + i), b2 = (ImDrawIdx)(base + (j + 1) * n + i1);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b); dl->PrimWriteIdx(b2);
+            dl->PrimWriteIdx(a); dl->PrimWriteIdx(b2); dl->PrimWriteIdx(a2);
+        }
+}
+
 void RingArc(ImDrawList* dl, ImVec2 c, float r, float aUp0, float aUp1, float w, ImU32 col)
 {
     float rho[kRingMaxRings], al[kRingMaxRings];
@@ -1726,8 +1760,16 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
             pulse[i] = ring::PulseOpacity((double)(forced - std::floor(forced)) * ring::kPulsePeriodMs);
     }
 
-    // 1 disc glass
-    dl->AddCircleFilled(c, ring::kDiscR * k, RingCol(ring::kDiscGlass, a), 96);
+    // 1 disc glass; 0.5.2 ring_map open: an annulus from the map's edge out to the disc instead, over the radar square's corners, so GTA's map
+    // (drawn by the game under the overlay) shows through the hole as a circle
+    const bool mapOpen = g_ringMapOpen.load();
+    const float mr = ring::MapRadiusPx(H), dr = ring::kDiscR * k;
+    if (mapOpen) {
+        const float rr[4] = {mr - 0.5f, mr + 0.5f, dr - 0.5f, dr + 0.5f}, al[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+        RadialBand(dl, c, rr, al, 4, RingCol(ring::kMapAnnulus, a));
+    } else {
+        dl->AddCircleFilled(c, dr, RingCol(ring::kDiscGlass, a), 96);
+    }
     // 2 tracks
     const float R = ring::kArcR * k;
     RingArc(dl, c, R, ring::kHpStartDeg, ring::kHpStartDeg - ring::kSweepDeg, ring::kArcW * k, RingCol(ring::kArcTrack, a));
@@ -1744,6 +1786,19 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
         const float pa = a * pulse[i];
         RingGlow(dl, c, R, a0, a1, ring::kArcW * k, ring::kGlowSigma * k, RingCol(look[i].glow, pa));   // the spec's blur, as a Gaussian falloff
         RingArc(dl, c, R, a0, a1, ring::kArcW * k, RingCol(look[i].arc, pa));
+    }
+    // 4 / 5 (map open): the vignette inside the hole, the amber ring's glow (outside only), the 1.5 px amber ring just outside the map
+    if (mapOpen) {
+        const float vr[2] = {mr * ring::kMapVignetteFrom, mr}, va[2] = {0.0f, 1.0f};
+        RadialBand(dl, c, vr, va, 2, RingCol(ring::kMapVignette, a));
+        const float w = std::fmax(1.0f, ring::kMapRingW * k), rc = mr + w * 0.5f;
+        float rho[kRingMaxRings], gal[kRingMaxRings];
+        const int ng = GlowProfile(w, ring::kMapGlowSigma * k, rho, gal);
+        for (int j = 0; j < ng; ++j)
+            rho[j] += rc;   // the profile's outer side only: from the stroke's edge outwards
+        RadialBand(dl, c, rho, gal, ng, RingCol(ring::kMapRingGlow, a));
+        const float br[4] = {mr - 0.5f, mr + 0.5f, mr + w - 0.5f, mr + w + 0.5f}, ba[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+        RadialBand(dl, c, br, ba, 4, RingCol(ring::kMapRing, a));
     }
     // 6 strip: the pill and its 1 px border inside the box
     const ImVec2 s0 = P(ring::kStripX, ring::kStripY + ring::kStripH), s1 = P(ring::kStripX + ring::kStripW, ring::kStripY);
@@ -3943,6 +3998,7 @@ void SetRadarDock(bool dock, float safeZone, bool safeZoneOk, float scale)
 }
 
 void SetHudRing(bool on) { g_hudRing.store(on); }
+void SetRingMap(bool open) { g_ringMapOpen.store(open); }
 
 void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel)
 {

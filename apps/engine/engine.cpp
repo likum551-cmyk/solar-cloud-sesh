@@ -15,6 +15,7 @@
 #include "pack_stream.h"
 #include "pack_meta.h"
 #include "minimap_size.h"
+#include "sync/hud_ring.h"     // 0.5.2 ring_map: where the map square goes (MapCentrePx / MapSquarePx)
 #include "quit_gate.h"
 #include "ambient.h"
 #include "common/common.h"
@@ -838,6 +839,7 @@ namespace {
     bool               g_miniScaleInit = false;       // script tick only
     float              g_miniAppliedScale = 1.0f;     // what the game's table holds now (read back); the overlay's radar rectangle and the clearance check use it
     std::atomic<bool>  g_hudRing{true};               // 0.4.31 hud_ring (MinimapReadSwitches)
+    std::atomic<bool>  g_ringMap{true};               // 0.5.2 ring_map: GTA's radar moved into the ring (MinimapReadSwitches)
     void MinimapScaleRead()
     {
         const sync::ParsedScale p = sync::ParseMinimapScale(reg::Get(L"minimap_scale"));
@@ -852,9 +854,14 @@ namespace {
         // radar HIDDEN (GI's pick 2026-11-06: the design's place and size, map off, until the radar can be moved into the circle).
         g_hudRing.store(reg::Get(L"hud_ring") != L"0");
         game::Overlay::SetHudRing(g_hudRing.load());
-        g_minimap.store(reg::Get(L"minimap") != L"0" && !g_hudRing.load());
-        GLOGI("engine: HUD (0.4.31): hud_ring=%s", g_hudRing.load() ? "on (the REV1 vitals ring bottom-left; GTA's radar hidden, minimap ignored)"
-                                                                     : "OFF (the 0.4.30 vitals and GTA's radar per minimap)");
+        // 0.5.2 ring_map (default on; 0 = 0.5.0's ring without a map): GTA's radar is shown again and moved into the ring through the game's own
+        // minimap table (minimapsize::ConfigurePlacement), the overlay hides the square's corners. GI 2026-11-06: "do the real round map".
+        g_ringMap.store(reg::Get(L"ring_map") != L"0");
+        g_minimap.store(g_hudRing.load() ? g_ringMap.load() : reg::Get(L"minimap") != L"0");
+        GLOGI("engine: HUD (0.4.31): hud_ring=%s; ring_map (0.5.2)=%s",
+              g_hudRing.load() ? "on (the REV1 vitals ring bottom-left; minimap ignored)" : "OFF (the 0.4.30 vitals and GTA's radar per minimap)",
+              !g_hudRing.load() ? "n/a (no ring)" : g_ringMap.load() ? "on (GTA's radar moved into the ring, its corners covered; LIVE-UNVERIFIED)"
+                                                                   : "OFF (the ring without a map, GTA's radar hidden)");
         const sync::BarsMode bm = sync::ParseBarsMode(reg::Get(L"minimap_bars"));
         g_barsMode.store((int)bm);
         g_barsReset.store(true);
@@ -4069,16 +4076,62 @@ namespace {
             MinimapScaleRead();
         }
         const bool dirty = g_miniScaleDirty.exchange(false);
-        const float want = g_minimap.load() ? g_miniScaleReq.load() : 1.0f;
-        if (dirty || want != g_miniCfgScale)
+        if (g_hudRing.load() && g_ringMap.load())
         {
-            g_miniCfgScale = want;
-            game::minimapsize::Configure(want, g_minimap.load() ? sync::ScaleSourceName((sync::ScaleSource)g_miniScaleSrc.load()) : "minimap=0: no radar, nothing to resize");
+            // 0.5.2 ring_map: the visible map as a square in the ring, from the display the overlay drew last (no frame yet = wait) and the safe zone.
+            const game::Overlay::UiState ui = game::Overlay::LastUiState();
+            if (ui.valid && ui.displayW > 0.0f && ui.displayH > 0.0f)
+            {
+                const sync::hudring::Pt c = sync::hudring::MapCentrePx(ui.displayH);
+                const sync::MinimapPlacement p = sync::RingPlacement(ui.displayW, ui.displayH, g_miniSafe, g_miniSafeOk, c.x, c.y,
+                                                                     sync::hudring::MapSquarePx(ui.displayH));
+                game::minimapsize::ConfigurePlacement(p, "ring_map");   // the same placement is not written again
+                g_miniCfgScale = -1.0f;
+            }
+        }
+        else
+        {
+            const float want = g_minimap.load() ? g_miniScaleReq.load() : 1.0f;
+            if (dirty || want != g_miniCfgScale)
+            {
+                g_miniCfgScale = want;
+                game::minimapsize::Configure(want, g_minimap.load() ? sync::ScaleSourceName((sync::ScaleSource)g_miniScaleSrc.load()) : "minimap=0: no radar, nothing to resize");
+            }
         }
         game::minimapsize::Tick(nowMs);
         if (game::minimapsize::TakeWritten())
             g_barsGate.RequestFlip();
         g_miniAppliedScale = game::minimapsize::AppliedScale();
+    }
+
+    // 0.5.2 ring_map: the overlay opens the ring's map hole only while the table holds the placement, the radar is shown, the big radar is off (a
+    // flip re-lays the radar out: it is the big map for its duration) and all of that has held for kRingMapSettleMs. Round 1 of the round map also
+    // saves the bottom-left of the frame twice (Overlay::RequestRadarProbe, D3D11 only) so the radar's real landing place can be measured.
+    constexpr double kRingMapSettleMs = 800.0;
+    constexpr double kRingProbeAtMs[2] = {2500.0, 20000.0};
+    double g_ringMapSinceMs = -1.0;     // when all the conditions first held (-1 = not now)
+    int g_ringProbes = 0;
+    bool g_ringOpenLogged = false;
+    void TickRingMap(double nowMs, bool wanted)
+    {
+        const bool ready = g_hudRing.load() && g_ringMap.load() && wanted && game::minimapsize::PlacementApplied() && !g_barsGate.BigmapOn();
+        if (!ready)
+        {
+            g_ringMapSinceMs = -1.0;
+            game::Overlay::SetRingMap(false);
+            return;
+        }
+        if (g_ringMapSinceMs < 0.0)
+            g_ringMapSinceMs = nowMs;
+        const bool open = nowMs - g_ringMapSinceMs >= kRingMapSettleMs;
+        game::Overlay::SetRingMap(open);
+        if (open && !g_ringOpenLogged)
+        {
+            g_ringOpenLogged = true;
+            GLOGI("engine: ring map (0.5.2): the ring's map hole is open (the table holds the placement, the radar shows, the big radar is off)");
+        }
+        if (g_ringProbes < 2 && nowMs - g_ringMapSinceMs >= kRingProbeAtMs[g_ringProbes])
+            game::Overlay::RequestRadarProbe(++g_ringProbes);
     }
 
     void TickMinimap(double nowMs)
@@ -4122,6 +4175,7 @@ namespace {
             g_miniSafeOk = g_world->SafeZoneSize(g_miniSafe);
         }
         game::Overlay::SetRadarDock(in.switchOn, g_miniSafe, g_miniSafeOk, g_miniAppliedScale);
+        TickRingMap(nowMs, wanted);
         ++s.ticks;
         if (wanted)
             ++s.wantedTicks;

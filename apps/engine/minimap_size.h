@@ -7,12 +7,21 @@
 // (minimap, minimap_mask, minimap_blur). Every write is read back; a mismatch puts the old bytes back and counts as a failure (three and it gives up).
 #pragma once
 
+#include "sync/minimap_size.h"
+
 #include <string>
 
 namespace gage::game::minimapsize {
 
     // scale: the parsed registry value (0.5..1; 1 = untouched). sourceName: how it was read, for the log only. Safe to call again with a new value.
     void Configure(float scale, const char* sourceName);
+
+    // 0.5.2 ring_map: an absolute placement (sync::RingPlacement: the radar's visible map as a square inside the REV1 ring) instead of the factor.
+    // Configure(float) switches back. Safe to call every tick: the same placement is not written again.
+    void ConfigurePlacement(const sync::MinimapPlacement& p, const char* sourceName);
+
+    // True while the table holds the placement (written, read back, not taken back by the game).
+    bool PlacementApplied();
 
     // Locate (once), apply when the table is populated, re-assert when the game rewrites it. Call every script tick; it paces itself.
     void Tick(double nowMs);

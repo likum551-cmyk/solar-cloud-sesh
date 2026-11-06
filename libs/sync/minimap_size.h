@@ -257,6 +257,85 @@ namespace gage::sync {
         return o;
     }
 
+    // ---- 0.5.2 ring_map: the radar moved into the REV1 ring (GI 2026-11-06: "do the real round map") ------------------------------------
+    // Evidence (Legacy 3889 dump, read 2026-11-06): the game reads this table through six getters (frame pos / size +0x2cca98 / +0x2ccb64, mask
+    // +0x2cc928 / +0x2cca14, blur +0x2cc7bc / +0x2cc890; the slot comes from the radar mode at +0x1f77600 through +0x2cc6f0: 0 minimap, 3 bigmap,
+    // 6 pausemap, 8, 10 golf), and the per-frame radar update (+0x2eccb8 -> +0x2f8080) calls all six every frame and hands the result to the render
+    // thread. The scaleform movie's own rectangle is set only on a re-layout (+0x2f6514 -> +0x3f8924, and the movie's creation +0x2c7988), which is
+    // what the big-radar flip (or a pause-menu round trip) triggers: the Cfx / alt:V reports say the same ("mask and blur follow, the minimap
+    // component only after a re-render").
+    //
+    // The table's L / B space, read from the alignment helper +0x2c3fb0 (the frame getter's last call): x = safeLeft + posX ('L'), and for 'B'
+    // y_top = safeBottom - sizeY + posY, screen y DOWN. So posX is the left edge right of the safe zone's left edge, posY the BOTTOM edge measured
+    // DOWN from the safe zone's bottom edge (a radar raised 5 % of the height has posY -0.05), both in fractions of the screen.
+    // A placement maps each component's position about an anchor and per axis, in that space:
+    //   pos' = t + (pos - a) * s, size' = size * s (per axis). Scale mode (minimap_scale) is a = t = 0, sx = sy = the factor.
+    struct MinimapPlacement
+    {
+        float sx = 1.0f, sy = 1.0f, ax = 0.0f, ay = 0.0f, tx = 0.0f, ty = 0.0f;
+        bool blurToVisible = false;                        // the blur is set to the visible square itself (stock, it is twice the map's width)
+        float vx = 0.0f, vy = 0.0f, vw = 0.0f, vh = 0.0f;  // that square in table space (posX = left edge, posY = bottom edge, size)
+        bool operator==(const MinimapPlacement& o) const
+        {
+            return sx == o.sx && sy == o.sy && ax == o.ax && ay == o.ay && tx == o.tx && ty == o.ty && blurToVisible == o.blurToVisible && vx == o.vx &&
+                   vy == o.vy && vw == o.vw && vh == o.vh;
+        }
+    };
+
+    inline MinimapComp PlacedComp(const MinimapComp& c, const MinimapPlacement& p)
+    {
+        MinimapComp o = c;
+        o.posX = p.tx + (c.posX - p.ax) * p.sx;
+        o.posY = p.ty + (c.posY - p.ay) * p.sy;
+        o.sizeX = c.sizeX * p.sx;
+        o.sizeY = c.sizeY * p.sy;
+        return o;
+    }
+
+    inline MinimapTrio PlacedTrio(const MinimapTrio& t, const MinimapPlacement& p)
+    {
+        MinimapTrio o = t;
+        for (int r = 0; r < 3; ++r)
+            o.c[r] = PlacedComp(t.c[r], p);
+        if (p.blurToVisible)
+        {
+            o.c[kRoleBlur].posX = p.vx;
+            o.c[kRoleBlur].posY = p.vy;
+            o.c[kRoleBlur].sizeX = p.vw;
+            o.c[kRoleBlur].sizeY = p.vh;
+        }
+        return o;
+    }
+
+    // The stock VISIBLE map (RadarKeepOut's community formula: H / 4 px wide, H / 5.674 px tall, its bottom-left corner on the safe-zone corner) is
+    // mapped onto a square of squarePx centred at (cxPx, cyPx) (screen px, y down) on a W x H display: per-axis scale about the visible map's centre,
+    // then that centre moved onto the target. Every component keeps its place relative to the visible map (the frame and the mask render as stock,
+    // only squeezed to a square). W, H > 0 and squarePx > 0, else the identity.
+    // Table space (above): the visible map spans x 0..wv, y -hv..0 (it sits ON the safe zone's bottom edge, y down), so its centre is (wv / 2, -hv / 2);
+    // the safe zone's left / bottom edges are at inset / 1 - inset of the screen, so a screen point (x, y) (fractions, y down) is (x - inset, y - 1 + inset).
+    // Round-1 assumption, measured by the radar probe: the frame getter's aspect step (+0x2c342c) is the identity on a 16:9 display.
+    inline MinimapPlacement RingPlacement(float displayW, float displayH, float safeZone, bool safeZoneOk, float cxPx, float cyPx, float squarePx)
+    {
+        MinimapPlacement p;
+        if (!(displayW > 0.0f) || !(displayH > 0.0f) || !(squarePx > 0.0f))
+            return p;
+        const float sz = SafeZoneClamped(safeZone, safeZoneOk);
+        const float inset = 0.05f * std::fabs(sz - 1.0f) * 10.0f;   // as RadarKeepOut: the same fraction of W (x) and of H (y)
+        const float wv = displayH / 4.0f / displayW, hv = 1.0f / 5.674f;
+        p.ax = wv * 0.5f;
+        p.ay = -hv * 0.5f;
+        p.sx = squarePx / displayW / wv;
+        p.sy = squarePx / displayH / hv;
+        p.tx = cxPx / displayW - inset;
+        p.ty = cyPx / displayH - 1.0f + inset;
+        p.blurToVisible = true;
+        p.vw = squarePx / displayW;
+        p.vh = squarePx / displayH;
+        p.vx = p.tx - p.vw * 0.5f;
+        p.vy = p.ty + p.vh * 0.5f;   // the bottom edge, y down
+        return p;
+    }
+
     // ---- when to write -----------------------------------------------------------------------------------------------
 
     // The engine feeds it what the table holds (script tick) and performs what it answers. The first complete, plausible read becomes the
@@ -283,17 +362,19 @@ namespace gage::sync {
         void Configure(float scale)
         {
             const float was = scale_;
+            const bool wasPlaced = placed_;
             scale_ = ClampRadarScale(scale);
-            if (phase_ == Phase::GaveUp || (hasOrig_ && was == scale_))
-                return;   // nothing new to write (a Welcome re-reads the registry; the same value is not written again)
-            if (!hasOrig_)
-            {
-                phase_ = scale_ < 1.0f ? Phase::Waiting : Phase::Off;
-                return;
-            }
-            target_ = ScaledTrio(orig_, scale_);
-            phase_ = Phase::Applied;
-            forced_ = true;
+            placed_ = false;
+            Retarget(wasPlaced || was != scale_);
+        }
+
+        // 0.5.2 ring_map: an absolute placement (RingPlacement) instead of a factor. Configure(float) switches back to the factor.
+        void ConfigurePlacement(const MinimapPlacement& p)
+        {
+            const bool changed = !placed_ || !(place_ == p);
+            place_ = p;
+            placed_ = true;
+            Retarget(changed);
         }
 
         Act Next(const MinimapTrio& cur, bool readable, double nowMs)
@@ -325,7 +406,9 @@ namespace gage::sync {
         }
 
         Phase PhaseNow() const { return phase_; }
-        float Scale() const { return scale_; }
+        float Scale() const { return placed_ ? 1.0f : scale_; }   // the factor (1 in placement mode: the overlay's dock rectangle is not used then)
+        bool Placed() const { return placed_; }
+        const MinimapPlacement& Placement() const { return place_; }
         bool HasOriginal() const { return hasOrig_; }
         const MinimapTrio& Original() const { return orig_; }
         const MinimapTrio& Target() const { return target_; }
@@ -333,6 +416,23 @@ namespace gage::sync {
         const std::string& Why() const { return why_; }   // why it is waiting / gave up (last)
 
     private:
+        // Untouched: the factor 1 in scale mode (a placement always writes).
+        bool Untouched() const { return !placed_ && scale_ >= 1.0f; }
+        MinimapTrio MakeTarget(const MinimapTrio& orig) const { return placed_ ? PlacedTrio(orig, place_) : ScaledTrio(orig, scale_); }
+        void Retarget(bool changed)
+        {
+            if (phase_ == Phase::GaveUp || (hasOrig_ && !changed))
+                return;   // nothing new to write (a Welcome re-reads the registry; the same value is not written again)
+            if (!hasOrig_)
+            {
+                phase_ = Untouched() ? Phase::Off : Phase::Waiting;
+                return;
+            }
+            target_ = Untouched() ? orig_ : MakeTarget(orig_);
+            phase_ = Phase::Applied;
+            forced_ = true;
+        }
+
         Act NextWaiting(const MinimapTrio& cur, bool readable, double nowMs)
         {
             if (polled_ && nowMs - lastPollMs_ < kPollMs)
@@ -352,7 +452,7 @@ namespace gage::sync {
                 {
                     orig_ = cur;
                     hasOrig_ = true;
-                    target_ = ScaledTrio(orig_, scale_);
+                    target_ = MakeTarget(orig_);
                     phase_ = Phase::Applied;
                     lastCheckMs_ = nowMs;
                     ++stats_.applies;
@@ -379,7 +479,7 @@ namespace gage::sync {
                 lastCheckMs_ = nowMs;
                 return Act::Reassert;
             }
-            if (scale_ >= 1.0f)
+            if (Untouched())
             {
                 phase_ = Phase::Off;   // the originals have been written back
                 return Act::None;
@@ -411,12 +511,13 @@ namespace gage::sync {
                         return Act::None;
                     }
                     nextOrig.c[r] = cur.c[r];
-                    nextTarget.c[r] = ScaledComp(cur.c[r], scale_);
                     ++adopted;
                 }
             }
             if (!changed)
                 return Act::None;
+            if (adopted)
+                nextTarget = MakeTarget(nextOrig);   // a placement's blur is set from the visible square, not from its own stock value
             if (stats_.reasserts >= kMaxReasserts)
             {
                 phase_ = Phase::GaveUp;
@@ -432,6 +533,8 @@ namespace gage::sync {
 
         Phase phase_ = Phase::Off;
         float scale_ = 1.0f;
+        bool placed_ = false;          // 0.5.2: place_ (ConfigurePlacement) instead of scale_
+        MinimapPlacement place_;
         bool hasOrig_ = false, forced_ = false, polled_ = false;
         double lastPollMs_ = 0.0, firstPollMs_ = -1.0, lastCheckMs_ = 0.0;
         MinimapTrio orig_, target_;

@@ -18,7 +18,7 @@
 
 namespace minimapsizetest {
 
-    constexpr int kChecks = 30;   // 23 for 0.4.25 + 7 for the Enhanced layout (0.4.26)
+    constexpr int kChecks = 34;   // 23 for 0.4.25 + 7 for the Enhanced layout (0.4.26) + 4 for ring_map (0.5.2)
 
     using namespace gage::sync;
 
@@ -685,6 +685,121 @@ namespace minimapsizetest {
             const int tooShort = FindLayoutHits(kMinimapLayoutEnhanced, exact.data(), exact.size() - 1, e2, 4, 0);
             Check("minimap_scale layouts: hits found in separate runs add up (2), a full hit buffer is left alone, a run that is exactly the pattern hits and one byte shorter does not",
                   have == 2 && h[0] == &a.img[a.hit] && h[1] == &b.img[b.hit] && capped == 1 && atEnd == 1 && e1[0] == exact.data() && tooShort == 0);
+        }
+
+        // ---- 0.5.2 ring_map: RingPlacement and the gate's placement mode --------------------------------------------------------------------
+        const auto Fs = [](const char* f, auto... a) { char b[256]; std::snprintf(b, sizeof b, f, a...); return std::string(b); };
+        // Where the game draws a component: the alignment helper +0x2c3fb0 ('L' / 'B'): left = safeLeft + posX, top = safeBottom - sizeY + posY.
+        const auto screenRect = [](const MinimapComp& c, float W, float H, float inset, float* l, float* t, float* w, float* h) {
+            *l = (inset + c.posX) * W;
+            *t = ((1.0f - inset) - c.sizeY + c.posY) * H;
+            *w = c.sizeX * W;
+            *h = c.sizeY * H;
+        };
+        {
+            // The stock VISIBLE map (H / 4 x H / 5.674 px on the safe zone's bottom-left corner) lands as the asked square, centred where asked, with
+            // the safe zone at 1.0 and at 0.9 (inset 5 %): the y sign of the table is the game's, not y up.
+            const float W = 1920.0f, H = 1080.0f, cx = 174.8f, cy = 852.4f, sq = 159.83f;
+            bool ok = true;
+            char got[200] = "";
+            const float zones[2] = {1.0f, 0.9f};
+            for (int z = 0; z < 2; ++z) {
+                const float inset = 0.05f * std::fabs(zones[z] - 1.0f) * 10.0f;
+                const MinimapPlacement p = RingPlacement(W, H, zones[z], true, cx, cy, sq);
+                const MinimapComp visible = Comp("visible", 0.0f, 0.0f, H / 4.0f / W, 1.0f / 5.674f);
+                float l, t, w, h;
+                screenRect(PlacedComp(visible, p), W, H, inset, &l, &t, &w, &h);
+                ok = ok && Near(l, cx - sq / 2, 0.01f) && Near(t, cy - sq / 2, 0.01f) && Near(w, sq, 0.01f) && Near(h, sq, 0.01f);
+                if (z == 1)
+                    std::snprintf(got, sizeof got, "safe zone 0.9: (%.2f, %.2f) %.2f x %.2f", l, t, w, h);
+            }
+            Check("ring_map: RingPlacement puts the stock visible map on the asked square (centre (174.8, 852.4), 159.83 px on 1080p) in the game's own table space, "
+                  "with the safe zone at 1.0 and at 0.9",
+                  ok, got);
+        }
+        {
+            // PlacedTrio: the frame and the mask keep their place relative to the visible map (scaled per axis about its centre); the blur is the
+            // visible square itself (blurToVisible), on the same pixels as the visible map
+            const float W = 2560.0f, H = 1440.0f, inset = 0.0f;
+            const MinimapPlacement p = RingPlacement(W, H, 1.0f, true, 233.07f, 1136.53f, 213.1f);
+            MinimapTrio st;
+            st.c[kRoleMinimap] = StockMinimap(); st.c[kRoleMask] = StockMask(); st.c[kRoleBlur] = StockBlur();
+            const MinimapTrio o = PlacedTrio(st, p);
+            const MinimapComp& m = o.c[kRoleMask];
+            const bool rel = Near(m.posX - p.tx, (st.c[kRoleMask].posX - p.ax) * p.sx) && Near(m.posY - p.ty, (st.c[kRoleMask].posY - p.ay) * p.sy) &&
+                             Near(m.sizeX, st.c[kRoleMask].sizeX * p.sx) && Near(o.c[kRoleMinimap].sizeY, st.c[kRoleMinimap].sizeY * p.sy);
+            float bl, bt, bw, bh, vl, vt, vw, vh;
+            screenRect(o.c[kRoleBlur], W, H, inset, &bl, &bt, &bw, &bh);
+            screenRect(PlacedComp(Comp("visible", 0.0f, 0.0f, H / 4.0f / W, 1.0f / 5.674f), p), W, H, inset, &vl, &vt, &vw, &vh);
+            const bool blur = Near(bl, vl, 0.01f) && Near(bt, vt, 0.01f) && Near(bw, vw, 0.01f) && Near(bh, vh, 0.01f) && o.c[kRoleBlur].name == "minimap_blur" &&
+                              o.c[kRoleBlur].alignY == 'B';
+            bool plausible = true;
+            for (int r = 0; r < 3; ++r)
+                plausible = plausible && PlausibleComp(o.c[r], nullptr);
+            Check("ring_map: PlacedTrio scales the frame and the mask about the visible map's centre and sets the blur to the visible square (same pixels); "
+                  "all three stay plausible on 1440p",
+                  rel && blur && plausible, Fs("blur (%.2f, %.2f) %.2f x %.2f, visible (%.2f, %.2f) %.2f x %.2f", bl, bt, bw, bh, vl, vt, vw, vh));
+        }
+        {
+            // Bad input is the identity; the identity placement leaves a trio as it is
+            const MinimapPlacement a = RingPlacement(0.0f, 1080.0f, 1.0f, true, 100, 100, 100), b = RingPlacement(1920.0f, 1080.0f, 1.0f, true, 100, 100, 0.0f);
+            MinimapTrio st;
+            st.c[kRoleMinimap] = StockMinimap(); st.c[kRoleMask] = StockMask(); st.c[kRoleBlur] = StockBlur();
+            const MinimapTrio o = PlacedTrio(st, a);
+            bool same = true;
+            for (int r = 0; r < 3; ++r)
+                same = same && SameComp(o.c[r], st.c[r]);
+            Check("ring_map: a display of width 0 or a square of 0 px gives the identity placement, which leaves the table as it is",
+                  a == MinimapPlacement() && b == MinimapPlacement() && same);
+        }
+        {
+            // The gate in placement mode: waits, applies the placed trio once, never rewrites the same placement (a Welcome re-reads the registry),
+            // re-targets a changed one from the saved originals, re-asserts a game reset with the blur still on the visible square, and
+            // Configure(1) writes the stock values back once.
+            MinimapSizeGate g;
+            const MinimapPlacement p = RingPlacement(1920.0f, 1080.0f, 1.0f, true, 174.8f, 852.4f, 159.83f);
+            g.ConfigurePlacement(p);
+            const bool waiting = g.PhaseNow() == MinimapSizeGate::Phase::Waiting && g.Placed() && g.Scale() == 1.0f;
+            SimTable t;
+            t.PutStock();
+            const std::vector<uint8_t> stock = t.b;
+            double now = 0;
+            const MinimapSizeGate::Act apply = Step(g, t, now);
+            MinimapTrio st;
+            st.c[kRoleMinimap] = StockMinimap(); st.c[kRoleMask] = StockMask(); st.c[kRoleBlur] = StockBlur();
+            const MinimapTrio want = PlacedTrio(st, p);
+            bool placed = true;
+            for (int r = 0; r < 3; ++r)
+                placed = placed && SameComp(t.Slot(r), want.c[r]);
+            g.ConfigurePlacement(p);   // the same placement again
+            int extra = 0;
+            for (int i = 0; i < 4; ++i) {
+                now += 1000.0;
+                extra += Step(g, t, now) != MinimapSizeGate::Act::None;
+            }
+            const MinimapPlacement p2 = RingPlacement(1920.0f, 1080.0f, 1.0f, true, 180.0f, 850.0f, 150.0f);
+            g.ConfigurePlacement(p2);
+            now += 250.0;
+            const MinimapSizeGate::Act moved = Step(g, t, now);
+            const MinimapTrio want2 = PlacedTrio(st, p2);
+            bool placed2 = true;
+            for (int r = 0; r < 3; ++r)
+                placed2 = placed2 && SameComp(t.Slot(r), want2.c[r]);
+            t.Put(2, StockBlur());   // the game resets the blur
+            now += 1000.0;
+            const MinimapSizeGate::Act re = Step(g, t, now);
+            const bool blurBack = SameComp(t.Slot(2), want2.c[kRoleBlur]);
+            g.Configure(1.0f);
+            now += 250.0;
+            const MinimapSizeGate::Act back = Step(g, t, now);
+            now += 250.0;
+            const MinimapSizeGate::Act done = Step(g, t, now);
+            Check("ring_map gate: a placement waits, is applied once, the same placement is never written again, a new one is re-targeted from the stock values, "
+                  "a reset blur goes back onto the visible square, and minimap_scale 1 writes the stock values back once",
+                  waiting && apply == MinimapSizeGate::Act::Apply && placed && extra == 0 && moved == MinimapSizeGate::Act::Reassert && placed2 &&
+                      re == MinimapSizeGate::Act::Reassert && blurBack && back == MinimapSizeGate::Act::Reassert && done == MinimapSizeGate::Act::None &&
+                      g.PhaseNow() == MinimapSizeGate::Phase::Off && !g.Placed() && t.b == stock,
+                  Fs("apply %d extra %d moved %d re %d back %d done %d", (int)apply, extra, (int)moved, (int)re, (int)back, (int)done));
         }
     }
 
