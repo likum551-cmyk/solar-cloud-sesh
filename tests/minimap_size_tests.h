@@ -18,7 +18,7 @@
 
 namespace minimapsizetest {
 
-    constexpr int kChecks = 34;   // 23 for 0.4.25 + 7 for the Enhanced layout (0.4.26) + 4 for ring_map (0.5.2)
+    constexpr int kChecks = 37;   // 23 for 0.4.25 + 7 for the Enhanced layout (0.4.26) + 4 for ring_map (0.5.2) + 3 for ring_map_big / ring_map_zoom (0.5.4)
 
     using namespace gage::sync;
 
@@ -800,6 +800,112 @@ namespace minimapsizetest {
                       re == MinimapSizeGate::Act::Reassert && blurBack && back == MinimapSizeGate::Act::Reassert && done == MinimapSizeGate::Act::None &&
                       g.PhaseNow() == MinimapSizeGate::Phase::Off && !g.Placed() && t.b == stock,
                   Fs("apply %d extra %d moved %d re %d back %d done %d", (int)apply, extra, (int)moved, (int)re, (int)back, (int)done));
+        }
+        {
+            // 0.5.4 ring_map_big (GI 2026-11-07, "a square over the hp and sat bar"): the radar was in big mode, which reads slots 3-5. The 0.5.3
+            // path (the minimap gate alone) leaves those slots stock: that is the defect. The mirror gate writes the minimap placement's geometry
+            // into them (names, alignment and slot indices kept), never rewrites the same mirror, re-asserts a game reset, and goes back to stock.
+            SimTable t;
+            t.PutStock();
+            const MinimapComp bigStock[3] = {Comp("bigmap", -0.004f, 0.022f, 0.364f, 0.460417f), Comp("bigmap_mask", 0.145f, 0.015f, 0.176f, 0.395f),
+                                             Comp("bigmap_blur", -0.019f, 0.022f, 0.262f, 0.464f)};
+            for (int r = 0; r < 3; ++r)
+                t.Put(3 + r, bigStock[r]);
+            auto readBig = [&]() {
+                MinimapComp all[kMinimapEntries];
+                for (int i = 0; i < kMinimapEntries; ++i)
+                    all[i] = DecodeMinimapComp(&t.b[(size_t)i * kMinimapStride]);
+                return PickTrio(all, kMinimapEntries, kBigmapRoleNames);
+            };
+            auto stepBig = [&](MinimapSizeGate& gb, double at) {
+                const MinimapSizeGate::Act a = gb.Next(readBig(), true, at);
+                if (a != MinimapSizeGate::Act::None)
+                    for (int r = 0; r < 3; ++r)
+                        EncodeMinimapGeometry(&t.b[(size_t)gb.Target().index[r] * kMinimapStride], gb.Target().c[r]);
+                return a;
+            };
+            const MinimapTrio bigFound = readBig();
+            MinimapSizeGate g;
+            g.ConfigurePlacement(RingPlacement(2560.0f, 1440.0f, 0.97f, true, 233.07f, 1136.53f, 213.1f));
+            double now = 0;
+            Step(g, t, now);
+            bool oldLeavesBig = true;   // the 0.5.3 path: only the minimap gate ran
+            for (int r = 0; r < 3; ++r)
+                oldLeavesBig = oldLeavesBig && SameComp(t.Slot(3 + r), bigStock[r]);
+            const std::vector<uint8_t> minimapSlots(t.b.begin(), t.b.begin() + 3 * kMinimapStride);
+
+            MinimapSizeGate gb;
+            gb.ConfigureMirror(g.Target());
+            const bool mirrorMode = gb.Mirrored() && !gb.Placed() && gb.Scale() == 1.0f;
+            const MinimapSizeGate::Act apply = stepBig(gb, now);
+            bool mirrored = true;
+            for (int r = 0; r < 3; ++r)
+            {
+                const MinimapComp s = t.Slot(3 + r);
+                mirrored = mirrored && s.name == bigStock[r].name && s.alignX == 'L' && s.alignY == 'B' && s.posX == g.Target().c[r].posX &&
+                           s.posY == g.Target().c[r].posY && s.sizeX == g.Target().c[r].sizeX && s.sizeY == g.Target().c[r].sizeY;
+            }
+            const bool minimapUntouched = std::vector<uint8_t>(t.b.begin(), t.b.begin() + 3 * kMinimapStride) == minimapSlots;
+            int extra = 0;
+            for (int i = 0; i < 4; ++i)
+            {
+                now += 1000.0;
+                gb.ConfigureMirror(g.Target());   // the engine hands the same geometry every tick
+                extra += stepBig(gb, now) != MinimapSizeGate::Act::None;
+            }
+            t.Put(3, bigStock[0]);   // the game resets the big frame
+            now += 1000.0;
+            const MinimapSizeGate::Act re = stepBig(gb, now);
+            const bool frameBack = t.Slot(3).sizeX == g.Target().c[0].sizeX && t.Slot(3).posY == g.Target().c[0].posY;
+            gb.Configure(1.0f);
+            now += 250.0;
+            const MinimapSizeGate::Act back = stepBig(gb, now);
+            bool stockAgain = true;
+            for (int r = 0; r < 3; ++r)
+                stockAgain = stockAgain && SameComp(t.Slot(3 + r), bigStock[r]);
+            Check("ring_map_big (0.5.4): the big radar's slots 3-5 are found by name; the 0.5.3 path leaves them stock; the mirror writes the minimap placement's "
+                  "geometry into them (names / alignment kept, slots 0-2 untouched), never again for the same geometry, re-asserts a reset, and minimap_scale 1 "
+                  "puts the stock big radar back",
+                  bigFound.AllFound() && bigFound.index[0] == 3 && bigFound.index[2] == 5 && oldLeavesBig && mirrorMode &&
+                      apply == MinimapSizeGate::Act::Apply && mirrored && minimapUntouched && extra == 0 && re == MinimapSizeGate::Act::Reassert && frameBack &&
+                      back == MinimapSizeGate::Act::Reassert && stockAgain && !gb.Mirrored(),
+                  Fs("old %d apply %d mirrored %d extra %d re %d back %d stock %d", (int)oldLeavesBig, (int)apply, (int)mirrored, extra, (int)re, (int)back,
+                     (int)stockAgain));
+        }
+        {
+            // A changed placement re-targets the mirror from the big radar's stock values (not from the old mirror), MirroredTrio keeps the
+            // big trio's names / alignment / indices, and SameGeometry ignores the names.
+            MinimapTrio bigT, geo;
+            bigT.c[0] = Comp("bigmap", -0.004f, 0.022f, 0.364f, 0.460417f);
+            bigT.c[1] = Comp("bigmap_mask", 0.145f, 0.015f, 0.176f, 0.395f);
+            bigT.c[2] = Comp("bigmap_blur", -0.019f, 0.022f, 0.262f, 0.464f);
+            for (int r = 0; r < 3; ++r)
+                bigT.index[r] = 3 + r;
+            geo.c[0] = StockMinimap(); geo.c[1] = StockMask(); geo.c[2] = StockBlur();
+            const MinimapTrio m = MirroredTrio(bigT, geo);
+            bool ok = true;
+            for (int r = 0; r < 3; ++r)
+                ok = ok && m.c[r].name == bigT.c[r].name && m.index[r] == 3 + r && m.c[r].posX == geo.c[r].posX && m.c[r].sizeY == geo.c[r].sizeY;
+            MinimapTrio geo2 = geo;
+            geo2.c[1].sizeX += 0.001f;
+            Check("ring_map_big (0.5.4): MirroredTrio copies only the four geometry floats; SameGeometry ignores names and sees one changed size",
+                  ok && SameGeometry(m, geo) && !SameGeometry(m, geo2));
+        }
+        {
+            // ring_map_zoom: unset = 1100, "0" = the game's own zoom, 1..1400 as given (spaces trimmed), above 1400 held, junk = the default.
+            const RingZoom u = ParseRingMapZoom(L""), z = ParseRingMapZoom(L"0"), a = ParseRingMapZoom(L" 800 "), top = ParseRingMapZoom(L"1400"),
+                           hi = ParseRingMapZoom(L"2000");
+            const wchar_t* junk[] = {L"abc", L"-5", L"1.5", L"1234567", L"12a"};
+            bool junkOk = true;
+            for (const wchar_t* j : junk)
+            {
+                const RingZoom r = ParseRingMapZoom(j);
+                junkOk = junkOk && r.level == kRingMapZoomDefault && r.why != nullptr;
+            }
+            Check("ring_map_zoom (0.5.4): unset = 1100, 0 = off, ' 800 ' = 800, 1400 = 1400, 2000 held to 1400 (reported), junk = 1100 (reported)",
+                  u.level == 1100 && !u.why && z.level == 0 && !z.why && a.level == 800 && !a.why && top.level == 1400 && !top.why && hi.level == 1400 &&
+                      hi.why && junkOk,
+                  Fs("u %d z %d a %d hi %d", u.level, z.level, a.level, hi.level));
         }
     }
 

@@ -231,6 +231,9 @@ namespace gage::game {
         constexpr uint64_t END_SCALEFORM_MOVIE_METHOD                       = 0xC6796A8FFA375E53;  // void ()
         constexpr uint64_t SET_BIGMAP_ACTIVE                                = 0x231C8F89D0539D8F;  // void (BOOL toggleBigMap, BOOL showFullMap)
         constexpr uint64_t GET_SAFE_ZONE_SIZE                               = 0xBAF107B6BB2C97F0;  // float (): 1.0 at the settings maximum
+        // 0.5.4 ring_map_zoom. alloc8or HUD::SET_RADAR_ZOOM 0x096EF57A0C999BBA void (int zoomLevel), "0 to 1400 in R* Scripts"; 3889 hash in
+        // kCrossmap3889 (natlookup.mjs 2026-11-07: YimMenu b3889 idx 1539 and YimMenuV2 enhanced idx 1579 AGREE).
+        constexpr uint64_t SET_RADAR_ZOOM                                   = 0x096EF57A0C999BBA;  // void (int zoomLevel)
 
         // remote-player ped driving (GTA Network / RAGECOOP style: a locomotion task, a per-frame
         // velocity steer and a rare hard snap), the local-state readers the sender needs, and the
@@ -915,6 +918,8 @@ namespace gage::game {
         bool     ScaleformLoaded(int handle);
         bool     ScaleformCallInt(int handle, const char* method, int arg, bool& began);
         bool     SetBigmap(bool on);
+        // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM(level), 0 = the game's own zoom, up to 1400 = furthest. False when the native does not resolve.
+        bool     SetRadarZoom(int level);
         bool     SafeZoneSize(float& out);
         // Diagnostic: log every live GTA script thread (id + script-name hash, resolved to a
         // readable name when known, else hex) to gage.log. `when` tags the line (e.g. "pristine"

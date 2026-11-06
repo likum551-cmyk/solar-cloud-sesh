@@ -20,7 +20,12 @@ namespace gage::game::minimapsize {
     // Configure(float) switches back. Safe to call every tick: the same placement is not written again.
     void ConfigurePlacement(const sync::MinimapPlacement& p, const char* sourceName);
 
-    // True while the table holds the placement (written, read back, not taken back by the game).
+    // 0.5.4 ring_map_big: true = once the placement is in the minimap slots, the big radar's slots (bigmap / bigmap_mask / bigmap_blur) get the
+    // same geometry (sync::MirroredTrio), so a radar in big mode lands in the ring too. Call before the first Tick; false = slots 0-2 only (0.5.3).
+    void SetBigMirror(bool on);
+
+    // True while the table holds the placement (written, read back, not taken back by the game); with SetBigMirror(true) also the big radar's
+    // mirror, unless its slots gave up (then the minimap slots alone).
     bool PlacementApplied();
 
     // Locate (once), apply when the table is populated, re-assert when the game rewrites it. Call every script tick; it paces itself.
