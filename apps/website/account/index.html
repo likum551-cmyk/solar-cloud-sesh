@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- @include head -->
+  <title>Your account: Solar RP</title>
+  <meta name="robots" content="noindex" />
+  <link rel="preload" href="/media/vinewood.webp" as="image" />
+</head>
+<body class="page-account">
+  <a class="skip" href="#main">Skip to your account</a>
+  <!-- @include bar -->
+
+  <main class="acct" id="main" data-state="loading" aria-busy="true">
+    <header class="acct__band">
+      <img class="acct__band-img" src="/media/vinewood.webp" alt="" width="1600" height="900" decoding="async" fetchpriority="high" />
+      <div class="acct__band-row">
+        <div class="acct__who">
+          <h1 class="acct__name"><span class="js-username"><span class="sk sk--name"></span></span></h1>
+          <p class="acct__since js-since"><span class="sk sk--line"></span></p>
+        </div>
+        <div class="acct__out">
+          <button class="plate plate--ghost js-logout" type="button"><span class="js-label">Log out</span></button>
+          <p class="acct__out-status js-logout-status" role="status"></p>
+        </div>
+      </div>
+    </header>
+
+    <div class="acct__load-error js-load-error" role="alert" hidden>
+      <p class="js-load-error-text"></p>
+      <button class="plate plate--ghost js-retry" type="button">Try again</button>
+    </div>
+
+    <div class="acct__body">
+      <div class="acct__ban js-ban" role="note" hidden>
+        <svg class="form__alert-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5L18.5 17.5H1.5Z"/><path d="M10 8v4.5M10 14.5v1.5"/></svg>
+        <p class="js-ban-text"></p>
+      </div>
+
+      <section class="sec sec--quests" aria-labelledby="h-quests">
+        <div class="quests__intro">
+          <h2 class="sec__title" id="h-quests">Quests</h2>
+          <p class="sec__lede">Coins for linking Discord and following Solar RP. Each quest pays once.</p>
+        </div>
+        <!-- the wallet sits in the page's right column, the ledger in its left one -->
+        <div class="wallet" role="group" aria-label="Your coins">
+          <p class="coins">
+            <span class="coins__label">Balance</span>
+            <span class="coins__value"><span class="js-coins"><span class="sk sk--coins"></span></span> <span class="coins__unit">coins</span></span>
+          </p>
+          <div class="wallet__progress js-quests-progress" hidden>
+            <p class="wallet__progress-text js-quests-progress-text"></p>
+            <div class="wallet__bar js-quests-bar" aria-hidden="true"></div>
+          </div>
+          <!-- Discord: what unlocks the claims. This block is the STATUS (linked = the name and a gold check;
+               not linked = a chip and why); the Discord quest's row is the action. Its own opener shows only
+               when the ledger has no such row (CSS :has). Open = password, then a round trip to Discord. -->
+          <div class="dlink js-discord" role="group" aria-labelledby="h-discord" data-state="loading">
+            <p class="coins__label" id="h-discord">Discord</p>
+            <div class="dlink__status js-discord-status" role="status" hidden>
+              <svg class="form__alert-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5L18.5 17.5H1.5Z"/><path d="M10 8v4.5M10 14.5v1.5"/></svg>
+              <p class="js-discord-status-text"></p>
+            </div>
+            <p class="dlink__linked js-discord-linked" hidden>
+              <span class="dlink__name js-discord-name"></span>
+              <span class="chip chip--ok dlink__chip"><svg class="dlink__chip-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 8.5l3.5 3.5 7.5-8"/></svg>Linked</span>
+            </p>
+            <div class="dlink__unlinked js-discord-unlinked" hidden>
+              <p class="dlink__state"><span class="chip">Not linked</span></p>
+              <p class="dlink__why">Quests pay out only to accounts with Discord linked.</p>
+              <button class="plate plate--ghost plate--sm dlink__open js-discord-open" type="button" aria-expanded="false" aria-controls="discord-form"><span class="js-label">Link Discord</span></button>
+              <form class="form dlink__form js-discord-form" id="discord-form" novalidate hidden>
+                <input type="text" name="username" autocomplete="username" class="visually-hidden" tabindex="-1" aria-hidden="true" />
+                <div class="field" data-field="password">
+                  <label class="field__label" for="dl-password">Confirm your Solar RP password</label>
+                  <div class="field__box">
+                    <input class="field__input" id="dl-password" name="password" type="password" autocomplete="current-password" maxlength="1024" aria-describedby="dl-password-hint dl-password-error" />
+                    <button class="field__reveal" type="button" aria-controls="dl-password" aria-pressed="false">Show</button>
+                  </div>
+                  <p class="field__hint" id="dl-password-hint">Linking adds a way to sign in. Next, Discord asks you to approve and sends you back here.</p>
+                  <p class="field__error" id="dl-password-error" hidden></p>
+                </div>
+                <div class="form__alert" role="alert" tabindex="-1" hidden>
+                  <svg class="form__alert-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5L18.5 17.5H1.5Z"/><path d="M10 8v4.5M10 14.5v1.5"/></svg>
+                  <p class="form__alert-text"></p>
+                </div>
+                <div class="dlink__actions">
+                  <button class="plate plate--sm form__submit js-discord-go" type="submit"><span class="js-label">Continue to Discord</span></button>
+                  <button class="dlink__cancel js-discord-cancel" type="button">Cancel</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+        <ul class="quests js-quests" aria-busy="true">
+          <li class="quest quest--sk"><span class="sk sk--reward"></span><div class="quest__text"><span class="sk sk--line"></span><span class="sk sk--short"></span></div></li>
+          <li class="quest quest--sk"><span class="sk sk--reward"></span><div class="quest__text"><span class="sk sk--line"></span><span class="sk sk--short"></span></div></li>
+        </ul>
+        <p class="quests__empty js-quests-empty" hidden>No quests are running right now.</p>
+        <p class="sec__status quests__status js-quests-status" role="status"></p>
+      </section>
+
+      <section class="sec sec--profile" aria-labelledby="h-profile">
+        <h2 class="sec__title" id="h-profile">Profile</h2>
+        <dl class="kv">
+          <div class="kv__row">
+            <dt>Username</dt>
+            <dd class="js-p-username"><span class="sk sk--line"></span></dd>
+          </div>
+          <div class="kv__row">
+            <dt>Email</dt>
+            <dd>
+              <span class="kv__email"><span class="js-p-email"><span class="sk sk--line"></span></span> <span class="chip js-email-state" hidden></span></span>
+              <span class="kv__note js-email-note" hidden>Email verification isn’t available yet: Solar RP doesn’t send email yet.</span>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="sec sec--sessions" aria-labelledby="h-sessions">
+        <h2 class="sec__title" id="h-sessions">Sessions</h2>
+        <p class="sec__lede js-sessions-count">Browsers and devices signed in to this account.</p>
+        <ul class="sessions js-sessions" aria-busy="true">
+          <li class="session session--sk"><div class="session__text"><span class="sk sk--line"></span><span class="sk sk--short"></span></div></li>
+          <li class="session session--sk"><div class="session__text"><span class="sk sk--line"></span><span class="sk sk--short"></span></div></li>
+        </ul>
+        <button class="plate plate--ghost js-revoke-others" type="button" hidden><span class="js-label">Sign out all other sessions</span></button>
+        <p class="sec__status js-sessions-status" role="status"></p>
+      </section>
+
+      <section class="sec sec--password" aria-labelledby="h-password">
+        <h2 class="sec__title" id="h-password">Change password</h2>
+        <p class="sec__lede">Changing it signs out every other session.</p>
+        <form class="form js-password" novalidate>
+          <input type="text" name="username" autocomplete="username" class="visually-hidden" tabindex="-1" aria-hidden="true" />
+          <div class="field" data-field="currentPassword">
+            <label class="field__label" for="pw-current">Current password</label>
+            <div class="field__box">
+              <input class="field__input" id="pw-current" name="currentPassword" type="password" autocomplete="current-password" maxlength="1024" aria-describedby="pw-current-error" />
+              <button class="field__reveal" type="button" aria-controls="pw-current" aria-pressed="false">Show</button>
+            </div>
+            <p class="field__error" id="pw-current-error" hidden></p>
+          </div>
+          <div class="field" data-field="newPassword">
+            <label class="field__label" for="pw-new">New password</label>
+            <div class="field__box">
+              <input class="field__input" id="pw-new" name="newPassword" type="password" autocomplete="new-password" maxlength="1024" aria-describedby="pw-rules pw-new-error" />
+              <button class="field__reveal" type="button" aria-controls="pw-new" aria-pressed="false">Show</button>
+            </div>
+            <ul class="rules" id="pw-rules" aria-label="Password rules">
+              <li data-rule="length" data-state="idle"><svg class="rule__icon" viewBox="0 0 16 16" aria-hidden="true"><path class="i-ok" d="M2.5 8.5l3.5 3.5 7.5-8"/><path class="i-fail" d="M4 4l8 8M12 4l-8 8"/><rect class="i-idle" x="6" y="6" width="4" height="4"/></svg>10 to 128 characters</li>
+              <li data-rule="username" data-state="idle"><svg class="rule__icon" viewBox="0 0 16 16" aria-hidden="true"><path class="i-ok" d="M2.5 8.5l3.5 3.5 7.5-8"/><path class="i-fail" d="M4 4l8 8M12 4l-8 8"/><rect class="i-idle" x="6" y="6" width="4" height="4"/></svg>Not your username</li>
+              <li data-rule="email" data-state="idle"><svg class="rule__icon" viewBox="0 0 16 16" aria-hidden="true"><path class="i-ok" d="M2.5 8.5l3.5 3.5 7.5-8"/><path class="i-fail" d="M4 4l8 8M12 4l-8 8"/><rect class="i-idle" x="6" y="6" width="4" height="4"/></svg>Not the part of your email before the @</li>
+            </ul>
+            <p class="field__error" id="pw-new-error" hidden></p>
+          </div>
+          <div class="form__alert" role="alert" tabindex="-1" hidden>
+            <svg class="form__alert-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5L18.5 17.5H1.5Z"/><path d="M10 8v4.5M10 14.5v1.5"/></svg>
+            <p class="form__alert-text"></p>
+          </div>
+          <div class="form__done js-pw-done" role="status" hidden>
+            <svg class="form__done-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 8.5l3.5 3.5 7.5-8"/></svg>
+            <p class="js-pw-done-text"></p>
+          </div>
+          <button class="plate form__submit" type="submit"><span class="js-label">Save password</span></button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <!-- @include foot -->
+  <div class="grain" aria-hidden="true"></div>
+  <script type="module" src="/src/account/account.ts"></script>
+</body>
+</html>

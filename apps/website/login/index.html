@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!-- @include head -->
+  <title>Log in: Solar RP</title>
+  <meta name="description" content="Log in to your Solar RP account." />
+  <link rel="canonical" href="https://solar-rp.com/login/" />
+  <link rel="preload" href="/media/downtown.webp" as="image" />
+</head>
+<body class="page-auth">
+  <a class="skip" href="#main">Skip to the form</a>
+  <!-- @include bar -->
+
+  <main class="auth auth--login" id="main">
+    <div class="auth__art" aria-hidden="true">
+      <img src="/media/downtown.webp" alt="" width="1600" height="900" decoding="async" fetchpriority="high" />
+      <p class="auth__line">Welcome<br />back.</p>
+    </div>
+
+    <section class="auth__panel" aria-labelledby="li-title">
+      <div class="auth__inner">
+        <h1 class="auth__title" id="li-title">Log in</h1>
+        <p class="auth__switch">New here? <a href="/signup/">Create an account</a></p>
+
+        <form class="form js-login" novalidate>
+          <div class="field" data-field="identifier">
+            <label class="field__label" for="li-identifier">Username or email</label>
+            <input class="field__input" id="li-identifier" name="identifier" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="254" required aria-describedby="li-identifier-error" />
+            <p class="field__error" id="li-identifier-error" hidden></p>
+          </div>
+
+          <div class="field" data-field="password">
+            <label class="field__label" for="li-password">Password</label>
+            <div class="field__box">
+              <input class="field__input" id="li-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required aria-describedby="li-password-error" />
+              <button class="field__reveal" type="button" aria-controls="li-password" aria-pressed="false">Show</button>
+            </div>
+            <p class="field__error" id="li-password-error" hidden></p>
+          </div>
+
+          <label class="check">
+            <input id="li-persist" name="persist" type="checkbox" />
+            <span class="check__box" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2.5 8.5l3.5 3.5 7.5-8"/></svg></span>
+            <span>Stay signed in on this computer</span>
+          </label>
+
+          <div class="form__alert" role="alert" tabindex="-1" hidden>
+            <svg class="form__alert-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5L18.5 17.5H1.5Z"/><path d="M10 8v4.5M10 14.5v1.5"/></svg>
+            <p class="form__alert-text"></p>
+          </div>
+
+          <button class="plate plate--lg form__submit" type="submit"><span class="js-label">Log in</span></button>
+        </form>
+
+        <details class="forgot">
+          <summary>Forgot your password?</summary>
+          <p>Password reset is not available yet. It works by email, and Solar RP doesn’t send email yet.</p>
+        </details>
+        <noscript><p class="auth__noscript">Logging in needs JavaScript.</p></noscript>
+      </div>
+    </section>
+  </main>
+
+  <!-- @include foot -->
+  <div class="grain" aria-hidden="true"></div>
+  <script type="module" src="/src/account/login.ts"></script>
+</body>
+</html>

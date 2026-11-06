@@ -1,4 +1,5 @@
 import 'lenis/dist/lenis.css';
+import './base.css';
 import './styles.css';
 import { gsap } from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
@@ -6,6 +7,8 @@ import { SplitText } from 'gsap/SplitText';
 import Lenis from 'lenis';
 import { formatSize, loadRelease, type Release } from './release';
 import type { Look, Mark3D, Pose } from './mark3d';
+import { browserTokenStore } from './account/store';
+import { wireAccountLink } from './account/ui';
 
 // One scroll clock: Lenis smooths the wheel and drives GSAP's ticker; every beat is a ScrollTrigger
 // timeline scrubbed by it (SHOTS.md). Without motion (reduced-motion users) nothing pins or scrubs:
@@ -24,16 +27,17 @@ function showRelease(r: Release | null) {
   const status = $<HTMLElement>('.js-release-status');
   const label = (a: HTMLElement) => $<HTMLElement>('.js-download-label', a) ?? a;
   if (!r) {
-    // Not published yet: every control leads to the closing section, which says so, and is named for that.
+    // The release feed did not answer or did not check out (releases ARE published: this is a fetch or
+    // feed problem, never "no build yet"). Every control leads to the closing section, which says so.
     for (const a of plates) {
       a.href = '#download';
       a.removeAttribute('download');
-      label(a).textContent = a.classList.contains('plate--sm') ? 'Soon' : 'Download opens soon';
-      a.classList.add('is-soon'); // outlined, not gold: nothing to download yet
+      label(a).textContent = a.classList.contains('plate--sm') ? 'Download' : 'Download Solar Launcher';
+      a.classList.add('is-soon'); // outlined, not gold: there is no file to hand out right now
     }
     $<HTMLAnchorElement>('.js-download-main')?.setAttribute('aria-disabled', 'true');
-    for (const m of $$<HTMLElement>('.js-release-meta')) m.textContent = 'Windows 10 and 11 · first build soon';
-    if (status) status.textContent = 'The first public build of Solar Launcher is on its way. Check back shortly.';
+    for (const m of $$<HTMLElement>('.js-release-meta')) m.textContent = 'Windows 10 and 11 · free download';
+    if (status) status.textContent = 'The download link could not be loaded. Reload the page to try again.';
     return;
   }
   for (const a of plates) {
@@ -56,6 +60,9 @@ function showRelease(r: Release | null) {
 loadRelease(SITE_HOST)
   .then(showRelease)
   .catch(() => showRelease(null));
+
+// "Log in" for visitors, "Account" when this browser holds a session (src/account/store.ts)
+wireAccountLink(browserTokenStore());
 
 /* ---------------------------------------------------------------- videos play only on screen */
 
@@ -122,10 +129,11 @@ let mark: Mark3D | null = null;
 const heroStage = $<HTMLElement>('[data-stage="hero"]');
 const closeStage = $<HTMLElement>('[data-stage="close"]');
 
-// each stage lights the S from its own shot: the hero's warm city haze, the close's Vinewood dusk
+// each stage lights the S from its own shot (its poster): the hero's golden skyline at dusk, the close's
+// observatory at night. Each reel is ONE shot, so the S never stands in a plate it was not lit from.
 const LOOKS: Record<string, Look> = {
   hero: {
-    env: '/media/city.webp',
+    env: '/media/hero.webp',
     fog: 0xb39a7e,
     // from the side and above: the front faces take less of it than the tops and chamfers, so the
     // cream enamel holds a tone instead of clipping to white
@@ -133,28 +141,34 @@ const LOOKS: Record<string, Look> = {
     rim: { color: 0xffb45a, intensity: 2, position: [-3, 2, -4] },
   },
   close: {
-    env: '/media/vinewood.webp',
-    fog: 0x2c2230,
+    env: '/media/close.webp',
+    // the observatory at night over the lit city: warm lamp light, never a violet rim (NOON)
+    fog: 0x2a2219,
     key: { color: 0xffc890, intensity: 1.2, position: [4, 1, 3] },
-    rim: { color: 0x9a6cff, intensity: 1.6, position: [-3, 3, -4] },
+    rim: { color: 0xffa64d, intensity: 1.5, position: [-3, 3, -4] },
   },
 };
 
 // The hero timeline runs HERO_LEN screen heights: the mark's flight and the letterbox take the first
 // one, the gold slab hands over to the cards in the rest.
-const HERO_LEN = 1.9;
+const HERO_LEN = 1.55;
 const MARK_GONE = 0.58; // timeline time after which the S is fully faded and stops rendering
+const HERO_CUT_AT = 0.72; // the gold slab starts here and takes 0.7: was 1.1, which left half a screen of bare footage
 const BAR_H = 64; // --bar-h
 
-/** The hero pose at hero timeline time u. The S holds while the copy leaves (to 0.2), then passes
- *  the camera fast (gone by 0.54) so no frame holds a big flat face; the studio highlight sweeps
- *  across it from the first pixel of scroll. */
+/** The hero pose at hero timeline time u. As the copy lifts away the S rises into the haze sun
+ *  (SHOTS.md beat 1: lifts toward the sun, about half its size, fades), one long eased move that
+ *  starts with the first pixel of scroll; it no longer flies at the camera, which filled the frame
+ *  with a half-transparent face (GI, 2026-11-06: fewer, more fluid moves). */
 function heroPose(u: number): Pose {
-  const t = ease(clamp01((u - 0.2) / 0.34));
-  const opacity = 1 - clamp01((u - 0.38) / 0.16);
-  const sweep = lerp(-12, 48, clamp01(u / 0.54));
+  const t = ease(clamp01((u - 0.04) / 0.5));
+  const opacity = 1 - clamp01((u - 0.3) / 0.26);
+  const sweep = lerp(-12, 40, clamp01(u / 0.56));
   if (isPhone()) {
-    return { x: 0, y: lerp(0.36, 0.3, t), height: lerp(0.3, 1.2, t), yaw: lerp(-6, 4, t), pitch: lerp(3, -4, t), opacity, sweep };
+    // ends clear of the nav bar (0.66 parked the S's top 12 px under it)
+    // starts at 0.28: in front of the towers, overlapping their crowns by a clear margin (0.36, 0.38 and 0.45
+    // each left its foot just touching a roof as the drone moves, which read as an accident)
+    return { x: lerp(0, 0.14, t), y: lerp(0.28, 0.5, t), height: lerp(0.3, 0.16, t), yaw: lerp(-11, 10, t), pitch: lerp(3, -2, t), opacity, sweep };
   }
   // the letterbox exists only where the stylesheet draws it (landscape, wider than a phone); its top
   // bar is only as tall as the nav bar, so the frame sits low of centre
@@ -165,12 +179,14 @@ function heroPose(u: number): Pose {
   const frame = (H - top - lb) / H; // the letterboxed frame's share
   const centre = (lb - top) / H; // the frame's centre, in the stage's -1..1 (y up)
   const portrait = H > window.innerWidth;
+  // the haze sun sits at 62% / 18% of the frame (.haze): in stage units about x 0.24, y 0.64
   return {
     x: lerp(portrait ? 0.4 : 0.48, 0.3, t),
-    y: lerp(portrait ? 0.2 : 0.06 * frame - centre, 0.1, t),
-    height: lerp(portrait ? 0.36 : 0.6 * frame, 1.5, t),
-    yaw: lerp(-6, 4, t),
-    pitch: lerp(3, -4, t),
+    y: lerp(portrait ? 0.2 : 0.06 * frame - centre, 0.56, t),
+    height: lerp(portrait ? 0.36 : 0.6 * frame, portrait ? 0.2 : 0.33 * frame, t),
+    // at rest turned to -11 (MAX_TURN is 12): a side wall and the chamfer catch light, still an S
+    yaw: lerp(-11, 10, t),
+    pitch: lerp(3, -2, t),
     opacity,
     sweep,
   };
@@ -189,6 +205,7 @@ async function startMark() {
   const { createMark3D, webglAvailable } = await import('./mark3d');
   if (!webglAvailable() || !heroStage) {
     root.classList.add('no-webgl');
+    openEntrance();
     return;
   }
   try {
@@ -196,6 +213,7 @@ async function startMark() {
   } catch (err) {
     console.warn('3D mark unavailable, showing the flat mark', err);
     root.classList.add('no-webgl');
+    openEntrance();
     return;
   }
   mark.attach(heroStage, 'hero');
@@ -206,12 +224,29 @@ async function startMark() {
     setTimeout(() => mark?.setActive(false), 1500);
     return;
   }
-  // entrance: rises and turns in to its hero yaw
-  const rest = heroPose(0);
-  mark.setPose({ ...rest, y: rest.y - 0.12, yaw: -16, opacity: 0 }, true);
+  // entrance: the S rises into its hero pose on the same curve as the title (ENTER), from wherever the
+  // scroll already is, so arriving and scrolling are one continuous move
+  mark.setPose(withEntry(heroPose(0)), true);
   mark.setActive(true);
-  requestAnimationFrame(() => mark?.setPose(rest));
   wireMarkScroll();
+  openEntrance();
+  gsap.to(markEntry, { v: 1, duration: ENTER.duration, ease: ENTER.ease, delay: ENTER.delay, onUpdate: () => placeMark?.() });
+}
+
+/** The one load move on the page: the hero copy and the S both arrive on it. */
+const ENTER = { duration: 1.8, ease: 'expo.out', delay: 0.05 } as const;
+/** Opens when the S is ready (or cannot be), at the latest after ENTRANCE_WAIT_MS, so the copy and the
+ *  S start their arrival together instead of as two events seconds apart. */
+const ENTRANCE_WAIT_MS = 900;
+let openEntrance: () => void = () => {};
+const entranceOpen = new Promise<void>((resolve) => { openEntrance = resolve; });
+window.setTimeout(() => openEntrance(), ENTRANCE_WAIT_MS);
+const markEntry = { v: 0 };
+let placeMark: (() => void) | null = null;
+/** The hero pose, held back by the entrance: lower, turned a little further, faded. */
+function withEntry(p: Pose): Pose {
+  const k = 1 - markEntry.v;
+  return { ...p, y: p.y - 0.08 * k, yaw: p.yaw - 8 * k, opacity: p.opacity * markEntry.v };
 }
 
 /* ---------------------------------------------------------------- motion */
@@ -241,13 +276,14 @@ function wireMarkScroll() {
       // a stopped renderer leaves its last frame on the canvas: hide every stage the S is not in
       heroStage.style.visibility = want === 'hero' ? '' : 'hidden';
       closeStage.style.visibility = want === 'close' ? '' : 'hidden';
-      if (want === 'hero') { m.attach(heroStage, 'hero'); m.setPose(heroPose(u), true); }
+      if (want === 'hero') { m.attach(heroStage, 'hero'); m.setPose(withEntry(heroPose(u)), true); }
       if (want === 'close') { m.attach(closeStage, 'close'); m.setPose(closeAt(cp), true); }
       m.setActive(want !== 'none');
     }
-    if (where === 'hero') m.setPose(heroPose(u));
+    if (where === 'hero') m.setPose(withEntry(heroPose(u)));
     else if (where === 'close') m.setPose(closeAt(cp));
   };
+  placeMark = place;
   hero = ScrollTrigger.create({
     trigger: '.hero',
     start: 'top top',
@@ -271,7 +307,7 @@ function wireMotion() {
   gsap.ticker.lagSmoothing(0);
 
   /* 1. cold open: letterbox opens, footage pushes in, copy leaves, the S flies past the camera
-        (wireMarkScroll); then a gold slab cuts to the harbour, which IS the first card's shot */
+        (wireMarkScroll); then a gold slab cuts to the beach, which IS the first card's shot */
   const front = $<HTMLElement>('.hero__front')!;
   const heroSlab = $<HTMLElement>('.slab--hero')!;
   const heroNext = $<HTMLElement>('.hero__next')!;
@@ -283,11 +319,9 @@ function wireMotion() {
     front.style.clipPath = heroCut.p <= 0 ? 'none' : c.outgoing;
     heroSlab.style.clipPath = heroCut.p > 0 && heroCut.p < 1 ? c.slab : 'polygon(0 0, 0 0, 0 0)';
   };
-  const heroSplit = new SplitText('.hero__title .line', { type: 'words,chars', mask: 'words', aria: 'auto' });
-  const heroTitle = $<HTMLElement>('.hero__title')!;
-  // the copy leaves the way it came, through its word masks (y in px: the entrance owns yPercent),
-  // and is gone before the S starts towards the camera, so nothing ghosts across it
-  const lineUp = () => -1.1 * parseFloat(getComputedStyle(heroTitle).fontSize);
+  // GI, 2026-11-06: fewer animations, more fluid. The hero has exactly two moves: one arrival on load
+  // (copy and S on the same expo-out curve, ENTER) and one continuous scroll move (footage drifts in,
+  // the copy lifts away as one block, the bars open), all scrubbed on Lenis' smoothed scroll.
   const hero = gsap.timeline({
     defaults: { ease: 'none' },
     scrollTrigger: {
@@ -305,25 +339,31 @@ function wireMotion() {
     },
   });
   hero
-    .to('.hero__video', { scale: 1.12, duration: 1.2 }, 0)
-    .to(heroSplit.chars, { y: lineUp, duration: 0.16, stagger: 0.003, ease: 'power2.in' }, 0.02)
-    .to('.hero__credits', { yPercent: 40, autoAlpha: 0, duration: 0.14, ease: 'power2.in' }, 0.02)
-    // the bars open with the credits' exit, before the S moves: an empty bottom bar cropped the gold hook
-    .to('.letterbox--top, .letterbox--bottom', { scaleY: 0, duration: 0.2 }, 0)
-    .fromTo('.haze', { opacity: 0.7 }, { opacity: 1, duration: 0.6 }, 0.3)
-    .to('.hero__shade', { opacity: 0.35, duration: 0.6 }, 0.4)
-    .to(heroCut, { p: 1, duration: 0.7, ease: 'power2.inOut', onUpdate: drawHeroCut }, 1.1)
-    .fromTo(heroNext, { scale: 1.14 }, { scale: 1.06, duration: 0.8, ease: 'power2.out' }, 1.1)
-    .to({}, { duration: HERO_LEN - 1.8 }, 1.8);
+    // the footage drifts in and up over the whole hero: one slow push, never a stop
+    .fromTo('.hero__video', { scale: 1, yPercent: 0 }, { scale: 1.1, yPercent: -2.5, duration: HERO_CUT_AT + 0.7, ease: 'none' }, 0)
+    // the copy lifts away as one block (the parent: the load move owns its children), gone before the
+    // S heads for the camera so nothing ghosts across it
+    .to('.hero__copy', { y: () => -0.14 * window.innerHeight, autoAlpha: 0, duration: 0.3, ease: 'power1.in' }, 0.02)
+    // the credits live on the bottom bar: they leave before the shrinking bar can uncover them
+    .to('.hero__credits', { autoAlpha: 0, duration: 0.12, ease: 'power1.out' }, 0)
+    // the bars open with it, before the S moves: an empty bottom bar cropped the gold hook
+    .to('.letterbox--top, .letterbox--bottom', { scaleY: 0, duration: 0.34, ease: 'power1.inOut' }, 0)
+    .to('.hero__shade', { opacity: 0.35, duration: 0.7, ease: 'none' }, 0.3)
+    // the slab cut starts as the S finishes fading (MARK_GONE), so no screen of bare footage waits between
+    .to(heroCut, { p: 1, duration: 0.7, ease: 'power2.inOut', onUpdate: drawHeroCut }, HERO_CUT_AT)
+    .fromTo(heroNext, { scale: 1.14 }, { scale: 1.06, duration: 0.8, ease: 'power2.out' }, HERO_CUT_AT)
+    .to({}, { duration: HERO_LEN - HERO_CUT_AT - 0.7 }, HERO_CUT_AT + 0.7);
 
-  // entrance (not scrubbed): the title lines rise out of a mask, then the rest
-  gsap.timeline({ delay: 0.25 })
-    .from(heroSplit.chars, { yPercent: 110, duration: 1.1, ease: 'expo.out', stagger: 0.028 })
-    .from('.hero__lede, .hero .cta', { y: 24, autoAlpha: 0, duration: 0.9, ease: 'expo.out', stagger: 0.08 }, 0.45)
-    .from('.letterbox--top', { yPercent: -100, duration: 1.2, ease: 'expo.out' }, 0)
-    .from('.letterbox--bottom', { yPercent: 100, duration: 1.2, ease: 'expo.out' }, 0);
+  // the load move: the title rises and sharpens on the S's curve and clock (ENTER, entranceOpen); the
+  // letterbox and the credits band (lede, download plate) are simply there from the first frame, so the
+  // action is never a blur
+  const heroTitle = '.hero__title';
+  gsap.set(heroTitle, { y: 36, autoAlpha: 0, filter: 'blur(10px)' });
+  void entranceOpen.then(() =>
+    gsap.to(heroTitle, { y: 0, autoAlpha: 1, filter: 'blur(0px)', duration: ENTER.duration, ease: ENTER.ease, delay: ENTER.delay, clearProps: 'filter' }),
+  );
 
-  /* 2. title cards: the harbour is already on screen; each next shot is cut in by the gold slab */
+  /* 2. title cards: the beach is already on screen; each next shot is cut in by the gold slab */
   const cards = $$<HTMLElement>('.card');
   const titleSplits = cards.map((c) => new SplitText($('.card__title', c)!, { type: 'words,chars', mask: 'words', aria: 'auto' }));
   // one card video at a time: the top revealed card plays while the cards stage is pinned
@@ -514,11 +554,7 @@ function wireMotion() {
 }
 
 if (!reduced) wireMotion();
-// the 3D chunk is half a megabyte: let the hero shot get its first frame (or the page go idle) first
-let markStarted = false;
-const kickMark = () => { if (!markStarted) { markStarted = true; void startMark(); } };
-if (!heroVideo || reduced || saveData || heroVideo.readyState >= 2) kickMark();
-else {
-  heroVideo.addEventListener('loadeddata', kickMark, { once: true });
-  window.setTimeout(kickMark, 2500);
-}
+// The S starts at once (it used to wait up to 2.5 s for the hero video's first frame): the copy now waits
+// for it, at most ENTRANCE_WAIT_MS, so both arrive as one move. The 3D chunk (about 130 kB gzipped)
+// loads beside the video, which has its poster on screen meanwhile.
+void startMark();

@@ -19,9 +19,11 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-  <link rel="preload" href="/media/city.webp" as="image" />
-  <script type="module" crossorigin src="/assets/index-Bo3ow0xc.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-DGwfvUb_.css">
+  <link rel="preload" href="/media/hero.webp" as="image" />
+  <script type="module" crossorigin src="/assets/main-H9HSivKF.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/store-C-6o9CLr.js">
+  <link rel="stylesheet" crossorigin href="/assets/store-mlPAqNcE.css">
+  <link rel="stylesheet" crossorigin href="/assets/main-dr6IWE_g.css">
 </head>
 <body>
   <a class="skip" href="#download">Skip to download</a>
@@ -34,6 +36,7 @@
       <a href="#servers">Servers</a>
       <a href="#get-in">Get in</a>
     </nav>
+    <a class="bar__account js-account-link" href="/login/">Log in</a>
     <a class="plate plate--sm js-download" href="#download"><span class="js-download-label">Download</span></a>
   </header>
 
@@ -42,10 +45,11 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero__stage">
         <!-- the next shot waits under the hero; the closing slab reveals it, then the cards take over -->
-        <img class="hero__next" src="/media/harbor.webp" alt="" aria-hidden="true" decoding="async" />
+        <img class="hero__next" src="/media/beach.webp" alt="" aria-hidden="true" decoding="async" />
         <div class="hero__front">
           <div class="hero__frame">
-            <video class="hero__video js-loop" src="/media/city.mp4" poster="/media/city.webp" muted loop playsinline preload="none" aria-hidden="true"></video>
+            <!-- the skyline at dusk, forward then back: one shot, no seam -->
+            <video class="hero__video js-loop" poster="/media/hero.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/hero.webm" type="video/webm; codecs=vp9" /><source src="/media/hero.mp4" type="video/mp4" /></video>
             <div class="hero__shade" aria-hidden="true"></div>
           </div>
           <div class="stage3d" data-stage="hero" aria-hidden="true"></div>
@@ -72,7 +76,7 @@
     <section class="cards" aria-label="What Solar RP is">
       <div class="cards__stage">
         <article class="card card--low" data-card="0">
-          <video class="card__video js-loop" src="/media/harbor.mp4" poster="/media/harbor.webp" muted loop playsinline preload="none" aria-hidden="true"></video>
+          <video class="card__video js-loop" poster="/media/beach.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/beach.webm" type="video/webm; codecs=vp9" /><source src="/media/beach.mp4" type="video/mp4" /></video>
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">Our own servers.</h2>
@@ -80,7 +84,7 @@
           </div>
         </article>
         <article class="card card--high" data-card="1">
-          <video class="card__video js-loop" src="/media/night.mp4" poster="/media/night.webp" muted loop playsinline preload="none" aria-hidden="true"></video>
+          <video class="card__video js-loop" poster="/media/streets.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/streets.webm" type="video/webm; codecs=vp9" /><source src="/media/streets.mp4" type="video/mp4" /></video>
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">Our own client.</h2>
@@ -89,7 +93,7 @@
           <div class="slab" aria-hidden="true"></div>
         </article>
         <article class="card card--mid" data-card="2">
-          <video class="card__video js-loop" src="/media/wild.mp4" poster="/media/wild.webp" muted loop playsinline preload="none" aria-hidden="true"></video>
+          <video class="card__video js-loop" poster="/media/canal.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/canal.webm" type="video/webm; codecs=vp9" /><source src="/media/canal.mp4" type="video/mp4" /></video>
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">One button in.</h2>
@@ -125,7 +129,7 @@
         <p class="section-lede">Three servers, named for the sun, the moon and the earth. SOL is open; LUNA and TERRA are next.</p>
         <div class="servers__grid">
           <article class="server server--open">
-            <img class="server__img" src="/media/downtown.webp" alt="" loading="lazy" decoding="async" />
+            <img class="server__img" src="/media/sol.webp" alt="" loading="lazy" decoding="async" />
             <div class="server__body">
               <span class="state state--open">Open</span>
               <h3 class="server__name">SOL</h3>
@@ -196,7 +200,8 @@
 
     <!-- 6. Close: the decision, with what it needs -->
     <section class="close" id="download" aria-labelledby="close-title">
-      <video class="close__video js-loop" src="/media/vinewood.mp4" poster="/media/vinewood.webp" muted loop playsinline preload="none" aria-hidden="true"></video>
+      <!-- the Galileo Observatory at night over the lit city, forward then back -->
+      <video class="close__video js-loop" poster="/media/close.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/close.webm" type="video/webm; codecs=vp9" /><source src="/media/close.mp4" type="video/mp4" /></video>
       <div class="close__shade" aria-hidden="true"></div>
       <div class="stage3d stage3d--close" data-stage="close" aria-hidden="true"></div>
       <div class="close__copy">
@@ -207,7 +212,7 @@
         </div>
         <dl class="needs">
           <div><dt>System</dt><dd>Windows 10 or 11, 64-bit</dd></div>
-          <div><dt>Game</dt><dd>GTA V for PC (Legacy edition) on Steam, Epic Games or the Rockstar Games Launcher</dd></div>
+          <div><dt>Game</dt><dd>GTA V for PC, Legacy or Enhanced, on Steam, Epic Games or the Rockstar Games Launcher</dd></div>
         </dl>
         <p class="hash js-release-hash" hidden>SHA-256 <code class="js-sha"></code></p>
         <p class="cta__status js-release-status" role="status"></p>
@@ -218,6 +223,11 @@
   <footer class="foot">
     <div class="wrap foot__row">
       <svg class="foot__mark" viewBox="0 0 50 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f7f2e8"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/></svg>
+      <nav class="foot__nav" aria-label="Account">
+        <a class="js-foot-guest" href="/signup/">Create account</a>
+        <a class="js-foot-guest" href="/login/">Log in</a>
+        <a class="js-foot-member" href="/account/" hidden>Your account</a>
+      </nav>
       <p class="foot__discord">Discord: soon</p>
       <p class="foot__legal">Solar RP is not affiliated with Rockstar Games or Take-Two Interactive. Footage and artwork: Grand Theft Auto V, &copy; Rockstar Games.</p>
     </div>

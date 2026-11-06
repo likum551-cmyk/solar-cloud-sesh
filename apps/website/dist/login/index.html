@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0907" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <title>Log in: Solar RP</title>
+  <meta name="description" content="Log in to your Solar RP account." />
+  <link rel="canonical" href="https://solar-rp.com/login/" />
+  <link rel="preload" href="/media/downtown.webp" as="image" />
+  <script type="module" crossorigin src="/assets/login-CUzo3CAU.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/store-C-6o9CLr.js">
+  <link rel="modulepreload" crossorigin href="/assets/format-CBeke1xK.js">
+  <link rel="stylesheet" crossorigin href="/assets/store-mlPAqNcE.css">
+  <link rel="stylesheet" crossorigin href="/assets/format-DujlPx1x.css">
+</head>
+<body class="page-auth">
+  <a class="skip" href="#main">Skip to the form</a>
+  <header class="bar is-solid" id="top">
+    <a class="bar__brand" href="/" aria-label="Solar RP home"><svg class="lockup" viewBox="0 0 430 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f7f2e8"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/><g fill="#f7f2e8" fill-rule="evenodd"><path transform="translate(60 0)" d="M0 0L41 0L50 9L50 100L9 100L0 91ZM18 18L32 18L32 82L18 82Z"/><path transform="translate(120 0)" d="M0 0L10 0L18 8L18 82L42 82L42 100L9 100L0 91Z"/><path transform="translate(168 0)" d="M0 100L0 20L20 0L38 0L58 20L58 100L40 100L40 59L18 59L18 100ZM18 22L40 22L40 41L18 41Z"/><path transform="translate(236 0)" d="M0 0L41 0L50 9L50 100L33 100L23 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/><path transform="translate(320 0)" d="M0 0L41 0L50 9L50 100L33 100L23 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/><path transform="translate(380 0)" d="M0 0L41 0L50 9L50 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/></g></svg></a>
+    <nav class="bar__nav" aria-label="Site">
+      <a href="/#servers">Servers</a>
+      <a href="/#get-in">Get in</a>
+    </nav>
+    <a class="bar__account js-account-link" href="/login/">Log in</a>
+    <a class="plate plate--sm" href="/#download">Download</a>
+  </header>
+
+  <main class="auth auth--login" id="main">
+    <div class="auth__art" aria-hidden="true">
+      <img src="/media/downtown.webp" alt="" width="1600" height="900" decoding="async" fetchpriority="high" />
+      <p class="auth__line">Welcome<br />back.</p>
+    </div>
+
+    <section class="auth__panel" aria-labelledby="li-title">
+      <div class="auth__inner">
+        <h1 class="auth__title" id="li-title">Log in</h1>
+        <p class="auth__switch">New here? <a href="/signup/">Create an account</a></p>
+
+        <form class="form js-login" novalidate>
+          <div class="field" data-field="identifier">
+            <label class="field__label" for="li-identifier">Username or email</label>
+            <input class="field__input" id="li-identifier" name="identifier" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="254" required aria-describedby="li-identifier-error" />
+            <p class="field__error" id="li-identifier-error" hidden></p>
+          </div>
+
+          <div class="field" data-field="password">
+            <label class="field__label" for="li-password">Password</label>
+            <div class="field__box">
+              <input class="field__input" id="li-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required aria-describedby="li-password-error" />
+              <button class="field__reveal" type="button" aria-controls="li-password" aria-pressed="false">Show</button>
+            </div>
+            <p class="field__error" id="li-password-error" hidden></p>
+          </div>
+
+          <label class="check">
+            <input id="li-persist" name="persist" type="checkbox" />
+            <span class="check__box" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2.5 8.5l3.5 3.5 7.5-8"/></svg></span>
+            <span>Stay signed in on this computer</span>
+          </label>
+
+          <div class="form__alert" role="alert" tabindex="-1" hidden>
+            <svg class="form__alert-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5L18.5 17.5H1.5Z"/><path d="M10 8v4.5M10 14.5v1.5"/></svg>
+            <p class="form__alert-text"></p>
+          </div>
+
+          <button class="plate plate--lg form__submit" type="submit"><span class="js-label">Log in</span></button>
+        </form>
+
+        <details class="forgot">
+          <summary>Forgot your password?</summary>
+          <p>Password reset is not available yet. It works by email, and Solar RP doesn’t send email yet.</p>
+        </details>
+        <noscript><p class="auth__noscript">Logging in needs JavaScript.</p></noscript>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="wrap foot__row">
+      <svg class="foot__mark" viewBox="0 0 50 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f7f2e8"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/></svg>
+      <nav class="foot__nav" aria-label="Account">
+        <a class="js-foot-guest" href="/signup/">Create account</a>
+        <a class="js-foot-guest" href="/login/">Log in</a>
+        <a class="js-foot-member" href="/account/" hidden>Your account</a>
+      </nav>
+      <p class="foot__discord">Discord: soon</p>
+      <p class="foot__legal">Solar RP is not affiliated with Rockstar Games or Take-Two Interactive. Footage and artwork: Grand Theft Auto V, &copy; Rockstar Games.</p>
+    </div>
+  </footer>
+  <div class="grain" aria-hidden="true"></div>
+</body>
+</html>

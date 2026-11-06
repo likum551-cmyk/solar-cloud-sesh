@@ -216,7 +216,9 @@ export function createMark3D(reducedMotion: boolean, looks: Record<string, Look>
   // brand albedo (ink #f3ecdf enamel, gold #f2b134 brushed metal): the 3D S is the logo, not a darker copy
   const ink = new MeshPhysicalMaterial({ color: 0xf3ecdf, roughness: 0.3, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.06, envMapIntensity: 1 });
   const brushed = brushedRoughness();
-  const gold = new MeshPhysicalMaterial({ color: 0xf2b134, roughness: 1, roughnessMap: brushed, metalness: 0.85, envMapIntensity: 1.2 });
+  // metalness 0.65 (was 0.85): fully metal, the face only mirrored the dusk plates and read bronze next to the
+  // flat brand gold of the slabs and numerals; part diffuse keeps it #f2b134 under the key light
+  const gold = new MeshPhysicalMaterial({ color: 0xf2b134, roughness: 1, roughnessMap: brushed, metalness: 0.65, envMapIntensity: 1.2 });
   const mark = new Group();
   mark.add(new Mesh(upperGeo, ink));
   mark.add(new Mesh(lowerGeo, gold));
@@ -319,11 +321,10 @@ export function createMark3D(reducedMotion: boolean, looks: Record<string, Look>
     const pitch = MathUtils.clamp(cur.pitch + pointerCur.y * 2, -MAX_TURN, MAX_TURN);
     mark.rotation.set(MathUtils.degToRad(pitch), MathUtils.degToRad(yaw), 0);
     scene.environmentRotation.y = MathUtils.degToRad(cur.sweep);
+    // fade the canvas, never the materials: a transparent mesh has no depth pre-pass, so its inner
+    // chamfer faces showed through as grey slabs mid-fade; the canvas holds only the S, so this is free
     const o = MathUtils.clamp(cur.opacity, 0, 1);
-    for (const m of [ink, gold]) {
-      m.transparent = o < 0.999;
-      m.opacity = o;
-    }
+    renderer.domElement.style.opacity = o < 0.999 ? o.toFixed(3) : '';
     mark.visible = o > 0.004;
   }
 

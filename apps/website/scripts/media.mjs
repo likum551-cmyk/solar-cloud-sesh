@@ -14,8 +14,11 @@ const OUT = path.join(SITE, 'public', 'media');
 const LAUNCHER = path.join(REPO, 'apps', 'launcher-ui', 'public', 'assets');
 const KEYART = path.join(REPO, 'docs', 'archive', 'web-legacy', 'src', 'assets', 'gta');
 
+// The page's footage is the site's own encode (scripts/encode-media.mjs: graded boomerang loops, committed
+// in public/media because their source recordings are not in the repo); this script only checks it is
+// there. The account band's still comes from the launcher.
 const FILES = [
-  ...['city', 'harbor', 'wild', 'night', 'vinewood'].flatMap((c) => [[LAUNCHER, `video/${c}.mp4`, `${c}.mp4`], [LAUNCHER, `video/${c}.webp`, `${c}.webp`]]),
+  [LAUNCHER, 'video/vinewood.webp', 'vinewood.webp'],
   [LAUNCHER, 'stills/vehicle.webp', 'vehicle.webp'],
   [LAUNCHER, 'stills/downtown.webp', 'downtown.webp'],
   [LAUNCHER, 'stills/settings.webp', 'dusk.webp'],
@@ -42,4 +45,11 @@ if (missing.length) {
   process.exit(1);
 }
 if (copied + same !== FILES.length) { console.error('media: count mismatch'); process.exit(1); }
+// the site's own encodes must be there too (a fresh checkout has them; encode-media.mjs remakes them)
+const OWN = ['hero', 'beach', 'streets', 'canal', 'close'].flatMap((r) => [`${r}.webm`, `${r}.mp4`, `${r}.webp`]).concat(['sol.webp']);
+const ownMissing = OWN.filter((f) => !fs.existsSync(path.join(OUT, f)));
+if (ownMissing.length) {
+  console.error(`media: ${ownMissing.length} encoded file(s) missing from public/media (run node scripts/encode-media.mjs):\n  ${ownMissing.join('\n  ')}`);
+  process.exit(1);
+}
 console.log(`media: ${copied} copied, ${same} unchanged, ${FILES.length} total -> ${path.relative(SITE, OUT)}`);
