@@ -127,6 +127,8 @@ html, body { background: var(--ground); }
 .tally dt { font: 700 14px/1 var(--f-display); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); }
 .tally dd { margin-top: 8px; font: 800 clamp(40px, 4vw, 60px)/0.9 var(--f-display); color: var(--sun); }
 .tally p { margin-top: 6px; font-size: 14px; line-height: 1.4; color: var(--ink-3); }
+/* GI 2026-11-07: "into editions add cracked Coming soon" */
+.tally .tally__soon { margin-top: 8px; font: 700 13px/1 var(--f-display); letter-spacing: 0.14em; text-transform: uppercase; color: var(--sun); }
 
 /* the photo stack: three in-game shots, tilted, floating, following the pointer (main.ts sets --px / --py) */
 .stack { --px: 0; --py: 0; position: relative; height: clamp(320px, 42vw, 580px); }
