@@ -1,5 +1,5 @@
-/* solar-rp.com, shared by every page: fonts, NOON tokens, the reset, plates, the top bar, the footer
-   and the grain. Landing-only rules live in styles.css; the account pages in account.css. */
+/* solar-rp.com, shared by every page: fonts, NOON tokens, the reset, plates, the top bar and the
+   footer. Landing-only rules live in styles.css; the account pages in account.css. */
 
 @font-face {
   font-family: 'Sofia Sans';
@@ -191,11 +191,5 @@ button.plate--ghost:disabled { background: transparent; color: var(--ink-4); }
 .foot__nav a:hover { color: var(--sun); }
 .foot__legal { margin-left: auto; max-width: 60ch; font-size: 14px; color: var(--ink-3); }
 @media (max-width: 760px) { .foot__legal { margin-left: 0; } }
-
-/* ---------- grain over everything, the mark included ---------- */
-.grain {
-  position: fixed; inset: -50%; z-index: 60; pointer-events: none;
-  opacity: 0.075; mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 1.4 -0.2'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-/* static: the stepped jitter it used to have was a busy loop over the whole page (GI, 2026-11-06) */
+/* No grain layer: a fixed full-window overlay blend made the browser re-composite the whole page over the
+   playing footage on every frame (GI, 2026-11-06: "a bit laggy"). */

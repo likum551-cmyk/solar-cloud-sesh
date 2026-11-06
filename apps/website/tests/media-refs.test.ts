@@ -44,9 +44,11 @@ describe('media references', () => {
     expect(missing).toEqual([]);
   });
 
-  it('gives every video a VP9 WebM source before its H.264 MP4 and a poster', () => {
+  // GI, 2026-11-06: "too many videos and it's a bit laggy": the hero is the one moving shot
+  it('plays one video, the hero, with a VP9 WebM source before its H.264 MP4 and a poster', () => {
     const videos = [...indexHtml.matchAll(/<video\b[^>]*>([\s\S]*?)<\/video>/g)];
-    expect(videos.length).toBe(5);
+    expect(videos.length).toBe(1);
+    expect(videos[0]![0]).toMatch(/class="hero__video\b/);
     for (const v of videos) {
       const tag = v[0];
       expect(tag).toMatch(/poster="\/media\/[a-z]+\.webp"/);

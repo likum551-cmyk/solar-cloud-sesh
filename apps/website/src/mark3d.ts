@@ -366,6 +366,8 @@ export function createMark3D(reducedMotion: boolean, looks: Record<string, Look>
       kick();
     },
     setPose(p, snap = false) {
+      // the page re-places the S on every scroll update; an unchanged pose must not cost a render
+      if (!snap && (Object.keys(p) as Array<keyof Pose>).every((k) => Math.abs((p[k] ?? target[k]) - target[k]) < 1e-5)) return;
       Object.assign(target, p);
       if (snap) Object.assign(cur, p);
       dirty = true;

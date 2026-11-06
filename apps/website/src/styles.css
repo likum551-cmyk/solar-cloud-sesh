@@ -17,7 +17,7 @@
     linear-gradient(0deg, rgb(10 9 7 / 0.8) 0%, rgb(10 9 7 / 0.32) 30%, rgb(10 9 7 / 0) 52%),
     linear-gradient(90deg, rgb(10 9 7 / 0.45) 0%, rgb(10 9 7 / 0) 50%),
     /* the skyline's sky is pale gold: deepen it above the horizon so the S's cream half stands off it */
-    linear-gradient(180deg, rgb(48 30 12 / 0.52) 0%, rgb(48 30 12 / 0.3) 28%, rgb(48 30 12 / 0) 50%),
+    linear-gradient(180deg, rgb(48 30 12 / 0.36) 0%, rgb(48 30 12 / 0.18) 28%, rgb(48 30 12 / 0) 50%),
     /* ground under the nav where no letterbox covers the sky (portrait, tablets) */
     linear-gradient(180deg, rgb(10 9 7 / 0.75), rgb(10 9 7 / 0) 18%);
 }
@@ -26,8 +26,8 @@
 /* the footage's haze laid over the mark too, so both sit in one light */
 .haze {
   position: absolute; inset: 0; z-index: 2; pointer-events: none;
-  background: radial-gradient(60% 50% at 62% 18%, rgb(255 210 140 / 0.14), rgb(255 210 140 / 0) 70%);
-  mix-blend-mode: screen;
+  /* a plain alpha layer, not a blend: a blend over playing video costs a re-composite every frame */
+  background: radial-gradient(60% 50% at 62% 18%, rgb(255 214 150 / 0.1), rgb(255 214 150 / 0) 70%);
 }
 .letterbox { position: absolute; left: 0; right: 0; z-index: 3; height: var(--lb); background: var(--black); }
 /* the top bar is only as tall as the nav: the footage gets the rest */
@@ -92,51 +92,47 @@
    keeps the page's one left edge (--edge) measured from the window, not from the plate. */
 .cards, .cast { display: grid; gap: var(--plate); padding: var(--plate) var(--plate) 0; background: var(--black); }
 .card { position: relative; height: calc(100svh - 2 * var(--plate)); min-height: 520px; overflow: hidden; isolation: isolate; }
-.card__video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.card__img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .card__shade { position: absolute; inset: 0; }
 .card__copy { position: absolute; z-index: 2; left: calc(var(--edge) - var(--plate)); right: calc(var(--edge) - var(--plate)); }
 /* the second step of the type scale: the hero (10.6vw) is the only line above 150 px */
 .card__title {
   font: 800 clamp(52px, 7.2vw, 132px)/0.84 var(--f-display);
   letter-spacing: -0.005em; text-transform: uppercase;
-  text-shadow: 0 4px 40px rgb(0 0 0 / 0.35);
+  text-shadow: 0 2px 28px rgb(0 0 0 / 0.5);
 }
 .card__fact { margin-top: clamp(12px, 1.8vh, 20px); max-width: 44ch; font-size: clamp(17px, 1.3vw, 21px); color: var(--ink-2); text-shadow: 0 1px 14px rgb(0 0 0 / 0.8); }
+/* Each shade is a soft pool behind its copy only, at most 0.6: the rest of the shot keeps its own light (a
+   full-frame scrim took 64-86 % of the stills' brightness and read as mud). */
 /* low: title on the ground line, bottom left */
 .card--low .card__copy { bottom: clamp(36px, 9vh, 96px); }
-.card--low .card__shade { background: linear-gradient(0deg, rgb(10 9 7 / 0.86) 0%, rgb(10 9 7 / 0.35) 40%, rgb(10 9 7 / 0) 64%), linear-gradient(90deg, rgb(10 9 7 / 0.5), rgb(10 9 7 / 0) 55%); }
-/* high: hung from the top right, like a sign over the street */
+.card--low .card__shade { background: radial-gradient(ellipse 58% 46% at 18% 86%, rgb(10 9 7 / 0.6), rgb(10 9 7 / 0) 100%); }
+/* high: hung from the top right, on the dark terrace round the pool */
 .card--high .card__copy { top: calc(var(--bar-h) + clamp(16px, 5vh, 56px)); text-align: right; }
 .card--high .card__fact { margin-left: auto; }
-/* the street block from above is lit concrete edge to edge: the shade holds dark through the fact line */
-.card--high .card__shade { background: linear-gradient(180deg, rgb(10 9 7 / 0.86) 0%, rgb(10 9 7 / 0.66) 30%, rgb(10 9 7 / 0.28) 50%, rgb(10 9 7 / 0) 68%), linear-gradient(270deg, rgb(10 9 7 / 0.5), rgb(10 9 7 / 0) 60%); }
+.card--high .card__shade { background: radial-gradient(ellipse 52% 40% at 80% 20%, rgb(10 9 7 / 0.45), rgb(10 9 7 / 0) 100%); }
 /* mid: centred on the canal water, below the Downtown towers at the end of the river */
 .card--mid .card__copy { top: 64%; transform: translateY(-50%); text-align: center; }
 /* the fact line sits on bright moving water: full ink, and the shade centred on the copy (64-77%) */
 .card--mid .card__fact { margin-inline: auto; color: var(--ink); }
-.card--mid .card__shade { background: radial-gradient(64% 40% at 50% 68%, rgb(10 9 7 / 0.72), rgb(10 9 7 / 0) 100%); }
-/* phones see about a quarter of each 16:9 shot: aim that quarter at the subject */
+.card--mid .card__shade { background: radial-gradient(56% 36% at 50% 68%, rgb(10 9 7 / 0.55), rgb(10 9 7 / 0) 100%); }
+/* Phones: a full-height card drew a 1080 px frame 2.3x too large. Each shot is a square plate instead (about
+   1:1 with the source on a 3x screen) and the copy stands on the ground under it, clear of the picture. */
 @media (max-width: 760px) {
-  .card--high .card__video { object-position: 8% 50%; }
-  /* a narrow right-aligned paragraph reads ragged: on phones the high card's copy sits on the left edge */
-  .card--high .card__copy { text-align: left; }
-  .card--high .card__fact { margin-left: 0; }
-  .card--high .card__shade { background: linear-gradient(180deg, rgb(10 9 7 / 0.88) 0%, rgb(10 9 7 / 0.72) 42%, rgb(10 9 7 / 0.3) 62%, rgb(10 9 7 / 0) 80%); }
-  .card--low .card__video { object-position: 33% 50%; } /* the tall palm (x 30%) and the pier wheel (x 37%) */
-  .card--mid .card__video { object-position: 50% 50%; } /* the towers at the end of the canal */
-  .card--mid .card__copy { top: 70%; }
-  .card--mid .card__shade { background: radial-gradient(90% 40% at 50% 70%, rgb(10 9 7 / 0.66), rgb(10 9 7 / 0) 100%); }
+  .card { height: auto; min-height: 0; background: var(--black); }
+  .card__img { position: relative; display: block; aspect-ratio: 1; height: auto; }
+  .card__shade { display: none; }
+  .card .card__copy { position: static; transform: none; text-align: left; padding: 22px calc(var(--edge) - var(--plate)) 40px; }
+  .card .card__fact { margin-inline: 0; color: var(--ink-2); }
+  .card--low .card__img { object-position: 33% 50%; } /* the tall palm (x 27%) and the pier wheel (x 46%) */
 }
 
 /* ---------- 3. cast: key art plates (a triptych on wide screens) ---------- */
 /* no ground under the last plates: they meet the servers' --ground directly (a --black strip there read
    as a misregistered band) */
 .panel { position: relative; height: 60svh; min-height: 420px; overflow: hidden; }
-.panel img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: 62% 22%; }
-/* each crop is aimed at the face (the face's position in the key art) */
-.panel:nth-child(1) img { object-position: 53.5% 17%; } /* Michael */
-.panel:nth-child(2) img { object-position: 55.7% 20%; } /* Franklin */
-.panel:nth-child(3) img { object-position: 48% 19%; } /* Trevor */
+/* the portrait crops are centred on each character by encode-media.mjs, so one aim fits all three */
+.panel img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }
 /* the line sits bottom-left over light key art (pink sky, Franklin's cream sleeve): ground rises under it */
 .panel::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.92) 0%, rgb(10 9 7 / 0.66) 24%, rgb(10 9 7 / 0) 54%), linear-gradient(90deg, rgb(10 9 7 / 0.4) 0%, rgb(10 9 7 / 0) 56%); }
 .panel__line {
@@ -155,6 +151,12 @@
 /* ---------- section heads (the third step of the type scale) ---------- */
 .section-title { font: 800 clamp(44px, 5.6vw, 96px)/0.86 var(--f-display); letter-spacing: 0; text-transform: uppercase; text-wrap: balance; }
 .section-lede { margin-top: 18px; max-width: 52ch; font-size: clamp(17px, 1.3vw, 19px); color: var(--ink-2); }
+/* wide screens: the lede beside the title, on its baseline, so the head is one band and not a heading
+   with an empty right half */
+@media (min-width: 1101px) {
+  .servers__head { display: grid; grid-template-columns: auto minmax(0, 46ch); justify-content: space-between; align-items: end; gap: 48px; }
+  .servers__head .section-lede { margin-top: 0; }
+}
 
 /* ---------- 4. servers ---------- */
 .servers { padding: clamp(96px, 16vh, 180px) 0 clamp(72px, 12vh, 140px); background: var(--ground); }
@@ -172,13 +174,14 @@
 .server--open { grid-row: span 2; }
 .server__img {
   position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-  filter: grayscale(0.6) brightness(0.5);
+  /* "soon": near-monochrome but still a picture (grey at half brightness read as an image that failed) */
+  filter: grayscale(0.85) brightness(0.7) contrast(1.08);
   transform: scale(1.02);
   transition: filter 500ms var(--ease-out), transform 900ms var(--ease-out);
 }
-.server--open .server__img { filter: saturate(1) brightness(0.78); }
-.server:hover .server__img { filter: saturate(1) brightness(0.86); transform: scale(1.05); }
-.server::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.88), rgb(10 9 7 / 0) 62%); z-index: 0; }
+.server--open .server__img { filter: none; }
+.server:hover .server__img { filter: none; transform: scale(1.05); }
+.server::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.82), rgb(10 9 7 / 0) 48%); z-index: 0; }
 /* the open server's gold frame follows the cut corner: a ring with an evenodd hole, like the plates (an
    inset box-shadow is cut off at the diagonal by the card's clip-path) */
 .server--open::before {
@@ -214,7 +217,7 @@
 }
 
 /* ---------- 5. get in: three steps, each beside its launcher screen ---------- */
-.getin { padding: clamp(80px, 12vh, 140px) 0 clamp(96px, 14vh, 160px); background: linear-gradient(180deg, var(--ground), var(--panel) 40%, var(--ground)); }
+.getin { padding: clamp(48px, 7vh, 88px) 0 clamp(40px, 6vh, 64px); background: linear-gradient(180deg, var(--ground), var(--panel) 40%, var(--ground)); }
 .getin__stage { margin-inline: var(--edge); }
 .steps { list-style: none; padding: 0; margin-top: clamp(40px, 7vh, 80px); display: grid; gap: clamp(56px, 9vh, 104px); }
 .step { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 18px clamp(18px, 3vw, 40px); align-items: end; }
@@ -228,7 +231,7 @@
   box-shadow: 0 30px 60px rgb(0 0 0 / 0.5);
 }
 /* under the window, never on it: the shots carry sample names and counts, and must say so legibly */
-.shot-note { margin-top: 12px; font: 600 14px/1.3 var(--f-display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+.shot-note { margin-top: 10px; font: 400 14px/1.4 var(--f-text); color: var(--ink-3); }
 /* wide screens: the step (number over text) on the left, centred against its launcher screen on the right */
 @media (min-width: 901px) {
   .steps { gap: clamp(40px, 6vh, 72px); }
@@ -242,10 +245,24 @@
 }
 
 /* ---------- 6. close: centred, the decision and what it needs ---------- */
-.close { position: relative; min-height: 100svh; display: grid; align-items: end; overflow: hidden; isolation: isolate; background: var(--black); }
-.close__video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 0; }
-/* the top rises out of the ground the get-in section ends on, so the join has no hard grey edge */
-.close__shade { position: absolute; inset: 0; z-index: 0; background: linear-gradient(180deg, var(--ground) 0%, rgb(10 9 7 / 0.35) 22%, rgb(10 9 7 / 0.6) 54%, rgb(10 9 7 / 0.92) 100%); }
+.close { position: relative; min-height: calc(100svh - var(--foot-h, 0px)); display: grid; align-items: end; overflow: hidden; isolation: isolate; background: var(--ground); }
+/* The picture starts below the section's top and rises out of the ground the get-in section ends on (no
+   hard edge), so the main dome sits low enough for the S to stand in the sky above it, not on the building
+   (closePose in main.ts reads this box and the object-position). Wide screens have little spare width:
+   100% brings the dome (x 57 % of the frame) nearest the centre; phones have a lot, and 58% centres it. */
+.close__img {
+  --top: clamp(56px, 14svh, 180px);
+  position: absolute; left: 0; top: var(--top); width: 100%; height: calc(100% - var(--top)); z-index: 0;
+  object-fit: cover; object-position: 100% 0%;
+  -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 9%); mask-image: linear-gradient(180deg, transparent 0%, #000 9%);
+}
+/* dark only where the copy is: the CTA and the requirements at the foot */
+.close__shade { position: absolute; inset: 0; z-index: 0; background: linear-gradient(180deg, rgb(10 9 7 / 0) 44%, rgb(10 9 7 / 0.5) 66%, rgb(10 9 7 / 0.9) 100%); }
+@media (max-width: 760px) {
+  .close__img { object-position: 58% 0%; }
+  /* the copy is taller than the picture's lower half here: the download plate lands on the lit facade */
+  .close__shade { background: linear-gradient(180deg, rgb(10 9 7 / 0) 34%, rgb(10 9 7 / 0.66) 50%, rgb(10 9 7 / 0.9) 100%); }
+}
 .stage3d--close { z-index: 1; }
 .close__copy { position: relative; z-index: 2; width: min(64rem, 100% - 2 * var(--gutter)); margin: 0 auto; padding: 38svh 0 clamp(56px, 10vh, 112px); text-align: center; }
 .close__title { font: 800 clamp(56px, 7.6vw, 136px)/0.84 var(--f-display); text-transform: uppercase; text-wrap: balance; text-shadow: 0 4px 40px rgb(0 0 0 / 0.4); }

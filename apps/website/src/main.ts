@@ -1,18 +1,17 @@
-import 'lenis/dist/lenis.css';
 import './base.css';
 import './styles.css';
 import { gsap } from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
-import Lenis from 'lenis';
 import { formatSize, loadRelease, type Release } from './release';
 import type { Look, Mark3D, Pose } from './mark3d';
 import { browserTokenStore } from './account/store';
 import { wireAccountLink } from './account/ui';
 
-// GI, 2026-11-06: "too animated, make it more professional". The page scrolls as a page: nothing pins,
-// nothing is scrubbed, no wipes, no per-letter reveals. The one authored moment is the arrival (the hero
-// title and the 3D S on one curve); after that the footage is the only thing that moves. Lenis only
-// smooths the wheel. The S stands still in its two shots (hero, close) and turns a little with the pointer.
+// GI, 2026-11-06: "too animated, make it more professional", then "too many videos, a bit laggy". The page
+// scrolls as a page, on the browser's own scrolling (no smoothing library: it made the page trail the
+// wheel): nothing pins, nothing is scrubbed. One video, the hero; every other shot is a still. The one
+// authored moment is the arrival (the hero title and the 3D S on one curve). The S stands still in its two
+// shots (hero, close), turns a little with the pointer, and renders only when its pose changes.
 const SITE_HOST = 'solar-rp.com';
 const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const root = document.documentElement;
@@ -94,6 +93,14 @@ if (bar) {
   solid();
 }
 const isPhone = () => window.matchMedia('(max-width: 760px)').matches;
+// The close section is at least the window less the footer (styles.css .close), so at the foot of the page
+// it starts at the window's top: the sky above the dome, where the S stands, is never under the bar.
+const foot = $<HTMLElement>('.foot');
+if (foot) {
+  const setFoot = () => root.style.setProperty('--foot-h', `${foot.offsetHeight}px`);
+  new ResizeObserver(setFoot).observe(foot);
+  setFoot();
+}
 
 /* ---------------------------------------------------------------- 3D mark */
 
@@ -113,7 +120,7 @@ const LOOKS: Record<string, Look> = {
     rim: { color: 0xffb45a, intensity: 2, position: [-3, 2, -4] },
   },
   close: {
-    env: '/media/close.webp',
+    env: '/media/still-close.webp',
     // the observatory at night over the lit city: warm lamp light, never a violet rim (NOON)
     fog: 0x2a2219,
     key: { color: 0xffc890, intensity: 1.2, position: [4, 1, 3] },
@@ -156,18 +163,40 @@ function heroPose(): Pose {
 /** The S above the closing title. It does not move; it fades in once, the first time the section comes on
  *  screen (closeFade), and is simply there after that. */
 const closeFade = { v: reduced ? 1 : 0 };
-const closeTitle = $<HTMLElement>('.close__title');
+const closeImg = $<HTMLElement>('.close__img');
 /** Placed from the title's real position (the copy is laid out with svh padding, so a fixed stage y put
  *  the S under the nav bar at max scroll): its foot 32 px above the title, its height a share of the
  *  window, not of the section. Stage units: y -1..1 (up), height a fraction of the stage height. */
+// The main dome in still-close.webp, as fractions of its 1920x1080 frame: the S stands in the sky above it.
+const CLOSE_FRAME = { w: 1920, h: 1080, domeX: 0.567, domeTop: 0.19 };
+
+/** Where the dome's crown lands in the close picture's box (object-fit: cover, the CSS object-position). */
+function closeDome(img: HTMLElement): { x: number; top: number } {
+  const box = img.getBoundingClientRect();
+  const s = Math.max(box.width / CLOSE_FRAME.w, box.height / CLOSE_FRAME.h);
+  const rw = CLOSE_FRAME.w * s;
+  const rh = CLOSE_FRAME.h * s;
+  const [px = 50, py = 50] = getComputedStyle(img).objectPosition.split(' ').map((v) => parseFloat(v));
+  return {
+    x: box.left + ((box.width - rw) * px) / 100 + CLOSE_FRAME.domeX * rw,
+    top: box.top + ((box.height - rh) * py) / 100 + CLOSE_FRAME.domeTop * rh,
+  };
+}
+
 function closePose(): Pose {
   const opacity = closeFade.v;
-  const hPx = window.innerHeight * (isPhone() ? 0.14 : 0.17);
   const stage = closeStage?.getBoundingClientRect();
-  const title = closeTitle?.getBoundingClientRect();
-  if (!stage || !title || stage.height <= 0) return { x: 0, y: 0.5, height: 0.17, yaw: 0, pitch: 0, opacity, sweep: 4 };
-  const centrePx = title.top - stage.top - 32 - hPx / 2;
-  return { x: 0, y: 1 - (2 * centrePx) / stage.height, height: hPx / stage.height, yaw: 0, pitch: 0, opacity, sweep: 4 };
+  if (!stage || !closeImg || stage.height <= 0) return { x: 0, y: 0.5, height: 0.17, yaw: 0, pitch: 0, opacity, sweep: 4 };
+  const dome = closeDome(closeImg);
+  // The S must fit between the bar and the dome's crown where the page ends (the last place the close is
+  // seen). Measured in document terms, so the size is the same at every scroll position.
+  const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+  const crownAtEnd = dome.top - (maxScroll - window.scrollY);
+  const room = (crownAtEnd - BAR_H - 12 - 14) / 1.12; // the gap below the S is max(14, 0.12 h)
+  const hPx = Math.max(window.innerHeight * 0.09, Math.min(window.innerHeight * (isPhone() ? 0.14 : 0.16), room));
+  const centrePx = dome.top - stage.top - Math.max(14, hPx * 0.12) - hPx / 2;
+  const x = (2 * (dome.x - stage.left)) / stage.width - 1;
+  return { x, y: 1 - (2 * centrePx) / stage.height, height: hPx / stage.height, yaw: 0, pitch: 0, opacity, sweep: 4 };
 }
 
 async function startMark() {
@@ -255,11 +284,6 @@ function wireMarkScroll() {
 gsap.registerPlugin(ScrollTrigger);
 
 function wireMotion() {
-
-  const lenis = new Lenis({ lerp: 0.12, smoothWheel: true, anchors: true });
-  lenis.on('scroll', ScrollTrigger.update);
-  gsap.ticker.add((time) => lenis.raf(time * 1000));
-  gsap.ticker.lagSmoothing(0);
 
   // the arrival: the title rises 16 px and fades in on the S's curve and clock (ENTER, entranceOpen);
   // the lede and the download plate are there from the first frame, so the action is never hidden. The

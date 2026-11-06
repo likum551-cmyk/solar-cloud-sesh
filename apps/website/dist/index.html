@@ -21,10 +21,10 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="preload" href="/media/hero.webp" as="image" />
   <script src="/enter.js"></script>
-  <script type="module" crossorigin src="/assets/main-mCo8PwMR.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/store-BDFcqJ9J.js">
-  <link rel="stylesheet" crossorigin href="/assets/store-DrBHlS1O.css">
-  <link rel="stylesheet" crossorigin href="/assets/main-LzNigMUc.css">
+  <script type="module" crossorigin src="/assets/main-BVCsA_Qt.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/store-CBSRnhaV.js">
+  <link rel="stylesheet" crossorigin href="/assets/store--k_NHWCU.css">
+  <link rel="stylesheet" crossorigin href="/assets/main-CzeB2V82.css">
 </head>
 <body>
   <a class="skip" href="#download">Skip to download</a>
@@ -73,7 +73,7 @@
     <!-- 2. Title cards: three shots, three compositions -->
     <section class="cards" aria-label="What Solar RP is">
         <article class="card card--low">
-          <video class="card__video js-loop" poster="/media/beach.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/beach.webm" type="video/webm; codecs=vp9" /><source src="/media/beach.mp4" type="video/mp4" /></video>
+          <img class="card__img" src="/media/still-beach.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">Our own servers.</h2>
@@ -81,7 +81,7 @@
           </div>
         </article>
         <article class="card card--high">
-          <video class="card__video js-loop" poster="/media/streets.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/streets.webm" type="video/webm; codecs=vp9" /><source src="/media/streets.mp4" type="video/mp4" /></video>
+          <img class="card__img" src="/media/still-pool.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">Our own client.</h2>
@@ -89,7 +89,7 @@
           </div>
         </article>
         <article class="card card--mid">
-          <video class="card__video js-loop" poster="/media/canal.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/canal.webm" type="video/webm; codecs=vp9" /><source src="/media/canal.mp4" type="video/mp4" /></video>
+          <img class="card__img" src="/media/still-canal.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">One button in.</h2>
@@ -101,15 +101,15 @@
     <!-- 3. Characters: three key-art panels -->
     <section class="cast" aria-label="Los Santos">
         <figure class="panel">
-          <img src="/media/michael.webp" alt="" width="2320" height="1497" loading="lazy" decoding="async" />
+          <img src="/media/cast-michael.webp" alt="" width="1200" height="1620" loading="lazy" decoding="async" />
           <figcaption class="panel__line">The city you know.</figcaption>
         </figure>
         <figure class="panel">
-          <img src="/media/franklin.webp" alt="" width="2320" height="1497" loading="lazy" decoding="async" />
+          <img src="/media/cast-franklin.webp" alt="" width="1200" height="1620" loading="lazy" decoding="async" />
           <figcaption class="panel__line">The rules are ours.</figcaption>
         </figure>
         <figure class="panel">
-          <img src="/media/trevor.webp" alt="" width="2320" height="1497" loading="lazy" decoding="async" />
+          <img src="/media/cast-trevor.webp" alt="" width="1200" height="1620" loading="lazy" decoding="async" />
           <figcaption class="panel__line">Roleplay first.</figcaption>
         </figure>
     </section>
@@ -117,11 +117,13 @@
     <!-- 4. Servers -->
     <section class="servers" id="servers" aria-labelledby="servers-title">
       <div class="wrap">
-        <h2 class="section-title" id="servers-title">The Solar system</h2>
-        <p class="section-lede">Three servers, named for the sun, the moon and the earth. SOL is open; LUNA and TERRA are next.</p>
+        <div class="servers__head">
+          <h2 class="section-title" id="servers-title">The Solar system</h2>
+          <p class="section-lede">Three servers, named for the sun, the moon and the earth. SOL is open; LUNA and TERRA are next.</p>
+        </div>
         <div class="servers__grid">
           <article class="server server--open">
-            <img class="server__img" src="/media/sol.webp" alt="" loading="lazy" decoding="async" />
+            <img class="server__img" src="/media/server-sol.webp" alt="" loading="lazy" decoding="async" />
             <div class="server__body">
               <span class="state state--open">Open</span>
               <h3 class="server__name">SOL</h3>
@@ -129,18 +131,18 @@
             </div>
           </article>
           <article class="server">
-            <img class="server__img" src="/media/dusk.webp" alt="" loading="lazy" decoding="async" />
+            <img class="server__img" src="/media/server-luna.webp" alt="" loading="lazy" decoding="async" />
             <span class="tape" aria-hidden="true">Soon</span>
             <div class="server__body">
-              <h3 class="server__name">LUNA</h3>
+              <h3 class="server__name">LUNA<span class="visually-hidden">, opening soon</span></h3>
               <p class="server__meta">EU &middot; Freeroam</p>
             </div>
           </article>
           <article class="server">
-            <img class="server__img" src="/media/vehicle.webp" alt="" loading="lazy" decoding="async" />
+            <img class="server__img" src="/media/server-terra.webp" alt="" loading="lazy" decoding="async" />
             <span class="tape" aria-hidden="true">Soon</span>
             <div class="server__body">
-              <h3 class="server__name">TERRA</h3>
+              <h3 class="server__name">TERRA<span class="visually-hidden">, opening soon</span></h3>
               <p class="server__meta">EU &middot; Racing</p>
             </div>
           </article>
@@ -192,8 +194,8 @@
 
     <!-- 6. Close: the decision, with what it needs -->
     <section class="close" id="download" aria-labelledby="close-title">
-      <!-- the Galileo Observatory at night over the lit city, forward then back -->
-      <video class="close__video js-loop" poster="/media/close.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/close.webm" type="video/webm; codecs=vp9" /><source src="/media/close.mp4" type="video/mp4" /></video>
+      <!-- the Galileo Observatory at night over the lit city -->
+      <img class="close__img" src="/media/still-close.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
       <div class="close__shade" aria-hidden="true"></div>
       <div class="stage3d stage3d--close" data-stage="close" aria-hidden="true"></div>
       <div class="close__copy">
@@ -225,6 +227,5 @@
     </div>
   </footer>
 
-  <div class="grain" aria-hidden="true"></div>
 </body>
 </html>
