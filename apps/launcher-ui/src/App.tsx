@@ -3,11 +3,12 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { playLaunch } from './audio/launch';
 import { EMBLEM_3D } from './brand/brand';
 import { Backdrop, type BackdropScene } from './media/Backdrop';
-import { serverArt, type StillName } from './media/catalog';
+import { QUESTS_REEL, serverArt, type StillName } from './media/catalog';
 import { AuthScreen } from './screens/AuthScreen';
 import { LaunchOverlay } from './screens/LaunchOverlay';
 import { PlayScreen } from './screens/PlayScreen';
 import { ProfileScreen } from './screens/ProfileScreen';
+import { QuestsScreen } from './screens/QuestsScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { UpdatePopup } from './screens/UpdatePopup';
 import { ShopScreen } from './screens/ShopScreen';
@@ -24,7 +25,7 @@ import { Rail } from './ui/Rail';
 
 const EmblemLayer = lazy(() => import('./three/EmblemLayer'));
 
-export type Shot = 'auth' | 'play' | 'profile' | 'settings' | 'shop';
+export type Shot = 'auth' | 'play' | 'quests' | 'profile' | 'settings' | 'shop';
 
 export default function App() {
   return (
@@ -55,8 +56,11 @@ function Shell() {
   const selected = selIndex >= 0 ? servers[selIndex]! : null;
   const art = selected ? serverArt(selected, selIndex) : null;
   const scene: BackdropScene =
-    shot === 'auth' ? { clip: 'city' }
-      : shot === 'play' ? { clip: art?.clip ?? 'city' }
+    shot === 'auth' ? { clip: 'skyline' }
+      : shot === 'play' ? { clip: art?.clip ?? 'skyline' }
+        // Its own dusk reel (catalog.ts QUESTS_REEL), framed right of centre so the towers stand
+        // over the title and clear of the wide quest panel.
+        : shot === 'quests' ? { clip: QUESTS_REEL[0], reel: QUESTS_REEL, frame: '85% 50%' }
         : shot === 'shop' ? { still: shopStill, drift: true }
           : shot === 'profile' ? { still: 'downtown', drift: true }
             : { still: 'settings' };
@@ -142,6 +146,7 @@ function Shell() {
           <>
             {screen === 'play' && <PlayScreen onPlay={onPlay} />}
             {screen === 'shop' && <ShopScreen onStill={setShopStill} />}
+            {screen === 'quests' && <QuestsScreen />}
             {screen === 'profile' && <ProfileScreen />}
             {screen === 'settings' && <SettingsScreen />}
           </>

@@ -16,9 +16,11 @@ export interface MockScenario {
   account: 'ok' | 'unverified' | 'banned';
   /** offline = every request fails at the network layer. */
   net: 'ok' | 'offline' | 'slow';
+  /** Quests: ok (Discord linked), nodiscord (no Discord on the account), empty (no active quests), down (the list fails). */
+  quests: 'ok' | 'nodiscord' | 'empty' | 'down';
 }
 
-export const DEFAULT_SCENARIO: MockScenario = { servers: 'ok', shop: 'ok', account: 'ok', net: 'ok' };
+export const DEFAULT_SCENARIO: MockScenario = { servers: 'ok', shop: 'ok', account: 'ok', net: 'ok', quests: 'ok' };
 
 const now = () => new Date();
 const iso = (d: Date) => d.toISOString();
@@ -37,7 +39,7 @@ function demoAccount(s: MockScenario): Account {
     emailVerified: s.account !== 'unverified',
     roles: ['player', 'mod'],
     hasPassword: true,
-    discord: { id: '412233445566778899', username: 'nightshift' },
+    discord: s.quests === 'nodiscord' ? null : { id: '412233445566778899', username: 'nightshift' },
     ban: s.account === 'banned' ? { id: 'b1', reason: 'Demo ban: combat logging', createdAt: daysAgo(1), expiresAt: daysAhead(6) } : null,
     createdAt: daysAgo(214),
   };
@@ -100,6 +102,20 @@ function demoSessions(): SessionRow[] {
   ];
 }
 
+// The platform's seeded quests (apps/platform drizzle/0003_quests.sql), as demo data. The visit
+// quests open the Solar RP site in demo mode: their real pages are set by the owner on the platform.
+const QUEST_WAIT_S = 30;
+interface DemoQuest { slug: string; kind: 'discord_link' | 'discord_guild' | 'visit'; title: string; description: string; amount: number; sort: number }
+const DEMO_QUESTS: readonly DemoQuest[] = [
+  { slug: 'link_discord', kind: 'discord_link', title: 'Link your Discord', description: 'Connect your Discord account to your Solar RP account.', amount: 500, sort: 0 },
+  { slug: 'join_discord_server', kind: 'discord_guild', title: 'Join the Solar RP Discord', description: 'Become a member of the Solar RP Discord server.', amount: 100, sort: 10 },
+  { slug: 'youtube_subscribe', kind: 'visit', title: 'Subscribe on YouTube', description: 'Subscribe to the Solar RP YouTube channel.', amount: 100, sort: 20 },
+  { slug: 'instagram_follow', kind: 'visit', title: 'Follow on Instagram', description: 'Follow Solar RP on Instagram.', amount: 100, sort: 40 },
+  { slug: 'tiktok_follow', kind: 'visit', title: 'Follow on TikTok', description: 'Follow Solar RP on TikTok.', amount: 100, sort: 50 },
+  { slug: 'x_follow', kind: 'visit', title: 'Follow on X', description: 'Follow Solar RP on X.', amount: 100, sort: 60 },
+];
+const DEMO_QUEST_URL = 'https://solar-rp.com/';
+
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
   new Response(status === 204 ? null : JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', ...headers } });
 const err = (status: number, code: string, message: string, headers: Record<string, string> = {}) => json(status, { error: { code, message, requestId: 'demo' } }, headers);
@@ -109,6 +125,42 @@ export function createMockFetch(getScenario: () => MockScenario = () => DEFAULT_
   let sessions = demoSessions();
   let discordPolls = 0;
   const token = 'demo-session-token-0123456789abcdef';
+  let coins = 12_450;
+  // Quest progress, as the platform keeps it per account: one demo quest already claimed, one
+  // started 18 s before the first request (so its claim opens a few seconds after the screen opens).
+  const questStarted = new Map<string, number>();
+  const questClaimed = new Map<string, number>();
+  let questsSeeded = false;
+  const seedQuests = () => {
+    if (questsSeeded) return;
+    questsSeeded = true;
+    questStarted.set('instagram_follow', t0() - 3 * 86_400_000);
+    questClaimed.set('instagram_follow', t0() - 3 * 86_400_000 + 60_000);
+    questStarted.set('tiktok_follow', Date.now() - 18_000);
+  };
+  /** The platform's questView rules (apps/platform src/quests/service.ts), over the demo state. */
+  const questView = (q: DemoQuest, s: MockScenario) => {
+    const linked = s.quests !== 'nodiscord';
+    const started = questStarted.get(q.slug) ?? null;
+    const claimed = questClaimed.get(q.slug) ?? null;
+    const claimableAt = q.kind === 'visit' && started !== null ? started + QUEST_WAIT_S * 1000 : null;
+    const base = {
+      slug: q.slug, kind: q.kind, title: q.title, description: q.description,
+      url: q.kind === 'visit' ? DEMO_QUEST_URL : null,
+      reward: { currency: 'coins', amount: q.amount }, sort: q.sort,
+      startedAt: started === null ? null : iso(new Date(started)),
+      claimableAt: claimableAt === null ? null : iso(new Date(claimableAt)),
+      waitSeconds: claimableAt === null ? null : Math.max(0, Math.ceil((claimableAt - Date.now()) / 1000)),
+      claimedAt: claimed === null ? null : iso(new Date(claimed)),
+    };
+    const as = (status: string, lockReason: string | null = null) => ({ ...base, status, lockReason });
+    if (claimed !== null) return as('claimed');
+    if (q.kind === 'discord_guild') return as('locked', 'not_available');
+    if (q.kind === 'visit' && started === null) return as('available');
+    if (!linked) return as('locked', 'discord_required');
+    if (claimableAt !== null && claimableAt > Date.now()) return as('started');
+    return as('claimable');
+  };
 
   return async (input, init) => {
     const s = getScenario();
@@ -130,25 +182,18 @@ export function createMockFetch(getScenario: () => MockScenario = () => DEFAULT_
         }
         return json(200, { token, expiresAt: daysAhead(30), sessionId: 's-cur', account: demoAccount(s) });
       }
-      case `POST ${ROUTES.register}`: {
-        if (String(body.username ?? '').toLowerCase() === 'taken') return err(409, 'username_taken', 'That username is taken.');
-        if (String(body.password ?? '').length < 10) return err(400, 'weak_password', 'Use at least 10 characters.', {});
-        return json(201, { verificationRequired: true });
-      }
       case `POST ${ROUTES.forgotPassword}`: return json(202, { sent: true });
       case `POST ${ROUTES.resetPassword}`: return String(body.token ?? '').startsWith('bad') ? err(400, 'invalid_token', 'Invalid or expired token.') : json(200, { ok: true });
       case `POST ${ROUTES.verifyEmail}`: return json(200, { account: { ...demoAccount(s), emailVerified: true } });
       case `POST ${ROUTES.resendVerification}`: return needAuth() ?? json(202, { sent: true });
       case `POST ${ROUTES.logout}`: return needAuth() ?? json(204, null);
       case `POST ${ROUTES.discordStart}`:
-      case `POST ${ROUTES.discordLink}`:
         discordPolls = 0;
         return json(200, { flowId: '3f1e2d4c-5b6a-4789-8abc-def012345678', authorizeUrl: 'https://discord.com/oauth2/authorize?client_id=demo', pollSecret: 'demo-poll-secret-0123456789', expiresAt: daysAhead(0.01) });
       case `POST ${ROUTES.discordPoll}`:
         discordPolls++;
         return discordPolls < 3 ? json(200, { status: 'pending' }) : json(200, { status: 'complete', token, expiresAt: daysAhead(30), sessionId: 's-cur', account: demoAccount(s) });
       case `POST ${ROUTES.discordComplete}`: return json(200, { token, expiresAt: daysAhead(30), sessionId: 's-cur', account: demoAccount(s) });
-      case `DELETE ${ROUTES.discordUnlink}`: return needAuth() ?? json(204, null);
       case `GET ${ROUTES.me}`: return needAuth() ?? json(200, { account: demoAccount(s) });
       case `POST ${ROUTES.password}`:
         if (!authed) return err(401, 'unauthorized', 'Session expired.');
@@ -161,7 +206,14 @@ export function createMockFetch(getScenario: () => MockScenario = () => DEFAULT_
         return needAuth() ?? json(200, { revoked: n });
       }
       case `GET ${ROUTES.settings}`: return needAuth() ?? json(200, { settings: {}, version: 0, updatedAt: null });
-      case `GET ${ROUTES.wallet}`: return needAuth() ?? json(200, { balances: [{ currency: 'coins', balance: 12_450 }] });
+      case `GET ${ROUTES.wallet}`: return needAuth() ?? json(200, { balances: [{ currency: 'coins', balance: coins }] });
+      case `GET ${ROUTES.quests}`: {
+        if (!authed) return err(401, 'unauthorized', 'Session expired.');
+        if (s.quests === 'down') return err(500, 'internal_error', 'Quests are unavailable.');
+        seedQuests();
+        const list = s.quests === 'empty' ? [] : DEMO_QUESTS.map((q) => questView(q, s));
+        return json(200, { discordLinked: s.quests !== 'nodiscord', visitMinSeconds: QUEST_WAIT_S, quests: list });
+      }
       case `GET ${ROUTES.items}`: return needAuth() ?? json(200, {
         items: [
           { id: 'g1', sku: 'vip.30d', type: 'entitlement', payload: { type: 'entitlement', key: 'vip', durationDays: 30 }, quantity: 1, orderId: 'o-1038', delivered: true, createdAt: daysAgo(13) },
@@ -188,6 +240,33 @@ export function createMockFetch(getScenario: () => MockScenario = () => DEFAULT_
       }
       case `GET ${ROUTES.orders}`: return needAuth() ?? json(200, { orders: demoOrders() });
     }
+    const questPath = /^\/v1\/me\/quests\/([a-z0-9][a-z0-9_]{1,47})\/(start|claim)$/.exec(path);
+    if (method === 'POST' && questPath) {
+      if (!authed) return err(401, 'unauthorized', 'Session expired.');
+      seedQuests();
+      const q = s.quests === 'empty' ? undefined : DEMO_QUESTS.find((x) => x.slug === questPath[1]);
+      if (!q) return err(404, 'quest_not_found', 'No such quest.');
+      if (questPath[2] === 'start') {
+        if (q.kind !== 'visit') return err(409, 'not_a_visit_quest', 'Only a visit quest is started; this one is claimed directly.');
+        if (!questStarted.has(q.slug) && !questClaimed.has(q.slug)) questStarted.set(q.slug, Date.now());
+        return json(200, { quest: questView(q, s) });
+      }
+      if (questClaimed.has(q.slug)) return err(409, 'already_claimed', 'You already claimed this quest.');
+      if (q.kind === 'discord_guild') return err(409, 'quest_unavailable', 'This quest cannot be completed yet: joining the Discord server cannot be checked yet.');
+      const started = questStarted.get(q.slug);
+      if (q.kind === 'visit' && started === undefined) return err(409, 'quest_not_started', 'Start the quest first.');
+      if (s.quests === 'nodiscord') return err(403, 'discord_required', 'Link your Discord account first.');
+      if (q.kind === 'visit' && started !== undefined) {
+        const opens = started + QUEST_WAIT_S * 1000;
+        const wait = Math.max(0, Math.ceil((opens - Date.now()) / 1000));
+        if (opens > Date.now()) {
+          return json(409, { error: { code: 'quest_wait', message: `You can claim this in ${wait} s.`, requestId: 'demo', details: { waitSeconds: wait, claimableAt: iso(new Date(opens)) } } }, { 'Retry-After': String(wait) });
+        }
+      }
+      questClaimed.set(q.slug, Date.now());
+      coins += q.amount;
+      return json(200, { quest: questView(q, s), credited: { currency: 'coins', amount: q.amount }, balance: coins });
+    }
     if (method === 'DELETE' && path.startsWith(`${ROUTES.sessions}/`)) {
       const id = decodeURIComponent(path.slice(ROUTES.sessions.length + 1));
       if (!sessions.some((x) => x.id === id)) return err(404, 'session_not_found', 'No such session.');
@@ -210,5 +289,6 @@ export function scenarioFromQuery(search: string): MockScenario {
     shop: pick('shop', ['ok', 'empty'] as const, 'ok'),
     account: pick('account', ['ok', 'unverified', 'banned'] as const, 'ok'),
     net: pick('net', ['ok', 'offline', 'slow'] as const, 'ok'),
+    quests: pick('quests', ['ok', 'nodiscord', 'empty', 'down'] as const, 'ok'),
   };
 }

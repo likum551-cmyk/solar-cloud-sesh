@@ -1,15 +1,17 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { describeFailure, formatWait, isFailure } from '../lib/errors';
 import { tokenFromPaste } from '../lib/links';
+import { SIGNUP_URL } from '../lib/site';
 import { useApp } from '../state/AppState';
 import { isLocked } from '../state/auth';
 import { EmblemSlot } from '../ui/emblemSlot';
 import { useNow } from '../ui/hooks';
 import { Chip, Field, Icon, Lockup, Plate } from '../ui/primitives';
 
-// Signed out: log in, register, verify notice, forgot / reset password and Discord. The city
-// loop fills the window; bottom left, the chrome emblem, the lockup and one line on what this
-// is; on the right, one opaque panel holds the form.
+// Signed out: log in, forgot / reset password and Discord. Accounts are created on the website
+// only (lib/site.ts SIGNUP_URL, opened in the system browser), so there is one way to make one.
+// The dusk reel fills the window; bottom left, the chrome emblem, the lockup and one line on what
+// this is; on the right, one opaque panel holds the form.
 
 export function AuthScreen() {
   const app = useApp();
@@ -38,34 +40,10 @@ export function AuthScreen() {
           }}
           onDiscord={() => startDiscord()}
           onForgot={() => show('forgot')}
-          onRegister={() => show('register')}
+          onSignup={() => app.openExternal(SIGNUP_URL)}
           onReset={() => show('reset')}
           onRetry={app.retryBoot}
         />
-      );
-    case 'register':
-      return (
-        <RegisterView
-          busy={auth.busy}
-          error={auth.error}
-          onSubmit={async (email, username, password) => {
-            authDispatch({ type: 'SUBMIT', now: Date.now() });
-            try {
-              await api.register({ email, username, password });
-              authDispatch({ type: 'REGISTERED', email });
-            } catch (e) { fail(e); }
-          }}
-          onBack={() => show('login')}
-          onDiscord={() => startDiscord()}
-        />
-      );
-    case 'verifyNotice':
-      return (
-        <AuthFrame title="Check your inbox">
-          <p className="auth__lead">We sent a verification link to <strong>{auth.email}</strong>. Open it, then log in here.</p>
-          <p className="auth__note">Nothing after a few minutes? Check spam, or log in and resend it from your profile.</p>
-          <Plate tone="primary" size="lg" className="auth__submit" onClick={() => show('login')}>Go to log in <Icon name="arrow" /></Plate>
-        </AuthFrame>
       );
     case 'forgot':
       return (
@@ -174,10 +152,12 @@ const DEMO_LOGIN = { identifier: 'demo@solar-rp.com', password: 'demo-password' 
 
 function LoginView(p: {
   demo: boolean; busy: boolean; error: string | null; reason: string | null; lockedFor: number;
-  onSubmit: (identifier: string, password: string) => void; onDiscord: () => void; onForgot: () => void; onRegister: () => void; onReset: () => void; onRetry: () => void;
+  onSubmit: (identifier: string, password: string) => void; onDiscord: () => void; onForgot: () => void; onSignup: () => void; onReset: () => void; onRetry: () => void;
 }) {
   const [identifier, setIdentifier] = useState(p.demo ? DEMO_LOGIN.identifier : '');
   const [password, setPassword] = useState(p.demo ? DEMO_LOGIN.password : '');
+  // After "Create an account" the browser has the sign-up page; this frame says where to come back.
+  const [signupOpened, setSignupOpened] = useState(false);
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (!identifier.trim() || !password) return;
@@ -187,6 +167,11 @@ function LoginView(p: {
   return (
     <AuthFrame title="Log in">
       {p.reason && <p className="auth__notice">{p.reason}</p>}
+      {/* Mounted from the start, so the sentence that lands in it is announced. On screen the
+          link row itself says what happened (no reflow of the centred panel under the cursor). */}
+      <div className="sr-only" role="status">
+        {signupOpened ? 'Opening the sign-up page on solar-rp.com in your browser. Create your account there, then log in here.' : ''}
+      </div>
       <form className="auth__form" onSubmit={submit} noValidate>
         <Field label="Email or username" autoComplete="username" value={identifier} onChange={(e) => setIdentifier(e.target.value)} autoFocus spellCheck={false} />
         <Field label="Password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
@@ -211,43 +196,13 @@ function LoginView(p: {
       <Plate tone="ghost" size="md" className="auth__discord" onClick={p.onDiscord} disabled={p.busy}>Log in with Discord <Icon name="external" /></Plate>
       <div className="auth__links">
         <button type="button" className="auth__link" onClick={p.onForgot}>Forgot password</button>
-        <button type="button" className="auth__link" onClick={p.onRegister}>Create an account</button>
+        <button type="button" className="auth__link" onClick={() => { setSignupOpened(true); p.onSignup(); }}>
+          {signupOpened ? 'Sent to your browser · Open again' : 'Create an account'} <Icon name="external" size={14} />
+        </button>
       </div>
       {p.error && /reach|answer in time|network address/.test(p.error) && (
         <button type="button" className="auth__link auth__retry" onClick={p.onRetry}><Icon name="refresh" /> Try the network again</button>
       )}
-    </AuthFrame>
-  );
-}
-
-function RegisterView(p: { busy: boolean; error: string | null; onSubmit: (email: string, username: string, password: string) => void; onBack: () => void; onDiscord: () => void }) {
-  const [email, setEmail] = useState('');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const userOk = /^[A-Za-z0-9_]{3,20}$/.test(username);
-  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
-  const pwOk = password.length >= 10;
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    if (userOk && emailOk && pwOk) p.onSubmit(email.trim(), username, password);
-  };
-  return (
-    <AuthFrame title="Create account">
-      <form className="auth__form" onSubmit={submit} noValidate>
-        <Field label="Email" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus spellCheck={false} error={email && !emailOk ? 'Enter a full email address.' : null} />
-        <Field label="Username" autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} spellCheck={false}
-          error={username && !userOk ? '3 to 20 letters, digits or underscore.' : null} hint="Shown in game. 3 to 20 letters, digits or underscore." />
-        <Field label="Password" type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)}
-          error={password && !pwOk ? 'At least 10 characters.' : null} hint="At least 10 characters. Common passwords are refused." />
-        <FormError error={p.error} />
-        <Plate tone="primary" size="lg" type="submit" className="auth__submit" busy={p.busy} disabled={!userOk || !emailOk || !pwOk}>
-          {p.busy ? 'Creating' : 'Create account'} <Icon name="arrow" />
-        </Plate>
-      </form>
-      <div className="auth__links">
-        <button type="button" className="auth__link" onClick={p.onBack}><Icon name="back" /> I have an account</button>
-        <button type="button" className="auth__link" onClick={p.onDiscord}>Use Discord instead</button>
-      </div>
     </AuthFrame>
   );
 }

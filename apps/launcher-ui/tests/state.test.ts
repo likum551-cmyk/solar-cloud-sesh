@@ -48,14 +48,13 @@ describe('auth reducer', () => {
     expect(out(authReducer(s, { type: 'SUBMIT', now: T0 + 541_000 })).busy).toBe(true);
   });
 
-  it('the lock only gates login: register still submits', () => {
+  it('the lock only gates login: forgot password still submits', () => {
     let s = authReducer(signedOut(), { type: 'FAIL', error: 'x', retryAfterSeconds: 60, now: T0 });
-    s = authReducer(s, { type: 'SHOW', view: 'register' });
+    s = authReducer(s, { type: 'SHOW', view: 'forgot' });
     expect(out(authReducer(s, { type: 'SUBMIT', now: T0 })).busy).toBe(true);
   });
 
-  it('register -> verify notice, forgot -> sent, reset -> done carry the email', () => {
-    expect(out(authReducer(signedOut('register'), { type: 'REGISTERED', email: 'a@b.c' }))).toMatchObject({ view: 'verifyNotice', email: 'a@b.c' });
+  it('forgot -> sent carries the email, reset -> done', () => {
     expect(out(authReducer(signedOut('forgot'), { type: 'FORGOT_SENT', email: 'a@b.c' }))).toMatchObject({ view: 'forgotSent', email: 'a@b.c' });
     expect(out(authReducer(signedOut('reset'), { type: 'RESET_DONE' })).view).toBe('resetDone');
   });
@@ -72,7 +71,7 @@ describe('auth reducer', () => {
   it('signing out carries the reason once; the next view change clears it', () => {
     const s = authReducer({ status: 'signedIn', account, token: 't' }, { type: 'SIGNED_OUT', reason: 'Your session ended. Log in again.' });
     expect(out(s).reason).toBe('Your session ended. Log in again.');
-    expect(out(authReducer(s, { type: 'SHOW', view: 'register' })).reason).toBeNull();
+    expect(out(authReducer(s, { type: 'SHOW', view: 'forgot' })).reason).toBeNull();
   });
 
   it('ACCOUNT refreshes only a signed-in state', () => {

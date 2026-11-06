@@ -3,7 +3,7 @@ import { useApp, type Screen } from '../state/AppState';
 import { GageMark, Icon, Lockup } from './primitives';
 
 // The rail is the top edge of the picture, not a strip of window chrome: the GAGE-MP lockup,
-// the sections (PLAY SHOP PROFILE SETTINGS) at title scale on a graded edge, one gold marker
+// the sections (PLAY SHOP QUESTS PROFILE SETTINGS) at title scale on a graded edge, one gold marker
 // with the G's 45-degree cut riding a hairline track under the current section, then the demo
 // label, the account and the window controls. The rail is the window's drag region
 // (app-region: drag); every control carves itself out with no-drag. Nothing clickable sits in
@@ -12,6 +12,7 @@ import { GageMark, Icon, Lockup } from './primitives';
 const SECTIONS: Array<{ id: Screen; label: string }> = [
   { id: 'play', label: 'Play' },
   { id: 'shop', label: 'Shop' },
+  { id: 'quests', label: 'Quests' },
   { id: 'profile', label: 'Profile' },
   { id: 'settings', label: 'Settings' },
 ];

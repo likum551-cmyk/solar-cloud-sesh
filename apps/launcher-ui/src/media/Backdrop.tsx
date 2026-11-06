@@ -1,19 +1,29 @@
-import { forwardRef, useEffect, useRef, useState } from 'react';
-import { canPlayLoops, clipUrl, posterUrl, stillUrl, type ClipName, type StillName } from './catalog';
+import { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
+import { canPlayLoops, clipUrl, posterUrl, reelFor, REEL_FADE_MS, stillUrl, type ClipName, type StillName } from './catalog';
 
-// The full-bleed picture behind every screen: a muted GTA V loop (Play, sign-in) or a GTA V
-// still with a slow drift (Shop, Profile, Settings). A new scene fades in over the old one.
+// The full-bleed picture behind every screen: a muted GTA V reel (Play, sign-in, Quests) or a
+// GTA V still with a slow drift (Shop, Profile, Settings). A new scene fades in over the old one.
+// A reel is two or three held shots from its lead clip (catalog.ts `reelFor`); near the end of each
+// shot it sinks to the ground (`is-leaving`) as the next one rises over REEL_FADE_MS, and after
+// the last the reel wraps to the lead, so no shot ever cuts or dissolves into itself. Once the
+// lead plays, the layer hides its poster (`is-rolling`), so the ground under a pass is the ground.
 //
-// Loops are fetched whole and played from a blob: URL. The host serves assets as whole-file 200
+// Shots are fetched whole and played from a blob: URL. The host serves assets as whole-file 200
 // responses with no Range support (NATIVE-INTEGRATION.md), and a <video> over such a response
 // is not seekable, so it cannot rely on looping back to the start; a blob always seeks.
 // The video plays only while `active` (the same policy that pauses the emblem: hidden, idle and
-// unfocused, launching, in game). Under reduced motion, or without an H.264 decoder, the
-// poster (the loop's first frame) stands in for it.
+// unfocused, launching, in game). Under reduced motion, or without a VP9 decoder, the
+// poster (the lead shot's first frame) stands in for it.
 
-export type BackdropScene = { clip: ClipName } | { still: StillName; drift?: boolean };
+/**
+ * `frame`: where the footage sits in the window (CSS object-position, default centre), so a screen
+ * can keep a shot's subject clear of its panel. `reel`: a screen's own sequence when the lead's
+ * reel (catalog.ts `reelFor`, shared with Play) does not suit it; it starts with `clip`.
+ */
+export type BackdropScene = { clip: ClipName; frame?: string; reel?: readonly ClipName[] } | { still: StillName; drift?: boolean };
 
-const sceneKey = (s: BackdropScene) => ('clip' in s ? `clip:${s.clip}` : `still:${s.still}`);
+/** The same clip at another framing or in another reel is another picture (it fades in like a new scene). */
+const sceneKey = (s: BackdropScene) => ('clip' in s ? `clip:${s.clip}@${s.frame ?? ''}/${s.reel?.join('+') ?? ''}` : `still:${s.still}`);
 
 const blobs = new Map<string, Promise<string>>();
 /** One fetch per loop per session; a failed fetch is forgotten so a later visit can retry. */
@@ -74,15 +84,24 @@ export const Backdrop = forwardRef<HTMLDivElement, Props>(function Backdrop({ sc
   );
 });
 
+/** One shot of a reel on screen: `n` counts every shot the layer has started (React key). */
+interface Shot { n: number; clip: ClipName; src: string }
+
 function Layer({ scene, top, active, reducedMotion, onShown }: { scene: BackdropScene; top: boolean; active: boolean; reducedMotion: boolean; onShown: () => void }) {
   const [shown, setShown] = useState(false);
-  const [src, setSrc] = useState<string | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const video = useRef<HTMLVideoElement>(null);
   const clip = 'clip' in scene ? scene.clip : null;
   const wantVideo = clip !== null && !reducedMotion && canPlayLoops();
   const drift = 'still' in scene && scene.drift === true && !reducedMotion;
   const shownOnce = useRef(false);
+  // A layer's scene is fixed for its life (Backdrop keeps it in state), so this is computed once.
+  const ownReel = 'clip' in scene ? scene.reel : undefined;
+  const reel = useMemo(() => (clip === null ? [] : ownReel && ownReel[0] === clip ? ownReel : reelFor(clip)), [clip, ownReel]);
+  // At most two shots are mounted: the one playing and, during a dissolve, the one fading in
+  // over it. The older one is unmounted once the dissolve has finished.
+  const [shots, setShots] = useState<Shot[]>([]);
+  const [playingN, setPlayingN] = useState<ReadonlySet<number>>(() => new Set());
+  const videos = useRef(new Map<number, HTMLVideoElement>());
+  const handoff = useRef<number | null>(null);
 
   const show = () => {
     setShown(true);
@@ -91,32 +110,74 @@ function Layer({ scene, top, active, reducedMotion, onShown }: { scene: Backdrop
     onShown();
   };
 
+  // The lead shot.
   useEffect(() => {
-    if (!wantVideo || clip === null) return;
+    if (!wantVideo || reel.length === 0) return;
     let live = true;
-    loopBlob(clipUrl(clip)).then(
-      (u) => { if (live) setSrc(u); },
+    const lead = reel[0]!;
+    loopBlob(clipUrl(lead)).then(
+      (src) => { if (live) setShots([{ n: 0, clip: lead, src }]); },
       (e: unknown) => console.warn('[backdrop] loop unavailable, keeping its poster:', e),
     );
     return () => { live = false; };
-  }, [wantVideo, clip]);
+  }, [wantVideo, reel]);
 
+  const current = shots[shots.length - 1] ?? null;
+
+  // Fetch the next shot while this one plays, so the dissolve never waits on the network.
   useEffect(() => {
-    const v = video.current;
-    if (!v || !src) return;
-    if (active && top) {
-      v.muted = true;
-      v.play().catch((e: unknown) => {
-        // A pause right after play() rejects the play promise: expected, not a fault.
-        if (!(e instanceof DOMException && e.name === 'AbortError')) console.warn('[backdrop] play failed:', e);
-      });
-    } else {
-      v.pause();
+    if (!current || reel.length < 2) return;
+    const next = reel[(reel.indexOf(current.clip) + 1) % reel.length]!;
+    loopBlob(clipUrl(next)).catch((e: unknown) => console.warn('[backdrop] next shot unavailable, holding this one:', e));
+  }, [current, reel]);
+
+  /** Near the end of the current shot: mount the next one; it fades in over REEL_FADE_MS. */
+  const onTime = (shot: Shot, v: HTMLVideoElement) => {
+    if (reel.length < 2 || shot !== current || handoff.current === shot.n) return;
+    if (!Number.isFinite(v.duration) || v.currentTime < v.duration - REEL_FADE_MS / 1000) return;
+    handoff.current = shot.n;
+    const next = reel[(reel.indexOf(shot.clip) + 1) % reel.length]!;
+    loopBlob(clipUrl(next)).then(
+      (src) => {
+        // The shot going out holds its last frame instead of wrapping to its first under the dissolve.
+        v.loop = false;
+        setShots((ss) => (ss[ss.length - 1] === shot ? [...ss.slice(-1), { n: shot.n + 1, clip: next, src }] : ss));
+      },
+      // Not fetched: this shot keeps looping, and the next pass through its end tries again.
+      () => { handoff.current = null; },
+    );
+  };
+
+  // Once the incoming shot is visibly playing and its dissolve has run, drop the outgoing one.
+  useEffect(() => {
+    if (shots.length < 2 || !current || !playingN.has(current.n)) return;
+    const keep = current.n;
+    const t = window.setTimeout(() => {
+      setShots((ss) => ss.slice(-1));
+      setPlayingN((p) => new Set([...p].filter((n) => n >= keep)));
+    }, REEL_FADE_MS + 100);
+    return () => window.clearTimeout(t);
+  }, [shots, current, playingN]);
+
+  // Play the mounted shots while the layer is the top one and rendering is active.
+  useEffect(() => {
+    for (const s of shots) {
+      const v = videos.current.get(s.n);
+      if (!v) continue;
+      if (active && top) {
+        v.muted = true;
+        v.play().catch((e: unknown) => {
+          // A pause right after play() rejects the play promise: expected, not a fault.
+          if (!(e instanceof DOMException && e.name === 'AbortError')) console.warn('[backdrop] play failed:', e);
+        });
+      } else {
+        v.pause();
+      }
     }
-  }, [active, top, src]);
+  }, [active, top, shots]);
 
   return (
-    <div className={`backdrop__layer ${shown ? 'is-shown' : ''} ${drift ? 'is-drift' : ''}`}>
+    <div className={`backdrop__layer ${shown ? 'is-shown' : ''} ${drift ? 'is-drift' : ''} ${playingN.size > 0 ? 'is-rolling' : ''}`} style={'frame' in scene && scene.frame ? { ['--frame' as string]: scene.frame } : undefined}>
       <img
         className="backdrop__img"
         src={clip !== null ? posterUrl(clip) : stillUrl((scene as { still: StillName }).still)}
@@ -125,19 +186,21 @@ function Layer({ scene, top, active, reducedMotion, onShown }: { scene: Backdrop
         onLoad={show}
         onError={() => { console.warn('[backdrop] picture missing:', sceneKey(scene)); show(); }}
       />
-      {src && (
+      {shots.map((s) => (
         <video
-          ref={video}
-          className={`backdrop__video ${playing ? 'is-playing' : ''}`}
-          src={src}
+          key={s.n}
+          ref={(el) => { if (el) videos.current.set(s.n, el); else videos.current.delete(s.n); }}
+          className={`backdrop__video ${s.n > 0 ? 'is-reel' : ''} ${playingN.has(s.n) ? 'is-playing' : ''} ${s !== current && current !== null && playingN.has(current.n) ? 'is-leaving' : ''}`}
+          src={s.src}
           muted
           loop
           playsInline
           preload="auto"
           disablePictureInPicture
-          onPlaying={() => setPlaying(true)}
+          onPlaying={() => setPlayingN((p) => (p.has(s.n) ? p : new Set(p).add(s.n)))}
+          onTimeUpdate={(e) => onTime(s, e.currentTarget)}
         />
-      )}
+      ))}
     </div>
   );
 }

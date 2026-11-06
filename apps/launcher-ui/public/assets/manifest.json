@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "totalBytes": 12479136,
+  "totalBytes": 16116501,
   "files": [
     {
       "path": "assets/stills/coins.webp",
@@ -75,93 +75,147 @@
       "type": "image/webp"
     },
     {
-      "path": "assets/video/city.mp4",
-      "bytes": 3324769,
-      "sha256": "65c29a56c3c25e89923e8036ed9bb8e41381aa060a5d16f46ee9d462b97d49b9",
-      "type": "video/mp4"
+      "path": "assets/video/beach.webm",
+      "bytes": 1745771,
+      "sha256": "8153cef4dee1499d10bd59ff8e1eb873af2cadcaa70334b8f059689987a2f132",
+      "type": "video/webm"
     },
     {
-      "path": "assets/video/city.webp",
-      "bytes": 81826,
-      "sha256": "8197279bef27b9318d243f4875e6d87cccb467f34d825e7a21e3f8311a0b0daf",
+      "path": "assets/video/beach.webp",
+      "bytes": 88408,
+      "sha256": "ec55d531a2e150d2a09e32d1a218297a905d966640057bddcc1a8fcd7c5064d8",
       "type": "image/webp"
     },
     {
-      "path": "assets/video/harbor.mp4",
-      "bytes": 956452,
-      "sha256": "9eb3164abbf3446405d83a53d9bb072b8f159daa05772a2ab9f842925967c4e6",
-      "type": "video/mp4"
+      "path": "assets/video/boulevard.webm",
+      "bytes": 1435303,
+      "sha256": "2a82f90a6232fb2156357defc464d4ababeca6f03aa0bde36e1caf2292d38b3e",
+      "type": "video/webm"
     },
     {
-      "path": "assets/video/harbor.webp",
-      "bytes": 44604,
-      "sha256": "62e1bb7914e9700ce5ad2f59a3bec937159aa9c61b0aee7c8cdf576b41858d34",
+      "path": "assets/video/boulevard.webp",
+      "bytes": 101548,
+      "sha256": "eb4b30db5662be5c0ffc453d8e853a05cc46c82ac26a98306208cd4ac761248a",
       "type": "image/webp"
     },
     {
-      "path": "assets/video/night.mp4",
-      "bytes": 3268674,
-      "sha256": "8320b7f731a61ecb44c36b426d4e990a9019c86625dc8315051deb8ad5f0ddde",
-      "type": "video/mp4"
+      "path": "assets/video/canal.webm",
+      "bytes": 3428736,
+      "sha256": "04544f6fd69092fa839696c3a2cd339c231ca7caa1d5704edc4c861e03c8536d",
+      "type": "video/webm"
     },
     {
-      "path": "assets/video/night.webp",
-      "bytes": 79570,
-      "sha256": "6b94e5747527ea8f817b0a053ca2ecce7404e225138d3f82e5419f9a7aa555c5",
+      "path": "assets/video/canal.webp",
+      "bytes": 102288,
+      "sha256": "f97681241ea4d27b878166a3b19ea30d8d9f1a4cb2c3ad6d25418d5a585eaf40",
       "type": "image/webp"
     },
     {
-      "path": "assets/video/thumb/city.webp",
-      "bytes": 22590,
-      "sha256": "0b7398d978ad923688974cad16c95fe02996d079504f33f80aebf4bf100d2baf",
+      "path": "assets/video/observatory.webm",
+      "bytes": 1074187,
+      "sha256": "9be83b8802d5490d8feea65840765f17f06664e62a249c528fc8821d9686e9ad",
+      "type": "video/webm"
+    },
+    {
+      "path": "assets/video/observatory.webp",
+      "bytes": 78136,
+      "sha256": "aa0eb951c02f0f0b8d84819a7dabff511f00794e1d02af4797aa691bcb5e6bc0",
       "type": "image/webp"
     },
     {
-      "path": "assets/video/thumb/harbor.webp",
-      "bytes": 13048,
-      "sha256": "837373fb25aa1a4d57431bc82f9fb7dc222a1c2b4be4925ed9cebd952061dea0",
+      "path": "assets/video/pool.webm",
+      "bytes": 2898316,
+      "sha256": "f22467535a5ce577fe57991ce070eaffd1224be1704fb04beb77f71388bbc7e9",
+      "type": "video/webm"
+    },
+    {
+      "path": "assets/video/pool.webp",
+      "bytes": 93468,
+      "sha256": "ea68cbea4913c77cc57c1ec3e40bd38f15748b5d6676a59c06ed42f17f8e0b60",
       "type": "image/webp"
     },
     {
-      "path": "assets/video/thumb/night.webp",
-      "bytes": 24880,
-      "sha256": "b3a22dca6bb9e307a7a3b087254362d8647cece997c23a7f9637ef1f768753a6",
+      "path": "assets/video/skyline.webm",
+      "bytes": 671206,
+      "sha256": "4a3e989b16d917def98d5d1ec3f746099986de914bfe251c6063a91118132a31",
+      "type": "video/webm"
+    },
+    {
+      "path": "assets/video/skyline.webp",
+      "bytes": 72616,
+      "sha256": "4773f112105786edf1393c9d3960e5b12b7d9899461814e74e2d46cca4c63700",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/streets.webm",
+      "bytes": 2204331,
+      "sha256": "8bcd94d48d70031398b6c7c564ece93d63543b3c6637989b4456e408d6424e5b",
+      "type": "video/webm"
+    },
+    {
+      "path": "assets/video/streets.webp",
+      "bytes": 282924,
+      "sha256": "62a7dce7481cd845d362068e3ba657df00a9cc18bd7db35d0e08318495d81d19",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/beach.webp",
+      "bytes": 25448,
+      "sha256": "dae48b1a6ba01700af0470c6c67816fb2f002d281a895b3b43a17a1bea32a367",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/boulevard.webp",
+      "bytes": 32044,
+      "sha256": "339128455ac87c3f8826b91d3a321e4cf617608548a69340ede2a1916c07f046",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/canal.webp",
+      "bytes": 26334,
+      "sha256": "d21b939d4621fe6e24b7f8dbace28e17edbf5eefe1ff71fcef50b1eaf3ca5fbb",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/observatory.webp",
+      "bytes": 21638,
+      "sha256": "b8a8a4c6ab60cef9e388896ae3d0647ce624d8f7d5662331a5bbf9885322f24a",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/pool.webp",
+      "bytes": 20484,
+      "sha256": "2f86831069d245df31daaa36c41edab4f717acbdd2a4bc09f5f2499ac78cf258",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/skyline.webp",
+      "bytes": 19878,
+      "sha256": "4aab9e0e3fe7c14417164c69419b6a41498fe7a5ae2e20c2fc91123a838e1674",
+      "type": "image/webp"
+    },
+    {
+      "path": "assets/video/thumb/streets.webp",
+      "bytes": 62056,
+      "sha256": "c5c56d85e7170e16822cd1e71b5d750767b5e24dc41bf61d898bfac5b5cdb019",
       "type": "image/webp"
     },
     {
       "path": "assets/video/thumb/vinewood.webp",
-      "bytes": 16156,
-      "sha256": "ff48dae47966f207792997c5ee517ade8f84f6ffe7ab11ebc64fc8a8982e87a0",
+      "bytes": 17750,
+      "sha256": "59ad4b08ca67de5eece83f4f91a9a2e5ce9d4213b9d53778bd95ea0915801259",
       "type": "image/webp"
     },
     {
-      "path": "assets/video/thumb/wild.webp",
-      "bytes": 12250,
-      "sha256": "a35ed14c5dbce64787f3404f8b88a5888f10560967513cb9bccc82466b2dcb41",
-      "type": "image/webp"
-    },
-    {
-      "path": "assets/video/vinewood.mp4",
-      "bytes": 2098396,
-      "sha256": "8f11d1c5a7cf16774f0de1fe599e43c9123ac68796f562d59cb54bfaf2400507",
-      "type": "video/mp4"
+      "path": "assets/video/vinewood.webm",
+      "bytes": 756305,
+      "sha256": "31a07f6f7a50e2285943b2b15fa18cecdf5a814b92e0b1287a40ed7670a3f61f",
+      "type": "video/webm"
     },
     {
       "path": "assets/video/vinewood.webp",
-      "bytes": 48010,
-      "sha256": "74ef7f459fdeddc594add54954affa13224713448da540df19c85b88d15febd7",
-      "type": "image/webp"
-    },
-    {
-      "path": "assets/video/wild.mp4",
-      "bytes": 1650327,
-      "sha256": "ce29be3f79c43f0929c52189aa2ef189e4b3f67249d92a28a2f676042a5d37da",
-      "type": "video/mp4"
-    },
-    {
-      "path": "assets/video/wild.webp",
-      "bytes": 38362,
-      "sha256": "aca19db892b2eadf6912e57888a7898a0dcc4048adc7465da5c34d19bdc17bc1",
+      "bytes": 58104,
+      "sha256": "a0a934e5c4c1f70e447d3f8d654aa250f9e81b05826cd463e02239cfab0cc9a2",
       "type": "image/webp"
     }
   ]

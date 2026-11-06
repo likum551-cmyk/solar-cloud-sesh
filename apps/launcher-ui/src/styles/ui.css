@@ -32,10 +32,20 @@
   height: 100%;
   max-width: none;
   object-fit: cover;
+  object-position: var(--frame, 50% 50%);
 }
 /* The poster is the loop's first frame, so the video takes over without a visible change. */
 .backdrop__video { opacity: 0; transition: opacity 200ms linear; }
 .backdrop__video.is-playing { opacity: 1; }
+/* A reel passes from shot to shot through the ground (REEL_FADE_MS = 1500 in catalog.ts): the
+   shot going out sinks over 700 ms (linear), the next rises from 300 ms to 1400 ms. At the
+   crossing both are faint over Night Ground (the frame dips to about a quarter, never to black),
+   so their horizons never stack into a double exposure. Under a playing reel the poster is
+   hidden, so what shows through is the ground, not the lead's frame. */
+.backdrop__video.is-reel { transition: opacity 1100ms var(--ease-in-out) 300ms; }
+.backdrop__video.is-leaving { opacity: 0; transition: opacity 700ms linear; }
+.backdrop__layer.is-rolling { background: var(--ground); }
+.backdrop__layer.is-rolling .backdrop__img { visibility: hidden; }
 .backdrop__layer.is-drift .backdrop__img { animation: drift 48s var(--ease-in-out) infinite alternate; }
 .backdrop.is-paused .backdrop__img { animation-play-state: paused; }
 @keyframes drift {
@@ -58,7 +68,8 @@
     linear-gradient(270deg, rgb(10 9 7 / 0.66) 0, rgb(10 9 7 / 0.3) 22%, rgb(10 9 7 / 0) 36%);
 }
 .app--settings .scrim,
-.app--profile .scrim {
+.app--profile .scrim,
+.app--quests .scrim {
   background:
     linear-gradient(180deg, rgb(10 9 7 / 0.72) 0, rgb(10 9 7 / 0) calc(var(--rail-h) + 110px)),
     linear-gradient(0deg, rgb(10 9 7 / 0.9) 0, rgb(10 9 7 / 0.4) 36%, rgb(10 9 7 / 0) 64%),

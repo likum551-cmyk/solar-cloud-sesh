@@ -5,6 +5,7 @@
 .showroom,
 .profile,
 .settings,
+.quests,
 .auth {
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--col);
@@ -13,6 +14,7 @@
 .play,
 .profile,
 .settings,
+.quests,
 .auth {
   height: 100%;
   padding: 24px var(--gutter) var(--floor);
@@ -445,7 +447,8 @@
   padding: 16px 0;
   box-shadow: inset 0 -1px 0 var(--line-soft);
 }
-.facts dt {
+.facts dt,
+.quests__discord-label {
   font: 700 12px/1.3 var(--f-display);
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -457,6 +460,178 @@
 .facts__paste { flex-basis: 100%; display: grid; gap: 10px; margin-top: 6px; }
 .facts__paste-actions { display: flex; align-items: center; gap: 14px; }
 .profile__msg { margin-top: 14px; padding: 10px 14px; background: var(--panel-2); font-size: 14px; color: var(--ink-2); }
+
+/* ---------- quests --------------------------------------------------------------------- */
+/* The profile grammar: title, one line and the wallet figure bottom left on the graded corner;
+   one opaque panel on the right holding the Discord state and the quests, scrolling inside. */
+
+/* The shared screen grid; a quest row needs a reward, a sentence and a plate side by side, so the
+   column is wider than --col (DESIGN.md Layout). */
+.quests { --col: min(520px, 46vw); }
+.quests__plate { align-self: end; display: grid; gap: 18px; justify-items: start; min-width: 0; }
+.quests__title {
+  font: 800 clamp(64px, 7.4vw, 112px)/0.84 var(--f-display);
+  text-transform: uppercase;
+  text-shadow: 0 2px 28px rgb(0 0 0 / 0.4);
+}
+.quests__lead { max-width: 44ch; font-size: 16px; color: var(--ink-2); text-wrap: balance; }
+
+/* The wallet is Play's count block (`.count`): the figure, its two lines (the second explains the
+   bar), and the bar of coins earned here out of all this screen pays. */
+.purse { position: relative; }
+.purse .count__side { font-variant-numeric: tabular-nums; }   /* "N of M earned here" keeps its width as N grows */
+/* The credit after a claim: out of flow, right of the lines and level with them, so neither the
+   lines nor the bar move when it comes and goes; ink, never gold. */
+.purse__credit {
+  position: absolute;
+  left: 100%;
+  bottom: 15px;   /* the bar (3px) and the row gap (12px) */
+  padding-left: 16px;
+  white-space: nowrap;
+  font: 800 28px/1 var(--f-display);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  text-shadow: 0 1px 10px rgb(0 0 0 / 0.75);
+  animation: credit-rise 4200ms var(--ease-out) both;
+}
+@keyframes credit-rise {
+  0% { opacity: 0; transform: translate3d(0, 10px, 0); }
+  10%, 70% { opacity: 1; transform: none; }
+  100% { opacity: 0; transform: translate3d(0, -8px, 0); }
+}
+/* base.css shortens every animation to 1 ms under reduced motion, which would land this one on
+   its last, invisible keyframe: show the credit still instead (the 4.2 s timer removes it). */
+@media (prefers-reduced-motion: reduce) {
+  .purse__credit { animation: none; }
+}
+
+.quests__panel {
+  align-self: end;
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  min-height: 0;
+}
+/* A Profile facts row (`.facts__row`) as the panel's head: inset, centred, a full line under it. */
+.quests__discord {
+  align-items: center;
+  min-height: 72px;
+  padding: 16px 24px;
+  box-shadow: inset 0 -1px 0 var(--line);
+}
+/* One line in both states: the chip (and the linked name); unlinked with no Discord quest row, the
+   Link Discord plate pinned right. */
+.quests__discord-state { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.quests__discord-name { min-width: 0; font: 700 16px/1 var(--f-display); letter-spacing: 0.06em; text-transform: uppercase; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quests__discord-state .plate { flex: none; margin-left: auto; }
+.quests__note { margin: 14px 24px 0; }   /* on .profile__msg */
+
+/* A ledger: the list owns the columns (title, reward, next step) and every row is a subgrid of
+   them, so the rewards and the plates line up down the list whatever each row holds. The step
+   column is never narrower than a waiting row (the reopen icon and "Claim · 0:00"), so a wait
+   that ends moves nothing. */
+.quests__list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(140px, auto);
+  align-content: start;
+  column-gap: 16px;
+  min-height: 0;
+  margin: 0;
+  padding: 6px 24px;
+  list-style: none;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+/* The Settings panel's veils (`.settings__panel::before/::after`): rows leaving the list fade
+   instead of being sliced. At rest each sits over the list's 6px plus a row's 14px padding. */
+.quests__list::before,
+.quests__list::after {
+  content: '';
+  position: sticky;
+  z-index: 1;
+  display: block;
+  grid-column: 1 / -1;
+  height: 20px;
+  pointer-events: none;
+}
+.quests__list::before { top: 0; margin: -6px 0 -14px; background: linear-gradient(to bottom, var(--panel), rgb(16 14 11 / 0)); }
+.quests__list::after { bottom: 0; margin: -14px 0 -6px; background: linear-gradient(to top, var(--panel), rgb(16 14 11 / 0)); }
+
+/* One line per quest: the title leads; the reward and the next step sit together on the right. */
+.quest {
+  position: relative;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  align-items: center;
+  padding: 14px 0;
+  box-shadow: inset 0 -1px 0 var(--line-soft);
+}
+/* A row that takes focus (after its Start or Claim) draws its ring above the list's veils:
+   inside the row's height (the list clips above and below), out into the 24px side gutters. */
+.quest:focus-visible { z-index: 2; outline: none; }
+.quest:focus-visible::before {
+  content: '';
+  position: absolute;
+  inset: 2px -10px;
+  outline: 2px solid var(--sun-hi);
+  pointer-events: none;
+}
+.quest__body { grid-column: 1; display: grid; gap: 4px; min-width: 0; }
+.quest__amt { grid-column: 2; justify-self: end; }
+.quest__act { grid-column: 3; }
+.quest__name { font: 800 22px/0.95 var(--f-display); letter-spacing: 0.02em; text-transform: uppercase; }
+.quest__hint { font-size: 13px; color: var(--ink-3); }
+.quest__error { display: flex; gap: 6px; align-items: flex-start; font-size: 13px; color: var(--danger); }
+.quest__error .icon { flex: none; margin-top: 2px; }
+.quest__amt {
+  font: 700 18px/1 var(--f-display);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+.quest__act { display: flex; align-items: center; justify-content: flex-end; gap: 4px; min-height: 32px; }
+.quest__reopen.plate--sm { width: 32px; padding: 0; }
+
+/* A started quest counts down inside its Claim plate: the ghost plate keeps its edge, and a light
+   fill grows left to right toward the moment it opens, ticking with the clock. */
+.quest .quest__wait.plate:disabled:not(.is-busy) { background: var(--line-2); color: var(--ink-2); cursor: default; }
+.quest .quest__wait.plate:disabled:not(.is-busy)::before { display: block; }
+.quest .quest__wait.plate::after {
+  content: '';
+  position: absolute;
+  inset: 1px;
+  background: rgb(255 244 224 / 0.16);
+  clip-path: polygon(0 0, calc(100% - var(--c) + 0.6px) 0, 100% calc(var(--c) - 0.6px), 100% 100%, 0 100%);
+  transform: scaleX(var(--fill, 0));
+  transform-origin: left;
+  transition: transform 260ms linear;
+}
+.quest__clock { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+/* Done quests fold to one quiet line at the end of the list; coming-soon quests keep their size
+   but step back to ink-2, so neither competes with what can be done now. */
+.quest--claimed .quest__name { font-size: 18px; color: var(--ink-3); }
+/* Still one line at the narrowest panel: the title gives way (ellipsis, the full title is the
+   row's accessible name and tooltip), the date never wraps. */
+.quest--claimed .quest__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quest--claimed .quest__hint { white-space: nowrap; }
+.quest--claimed .quest__body { grid-column: 1 / 3; grid-template-columns: minmax(0, auto) auto; justify-content: start; align-items: baseline; column-gap: 12px; }
+.quest--soon .quest__name,
+.quest--locked .quest__name,
+.quest--unknown .quest__name { color: var(--ink-2); }
+.quest--soon .quest__amt,
+.quest--locked .quest__amt,
+.quest--unknown .quest__amt { color: var(--ink-3); }
+
+.quests__empty { padding: 28px 24px; }   /* on .record--empty */
+.quests__fine {
+  padding: 14px 24px 18px;
+  font-size: 12px;
+  color: var(--ink-3);
+  box-shadow: inset 0 1px 0 var(--line);
+}
 
 .vip { display: grid; gap: 10px; padding-top: 18px; }
 .vip__label {
@@ -604,8 +779,7 @@
 .auth__lead { font-size: 15px; color: var(--ink-2); }
 .auth__lead strong { color: var(--ink); }
 .auth__note { font-size: 13px; color: var(--ink-3); }
-.auth__notice { padding: 10px 12px; background: var(--panel-2); font-size: 14px; color: var(--ink-2); }
-.auth__error { font-size: 14px; }
+.auth__notice { padding: 10px 12px; background: var(--panel-2); font-size: 14px; color: var(--ink-2); }.auth__error { font-size: 14px; }
 .auth__or {
   display: flex;
   align-items: center;

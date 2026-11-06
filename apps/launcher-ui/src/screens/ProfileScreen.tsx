@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { describeFailure } from '../lib/errors';
 import { tokenFromPaste } from '../lib/links';
+import { ACCOUNT_URL } from '../lib/site';
 import type { Balance, OwnedItem } from '../lib/schemas';
 import { useApp } from '../state/AppState';
 import { vipWindow, type VipWindow } from '../state/shop';
@@ -14,13 +15,13 @@ import { Chip, Code, Field, Icon, Plate } from '../ui/primitives';
 const DAY = 86_400_000;
 
 export function ProfileScreen() {
-  const { auth, api, authDispatch, openExternal, demo, verifyEmail, notice, clearNotice } = useApp();
+  const { auth, api, authDispatch, openExternal, demo, verifyEmail, notice, clearNotice, windowState } = useApp();
   const now = useNow(60_000);
   const [items, setItems] = useState<OwnedItem[] | null>(null);
   /** Wallet balances; 'error' when the platform did not answer (shown as such, never as 0). */
   const [balances, setBalances] = useState<Balance[] | 'error' | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'resend' | 'link' | 'unlink' | 'verify' | null>(null);
+  const [busy, setBusy] = useState<'resend' | 'verify' | null>(null);
   const [pasting, setPasting] = useState(false);
   const [pasted, setPasted] = useState('');
 
@@ -30,6 +31,19 @@ export function ProfileScreen() {
     api.wallet().then((r) => { if (!off) setBalances(r.balances); }).catch(() => { if (!off) setBalances('error'); });
     return () => { off = true; };
   }, [api]);
+
+  // After "Link Discord" or "Unlink" sent the player to the website: re-read the account when the
+  // window is focused again, so a change made there shows here.
+  const [linkOpened, setLinkOpened] = useState(false);
+  useEffect(() => {
+    if (!linkOpened || !windowState.focused) return;
+    let off = false;
+    api.me().then(
+      ({ account }) => { if (!off) authDispatch({ type: 'ACCOUNT', account }); },
+      (e: unknown) => console.warn('[profile] account refresh failed:', e),
+    );
+    return () => { off = true; };
+  }, [linkOpened, windowState.focused, api, authDispatch]);
 
   // A handled email link (AppState) reports here once.
   useEffect(() => {
@@ -42,7 +56,7 @@ export function ProfileScreen() {
   const a = auth.account;
   const vip = items ? vipWindow(items, now) : null;
   const pastedToken = tokenFromPaste(pasted, 'verifyEmail');
-  const run = async (kind: 'resend' | 'link' | 'unlink' | 'verify', f: () => Promise<string | null>) => {
+  const run = async (kind: 'resend' | 'verify', f: () => Promise<string | null>) => {
     setBusy(kind);
     setMsg(null);
     try { setMsg(await f()); } catch (e) { setMsg(describeFailure(e)); } finally { setBusy(null); }
@@ -122,21 +136,22 @@ export function ProfileScreen() {
                 <>
                   <span>{a.discord.username ?? a.discord.id}</span>
                   <Chip tone="done">Linked</Chip>
-                  <button type="button" className="text-link" disabled={busy !== null} onClick={() => run('unlink', async () => {
-                    await api.discordUnlink();
-                    const { account } = await api.me();
-                    authDispatch({ type: 'ACCOUNT', account });
-                    return 'Discord unlinked.';
-                  })}>Unlink</button>
+                  {/* Unlinking asks for the password, so it runs on the website too. */}
+                  <button type="button" className="text-link" disabled={busy !== null} onClick={() => {
+                    openExternal(ACCOUNT_URL);
+                    setLinkOpened(true);
+                    setMsg('We opened your account page on solar-rp.com. Unlink Discord there; it shows here when you come back to this window.');
+                  }}>Unlink <Icon name="external" /></button>
                 </>
               ) : (
                 <>
                   <span className="dim">Not linked</span>
-                  <button type="button" className="text-link" disabled={busy !== null} onClick={() => run('link', async () => {
-                    const flow = await api.discordLinkStart();
-                    openExternal(flow.authorizeUrl);
-                    return 'Approve Solar RP in your browser, then come back here.';
-                  })}>Link Discord <Icon name="external" /></button>
+                  {/* Linking runs on the website: it asks for the password, then makes the Discord round trip. */}
+                  <button type="button" className="text-link" disabled={busy !== null} onClick={() => {
+                    openExternal(ACCOUNT_URL);
+                    setLinkOpened(true);
+                    setMsg('We opened your account page on solar-rp.com. Link Discord there; it shows here when you come back to this window.');
+                  }}>Link Discord <Icon name="external" /></button>
                 </>
               )}
             </dd>

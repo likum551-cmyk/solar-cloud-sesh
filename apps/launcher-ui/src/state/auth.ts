@@ -3,11 +3,9 @@ import type { Account } from '../lib/schemas';
 // The auth flow as a pure reducer: every screen of the signed-out frame is a `view`, every
 // network outcome an event. Side effects (API calls, token storage) live in AppState.tsx.
 
+// There is no register view: accounts are created on the website (lib/site.ts SIGNUP_URL).
 export type AuthView =
   | 'login'
-  | 'register'
-  /** After register: "check your inbox". */
-  | 'verifyNotice'
   | 'forgot'
   | 'forgotSent'
   /** Paste the reset token from the email and choose a new password. */
@@ -33,7 +31,7 @@ export type AuthState =
       error: string | null;
       /** Epoch ms until which login is refused (429 Retry-After). */
       lockedUntil: number | null;
-      /** The address the last register / forgot request used, for the notice copy. */
+      /** The address the last forgot-password request used, for the notice copy. */
       email: string | null;
       discord: DiscordFlow | null;
       /** Why we are signed out, shown once on the login frame (session expired, logged out). */
@@ -47,7 +45,6 @@ export type AuthEvent =
   | { type: 'SHOW'; view: AuthView }
   | { type: 'SUBMIT'; now: number }
   | { type: 'FAIL'; error: string; retryAfterSeconds?: number | null; now: number }
-  | { type: 'REGISTERED'; email: string }
   | { type: 'FORGOT_SENT'; email: string }
   | { type: 'RESET_DONE' }
   | { type: 'DISCORD_STARTED'; flowId: string; pollSecret: string }
@@ -97,8 +94,6 @@ export function authReducer(s: AuthState, e: AuthEvent): AuthState {
         error: e.error,
         lockedUntil: e.retryAfterSeconds ? e.now + e.retryAfterSeconds * 1000 : s.lockedUntil,
       };
-    case 'REGISTERED':
-      return { ...s, view: 'verifyNotice', busy: false, error: null, email: e.email };
     case 'FORGOT_SENT':
       return { ...s, view: 'forgotSent', busy: false, error: null, email: e.email };
     case 'RESET_DONE':

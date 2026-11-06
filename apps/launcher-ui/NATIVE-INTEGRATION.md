@@ -16,7 +16,7 @@ Source of truth for the shapes: `src/lib/bridge.ts`. Incoming messages are zod-v
 | Output | What | Size (last build) |
 |---|---|---|
 | `dist/index.html` | The whole SPA in one file: JS, CSS and the 4 woff2 fonts inlined. No external URL is fetched at runtime besides `./assets/…` and the platform API. | 1,538,345 B |
-| `dist/assets/**` | GTA V footage and stills: 5 muted H.264 MP4 loops, each with a WebP poster and a WebP card thumbnail, 7 WebP stills and 5 WebP product thumbnails (ASSETS.md). Copied verbatim from `public/assets/`. | 12,484,333 B, 28 files (27 plus `manifest.json`) |
+| `dist/assets/**` | GTA V footage and stills (ASSETS.md), copied verbatim from `public/assets/`: 8 muted VP9 WebM clips, each with a WebP poster and a WebP card thumbnail, plus 7 WebP stills and 5 WebP product thumbnails. | 16,123,459 B, 37 files (36 plus `manifest.json`), 2026-11-06 |
 | `dist/assets/manifest.json` | `{version:1,totalBytes,files:[{path,bytes,sha256,type}]}`: every asset with its SHA-256 and MIME type, sorted. | ≈3 KB |
 
 **Embedding.** Point CMake's `GAGE_UI_HTML_IN` at `${CMAKE_SOURCE_DIR}/apps/launcher-ui/dist/index.html`. Today it points at `docs/archive/web-legacy/dist/index.html`. `tools/embed_ui.cmake` needs no change, because the file is plain bytes like before. `CMakeLists.txt` is owned by the platform agent, so this one-line change goes through them.
@@ -35,7 +35,7 @@ Source: "..\apps\launcher-ui\dist\assets\*"; DestDir: "{app}\launcher-assets"; F
 
 ## 2. URL → file mapping under `https://app.gage/`
 
-The page loads from `https://app.gage/index.html` and requests its assets by relative URL (`./assets/video/city.mp4` resolves to `https://app.gage/assets/video/city.mp4`). The existing `WebResourceRequested` filter `https://app.gage/*` already sees every request. Extend `ResHandler::Invoke` as follows:
+The page loads from `https://app.gage/index.html` and requests its assets by relative URL (`./assets/video/skyline.webm` resolves to `https://app.gage/assets/video/skyline.webm`). The existing `WebResourceRequested` filter `https://app.gage/*` already sees every request. Extend `ResHandler::Invoke` as follows:
 
 | Request (query and fragment stripped) | Response |
 |---|---|
@@ -46,24 +46,24 @@ The page loads from `https://app.gage/index.html` and requests its assets by rel
 Rules for `<rel>`:
 - Serve only paths that appear in `manifest.json`. That allow-list is the whole path validation: no `..`, no `\`, no `%`-escapes, no drive letters ever reach the file system.
 - The manifest is read once at startup from `{exeDir}\launcher-assets\manifest.json`. If the manifest is missing or unreadable, log it and serve 404 for every asset. The UI then falls back to its black ground with the emblem and the interface intact (the boot cover lifts after 5 s without a picture); it never hangs.
-- Optional, recommended: check each file's size against the manifest on first serve (cheap). A full SHA-256 check of all 12.4 MB costs about 35 ms if you want it at startup. On a mismatch, log and 404.
-- Serve each file whole from an `SHCreateStreamOnFileEx` stream (read-only, `STGM_SHARE_DENY_WRITE`). **Range requests are not needed, video included.** A `<video>` over a whole-file 200 is not seekable and cannot loop reliably, so the UI fetches each MP4 once with `fetch()` into a Blob and plays it from a `blob:` URL (`src/media/Backdrop.tsx`). Verified in Chrome for Testing 156 against a server that sends no `Accept-Ranges`: seekable to the full duration and wrapping at the loop point. If you ever add Range support (`206`, `Accept-Ranges: bytes`), nothing changes on the UI side.
-- Send `Content-Length` with every asset; the MP4s are 0.9-3.3 MB each.
+- Optional, recommended: check each file's size against the manifest on first serve (cheap). A full SHA-256 check of all 16.1 MB costs roughly 45 ms if you want it at startup (35 ms was measured for the earlier 12.4 MB set). On a mismatch, log and 404.
+- Serve each file whole from an `SHCreateStreamOnFileEx` stream (read-only, `STGM_SHARE_DENY_WRITE`). **Range requests are not needed, video included.** A `<video>` over a whole-file 200 is not seekable and cannot loop reliably, so the UI fetches each clip once with `fetch()` into a Blob and plays it from a `blob:` URL (`src/media/Backdrop.tsx`). This was verified in Chrome for Testing 156 against a server that sends no `Accept-Ranges`: the video was seekable to its full duration and wrapped at the loop point. On 2026-11-06 the WebM clips played from Blobs in headless Edge 156, and the reel's dissolve was caught mid-blend. If you ever add Range support (`206`, `Accept-Ranges: bytes`), nothing changes on the UI side.
+- Send `Content-Length` with every asset; the WebM clips are 0.7-3.4 MB each.
 - No CORS headers: every asset request is same-origin.
 
 | Extension | Content-Type |
 |---|---|
-| `.mp4` | `video/mp4` |
+| `.webm` | `video/webm` (the clips) |
 | `.webp` | `image/webp` |
 | `.json` | `application/json` |
-| `.webm` / `.avif` | `video/webm` / `image/avif` (none ship today; mapped so a VP9 fallback or AVIF stills can be added without a host change) |
+| `.mp4` / `.avif` | `video/mp4` / `image/avif` (none ship today; no MP4 ships since 2026-11-06) |
 | `.png` / `.jpg` / `.glb` / `.hdr` / `.ktx2` / `.woff2` | `image/png` / `image/jpeg` / `model/gltf-binary` / `image/vnd.radiance` / `image/ktx2` / `font/woff2` (none ship today; `asset-manifest.mjs` refuses an unknown extension) |
 
 The manifest carries each file's `type`; the host may take `Content-Type` from it instead of keeping its own table.
 
 **Page background.** Change `kBgColor` from `#0b0e15` to the new ground `#07080a`, i.e. `{ 255, 7, 8, 10 }`. It shows during resize and before first paint.
 
-**H.264.** The loops are H.264 High (`avc1.640029`). WebView2 decodes it through Windows Media Foundation. On Windows N/KN without the Media Feature Pack, `canPlayType` returns `''` and the UI shows each loop's poster instead (a still, by design). No host change is needed for that.
+**VP9.** The clips are VP9 profile 0 WebM (`vp09.00.40.08`). Chromium, and so WebView2, decodes VP9 itself (libvpx, or the GPU where there is one), not through Windows Media Foundation, so the clips also play on Windows N/KN without the Media Feature Pack, where the earlier H.264 loops fell back to posters. Where `canPlayType` still says no, the UI shows each clip's poster instead (a still, by design). No host change is needed beyond mapping `.webm` to `video/webm`.
 
 ---
 
@@ -93,14 +93,14 @@ Status key:
 | `{"type":"tokenGet"}` | **NEW** | Reply `{"type":"token","token":S\|null}` within 1.5 s; the UI treats silence as "no token". |
 | `{"type":"tokenSet","token":S}` | **NEW** | Store the session token with DPAPI (`CryptProtectData`, user scope, `CRYPTPROTECT_UI_FORBIDDEN`) in `%LOCALAPPDATA%\GAGE-MP\session.bin`. Write atomically: temp file, then `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`. Reply `tokenSaved`. Refuse an empty token or one over 512 chars with `ok:false`. Never log the token. |
 | `{"type":"tokenClear"}` | **NEW** | Delete `session.bin` and reply `tokenSaved` (`ok:true` when the file is gone, including when it never existed). |
-| `{"type":"openExternal","url":S}` | **NEW** | Only `https://` URLs of at most 2048 chars: `ShellExecuteW(nullptr, L"open", url, …)`, then reply `opened`. Refuse anything else with `ok:false`. Used for checkout pages and the Discord authorize page. |
+| `{"type":"openExternal","url":S}` | **NEW** | Only `https://` URLs of at most 2048 chars: `ShellExecuteW(nullptr, L"open", url, …)`, then reply `opened`. Refuse anything else with `ok:false`. Used for checkout pages, the Discord log-in authorize page, quest pages, and two website pages: sign-up (`https://solar-rp.com/signup/`; the launcher creates no accounts) and the account page (`https://solar-rp.com/account/`), where Discord is linked and unlinked behind the password. The launcher calls neither `POST /v1/me/discord/link` nor `DELETE /v1/me/discord`. |
 | `fetch`, `refresh`, `ping`, `addFavorite`, `removeFavorite`, `clearFavorites`, `addRecent`, `clearRecents` | legacy, **unused** | The new UI never sends these: the server list comes from the platform API (`GET /v1/servers`). Keep them if the legacy SPA must still run. |
 
 ### 3.2 native → JS
 
 | Message | Status | When |
 |---|---|---|
-| `{"type":"settings","gamePath":S,"playerName":S,"language":S,"autoUpdate":B,"startMinimized":B,"closeGame":B,"version":S,"launchOptions":S,"apiBase":S}` | changed | After `ready`, `getSettings`, `saveSetting` and `browseGamePath`. **`apiBase`** is the platform API origin, e.g. `https://api.gage-mp.net`, with no trailing path. Add `kDefaultApiBase` to `tools/build_config.h.in`, overridable by an `api_base=` line in `gage_mp.cfg` the way `list_url` is. Accept only `https://…`, or `http://127.0.0.1[:port]` / `http://localhost[:port]` for development. Without it every API call fails with "not configured". |
+| `{"type":"settings","gamePath":S,"playerName":S,"language":S,"autoUpdate":B,"startMinimized":B,"closeGame":B,"version":S,"launchOptions":S,"apiBase":S}` | changed | After `ready`, `getSettings`, `saveSetting` and `browseGamePath`. **`apiBase`** is the platform API base: an origin with an optional plain path prefix (wired: the build's `GAGE_API_BASE`, default `https://solar-rp.com/api`, which Caddy strips to the platform's `/v1/...`), overridable by an `api_base=` line in `gage_mp.cfg` (`api_base=off` = demo). Only `https://…`, or `http://127.0.0.1[:port]` / `http://localhost[:port]` for development (`apps/launcher/api_base.h`). Without it every API call fails with "not configured". |
 | `{"type":"status","text":S}` | legacy | During launch, as before. |
 | `{"type":"launchStage","stage":"preflight"\|"starting_store"\|"waiting_for_game"\|"injecting"\|"injected"}` | **NEW** | At each transition, in this order: integrity check (code 11 is decided here) → store asked to start the game → polling for the game process → injecting → injected. Skip stages that do not apply; for example, attaching to a running game goes `preflight` → `injecting`. |
 | `{"type":"launchResult","ok":B,"code":N,"error":S}` | legacy, + code 12 | As before. **New code 12**: no join token, because the reply to `joinTokenNeeded` had `token:null` or did not come within 15 s. Put the `joinToken.error` text in `error`. The game is left running, and pressing PLAY again attaches to it. |
@@ -128,7 +128,9 @@ A join token lives `JOIN_TOKEN_TTL_SECONDS`, 60 s by default, and a cold GTA V s
 5. The engine sends `join_token` in its connect packet, and the game server redeems it with `POST /internal/game/verify`. See `apps/platform/docs/game-server-contract.md`.
 6. Native deletes `join_token` from the registry once the engine has read it, or at the latest when the game exits. The value is single-use and worthless after 60 s, but it should not sit in the registry.
 
-If the reply is `token:null`, or nothing arrives within 15 s, native sends `launchResult` `{ok:false, code:12, error:<joinToken.error or "No answer from the launcher UI.">}`.
+If the reply is `token:null`, or nothing arrives within 15 s, native sends `launchResult` `{ok:false, code:12, error:<joinToken.error or "No answer from the launcher window.">}`.
+
+**Wired (protocol v8):** `launchStage`, `joinTokenNeeded` / `joinToken`, `game` and code 12 in `apps/launcher/gage_gui.cpp` (`DoLaunch`, `AskJoinToken`); the engine reads and clears `join_token` in `apps/engine/gage_mp.cpp` `Run()` and sends it in the protocol v8 `JoinAuth` message right after `Hello` (docs/api/protocol.md "v8: accounts"). Deep links (3.4) are not wired yet.
 
 ### 3.4 Deep links (`gage-mp://`)
 
@@ -188,7 +190,7 @@ The server-list polling (every 15 s) stops on the same visibility, game and laun
 |---|---|
 | No route to change the account email | Settings shows the email read-only. |
 | No VIP expiry field | The UI derives VIP time from the owned `vip` entitlement grants (`vipWindow()`, documented as the client's reading of the ledger). |
-| No per-server art field | Footage and card art by keywords in the server name and tags (harbor/port/beach → harbor; vinewood/hills/boulevard → vinewood; race/drift/street/night/police → night; freeroam/sandbox/county → wild; downtown/city → city), otherwise rotated by list position (`serverArt()` in `src/media/catalog.ts`). An optional `art: "city"\|"harbor"\|"wild"\|"night"\|"vinewood"` field on the server would let the operator choose. |
+| No per-server art field | Footage and card art are picked by keywords in the server name and tags (`serverArt()` in `src/media/catalog.ts`): SOL/sun → beach; LUNA/moon/night → observatory; TERRA/race/drift/street/police → streets; harbor/port/beach/coast → beach; vinewood/hills → vinewood; roleplay → boulevard; canal/freeroam/sandbox/county → canal; party/club/pool → pool; downtown/city → skyline. Any other server is rotated by its list position. An optional `art` field on the server, holding one of the 8 clip names in `CLIPS`, would let the operator choose. |
 | No per-product art field | Still by first item-grant key prefix: `vehicle.*` → vehicle, `outfit.*` → outfit, other items → watch; VIP → vip; otherwise coins (`productStill()` over `showroomModelFor()`). The product schema's `imageUrl` is not used: a remote image would need a CSP and host decision. |
 | No eligibility check without minting a join token | The PLAY gate mints a token that the injection-time token voids (3.3). |
 
@@ -197,14 +199,14 @@ The server-list polling (every 15 s) stops on the same visibility, game and laun
 ## 7. Checklist for the native pass
 
 1. `GAGE_UI_HTML_IN` → `apps/launcher-ui/dist/index.html` (through the CMake owner).
-2. `ResHandler`: serve `/assets/<rel>` from `{exeDir}\launcher-assets\` against `manifest.json`, with `video/mp4` for `.mp4` (section 2); set `kBgColor` to `#07080a`.
+2. `ResHandler`: serve `/assets/<rel>` from `{exeDir}\launcher-assets\` against `manifest.json`, with `video/webm` for `.webm` (section 2); set `kBgColor` to `#07080a`.
 3. `settings` gains `apiBase` (`kDefaultApiBase` + `api_base=` override) and `launchOptions`; `saveSetting` accepts `launchOptions`.
 4. Add `toggleMaximize`, `tokenGet`/`tokenSet`/`tokenClear` (DPAPI), `openExternal` (https only) and `joinToken`.
 5. Send `window`, `game`, `launchStage`, `joinTokenNeeded` and `deepLink`; add launch result code 12.
 6. Registry: `join_token` and `server_id` for the engine, deleted after use; the engine sends `join_token` in its connect packet.
 7. Installer: the `{app}\launcher-assets` tree (delete, then copy) and the `gage-mp://` protocol keys; second-instance URL forwarding over `WM_COPYDATA`.
 8. Verify inside the exe:
-   - the boot cover, then the city loop playing and looping past its 11.5 s mark;
+   - the boot cover, then the sign-in reel (`skyline`) playing and, about 10 s in, passing through the dark over 1.5 s into the next shot (`canal`), never a hard cut;
    - drag, snap and double-click on the rail;
    - minimize → the video pauses and the GPU drops to idle (render pause);
    - log in → the token survives a restart;

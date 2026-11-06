@@ -45,7 +45,6 @@ export const loginResultSchema = z.object({
 });
 export type LoginResult = z.infer<typeof loginResultSchema>;
 
-export const registerResultSchema = z.object({ verificationRequired: z.boolean() });
 export const meSchema = z.object({ account: accountSchema });
 export const sentSchema = z.object({ sent: z.literal(true) });
 export const okSchema = z.object({ ok: z.literal(true) });
@@ -183,6 +182,43 @@ export const ownedItemSchema = z.object({
 });
 export type OwnedItem = z.infer<typeof ownedItemSchema>;
 export const ownedItemsSchema = z.object({ items: z.array(ownedItemSchema) });
+
+// Quests (platform src/quests/service.ts QuestView). `kind` is discord_link | discord_guild | visit,
+// `status` available | started | claimable | claimed | locked, `lockReason` discord_required |
+// discord_already_claimed | not_available; all read as strings (see the note at the top).
+export const questSchema = z.object({
+  slug: z.string(),
+  kind: z.string(),
+  title: z.string(),
+  description: z.string(),
+  /** The page a visit quest opens; null for the other kinds. */
+  url: z.string().nullable(),
+  reward: z.object({ currency: z.string(), amount: z.number().int() }),
+  sort: z.number(),
+  status: z.string(),
+  lockReason: z.string().nullable(),
+  startedAt: isoDate.nullable(),
+  /** Visit quests: when the claim opens (startedAt + visitMinSeconds). */
+  claimableAt: isoDate.nullable(),
+  /** Whole seconds until claimableAt when the server answered, 0 once it passed; null when not started. */
+  waitSeconds: z.number().int().min(0).nullable(),
+  claimedAt: isoDate.nullable(),
+});
+export type Quest = z.infer<typeof questSchema>;
+export const questListSchema = z.object({
+  discordLinked: z.boolean(),
+  visitMinSeconds: z.number().int().min(0),
+  quests: z.array(questSchema),
+});
+export type QuestList = z.infer<typeof questListSchema>;
+export const questStartSchema = z.object({ quest: questSchema });
+export const questClaimSchema = z.object({
+  quest: questSchema,
+  credited: z.object({ currency: z.string(), amount: z.number().int() }),
+  /** The wallet balance in `credited.currency` after the credit. */
+  balance: z.number(),
+});
+export type QuestClaim = z.infer<typeof questClaimSchema>;
 
 export const settingsViewSchema = z.object({
   settings: z.record(z.string(), z.unknown()),

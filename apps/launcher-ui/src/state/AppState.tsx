@@ -14,7 +14,7 @@ import { deriveUpdateView, initialUpdateGate, updateGateReducer, type UpdateView
 // The app's single state owner: bridge, API client, auth, launch, local settings, window state
 // and the server list. Screens read it through useApp(); every side effect lives here.
 
-export type Screen = 'play' | 'shop' | 'profile' | 'settings';
+export type Screen = 'play' | 'shop' | 'quests' | 'profile' | 'settings';
 
 export interface WindowState {
   focused: boolean;
@@ -141,7 +141,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const updateView = useMemo(() => deriveUpdateView(updateGate), [updateGate]);
   const [screen, setScreen] = useState<Screen>(() => {
     const s = new URLSearchParams(search).get('screen');
-    return demo && (s === 'shop' || s === 'profile' || s === 'settings') ? s : 'play';
+    return demo && (s === 'shop' || s === 'quests' || s === 'profile' || s === 'settings') ? s : 'play';
   });
   const [windowState, setWindowState] = useState<WindowState>({ focused: true, visible: true, maximized: false });
   const [gameRunning, setGameRunning] = useState(false);

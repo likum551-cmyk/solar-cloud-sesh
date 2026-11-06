@@ -2,16 +2,16 @@ import type { z } from 'zod';
 import { ApiFailure } from './errors';
 import {
   balancesSchema, discordPollSchema, discordStartSchema, errorBodySchema, joinResultSchema, loginResultSchema, meSchema,
-  okSchema, orderEnvelopeSchema, ordersSchema, ownedItemsSchema, passwordChangedSchema, productsSchema, registerResultSchema,
-  revokedSchema, sentSchema, serversSchema, sessionsSchema, settingsViewSchema,
+  okSchema, orderEnvelopeSchema, ordersSchema, ownedItemsSchema, passwordChangedSchema, productsSchema, questClaimSchema,
+  questListSchema, questStartSchema, revokedSchema, sentSchema, serversSchema, sessionsSchema, settingsViewSchema,
 } from './schemas';
 
 // The launcher's only door to the platform API. Every route path lives here (ROUTES) so the
 // client can be re-aligned with the platform's docs/api.md in one file. Every response is
 // validated with zod; every failure becomes an ApiFailure (see errors.ts).
 
+// No register route: accounts are created on the website (lib/site.ts SIGNUP_URL).
 export const ROUTES = {
-  register: '/v1/auth/register',
   login: '/v1/auth/login',
   logout: '/v1/auth/logout',
   verifyEmail: '/v1/auth/verify-email',
@@ -21,14 +21,15 @@ export const ROUTES = {
   discordStart: '/v1/auth/discord/start',
   discordPoll: '/v1/auth/discord/poll',
   discordComplete: '/v1/auth/discord/complete',
-  discordLink: '/v1/me/discord/link',
-  discordUnlink: '/v1/me/discord',
+  // No Discord link or unlink route: both need the password and run on the website (lib/site.ts ACCOUNT_URL).
   me: '/v1/me',
   password: '/v1/me/password',
   sessions: '/v1/me/sessions',
   settings: '/v1/me/settings',
   wallet: '/v1/me/wallet',
   items: '/v1/me/items',
+  /** GET the list; POST `${quests}/<slug>/start` and `${quests}/<slug>/claim`. */
+  quests: '/v1/me/quests',
   servers: '/v1/servers',
   join: '/v1/game/join',
   products: '/v1/shop/products',
@@ -98,8 +99,6 @@ export function createApi(opts: ApiOptions) {
 
   return {
     // --- auth -----------------------------------------------------------------------------------
-    register: (b: { email: string; username: string; password: string }) =>
-      call({ method: 'POST', path: ROUTES.register, body: b, schema: registerResultSchema }),
     login: (b: { identifier: string; password: string; deviceName?: string }) =>
       call({ method: 'POST', path: ROUTES.login, body: b, schema: loginResultSchema }),
     logout: () => call({ method: 'POST', path: ROUTES.logout, auth: true, schema: null }),
@@ -113,8 +112,6 @@ export function createApi(opts: ApiOptions) {
       call({ method: 'POST', path: ROUTES.discordPoll, body: { flowId, pollSecret }, schema: discordPollSchema }),
     discordComplete: (flowId: string, pollSecret: string, username: string) =>
       call({ method: 'POST', path: ROUTES.discordComplete, body: { flowId, pollSecret, username }, schema: loginResultSchema }),
-    discordLinkStart: () => call({ method: 'POST', path: ROUTES.discordLink, body: {}, auth: true, schema: discordStartSchema }),
-    discordUnlink: () => call({ method: 'DELETE', path: ROUTES.discordUnlink, auth: true, schema: null }),
 
     // --- the signed-in account ------------------------------------------------------------------
     me: () => call({ method: 'GET', path: ROUTES.me, auth: true, schema: meSchema }),
@@ -128,6 +125,13 @@ export function createApi(opts: ApiOptions) {
       call({ method: 'PUT', path: ROUTES.settings, auth: true, body: expectedVersion === undefined ? { settings } : { settings, expectedVersion }, schema: settingsViewSchema }),
     wallet: () => call({ method: 'GET', path: ROUTES.wallet, auth: true, schema: balancesSchema }),
     items: () => call({ method: 'GET', path: ROUTES.items, auth: true, schema: ownedItemsSchema }),
+
+    // --- quests (apps/platform docs/api.md "Quests") ----------------------------------------------
+    quests: () => call({ method: 'GET', path: ROUTES.quests, auth: true, schema: questListSchema }),
+    /** Records the start (idempotent: a repeat keeps the first time); then open `quest.url`. */
+    startQuest: (slug: string) => call({ method: 'POST', path: `${ROUTES.quests}/${encodeURIComponent(slug)}/start`, auth: true, schema: questStartSchema }),
+    /** Pays the reward once; refusals: quest_wait (409, Retry-After), discord_required (403), already_claimed, ... */
+    claimQuest: (slug: string) => call({ method: 'POST', path: `${ROUTES.quests}/${encodeURIComponent(slug)}/claim`, auth: true, schema: questClaimSchema }),
 
     // --- play -----------------------------------------------------------------------------------
     servers: () => call({ method: 'GET', path: ROUTES.servers, schema: serversSchema }),
@@ -183,7 +187,9 @@ export async function readResponse(res: Response, schema: z.ZodType | null): Pro
   if (body === null || code === 'internal_error' || (res.status >= 500 && res.status !== 503)) {
     throw new ApiFailure('server', message, { status: res.status, code, details });
   }
-  throw new ApiFailure('refused', message, { status: res.status, code, details });
+  // A refusal may say when to try again (409 quest_wait sends Retry-After).
+  const retry = Number(res.headers.get('Retry-After'));
+  throw new ApiFailure('refused', message, { status: res.status, code, details, retryAfterSeconds: Number.isFinite(retry) && retry > 0 ? retry : null });
 }
 
 /** A fresh Idempotency-Key (8-64 chars of [A-Za-z0-9_-]) for one checkout attempt. */

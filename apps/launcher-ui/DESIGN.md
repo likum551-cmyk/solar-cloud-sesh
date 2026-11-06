@@ -195,7 +195,7 @@ Provenance: this world is owner-pinned, not chosen by a direction roll, and ther
 Density is low on Play and the Shop showroom (a hero and a column of five cards), and higher on the reading surfaces (orders, owned, settings, profile facts), where the footage drops to a near-solid ground and opaque panels carry the content.
 
 **Key Characteristics:**
-- Full-bleed GTA V footage or stills on every screen; one continuous held shot per loop, never a montage.
+- Full-bleed GTA V footage or stills on every screen. Footage plays as a curated reel of held single shots, each passing to the next through the ground, never a cut.
 - Grading at the edges only: a band under the rail, the bottom-left corner the type stands on, a falloff on the right for the list.
 - Warm night ink for all type and panels, so the picture carries the colour.
 - Solar gold is rationed to the one active choice; green only for "online"; ember and red only for product states.
@@ -231,7 +231,7 @@ NOON (chosen by the owner, 2026-11-02, for the Solar RP rebrand): warm near-blac
 - The window's close button turns Windows close red (#c42b1c) on hover, the OS convention; it is not part of the palette.
 
 ### Named Rules
-**The Rationed Gold Rule.** Gold marks the one active choice on a screen: PLAY, a form's single submit, the chosen card, the active rail tab, the running launch step, focus. Secondary choices are ink: the Shop's sub-tab bar is an ink bar, a toggle that is on turns white, a done launch segment is solid ink.
+**The Rationed Gold Rule.** Gold marks the one active choice on a screen: PLAY, a form's single submit, the chosen card, the active rail tab, the running launch step, focus, and on Quests the Discord quest's Link Discord while no Discord is linked (nothing else can be claimed then), otherwise only the first claimable row's Claim (any other claimable row's Claim is a ghost plate). Secondary choices are ink: the Shop's sub-tab bar is an ink bar, a toggle that is on turns white, a done launch segment is solid ink.
 
 **The Green Dot Rule.** Green means a server is online, as a dot. It is never a button, a fill or a text colour.
 
@@ -250,7 +250,7 @@ NOON (chosen by the owner, 2026-11-02, for the Solar RP rebrand): warm near-blac
 - **Launch step** (800, `clamp(40px, 4.4vw, 60px)`, 0.92, caps): the current launch step, the overlay's headline.
 - **Headline** (800, 40px, 0.95, caps): the auth panel title (34px on windows 760px tall or less); empty-record title 34px.
 - **Title** (800, 26px, caps): panel titles, settings section heads, profile fact figures, VIP days. Card names 22px (server, product and owned tiles). Wallet balance 20px.
-- **Section** (800, `clamp(21px, 1.6vw, 23px)`, 1, caps, 0.08em): the rail's PLAY SHOP PROFILE SETTINGS; the username beside the avatar is 700 16px/0.08em.
+- **Section** (800, `clamp(21px, 1.6vw, 23px)`, 1, caps, 0.08em): the rail's PLAY SHOP QUESTS PROFILE SETTINGS; the username beside the avatar is 700 16px/0.08em.
 - **Plate labels** (800, caps, 0.1em): 15px default, 13px small, 18px large, 30px on the PLAY plate (0.12em; 24px for the "set up" variant).
 - **Label** (600-700, 12-15px, caps, 0.06-0.14em): sub-tabs 15px/700/0.1em; hero meta row 15px/600/0.08em; "Online now / of 300 slots" 14px/600/0.1em; list head 14px/700/0.14em; codes 13px/600/0.06em; field labels, chips, table heads, launch segment names, card meta 12px; toggle ON/OFF 10px/800.
 - **Body** (400, 15px, 1.45): all reading copy. Leads 16px (hero body 48ch, product line 46ch, launch status); launch outcome lead 18px (52ch); secondary 14px (why-not line 36ch, banners, links); hints and fine print 13px; footers 12px. Auth tagline is the one condensed reading line: 600, `clamp(16px, 1.4vw, 20px)`, caps.
@@ -262,7 +262,7 @@ NOON (chosen by the owner, 2026-11-02, for the Solar RP rebrand): warm near-blac
 
 ## Layout
 
-One grammar for every screen: the picture holds the window; the title block sits bottom-left on the scrim; the right column carries the list or the opaque panel. Screens are a two-column grid, `minmax(0, 1fr)` beside the column (`column`, about 320px at 1240), with a `split` gap, padded `24px gutter floor`. Profile widens the right side to `min(420px, 40vw)`, Settings to `min(600px, 52vw)`, Auth to `min(420px, 42vw)`. The Shop puts a 14px sub-tab bar above the same grid; its Orders and Owned pages become a ledger: the summary panel as a full-height left column at `column` width, the record filling the rest.
+One grammar for every screen: the picture holds the window; the title block sits bottom-left on the scrim; the right column carries the list or the opaque panel. Screens are a two-column grid, `minmax(0, 1fr)` beside the column (`column`, about 320px at 1240), with a `split` gap, padded `24px gutter floor`. Profile widens the right side to `min(420px, 40vw)`, Quests to `min(520px, 46vw)` (a quest row holds a title, a reward and its step side by side), Settings to `min(600px, 52vw)`, Auth to `min(420px, 42vw)`. Quests keeps the Profile grammar: title, one line and the wallet as Play's count block bottom-left (the line beside the figure, "100 of 900 earned here", explains the bar under it; the +N credit after a claim sits out of flow so nothing reflows), one opaque panel right whose head is a facts row (the Discord state as a chip, one line) above the quest list, which scrolls inside the panel. The list is a ledger: the list owns the columns (title, reward, step at least 140px) and each row is a subgrid of them, so rewards and plates line up and a row never changes height when its state changes (reopen-the-page is a quiet icon beside the waiting Claim plate; a claimed row folds to a quieter one-line title and date). The Discord quest's own row carries Link Discord; the head offers it only when that row is missing. The Shop puts a 14px sub-tab bar above the same grid; its Orders and Owned pages become a ledger: the summary panel as a full-height left column at `column` width, the record filling the rest.
 
 The 60px rail sits on top of everything; its top 8px is left empty for WebView2's resize border and the rail is the window's drag region. The emblem is a `clamp(88px, 9vw, 120px)` square slot beside the display name (auth: `clamp(96px, 9vw, 128px)`).
 
@@ -293,7 +293,7 @@ Every surface is square-cornered except one 45-degree corner cut at the top righ
 ## Components
 
 ### Rail
-- **Style:** 60px, the top edge of the picture rather than window chrome: graded `rgb(10 9 7 / 0.8)` to `0.42`, then to nothing over its last 18px, so it hands off to each screen's top scrim with no ruled edge. The Solar RP lockup left at `--lockup-h` (26-28px, its letters as tall as the section names; on auth the flat G alone), a 24px hairline rule, then PLAY SHOP PROFILE SETTINGS in the Section style (`clamp(21px, 1.6vw, 23px)`), ink-2 with a soft dark text halo over bright footage (4.4:1 or better on the measured poster frames; ink-3 fell to about 3:1 on Play), ink on hover; the current one is ink on a deeper halo. A 20%-white 1px track runs under the sections only, first label to last. Right: the demo pill (13px caps on a 20% hairline), the account chip (32px avatar with a 7px cut, the username in condensed caps, dropped at 1180px and below), a 24px rule, three 46px window buttons with 1px caption glyphs 10px across on whole pixels; close goes Windows red on hover, painted up through the 8px resize band (paint only). Signed out: a light `0.6`-to-0 shade only, no band, no rule; it keeps its height as the drag region.
+- **Style:** 60px, the top edge of the picture rather than window chrome: graded `rgb(10 9 7 / 0.8)` to `0.42`, then to nothing over its last 18px, so it hands off to each screen's top scrim with no ruled edge. The Solar RP lockup left at `--lockup-h` (26-28px, its letters as tall as the section names; on auth the flat G alone), a 24px hairline rule, then PLAY SHOP QUESTS PROFILE SETTINGS in the Section style (`clamp(21px, 1.6vw, 23px)`), ink-2 with a soft dark text halo over bright footage (4.4:1 or better on the measured poster frames; ink-3 fell to about 3:1 on Play), ink on hover; the current one is ink on a deeper halo. A 20%-white 1px track runs under the sections only, first label to last. Right: the demo pill (13px caps on a 20% hairline), the account chip (32px avatar with a 7px cut, the username in condensed caps, dropped at 1180px and below), a 24px rule, three 46px window buttons with 1px caption glyphs 10px across on whole pixels; close goes Windows red on hover, painted up through the 8px resize band (paint only). Signed out: a light `0.6`-to-0 shade only, no band, no rule; it keeps its height as the drag region.
 - **Active:** one 4px Solar gold marker with the G's 45-degree cut on its top-right corner, riding the track under the current tab's label and sliding to the next tab over 340ms (transform and width; scaleX would stretch the cut). It sits on a 2px Ground keyline with the same cut (5px), a separate layer that travels with it: gold alone can drop under 3:1 on a bright sky, on the keyline it holds 3:1 everywhere. The rail stacks above the launch overlay (`--z-rail` 8), which runs to the window's top edge under it. Hover previews a 4px 34%-white bar under the hovered tab. Focus is the 2px Gold Lift ring drawn 8px inside the tab, clear of the marker. While a launch runs the sections and the account chip are disabled at 50% and the marker turns ink-4 at full opacity (a half-faded gold read as bronze; the running launch segment keeps the only gold); the window buttons keep working.
 - **Forced colours:** the rail is solid Canvas, the track CanvasText, the marker Highlight on a Canvas keyline, the lockup and the G drawn in CanvasText, the demo pill outlined.
 
@@ -356,7 +356,7 @@ Fluid layout steps (`gutter`, `column`, `emblem`, `floor`, the launch floor and 
 ### Motion
 
 - **Screen entrance:** 480ms, `cubic-bezier(0.16, 1, 0.3, 1)`, from 0 opacity and 8px lower. Display titles rise 0.16em over 640ms.
-- **Footage:** a new scene crossfades over the old in 900ms (`cubic-bezier(0.65, 0, 0.35, 1)`); the video fades in over its own first-frame poster in 200ms. Stills drift over 48s (scale 1.06, about 1.2% pan, alternate). Loops are 3.7-5.4s single shots made seamless. Footage and emblem pause when the window is hidden, idle and unfocused, or in game.
+- **Footage:** a new scene crossfades over the old in 900ms (`cubic-bezier(0.65, 0, 0.35, 1)`); the video fades in over its own first-frame poster in 200ms. Stills drift over 48s (scale 1.06, about 1.2% pan, alternate). Footage is a reel (`reelFor` in `src/media/catalog.ts`; GI, 2026-11-06: hide the loop seam "with a long crossfade or a sequence of clips", never a hard cut, never a visible 0.8 s self-dissolve). A reel is 2-3 single 12s shots, paired by horizon and light (the low dusk horizons together, overhead with overhead). Each shot passes to the next through Night Ground over its last 1500ms: it sinks over 700ms (linear) while the next rises from 300ms to 1400ms (`cubic-bezier(0.65, 0, 0.35, 1)`), a dip to about a quarter of the light, never to black, so two horizons never stack into a double exposure; the reel then wraps to its lead. No shot dissolves into itself, and a reel never borrows another server's signature shot (SOL beach, LUNA observatory, TERRA streets), so picking a server still changes the whole window. Footage and emblem pause when the window is hidden, idle and unfocused, or in game.
 - **Server pick:** the emblem's enamel pulses (to 0.42 charge in 60ms, back over 300ms) as the footage crossfades.
 - **PLAY:** a short launch sound; the emblem charges gold-white (0.46s), the footage pushes in to 1.05 over 1.4s and keeps playing, the screen fades out from 0.32s over 0.3s, the launch overlay fades in over 520ms at 0.64s. Returning eases the push back over 0.6s.
 - **Launch rail:** completed segments fill in 500ms; the current one sweeps gold on a 2.4s loop.
@@ -365,7 +365,7 @@ Fluid layout steps (`gutter`, `column`, `emblem`, `floor`, the launch floor and 
 ## Do's and Don'ts
 
 ### Do:
-- **Do** put real GTA V footage or an official still behind every screen, full-bleed, one held continuous shot per loop, with its source recorded in `ASSETS.md`.
+- **Do** put real GTA V footage or an official still behind every screen, full-bleed, held single shots in a curated reel, with every source recorded in `ASSETS.md`.
 - **Do** grade only the edges the type stands on, and drop reading surfaces to a flat 92% veil.
 - **Do** set every name at display scale in Extra Condensed 800 caps on the bottom-left corner, with the emblem beside it on Play, Auth and the launch.
 - **Do** spend gold on the one active choice per screen and keep everything else ink (The Rationed Gold Rule).
@@ -376,7 +376,7 @@ Fluid layout steps (`gutter`, `column`, `emblem`, `floor`, the launch floor and 
 ### Don't:
 - **Don't** build a home-made 3D scene, a film strip or any drawn stand-in for the city; the owner rejected exactly that ("just dogshit 3d wannabe").
 - **Don't** add real-time 3D beyond the chrome G emblem.
-- **Don't** cut loops into a montage.
+- **Don't** cut footage hard, dissolve a shot into itself, or cross-dissolve two shots at full strength (two horizons read as a double exposure): pass through the ground.
 - **Don't** use glass, backdrop blur, border radius or neon glow on panels, plates, chips or cards.
 - **Don't** show Rockstar or GTA V logos, Pricedown, or anything that presents the client as an official Rockstar product.
 - **Don't** use green for anything but the online dot.

@@ -28,3 +28,8 @@ node_modules/
 /.claude/settings.local.json
 .DS_Store
 Thumbs.db
+
+# owner source material: never committed (only re-encoded derivatives go into app media)
+/fresh_videos/
+/fresh_images/
+/DLC PACKS/

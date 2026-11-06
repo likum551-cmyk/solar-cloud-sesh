@@ -48,10 +48,76 @@ describe('mock platform through the real client', () => {
     expect(await kindOf(api.me())).toBe('unauthorized:unauthorized');
   });
 
-  it('refuses a taken username and a short password on register', async () => {
-    const { api } = client();
-    expect(await kindOf(api.register({ email: 'a@b.c', username: 'taken', password: 'longenough1' }))).toBe('refused:username_taken');
-    expect(await kindOf(api.register({ email: 'a@b.c', username: 'fresh', password: 'short' }))).toBe('refused:weak_password');
+  it('has no register route: accounts are created on the website', async () => {
+    const res = await createMockFetch()('mock://platform/v1/auth/register', { method: 'POST', body: '{}' });
+    expect(res.status).toBe(404);
+  });
+
+  it('lists the demo quests in the platform shape, Discord linked', async () => {
+    const { api, setToken } = client();
+    expect(await kindOf(api.quests())).toBe('unauthorized:unauthorized');
+    setToken((await api.login({ identifier: 'nightshift', password: 'x' })).token);
+    const list = await api.quests();
+    expect(list.discordLinked).toBe(true);
+    expect(list.visitMinSeconds).toBe(30);
+    const by = Object.fromEntries(list.quests.map((q) => [q.slug, q]));
+    expect(by.link_discord).toMatchObject({ kind: 'discord_link', status: 'claimable', reward: { currency: 'coins', amount: 500 }, url: null });
+    expect(by.join_discord_server).toMatchObject({ status: 'locked', lockReason: 'not_available' });
+    expect(by.youtube_subscribe).toMatchObject({ kind: 'visit', status: 'available', startedAt: null, waitSeconds: null });
+    expect(by.instagram_follow?.status).toBe('claimed');
+    expect(by.tiktok_follow?.status).toBe('started');
+    expect(by.tiktok_follow?.waitSeconds).toBeGreaterThan(0);
+    expect(list.quests.map((q) => q.sort)).toEqual([...list.quests.map((q) => q.sort)].sort((a, b) => a - b));
+  });
+
+  it('start then claim: quest_wait with Retry-After first, then the credit moves the wallet once', async () => {
+    const { api, setToken } = client();
+    setToken((await api.login({ identifier: 'nightshift', password: 'x' })).token);
+    const before = (await api.wallet()).balances[0]!.balance;
+    expect(await kindOf(api.claimQuest('youtube_subscribe'))).toBe('refused:quest_not_started');
+    const { quest } = await api.startQuest('youtube_subscribe');
+    expect(quest).toMatchObject({ status: 'started', waitSeconds: 30, url: 'https://solar-rp.com/' });
+    const again = await api.startQuest('youtube_subscribe');
+    expect(again.quest.startedAt).toBe(quest.startedAt);    // a repeated start keeps the first time
+    const early = await api.claimQuest('youtube_subscribe').then(() => null, (e: unknown) => e);
+    expect(early).toBeInstanceOf(ApiFailure);
+    expect(early).toMatchObject({ kind: 'refused', code: 'quest_wait', status: 409, details: { waitSeconds: expect.any(Number) } });
+    expect((early as ApiFailure).retryAfterSeconds).toBeGreaterThan(25);
+    const paid = await api.claimQuest('link_discord');
+    expect(paid.credited).toEqual({ currency: 'coins', amount: 500 });
+    expect(paid.balance).toBe(before + 500);
+    expect(paid.quest.status).toBe('claimed');
+    expect(await kindOf(api.claimQuest('link_discord'))).toBe('refused:already_claimed');
+    expect((await api.wallet()).balances[0]!.balance).toBe(before + 500);
+    expect(await kindOf(api.startQuest('link_discord'))).toBe('refused:not_a_visit_quest');
+    expect(await kindOf(api.claimQuest('join_discord_server'))).toBe('refused:quest_unavailable');
+    expect(await kindOf(api.claimQuest('no_such_quest'))).toBe('refused:quest_not_found');
+  });
+
+  it('without Discord: the link quest and started visit quests are locked, a claim is discord_required', async () => {
+    const { api, setToken } = client({ quests: 'nodiscord' });
+    const login = await api.login({ identifier: 'nightshift', password: 'x' });
+    expect(login.account.discord).toBeNull();
+    setToken(login.token);
+    const list = await api.quests();
+    expect(list.discordLinked).toBe(false);
+    const by = Object.fromEntries(list.quests.map((q) => [q.slug, q]));
+    expect(by.link_discord).toMatchObject({ status: 'locked', lockReason: 'discord_required' });
+    expect(by.tiktok_follow).toMatchObject({ status: 'locked', lockReason: 'discord_required' });
+    expect(by.youtube_subscribe?.status).toBe('available');
+    await expect(api.claimQuest('link_discord')).rejects.toMatchObject({ kind: 'refused', code: 'discord_required', status: 403 });
+  });
+
+  it('serves an empty quest list in the empty scenario', async () => {
+    const { api, setToken } = client({ quests: 'empty' });
+    setToken((await api.login({ identifier: 'nightshift', password: 'x' })).token);
+    expect((await api.quests()).quests).toEqual([]);
+  });
+
+  it('fails the quest list as a server fault in the down scenario', async () => {
+    const { api, setToken } = client({ quests: 'down' });
+    setToken((await api.login({ identifier: 'nightshift', password: 'x' })).token);
+    await expect(api.quests()).rejects.toMatchObject({ kind: 'server', status: 500 });
   });
 
   it('serves every server scenario in a valid shape', async () => {
@@ -83,7 +149,7 @@ describe('mock platform through the real client', () => {
   });
 
   it('reads scenarios from the query and ignores unknown values', () => {
-    expect(scenarioFromQuery('?servers=down&shop=empty&account=banned&net=offline')).toEqual({ servers: 'down', shop: 'empty', account: 'banned', net: 'offline' });
+    expect(scenarioFromQuery('?servers=down&shop=empty&account=banned&net=offline&quests=nodiscord')).toEqual({ servers: 'down', shop: 'empty', account: 'banned', net: 'offline', quests: 'nodiscord' });
     expect(scenarioFromQuery('?servers=lol')).toEqual(DEFAULT_SCENARIO);
   });
 });
