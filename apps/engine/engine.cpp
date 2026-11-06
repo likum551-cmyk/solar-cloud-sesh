@@ -7562,7 +7562,9 @@ namespace {
             gf.ragdoll = in.ragdoll;
             if (gf.commanded != sync::Gait::Still)
             {
-                gf.entitySpeed = g_world->GetEntitySpeed(pe.ped);
+                // GET_ENTITY_SPEED is the length of GET_ENTITY_VELOCITY, already read above this frame: one native less per puppet
+                gf.entitySpeed = in.havePedVel ? std::sqrt(in.pedVel.x * in.pedVel.x + in.pedVel.y * in.pedVel.y + in.pedVel.z * in.pedVel.z)
+                                               : g_world->GetEntitySpeed(pe.ped);
                 gf.pedStill = g_world->IsPedStill(pe.ped) ? 1 : 0;
             }
             pe.gaitDiag.Observe(gf);

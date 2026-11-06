@@ -877,45 +877,6 @@ namespace gage::net {
     }
 
     // ---- version helpers --------------------------------------------------
-    // Compare two dot-separated version strings. Returns <0 if a<b, 0 if
-    // equal, >0 if a>b. Non-numeric components (spaces, 'v', letters) are
-    // skipped; missing trailing components count as 0 ("1" == "1.0").
-    // Components are compared as digit strings (leading zeros dropped, then
-    // length, then lexicographic), so arbitrarily long runs cannot overflow.
-    static int VerCmp(const std::wstring& a, const std::wstring& b)
-    {
-        auto next = [](const std::wstring& s, size_t& i)
-        {
-            while (i < s.size() && !(s[i] >= L'0' && s[i] <= L'9'))
-                i++;                       // skip non-digits
-            size_t start = i;
-            while (i < s.size() && s[i] >= L'0' && s[i] <= L'9')
-                i++;                       // one digit run
-            size_t z = start;
-            while (z < i && s[z] == L'0')
-                z++;                       // drop leading zeros ("" == 0)
-            return s.substr(z, i - z);
-        };
-        size_t i = 0, j = 0;
-        for (;;)
-        {
-            std::wstring va = next(a, i);
-            std::wstring vb = next(b, j);
-            if (va.size() != vb.size())
-                return (va.size() > vb.size()) ? 1 : -1;
-            int c = va.compare(vb);
-            if (c != 0)
-                return (c > 0) ? 1 : -1;
-            if (i >= a.size() && j >= b.size())
-                return 0;
-        }
-    }
-
-    bool VersionAtLeast(const std::wstring& a, const std::wstring& b)
-    {
-        return VerCmp(a, b) >= 0;
-    }
-
     // The "version" string at the top level of the document, else one object
     // level down ({"data":{"version":"1.2.3"}}).
     static const JVal* FindVersion(const JVal& root)

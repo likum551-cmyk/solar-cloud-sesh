@@ -240,7 +240,6 @@ namespace gage::server::ac {
 
     // ---- constants of the hit rules ------------------------------------------------------------------
 
-    constexpr uint32_t kShotWindowMs = 500;      // default Config::hitShotWindowMs: a Hit's shot was received this recently
     // A MELEE Hit lands when the blow does, not when the swing starts: the client counts the swing at the button press (shotSeq
     // step) and reports the damage event up to its 900 ms swing window later (sync::kMeleeHitWindowMs), then holds it 50 ms in
     // its batcher, and the Hit and the state that carries the swing travel on two channels. With the 500 ms hitShotWindowMs a
@@ -263,8 +262,6 @@ namespace gage::server::ac {
     constexpr uint64_t kRunOverMovedMs = 2000;   // the vehicle must have moved this recently ...
     constexpr float    kMovingSpeed = 3.0f;      // ... at least this fast (m/s, measured from displacement)
     constexpr double   kDamageBudgetSec = 2.0;   // burst of the damage-rate bucket, in seconds of a class's rate
-    constexpr float    kRegisterSeparation = 4.0f; // m: Register this close to a networked vehicle is refused
-    constexpr uint64_t kOrphanDefaultMs = 60000;
 
     // ---- shots ---------------------------------------------------------------------------------------
 

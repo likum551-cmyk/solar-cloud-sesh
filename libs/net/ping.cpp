@@ -515,11 +515,6 @@ namespace gage::net {
         return result;
     }
 
-    int Ping(const std::wstring& host, int port, int timeoutMs)
-    {
-        return PingOne(PingTarget{host, port, false}, timeoutMs);
-    }
-
     int PingServer(const std::wstring& host, int port, int timeoutMs)
     {
         return PingOne(PingTarget{host, port, true}, timeoutMs);

@@ -66,14 +66,6 @@ namespace gage::net {
     // 127.0.0.1:24800).
     ServerInfo ResolveServer(const std::wstring& configured);
 
-    // Measure TCP connect time to host:port. Returns milliseconds when a
-    // connect succeeds, or -1 on failure/timeout. `timeoutMs` is ONE deadline
-    // covering the DNS lookup and every connect attempt (all resolved
-    // addresses); the returned value is the connect time of the successful
-    // attempt only (DNS time is excluded from the measurement), taken with
-    // QueryPerformanceCounter.
-    int Ping(const std::wstring& host, int port, int timeoutMs);
-
     // A game server's round trip, for the server list. Game ports are UDP, so
     // a TCP connect to them is refused or dropped; this races a TCP connect to
     // the game port and to game port + 1 in one pass and returns the first
@@ -91,7 +83,7 @@ namespace gage::net {
     {
         std::wstring host;
         int          port = 0;
-        bool         server = true; // PingServer semantics; false = Ping (this port only)
+        bool         server = true; // PingServer semantics; false = a TCP connect to this port only
     };
     // (target index, ms or -1) pairs, in completion order
     using PingBatchFn = std::function<void(const std::vector<std::pair<int, int>>&)>;
@@ -101,7 +93,7 @@ namespace gage::net {
     // they arrive (at most every 40 ms, and once at the end), so the whole
     // list takes about one deadline. `cancelled` (may be empty) is polled
     // between waits; once it returns true the call returns promptly and the
-    // targets still in flight get no result. Ping and PingServer are this
+    // targets still in flight get no result. PingServer is this
     // engine with one target.
     void PingMany(const std::vector<PingTarget>& targets, int timeoutMs,
                   const std::function<bool()>& cancelled, const PingBatchFn& onBatch);
@@ -127,11 +119,6 @@ namespace gage::net {
     // is the UDP equivalent of PingServer for GAGE servers (ENet/UDP), which a TCP connect cannot
     // reach; it is independent of the TCP Ping/PingServer/PingMany path above.
     bool QueryServer(const std::wstring& host, int port, int timeoutMs, QueryResult& out);
-
-    // Compare dot-separated version strings numerically (1.10 > 1.9). Missing
-    // components are treated as 0, so "1" == "1.0" and "1.2" < "1.2.1".
-    // Components of any length compare correctly (no integer overflow).
-    bool VersionAtLeast(const std::wstring& a, const std::wstring& b);
 
     struct HttpGetOptions
     {

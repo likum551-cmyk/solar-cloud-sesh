@@ -5298,19 +5298,37 @@ bool World::VehicleFieldsReady() const {
     return g_vehHtp.load() != nullptr && g_vehSteerOff.load() != 0;
 }
 
-static uint8_t* vehFieldPtr(int32_t veh, int32_t add, size_t len) {
+// One VirtualQuery for the object AND the field when both sit in the same committed region (a CVehicle is one heap block,
+// so that is the usual case: called for every copy every frame, a second / third query per call was pure overhead).
+// *writable (optional): the field's page is plain read-write heap (PAGE_READWRITE / PAGE_EXECUTE_READWRITE).
+static uint8_t* vehFieldPtr(int32_t veh, int32_t add, size_t len, bool* writable = nullptr) {
     const HandleToPtrFn htp = g_vehHtp.load();
     const int32_t off = g_vehSteerOff.load();
     if (!htp || !off || veh <= 0) return nullptr;
     uint8_t* p = htp(veh);
+    if (!p) return nullptr;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT) return nullptr;
+    DWORD prot = mbi.Protect & 0xFF;
+    if (prot == PAGE_NOACCESS || prot == PAGE_EXECUTE || (mbi.Protect & PAGE_GUARD)) return nullptr;
+    const uintptr_t regionEnd = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    if ((uintptr_t)p + 8 > regionEnd) return nullptr;
     // a CVehicle's first qword is its vtable, inside the game image: anything else is not the object we resolved the offset for
-    if (!p || !isReadable(p, 8)) return nullptr;
     uintptr_t vt = 0;
     memcpy(&vt, p, 8);
     const uintptr_t lo = reinterpret_cast<uintptr_t>(g_imageBase);
     if (vt < lo || vt >= lo + g_imageSize) return nullptr;
-    if (!isReadable(p + off + add, len)) return nullptr;
-    return p + off + add;
+    uint8_t* f = p + off + add;
+    if ((uintptr_t)f < (uintptr_t)p || (uintptr_t)f + len > regionEnd) {
+        // the field lies outside the object's region (or the offset is negative): query its own page
+        if (!isReadable(f, len)) return nullptr;
+        if (writable) {
+            if (VirtualQuery(f, &mbi, sizeof(mbi)) != sizeof(mbi)) return nullptr;
+            prot = mbi.Protect & 0xFF;
+        }
+    }
+    if (writable) *writable = prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE;
+    return f;
 }
 
 bool World::GetVehicleSteerAngle(int32_t veh, float& rad) {
@@ -5322,23 +5340,23 @@ bool World::GetVehicleSteerAngle(int32_t veh, float& rad) {
 
 bool World::SetVehicleSteerAngle(int32_t veh, float rad) {
     if (!std::isfinite(rad)) return false;
-    uint8_t* f = vehFieldPtr(veh, 0, 4);
+    bool writable = false;
+    uint8_t* f = vehFieldPtr(veh, 0, 4, &writable);
     if (!f) return false;
     float cur = 0.0f;
     memcpy(&cur, f, 4);
     if (!gage::game::vehfields::PlausibleAngle(cur)) return false;   // not a steering angle: never write it
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(f, &mbi, sizeof mbi) != sizeof mbi) return false;
-    const DWORD prot = mbi.Protect & 0xFF;
-    if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) return false;   // heap memory of a live vehicle, nothing else
+    if (!writable) return false;   // heap memory of a live vehicle, nothing else
     memcpy(f, &rad, 4);
     return true;
 }
 
 bool World::GetVehicleCopyControls(int32_t veh, float& brake, bool& handbrake) {
     const uint8_t* b = vehFieldPtr(veh, gage::game::vehfields::kBrakeFromAngle, 4);
-    const uint8_t* h = vehFieldPtr(veh, gage::game::vehfields::kHandbrakeFromAngle, 1);
-    if (!b || !h) return false;
+    if (!b) return false;
+    // the handbrake byte is a fixed distance from the brake float in the same object: no second handle lookup or query
+    const uint8_t* h = b + (gage::game::vehfields::kHandbrakeFromAngle - gage::game::vehfields::kBrakeFromAngle);
+    if (!isReadable(h, 1)) return false;
     memcpy(&brake, b, 4);
     handbrake = *h != 0;
     return true;
