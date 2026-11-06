@@ -16,6 +16,7 @@
 // tools/deploy/wine-selftests.list: it touches nothing wine implements differently from Windows.
 
 #include "../apps/launcher/version_gate.h"
+#include "../apps/launcher/api_base.h"
 #include "protocol/protocol.h"
 #include "protocol/query.h"
 
@@ -243,7 +244,29 @@ int main() {
         }
     }
 
+    // ---- v8: the platform API base (apps/launcher/api_base.h) ---------------------------------------------
+    {
+        namespace ab = gage::apibase;
+        Check("api base: the baked default https://solar-rp.com/api (a path prefix) is valid; so are a bare origin, a port and a nested path",
+              ab::Valid(L"https://solar-rp.com/api") && ab::Valid(L"https://solar-rp.com") && ab::Valid(L"https://api.solar-rp.com:8443") &&
+                  ab::Valid(L"https://solar-rp.com/api/v-2_x.y~z"));
+        Check("api base: loopback http for development (127.0.0.1, localhost, with a port and a path); any other http host is refused",
+              ab::Valid(L"http://127.0.0.1:8787") && ab::Valid(L"http://localhost/api") && !ab::Valid(L"http://solar-rp.com/api") &&
+                  !ab::Valid(L"http://10.0.0.1:8787"));
+        Check("api base: a query, a fragment, an empty / . / .. segment, a backslash, a space, a trailing slash and a path over 64 are refused",
+              !ab::Valid(L"https://solar-rp.com/api?x=1") && !ab::Valid(L"https://solar-rp.com/api#x") && !ab::Valid(L"https://solar-rp.com//api") &&
+                  !ab::Valid(L"https://solar-rp.com/./api") && !ab::Valid(L"https://solar-rp.com/../api") && !ab::Valid(L"https://solar-rp.com/a\\b") &&
+                  !ab::Valid(L"https://solar-rp.com/a b") && !ab::Valid(L"https://solar-rp.com/api/") &&
+                  !ab::Valid(L"https://solar-rp.com/" + std::wstring(64, L'a')) && ab::Valid(L"https://solar-rp.com/" + std::wstring(63, L'a')));
+        Check("api base: no scheme, another scheme, an empty host, a bad port (0, 65536, letters, two colons), userinfo and a non-ASCII host are refused",
+              !ab::Valid(L"solar-rp.com/api") && !ab::Valid(L"ftp://solar-rp.com") && !ab::Valid(L"https://") && !ab::Valid(L"https:///api") &&
+                  !ab::Valid(L"https://x.com:0") && !ab::Valid(L"https://x.com:65536") && !ab::Valid(L"https://x.com:8a") &&
+                  !ab::Valid(L"https://x.com:1:2") && !ab::Valid(L"https://u@x.com") && !ab::Valid(std::wstring(L"https://x") + (wchar_t)0xE9 + L".com") && ab::Valid(L"https://x.com:65535"));
+        Check("api base: off / OFF / none mean 'no API, the demo UI'; an empty value and a URL do not",
+              ab::IsOff(L"off") && ab::IsOff(L"OFF") && ab::IsOff(L"None") && !ab::IsOff(L"") && !ab::IsOff(L"https://solar-rp.com/api"));
+    }
+
     std::printf("CHECKS %d FAILED %d\n", g_run, g_fail);
-    if (g_run < 60) { std::printf("FAIL  expected at least 60 checks, ran %d\n", g_run); return 1; }
+    if (g_run < 66) { std::printf("FAIL  expected at least 66 checks, ran %d\n", g_run); return 1; }
     return g_fail == 0 ? 0 : 1;
 }

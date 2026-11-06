@@ -63,6 +63,7 @@ add_library(gage_server_core STATIC
     ${GAGE_ROOT}/apps/server/config.cpp
     ${GAGE_ROOT}/apps/server/util.cpp
     ${GAGE_ROOT}/apps/server/banlist.cpp
+    ${GAGE_ROOT}/apps/server/inventory_store.cpp
     ${GAGE_ROOT}/apps/server/sock.cpp
     ${GAGE_ROOT}/apps/server/httpclient.cpp
     ${GAGE_ROOT}/apps/server/announce.cpp

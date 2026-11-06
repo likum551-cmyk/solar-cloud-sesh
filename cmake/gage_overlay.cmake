@@ -37,6 +37,11 @@ set(GAGE_OVERLAY_ASSETS
     # 0.4.31 the vitals ring (GI's REV1 HUD design): Sofia Sans Bold, SIL OFL 1.1 (brand/fonts/SofiaSans-OFL.txt), the design's Latin-only conversion.
     # Used from memory by overlay_ui.cpp (the atlas does not own the bytes).
     "sofia|fonts/SofiaSans-Bold-latin.ttf|kOverlaySofiaBoldTtf"
+    # 0.6 the inventory (GI's REV3 design): its own Sofia Sans conversions (Medium / SemiBold / Bold; the REV3 Bold is not byte-identical
+    # to the HUD's, so each screen keeps the face its goldens were rendered with). Used from memory by overlay_inventory.cpp.
+    "sofia3b|fonts/rev3/SofiaSans-Bold-latin.ttf|kOverlaySofia3BoldTtf"
+    "sofia3s|fonts/rev3/SofiaSans-SemiBold-latin.ttf|kOverlaySofia3SemiTtf"
+    "sofia3m|fonts/rev3/SofiaSans-Medium-latin.ttf|kOverlaySofia3MediumTtf"
 )
 set(GAGE_OVERLAY_GENERATED "")
 foreach(asset IN LISTS GAGE_OVERLAY_ASSETS)
@@ -59,12 +64,28 @@ foreach(asset IN LISTS GAGE_OVERLAY_ASSETS)
     )
     list(APPEND GAGE_OVERLAY_GENERATED ${a_out})
 endforeach()
+# 0.6 the inventory's 46 glyphs (REV3 icons/png, 96 x 96 white + alpha, tinted at draw time): one header, a name -> bytes table.
+file(GLOB GAGE_INV_ICON_PNGS CONFIGURE_DEPENDS ${GAGE_ROOT}/brand/icons/inventory/*.png)
+set(GAGE_INV_ICONS_H ${CMAKE_BINARY_DIR}/gen/overlay_inv_icons.h)
+add_custom_command(
+    OUTPUT ${GAGE_INV_ICONS_H}
+    COMMAND ${CMAKE_COMMAND}
+            -DINPUT_DIR=${GAGE_ROOT}/brand/icons/inventory
+            -DOUTPUT=${GAGE_INV_ICONS_H}
+            -DSYMBOL=kInvIcons
+            -P ${GAGE_ROOT}/tools/embed_icons.cmake
+    DEPENDS ${GAGE_INV_ICON_PNGS} ${GAGE_ROOT}/tools/embed_icons.cmake
+    COMMENT "Embedding the inventory icons into overlay_inv_icons.h"
+    VERBATIM
+)
+list(APPEND GAGE_OVERLAY_GENERATED ${GAGE_INV_ICONS_H})
 add_custom_target(gage_overlay_logo DEPENDS ${GAGE_OVERLAY_GENERATED})
 
 add_library(gage_overlay STATIC
     ${GAGE_ROOT}/apps/engine/overlay.cpp
     ${GAGE_ROOT}/apps/engine/overlay_dx12.cpp
     ${GAGE_ROOT}/apps/engine/overlay_ui.cpp
+    ${GAGE_ROOT}/apps/engine/overlay_inventory.cpp
     ${GAGE_ROOT}/third_party/imgui/imgui.cpp
     ${GAGE_ROOT}/third_party/imgui/imgui_draw.cpp
     ${GAGE_ROOT}/third_party/imgui/imgui_tables.cpp

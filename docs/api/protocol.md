@@ -1,4 +1,6 @@
-# GAGE game protocol v7
+# GAGE game protocol v8
+
+v8 (Solar RP accounts, the first client after 0.5.2) adds, against v7: `JoinAuth` (45, the launcher's join token right after `Hello`), `AccountInfo` (46, the account the server verified, closing the Welcome burst), `AdminCmd` (47) / `AdminResult` (48, the server's yes or no to an admin command) and the refuse reasons 9 `AccountRequired`, 10 `AuthFailed`, 11 `AuthUnavailable` [section "v8: accounts"]. `Hello` keeps its v1 layout and carries version 8. Every other layout is the v7 one described below. A v7 peer is refused by the version gate (`Refuse(VersionMismatch)`).
 
 v7 (desync overhaul round 3, client 0.4.8) adds, against v6: the vehicle damage block (`flags` bit 5 of `VehicleUpdate`, and the full `VehicleWorld` entry: petrol tank, broken doors, headlights, dent probes) [section "R3 T4"] and `LinkInfo` (44) [section "R3 T5"]. Every other layout is the v6 one described below. A v6 peer is refused by the version gate (`Refuse(VersionMismatch)`).
 
@@ -139,6 +141,7 @@ Compatibility rules (why the request keeps query version 1)
 client                                   server
   | ---- ENet connect ------------------> |
   | ---- Hello{version, name} ----------> |   reliable; must arrive within 5 s (HelloTimeout)
+  | ---- JoinAuth{token} ---------------> |   reliable, right behind Hello (v8; "" = no token); the server may ask the platform first
   | <--- Welcome{yourId, tickHz, name, playerHealth} |   reliable (playerHealth: v5), or
   | <--- Refuse{reason, text} ----------- |   reliable, then the connection is closed
   | <--- PlayerJoined x (players here) -- |   reliable: the roster, one message per player
@@ -151,6 +154,10 @@ client                                   server
   | <--- PlayerJoined / PlayerLeft ------ |   reliable: the roster changes
   | <--- PeerLook ----------------------- |   reliable: someone else's appearance changed (v3)
   | <--- PeerAnim / PeerScenario x ------ |   reliable: after the PeerLook burst, every running loop / scenario (v4)
+  | <--- AccountInfo{flags, username} --- |   reliable: the last message of the Welcome burst (v8)
+  | ---- AdminCmd / <--- AdminResult ---- |   reliable: may this player run /heal, /fix, /spawn, /tp, /noclip, /gun, /car? (v8)
+  | <--- InvState (after AccountInfo) --- |   reliable: the player's whole inventory (0.6; again after every InvOp, ackSeq = its seq)
+  | ---- InvOp / <--- InvUsed ----------- |   reliable: one inventory operation; an item used for food (0.6)
   | <--- VehicleWorld (up to tickHz) ---- |   unreliable: the vehicles relevant to you, per receiver (v4)
   | ---- VehicleCmd --------------------> |   reliable: spawn, enter, exit, lock, ... (v4)
   | <--- VehicleResult ------------------ |   reliable: the answer to every VehicleCmd (v4)
@@ -782,6 +789,11 @@ information of a relevant player. Ids ascend; the client's own id never appears.
 | 6 | `HelloTimeout` | no Hello within 5 s |
 | 7 | `Banned` | the name or address is on the ban list |
 | 8 | `TooManyConnections` | the per-address connection cap is reached |
+| 9 | `AccountRequired` | v8: no join token, and server.json `requireAccount` is on |
+| 10 | `AuthFailed` | v8: the platform refused the token (invalid, expired, used) and `requireAccount` is on |
+| 11 | `AuthUnavailable` | v8: the platform could not be asked (down, a non-200, no verdict in time) and `requireAccount` is on (fail closed) |
+
+A banned account (the platform's verdict `banned`) is refused `Banned` whatever `requireAccount` says.
 
 `LeaveReason` (the `u8` in `PlayerLeft`): 1 `Quit` (said goodbye), 2 `Timeout` (vanished), 3 `Kicked` (the server cut
 it off: kick, ban, rule violation).
@@ -1357,3 +1369,123 @@ The server, the wire and the session are **real** (tested over loopback ENet). W
 inside, whether control 182 and 58 are the L key and the grenade throw, the sound names and the rear seat bones of a given model are **live-unverified** (the log
 lines above are the live check).
 <!-- DOORS-SEATS-END -->
+
+## v8: accounts (`JoinAuth` 45, `AccountInfo` 46, `AdminCmd` 47, `AdminResult` 48)
+
+The launcher gets a single-use join token from the platform (`POST /v1/game/join`, 60 s) right before it injects the
+engine and hands it over in `HKCU\Software\GAGE-MP` `join_token` (the engine reads it once and clears it). The server
+asks the platform's internal listener whether the token is good (`POST /internal/game/verify`,
+`apps/platform/docs/game-server-contract.md`) on a worker thread (`apps/server/platform.h`), and only then answers with
+`Welcome` or `Refuse`. All four messages are reliable and ordered.
+
+### 45 `JoinAuth` (client to server): 3 + n bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 45 |
+| 1 | 2 + n | `str` token: 0..256 bytes of 0x21..0x7E (no space); "" = no token |
+
+Sent right behind `Hello` on the same channel. The server waits for it (`helloTimeoutMs` from the connect, then
+`HelloTimeout`: a v7-style client that sends only `Hello` never joins). Any other message before it is `Protocol`.
+What the server does:
+
+| token | `requireAccount` false (default) | `requireAccount` true |
+|---|---|---|
+| "" | joins as a guest under the `Hello` name (logged) | `Refuse(AccountRequired)` |
+| set, server has no `platformUrl` | guest, the token is ignored (logged) | (not a valid config) |
+| verified | joins under the account's username (a guest holding that name, or an older connection of the same account, is kicked) | same |
+| invalid / expired / used | guest (logged) | `Refuse(AuthFailed)` with a "press Play again" sentence |
+| banned | `Refuse(Banned)` with the platform's reason and expiry | same |
+| platform down, non-200, no verdict within `platformTimeoutMs` + 3 s | guest (logged) | `Refuse(AuthUnavailable)` (fail closed) |
+
+The ban list, `ServerFull` and the name rules are checked BEFORE the platform is asked, so those refusals never spend a
+token. A verified player's leave, kick, timeout or the server's shutdown sends `POST /internal/game/session-end`
+(`quit`, `kicked`, `timeout`, `shutdown`), retried up to 3 times on a transport error, 429 or 5xx.
+
+### 46 `AccountInfo` (server to client): 4 + n bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 46 |
+| 1 | 1 | `u8` flags: 1 `kAcctVerified` (the platform verified the token), 2 `kAcctAdmin` (a role in server.json `adminRoles`), 4 `kAcctCommands` (the admin commands are open to this player: an admin, or a guest on a server that does not require accounts) |
+| 2 | 2 + n | `str` username, 0..24 printable ASCII ("" for a guest) |
+
+The last message of the Welcome burst (after the roster, looks and running emotes), once per connection. Unknown flag
+bits are refused by the decoder. The engine turns `kAcctCommands` into `game::Overlay::SetIsAdmin`.
+
+### 47 `AdminCmd` (client to server): 6 + n bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 47 |
+| 1 | 2 | `u16` seq (echoed in the answer) |
+| 3 | 1 | `u8` op: 1 heal, 2 fix, 3 spawn (back to the server spawn), 4 tp, 5 noclip, 6 gun, 7 car |
+| 4 | 2 + n | `str` arg, 0..64 printable ASCII (the weapon or model name, "x y z" for tp) |
+
+The admin commands run in the client's game; the server decides who may run them. When it knows the player's roles
+(a verified player, or any player on a `requireAccount` server) only an admin role passes; a guest on a server that
+does not require accounts passes as before v8 (logged "roles unknown"). Rate: 8 at once, 4 a second per player.
+`heal` is carried out by the server itself (health is server-owned); every other op runs in the client after an `Ok`.
+`VehicleCmd` `Spawn` and `Register` (the `/car` command and the Tab menu's Cars page) follow the same rule and are
+answered `NotAllowed` to a player without the role.
+
+### 48 `AdminResult` (server to client): 7 + n bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 48 |
+| 1 | 2 | `u16` seq of the `AdminCmd` |
+| 3 | 1 | `u8` op |
+| 4 | 1 | `u8` code: 0 `Ok`, 1 `NotAdmin`, 2 `RateLimited`, 3 `BadArg`, 4 `Failed` (allowed but not doable: a dead player's heal) |
+| 5 | 2 + n | `str` text, 0..200, the sentence the player reads ("" for `Ok`) |
+
+The checks and the live tests are `tests/server_test.cpp` (`account_tests.h`: a fake platform on loopback),
+`tests/join_test.cpp` (the engine adapter) and `tests/decode_fuzz_test.cpp`. What the game does with the parked
+commands, and the platform's real answers, are live-unverified.
+
+## 0.6: inventory (`InvState` 49, `InvOp` 50, `InvUsed` 51; still v8)
+
+No v8 client was released before these, so `kVersion` stays 8. The protocol only frames and caps the bytes inside; their
+meaning is `libs/sync/inventory.h` (the item catalog, the rules in `sync::inv::Apply`, the codec `Encode` / `EncodeOp`),
+which the server and the client share. The server holds the truth; the client applies each op to a prediction at once
+and replaces it with the next `InvState` (ops the server has not answered yet are applied again on top; one unanswered
+for 3 s is dropped).
+
+### 49 `InvState` (server to client, reliable): 7 + n bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 49 |
+| 1 | 4 | `u32` ackSeq: the last `InvOp` seq the server processed (applied or refused); 0 for the join and for a console `give` / `clearinv` |
+| 5 | 2 + n | blob, 1..1024 bytes: `sync::inv::Encode(Character)` (codec version, 16 pocket slots, 14 equipment slots, the pack's slots, 4 quick refs; a full rucksack is about 450 bytes) |
+
+Sent right after `AccountInfo` (the starter kit for a guest or a new account, else the account's save), after every
+`InvOp`, and after a console `give` / `clearinv`. A server that sends none is a server without inventories: the Tab
+menu shows the screen locked ("INVENTORY UNAVAILABLE"). The receiver's `sync::inv::Decode` refuses a blob the rules
+could not have produced (the client then keeps its last good one and logs it).
+
+### 50 `InvOp` (client to server, reliable): 16 bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 50 |
+| 1 | 4 | `u32` seq, from 1, counting up per client (0 is refused) |
+| 5 | 11 | `sync::inv::EncodeOp`: kind (Move, Split, QuickMove, Use, Drop, Bind, Unbind, UseQuick), src, `i16` si, dst, `i16` di, `u32` qty |
+
+An op that does not decode cuts the sender off (`Protocol`). One that decodes is answered by `InvState` whatever
+`Apply` says. Over 20 at once, then 10 a second, an op is refused (answered, not applied). USE is tried on a copy
+first and refused while the player is dead, and for an item that only heals while health is full (the item stays).
+A medkit's or bandage's HP are percent of the bar (`playerHealth` is 100 %): the server raises its health and sends
+the usual `Damage` (attacker `kServerId`).
+
+### 51 `InvUsed` (server to client, reliable): 4 bytes
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | type 51 |
+| 1 | 2 | `u16` item id |
+| 3 | 1 | `u8` satiety to add, 1..100 (satiety is client-side in 0.6) |
+
+Live tests: `tests/inventory_net_tests.h` (in `server_test`: the kit, ops, USE effects, the dead / full-health rules,
+console, a malformed op, saves per verified account against the fake platform, a corrupt save); the codec and rules
+are `tests/inventory_tests.h` (in `gameplay_test`). The in-game screen is live-unverified.

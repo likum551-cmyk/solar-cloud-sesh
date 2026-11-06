@@ -180,6 +180,7 @@ namespace gage::net {
         myId_ = 0;
         tickHz_ = 0;
         serverName_.clear();
+        account_ = proto::AccountInfo();
         seq_ = 0;
         vehSeq_ = 0;
         lookSent_ = false; // a new connection: the server knows no look of ours
@@ -245,6 +246,16 @@ namespace gage::net {
                         h.version = opts_.protocolVersion;
                         h.name = opts_.name;
                         SendBytes(proto::kChanReliable, proto::Encode(h), true);
+                        // v8: the join token goes right behind Hello on the same ordered channel; the server waits for it
+                        // before Welcome. Hello keeps its v1 layout, so a server of another version still refuses cleanly.
+                        if (opts_.autoJoinAuth)
+                        {
+                            proto::JoinAuth a;
+                            // A token the wire cannot carry (control bytes, over 256) is sent as "no token": the server then
+                            // answers AccountRequired or admits a guest instead of waiting for a JoinAuth that never comes.
+                            if (proto::ValidJoinToken(opts_.joinToken)) a.token = opts_.joinToken;
+                            SendBytes(proto::kChanReliable, proto::Encode(a), true);
+                        }
                     }
                 }
                 break;
@@ -448,6 +459,27 @@ namespace gage::net {
             if (!proto::Decode(data, len, e.linkInfo)) { malformed_++; return; }
             e.type = Event::Type::LinkInfo;
             break;
+        case proto::Msg::AccountInfo:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.account)) { malformed_++; return; }
+            account_ = e.account;
+            e.type = Event::Type::AccountInfo;
+            break;
+        case proto::Msg::AdminResult:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.adminResult)) { malformed_++; return; }
+            e.type = Event::Type::AdminResult;
+            break;
+        case proto::Msg::InvState:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.invState)) { malformed_++; return; }
+            e.type = Event::Type::InvState;
+            break;
+        case proto::Msg::InvUsed:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.invUsed)) { malformed_++; return; }
+            e.type = Event::Type::InvUsed;
+            break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:
             return; // server-to-client types this session does not surface yet: ignored, not an error
@@ -463,6 +495,9 @@ namespace gage::net {
         case proto::Msg::PlayAnim:
         case proto::Msg::PlayScenario:
         case proto::Msg::StopAnim:
+        case proto::Msg::JoinAuth:
+        case proto::Msg::AdminCmd:
+        case proto::Msg::InvOp:
             malformed_++; // client-to-server types never arrive here
             return;
         }
@@ -632,6 +667,21 @@ namespace gage::net {
     {
         if (state_ != SessionState::Joined) return false;
         return SendBytes(proto::kChanReliable, proto::Encode(proto::StopAnim()), true);
+    }
+
+    bool ClientSession::SendAdminCmd(const proto::AdminCmd& c)
+    {
+        if (state_ != SessionState::Joined || c.arg.size() > proto::kMaxAdminArg || (uint8_t)c.op < (uint8_t)proto::AdminOp::Heal ||
+            (uint8_t)c.op > proto::kAdminOpLast)
+            return false;
+        return SendBytes(proto::kChanReliable, proto::Encode(c), true);
+    }
+
+    bool ClientSession::SendInvOp(const proto::InvOp& o)
+    {
+        if (state_ != SessionState::Joined || o.seq == 0 || o.op.size() != proto::kInvOpBytes)
+            return false;
+        return SendBytes(proto::kChanReliable, proto::Encode(o), true);
     }
 
     bool ClientSession::SendRaw(uint8_t channel, const proto::Bytes& bytes, bool reliable)

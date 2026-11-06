@@ -249,10 +249,10 @@ static void CodecTests()
                                               0x20, 0x00, 0xE0, 0xFF, 0x10, 0x00};            // velocity
         proto::Hello h;
         h.name = "Al";
-        // v7 (deliberate): the frozen Hello layout now carries version 7.
-        const proto::Bytes wantHello = {1, 7, 0, 2, 0, 'A', 'l'}; // type, u16 version 7, u16 length, bytes
-        Check("codec: Hello is type, u16 version (7), u16-length string, little-endian",
-              proto::kVersion == 7 && proto::Encode(h) == wantHello, Hex(proto::Encode(h)));
+        // v8 (deliberate): the frozen Hello layout now carries version 8 (the join token rides in JoinAuth).
+        const proto::Bytes wantHello = {1, 8, 0, 2, 0, 'A', 'l'}; // type, u16 version 8, u16 length, bytes
+        Check("codec: Hello is type, u16 version (8), u16-length string, little-endian",
+              proto::kVersion == 8 && proto::Encode(h) == wantHello, Hex(proto::Encode(h)));
 
         // v3 (deliberate): PlayerState is the v2 29 bytes plus the ped block; v4 (deliberate): the ped block
         // gains the shot byte (8 bytes): 37, 43 while aiming; v5 (deliberate): + u16 sampleMs after the ack: 39, 45.
@@ -381,14 +381,17 @@ static void CodecTests()
     // PeekType.
     {
         proto::Msg m = proto::Msg::Hello;
-        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; T1 (v6): 31 SeatNotice; T4 (v6): 40 VehicleImpact; R3 T5: 44 LinkInfo
-        // (32..39 and 41..43 are reserved for other messages; PeekType only range-checks them). 45 is the first value past the last message.
-        const uint8_t zero = 0, firstUnknown = 45, ff = 255, impact = 40, link = 44;
+        // v3: 16 PlayerLook and 17 PeerLook; v4: 18 VehicleUpdate .. 30 PeerAnimStop; T1 (v6): 31 SeatNotice; T4 (v6): 40 VehicleImpact; R3 T5: 44 LinkInfo;
+        // v8: 45 JoinAuth .. 48 AdminResult, 0.6 inventory 49 InvState .. 51 InvUsed (32..39 and 41..43 are reserved for other
+        // messages; PeekType only range-checks them). 52 is the first value past the last message.
+        const uint8_t zero = 0, firstUnknown = 52, ff = 255, impact = 40, link = 44;
         bool allKnown = true;
         for (uint8_t t = 1; t <= 31; t++)
             allKnown = allKnown && proto::PeekType(&t, 1, m) && (uint8_t)m == t;
-        Check("codec: PeekType accepts 1..31, 40 and 44 and rejects empty, 0, 45, 255",
-              allKnown && proto::kMsgLast == 44 && proto::PeekType(&impact, 1, m) && m == proto::Msg::VehicleImpact && proto::PeekType(&link, 1, m) && m == proto::Msg::LinkInfo && !proto::PeekType(&zero, 0, m) &&
+        for (uint8_t t = 45; t <= 51; t++)
+            allKnown = allKnown && proto::PeekType(&t, 1, m) && (uint8_t)m == t;
+        Check("codec: PeekType accepts 1..31, 40, 44 and 45..51 and rejects empty, 0, 52, 255",
+              allKnown && proto::kMsgLast == 51 &&proto::PeekType(&impact, 1, m) && m == proto::Msg::VehicleImpact && proto::PeekType(&link, 1, m) && m == proto::Msg::LinkInfo && !proto::PeekType(&zero, 0, m) &&
                   !proto::PeekType(nullptr, 0, m) && !proto::PeekType(&zero, 1, m) && !proto::PeekType(&firstUnknown, 1, m) && !proto::PeekType(&ff, 1, m));
     }
 
@@ -452,7 +455,7 @@ static void CodecTests()
     // Unknown enum values.
     {
         int accepted = 0;
-        for (int v : {0, 9, 255})
+        for (int v : {0, (int)proto::RefuseReason::AuthUnavailable + 1, 255})
         {
             proto::Refuse r;
             r.reason = (proto::RefuseReason)v;
@@ -465,7 +468,7 @@ static void CodecTests()
             if (DecodeAs<proto::PlayerLeft>(proto::Encode(l).data(), proto::Encode(l).size())) accepted++;
         }
         proto::Refuse okR;
-        okR.reason = proto::RefuseReason::TooManyConnections; // the last known value
+        okR.reason = proto::RefuseReason::AuthUnavailable; // the last known value (v8)
         proto::PlayerLeft okL;
         okL.reason = proto::LeaveReason::Kicked;
         Check("codec: unknown RefuseReason / LeaveReason values are rejected, the last known ones accepted",
@@ -3207,7 +3210,9 @@ static void AnimNetworkTests()
           "sender's PlayerJoined, and is not echoed to the sender",
           relayed && pa && pa->anim.id == aId && SameAnim(pa->anim.anim, Smoke()) && cj && replay && pc && pc->anim.id == aId &&
               SameAnim(pc->anim.anim, Smoke()) && joinedAt > 0 && animAt > joinedAt && alice.Count(ET::PeerAnim) == 0,
-          bob.Describe());
+          bob.Describe() + " | carol " + carol.Describe() + " | relayed " + std::to_string(relayed) + " cj " + std::to_string(cj) +
+              " replay " + std::to_string(replay) + " joinedAt " + std::to_string(joinedAt) + " animAt " + std::to_string(animAt) +
+              " aliceAnims " + std::to_string(alice.Count(ET::PeerAnim)));
 
     // StopAnim clears it; a scenario is relayed and replayed; a one-shot is relayed but replaces (and is never replayed).
     {

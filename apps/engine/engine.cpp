@@ -854,6 +854,12 @@ namespace {
         // radar HIDDEN (GI's pick 2026-11-06: the design's place and size, map off, until the radar can be moved into the circle).
         g_hudRing.store(reg::Get(L"hud_ring") != L"0");
         game::Overlay::SetHudRing(g_hudRing.load());
+        // 0.6 inv_rev3 (default on; 0 = the 0.5.2 Tab menu only): the Tab menu opens on GI's REV3 inventory, admins get the old menu as ADMIN.
+        {
+            const bool rev3 = reg::Get(L"inv_rev3") != L"0";
+            game::Overlay::SetInventoryScreen(rev3);
+            GLOGI("engine: inventory (0.6): inv_rev3=%s", rev3 ? "on" : "OFF (the old Tab menu)");
+        }
         // 0.5.2 ring_map (default on; 0 = 0.5.0's ring without a map): GTA's radar is shown again and moved into the ring through the game's own
         // minimap table (minimapsize::ConfigurePlacement), the overlay hides the square's corners. GI 2026-11-06: "do the real round map".
         g_ringMap.store(reg::Get(L"ring_map") != L"0");
@@ -1238,9 +1244,16 @@ namespace {
         std::string arg;              // /car, /gun model/weapon name; /e dictionary; /scenario name
         std::string arg2;             // /e clip name
         bool loop = false, upper = false; // /e options
+        bool approved = false;        // v8: the server answered AdminResult Ok for it (run it, do not ask again)
+        bool tpSpawn = false;         // v8: a /spawn (a Tp to kSpawn), asked as AdminOp::Spawn
     };
     std::mutex g_cmdMtx;
     std::vector<Command> g_cmdQueue;
+    // v8: admin commands waiting for the server's AdminResult, by AdminCmd seq (g_cmdMtx). Bounded: an answer that never
+    // comes (the session ended) is dropped with the oldest when the map is full, and the map is cleared per session.
+    std::map<uint16_t, Command> g_adminParked;
+    uint16_t g_adminSeq = 0;
+    constexpr size_t kMaxAdminParked = 16;
 
     // One deferred vehicle spawn (/car): the model streams in over a few frames, so
     // the tick requests it and creates the vehicle once it has loaded. Script tick only.
@@ -1258,6 +1271,14 @@ namespace {
     // system; reset to full on entry. Script-tick only.
     float g_satiety = 100.0f;
     ULONG g_satietyAt = 0;
+    // 0.6: satiety from food the server used for us (InvUsed, join worker thread), added on the next vitals tick.
+    std::atomic<int> g_satietyAdd{0};
+
+    // 0.6 inventory: the name for the CHARACTER chip (the verified account's, else the name we joined under) and the counters of the
+    // 10 s line. The name is written by the join worker (OnAccount) and read by it (OnInvState): g_invMtx keeps it whole for OnEnded.
+    std::mutex g_invMtx;
+    std::string g_invName;
+    std::atomic<uint32_t> g_invStates{0}, g_invOpsSent{0}, g_invOpsUnsent{0}, g_invUsed{0};
 
     // With stock scripts off the per-tick entry-boot suppression has no script to kill; it then runs
     // once per entry (for its FORCE_GAME_STATE_PLAYING). Script tick only; EnterServer re-arms it.
@@ -1910,10 +1931,15 @@ namespace {
         {
             g_connectThread = std::thread([] {
                 join::Session sess;
-                if (join::Connect(g_cfg, 4000, sess))   // was 6000; a failed attempt is retried after 1 s
+                // v8: with a join token the server asks the platform before its Welcome (up to ~2.5 s), so the wait is longer.
+                if (join::Connect(g_cfg, g_cfg.joinToken.empty() ? 4000 : 8000, sess))   // was 6000; a failed attempt is retried after 1 s
+                {
                     GLOGI("engine: joined %s:%d (server '%s', id %u)",
                         Narrow(g_cfg.host).c_str(), g_cfg.port,
                         sess.serverName.c_str(), (unsigned)sess.myId);
+                    // v8: the token is single use and now redeemed; a reconnect goes without it (the launcher's Play mints a new one).
+                    g_cfg.joinToken.clear();
+                }
                 else if (sess.refused)
                 {
                     if (join::RefusalIsFinal(sess.refuseReason))
@@ -2259,6 +2285,16 @@ namespace {
     // connection must re-enter (swap model, teleport to spawn) from scratch.
     void OnEnded()
     {
+        // v8: the next session's server decides again; nothing asked of this one is answered any more.
+        game::Overlay::SetIsAdmin(false);
+        {
+            std::lock_guard<std::mutex> lk(g_cmdMtx);
+            g_adminParked.clear();
+        }
+        game::Overlay::ClearInventory();   // 0.6: the inventory page shows "unavailable" until the next server sends one
+        g_satietyAdd.store(0);
+        GLOGI("engine: inventory (0.6) this session: %u states received, %u ops sent, %u not sent, %u food used", g_invStates.exchange(0),
+              g_invOpsSent.exchange(0), g_invOpsUnsent.exchange(0), g_invUsed.exchange(0));
         g_entry.store(Entry::Waiting);
         g_entryStarted.store(0);
         g_entryReadyAt.store(0);
@@ -3511,6 +3547,7 @@ namespace {
         else if (verb == "fix") c.kind = Command::Fix;
         else if (verb == "spawn") {                  // back to the server spawn (the quick-actions palette)
             c.kind = Command::Tp;
+            c.tpSpawn = true;
             c.x = kSpawn[0]; c.y = kSpawn[1]; c.z = kSpawn[2];
         }
         else if (verb == "tp") {
@@ -3565,14 +3602,138 @@ namespace {
 
     void RunSwingTest(int32_t lp);   // R4 T3, defined with the swing display (PlayPeerSwing)
 
+    // v8: the admin command a queued command is on a server (none for emotes, /kill, /swing: those are everybody's).
+    bool AdminOpOf(const Command& c, proto::AdminOp& op, std::string& arg) {
+        arg.clear();
+        switch (c.kind) {
+        case Command::Heal:   op = proto::AdminOp::Heal; return true;
+        case Command::Fix:    op = proto::AdminOp::Fix; return true;
+        case Command::Noclip: op = proto::AdminOp::Noclip; return true;
+        case Command::Gun:    op = proto::AdminOp::Gun; arg = c.arg; break;
+        case Command::Car:    op = proto::AdminOp::Car; arg = c.arg; break;
+        case Command::Tp:
+            if (c.tpSpawn) { op = proto::AdminOp::Spawn; return true; }
+            op = proto::AdminOp::Tp;
+            {
+                char b[64];
+                std::snprintf(b, sizeof b, "%.1f %.1f %.1f", c.x, c.y, c.z);
+                arg = b;
+            }
+            break;
+        default: return false;
+        }
+        // The wire carries printable ASCII up to kMaxAdminArg: anything else is cut to what fits (the name is the player's own typing).
+        std::string clean;
+        for (char ch : arg)
+            if ((unsigned char)ch >= 0x20 && (unsigned char)ch <= 0x7E && clean.size() < proto::kMaxAdminArg) clean.push_back(ch);
+        arg = clean;
+        return true;
+    }
+
+    // v8: on a server, an admin command is asked for first (AdminCmd); OnAdminResult queues it again, approved, or says why not.
+    // True when `c` was parked (the caller skips it this tick). With no live session it runs locally as before.
+    bool ParkForServer(const Command& c) {
+        if (c.approved || !join::IsConnected()) return false;
+        proto::AdminCmd m;
+        if (!AdminOpOf(c, m.op, m.arg)) return false;
+        {
+            std::lock_guard<std::mutex> lk(g_cmdMtx);
+            m.seq = ++g_adminSeq;
+            if (g_adminParked.size() >= kMaxAdminParked) g_adminParked.erase(g_adminParked.begin());
+            g_adminParked[m.seq] = c;
+        }
+        if (!join::SendAdminCmd(m)) {
+            {
+                std::lock_guard<std::mutex> lk(g_cmdMtx);
+                g_adminParked.erase(m.seq);
+            }
+            game::Overlay::PushSystemLine("The server did not get that command. Try again.");
+            GLOGW("engine: /%s not sent to the server (queue full or the session ended)", proto::ToString(m.op));
+            return true;
+        }
+        GLOGI("engine: /%s asked of the server (seq %u)", proto::ToString(m.op), (unsigned)m.seq);
+        return true;
+    }
+
+    // v8, join worker thread: the server's answer to a ParkForServer.
+    void OnAdminResult(const proto::AdminResult& r) {
+        Command c;
+        {
+            std::lock_guard<std::mutex> lk(g_cmdMtx);
+            auto it = g_adminParked.find(r.seq);
+            if (it == g_adminParked.end()) {
+                GLOGW("engine: AdminResult seq %u (/%s) matches no command waiting", (unsigned)r.seq, proto::ToString(r.op));
+                return;
+            }
+            c = it->second;
+            g_adminParked.erase(it);
+            if (r.code == proto::AdminCode::Ok && r.op != proto::AdminOp::Heal) {
+                c.approved = true;             // run it on the next script tick (heal: the server already did it)
+                if (g_cmdQueue.size() < 32) g_cmdQueue.push_back(c);
+            }
+        }
+        GLOGI("engine: /%s answered by the server: %s%s%s", proto::ToString(r.op), proto::ToString(r.code), r.text.empty() ? "" : " - ",
+              r.text.c_str());
+        if (r.code != proto::AdminCode::Ok)
+            game::Overlay::PushSystemLine(r.text.empty() ? "The server refused that command." : r.text.c_str());
+    }
+
+    // v8, join worker thread: the account the server verified; the overlay offers admin actions when it may use them.
+    void OnAccount(const proto::AccountInfo& a) {
+        game::Overlay::SetIsAdmin((a.flags & proto::kAcctCommands) != 0);
+        std::string name = a.username;
+        if (name.empty())
+            for (wchar_t ch : g_cfg.player)   // the Hello name (ASCII by the protocol's own rule)
+                if (ch >= 0x20 && ch < 0x7F) name.push_back((char)ch);
+        std::lock_guard<std::mutex> lk(g_invMtx);
+        g_invName = name;
+    }
+
+    // 0.6, join worker thread: our inventory as the server holds it (after each of our ops, and after a console give / clear).
+    void OnInvState(const proto::InvState& s) {
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lk(g_invMtx);
+            name = g_invName;
+        }
+        if (g_invStates.fetch_add(1) == 0)
+            GLOGI("engine: inventory (0.6): first InvState, %zu bytes", s.blob.size());
+        game::Overlay::SetInventory(s.blob, s.ackSeq, name.c_str());
+    }
+
+    // 0.6, join worker thread: food the server used for us.
+    void OnInvUsed(const proto::InvUsed& u) {
+        g_invUsed.fetch_add(1);
+        g_satietyAdd.fetch_add((int)u.satiety);
+    }
+
+    // 0.6, script tick: the ops the player made on the inventory page, to the server in order. Without a live session there is no
+    // inventory to change (the page shows "unavailable"), so an op left over from a session that just ended is dropped.
+    void PumpInventoryOps() {
+        std::string op;
+        uint32_t seq = 0;
+        while (game::Overlay::PopInventoryOp(&op, &seq)) {
+            proto::InvOp m;
+            m.seq = seq;
+            m.op = op;
+            if (join::SendInvOp(m))
+                g_invOpsSent.fetch_add(1);
+            else if (g_invOpsUnsent.fetch_add(1) < 8)
+                GLOGW("engine: inventory op seq %u not sent (no live session, or the queue is full)", (unsigned)seq);
+        }
+    }
+
     // Run any queued commands and advance a pending vehicle spawn. Script tick only.
     // lp is the local ped, now is GetTickCount().
     void RunCommands(int32_t lp, ULONG now) {
+        PumpInventoryOps();
         std::vector<Command> cmds;
         {
             std::lock_guard<std::mutex> lk(g_cmdMtx);
             cmds.swap(g_cmdQueue);
         }
+        // v8: admin commands wait for the server's yes (ParkForServer); the rest run now.
+        cmds.erase(std::remove_if(cmds.begin(), cmds.end(), [](const Command& c) { return ParkForServer(c); }), cmds.end());
         float px = 0, py = 0, pz = 0, heading = 0;
         if (!cmds.empty() || g_pendingCar.active) {
             g_world->GetEntityCoords(lp, px, py, pz);
@@ -3716,6 +3877,8 @@ namespace {
             if (g_satiety < 0) g_satiety = 0;
         }
         g_satietyAt = now;
+        if (const int add = g_satietyAdd.exchange(0))   // 0.6: food used through the inventory (InvUsed)
+            g_satiety = std::fmin(100.0f, g_satiety + (float)add);
 
         // GTA ped health runs from 100 (dead) up to maxHp (200 for an MP freemode ped), so the
         // fraction is taken over that span: hp 100 is an empty bar, not half of one. A max at or
@@ -4154,7 +4317,9 @@ namespace {
         in.switchOn = g_minimap.load();
         in.entryDone = g_entry.load() == Entry::Done;
         in.pauseMenuActive = g_pauseMenuActive;
-        const bool wanted = sync::RadarWanted(in);
+        // 0.6: the REV3 inventory page covers the screen; GTA's radar would show through its dim, so it is hidden while the page is open.
+        const bool invOpen = game::Overlay::InventoryOpen();
+        const bool wanted = sync::RadarWanted(in) && !invOpen;
         if (wanted != g_miniWanted)
         {
             g_miniWanted = wanted;
@@ -4162,8 +4327,8 @@ namespace {
             if (g_miniTransitions < 24)
             {
                 ++g_miniTransitions;
-                GLOGI("engine: minimap (0.4.22): radar %s (minimap=%s, entry %s, pause menu %s)", wanted ? "SHOWN" : "hidden", in.switchOn ? "on" : "OFF",
-                      in.entryDone ? "done" : "not done", in.pauseMenuActive ? "up" : "closed");
+                GLOGI("engine: minimap (0.4.22): radar %s (minimap=%s, entry %s, pause menu %s, inventory %s)", wanted ? "SHOWN" : "hidden", in.switchOn ? "on" : "OFF",
+                      in.entryDone ? "done" : "not done", in.pauseMenuActive ? "up" : "closed", invOpen ? "open" : "closed");
             }
         }
         if (!in.entryDone)
@@ -14653,6 +14818,8 @@ namespace gage::engine {
         g_world = world;
         g_cfg = cfg;
         g_giveUp.store(false);
+        // v8: with no server every command runs locally (single player); on a server the AccountInfo decides.
+        game::Overlay::SetIsAdmin(cfg.host.empty());
         join::PeerSinks sinks;
         sinks.onWelcome = OnWelcome;
         sinks.onJoined = OnJoined;
@@ -14667,6 +14834,10 @@ namespace gage::engine {
         sinks.onSeatNotice = OnSeatNotice;
         sinks.onVehicleImpact = OnVehicleImpact;   // T4
         sinks.onLinkInfo = OnLinkInfo;             // R3 T5
+        sinks.onAccount = OnAccount;               // v8
+        sinks.onAdminResult = OnAdminResult;       // v8
+        sinks.onInvState = OnInvState;             // 0.6 inventory
+        sinks.onInvUsed = OnInvUsed;
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

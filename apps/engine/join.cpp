@@ -50,6 +50,8 @@ namespace {
         bool respawn = false;
         struct Emote { enum Kind { Anim, Scenario, Stop } kind = Stop; proto::Anim anim; std::string name; };
         std::deque<Emote> emotes;
+        std::deque<proto::AdminCmd> adminCmds;   // v8
+        std::deque<proto::InvOp> invOps;         // v8 (0.6)
 
         // Sinks, set before Connect() and copied into the worker at its start.
         join::EventSink events;
@@ -202,8 +204,12 @@ namespace {
                 std::deque<proto::VehicleCmd> vehCmds;
                 std::deque<proto::Hit> hits;
                 std::deque<Shared::Emote> emotes;
+                std::deque<proto::AdminCmd> adminCmds;
+                std::deque<proto::InvOp> invOps;
                 {
                     std::lock_guard<std::mutex> lk(S.mu);
+                    adminCmds.swap(S.adminCmds);
+                    invOps.swap(S.invOps);
                     haveState = S.haveState;
                     k = S.state;
                     ped = S.statePed;
@@ -220,6 +226,13 @@ namespace {
                     S.respawn = false;
                     emotes.swap(S.emotes);
                 }
+                // v8: admin commands before the vehicle commands they may lead to.
+                for (const proto::AdminCmd& c : adminCmds)
+                    if (!session.SendAdminCmd(c))
+                        GLOGW("join: admin command /%s (seq %u) not sent", proto::ToString(c.op), (unsigned)c.seq);
+                for (const proto::InvOp& o : invOps)
+                    if (!session.SendInvOp(o))
+                        GLOGW("join: inventory op seq %u not sent", (unsigned)o.seq);
                 // v4, reliable ones first (they are ordered on their own channel anyway).
                 for (const proto::VehicleCmd& c : vehCmds)
                     if (!session.SendVehicleCmd(c))
@@ -414,6 +427,25 @@ namespace {
                     if (peers.onLinkInfo)
                         timed("linkInfo", [&] { peers.onLinkInfo(e.linkInfo); });
                     break;
+                case net::Event::Type::AccountInfo:
+                    GLOGI("join: account: %s%s%s", (e.account.flags & proto::kAcctVerified) ? "verified as " : "guest (no verified account)",
+                          (e.account.flags & proto::kAcctVerified) ? e.account.username.c_str() : "",
+                          (e.account.flags & proto::kAcctAdmin) ? ", admin" : (e.account.flags & proto::kAcctCommands) ? ", admin commands allowed" : "");
+                    if (peers.onAccount)
+                        timed("account", [&] { peers.onAccount(e.account); });
+                    break;
+                case net::Event::Type::AdminResult:
+                    if (peers.onAdminResult)
+                        timed("adminResult", [&] { peers.onAdminResult(e.adminResult); });
+                    break;
+                case net::Event::Type::InvState:
+                    if (peers.onInvState)
+                        timed("invState", [&] { peers.onInvState(e.invState); });
+                    break;
+                case net::Event::Type::InvUsed:
+                    if (peers.onInvUsed)
+                        timed("invUsed", [&] { peers.onInvUsed(e.invUsed); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())
@@ -564,6 +596,30 @@ namespace gage::join {
         if (S.vehCmds.size() >= kMaxQueuedVehCmds)
             return false;
         S.vehCmds.push_back(c);
+        return true;
+    }
+
+    bool SendAdminCmd(const proto::AdminCmd& c)
+    {
+        Shared& S = Sh();
+        if (!S.live.load() || proto::Encode(c).empty())
+            return false;
+        std::lock_guard<std::mutex> lk(S.mu);
+        if (S.adminCmds.size() >= 16)
+            return false;
+        S.adminCmds.push_back(c);
+        return true;
+    }
+
+    bool SendInvOp(const proto::InvOp& o)
+    {
+        Shared& S = Sh();
+        if (!S.live.load() || proto::Encode(o).empty())
+            return false;
+        std::lock_guard<std::mutex> lk(S.mu);
+        if (S.invOps.size() >= 64)
+            return false;
+        S.invOps.push_back(o);
         return true;
     }
 
@@ -725,11 +781,15 @@ namespace gage::join {
         o.port = (uint16_t)cfg.port;
         o.name = SanitizeName(cfg.player);
         o.connectTimeoutMs = (uint32_t)timeoutMs;
+        o.joinToken = cfg.joinToken;
         if (Narrow(cfg.player) != o.name)
             GLOGW("join: player name '%s' is not allowed by the protocol, joining as '%s'",
                   Narrow(cfg.player).c_str(), o.name.c_str());
-        GLOGI("join: joining %s:%d as '%s' (protocol %u)", o.host.c_str(), cfg.port, o.name.c_str(),
-              (unsigned)proto::kVersion);
+        GLOGI("join: joining %s:%d as '%s' (protocol %u, %s)", o.host.c_str(), cfg.port, o.name.c_str(),
+              (unsigned)proto::kVersion,
+              cfg.joinToken.empty() ? "no join token: a guest unless the server requires an account"
+              : proto::ValidJoinToken(cfg.joinToken) ? "with a join token"
+                                                     : "the join token is malformed and is not sent");
 
         EventSink events;
         PeerSinks peers;
@@ -745,6 +805,8 @@ namespace gage::join {
             S.hits.clear();
             S.respawn = false;
             S.emotes.clear();
+            S.adminCmds.clear();
+            S.invOps.clear();
             S.stop.store(false);
             S.live.store(false);
             S.myId.store(0);

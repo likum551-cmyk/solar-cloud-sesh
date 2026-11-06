@@ -62,6 +62,13 @@ namespace gage::server {
         constexpr double kVehCmdBurst = 10.0, kVehCmdPerSec = 10.0;
         constexpr double kSpawnBurst = 3.0, kSpawnPerSec = 1.0;
         constexpr double kAnimBurst = 4.0, kAnimPerSec = 4.0;
+        // v8 AdminCmd per player (a quick-actions click is one; holding a key is not a thing): 8 at once, then 4 a second.
+        constexpr double kAdminBurst = 8.0, kAdminPerSec = 4.0;
+        // 0.6 InvOp per player: a drag is one op, Shift+click spam a few a second; 20 at once, then 10 a second. Over it the op
+        // is refused (answered with the unchanged InvState), never a disconnect.
+        constexpr double kInvBurst = 20.0, kInvPerSec = 10.0;
+        // Changed inventories are written at least this often (and always when the player leaves).
+        constexpr uint64_t kInvSaveEveryMs = 30000;
         // A VehicleCmd over its rate limit is answered RateLimited at most this often per player ...
         constexpr uint64_t kRateLimitedReplyEveryMs = 1000;
         // ... and every one over the limit also draws on this bucket (burst, per second): a client that keeps
@@ -109,13 +116,32 @@ namespace gage::server {
 
     struct Server::Conn
     {
-        enum class St { AwaitHello, Joined, Closing };
+        // v8: AwaitAuth = Hello passed, waiting for JoinAuth; Verifying = the platform is checking the token.
+        enum class St { AwaitHello, AwaitAuth, Verifying, Joined, Closing };
 
         _ENetPeer* peer = nullptr;
         St st = St::AwaitHello;
         uint64_t connectedAtMs = 0;
         uint64_t closingAtMs = 0;
         std::string addr;
+
+        // v8 accounts. `serial` names this connection to the platform worker (a peer pointer is reused by ENet).
+        uint64_t serial = 0;
+        std::string helloName;      // the name the Hello asked for (a guest plays under it)
+        uint64_t verifyStartMs = 0;
+        bool verified = false;      // the platform verified this player's join token
+        bool isAdmin = false;       // ... and one of its roles is in Config::adminRoles
+        bool sessionEnded = false;  // the platform was told this game session ended (once per connection)
+        std::string accountId, sessionId;
+        std::vector<std::string> roles;
+        TokenBucket adminRate;
+
+        // 0.6 inventory (valid once Joined): the server's copy is the truth; `invSave` = this session may write the save (a verified
+        // account whose save was not Unreadable), `invDirty` = changed since the last save.
+        sync::inv::Character inv;
+        bool invSave = false;
+        bool invDirty = false;
+        TokenBucket invRate;
 
         // valid once Joined
         uint16_t id = 0;
@@ -366,6 +392,7 @@ namespace gage::server {
 
         cfg_ = cfg;
         if (!bans_.Load(cfg_.bansFile, &why)) return fail("ban list: " + why);
+        invStore_.SetDir(cfg_.inventoryDir);
 
         enet_ = std::make_unique<net::EnetScope>();
         if (!enet_->ok()) return fail("ENet failed to initialise");
@@ -485,6 +512,29 @@ namespace gage::server {
         if (admin_->running())
             Log("admin channel on 127.0.0.1:" + std::to_string(admin_->port()) + " (loopback only, token required)");
 
+        // v8 accounts. The secret is never logged.
+        {
+            std::string roles;
+            for (const std::string& r : cfg_.adminRoles) roles += (roles.empty() ? "" : ",") + r;
+            if (!cfg_.platformUrl.empty())
+            {
+                std::string perr;
+                if (!platform_.Start(cfg_.platformUrl, cfg_.platformServerId, cfg_.platformServerSecret, cfg_.platformTimeoutMs, &perr))
+                {
+                    admin_->Stop();
+                    enet_host_destroy(host_);
+                    host_ = nullptr;
+                    return fail("platform: " + perr);
+                }
+                Log("accounts: join tokens verified by " + cfg_.platformUrl + " as server \"" + cfg_.platformServerId + "\"; requireAccount " +
+                    (cfg_.requireAccount ? "ON (a join without a verified account is refused)" : "off (guests are admitted and logged)") +
+                    "; admin roles " + roles);
+            }
+            else
+                Log("accounts: no platformUrl: join tokens are ignored, every player is a guest; admin commands open to all (admin roles " +
+                    roles + " apply only to verified players)");
+        }
+
         if (!cfg_.masterUrl.empty())
         {
             AnnounceSettings as;
@@ -595,22 +645,53 @@ namespace gage::server {
     {
         const uint64_t nowMs = net::NowMs();
 
-        // Timers over connections that are not (or no longer) playing.
-        std::vector<Conn*> helloLate, stuck;
+        // v8: the platform's verdicts and log lines (its worker never touches server state).
+        if (platform_.running())
+        {
+            std::vector<VerifyResult> verdicts;
+            std::vector<std::string> lines;
+            platform_.Drain(verdicts, lines);
+            for (const std::string& l : lines) Log(l);
+            for (const VerifyResult& r : verdicts) OnVerified(r);
+        }
+
+        // Timers over connections that are not (or no longer) playing. `nowMs` was read at the top of this Tick, and the
+        // verdicts above can start a close (Refuse, a replaced connection) with a LATER net::NowMs(): an unsigned
+        // `nowMs - closingAtMs` then wrapped to a huge age and the "stuck" branch reset the peer in the same pass, so
+        // its Refuse / kick notice was never sent (the client saw only a handshake timeout). Ages never go negative.
+        auto age = [nowMs](uint64_t since) { return nowMs > since ? nowMs - since : 0; };
+        std::vector<Conn*> helloLate, authLate, verifyLate, stuck;
         for (auto& kv : conns_)
         {
             Conn& c = *kv.second;
-            if (c.st == Conn::St::AwaitHello && nowMs - c.connectedAtMs >= cfg_.helloTimeoutMs)
+            if (c.st == Conn::St::AwaitHello && age(c.connectedAtMs) >= cfg_.helloTimeoutMs)
                 helloLate.push_back(&c);
-            else if (c.st == Conn::St::Closing && nowMs - c.closingAtMs >= kCloseGraceMs)
+            else if (c.st == Conn::St::AwaitAuth && age(c.connectedAtMs) >= cfg_.helloTimeoutMs)
+                authLate.push_back(&c);
+            else if (c.st == Conn::St::Verifying && age(c.verifyStartMs) >= (uint64_t)cfg_.platformTimeoutMs + 3000)
+                verifyLate.push_back(&c);
+            else if (c.st == Conn::St::Closing && age(c.closingAtMs) >= kCloseGraceMs)
                 stuck.push_back(&c);
         }
         for (Conn* c : helloLate)
             Refuse(*c, proto::RefuseReason::HelloTimeout, "no Hello within " + std::to_string(cfg_.helloTimeoutMs) + " ms");
+        for (Conn* c : authLate)
+            Refuse(*c, proto::RefuseReason::HelloTimeout, "no JoinAuth within " + std::to_string(cfg_.helloTimeoutMs) + " ms");
+        for (Conn* c : verifyLate)
+        {
+            // The worker owes a verdict (its HTTP call is bounded by platformTimeoutMs): fail this join now; the late
+            // verdict finds no Verifying connection and closes the platform session it may have opened.
+            VerifyResult r;
+            r.serial = c->serial;
+            r.reason = "no verdict from the platform within " + std::to_string(cfg_.platformTimeoutMs + 3000) + " ms";
+            OnVerified(r);
+        }
         for (Conn* c : stuck)
         {
             // The client never completed the close handshake; free the slot.
             ENetPeer* peer = c->peer;
+            Log("close: connection #" + std::to_string(c->serial) + " " + c->addr + " never completed its disconnect within " +
+                std::to_string(kCloseGraceMs) + " ms; its slot is freed");
             enet_peer_reset(peer);
             peer->data = nullptr;
             conns_.erase(peer);
@@ -723,6 +804,7 @@ namespace gage::server {
             nextSyncLogUs_ = nowUs + 10000000;
         }
         if (nowUs >= nextHitLogUs_) LogHitSummary(nowUs);
+        SaveDirtyInventories(net::NowMs());
     }
 
     void Server::BroadcastWorld()
@@ -786,6 +868,7 @@ namespace gage::server {
         c.connectedAtMs = net::NowMs();
         c.addr = AddressOf(peer);
         c.ownerKey = peer->address.host;
+        c.serial = nextSerial_++;
         peer->data = &c;
         enet_peer_timeout(peer, cfg_.peerTimeoutLimit, cfg_.peerTimeoutMinMs, cfg_.peerTimeoutMaxMs);
         // ENet's packet throttle deletes a share of UNRELIABLE packets (this server's whole state channel, both ways) each
@@ -835,6 +918,9 @@ namespace gage::server {
             RemovePlayer(c, data == proto::kDisconnectQuit ? proto::LeaveReason::Quit : proto::LeaveReason::Timeout);
         else if (c.st == Conn::St::AwaitHello)
             Log("disconnect " + c.addr + " before Hello");
+        else if (c.st == Conn::St::AwaitAuth || c.st == Conn::St::Verifying)
+            Log("disconnect " + c.addr + " (" + c.helloName + ") before Welcome" +
+                (c.st == Conn::St::Verifying ? std::string(" (its account check is still running)") : std::string()));
         peer->data = nullptr;
         conns_.erase(it);
     }
@@ -861,6 +947,22 @@ namespace gage::server {
             OnHello(c, data, len);
             return;
         }
+        if (c.st == Conn::St::AwaitAuth)
+        {
+            if (type != proto::Msg::JoinAuth || channel != proto::kChanReliable)
+            {
+                Refuse(c, proto::RefuseReason::Protocol, std::string("expected JoinAuth after Hello, got ") + proto::ToString(type));
+                return;
+            }
+            OnJoinAuth(c, data, len);
+            return;
+        }
+        if (c.st == Conn::St::Verifying)
+        {
+            // A client sends nothing between JoinAuth and Welcome.
+            Refuse(c, proto::RefuseReason::Protocol, std::string("unexpected ") + proto::ToString(type) + " before Welcome");
+            return;
+        }
 
         // Joined: PlayerState and VehicleUpdate (state channel); ChatSend, PlayerLook, VehicleCmd,
         // Hit, Respawn, PlayAnim, PlayScenario and StopAnim (reliable) are the client messages; a
@@ -882,6 +984,10 @@ namespace gage::server {
             OnRespawn(c, data, len);
         else if ((type == proto::Msg::PlayAnim || type == proto::Msg::PlayScenario || type == proto::Msg::StopAnim) && rel)
             OnAnim(c, type, data, len);
+        else if (type == proto::Msg::AdminCmd && rel)
+            OnAdminCmd(c, data, len);
+        else if (type == proto::Msg::InvOp && rel)
+            OnInvOp(c, data, len);
         else
             Refuse(c, proto::RefuseReason::Protocol,
                    std::string("unexpected ") + proto::ToString(type) + " on channel " + std::to_string(channel));
@@ -913,11 +1019,188 @@ namespace gage::server {
                        " characters of A-Z a-z 0-9 _ . - and single inner spaces");
             return;
         }
+        // The checks that need no account come before JoinAuth, so a refusal here never spends a join token.
+        if (!PreAdmitChecks(c, h.name)) return;
+        // v8: the join token comes next (JoinAuth, same ordered channel); the name may still change to the account's.
+        c.helloName = h.name;
+        c.st = Conn::St::AwaitAuth;
+    }
+
+    bool Server::PreAdmitChecks(Conn& c, const std::string& name)
+    {
         // By name, and by address again (a ban added while the connection sat waiting
         // for its Hello is caught here as well as by RefuseAddress).
-        if (const BanEntry* ban = bans_.Match(h.name, c.addr))
+        if (const BanEntry* ban = bans_.Match(name, c.addr))
         {
             RefuseBanned(c, *ban);
+            return false;
+        }
+        if (players_.size() >= cfg_.maxPlayers)
+        {
+            Refuse(c, proto::RefuseReason::ServerFull, "server is full");
+            return false;
+        }
+        return true;
+    }
+
+    // ---- v8 accounts --------------------------------------------------------------------------------
+
+    void Server::OnJoinAuth(Conn& c, const uint8_t* data, size_t len)
+    {
+        proto::JoinAuth a;
+        if (!proto::Decode(data, len, a))
+        {
+            Refuse(c, proto::RefuseReason::Protocol, "malformed JoinAuth");
+            return;
+        }
+        if (a.token.empty())
+        {
+            if (cfg_.requireAccount)
+            {
+                stats_.authRefused++;
+                Refuse(c, proto::RefuseReason::AccountRequired,
+                       "This server needs a Solar RP account. Log in to Solar Launcher and press Play there.");
+                return;
+            }
+            AdmitGuest(c, "no join token");
+            return;
+        }
+        if (!platform_.running())
+        {
+            AdmitGuest(c, "a join token, ignored: no platformUrl is configured");
+            return;
+        }
+        c.st = Conn::St::Verifying;
+        c.verifyStartMs = net::NowMs();
+        platform_.Verify(c.serial, a.token);
+        Log("account: connection #" + std::to_string(c.serial) + " " + c.addr + " (" + c.helloName + ") presented a join token; asking the platform");
+    }
+
+    void Server::OnVerified(const VerifyResult& r)
+    {
+        Conn* found = nullptr;
+        for (auto& kv : conns_)
+            if (kv.second->serial == r.serial && kv.second->st == Conn::St::Verifying) found = kv.second.get();
+        if (!found)
+        {
+            // The connection is gone (or was already failed by the verify timer): close the session the token opened.
+            if (r.outcome == VerifyResult::Outcome::Ok)
+            {
+                Log("account: verdict for connection #" + std::to_string(r.serial) + " (" + r.username +
+                    ") arrived after it was gone; ending its platform session");
+                platform_.SessionEnd(r.sessionId, r.accountId, "quit");
+            }
+            return;
+        }
+        Conn& c = *found;
+        const std::string conn = "connection #" + std::to_string(c.serial) + " " + c.addr + " (" + c.helloName + ")";
+        switch (r.outcome)
+        {
+        case VerifyResult::Outcome::Banned:
+        {
+            stats_.authRefused++;
+            stats_.refusedBanned++;
+            Log("account: " + conn + " belongs to banned account " + r.accountId + " (" + r.banReason + ", until " +
+                (r.banExpiresAt.empty() ? std::string("forever") : r.banExpiresAt) + ")");
+            std::string text = "Your Solar RP account is banned";
+            if (!r.banReason.empty()) text += ": " + r.banReason;
+            text += r.banExpiresAt.empty() ? " (permanently)." : " (until " + r.banExpiresAt + ").";
+            Refuse(c, proto::RefuseReason::Banned, text);
+            return;
+        }
+        case VerifyResult::Outcome::Rejected:
+        {
+            if (!cfg_.requireAccount)
+            {
+                AdmitGuest(c, "the platform refused its join token (" + r.reason + ")");
+                return;
+            }
+            stats_.authRefused++;
+            const char* text = r.reason == "expired" ? "Your join ticket expired before the game connected. Press Play in Solar Launcher again."
+                               : r.reason == "used"  ? "This join ticket was already used. Press Play in Solar Launcher again."
+                                                     : "Your join ticket is not valid for this server. Press Play in Solar Launcher again.";
+            Log("account: " + conn + " token refused by the platform: " + r.reason);
+            Refuse(c, proto::RefuseReason::AuthFailed, text);
+            return;
+        }
+        case VerifyResult::Outcome::Unavailable:
+        {
+            if (!cfg_.requireAccount)
+            {
+                AdmitGuest(c, "the platform could not verify its join token (" + r.reason + ")");
+                return;
+            }
+            stats_.authRefused++;
+            Log("account: " + conn + " could not be verified (" + r.reason + "); refused (requireAccount fails closed)");
+            Refuse(c, proto::RefuseReason::AuthUnavailable, "Solar RP could not check your account right now. Try again in a minute.");
+            return;
+        }
+        case VerifyResult::Outcome::Ok:
+            break;
+        }
+
+        // Verified. The account name is the in-game name.
+        const std::string& name = r.username;
+        auto endNew = [&](const char* reason) { platform_.SessionEnd(r.sessionId, r.accountId, reason); };
+        if (!proto::ValidName(name))
+        {
+            stats_.authRefused++;
+            Log("account: " + conn + " verified as \"" + name + "\", which is not a valid in-game name; refused");
+            endNew("kicked");
+            Refuse(c, proto::RefuseReason::BadName, "Your account name cannot be used in game. Contact support.");
+            return;
+        }
+        if (const BanEntry* ban = bans_.Match(name, c.addr))
+        {
+            stats_.authRefused++;
+            endNew("kicked");
+            RefuseBanned(c, *ban);
+            return;
+        }
+        // One place per account: an older connection of the same account goes (the platform has already closed its
+        // session as superseded). A guest playing under this account's name gives the name up to its owner.
+        std::vector<Conn*> out;
+        for (const auto& kv : players_)
+        {
+            Conn& o = *kv.second;
+            if ((o.verified && o.accountId == r.accountId) || o.key == proto::NameKey(name)) out.push_back(&o);
+        }
+        for (Conn* o : out)
+        {
+            const bool same = o->verified && o->accountId == r.accountId;
+            Notice(*o, same ? "You joined this server again from another game. This session ends."
+                            : "This name belongs to a Solar RP account that just joined. Log in to Solar Launcher to play.");
+            Log(std::string("account: ") + (same ? "older connection" : "guest") + " id=" + std::to_string(o->id) + " " + o->name +
+                " removed for the verified account " + r.accountId);
+            RemovePlayer(*o, proto::LeaveReason::Kicked);
+            BeginClose(*o, proto::kDisconnectKicked);
+        }
+        if (players_.size() >= cfg_.maxPlayers)
+        {
+            endNew("quit");
+            Refuse(c, proto::RefuseReason::ServerFull, "server is full");
+            return;
+        }
+        c.verified = true;
+        c.accountId = r.accountId;
+        c.sessionId = r.sessionId;
+        c.roles = r.roles;
+        c.isAdmin = false;
+        for (const std::string& role : r.roles)
+            if (std::find(cfg_.adminRoles.begin(), cfg_.adminRoles.end(), role) != cfg_.adminRoles.end()) c.isAdmin = true;
+        std::string roles;
+        for (const std::string& role : r.roles) roles += (roles.empty() ? "" : ",") + role;
+        stats_.authVerified++;
+        Log("account: " + conn + " verified as " + name + " (account " + r.accountId + ", roles " + (roles.empty() ? "none" : roles) +
+            (c.isAdmin ? ", ADMIN" : "") + ") after " + std::to_string(net::NowMs() - c.verifyStartMs) + " ms");
+        Accept(c, name);
+    }
+
+    void Server::AdmitGuest(Conn& c, const std::string& why)
+    {
+        if (nameKeys_.count(proto::NameKey(c.helloName)))
+        {
+            Refuse(c, proto::RefuseReason::NameTaken, "name is already in use");
             return;
         }
         if (players_.size() >= cfg_.maxPlayers)
@@ -925,12 +1208,232 @@ namespace gage::server {
             Refuse(c, proto::RefuseReason::ServerFull, "server is full");
             return;
         }
-        if (nameKeys_.count(proto::NameKey(h.name)))
+        stats_.authGuests++;
+        Log("account: " + c.helloName + " (" + c.addr + ") joins as a guest: " + why + " (requireAccount is off)");
+        Accept(c, c.helloName);
+    }
+
+    bool Server::AdminAllowed(Conn& c, const std::string& what, bool* unknown)
+    {
+        if (unknown) *unknown = false;
+        const bool rolesKnown = c.verified || cfg_.requireAccount;
+        if (rolesKnown)
         {
-            Refuse(c, proto::RefuseReason::NameTaken, "name is already in use");
+            if (c.isAdmin) return true;
+            stats_.adminRefused++;
+            Log("admin: " + what + " by id=" + std::to_string(c.id) + " " + c.name + " REFUSED (not an admin)");
+            return false;
+        }
+        if (unknown) *unknown = true;
+        stats_.adminUnknownRoles++;
+        Log("admin: " + what + " by id=" + std::to_string(c.id) + " " + c.name +
+            " allowed: a guest on a server that does not require accounts (roles unknown)");
+        return true;
+    }
+
+    void Server::OnAdminCmd(Conn& c, const uint8_t* data, size_t len)
+    {
+        proto::AdminCmd m;
+        if (!proto::Decode(data, len, m))
+        {
+            Refuse(c, proto::RefuseReason::Protocol, "malformed AdminCmd");
             return;
         }
-        Accept(c, h.name);
+        proto::AdminResult res;
+        res.seq = m.seq;
+        res.op = m.op;
+        const std::string what = std::string("/") + proto::ToString(m.op) + (m.arg.empty() ? "" : " " + m.arg);
+        if (!c.adminRate.Take(net::NowMs()))
+        {
+            res.code = proto::AdminCode::RateLimited;
+            res.text = "Too many commands. Wait a moment.";
+        }
+        else
+        {
+            bool unknown = false;
+            if (!AdminAllowed(c, what, &unknown))
+            {
+                res.code = proto::AdminCode::NotAdmin;
+                res.text = "Only admins can use " + std::string("/") + proto::ToString(m.op) + " on this server.";
+            }
+            else
+            {
+                stats_.adminAllowed++;
+                if (!unknown) Log("admin: " + what + " by id=" + std::to_string(c.id) + " " + c.name + " (admin)");
+                res.code = proto::AdminCode::Ok;
+                if (m.op == proto::AdminOp::Heal)
+                {
+                    // Health is the server's: the heal happens here.
+                    std::string why;
+                    if (!Heal(std::to_string(c.id), &why))
+                    {
+                        res.code = proto::AdminCode::Failed;
+                        res.text = c.dead ? "You are dead: wait for the respawn." : "Heal failed.";
+                    }
+                }
+            }
+        }
+        SendTo(c, proto::kChanReliable, proto::Encode(res), true);
+    }
+
+    // ---- 0.6 inventory ------------------------------------------------------------------------------
+
+    void Server::LoadInventory(Conn& c)
+    {
+        std::string why;
+        const std::string account = c.verified ? c.accountId : std::string();
+        const InventoryStore::Loaded l = invStore_.Load(account, c.inv, &why);
+        // Unreadable: the real save is still there and must not be written over. A guest is never saved; Fresh and Corrupt save at
+        // once (the kit, or the empty start after a corrupt save) so a restart does not hand out a second kit.
+        c.invSave = c.verified && invStore_.Enabled() && l != InventoryStore::Loaded::Unreadable;
+        c.invDirty = c.invSave && l != InventoryStore::Loaded::Saved;
+        if (l == InventoryStore::Loaded::Corrupt || l == InventoryStore::Loaded::Unreadable)
+            Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " save " + InventoryStore::ToString(l) + ": " + why);
+        else if (c.verified)
+            Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " " + InventoryStore::ToString(l) +
+                (invStore_.Enabled() ? "" : " (inventoryDir empty: not saved)"));
+        SendInventory(c, 0);
+    }
+
+    void Server::SendInventory(Conn& c, uint32_t ackSeq)
+    {
+        proto::InvState s;
+        s.ackSeq = ackSeq;
+        s.blob = sync::inv::Encode(c.inv);
+        const proto::Bytes b = proto::Encode(s);
+        if (b.empty())
+        {
+            Log("inventory: id=" + std::to_string(c.id) + " encodes to " + std::to_string(s.blob.size()) + " bytes, over kMaxInvBlob: not sent");
+            return;
+        }
+        SendTo(c, proto::kChanReliable, b, true);
+    }
+
+    void Server::OnInvOp(Conn& c, const uint8_t* data, size_t len)
+    {
+        proto::InvOp m;
+        sync::inv::Op op;
+        if (!proto::Decode(data, len, m) || !sync::inv::DecodeOp(m.op, op))
+        {
+            Refuse(c, proto::RefuseReason::Protocol, "malformed InvOp");
+            return;
+        }
+        if (!c.invRate.Take(net::NowMs()))
+        {
+            stats_.invOpsRefused++;
+            SendInventory(c, m.seq);
+            return;
+        }
+        // On a copy first: USE consumes the item inside Apply, and a use the server cannot honour must leave it where it was.
+        sync::inv::Character trial = c.inv;
+        const sync::inv::ApplyOut out = sync::inv::Apply(trial, op);
+        bool ok = sync::inv::Ok(out.r);
+        sync::inv::Effect eff{0, 0};
+        if (ok && out.r == sync::inv::Result::Used)
+        {
+            eff = sync::inv::UseEffect(out.used);
+            const bool fullHealth = c.health >= (uint8_t)cfg_.playerHealth;
+            if (c.dead || (eff.hp > 0 && eff.satiety <= 0 && fullHealth))
+                ok = false; // dead: nothing can be used; a health-only item at full health is kept
+        }
+        if (!ok)
+        {
+            stats_.invOpsRefused++;
+            SendInventory(c, m.seq);
+            return;
+        }
+        c.inv = trial;
+        c.invDirty = c.invSave;
+        stats_.invOpsApplied++;
+        if (out.r == sync::inv::Result::Used)
+        {
+            stats_.invUses++;
+            if (eff.hp > 0)
+            {
+                // The item's HP are percent of the bar the player sees (Config::playerHealth is 100 %).
+                const uint32_t add = ((uint32_t)eff.hp * cfg_.playerHealth + 50) / 100;
+                c.health = (uint8_t)std::min<uint32_t>(cfg_.playerHealth, (uint32_t)c.health + add);
+                SendVitals(c, proto::kServerId, 0, 0, false);
+                PushShown(c);
+            }
+            if (eff.satiety > 0)
+            {
+                proto::InvUsed u;
+                u.item = out.used;
+                u.satiety = (uint8_t)std::min(eff.satiety, 100);
+                SendTo(c, proto::kChanReliable, proto::Encode(u), true);
+            }
+        }
+        SendInventory(c, m.seq);
+    }
+
+    void Server::SaveInventory(Conn& c, const char* when)
+    {
+        if (!c.invSave || !c.invDirty) return;
+        std::string why;
+        if (invStore_.Save(c.accountId, c.inv, &why))
+        {
+            c.invDirty = false;
+            stats_.invSaves++;
+        }
+        else
+        {
+            stats_.invSaveFailures++; // stays dirty: the next pass tries again
+            Log(std::string("inventory: save (") + when + ") of id=" + std::to_string(c.id) + " " + c.name + " failed: " + why);
+        }
+    }
+
+    void Server::SaveDirtyInventories(uint64_t nowMs)
+    {
+        if (nowMs < invSaveAtMs_) return;
+        invSaveAtMs_ = nowMs + kInvSaveEveryMs;
+        for (auto& kv : players_) SaveInventory(*kv.second, "periodic");
+    }
+
+    bool Server::GiveItem(const std::string& target, const std::string& item, uint32_t qty, std::string* msg)
+    {
+        auto say = [&](const std::string& s) { if (msg) *msg = s; };
+        Conn* c = FindPlayer(target);
+        if (!c) { say("no player \"" + target + "\""); return false; }
+        const sync::inv::ItemDef* d = sync::inv::FindKey(item);
+        if (!d) { say("no item \"" + item + "\" (keys are the catalog's, e.g. water, medkit, rucksack)"); return false; }
+        if (qty == 0) { say("qty must be 1 or more"); return false; }
+        const uint32_t in = sync::inv::Give(c->inv, d->id, qty);
+        if (in == 0) { say(c->name + " has no room for " + d->key); return false; }
+        c->invDirty = c->invSave;
+        SendInventory(*c, 0);
+        enet_host_flush(host_);
+        Log("give id=" + std::to_string(c->id) + " " + c->name + " " + std::to_string(in) + "x " + d->key);
+        say("gave " + std::to_string(in) + " of " + std::to_string(qty) + " " + d->key + " to " + c->name);
+        return true;
+    }
+
+    bool Server::ClearInventory(const std::string& target, std::string* msg)
+    {
+        Conn* c = FindPlayer(target);
+        if (!c) { if (msg) *msg = "no player \"" + target + "\""; return false; }
+        c->inv = sync::inv::Character();
+        c->invDirty = c->invSave;
+        SendInventory(*c, 0);
+        enet_host_flush(host_);
+        Log("clearinv id=" + std::to_string(c->id) + " " + c->name);
+        if (msg) *msg = "cleared the inventory of " + c->name;
+        return true;
+    }
+
+    bool Server::InventoryOf(const std::string& target, sync::inv::Character& out) const
+    {
+        Conn* c = const_cast<Server*>(this)->FindPlayer(target);
+        if (!c) return false;
+        out = c->inv;
+        return true;
+    }
+
+    void Server::EndPlatformSession(Conn& c, const char* reason)
+    {
+        if (!c.verified || c.sessionEnded || !platform_.running()) return;
+        c.sessionEnded = true;
+        platform_.SessionEnd(c.sessionId, c.accountId, reason);
     }
 
     void Server::Accept(Conn& c, const std::string& name)
@@ -948,6 +1451,8 @@ namespace gage::server {
         c.vehFlood.Configure(kVehFloodBurst, kVehFloodPerSec);
         c.spawnRate.Configure(kSpawnBurst, kSpawnPerSec);
         c.animRate.Configure(kAnimBurst, kAnimPerSec);
+        c.adminRate.Configure(kAdminBurst, kAdminPerSec);
+        c.invRate.Configure(kInvBurst, kInvPerSec);
         for (size_t k = 0; k < ac::kWeaponKinds; k++) // a burst of ac::kDamageBudgetSec seconds of the class's rate
         {
             const ac::WeaponRule r = ac::RuleForKind((ac::WeaponKind)k, cfg_.hitDamageScalePercent);
@@ -1001,6 +1506,17 @@ namespace gage::server {
                 continue;
             stats_.animsReplayed++;
         }
+        // v8: the burst ends with this player's own account (what the overlay offers it).
+        {
+            proto::AccountInfo ai;
+            if (c.verified) ai.flags |= proto::kAcctVerified;
+            if (c.isAdmin) ai.flags |= proto::kAcctAdmin;
+            if (c.isAdmin || (!c.verified && !cfg_.requireAccount)) ai.flags |= proto::kAcctCommands;
+            if (c.verified) ai.username = c.name;
+            SendTo(c, proto::kChanReliable, proto::Encode(ai), true);
+        }
+        // 0.6: then its inventory.
+        LoadInventory(c);
         proto::PlayerJoined self;
         self.id = c.id;
         self.name = c.name;
@@ -1536,6 +2052,12 @@ namespace gage::server {
                        "VehicleCmd flood: commands kept arriving over the limit of " + std::to_string((int)kVehCmdPerSec) + " per second");
                 return;
             }
+        }
+        else if ((m.op == proto::VehicleOp::Spawn || m.op == proto::VehicleOp::Register) &&
+                 !AdminAllowed(c, std::string("vehicle ") + proto::ToString(m.op), nullptr))
+        {
+            // v8: creating a networked car (the /car command, the Cars page) is an admin command once roles are known.
+            code = Code::NotAllowed;
         }
         else
             code = RunVehicleCmd(c, m, vehId);
@@ -2567,6 +3089,9 @@ namespace gage::server {
     void Server::RemovePlayer(Conn& c, proto::LeaveReason why)
     {
         if (players_.erase(c.id) == 0) return;
+        SaveInventory(c, "leave");
+        // v8: the platform closes the account's game session (purchases stop being delivered here).
+        EndPlatformSession(c, why == proto::LeaveReason::Quit ? "quit" : why == proto::LeaveReason::Timeout ? "timeout" : "kicked");
         repl_.RemovePlayer(c.id);
         // Its empty vehicles go with it (a reconnect does not start over with fresh caps, and nothing is
         // left parked for ever); the ones somebody else sits in become orphans that go once they empty.
@@ -2597,6 +3122,9 @@ namespace gage::server {
         if (enet_peer_send(c.peer, channel, pkt) < 0)
         {
             enet_packet_destroy(pkt); // enet_peer_send only takes ownership on success
+            if (reliable)
+                Log("send: a reliable " + std::string(proto::ToString((proto::Msg)bytes[0])) + " to " + c.addr + " (" +
+                    (c.name.empty() ? c.helloName : c.name) + ") was not queued: ENet peer state " + std::to_string((int)c.peer->state));
             return;
         }
         metrics_.packetsOut++;
@@ -2649,6 +3177,10 @@ namespace gage::server {
             p.vehicle = seat.veh;
             p.seat = seat.seat;
             p.untrusted = Untrusted(c, net::NowMs());
+            p.verified = c.verified;
+            p.isAdmin = c.isAdmin;
+            p.accountId = c.accountId;
+            p.roles = c.roles;
             out.push_back(p);
         }
         return out;
@@ -2886,6 +3418,29 @@ namespace gage::server {
             output = "armor of " + arg1 + " set to " + argRest;
             return CommandResult::Ok;
         }
+        if (cmd == "give")
+        {
+            // give <id|name> <item> [qty]
+            const size_t sp = argRest.find(' ');
+            const std::string item = argRest.substr(0, sp);
+            const std::string qtyS = sp == std::string::npos ? std::string() : argRest.substr(sp + 1);
+            if (arg1.empty() || item.empty() || (!qtyS.empty() && (!AllDigits(qtyS) || std::strtoul(qtyS.c_str(), nullptr, 10) == 0)))
+            {
+                output = "usage: give <id|name> <item> [qty 1..99999]";
+                return CommandResult::Error;
+            }
+            const uint32_t qty = qtyS.empty() ? 1u : (uint32_t)std::strtoul(qtyS.c_str(), nullptr, 10);
+            return GiveItem(arg1, item, qty, &output) ? CommandResult::Ok : CommandResult::Error;
+        }
+        if (cmd == "clearinv")
+        {
+            if (arg.empty())
+            {
+                output = "usage: clearinv <id|name>";
+                return CommandResult::Error;
+            }
+            return ClearInventory(arg, &output) ? CommandResult::Ok : CommandResult::Error;
+        }
         if (cmd == "vehicles")
         {
             const std::vector<proto::VehicleState> all = Vehicles();
@@ -2944,7 +3499,7 @@ namespace gage::server {
         {
             output = "commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | "
                      "banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | "
-                     "armor <id|name> <0..255> | vehicles | quit";
+                     "armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | vehicles | quit";
             return CommandResult::Ok;
         }
         if (cmd == "quit" || cmd == "exit" || cmd == "stop")
@@ -2971,6 +3526,9 @@ namespace gage::server {
             m.text = "Server is shutting down.";
             SendToAll(proto::Encode(m), nullptr);
         }
+        // v8: every verified player's platform session ends with the server.
+        for (auto& kv : players_) EndPlatformSession(*kv.second, "shutdown");
+        for (auto& kv : players_) SaveInventory(*kv.second, "shutdown");
         // Nobody is "leaving" any more: forget the roster so the disconnects that
         // follow do not broadcast PlayerLeft to people who are going too.
         players_.clear();
@@ -3003,6 +3561,15 @@ namespace gage::server {
         conns_.clear();
         enet_host_destroy(host_);
         host_ = nullptr;
+        // The queued session-ends get up to 2 s to reach the platform (nothing is queued without a verified player).
+        if (platform_.running())
+        {
+            platform_.Stop(2000);
+            std::vector<VerifyResult> verdicts;
+            std::vector<std::string> lines;
+            platform_.Drain(verdicts, lines);
+            for (const std::string& l : lines) Log(l);
+        }
         Log("stopped");
     }
 

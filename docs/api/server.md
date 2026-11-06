@@ -70,8 +70,14 @@ working directory the server is started in.
 | `chatBurst` | integer | `5` | 1..100. Chat flood limit per player: bucket size in messages. |
 | `chatWindowSeconds` | integer | `5` | 1..3600. The bucket refills evenly over this many seconds. With the defaults a player can send 5 messages at once, then one per second. |
 | `bansFile` | string | `"bans.json"` | At most 260 bytes. Path of the ban list. `""` keeps bans in memory only (lost on restart). |
+| `inventoryDir` | string | `"inventories"` | At most 200 bytes. 0.6: the folder of the inventory saves, one file per verified platform account (`<hex of the account id>.inv`, written atomically when the player leaves, every 30 s while it changed, and at shutdown; created on the first save). `""` = nothing is saved (everyone gets the starter kit each session). Guests are never saved. A save that does not decode is renamed to `.inv.corrupt` and the player starts empty; one that cannot be read is left alone and that session is not saved. |
 | `adminPort` | integer | `0` (off) | 0..65535. Loopback TCP port of the [admin channel](#6-the-admin-channel-loopback-tcp). `0` disables it. |
 | `adminToken` | string | `""` | 16..128 printable ASCII characters, no spaces. **Required when `adminPort` is not 0.** When the file sets none, the server uses the environment variable `GAGE_ADMIN_TOKEN`. |
+| `platformUrl` | string | `""` (off) | v8 accounts: the platform's **internal** listener origin, `http://host:port` with no path (e.g. `http://127.0.0.1:8788`). Set: every join token is verified there (`POST /internal/game/verify`) and a verified player's leave ends its platform session (`POST /internal/game/session-end`); `""`: tokens are ignored and every player is a guest. |
+| `platformServerId` | string | `""` | `^[a-z0-9][a-z0-9-]{1,31}$`, the id the platform knows this server by (`X-Gage-Server-Id`). **Required when `platformUrl` is set.** |
+| `platformServerSecret` | string | `""` | 16..128 printable ASCII, no spaces (`X-Gage-Server-Secret`). **Required when `platformUrl` is set**; when the file sets none the server uses the environment variable `GAGE_PLATFORM_SECRET` (preferred: keep it out of the file). Never logged. |
+| `requireAccount` | boolean | `false` | `true`: a join without a token is refused `AccountRequired`, a refused token `AuthFailed`, a platform that cannot answer `AuthUnavailable` (fail closed). `false`: those join as guests under their Hello name, each logged. Needs `platformUrl`. |
+| `adminRoles` | array of strings | `["admin"]` | 1..8 platform role names (`a-z 0-9 _ -`). A verified player holding one may use the admin commands (`/heal /fix /spawn /tp /noclip /gun /car`, the Cars page spawn). Where the server knows a player's roles (a verified player, or anyone on a `requireAccount` server) nobody else may; a guest on a server without `requireAccount` keeps the pre-v8 behaviour (allowed, logged "roles unknown"). |
 | `latestClientVersion` | string | absent (= `"0.0.0"`, unknown) | `"x.y.z"`, each part 0..255, or `""`. The newest launcher release this server was released with; the [UDP query](#8-the-udp-query) reports it to v2 askers and a launcher older than it refuses PLAY and updates at once. When the file sets none, the server uses the environment variable `GAGE_LATEST_CLIENT_VERSION` (malformed = the server refuses to start). **Release-managed, not listed in `server.json.example`:** `tools/deploy/release.sh` writes `GAGE_LATEST_CLIENT_VERSION` to `/etc/gage/server.env` rather than this file, because `server.json` is shared by every release and an older server binary refuses a key it does not know, which would break a rollback (docs/OPS.md). Set it only to a client that is already published. |
 
 Examples
@@ -446,10 +452,11 @@ old list or the new one, never half of either.
 
 ## 4. admins.json: there is none
 
-**There is no in-game admin by name and no `admins.json`.** No player is ever an administrator: not by name, not by
-role, not by anything a client sends. The only authorities are the **server console** (stdin of the process) and the
-optional **loopback admin channel**, which needs a shared token. Gamemodes and tools that need to moderate a
-running server do it through one of those two.
+**There is no in-game admin by name and no `admins.json`.** No player is an administrator by name or by anything a
+client sends. Since protocol v8 a player whose join token the platform verified holds the platform account's roles,
+and a role listed in `adminRoles` opens the in-game admin commands (`AdminCmd`, docs/api/protocol.md "v8: accounts");
+moderation of a running server (kick, ban, say) is still only the **server console** (stdin of the process) and the
+optional **loopback admin channel**, which needs a shared token.
 
 ---
 
@@ -618,6 +625,22 @@ Sets the player's armour.
 * Output: `armor of <target> set to <n>`
 * Errors: `usage: armor <id|name> <0..255>`; `no player "<target>"`; `<name> is dead`.
 
+### `give <id|name> <item> [qty]` (0.6)
+
+Adds up to `qty` (default 1, at most 99999) of a catalog item to the player's pockets, then its pack, as far as weight
+and stack room allow, and sends the player its inventory. `item` is the catalog key (`libs/sync/inventory.h`: `water`,
+`sandwich`, `medkit`, `bandage`, `fuel_can`, `rucksack`, ...).
+
+* Output: `gave <n> of <qty> <item> to <name>` (n < qty when not everything fitted)
+* Errors: `usage: give <id|name> <item> [qty 1..99999]`; `no player "<target>"`; `no item "<item>" (...)`; `<name> has no room for <item>`.
+
+### `clearinv <id|name>` (0.6)
+
+Empties the player's pockets, pack, worn items and quick slots, and sends the player its inventory.
+
+* Output: `cleared the inventory of <name>`
+* Errors: `usage: clearinv <id|name>`; `no player "<target>"`.
+
 ### `vehicles`
 
 Lists the networked vehicles: a `vehicles <count>/<maxVehicles>` header, then one line per vehicle with id, model hash,
@@ -626,7 +649,7 @@ position, body/engine health, fuel (permille), `adopted` or `spawned`, `locked`,
 
 ### `help`
 
-`commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | armor <id|name> <0..255> | vehicles | quit`
+`commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | vehicles | quit`
 
 ### `quit` (aliases `exit`, `stop`)
 
@@ -887,7 +910,13 @@ ban, or a protocol violation): the others then get `PlayerLeft(Kicked)`.
 | 7 | `Banned` | the connecting address is on the ban list (checked at connect, before Hello), or the Hello name (or address again) is | `You are banned from this server.` or `You are banned from this server: <reason>` |
 | 8 | `TooManyConnections` | `maxConnectionsPerIp` live connections from that address already, or more than `connectsPerIpPerMinute` connection attempts from it in the last minute (both checked at connect, after the ban check; the rate first) | `too many connections from your address (limit 4)`, `too many connection attempts from your address (limit 5 per minute)` |
 
-The order inside Hello is: protocol version, name charset, ban list (name, then address again), server full, name taken.
+| 9 | `AccountRequired` | v8: `JoinAuth` carried no token and `requireAccount` is on | `This server needs a Solar RP account. Log in to Solar Launcher and press Play there.` |
+| 10 | `AuthFailed` | v8: the platform refused the token (invalid_token, expired, used) and `requireAccount` is on | `Your join ticket expired before the game connected. Press Play in Solar Launcher again.` (and the used / not valid variants) |
+| 11 | `AuthUnavailable` | v8: the platform could not be asked (transport failure, a non-200, no verdict within `platformTimeoutMs` + 3 s) and `requireAccount` is on | `Solar RP could not check your account right now. Try again in a minute.` |
+
+A banned account (platform verdict `banned`) is refused `Banned` with `Your Solar RP account is banned: <reason> (until <time>|permanently).` whatever `requireAccount` says.
+
+The order inside Hello is: protocol version, name charset, ban list (name, then address again), server full; then (v8) `JoinAuth`: no token / the platform's verdict, the account name against the ban list, an older connection of the same account or a guest holding its name is kicked, server full; a guest finally gets name taken.
 
 Values 7 and 8 were added **without bumping the protocol version** (they date from v1; `kVersion` is 2 now): they only ever appear in a
 `Refuse`, after which the connection ends. A client built before them cannot decode such a `Refuse`

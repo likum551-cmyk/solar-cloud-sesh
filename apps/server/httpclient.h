@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace gage::server {
 
@@ -49,6 +51,10 @@ namespace gage::server {
         int connectTimeoutMs = 5000;                // TCP connect (capped at totalTimeoutMs)
         int totalTimeoutMs = 10000;                 // the whole request, resolve excluded
         const std::atomic<bool>* cancel = nullptr;  // set to true to abort within ~100 ms
+        // Extra request headers written verbatim after the fixed set (the platform's X-Gage-Server-Id / -Secret,
+        // apps/platform/docs/game-server-contract.md). A name must be 1..64 of [A-Za-z0-9-] and a value printable
+        // ASCII or tab (no CR, LF or NUL), else HttpPost fails before connecting. Values never appear in an error text.
+        std::vector<std::pair<std::string, std::string>> headers;
     };
 
     // Largest response body HttpPost will accept; a longer one is a failure.

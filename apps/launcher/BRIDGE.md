@@ -65,7 +65,11 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
       (`ms` -1 = no reply, or no such row) and updates its own copy of the list; it does
       not re-send the list, so the SPA patches that row itself. A reply whose list was
       refetched meanwhile is dropped. Returns on the first reply (worst case ~1.6 s).
-  `{"type":"launch","server":<serverObj>,"gamePath":"<string>","playerName":"<string>"}`
+  `{"type":"launch","server":<serverObj>,"gamePath":"<string>","playerName":"<string>","serverId":"<string>","launchOptions":"<string>"}`
+      `serverId` (v8, NATIVE-INTEGRATION 3.3) is the platform's id of the server (`^[a-z0-9][a-z0-9-]{1,31}$`);
+      with an API base configured (`settings.apiBase` non-empty) native asks for a join token for it right before
+      the injection (`joinTokenNeeded` below). Missing or malformed: the engine joins without a token (logged),
+      which a server with `requireAccount` refuses. `launchOptions` is ignored here (the stored setting is used).
       Start GTA V and load Solar RP into it. A running game is attached to;
       otherwise the store that installed it starts it (PlayGTAV.exe for the
       Rockstar Games Launcher, steam:// for Steam, the Epic launcher URI),
@@ -111,6 +115,22 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
       is ignored), then continues or refuses with code 14 as above. The protocol check of codes 14 / 15
       asks the target server's UDP query (1.5 s at most) as the first step of the launch worker.
       `gamePath` may be the game folder or the exe itself.
+      Stages (v8, NATIVE-INTEGRATION 3.2): native also sends `{"type":"launchStage","stage":"preflight"}` when the
+      worker starts, `starting_store` before it asks the store, `waiting_for_game` while the store brings the game
+      up (only when native started it), `injecting` once the game process is open, and `injected` after a
+      successful injection, followed by `{"type":"game","running":true}`. `game` with `running:false` follows when
+      that game exits (also after `inject=0`).
+      Join token (v8, NATIVE-INTEGRATION 3.3): between `injecting` and the injection native sends
+      `{"type":"joinTokenNeeded","serverId":"<id>"}` and waits up to 15 s for
+      `{"type":"joinToken","serverId":"<id>","token":"<string>|null","expiresAt":"<iso>|null","error":"<msg|empty>"}`.
+      A token is written to HKCU\Software\GAGE-MP `join_token` (with `server_id`); the engine reads it once at
+      start, clears it at once and sends it to the server in `JoinAuth` (docs/api/protocol.md "v8: accounts").
+      `token: null`, an answer for another `serverId`, a token outside printable ASCII / over 256 bytes, or no
+      answer in 15 s ends the launch with `launchResult` code 12 (`error` = the SPA's `error`, or
+      `"No answer from the launcher window."`); the game stays open and a second PLAY attaches to it. A stale
+      `join_token` is cleared when a launch starts, after a failed injection and when the game exits. The token
+      is never logged. Demo / `test_server` launches (no API base) ask for no token.
+  `{"type":"joinToken", ...}` — the reply to `joinTokenNeeded`, above. Native answers nothing.
   `{"type":"browseGamePath"}`
       Open a file picker for `GTA5.exe` / `GTA5_Enhanced.exe` (any other file is refused
       with a message box and the setting is unchanged). Native stores the game *folder*
@@ -173,6 +193,14 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
   `{"type":"recents","servers":[<serverObj>...]}`
   `{"type":"launchResult","ok":<bool>,"code":<int>,"error":"<msg|empty>"}`
   `{"type":"status","text":"<human>"}`
+  `{"type":"launchStage","stage":"preflight|starting_store|waiting_for_game|injecting|injected"}`   (v8, see `launch`)
+  `{"type":"joinTokenNeeded","serverId":"<id>"}`   (v8, see `launch`; the SPA answers `joinToken`)
+  `{"type":"game","running":<bool>}`   (true after a successful injection, false when that game exits)
+  `settings` also carries `"apiBase":"<url>"` (v8): the platform API base the SPA calls (`<apiBase>/v1/...`): a
+      `gage_mp.cfg` `api_base=` line, else the build's `GAGE_API_BASE` (CMake, default `https://solar-rp.com/api`;
+      `OFF` builds none). An https origin with an optional plain path, or loopback http; `api_base=off` in the cfg,
+      an empty build value or an invalid one gives `""`: the SPA then runs its labelled demo data (`?demo=1`) and
+      PLAY uses `test_server` or refuses with code 13 (apps/launcher/api_base.h; tests/version_gate_test.cpp).
   `{"type":"update","current":"<semver>","latest":"<semver>"|"","available":<bool>,"error":"<msg|empty>",
       "state":"idle|checking|downloading|verifying|ready|installing|deferred|error",
       "progress":<0..1>,"mandatory":<bool>,"notes":"<text|empty>"}`
@@ -207,6 +235,9 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
   treats each `servers` message as a full replace of the list.
 - Native is the single source of truth for settings, favorites, and recents.
   The SPA never persists them itself (no localStorage required).
-- No network requests are made by the SPA; all I/O goes through the bridge.
-  (The SPA must therefore be fully self-contained: inline CSS + JS, no external
-  URLs, no font CDN, system font stack.)
+- The SPA's only network requests are the platform API calls to `settings.apiBase` (login, account,
+  quests, the official server list, `POST /v1/game/join`; accounts are created on the website,
+  opened with `openExternal` at `https://solar-rp.com/signup/`; the platform's CORS allows the WebView origin
+  `https://app.gage`); everything else goes through the bridge. (The SPA stays self-contained otherwise:
+  inline CSS + JS, no external assets, no font CDN.)
+- Deep links (`gage-mp://`, NATIVE-INTEGRATION 3.4) are not wired in native yet.

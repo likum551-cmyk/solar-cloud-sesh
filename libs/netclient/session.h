@@ -68,6 +68,10 @@ namespace gage::net {
         std::string host = "127.0.0.1"; // IPv4 literal or a host name (blocking lookup)
         uint16_t port = proto::kDefaultPort;
         std::string name;
+        // v8: the platform join token sent in JoinAuth right after Hello ("" = none: the server then admits a guest or, with
+        // server.json requireAccount, refuses AccountRequired). Single use on the platform side: a reconnect that sends the
+        // same token again is refused AuthFailed by a server that requires accounts.
+        std::string joinToken;
 
         // Budget from Connect() to Welcome/Refuse; past it the session closes with
         // ConnectFailed or HandshakeTimeout.
@@ -82,7 +86,8 @@ namespace gage::net {
 
         // ---- test knobs (leave at defaults in the game) ----
         uint16_t protocolVersion = proto::kVersion; // version sent in Hello
-        bool autoHello = true;                      // false: the caller sends Hello via SendRaw
+        bool autoHello = true;                      // false: the caller sends Hello (and JoinAuth) via SendRaw
+        bool autoJoinAuth = true;                   // false: autoHello sends Hello only (a v7-style client that never sends JoinAuth)
         uint32_t dropWorldPercent = 0;              // drop this % of incoming WorldState (before decoding: a dropped frame is never acknowledged)
         uint32_t dropSeed = 1;                      // seed for the drop pattern
     };
@@ -97,6 +102,10 @@ namespace gage::net {
             SeatNotice, // T1 seats (wire v6)
             VehicleImpact,   // T4 (v6)
             LinkInfo,        // R3 T5: the server's round trip to each vehicle controller (about 1 Hz, unreliable)
+            AccountInfo,     // v8: the account the server verified (closes the Welcome burst)
+            AdminResult,     // v8: the answer to one SendAdminCmd
+            InvState,        // v8 (0.6): our whole inventory + the last InvOp seq the server applied
+            InvUsed,         // v8 (0.6): the server consumed one item for us (satiety for the client to add)
         };
         Type type = Type::Disconnected;
 
@@ -130,6 +139,10 @@ namespace gage::net {
         proto::SeatNotice seatNotice;       // T1 seats (v6): a player's enter / exit intent on a vehicle seat (reliable, in order)
         proto::VehicleImpact impact;        // T4: the server's resolution of a contact of a vehicle WE control (reliable, once per contact)
         proto::LinkInfo linkInfo;           // R3 T5: the round trip (ms) the server measures to each vehicle controller
+        proto::AccountInfo account;         // v8: kAcct* flags and the verified username ("" for a guest)
+        proto::AdminResult adminResult;     // v8: the server's answer to one of our AdminCmds
+        proto::InvState invState;           // v8 (0.6): blob = sync::inv::Encode(Character), ackSeq = the last InvOp applied or refused
+        proto::InvUsed invUsed;             // v8 (0.6): the item used and the satiety it gives
     };
 
     class ClientSession
@@ -192,6 +205,12 @@ namespace gage::net {
         bool SendAnim(const proto::Anim& a);
         bool SendScenario(const std::string& name);
         bool SendStopAnim();
+        // v8: ask the server whether we may run an admin command (reliable). Every one is answered with an
+        // Event::AdminResult carrying the same seq and op. False when not Joined or the arg is over kMaxAdminArg.
+        bool SendAdminCmd(const proto::AdminCmd& c);
+        // v8 (0.6): one inventory operation (reliable; `op` = sync::inv::EncodeOp). Every one is answered with an
+        // Event::InvState whose ackSeq is o.seq. False when not Joined, seq is 0 or op is not kInvOpBytes long.
+        bool SendInvOp(const proto::InvOp& o);
         // Sends bytes as they are, bypassing every check. For tools and tests that
         // build deliberately bad packets. False when there is no live connection.
         bool SendRaw(uint8_t channel, const proto::Bytes& bytes, bool reliable);
@@ -209,6 +228,9 @@ namespace gage::net {
         const std::string& serverName() const { return serverName_; }
         // v5: the server's maximum health (Welcome.playerHealth); proto::kDefaultHealth until Welcome arrives.
         uint8_t playerHealth() const { return playerHealth_; }
+        // v8: the newest AccountInfo of this connection (flags 0 and no name until it arrives, and for a guest).
+        uint8_t accountFlags() const { return account_.flags; }
+        const std::string& accountName() const { return account_.username; }
         uint32_t rttMs() const;
         // R3 T5: the round trip the near-car lead uses: ENet's smoothed value, or the quietest of its last interval when lower (the SampleClock's
         // constant is the fastest path, not the mean). 0 without a peer.
@@ -282,6 +304,7 @@ namespace gage::net {
         uint16_t tickHz_ = 0;
         uint8_t playerHealth_ = proto::kDefaultHealth;
         std::string serverName_;
+        proto::AccountInfo account_;
         uint32_t seq_ = 0;
         uint32_t vehSeq_ = 0; // VehicleUpdate numbering (its own sequence)
         bool lookSent_ = false;

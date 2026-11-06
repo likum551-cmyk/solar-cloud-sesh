@@ -1,4 +1,4 @@
-// GAGE protocol v7: the messages between the GAGE client engine and the GAGE server
+// GAGE protocol v8: the messages between the GAGE client engine and the GAGE server
 // (docs/api/protocol.md has every byte layout; docs/ENGINE-PLAN.md the history). Transport is
 // ENet: channel kChanReliable carries control and chat (reliable, ordered), kChanState carries
 // per-tick movement (unreliable, sequenced).
@@ -63,6 +63,17 @@
 //   * R3 T4 vehicle damage state: the full VehicleWorld entry grows by a VehicleDamage block (petrol tank health, broken-off doors and
 //     headlights, a coarse dent map: 3..11 bytes); VehicleUpdate.flags bit 5 (kVehDamageBlock) announces the same block after `windows`.
 //
+// v8 against v7 (real accounts, docs/api/protocol.md "v8 accounts"):
+//   * Msg::JoinAuth (45, C->S reliable): sent right after Hello, carries the platform join token (empty = none). The server
+//     verifies it with the platform (apps/platform/docs/game-server-contract.md) before Welcome; Hello itself is unchanged.
+//   * Msg::AccountInfo (46, S->C reliable): after the Welcome burst, the verified account name and the kAcct* flags (admin,
+//     admin commands allowed).
+//   * Msg::AdminCmd (47, C->S reliable) / Msg::AdminResult (48, S->C reliable): the overlay's admin commands (/heal, /fix,
+//     /spawn, /tp, /noclip, /gun, /car) are asked of the server, which allows them only to an admin when it knows roles.
+//   * RefuseReason AccountRequired (9), AuthFailed (10), AuthUnavailable (11).
+//   * 0.6 inventory (still v8: no v8 client was ever released without it): Msg::InvState (49, S->C), InvOp (50, C->S),
+//     InvUsed (51, S->C), all reliable; the bytes inside are libs/sync/inventory.h's codec.
+//
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
 //   * Sender-side sample time: PlayerState and VehicleUpdate carry a u16 sampleMs (the sender's own clock,
@@ -94,7 +105,8 @@ namespace gage::proto {
     //     scaling inputs (Welcome.playerHealth, Damage bone and flags, Killed flags), PedState.vehId.
     // v6: seat intents + SeatNotice, vehicle visual state (tyres, windows, brake lights), VehicleImpact.
     // v7: vehicle damage block (petrol, doors, headlights, dents), LinkInfo.
-    constexpr uint16_t kVersion = 7;
+    // v8: JoinAuth (the platform join token), AccountInfo, AdminCmd / AdminResult, the three account RefuseReasons.
+    constexpr uint16_t kVersion = 8;
 
     constexpr uint8_t kChanReliable = 0; // control, chat, join/leave: reliable ordered
     constexpr uint8_t kChanState    = 1; // PlayerState, WorldState, WorldCoarse: unreliable sequenced
@@ -110,6 +122,9 @@ namespace gage::proto {
     constexpr size_t kMaxChat       = 200;
     constexpr size_t kMaxServerName = 64;
     constexpr size_t kMaxRefuseText = 200;
+    // v8: a platform join token ("gmj_..." today; the platform accepts 8..200 characters) and an admin command's argument.
+    constexpr size_t kMaxJoinToken  = 256;
+    constexpr size_t kMaxAdminArg   = 64;
 
     // The player-facing text of Refuse(VersionMismatch): what the server sends, and what the engine shows on the
     // loading screen and in chat. They tell the player what to do, not which numbers differ (the server log has
@@ -198,8 +213,15 @@ namespace gage::proto {
         VehicleImpact    = 40, // S->C reliable (T4, vehicle collisions): the server's resolution of a contact between two vehicles for one controller
         // 41..43 are reserved for other round-3 messages.
         LinkInfo         = 44, // S->C state channel, about 1 Hz (R3 T5, vehicle position): the round trip the server measures to each vehicle controller
+        JoinAuth         = 45, // C->S reliable (v8): right after Hello, the platform join token (empty = none)
+        AccountInfo      = 46, // S->C reliable (v8): after the Welcome burst, the account the server verified (name, kAcct* flags)
+        AdminCmd         = 47, // C->S reliable (v8): "may I run this admin command?" (the overlay's quick actions and Cars page)
+        AdminResult      = 48, // S->C reliable (v8): the answer to one AdminCmd
+        InvState         = 49, // S->C reliable (v8, 0.6 inventory): the player's whole inventory + the last op the server applied
+        InvOp            = 50, // C->S reliable (v8, 0.6 inventory): one inventory operation (move, split, use, drop, bind, ...)
+        InvUsed          = 51, // S->C reliable (v8, 0.6 inventory): an item the player used; the client applies its satiety
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::LinkInfo;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::InvUsed;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -219,6 +241,10 @@ namespace gage::proto {
         HelloTimeout    = 6, // no Hello in time
         Banned          = 7, // the name or the address is on the server's ban list
         TooManyConnections = 8, // the per-address connection cap is reached
+        // v8 (added with the version bump): the platform account check of JoinAuth.
+        AccountRequired = 9,  // the server requires an account (server.json requireAccount) and JoinAuth carried no token
+        AuthFailed      = 10, // the platform refused the token (unknown, expired, already used, another server's)
+        AuthUnavailable = 11, // the platform could not be asked (down, misconfigured): the server fails closed
     };
 
     // Why a player left, as told to the others in PlayerLeft.
@@ -840,6 +866,65 @@ namespace gage::proto {
         std::vector<LinkEntry> e;
     };
 
+    // ---- v8: accounts (docs/api/protocol.md "v8 accounts") ----
+    // JoinAuth (C->S reliable) follows Hello at once: the platform join token the launcher handed the engine, "" when there is none
+    // (no launcher, demo mode). Printable ASCII without spaces (0x21..0x7E), at most kMaxJoinToken bytes; Decode refuses anything else.
+    // The server answers with Welcome or a Refuse only after it has the JoinAuth, so a v8 client always sends it.
+    struct JoinAuth { std::string token; };
+    bool ValidJoinToken(const std::string& token);
+
+    // AccountInfo (S->C reliable) closes the Welcome burst (after PlayerJoined / PeerLook / PeerAnim of the players already in).
+    // `flags` is a kAcct* set (unknown bits are refused by Decode), `username` the verified account name (empty for a guest).
+    constexpr uint8_t kAcctVerified = 1u << 0; // the platform verified this player's join token (username, roles are real)
+    constexpr uint8_t kAcctAdmin    = 1u << 1; // the verified account holds an admin role (server.json adminRoles)
+    constexpr uint8_t kAcctCommands = 1u << 2; // the server lets this player run the admin commands (AdminCmd): an admin, or any
+                                               // player while the server knows no roles (requireAccount off, no token)
+    constexpr uint8_t kAcctKnown    = kAcctVerified | kAcctAdmin | kAcctCommands;
+    struct AccountInfo { uint8_t flags = 0; std::string username; };
+
+    // AdminCmd (C->S reliable): the overlay's admin commands. The client runs most of them itself (they act on its own game);
+    // the server decides whether it may and answers every one with an AdminResult (same seq and op). `arg` is the command's
+    // argument as typed ("pistol", "adder", "1 2 3"), printable ASCII, at most kMaxAdminArg bytes. Heal is done by the server
+    // itself (health is server-owned); the client runs the others after an Ok.
+    enum class AdminOp : uint8_t
+    {
+        Heal   = 1, // /heal
+        Fix    = 2, // /fix (repair the vehicle you are in)
+        Spawn  = 3, // /spawn (back to the spawn point)
+        Tp     = 4, // /tp x y z
+        Noclip = 5, // /noclip
+        Gun    = 6, // /gun <weapon>
+        Car    = 7, // /car <model> (the Cars page)
+    };
+    constexpr uint8_t kAdminOpLast = (uint8_t)AdminOp::Car;
+    struct AdminCmd { uint16_t seq = 0; AdminOp op = AdminOp::Heal; std::string arg; };
+    enum class AdminCode : uint8_t
+    {
+        Ok          = 0, // allowed (Heal: done)
+        NotAdmin    = 1, // the server knows your roles and none of them is an admin role
+        RateLimited = 2, // too many admin commands
+        BadArg      = 3, // the argument is not acceptable
+        Failed      = 4, // allowed, but the server could not do it (Heal on a dead player)
+    };
+    constexpr uint8_t kAdminCodeLast = (uint8_t)AdminCode::Failed;
+    struct AdminResult { uint16_t seq = 0; AdminOp op = AdminOp::Heal; AdminCode code = AdminCode::Ok; std::string text; };
+
+    // ---- v8 (0.6 inventory, docs/api/protocol.md "Inventory") ----
+    // The bytes inside are libs/sync/inventory.h's: `blob` is sync::inv::Encode(Character) (version-prefixed, the receiver's
+    // sync::inv::Decode checks every rule), `op` is sync::inv::EncodeOp (exactly kInvOpBytes). The protocol layer only frames
+    // and caps them, so the protocol library does not depend on the item rules.
+    // InvState (S->C reliable): sent after AccountInfo, after every InvOp (applied or refused: ackSeq is that op's seq, so the
+    // client drops its prediction up to it) and after a console give / clear. A server without inventories never sends it,
+    // which the overlay shows as "unavailable".
+    constexpr size_t kMaxInvBlob = 1024; // a full rucksack character is about 450 bytes
+    constexpr size_t kInvOpBytes = 11;
+    struct InvState { uint32_t ackSeq = 0; std::string blob; };
+    // InvOp (C->S reliable): `seq` counts up from 1 per connection (the client's prediction keys on it).
+    struct InvOp { uint32_t seq = 0; std::string op; };
+    // InvUsed (S->C reliable): the server consumed one `item` for this player; `satiety` is what the client adds to its own
+    // satiety (0..100; health effects are applied by the server itself and arrive as Vitals).
+    struct InvUsed { uint16_t item = 0; uint8_t satiety = 0; };
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -892,6 +977,13 @@ namespace gage::proto {
     Bytes Encode(const VehicleImpact& m);
     // R3 T5: [44][u8 count][count x (u16 id, u16 rttMs)]; empty (refused) for more than kMaxLinkEntries entries.
     Bytes Encode(const LinkInfo& m);
+    Bytes Encode(const JoinAuth& m);     // v8
+    Bytes Encode(const AccountInfo& m);  // v8
+    Bytes Encode(const AdminCmd& m);     // v8
+    Bytes Encode(const AdminResult& m);  // v8
+    Bytes Encode(const InvState& m);     // v8 inventory: {} when the blob is empty or over kMaxInvBlob
+    Bytes Encode(const InvOp& m);        // v8 inventory: {} unless op is exactly kInvOpBytes
+    Bytes Encode(const InvUsed& m);      // v8 inventory: {} for item 0 or satiety over 100
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -942,6 +1034,13 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, VehicleImpact& out);
     // R3 T5: exactly 2 + 4 * count bytes; refuses a count over kMaxLinkEntries and a repeated id.
     bool Decode(const uint8_t* p, size_t n, LinkInfo& out);
+    bool Decode(const uint8_t* p, size_t n, JoinAuth& out);    // v8: a token failing ValidJoinToken is malformed
+    bool Decode(const uint8_t* p, size_t n, AccountInfo& out); // v8: unknown flag bits, a username over kMaxName
+    bool Decode(const uint8_t* p, size_t n, AdminCmd& out);    // v8: an unknown op, an arg over kMaxAdminArg or with control bytes
+    bool Decode(const uint8_t* p, size_t n, AdminResult& out); // v8: an unknown op or code, a text over kMaxRefuseText
+    bool Decode(const uint8_t* p, size_t n, InvState& out);    // v8: an empty blob or one over kMaxInvBlob
+    bool Decode(const uint8_t* p, size_t n, InvOp& out);       // v8: seq 0, an op that is not exactly kInvOpBytes
+    bool Decode(const uint8_t* p, size_t n, InvUsed& out);     // v8: item 0, satiety over 100
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would
@@ -997,5 +1096,7 @@ namespace gage::proto {
     const char* ToString(VehicleResultCode c);
     const char* ToString(SeatNoticeKind k);
     const char* ToString(SeatCancelReason r);
+    const char* ToString(AdminOp op);     // v8: "heal", "fix", ... (the command verb)
+    const char* ToString(AdminCode c);    // v8
 
 }

@@ -36,6 +36,7 @@
 #include "sync/hud_ring.h"            // 0.4.31 the vitals ring (GI's REV1 design): geometry, colours, state rules, the critical pulse
 #include "sync/hud_car.h"             // 0.4.31 the car cluster (GI's REV2 design): dial, fuel, blinkers, chips
 #include "overlay_sofia.h"            // kOverlaySofiaBoldTtf: Sofia Sans Bold (SIL OFL 1.1), the ring's labels and numerals
+#include "overlay_inventory.h"        // 0.6 the Tab menu's inventory page (GI's REV3 design); the old menu is its ADMIN page
 
 #include "imgui.h"
 #include "imgui_internal.h"   // ImGuiContext::ConfigNavWindowingKey* (UiInit)
@@ -157,6 +158,8 @@ std::atomic<bool>     g_radarSafeZoneOk{false};
 std::atomic<float>    g_radarScale{1.0f};   // 0.4.25 minimap_scale: the factor the game's radar was shrunk by (1 = the game's own size)
 // 0.4.31 hud_ring (SetHudRing): the vitals are the REV1 ring at the bottom-left (DrawVitalsRing) instead of the plate / the strip under the radar.
 std::atomic<bool>     g_hudRing{false};
+std::atomic<bool>     g_invRev3{true};        // 0.6 inv_rev3 (SetInventoryScreen): the REV3 inventory page; off = the old Tab menu only
+std::atomic<bool>     g_invPageOpen{false};   // InventoryOpen(): the Tab menu is open on the inventory page (render thread writes)
 // 0.5.2 ring_map (SetRingMap): GTA's radar sits in the ring, so the disc is an annulus and the map shows through its hole.
 std::atomic<bool>     g_ringMapOpen{false};
 // 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
@@ -283,7 +286,10 @@ struct Ui {
     char      buf[kBufLen] = {};
     int       scroll = 0;
     bool      invJustOpened = false;
-    int       invTab = 0;                   // the Tab menu's page: 0 quick actions, 1 cars (kept between openings)
+    int       invTab = 0;                   // the ADMIN page's tab: 0 quick actions, 1 cars (kept between openings)
+    // 0.6: the Tab menu's page. Inventory (REV3) for everyone; Admin (the old quick actions / cars menu) for admins only, and the
+    // only page when inv_rev3 is off. Kept between openings.
+    detail::inv3::Page invPage = detail::inv3::Page::Inventory;
 
     // The car browser (the Tab menu's "Cars" page): the render thread's copy of SetCars' list, the search and the page.
     struct CarRow {
@@ -564,13 +570,15 @@ void CloseChat()
     u.buf[0] = 0;
     u.scroll = 0;
 }
+detail::inv3::Page MenuPage();
 void OpenInventory()
 {
     u.invOpen = true;
     u.invJustOpened = true;
     u.invA = 0.0f;
-    u.searchFocusFrames = u.invTab == 1 ? 3 : 0;   // the cars page opens ready to type...
-    u.searchSelectAll = u.invTab == 1;             // ...over the last query, which the first key replaces
+    const bool cars = MenuPage() == detail::inv3::Page::Admin && u.invTab == 1;
+    u.searchFocusFrames = cars ? 3 : 0;   // the cars page opens ready to type...
+    u.searchSelectAll = cars;             // ...over the last query, which the first key replaces
     u.held.clear();
     u.wheelAcc = 0.0f;
 }
@@ -582,6 +590,29 @@ void SwitchInvTab(int t)
     u.invTab = t;
     u.searchFocusFrames = t == 1 ? 3 : 0;
     u.searchSelectAll = t == 1;
+    u.searchActive = false;
+    u.held.clear();
+    u.wheelAcc = 0.0f;
+}
+// 0.6: the page the Tab menu shows. inv_rev3 off: the old menu only (as before 0.6). A player who is not (or no longer) an admin never sees
+// the ADMIN page, whatever was kept from an earlier opening.
+detail::inv3::Page MenuPage()
+{
+    if (!g_invRev3.load())
+        return detail::inv3::Page::Admin;
+    if (u.invPage == detail::inv3::Page::Admin && !IsAdmin())
+        return detail::inv3::Page::Inventory;
+    return u.invPage;
+}
+void SetMenuPage(detail::inv3::Page p)
+{
+    if (p == u.invPage)
+        return;
+    u.invPage = p;
+    u.invJustOpened = true;   // the page's window takes the focus; the REV3 screen drops a drag / menu it had
+    const bool cars = p == detail::inv3::Page::Admin && u.invTab == 1;
+    u.searchFocusFrames = cars ? 3 : 0;
+    u.searchSelectAll = cars;
     u.searchActive = false;
     u.held.clear();
     u.wheelAcc = 0.0f;
@@ -3726,9 +3757,11 @@ void UiInit(float scale)
     // 0.4.31 the car cluster's icon glows, blurred on the CPU into the atlas (IconGlowFill): reserve, build here, fill before the backend uploads.
     // Baked at the cluster's drawn size (bake scale * kCarSize).
     IconGlowReserve(io.Fonts, scale * kCarSize);
-    if (io.Fonts->Build())
+    inv3::Reserve(io.Fonts, scale);   // 0.6 REV3: its Sofia faces, icons, glows and the mannequin
+    if (io.Fonts->Build()) {
         IconGlowFill(io.Fonts, scale * kCarSize);
-    else
+        inv3::Fill(io.Fonts, scale);
+    } else
         GLOGW("overlay: the font atlas did not build in UiInit; the icon glows use the stroke stand-in");
     BuildStyle(scale);
     // Ctrl+Tab turns the Tab menu's page (UiFrame), so ImGui must not also take it for its window switcher.
@@ -3751,6 +3784,8 @@ void UiReset()
 {
     g_interactive.store(false);
     g_vehKeys.store(0);
+    g_invPageOpen.store(false);
+    inv3::Reset();
     u = Ui();
 }
 
@@ -3840,10 +3875,27 @@ void UiFrame()
             if (esc)
                 CloseChat();
         } else if (u.invOpen) {
-            if (tab && io.KeyCtrl)
-                SwitchInvTab(1 - u.invTab);   // Ctrl+Tab turns the page (ImGui's own Ctrl+Tab window switch is off: UiInit)
-            else if (tab || esc)
+            const detail::inv3::Page page = MenuPage();
+            if (tab && io.KeyCtrl) {
+                // Ctrl+Tab turns the page (ImGui's own Ctrl+Tab window switch is off: UiInit). 0.6: an admin cycles INVENTORY -> ADMIN
+                // quick actions -> ADMIN cars -> INVENTORY; everyone else has one page.
+                if (!g_invRev3.load())
+                    SwitchInvTab(1 - u.invTab);
+                else if (IsAdmin()) {
+                    if (page == detail::inv3::Page::Inventory) {
+                        SwitchInvTab(0);
+                        SetMenuPage(detail::inv3::Page::Admin);
+                    } else if (u.invTab == 0) {
+                        SwitchInvTab(1);
+                    } else {
+                        SetMenuPage(detail::inv3::Page::Inventory);
+                    }
+                }
+            } else if (esc && page == detail::inv3::Page::Inventory && inv3::HandleEsc()) {
+                // Esc closed a drag, the split dialog, the context menu or the search box: the menu stays open
+            } else if (tab || esc) {
                 CloseInventory();
+            }
         } else if (tab) {
             OpenInventory();
         } else if (enter || tKey) {
@@ -3872,7 +3924,9 @@ void UiFrame()
     // The Tab menu's car search works the same way, and also takes whatever is typed while it does not have the keyboard
     // (after a click on the pager or a tab, or while the arrows steer the rows): the characters are held and the box
     // is focused again, caret kept (no select-all, which would eat the query on the next key).
-    const bool carsPage = u.invOpen && !u.chatOpen && u.invTab == 1;
+    const detail::inv3::Page menuPage = MenuPage();
+    const bool rev3Page = menuPage == detail::inv3::Page::Inventory;
+    const bool carsPage = u.invOpen && !u.chatOpen && !rev3Page && u.invTab == 1;
     if (carsPage && !u.searchActive) {
         bool printable = false;
         for (int i = 0; i < io.InputQueueCharacters.Size; ++i)
@@ -3903,8 +3957,8 @@ void UiFrame()
         }
     }
 
-    // Keyboard navigation of the quick actions (arrows + Enter) only while that panel is open.
-    if (u.invOpen)
+    // Keyboard navigation of the quick actions (arrows + Enter) only while that panel is open (not on the REV3 page: its keys are its own).
+    if (u.invOpen && !rev3Page)
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     else
         io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
@@ -3929,30 +3983,58 @@ void UiFrame()
         // palette is a modal layer), then the mark on top so the brand stays at full strength.
         // The name tags belong to the world, so they go first: every plate and the scrim lie over them.
         DrawNameTags(bg, W, H, u.hudA, now, L);
+        // 0.6: the REV3 inventory page is a full screen of its own (the engine hides GTA's radar under it): the ring and the car cluster
+        // fade out with the menu's fade, so nothing of the HUD shows through its dim.
+        const float hudUnder = u.hudA * (rev3Page ? 1.0f - u.invA : 1.0f);
         const bool ringHud = g_hudRing.load();
-        if (ringHud) {
-            // 0.4.31 REV2: the dial follows the car; the strip also carries the on-foot lock flash (then only the lock chip is drawn)
-            const float aStrip = std::fmax(u.speedA, u.rowA);
-            if (aStrip > 0.003f)
-                DrawCarCluster(bg, W, H, u.speedA * u.hudA, aStrip * u.hudA, u.speedA < 0.5f && u.rowA > u.speedA, u.speedSm, rowHud, rowNowMs, L);
-        } else if (u.speedA > 0.003f) {
-            DrawSpeedo(bg, W, H, u.speedA * u.hudA, u.speedSm, L);
+        if (hudUnder > 0.003f) {
+            if (ringHud) {
+                // 0.4.31 REV2: the dial follows the car; the strip also carries the on-foot lock flash (then only the lock chip is drawn)
+                const float aStrip = std::fmax(u.speedA, u.rowA);
+                if (aStrip > 0.003f)
+                    DrawCarCluster(bg, W, H, u.speedA * hudUnder, aStrip * hudUnder, u.speedA < 0.5f && u.rowA > u.speedA, u.speedSm, rowHud, rowNowMs, L);
+            } else if (u.speedA > 0.003f) {
+                DrawSpeedo(bg, W, H, u.speedA * hudUnder, u.speedSm, L);
+            }
+            if (u.vitalsA > 0.003f) {
+                if (ringHud)
+                    DrawVitalsRing(bg, W, H, u.vitalsA * hudUnder, rowNowMs, L);   // 0.4.31 REV1: the ring at the bottom-left
+                else
+                    DrawVitals(bg, W, H, u.vitalsA * hudUnder, L);
+            }
+            if (!ringHud && u.rowA > 0.003f)
+                DrawStateRow(bg, W, H, u.rowA * hudUnder, rowHud, rowNowMs, L);   // after both: it is placed against their rects
         }
-        if (u.vitalsA > 0.003f) {
-            if (g_hudRing.load())
-                DrawVitalsRing(bg, W, H, u.vitalsA * u.hudA, rowNowMs, L);   // 0.4.31 REV1: the ring at the bottom-left
-            else
-                DrawVitals(bg, W, H, u.vitalsA * u.hudA, L);
-        }
-        if (!ringHud && u.rowA > 0.003f)
-            DrawStateRow(bg, W, H, u.rowA * u.hudA, rowHud, rowNowMs, L);   // after both: it is placed against their rects
         DrawChat(bg, W, H, now, u.hudA, L);
-        if (u.invA > 0.003f)
+        if (u.invA > 0.003f && !rev3Page)   // the REV3 page draws its own dim
             bg->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), Col(kGround, 0.52f * u.invA * u.hudA));
         DrawLogo(bg, W, u.hudA, L);
-        if (u.invOpen)
-            DrawInventory(W, H, u.hudA, L);
+        if (u.invOpen) {
+            detail::inv3::FrameIn fi;
+            fi.W = W;
+            fi.H = H;
+            fi.a = u.invA * u.hudA;
+            fi.justOpened = u.invJustOpened;
+            fi.isAdmin = IsAdmin();
+            fi.page = menuPage;
+            if (rev3Page) {
+                const detail::inv3::FrameOut fo = inv3::DrawScreen(fi);
+                u.invJustOpened = false;
+                L.invOpen = true;
+                L.invX = 0; L.invY = 0; L.invW = W; L.invH = H;
+                if (fo.page != menuPage)
+                    SetMenuPage(fo.page);
+            } else {
+                DrawInventory(W, H, u.hudA, L);
+                if (g_invRev3.load() && IsAdmin()) {   // the INVENTORY | ADMIN pill over the old menu
+                    const detail::inv3::Page to = inv3::DrawTopTabs(fi);
+                    if (to != menuPage)
+                        SetMenuPage(to);
+                }
+            }
+        }
     }
+    g_invPageOpen.store(live && u.invOpen && rev3Page);
     if (u.loaderA > 0.003f)
         DrawLoader(W, H, now, status, statusFailed, L);
     if (u.quitA > 0.003f)                 // over everything, the loader included: Alt+F4 works while loading
@@ -3998,7 +4080,14 @@ void SetRadarDock(bool dock, float safeZone, bool safeZoneOk, float scale)
 }
 
 void SetHudRing(bool on) { g_hudRing.store(on); }
+void SetInventoryScreen(bool on) { g_invRev3.store(on); }
+bool InventoryOpen() { return g_invPageOpen.load(); }
 void SetRingMap(bool open) { g_ringMapOpen.store(open); }
+
+// v8 accounts (overlay.h): whether the admin actions may be offered; the server checks each one anyway.
+static std::atomic<bool> g_isAdmin{false};
+void SetIsAdmin(bool admin) { g_isAdmin.store(admin); }
+bool IsAdmin() { return g_isAdmin.load(); }
 
 void SetVitals(float healthFrac, float satietyFrac, float fuelFrac, bool show, bool showFuel)
 {

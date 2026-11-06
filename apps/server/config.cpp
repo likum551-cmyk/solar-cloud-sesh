@@ -123,6 +123,27 @@ namespace gage::server {
             return true;
         }
 
+        // The platform's server id rule (apps/platform POST /v1/game/join serverId): ^[a-z0-9][a-z0-9-]{1,31}$.
+        bool ValidPlatformId(const std::string& s)
+        {
+            if (s.size() < 2 || s.size() > 32) return false;
+            for (size_t i = 0; i < s.size(); i++)
+            {
+                const char c = s[i];
+                const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || (i > 0 && c == '-');
+                if (!ok) return false;
+            }
+            return true;
+        }
+
+        bool ValidRoleName(const std::string& s)
+        {
+            if (s.empty() || s.size() > 32) return false;
+            for (char c : s)
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+            return true;
+        }
+
     }
 
     bool Validate(const Config& cfg, std::string* err)
@@ -179,6 +200,8 @@ namespace gage::server {
             return fail("query reply rates must be 1..1000000 per second");
         if (cfg.bansFile.size() > 260)
             return fail("bansFile path is too long");
+        if (cfg.inventoryDir.size() > 200)
+            return fail("inventoryDir path is too long");
 
         // ---- world replication ----
         for (const ReplKey& k : kReplKeys)
@@ -252,6 +275,27 @@ namespace gage::server {
             for (uint32_t m : *list)
                 if (m == 0) return fail("vehicleModelDeny / vehicleModelAllow must not contain model 0");
         }
+
+        // ---- platform accounts (v8) ----
+        if (!cfg.platformUrl.empty())
+        {
+            HttpUrl u;
+            std::string why;
+            if (!ParseHttpUrl(cfg.platformUrl, u, &why)) return fail("platformUrl: " + why);
+            if (u.path != "/") return fail("platformUrl must be the listener's origin without a path, e.g. http://127.0.0.1:8788");
+            if (!ValidPlatformId(cfg.platformServerId))
+                return fail("platformServerId must match ^[a-z0-9][a-z0-9-]{1,31}$ (the id the platform knows this server by) whenever platformUrl is set");
+            if (!ValidToken(cfg.platformServerSecret))
+                return fail("platformServerSecret (or the environment variable GAGE_PLATFORM_SECRET) must be " + std::to_string(kMinTokenChars) +
+                            ".." + std::to_string(kMaxTokenChars) + " printable ASCII characters without spaces whenever platformUrl is set");
+        }
+        if (cfg.requireAccount && cfg.platformUrl.empty())
+            return fail("requireAccount needs platformUrl (and platformServerId, platformServerSecret): nobody could join otherwise");
+        if (cfg.adminRoles.empty() || cfg.adminRoles.size() > 8)
+            return fail("adminRoles must hold 1..8 role names");
+        for (const std::string& r : cfg.adminRoles)
+            if (!ValidRoleName(r)) return fail("adminRoles: every role must be 1..32 of a-z 0-9 _ -");
+        if (cfg.platformTimeoutMs < 100 || cfg.platformTimeoutMs > 30000) return fail("platformTimeoutMs must be 100..30000");
 
         // ---- admin channel ----
         if (cfg.adminEnabled() && !ValidToken(cfg.adminToken))
@@ -418,6 +462,10 @@ namespace gage::server {
             else if (key == "bansFile")
             {
                 if (!str(out.bansFile)) return false;
+            }
+            else if (key == "inventoryDir")
+            {
+                if (!str(out.inventoryDir)) return false;
             }
             else if (key == "adminPort")
             {
@@ -597,6 +645,35 @@ namespace gage::server {
                     return fail("\"" + key + "\" must be an array of at most " + std::to_string(kMaxModelListEntries) +
                                 " models: GTA hashes (1..4294967295), \"0x...\" hash strings or model names");
             }
+            else if (key == "platformUrl")
+            {
+                if (!str(out.platformUrl)) return false;
+            }
+            else if (key == "platformServerId")
+            {
+                if (!str(out.platformServerId)) return false;
+            }
+            else if (key == "platformServerSecret")
+            {
+                if (!str(out.platformServerSecret)) return false;
+            }
+            else if (key == "requireAccount")
+            {
+                if (v.t != JVal::Bool) return fail("\"requireAccount\" must be true or false");
+                out.requireAccount = v.b;
+            }
+            else if (key == "adminRoles")
+            {
+                if (v.t != JVal::Arr || v.a.empty() || v.a.size() > 8)
+                    return fail("\"adminRoles\" must be an array of 1..8 platform role names, e.g. [\"admin\"]");
+                std::vector<std::string> roles;
+                for (const JVal& e : v.a)
+                {
+                    if (e.t != JVal::Str) return fail("\"adminRoles\" must hold strings");
+                    if (std::find(roles.begin(), roles.end(), e.s) == roles.end()) roles.push_back(e.s);
+                }
+                out.adminRoles = roles;
+            }
             else if (const ReplKey* rk = FindReplKey(key))
             {
                 if (!WholeNumber(v, rk->lo, rk->hi, n))
@@ -607,7 +684,7 @@ namespace gage::server {
             else
             {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
-                                    "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, adminPort, adminToken, "
+                                    "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, inventoryDir, adminPort, adminToken, "
                                     "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
                                     "vehicleMaxSpeed, contactLagCapMs, vehicleLocks, vehicleLockDistance, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "
@@ -615,7 +692,7 @@ namespace gage::server {
                                     "hitsPerSecond, meleeAdjudicate, meleeReachPercent, spawnPoints, hitShotWindowMs, hitDamageScalePercent, onFootMaxSpeed, "
                                     "untrustedWindowMs, untrustedJoinGraceMs, connectsPerIpPerMinute, vehiclesPerIp, "
                                     "vehicleOrphanSeconds, registerCooldownMs, registerSeparationMeters, vehicleModelDeny, "
-                                    "vehicleModelAllow";
+                                    "vehicleModelAllow, platformUrl, platformServerId, platformServerSecret, requireAccount, adminRoles";
                 for (const ReplKey& k : kReplKeys) known += std::string(", ") + k.name;
                 return fail("unknown key \"" + key + "\" (known: " + known + ")");
             }
@@ -624,6 +701,9 @@ namespace gage::server {
         // of anything that gets copied around): only used when the file sets none.
         if (out.adminEnabled() && out.adminToken.empty())
             if (const char* env = std::getenv("GAGE_ADMIN_TOKEN")) out.adminToken = env;
+        // The platform secret likewise (game-server-contract.md: keep it in the environment or a root-only file).
+        if (!out.platformUrl.empty() && out.platformServerSecret.empty())
+            if (const char* env = std::getenv("GAGE_PLATFORM_SECRET")) out.platformServerSecret = env;
         // Same for the newest client release (tools/deploy/release.sh writes it to /etc/gage/server.env, which the
         // service unit loads; an older server binary ignores an environment variable it does not know, but would
         // refuse a new server.json key, so a rollback stays possible).

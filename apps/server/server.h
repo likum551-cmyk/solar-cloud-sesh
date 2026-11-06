@@ -54,7 +54,7 @@
 //    source address and overall; ENet never sees it. A request that asks for query format v2 (u16 at 6
 //    = 2) also gets Config::latestClient in the same 24 bytes; any other request gets the v1 reply.
 //  * Admin is the console (Execute) and, when Config::adminPort is set, the local
-//    loopback channel (admin.h). No player is ever an admin.
+//    loopback channel (admin.h). In game a player only ever gets the v8 admin COMMANDS (AdminCmd, below), by role.
 //  * v4 vehicles (vehicles.h): VehicleCmd (reliable) is checked against the server's own state
 //    (caps, occupancy, distance, lock, who may) and ALWAYS answered with a VehicleResult; a malformed
 //    one is a protocol violation. VehicleUpdate (state channel) is taken only from the driver the
@@ -78,12 +78,30 @@
 //    previous one than speed x time allows opens a short "untrusted" window (no Enter / Register / Spawn, no
 //    Hits on others); connections per address per minute, vehicles per address, orphaned vehicles, Register
 //    spacing and model allow / deny lists are limited; VehicleResult RateLimited replies are throttled.
+//  * v8 accounts (platform.h, apps/platform/docs/game-server-contract.md): after Hello passes its version, name, ban
+//    and server-full checks the connection must send JoinAuth (within helloTimeoutMs of connecting). A token is verified
+//    with the platform on the worker thread (POST /internal/game/verify, single use) before anything else happens:
+//    ok -> the verified username is the player's name, accountId / sessionId / roles are kept, an older connection of
+//    the same account is kicked; banned -> Refuse Banned (always). Without platformUrl a token is ignored (logged).
+//    requireAccount on: no token -> AccountRequired, a refused token -> AuthFailed, no verdict -> AuthUnavailable (fail
+//    closed). requireAccount off: such a player is admitted as a guest under its Hello name, and the reason is logged.
+//    Welcome's burst ends with AccountInfo (the kAcct* flags). A verified player's leave is reported to the platform
+//    (session-end). AdminCmd (/heal /fix /spawn /tp /noclip /gun /car) and VehicleCmd Spawn / Register are refused to a
+//    player whose roles the server knows (verified, or requireAccount on) and who holds none of Config::adminRoles;
+//    a guest on a server that does not require accounts keeps the pre-v8 behaviour (allowed, logged).
+//  * 0.6 inventory (libs/sync/inventory.h, inventory_store.h; Config::inventoryDir, "" = no inventories): after AccountInfo
+//    a player gets InvState with its items (a verified account's save, or the starter kit; a guest's is never saved).
+//    Every InvOp is applied by sync::inv::Apply on the server's copy and answered with InvState (ackSeq = its seq), applied
+//    or not. USE is tried on a copy first: refused when dead, and a health-only item at full health is kept; health effects
+//    are applied here (Vitals), satiety goes back as InvUsed. Saved when the player leaves and every 30 s while changed.
 #pragma once
 
 #include "announce.h"
 #include "banlist.h"
 #include "config.h"
+#include "inventory_store.h"
 #include "metrics.h"
+#include "platform.h"
 #include "protocol/protocol.h"
 #include "melee.h"
 #include "replication.h"
@@ -148,6 +166,19 @@ namespace gage::server {
         uint64_t refused = 0;          // Hello refusals and protocol cut-offs
         uint64_t refusedBanned = 0;    // of which: ban list
         uint64_t refusedIpCap = 0;     // of which: per-address connection cap
+        // v8 accounts
+        uint64_t authVerified = 0;     // joins whose token the platform verified
+        uint64_t authGuests = 0;       // joins admitted without a verified account (requireAccount off)
+        uint64_t authRefused = 0;      // AccountRequired / AuthFailed / AuthUnavailable / a banned account
+        uint64_t adminAllowed = 0;     // AdminCmd answered Ok (or Failed: allowed but not doable)
+        uint64_t adminRefused = 0;     // AdminCmd answered NotAdmin, plus Spawn / Register refused to a non-admin
+        uint64_t adminUnknownRoles = 0; // allowed only because the server knew no roles (a guest, requireAccount off)
+        // 0.6 inventory
+        uint64_t invOpsApplied = 0;    // InvOps sync::inv::Apply accepted
+        uint64_t invOpsRefused = 0;    // InvOps it refused (a stale prediction, a full pack, USE while dead, ...) or over the rate limit
+        uint64_t invUses = 0;          // items used (their effect applied)
+        uint64_t invSaves = 0;         // saves written
+        uint64_t invSaveFailures = 0;  // saves that could not be written (logged)
         uint64_t statesAccepted = 0;
         uint64_t statesStale = 0;      // seq not newer than the last accepted
         uint64_t statesInvalid = 0;    // decoded, but outside the world box / limits
@@ -247,6 +278,11 @@ namespace gage::server {
         uint16_t vehicle = VehicleStore::kNone; // the vehicle it sits in (VehicleStore::kNone = on foot)
         uint8_t seat = 0;
         bool untrusted = false;  // inside the untrusted window after a position jump (Config::untrustedWindowMs)
+        // v8: the platform account (verified false = a guest; accountId / roles empty then)
+        bool verified = false;
+        bool isAdmin = false;
+        std::string accountId;
+        std::vector<std::string> roles;
     };
 
     // What Execute() made of a console line.
@@ -311,8 +347,7 @@ namespace gage::server {
         void ResetMetricsPeaks() { metrics_.ResetPeaks(); }
         // The joined players, ordered by id (connections still saying Hello are not
         // listed).
-        std::vector<PlayerInfo> Players() const;
-        // The ban list (read-only; mutate it through Ban/BanIp/Unban). Pointers taken from
+        std::vector<PlayerInfo> Players() const;        // The ban list (read-only; mutate it through Ban/BanIp/Unban). Pointers taken from
         // it are invalidated by those calls.
         const BanList& bans() const { return bans_; }
         // Counters of the master announcer (all zero when masterUrl is empty).
@@ -354,6 +389,14 @@ namespace gage::server {
         bool Heal(const std::string& target, std::string* err = nullptr);
         bool KillPlayer(const std::string& target, std::string* err = nullptr);
         bool SetArmor(const std::string& target, uint8_t armor, std::string* err = nullptr);
+        // 0.6 inventory. Console `give <id|name> <item> [qty]`: adds up to qty (default 1) of the catalog item `item` (its key, e.g.
+        // "water") to the player's pockets, then its pack; *msg says how many fitted. `clearinv <id|name>`: empties every slot
+        // (pockets, pack, worn items, quick slots). Both send the player an InvState. False with *msg for an unknown player or
+        // item, a qty of 0, a server without inventories, or (give) nothing fitting.
+        bool GiveItem(const std::string& target, const std::string& item, uint32_t qty, std::string* msg = nullptr);
+        bool ClearInventory(const std::string& target, std::string* msg = nullptr);
+        // The player's inventory as the server holds it (tests): false for an unknown player or a server without inventories.
+        bool InventoryOf(const std::string& target, sync::inv::Character& out) const;
 
         // ---- admin ----
         // These are the programmatic form of the console commands; Execute() calls them.
@@ -414,6 +457,23 @@ namespace gage::server {
         void HandleDisconnect(_ENetPeer* peer, uint32_t data);
         void HandleReceive(Conn& c, uint8_t channel, const uint8_t* data, size_t len);
         void OnHello(Conn& c, const uint8_t* data, size_t len);
+        // ---- v8 accounts ----
+        void OnJoinAuth(Conn& c, const uint8_t* data, size_t len);
+        void OnVerified(const VerifyResult& r);    // a platform verdict for a connection (Poll thread)
+        void AdmitGuest(Conn& c, const std::string& why);
+        void OnAdminCmd(Conn& c, const uint8_t* data, size_t len);
+        // Whether `c` may use the admin commands: true for an admin; for a player whose roles the server does not know
+        // (a guest while requireAccount is off) true too, with *unknown set. `what` names the command for the log.
+        bool AdminAllowed(Conn& c, const std::string& what, bool* unknown);
+        void EndPlatformSession(Conn& c, const char* reason);
+        // ---- 0.6 inventory ----
+        void LoadInventory(Conn& c);                      // at Accept: the save or the starter kit, then the first InvState
+        void OnInvOp(Conn& c, const uint8_t* data, size_t len);
+        void SendInventory(Conn& c, uint32_t ackSeq);
+        void SaveInventory(Conn& c, const char* when);    // when dirty and allowed; logs a failure
+        void SaveDirtyInventories(uint64_t nowMs);        // every kInvSaveEveryMs
+        uint64_t invSaveAtMs_ = 0;
+        InventoryStore invStore_;
         void OnState(Conn& c, const uint8_t* data, size_t len);
         void OnChat(Conn& c, const uint8_t* data, size_t len);
         void OnLook(Conn& c, const uint8_t* data, size_t len);
@@ -470,6 +530,7 @@ namespace gage::server {
         void BroadcastLinkInfo(uint64_t nowMs);  // R3 T5: ~1 Hz, each client gets the round trip of the players that control a vehicle
         void VehicleDestroyed(uint16_t id);
         void Accept(Conn& c, const std::string& name);
+        bool PreAdmitChecks(Conn& c, const std::string& name);   // ban (name and address), server full, name taken: false = refused
         void Refuse(Conn& c, proto::RefuseReason reason, const std::string& text);
         void RefuseBanned(Conn& c, const BanEntry& ban);
         // Refuses (Banned) every live connection from `ip`, joined players included.
@@ -487,6 +548,8 @@ namespace gage::server {
         std::unique_ptr<Impl> impl_;
         std::unique_ptr<AdminChannel> admin_;
         Announcer announcer_;
+        PlatformClient platform_;     // v8: the platform's internal API (running only with Config::platformUrl)
+        uint64_t nextSerial_ = 1;
         BanList bans_;
         _ENetHost* host_ = nullptr;
         Config cfg_;

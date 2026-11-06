@@ -109,9 +109,26 @@ endif()
 if(NOT GAGE_UPDATE_URL MATCHES "^https?://[^ ]+$")
     message(FATAL_ERROR "GAGE_UPDATE_URL must be an http(s) URL, got '${GAGE_UPDATE_URL}'")
 endif()
-# The platform API origin; empty until the platform is deployed (the launcher UI
-# then runs its labelled demo data). gage_mp.cfg `api_base=` overrides it.
-set(GAGE_API_BASE "" CACHE STRING "Platform API origin for the launcher UI (https://...)")
+# The platform API base the launcher UI calls (an https origin with an optional path:
+# the SPA calls <base>/v1/...). Default: the live platform behind Caddy's /api route.
+# OFF bakes none (a demo build: the UI runs its labelled demo data, PLAY uses
+# GAGE_TEST_SERVER). gage_mp.cfg `api_base=` overrides it (`api_base=off` = demo).
+set(GAGE_API_BASE_DEFAULT "https://solar-rp.com/api")
+set(GAGE_API_BASE "${GAGE_API_BASE_DEFAULT}" CACHE STRING "Platform API base for the launcher UI (https://...[/path]); OFF = demo build")
+# A build tree configured before this default existed caches "" (the old default): move it once.
+if(NOT GAGE_API_BASE_MIGRATED)
+    if(GAGE_API_BASE STREQUAL "")
+        set_property(CACHE GAGE_API_BASE PROPERTY VALUE "${GAGE_API_BASE_DEFAULT}")
+        set(GAGE_API_BASE "${GAGE_API_BASE_DEFAULT}")
+        message(STATUS "GAGE_API_BASE: the cached empty value became the default ${GAGE_API_BASE_DEFAULT} (OFF = a demo build)")
+    endif()
+    set(GAGE_API_BASE_MIGRATED ON CACHE INTERNAL "GAGE_API_BASE's empty-to-default migration ran")
+endif()
+set(GAGE_API_BASE_CACHED "${GAGE_API_BASE}")
+if(GAGE_API_BASE MATCHES "^([Oo][Ff][Ff]|[Nn][Oo][Nn][Ee])$")
+    set(GAGE_API_BASE "")   # a normal variable shadows the cache entry in configure_file below
+endif()
+message(STATUS "GAGE_API_BASE: '${GAGE_API_BASE}' (cache '${GAGE_API_BASE_CACHED}')")
 # Test builds only: the server demo-mode PLAY joins (host[:port]).
 set(GAGE_TEST_SERVER "" CACHE STRING "Server demo-mode PLAY joins in test builds (host[:port])")
 configure_file(${CMAKE_SOURCE_DIR}/tools/build_config.h.in ${CMAKE_BINARY_DIR}/gen/build_config.h @ONLY)

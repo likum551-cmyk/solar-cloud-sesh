@@ -43,7 +43,7 @@ class ServerRunner {
 public:
     server::Server srv;
 
-    bool Start() {
+    bool Start(const std::function<void(server::Config&)>& tweak = nullptr) {
         server::Config c;
         c.name = "GAGE Join Test";
         c.port = 0;                // ephemeral
@@ -59,6 +59,7 @@ public:
         // in-process server; production keeps the limit and has no loopback exemption.
         c.connectsPerIpPerMinute = 0;
         c.log = [](const std::string&) {}; // the test reads state, not the log
+        if (tweak) tweak(c);
         std::string err;
         if (!srv.Start(c, &err)) {
             std::printf("      server start failed: %s\n", err.c_str());
@@ -126,12 +127,17 @@ struct Heard {
     int welcomes = 0;
     uint16_t welcomeId = 0xFFFF, welcomeTickHz = 0;
     int welcomeHealth = -1;
+    // v8: PeerSinks::onAccount / onAdminResult
+    int accounts = 0;
+    uint8_t accountFlags = 0;
+    std::vector<proto::AdminResult> adminResults;
 
     void Clear() {
         std::lock_guard<std::mutex> lk(mu);
         joined.clear(); left.clear(); positions.clear(); worlds = 0; sawSelf = false;
         chats.clear(); ended = 0; events.clear();
         welcomes = 0; welcomeId = 0xFFFF; welcomeTickHz = 0; welcomeHealth = -1;
+        accounts = 0; accountFlags = 0; adminResults.clear();
     }
     bool HasEvent(const std::string& name, const std::string& payloadPart) {
         std::lock_guard<std::mutex> lk(mu);
@@ -174,6 +180,15 @@ static void InstallSinks() {
     s.onEnded = [] {
         std::lock_guard<std::mutex> lk(g_heard.mu);
         g_heard.ended++;
+    };
+    s.onAccount = [](const proto::AccountInfo& a) {
+        std::lock_guard<std::mutex> lk(g_heard.mu);
+        g_heard.accounts++;
+        g_heard.accountFlags = a.flags;
+    };
+    s.onAdminResult = [](const proto::AdminResult& r) {
+        std::lock_guard<std::mutex> lk(g_heard.mu);
+        g_heard.adminResults.push_back(r);
     };
     join::SetPeerSinks(std::move(s));
     join::SetEventSink([](const char* ev, const char* payload) {
@@ -559,8 +574,57 @@ int main() {
         join::Disconnect();
     }
 
+    // v8: the adapter forwards Config::joinToken in JoinAuth, surfaces AccountInfo, and round-trips an admin command.
+    {
+        g_heard.Clear();
+        join::Config c = cfg;
+        c.player = L"Tokio";
+        c.joinToken = "gjt_token-from-the-launcher";
+        join::Session s;
+        const bool in = join::Connect(c, 5000, s);
+        const bool acct = Until(nullptr, [] { std::lock_guard<std::mutex> lk(g_heard.mu); return g_heard.accounts == 1; }, 2000);
+        proto::AdminCmd heal;
+        heal.seq = 77;
+        heal.op = proto::AdminOp::Heal;
+        const bool sent = join::SendAdminCmd(heal);
+        const bool answered = Until(nullptr, [] { std::lock_guard<std::mutex> lk(g_heard.mu); return !g_heard.adminResults.empty(); }, 2000);
+        std::lock_guard<std::mutex> lk(g_heard.mu);
+        Check("v8: a token on a server without a platform joins as a guest; onAccount says 'admin commands allowed, not verified', and "
+              "SendAdminCmd(/heal) is answered Ok through onAdminResult with its seq",
+              in && acct && (g_heard.accountFlags & proto::kAcctCommands) && !(g_heard.accountFlags & proto::kAcctVerified) && sent &&
+                  answered && g_heard.adminResults[0].seq == 77 && g_heard.adminResults[0].code == proto::AdminCode::Ok,
+              Narrow(s.error) + " flags " + std::to_string(g_heard.accountFlags));
+    }
+    join::Disconnect();
+    {
+        // requireAccount against a platform that does not answer (a closed loopback port): with a token the server fails
+        // closed (AuthUnavailable), without one it asks for an account (AccountRequired); the engine treats both as final.
+        ServerRunner strict;
+        const bool up = strict.Start([](server::Config& c) {
+            c.platformUrl = "http://127.0.0.1:1";
+            c.platformServerId = "sol";
+            c.platformServerSecret = "0123456789abcdefXYZ";
+            c.requireAccount = true;
+            c.platformTimeoutMs = 500;
+        });
+        join::Config c = cfg;
+        c.port = strict.port();
+        c.player = L"Strict";
+        c.joinToken = "gjt_whatever";
+        join::Session withTok, noTok;
+        const bool a = up && !join::Connect(c, 8000, withTok);
+        c.joinToken.clear();
+        const bool b = up && !join::Connect(c, 5000, noTok);
+        Check("v8: requireAccount refuses a token the platform cannot check (AuthUnavailable) and a join without one (AccountRequired), "
+              "both final for the engine, with the server's sentence",
+              a && b && withTok.refused && withTok.refuseReason == proto::RefuseReason::AuthUnavailable && noTok.refused &&
+                  noTok.refuseReason == proto::RefuseReason::AccountRequired && join::RefusalIsFinal(withTok.refuseReason) &&
+                  join::RefusalIsFinal(noTok.refuseReason) && noTok.refuseText.find("Solar RP account") != std::string::npos,
+              Narrow(withTok.error) + " | " + Narrow(noTok.error));
+    }
+
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    const int expected = 49 + 2 + 1 + 2 + 1 + 1;   // + vehicle mailbox 2 + playerHealth 1 + sample time 2 (sync plan W6) + refusal reason/text 1 + RefusalIsFinal 1
+    const int expected = 49 + 2 + 1 + 2 + 1 + 1 + 2;   // + vehicle mailbox 2 + playerHealth 1 + sample time 2 (sync plan W6) + refusal reason/text 1 + RefusalIsFinal 1 + v8 accounts 2
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
         return 1;

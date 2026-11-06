@@ -352,6 +352,15 @@ static std::vector<Case> Corpus()
         m.e.push_back({9, 120});
         v.push_back(Make("LinkInfo", m));
     }
+    // v8: the join token, the account the server verified, and the admin command round trip
+    { JoinAuth m; m.token = "gjt_0123456789abcdefABCDEF-_"; v.push_back(Make("JoinAuth", m)); }
+    { AccountInfo m; m.flags = kAcctVerified | kAcctAdmin | kAcctCommands; m.username = "Solar_Admin"; v.push_back(Make("AccountInfo", m)); }
+    { AdminCmd m; m.seq = 513; m.op = AdminOp::Car; m.arg = "adder"; v.push_back(Make("AdminCmd", m)); }
+    { AdminResult m; m.seq = 513; m.op = AdminOp::Car; m.code = AdminCode::NotAdmin; m.text = "Only admins can use /car on this server."; v.push_back(Make("AdminResult", m)); }
+    // 0.6 inventory: the protocol frames opaque bytes (the item rules decode them; tests/inventory_tests.h fuzzes that codec)
+    { InvState m; m.ackSeq = 70001; m.blob = std::string("\x01\x05\x00\x02\x00\x00\x00\xff", 8) + std::string(200, '\0'); v.push_back(Make("InvState", m)); }
+    { InvOp m; m.seq = 70002; m.op = std::string("\x00\x00\x03\x00\x01\x05\x00\x00\x00\x00\x00", 11); v.push_back(Make("InvOp", m)); }
+    { InvUsed m; m.item = 6; m.satiety = 40; v.push_back(Make("InvUsed", m)); }
     for (Case& c : v)
         if (c.name.rfind("VehicleWorld", 0) == 0 || c.name.rfind("VehicleUpdate", 0) == 0 || c.name == "VehicleCmd register") c.lossy = true;
     return v;

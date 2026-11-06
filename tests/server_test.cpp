@@ -945,8 +945,8 @@ static void QueryLiveTests()
         int size = 0;
         const query::Nonce n1 = MakeNonce(0xA1);
         const bool got = AskQuery(rig, udp, n1, rep, &size);
-        Check("query live: a request is answered with exactly 24 bytes carrying protocol 7 (kVersion), players 2, maxPlayers 8 and the nonce",
-              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 7 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
+        Check("query live: a request is answered with exactly 24 bytes carrying protocol 8 (kVersion), players 2, maxPlayers 8 and the nonce",
+              got && size == 24 && rep.protocol == proto::kVersion && rep.protocol == 8 && rep.players == 2 && rep.maxPlayers == 8 && rep.nonce == n1,
               got ? "players " + std::to_string(rep.players) : "no reply");
         query::Reply rep2;
         const query::Nonce n2 = MakeNonce(0x5C);
@@ -1182,6 +1182,12 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         return reqs_;
     }
+    // v8 (the fake platform): when set, every reply is computed from its request instead of taken from the script.
+    void Respond(std::function<Reply(const Req&)> f)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        responder_ = std::move(f);
+    }
 
 private:
     void Run()
@@ -1260,7 +1266,8 @@ private:
             std::lock_guard<std::mutex> lock(m_);
             reqs_.push_back(rq);
             const size_t idx = reqs_.size() - 1;
-            if (!script_.empty()) rp = script_[idx < script_.size() ? idx : script_.size() - 1];
+            if (responder_) rp = responder_(rq);
+            else if (!script_.empty()) rp = script_[idx < script_.size() ? idx : script_.size() - 1];
         }
         const std::string status = std::to_string(rp.status) + " X";
         switch (rp.mode)
@@ -1302,6 +1309,7 @@ private:
     mutable std::mutex m_;
     std::vector<Req> reqs_;
     std::vector<Reply> script_;
+    std::function<Reply(const Req&)> responder_;
 };
 
 static const char* kOkBody = "{\"status\":\"ok\",\"key\":\"127.0.0.1:24800\",\"created\":true,\"ttlSeconds\":90,\"heartbeatSeconds\":30}";
@@ -1337,7 +1345,7 @@ static void AnnounceTests()
                   NumField(p.v, "port") == rig.srv.port() && StrField(p.v, "name") == cfg.name &&
                   StrField(p.v, "gamemode") == "race" && StrField(p.v, "lang") == "pt-BR" &&
                   StrField(p.v, "url") == "https://example.org/x" && NumField(p.v, "players") == 0 &&
-                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 7, // v6: the master list shows protocol 6
+                  NumField(p.v, "maxPlayers") == 8 && NumField(p.v, "protocol") == proto::kVersion && proto::kVersion == 8, // v8: the master list shows protocol 8
               first ? r0.head + "\n" + r0.body : "no request");
 
         Probe a(rig);
@@ -3171,6 +3179,9 @@ static void PipelineHealthTests()
 #define R4T3_SERVER
 #include "r4_t3_tests.h"   // R4 T3 punches: the judgement at the live geometry (a displaced puppet) and the per-swing line
 
+#include "account_tests.h" // v8 accounts: join tokens against a fake platform, requireAccount, admin roles
+#include "inventory_net_tests.h" // 0.6 inventory over the wire: kit, ops, USE effects, console, saves per verified account
+
 int main()
 {
     // Unbuffered, so the lines before a crash are not lost when stdout is a pipe.
@@ -3214,10 +3225,14 @@ int main()
     W8MeleeCeilingTests();
     std::printf("-- sync pipeline review: ENet throttle, per-tier counters, sync log line\n");
     PipelineHealthTests();
+    std::printf("-- v8 accounts: join tokens, requireAccount, admin roles (fake platform)\n");
+    acct::Tests();
+    std::printf("-- 0.6 inventory: InvState / InvOp / InvUsed, USE effects, console give / clearinv, saves\n");
+    invnet::Tests();
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks + acct::kAccountChecks + invnet::kChecks; // 0.6: + the inventory checks; v8: + the account checks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

@@ -152,6 +152,10 @@ namespace gage::server {
         // Ban list file (see banlist.h). Empty = bans live in memory only. Relative
         // paths are relative to the working directory, like server.json itself.
         std::string bansFile = "bans.json";
+        // 0.6 inventory saves (inventory_store.h): one file per VERIFIED platform account in this folder (created on the first
+        // save; relative = the working directory). Empty = nothing is saved (every player gets the starter kit each session).
+        // Guests are never saved either way.
+        std::string inventoryDir = "inventories";
 
         // ---- server.json keys: local admin control channel (admin.h) ----
         // adminPort: loopback-only TCP port for the admin line protocol; 0 (default) =
@@ -163,7 +167,28 @@ namespace gage::server {
         uint16_t adminPort = 0;
         std::string adminToken;
 
+        // ---- server.json keys: platform accounts (protocol v8; apps/platform/docs/game-server-contract.md) ----
+        // platformUrl: the platform's INTERNAL listener, plain http, e.g. "http://127.0.0.1:8788" (the server calls
+        // <platformUrl>/internal/game/verify and /internal/game/session-end). Empty (default) = no platform: join tokens
+        // are ignored (logged) and every player is a guest. platformServerId: this server's id on the platform (the
+        // X-Gage-Server-Id header, ^[a-z0-9][a-z0-9-]{1,31}$, e.g. "sol"); platformServerSecret: its secret (gss_...,
+        // the X-Gage-Server-Secret header), taken from the environment variable GAGE_PLATFORM_SECRET when the file sets
+        // none (keep it out of server.json). Both are required whenever platformUrl is set.
+        std::string platformUrl;
+        std::string platformServerId;
+        std::string platformServerSecret;
+        // requireAccount: true = a join without a verified token is refused (AccountRequired / AuthFailed / AuthUnavailable,
+        // fail closed); false (default) = a join without a token, or whose token the platform refuses, is admitted as a
+        // guest (logged). A banned account is refused either way. true needs platformUrl.
+        bool requireAccount = false;
+        // adminRoles: the platform roles (apps/platform ROLES: player, mod, admin) that may run the admin commands
+        // (AdminCmd: /heal /fix /spawn /tp /noclip /gun /car, and VehicleCmd Spawn / Register) once the server knows a
+        // player's roles. 1..8 names of 1..32 [a-z0-9_-].
+        std::vector<std::string> adminRoles{"admin"};
+
         // ---- not in server.json ----
+        // How long one platform call may take (connect + answer). The contract asks for 2..3 s.
+        uint32_t platformTimeoutMs = 2500;
         std::string bindHost;           // empty = all interfaces; else an IPv4 literal
         uint32_t helloTimeoutMs = 5000; // a connection must say Hello within this
         // ENet peer timeout (limit, minimum ms, maximum ms): how long a silent

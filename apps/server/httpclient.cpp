@@ -227,6 +227,21 @@ namespace gage::server {
             if (err) *err = why;
             return false;
         };
+        // Extra headers first: a line break in a value would let it inject headers (or a second request).
+        std::string extra;
+        for (const auto& h : opt.headers)
+        {
+            if (h.first.empty() || h.first.size() > 64) return failMsg("bad extra header name");
+            for (char c : h.first)
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+                    return failMsg("bad extra header name");
+            for (char ch : h.second)
+            {
+                const unsigned char c = (unsigned char)ch;
+                if ((c < 0x20 && c != '\t') || c == 0x7F) return failMsg("extra header " + h.first + " has a control character");
+            }
+            extra += h.first + ": " + h.second + "\r\n";
+        }
         if (!sock::Init()) return failMsg("network stack unavailable");
         struct Cleanup
         {
@@ -253,7 +268,7 @@ namespace gage::server {
 
         std::string req = "POST " + url.path + " HTTP/1.1\r\nHost: " + url.hostHeader +
                           "\r\nUser-Agent: gage-server\r\nAccept: application/json\r\nContent-Type: " + contentType +
-                          "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                          "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n" + extra + "\r\n" + body;
 
         size_t sent = 0;
         while (sent < req.size())

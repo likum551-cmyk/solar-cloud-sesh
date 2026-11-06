@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -78,6 +79,9 @@ struct Rig
     // Declared before `srv` on purpose: ~Server() logs "stopped" through the sink,
     // so the vector it appends to must outlive it.
     std::vector<std::string> logs;
+    // Optional: called with every server log line on the server's own thread, inside whatever the server is doing (a test
+    // can stall the server at a chosen line). Declared before `srv` for the same reason as `logs`.
+    std::function<void(const std::string&)> onLog;
     std::vector<Probe*> probes;
     // Other rigs that are alive while this one is stepped. Every Step() services them too: a rig that is left unserviced
     // for about a second loses its clients to ENet's low rig timeouts (BaseConfig: 400..1000 ms), so a test that runs a
@@ -109,6 +113,7 @@ struct Rig
         // the per-address cap is off here (its own test turns it on); no ban file on disk.
         c.maxConnectionsPerIp = 0;
         c.bansFile = "";
+        c.inventoryDir = "";   // 0.6: no inventory saves from the rig; the save tests (inventory_net_tests.h) give their own scratch folder
         // The authority rules that count per address or judge invented positions would trip over a rig in
         // which every client is 127.0.0.1 and Place() teleports at will; they are off here and the tests
         // of those rules switch them on (netcode_test AuthorityNetworkTests, server_test J).
@@ -132,7 +137,10 @@ struct Rig
 
     bool Start(server::Config cfg = BaseConfig())
     {
-        cfg.log = [this](const std::string& line) { logs.push_back(line); };
+        cfg.log = [this](const std::string& line) {
+            logs.push_back(line);
+            if (onLog) onLog(line);
+        };
         std::string err;
         const bool ok = srv.Start(cfg, &err);
         if (!ok) std::printf("      server start failed: %s\n", err.c_str());
@@ -162,7 +170,9 @@ struct Probe
 {
     Rig& rig;
     net::ClientSession s;
-    std::vector<net::Event> events;
+    // A deque, not a vector: tests keep `const net::Event*` from First() across later Drain()s, and a push_back must not
+    // move the events they point at (v8's extra AccountInfo event made bob's vector reallocate under a held PeerAnim).
+    std::deque<net::Event> events;
     uint64_t worlds = 0;
     std::vector<uint32_t> worldTicks;     // the server tick of every WorldState received, in arrival order
     uint64_t coarseEvents = 0;
@@ -350,8 +360,9 @@ struct Probe
         static const char* names[] = {"Welcome",      "Refused",       "PlayerJoined", "PlayerLeft", "World",
                                       "Chat",         "Disconnected",  "Coarse",       "PeerLook",   "VehicleWorld",
                                       "VehicleResult", "Damage",       "Killed",       "RespawnOk",  "PeerAnim",
-                                      "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact", "LinkInfo"};
-        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::LinkInfo + 1, "a name per event type");
+                                      "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact", "LinkInfo",
+                                      "AccountInfo",  "AdminResult", "InvState",   "InvUsed"};
+        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::InvUsed + 1, "a name per event type");
         std::string out;
         for (const net::Event& e : events) out += std::string(names[(int)e.type]) + " ";
         return out;

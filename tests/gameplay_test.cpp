@@ -3089,6 +3089,7 @@ static void TestSyncD()
 #include "hud_car_tests.h"    // 0.4.31 the car cluster (GI REV2 design): dial, ticks, fuel row, chips, blink, anchor
 #include "hud_ring_tests.h"   // 0.4.31 the vitals ring (GI REV1 design): state table, rules, pulse, scale
 #include "vehstate_row_tests.h"   // 0.4.27 vehicle state row (lock / belt / engine) and the indicator fallback (needs Check / F above)
+#include "inventory_tests.h"   // 0.6 the inventory rules (GI REV3 design): catalog, moves, caps, packs, equipment, quick slots, Apply, codec
 
 int main()
 {
@@ -3151,6 +3152,8 @@ int main()
     hudring_t::RunPure();                           // 0.4.31 the vitals ring (tests/hud_ring_tests.h)
     hudcar_t::RunPure();                            // 0.4.31 the car cluster (tests/hud_car_tests.h)
     vehrow::RunPure();                              // 0.4.27 vehicle state row + indicator fallback (tests/vehstate_row_tests.h)
+    std::printf("-- 0.6 inventory rules (catalog, moves, caps, packs, equipment, quick slots, Apply, codec)\n");
+    invtest::RunPure();                             // 0.6 the inventory (tests/inventory_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3170,7 +3173,8 @@ int main()
                        + vehrow::kChecks      // + 0.4.27 vehicle state row + indicator fallback 31
                        + 1                    // + 0.4.30 punch: a melee stagger is a clip (tests W8 block)
                        + hudring_t::kChecks   // + 0.4.31 the vitals ring 9
-                       + hudcar_t::kChecks;   // + 0.4.31 the car cluster 10
+                       + hudcar_t::kChecks    // + 0.4.31 the car cluster 10
+                       + invtest::kChecks;    // + 0.6 the inventory rules 14
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

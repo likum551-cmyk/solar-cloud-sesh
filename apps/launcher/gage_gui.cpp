@@ -27,7 +27,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +56,7 @@
 #include "legacy_handoff.h"
 #include "updater.h"
 #include "pack_sync.h"
+#include "api_base.h"     // v8: the platform API base check (pure; tests/version_gate_test.cpp)
 #include "version_gate.h"  // the lockstep policy: protocol gate, every update mandatory, check timing (pure; tests/version_gate_test.cpp)
 #include "build_config.h"  // generated: GAGE_UPDATE_URL, GAGE_UPDATE_PUBKEY
 #include "ui_html.h"  // generated: embedded SPA bytes (kUiHtml / kUiHtmlLen)
@@ -373,39 +377,19 @@ static std::wstring GetLaunchOptions() {
     return v.size() > kMaxLaunchOptions ? L"" : v;
 }
 
-// `origin` is an https:// origin, or http:// on 127.0.0.1 / localhost for
-// development: a host with an optional :port and nothing after it.
-static bool ValidApiOrigin(const std::wstring& origin) {
-    std::wstring host;
-    bool loopbackOnly = false;
-    if (_wcsnicmp(origin.c_str(), L"https://", 8) == 0) host = origin.substr(8);
-    else if (_wcsnicmp(origin.c_str(), L"http://", 7) == 0) { host = origin.substr(7); loopbackOnly = true; }
-    else return false;
-    if (host.empty() || host.size() > 253) return false;
-    for (wchar_t c : host)
-        if (!(iswalnum(c) || c == L'.' || c == L'-' || c == L':')) return false;
-    size_t colon = host.find(L':');
-    std::wstring name = host.substr(0, colon);
-    if (name.empty()) return false;
-    if (colon != std::wstring::npos) {
-        std::wstring port = host.substr(colon + 1);
-        if (port.empty() || port.size() > 5 || port.find_first_not_of(L"0123456789") != std::wstring::npos) return false;
-        if (_wtoi(port.c_str()) < 1 || _wtoi(port.c_str()) > 65535) return false;
-    }
-    return !loopbackOnly || _wcsicmp(name.c_str(), L"127.0.0.1") == 0 || _wcsicmp(name.c_str(), L"localhost") == 0;
-}
-
-// The platform API origin the SPA calls (apps/platform): an `api_base=` line in
-// gage_mp.cfg, else the build's GAGE_API_BASE. "" when neither is set or the
-// value is not a valid origin: the SPA then runs its labelled demo data.
+// The platform API base the SPA calls (apps/platform): an `api_base=` line in
+// gage_mp.cfg, else the build's GAGE_API_BASE (default https://solar-rp.com/api).
+// "" when neither is set, `api_base=off`, or the value is not a valid base: the
+// SPA then runs its labelled demo data.
 static std::wstring GetApiBase() {
     std::wstring v = cfg::Get(L"api_base");
     const bool fromCfg = !v.empty();
+    if (fromCfg && apibase::IsOff(v)) return L"";   // demo on purpose
     if (!fromCfg) v = GAGE_API_BASE;
     while (!v.empty() && v.back() == L'/') v.pop_back();
     if (v.empty()) return L"";
-    if (!ValidApiOrigin(v)) {
-        GLOGW("api base: '%s' (%s) is not an https:// or loopback http:// origin; ignored",
+    if (!apibase::Valid(v)) {   // api_base.h
+        GLOGW("api base: '%s' (%s) is not an https:// or loopback http:// origin with an optional plain path; ignored",
               Narrow(v).c_str(), fromCfg ? "gage_mp.cfg api_base" : "GAGE_API_BASE");
         return L"";
     }
@@ -621,6 +605,91 @@ static void PostLaunch(const LaunchResult& r) {
     }
 }
 
+// BRIDGE.md `launchStage` (NATIVE-INTEGRATION 3.2): where the launch worker is. Worker threads.
+static void PostStageFromWorker(const char* stage) {
+    PostJsonFromWorker(std::string("{\"type\":\"launchStage\",\"stage\":\"") + stage + "\"}");
+}
+
+// The platform's server id (apps/platform: ^[a-z0-9][a-z0-9-]{1,31}$), as the SPA passes it in `launch.serverId`.
+static bool ValidServerId(const std::wstring& id) {
+    if (id.size() < 2 || id.size() > 32) return false;
+    for (size_t i = 0; i < id.size(); i++) {
+        const wchar_t c = id[i];
+        const bool ok = (c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') || (i > 0 && c == L'-');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// BRIDGE.md `joinTokenNeeded` / `joinToken` (NATIVE-INTEGRATION 3.3): right before the injection the launch worker asks
+// the SPA for a fresh single-use join token (POST /v1/game/join, 60 s) and waits for the answer here; Dispatch fills it.
+struct JoinTokenWait {
+    bool waiting = false;
+    bool answered = false;
+    std::string serverId;   // the id asked for; an answer for another id is ignored
+    std::string token;      // "" with answered = the SPA could not get one (error says why)
+    std::wstring error;
+};
+static std::mutex g_jtMu;
+static std::condition_variable g_jtCv;
+static JoinTokenWait g_jt;
+static const DWORD kJoinTokenWaitMs = 15000;
+
+// The join token's charset (proto::ValidJoinToken: printable ASCII without space, at most 256).
+static bool ValidJoinTokenText(const std::string& t) {
+    if (t.empty() || t.size() > 256) return false;
+    for (unsigned char c : t)
+        if (c < 0x21 || c > 0x7E) return false;
+    return true;
+}
+
+// UI thread (Dispatch "joinToken").
+static void OnJoinTokenAnswer(const std::string& serverId, const JVal* token, const std::wstring& error) {
+    std::lock_guard<std::mutex> lk(g_jtMu);
+    if (!g_jt.waiting || g_jt.answered) {
+        GLOGW("joinToken: an answer nobody waits for (server '%s'); ignored", serverId.c_str());
+        return;
+    }
+    if (serverId != g_jt.serverId) {
+        GLOGW("joinToken: answer for server '%s' while '%s' is launching; ignored", serverId.c_str(), g_jt.serverId.c_str());
+        return;
+    }
+    g_jt.answered = true;
+    g_jt.token.clear();
+    g_jt.error = error;
+    if (token && token->t == JVal::Str) {
+        if (ValidJoinTokenText(token->s)) g_jt.token = token->s;
+        else if (g_jt.error.empty()) g_jt.error = L"The join ticket the launcher got is malformed.";
+    }
+    g_jtCv.notify_all();
+}
+
+// Launch worker: post joinTokenNeeded and wait up to kJoinTokenWaitMs. True with `token` set; false with `error` set.
+static bool AskJoinToken(const std::string& serverId, std::string& token, std::wstring& error) {
+    {
+        std::lock_guard<std::mutex> lk(g_jtMu);
+        g_jt = JoinTokenWait();
+        g_jt.waiting = true;
+        g_jt.serverId = serverId;
+    }
+    PostJsonFromWorker("{\"type\":\"joinTokenNeeded\",\"serverId\":\"" + serverId + "\"}");   // the id's charset needs no escaping
+    std::unique_lock<std::mutex> lk(g_jtMu);
+    const bool got = g_jtCv.wait_for(lk, std::chrono::milliseconds(kJoinTokenWaitMs), [] { return g_jt.answered; });
+    token = g_jt.token;
+    error = g_jt.error;
+    SecureZeroMemory(g_jt.token.empty() ? nullptr : &g_jt.token[0], g_jt.token.size());
+    g_jt = JoinTokenWait();
+    if (!got) {
+        error = L"No answer from the launcher window.";
+        return false;
+    }
+    if (token.empty()) {
+        if (error.empty()) error = L"The Solar RP network did not hand out a join ticket.";
+        return false;
+    }
+    return true;
+}
+
 static void ApplyDefaultPort(ServerInfo& s) {
     if (s.port >= 1) return;
     std::wstring def = cfg::Get(L"default_port", std::to_wstring(proto::kDefaultPort));
@@ -651,6 +720,7 @@ static void WatchGameExit(HANDLE game, DWORD pid) {
         GLOGI("game pid %lu exited after %lu s, exit code 0x%08lX", (unsigned long)pid,
               (unsigned long)((GetTickCount() - t0) / 1000), (unsigned long)code);
         PostJsonFromWorker("{\"type\":\"game\",\"running\":false}");
+        reg::Clear(L"join_token");                    // v8: an engine that never read it is gone (normally already cleared)
         PostMessageW(g_hwnd, WM_GAME_EXITED, 0, 0);  // a deferred update may install now
         CloseHandle(w);
     }).detach();
@@ -717,7 +787,11 @@ static bool SyncCarPacks(bool mayRefuse, bool gen9) {
     return true;
 }
 
-static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const std::wstring& playerName) {
+// serverId: the platform id of the server (launch.serverId); with an API base configured the engine gets a join token for it.
+static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const std::wstring& playerName, const std::wstring& serverId) {
+    PostStageFromWorker("preflight");
+    // v8: a join token left by an earlier launch that never reached the engine is void (single use, 60 s): never hand it on.
+    if (reg::Has(L"join_token") && !reg::Clear(L"join_token")) GLOGW("handoff: could not clear a stale join_token");
     // 0. The lockstep gate (version_gate.h). Ask the server which protocol it enforces: a server AHEAD of this
     //    launcher means a release is out that we have not installed (refuse, and have the UI thread look for the
     //    update now); a server BEHIND has not been deployed yet (refuse, try again in a minute). A server that
@@ -849,6 +923,7 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
     //    Never GTA5.exe directly: the game expects its launcher to start it
     //    (PlayGTAV.exe / steam:// / the Epic launcher, with -nobattleye).
     PostStatusFromWorker(L"Starting GTA V…");
+    PostStageFromWorker("starting_store");
     launch::GameProc g = launch::FindGame();
     bool launched = false;  // true = we started the game; false = it was already running
     if (!g.pid && !g.battleye) {
@@ -921,6 +996,7 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
             return;
         }
         launched = true;
+        PostStageFromWorker("waiting_for_game");
         // The store/launcher may update, sign in or show its own window first. A
         // status every few seconds also keeps the SPA's no-response timer from firing.
         // While waiting, the shim also has to reach the Rockstar Games Launcher
@@ -995,6 +1071,40 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
         return;
     }
 
+    PostStageFromWorker("injecting");
+
+    // 4. v8: the join token, as late as possible (it lives 60 s and the engine connects soon after the injection). Only with a
+    //    platform API (demo / test_server launches have none) and a server id from the SPA. The engine reads join_token and
+    //    server_id from HKCU\Software\GAGE-MP and clears join_token at once (apps/engine/gage_mp.cpp Run()).
+    if (!GetApiBase().empty()) {
+        if (!ValidServerId(serverId)) {
+            GLOGW("launch: no valid serverId in the launch message ('%s'): the engine joins without a join token", Narrow(serverId).c_str());
+        } else {
+            PostStatusFromWorker(L"Getting your join ticket…");
+            std::string token;
+            std::wstring tokErr;
+            if (!AskJoinToken(Narrow(serverId), token, tokErr)) {
+                GLOGW("launch: no join token for server '%s': %s", Narrow(serverId).c_str(), Narrow(tokErr).c_str());
+                LaunchResult r = { false, 12, tokErr };
+                if (launched) { r.hProc = h; r.pid = pid; } else CloseHandle(h);
+                PostLaunch(r);
+                return;
+            }
+            std::wstring wtok(token.begin(), token.end());   // printable ASCII (ValidJoinTokenText)
+            SecureZeroMemory(&token[0], token.size());
+            const bool wrote = reg::Set(L"join_token", wtok) && reg::Set(L"server_id", serverId);
+            SecureZeroMemory(&wtok[0], wtok.size() * sizeof(wchar_t));
+            if (!wrote) {
+                reg::Clear(L"join_token");
+                LaunchResult r = { false, 6, L"Could not write launcher settings to the registry (join_token)." };
+                if (launched) { r.hProc = h; r.pid = pid; } else CloseHandle(h);
+                PostLaunch(r);
+                return;
+            }
+            GLOGI("launch: join token for server '%s' handed over (HKCU join_token, the engine clears it on read)", Narrow(serverId).c_str());
+        }
+    }
+
     // InjectDll waits (up to 10 s) for the new process to expose kernel32 before it injects.
     // Player-facing wording; the mechanics (pid, injector) go to gage.log.
     PostStatusFromWorker(L"Loading Solar RP into the game…");
@@ -1019,7 +1129,11 @@ static void DoLaunch(const ServerInfo& srv, const std::wstring& gamePath, const 
         // session in the background (join.cpp). Say only that injection succeeded.
         GLOGI("injected into pid %lu (engine will join %s:%d)", (unsigned long)pid,
               Narrow(s.host).c_str(), s.port);
+        PostStageFromWorker("injected");
+        if (alive) PostJsonFromWorker("{\"type\":\"game\",\"running\":true}");   // BRIDGE.md `game`; WatchGameExit posts false
     } else {
+        reg::Clear(L"join_token");   // nothing will read it
+
         // InjectDll leaves err at 0 on several early failures; don't print
         // "The operation completed successfully." as the reason.
         r.error = err == inject::kErrTargetNotReady
@@ -1655,7 +1769,7 @@ static bool CopyToClipboard(const std::wstring& text) {
 
 // PLAY that is waiting for the update check it needs (one at a time; a second press is ignored like a second
 // press during a launch). Resumed by the check's result, or by kTimerLaunchWait if the check is slow.
-struct ParkedLaunch { bool active = false; ServerInfo s; std::wstring gp, pn; };
+struct ParkedLaunch { bool active = false; ServerInfo s; std::wstring gp, pn, sid; };
 static ParkedLaunch g_parked;
 
 // The `launch` command (UI thread). Order: a pending update refuses PLAY (code 14); else, if the launcher has
@@ -1663,7 +1777,8 @@ static ParkedLaunch g_parked;
 // kLaunchCheckWaitMs), so a release published a minute ago is never skipped; then the demo/test-server
 // substitution, the address check, and the launch worker, whose first step is the protocol gate (DoLaunch).
 // `afterCheck`: this press already waited for its check; do not wait again.
-static void HandleLaunch(ServerInfo s, const std::wstring& gp, const std::wstring& pn, bool afterCheck) {
+// `sid`: the platform server id (launch.serverId, "" from an older SPA): DoLaunch asks the SPA for its join token.
+static void HandleLaunch(ServerInfo s, const std::wstring& gp, const std::wstring& pn, const std::wstring& sid, bool afterCheck) {
     std::wstring updateText;
     if (UpdateBlocksLaunch(&updateText)) {
         GLOGW("launch refused: update pending (%s)", Narrow(updateText).c_str());
@@ -1683,6 +1798,7 @@ static void HandleLaunch(ServerInfo s, const std::wstring& gp, const std::wstrin
                 g_parked.s = s;
                 g_parked.gp = gp;
                 g_parked.pn = pn;
+                g_parked.sid = sid;
                 SetTimer(g_hwnd, kTimerLaunchWait, kLaunchCheckWaitMs, nullptr);
                 PostStatus(L"Checking for updates…");
                 return;
@@ -1712,7 +1828,7 @@ static void HandleLaunch(ServerInfo s, const std::wstring& gp, const std::wstrin
         return;
     }
     PostStatus(L"Connecting…");
-    std::thread([s, gp, pn]() { DoLaunch(s, gp, pn); }).detach();
+    std::thread([s, gp, pn, sid]() { DoLaunch(s, gp, pn, sid); }).detach();
 }
 
 // The check PLAY was waiting for has finished, or kTimerLaunchWait ran out: go on with that press.
@@ -1721,7 +1837,7 @@ static void ResumeParkedLaunch() {
     KillTimer(g_hwnd, kTimerLaunchWait);
     const ParkedLaunch p = g_parked;
     g_parked = ParkedLaunch();
-    HandleLaunch(p.s, p.gp, p.pn, true);
+    HandleLaunch(p.s, p.gp, p.pn, p.sid, true);
 }
 
 // A server answered the UDP query with `protocol` and `latestClient` (WM_SERVER_PROTO; latestClient is the packed
@@ -1774,7 +1890,12 @@ static void Dispatch(const std::string& json) {
     } else if (type == "ping") {
         StartPing((int)jNum(jGet(&v, "row"), -1));
     } else if (type == "launch") {
-        HandleLaunch(FromJServer(jGet(&v, "server")), jStr(jGet(&v, "gamePath")), jStr(jGet(&v, "playerName")), false);
+        HandleLaunch(FromJServer(jGet(&v, "server")), jStr(jGet(&v, "gamePath")), jStr(jGet(&v, "playerName")),
+                     jStr(jGet(&v, "serverId")), false);
+    } else if (type == "joinToken") {
+        // v8 (NATIVE-INTEGRATION 3.3): the SPA's answer to joinTokenNeeded. The token is never logged.
+        const JVal* sid = jGet(&v, "serverId");
+        OnJoinTokenAnswer(sid && sid->t == JVal::Str ? sid->s : std::string(), jGet(&v, "token"), jStr(jGet(&v, "error")));
     } else if (type == "browseGamePath") {
         // Not inside the WebMessageReceived callback: a modal dialog there
         // pumps messages while the WebView2 call is still on the stack.

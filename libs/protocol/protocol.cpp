@@ -270,7 +270,17 @@ namespace gage::proto {
 
         bool KnownRefuse(uint8_t v)
         {
-            return v >= (uint8_t)RefuseReason::VersionMismatch && v <= (uint8_t)RefuseReason::TooManyConnections;
+            return v >= (uint8_t)RefuseReason::VersionMismatch && v <= (uint8_t)RefuseReason::AuthUnavailable;
+        }
+        // v8: printable ASCII 0x20..0x7E (an admin argument may hold spaces: "/tp 1 2 3").
+        bool PrintableAscii(const std::string& s)
+        {
+            for (char ch : s)
+            {
+                const unsigned char c = (unsigned char)ch;
+                if (c < 0x20 || c > 0x7E) return false;
+            }
+            return true;
         }
         bool KnownLeave(uint8_t v) { return v >= (uint8_t)LeaveReason::Quit && v <= (uint8_t)LeaveReason::Kicked; }
 
@@ -594,6 +604,79 @@ namespace gage::proto {
             w.u16(e.id);
             w.u16(e.rttMs);
         }
+        return w.take();
+    }
+
+    // ---- v8 accounts ----
+    Bytes Encode(const JoinAuth& m)
+    {
+        wire::Writer w;
+        if (!ValidJoinToken(m.token)) return {};
+        w.u8((uint8_t)Msg::JoinAuth);
+        if (!w.str(m.token)) return {};
+        return w.take();
+    }
+
+    Bytes Encode(const AccountInfo& m)
+    {
+        wire::Writer w;
+        if ((m.flags & ~kAcctKnown) != 0 || m.username.size() > kMaxName || !PrintableAscii(m.username)) return {};
+        w.u8((uint8_t)Msg::AccountInfo);
+        w.u8(m.flags);
+        if (!w.str(m.username)) return {};
+        return w.take();
+    }
+
+    Bytes Encode(const AdminCmd& m)
+    {
+        wire::Writer w;
+        if ((uint8_t)m.op < (uint8_t)AdminOp::Heal || (uint8_t)m.op > kAdminOpLast || m.arg.size() > kMaxAdminArg || !PrintableAscii(m.arg)) return {};
+        w.u8((uint8_t)Msg::AdminCmd);
+        w.u16(m.seq);
+        w.u8((uint8_t)m.op);
+        if (!w.str(m.arg)) return {};
+        return w.take();
+    }
+
+    Bytes Encode(const AdminResult& m)
+    {
+        wire::Writer w;
+        if ((uint8_t)m.op < (uint8_t)AdminOp::Heal || (uint8_t)m.op > kAdminOpLast || (uint8_t)m.code > kAdminCodeLast || m.text.size() > kMaxRefuseText) return {};
+        w.u8((uint8_t)Msg::AdminResult);
+        w.u16(m.seq);
+        w.u8((uint8_t)m.op);
+        w.u8((uint8_t)m.code);
+        if (!w.str(m.text)) return {};
+        return w.take();
+    }
+
+    Bytes Encode(const InvState& m)
+    {
+        if (m.blob.empty() || m.blob.size() > kMaxInvBlob) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::InvState);
+        w.u32(m.ackSeq);
+        if (!w.str(m.blob)) return {};
+        return w.take();
+    }
+
+    Bytes Encode(const InvOp& m)
+    {
+        if (m.seq == 0 || m.op.size() != kInvOpBytes) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::InvOp);
+        w.u32(m.seq);
+        w.bytes((const uint8_t*)m.op.data(), m.op.size());
+        return w.take();
+    }
+
+    Bytes Encode(const InvUsed& m)
+    {
+        if (m.item == 0 || m.satiety > 100) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::InvUsed);
+        w.u16(m.item);
+        w.u8(m.satiety);
         return w.take();
     }
 
@@ -1085,6 +1168,108 @@ namespace gage::proto {
         return true;
     }
 
+    // ---- v8 accounts ----
+    bool ValidJoinToken(const std::string& token)
+    {
+        if (token.size() > kMaxJoinToken) return false;
+        for (char ch : token)
+        {
+            const unsigned char c = (unsigned char)ch;
+            if (c < 0x21 || c > 0x7E) return false;
+        }
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, JoinAuth& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::JoinAuth)) return false;
+        JoinAuth m;
+        m.token = r.str(kMaxJoinToken);
+        if (!r.done() || !ValidJoinToken(m.token)) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, AccountInfo& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::AccountInfo)) return false;
+        AccountInfo m;
+        m.flags = r.u8();
+        m.username = r.str(kMaxName);
+        if (!r.done() || (m.flags & ~kAcctKnown) != 0 || !PrintableAscii(m.username)) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, AdminCmd& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::AdminCmd)) return false;
+        AdminCmd m;
+        m.seq = r.u16();
+        const uint8_t op = r.u8();
+        m.arg = r.str(kMaxAdminArg);
+        if (!r.done() || op < (uint8_t)AdminOp::Heal || op > kAdminOpLast || !PrintableAscii(m.arg)) return false;
+        m.op = (AdminOp)op;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, AdminResult& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::AdminResult)) return false;
+        AdminResult m;
+        m.seq = r.u16();
+        const uint8_t op = r.u8();
+        const uint8_t code = r.u8();
+        m.text = r.str(kMaxRefuseText);
+        if (!r.done() || op < (uint8_t)AdminOp::Heal || op > kAdminOpLast || code > kAdminCodeLast) return false;
+        m.op = (AdminOp)op;
+        m.code = (AdminCode)code;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, InvState& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::InvState)) return false;
+        InvState m;
+        m.ackSeq = r.u32();
+        m.blob = r.str(kMaxInvBlob);
+        if (!r.done() || m.blob.empty()) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, InvOp& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::InvOp)) return false;
+        InvOp m;
+        m.seq = r.u32();
+        uint8_t b[kInvOpBytes] = {};
+        if (!r.bytes(b, sizeof b) || !r.done() || m.seq == 0) return false;
+        m.op.assign((const char*)b, sizeof b);
+        out = std::move(m);
+        return true;
+    }
+
+    bool Decode(const uint8_t* p, size_t n, InvUsed& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::InvUsed)) return false;
+        InvUsed m;
+        m.item = r.u16();
+        m.satiety = r.u8();
+        if (!r.done() || m.item == 0 || m.satiety > 100) return false;
+        out = m;
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, Killed& out)
     {
         wire::Reader r(p, n);
@@ -1426,6 +1611,41 @@ namespace gage::proto {
         case Msg::SeatNotice:       return "SeatNotice";
         case Msg::VehicleImpact:    return "VehicleImpact";
         case Msg::LinkInfo:         return "LinkInfo";
+        case Msg::JoinAuth:         return "JoinAuth";
+        case Msg::AccountInfo:      return "AccountInfo";
+        case Msg::AdminCmd:         return "AdminCmd";
+        case Msg::AdminResult:      return "AdminResult";
+        case Msg::InvState:         return "InvState";
+        case Msg::InvOp:            return "InvOp";
+        case Msg::InvUsed:          return "InvUsed";
+        }
+        return "?";
+    }
+
+    const char* ToString(AdminOp op)
+    {
+        switch (op)
+        {
+        case AdminOp::Heal:   return "heal";
+        case AdminOp::Fix:    return "fix";
+        case AdminOp::Spawn:  return "spawn";
+        case AdminOp::Tp:     return "tp";
+        case AdminOp::Noclip: return "noclip";
+        case AdminOp::Gun:    return "gun";
+        case AdminOp::Car:    return "car";
+        }
+        return "?";
+    }
+
+    const char* ToString(AdminCode c)
+    {
+        switch (c)
+        {
+        case AdminCode::Ok:          return "Ok";
+        case AdminCode::NotAdmin:    return "NotAdmin";
+        case AdminCode::RateLimited: return "RateLimited";
+        case AdminCode::BadArg:      return "BadArg";
+        case AdminCode::Failed:      return "Failed";
         }
         return "?";
     }
@@ -1442,6 +1662,9 @@ namespace gage::proto {
         case RefuseReason::HelloTimeout:    return "HelloTimeout";
         case RefuseReason::Banned:          return "Banned";
         case RefuseReason::TooManyConnections: return "TooManyConnections";
+        case RefuseReason::AccountRequired: return "AccountRequired";
+        case RefuseReason::AuthFailed:      return "AuthFailed";
+        case RefuseReason::AuthUnavailable: return "AuthUnavailable";
         }
         return "?";
     }

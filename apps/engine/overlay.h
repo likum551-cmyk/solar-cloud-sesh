@@ -24,6 +24,8 @@
 // engine::SendChat, which routes /commands locally and plain text to the server.
 #pragma once
 #include <cstddef>
+#include <cstdint>
+#include <string>
 
 namespace gage::game::Overlay {
 
@@ -73,6 +75,27 @@ namespace gage::game::Overlay {
     // annulus over the radar square's corners (hudring::MapRadiusPx out to the disc) and the map shows through the hole, with the design's vignette
     // and amber map ring at the hole's edge. false = the full glass disc (map off). Any thread.
     void SetRingMap(bool open);
+
+    // v8 accounts: true = this player may use the admin commands (/heal, /fix, /spawn, /tp, /noclip, /gun, /car, the Cars page spawn), so the
+    // overlay may offer them. The engine sets it from the server's AccountInfo (kAcctCommands: an admin role, or a guest on a server that does
+    // not require accounts), false when a session ends, true with no server configured (single player). The server still checks every such
+    // command (AdminCmd), so this only decides what is shown. Any thread.
+    void SetIsAdmin(bool admin);
+    bool IsAdmin();
+
+    // 0.6 inventory (overlay_inventory.cpp, GI's REV3 design on the Tab menu). SetInventory: the server's InvState (`encoded` =
+    // sync::inv::Encode bytes, `ackSeq` = the last op it processed, `characterName` for the CHARACTER chip); the screen drops its
+    // predictions up to ackSeq and applies the rest again on top. ClearInventory: the session ended (the screen shows "unavailable").
+    // PopInventoryOp: the next op the player made (sync::inv::EncodeOp bytes and its seq) for the engine to send as InvOp; false when
+    // none is waiting. Any thread.
+    void SetInventory(const std::string& encoded, uint32_t ackSeq, const char* characterName);
+    void ClearInventory();
+    bool PopInventoryOp(std::string* encodedOp, uint32_t* seq);
+    // 0.6: true while the Tab menu shows the inventory page (the engine hides GTA's radar under it). Any thread.
+    bool InventoryOpen();
+    // 0.6 inv_rev3 (HKCU\Software\GAGE-MP, default on): the Tab menu opens on the REV3 inventory, admins also get the old menu as ADMIN;
+    // off = the old Tab menu only (0.5.2). Any thread.
+    void SetInventoryScreen(bool on);
 
     // 0.5.2 round-map probe: the next frame's bottom-left (the radar's quarter, before the overlay draws on it) is saved to
     // %LOCALAPPDATA%\GAGE-MP\radar_probe_<n>.bmp and logged, so the radar's landing place can be measured. D3D11 (Legacy) only; on D3D12 one line

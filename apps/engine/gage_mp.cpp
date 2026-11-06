@@ -292,6 +292,20 @@ namespace {
         const long portNum = wcstol(port.c_str(), nullptr, 10);
         cfg.port   = (portNum >= 1 && portNum <= 65535) ? (int)portNum : (int)proto::kDefaultPort;
         cfg.player = playerName.empty() ? L"player" : playerName;
+        // v8: the launcher's single-use join token (written by DoLaunch right before the injection, for the server in
+        // server_id). Read once and cleared at once, so a later game start without the launcher never reuses it.
+        {
+            const std::wstring tok = reg::Get(L"join_token");
+            const std::wstring sid = reg::Get(L"server_id");
+            if (!tok.empty())
+            {
+                reg::Clear(L"join_token");
+                for (wchar_t ch : tok)
+                    cfg.joinToken.push_back(ch >= 0x21 && ch <= 0x7E ? (char)ch : '?'); // a character the wire cannot carry becomes '?': the platform refuses such a token, nothing is cut
+            }
+            GLOGI("gage_mp: join token %s (server_id %s)", tok.empty() ? "absent: joining as a guest" : "present (handed over and cleared)",
+                  sid.empty() ? "(none)" : Narrow(sid).c_str());
+        }
 
         // Forward session events ("connected", "disconnected", "playerJoined",
         // "playerLeft") to the mp.* bridge (the JS layer subscribes via

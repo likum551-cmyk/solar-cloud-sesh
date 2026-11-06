@@ -24,6 +24,10 @@ namespace gage::join {
         std::wstring host;            // "1.2.3.4" or a hostname
         int          port = proto::kDefaultPort; // the game (UDP) port
         std::wstring player = L"player";
+        // v8: the single-use join token the launcher got from the platform (POST /v1/game/join) and handed over in
+        // HKCU\Software\GAGE-MP join_token; sent in JoinAuth right after Hello. Empty = join as a guest (the server
+        // admits one only while its requireAccount is off). Never logged.
+        std::string  joinToken;
     };
 
     // Whether a Refuse is the end of the engine's connecting (the player has to act: update the game, change the name, ask an
@@ -131,6 +135,15 @@ namespace gage::join {
         std::function<void(const proto::VehicleImpact&)> onVehicleImpact;
         // R3 T5: the round trip (ms) the server measures to each vehicle controller (about 1 Hz, unreliable).
         std::function<void(const proto::LinkInfo&)> onLinkInfo;
+        // v8: the account the server verified for us (kAcct* flags, the username; flags 0 for a guest on a server that
+        // requires none of the admin commands). Arrives once, at the end of the Welcome burst.
+        std::function<void(const proto::AccountInfo&)> onAccount;
+        // v8: the server's answer to one of our SendAdminCmd calls (same seq and op).
+        std::function<void(const proto::AdminResult&)> onAdminResult;
+        // v8 (0.6): our inventory (after AccountInfo, after each of our InvOps: ackSeq = its seq, and after a console give / clear),
+        // and an item the server used for us (the satiety to add).
+        std::function<void(const proto::InvState&)> onInvState;
+        std::function<void(const proto::InvUsed&)> onInvUsed;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;
@@ -156,6 +169,11 @@ namespace gage::join {
     bool SendAnim(const proto::Anim& a);
     bool SendScenario(const std::string& name);
     bool SendStopAnim();
+    // v8: ask the server whether we may run an admin command (/heal, /fix, /spawn, /tp, /noclip, /gun, /car); reliable,
+    // in order, at most 16 waiting. Answered by onAdminResult. False when not live or the command fails the wire checks.
+    bool SendAdminCmd(const proto::AdminCmd& c);
+    // v8 (0.6): one inventory operation (reliable, in order, at most 64 waiting). Answered by onInvState (ackSeq = o.seq).
+    bool SendInvOp(const proto::InvOp& o);
 
     // Our own movement and on-foot state (protocol v3 PedState), unreliable and
     // latest-wins: a newer call before the worker sends replaces the pending one.
