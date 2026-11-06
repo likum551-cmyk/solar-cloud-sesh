@@ -9,7 +9,7 @@
 
 #include "platform.h"
 
-namespace acct {
+namespace v8acct {
 
     constexpr int kAccountChecks = 23;
 

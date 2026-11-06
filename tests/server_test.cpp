@@ -3226,13 +3226,13 @@ int main()
     std::printf("-- sync pipeline review: ENet throttle, per-tier counters, sync log line\n");
     PipelineHealthTests();
     std::printf("-- v8 accounts: join tokens, requireAccount, admin roles (fake platform)\n");
-    acct::Tests();
+    v8acct::Tests();
     std::printf("-- 0.6 inventory: InvState / InvOp / InvUsed, USE effects, console give / clearinv, saves\n");
     invnet::Tests();
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks + acct::kAccountChecks + invnet::kChecks; // 0.6: + the inventory checks; v8: + the account checks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks + v8acct::kAccountChecks + invnet::kChecks; // 0.6: + the inventory checks; v8: + the account checks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

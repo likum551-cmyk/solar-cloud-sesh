@@ -1,6 +1,6 @@
 #pragma once
 // 0.6 inventory over the wire (protocol v8 InvState / InvOp / InvUsed; apps/server InventoryStore): the real server and the real ClientSession on
-// loopback. Included by tests/server_test.cpp after account_tests.h (it reuses acct's fake platform for the verified-account saves). Every check
+// loopback. Included by tests/server_test.cpp after account_tests.h (it reuses v8acct's fake platform for the verified-account saves). Every check
 // runs on the passing path (kChecks of them). The item rules themselves are tests/inventory_tests.h (gameplay_test).
 
 #include "sync/inventory.h"
@@ -169,12 +169,12 @@ namespace invnet {
         rig.Pump(100);
         gus.Drain();
         Check("inventory live: USE on a bandage at full health is refused: the bandage stays (2), no InvUsed, health stays 100",
-              askedFull && QtyOf(kept, kBandage) == 2 && InvUsedCount(gus) == usedMid && HealthOf(rig, acct::MyId(gus)) == 100);
+              askedFull && QtyOf(kept, kBandage) == 2 && InvUsedCount(gus) == usedMid && HealthOf(rig, v8acct::MyId(gus)) == 100);
 
         // 6. hurt, then bandage (+10 % of playerHealth) and a given medkit (+35 %, capped at the maximum)
-        const uint16_t gId = acct::MyId(gus);
-        const bool placed = acct::Placed(rig, alice, 0.0f, 0.0f) && acct::Placed(rig, gus, 5.0f, 0.0f) &&
-                            rig.Until([&] { return rig.srv.IsRelevant(acct::MyId(alice), gId); }, 3000);
+        const uint16_t gId = v8acct::MyId(gus);
+        const bool placed = v8acct::Placed(rig, alice, 0.0f, 0.0f) && v8acct::Placed(rig, gus, 5.0f, 0.0f) &&
+                            rig.Until([&] { return rig.srv.IsRelevant(v8acct::MyId(alice), gId); }, 3000);
         const bool fired = Fire(rig, alice, Kin(0, 0, 30));
         proto::Hit h;
         h.kind = proto::HitKind::Player;
@@ -253,8 +253,8 @@ namespace invnet {
         const fs::path dir = fs::temp_directory_path(ec) / ("gage_inv_test_" + std::to_string((long long)std::chrono::steady_clock::now().time_since_epoch().count()));
         FakeMaster fake;
         if (ec || !fake.Start()) { Check("inventory saves: a scratch folder and the fake platform", false); return; }
-        fake.Respond(acct::PlatformAnswer);
-        server::Config cfg = acct::PlatformConfig(fake, false);
+        fake.Respond(v8acct::PlatformAnswer);
+        server::Config cfg = v8acct::PlatformConfig(fake, false);
         cfg.inventoryDir = dir.string();
         Rig rig;
         if (!rig.Start(cfg)) { Check("inventory saves: server starts", false); return; }
@@ -270,7 +270,7 @@ namespace invnet {
         inv::Character moved;
         {
             Probe pia(rig);
-            const bool in = acct::JoinWith(rig, pia, "x", "tok-player");
+            const bool in = v8acct::JoinWith(rig, pia, "x", "tok-player");
             Client c{rig, pia};
             rig.Until([&] { pia.Drain(); return pia.Count(ET::InvState) > 0; }, 2000);
             inv::Character kit;
@@ -280,7 +280,7 @@ namespace invnet {
             rig.Until([&] { return rig.srv.Players().empty(); }, 3000);
             const bool saved = fs::exists(paths.PathFor("acc-player"), ec);
             Probe again(rig);
-            const bool in2 = acct::JoinWith(rig, again, "x", "tok-player2");
+            const bool in2 = v8acct::JoinWith(rig, again, "x", "tok-player2");
             Client c2{rig, again};
             rig.Until([&] { again.Drain(); return again.Count(ET::InvState) > 0; }, 2000);
             inv::Character back;
@@ -315,7 +315,7 @@ namespace invnet {
             const std::string p = paths.PathFor("acc-admin");
             WriteTextFile(p.c_str(), "not an inventory");
             Probe ada(rig);
-            const bool in = acct::JoinWith(rig, ada, "Ada", "tok-admin");
+            const bool in = v8acct::JoinWith(rig, ada, "Ada", "tok-admin");
             Client c{rig, ada};
             rig.Until([&] { ada.Drain(); return ada.Count(ET::InvState) > 0; }, 2000);
             inv::Character got;
