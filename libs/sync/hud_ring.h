@@ -73,7 +73,8 @@ namespace gage::sync::hudring {
 
     // 0.4.34 GI after the first live look (2026-11-06): "make map 25% smaller". The whole component (disc, arcs, strip, text) is drawn at kSize of
     // the design about its own bottom-left corner (kCompX, kCompY), so its 56 px margin to the screen corner stays as designed.
-    constexpr float kSize = 0.75f;
+    // 0.5.1 GI after the 0.5.0 look: "make map and hp and satiety stuff 10% bigger": 0.75 x 1.1.
+    constexpr float kSize = 0.825f;
 
     // Design px (y up) to screen px (y down) on a display H px tall. DesignScale = H / 1080 (the spec's rule); Scale = DesignScale * kSize, the factor
     // for every size inside the component.

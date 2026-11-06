@@ -1776,7 +1776,7 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
     static bool s_logged = false;
     if (!s_logged) {
         s_logged = true;
-        GLOGI("overlay: vitals ring (0.4.31 hud_ring, REV1): component x %.0f-%.0f y %.0f-%.0f at k %.3f (H / 1080 x 0.4.34 size), GTA's radar hidden; Sofia Sans %s",
+        GLOGI("overlay: vitals ring (0.4.31 hud_ring, REV1): component x %.0f-%.0f y %.0f-%.0f at k %.3f (H / 1080 x 0.5.1 size), GTA's radar hidden; Sofia Sans %s",
               (double)b0.x, (double)b1.x, (double)b0.y, (double)b1.y, (double)k,
               u.sofiaOk ? "loaded" : "MISSING (ImGui's default font stands in)");
     }
@@ -3643,7 +3643,7 @@ void UiInit(float scale)
     static const ImWchar kDigitRanges[] = { 0x0030, 0x0039, 0 };   // the 96 px speed: ten glyphs, not a 96 px Latin-1 atlas
     // weight: stb_truetype's coverage is linear; the goldens (Skia) boost small text's contrast, so the 12-14 px faces came out 15-20 % lighter
     // at the same peak (the critic's edge measurements): those faces are baked with RasterizerMultiply.
-    // size: the component's kSize (0.4.34: the ring at 0.75, the car cluster at 0.5), so each face is baked at the size it is drawn at
+    // size: the component's kSize (0.5.1: the ring at 0.825, the car cluster at 0.6), so each face is baked at the size it is drawn at
     const auto loadSofia = [&](float design, float size, const ImWchar* ranges = kLatinRanges, float weight = 1.0f) {
         Fnt f;
         f.design = design;

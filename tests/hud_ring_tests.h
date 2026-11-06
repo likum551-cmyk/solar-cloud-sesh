@@ -101,11 +101,11 @@ namespace hudring_t {
         {
             const Pt c1440 = ToScreen({kCx, kCy}, 1440.0f), b720 = ToScreen({kCompX, kCompY}, 720.0f), c1080 = ToScreen({kCx, kCy}, 1080.0f);
             const Pt tr1080 = ToScreen({kCompX + kCompW, kCompY + kCompH}, 1080.0f);
-            const bool ok = kSize == 0.75f && At(c1080, 164.0f, 868.0f) && At(c1440, 218.6667f, 1440.0f - 282.6667f) &&
-                            At(b720, 37.3333f, 720.0f - 37.3333f) && At(tr1080, 272.0f, 760.0f) &&
-                            Near(Scale(1440.0f), 1.0f, 1e-5f) && Near(DesignScale(1440.0f), 1.3333333f, 1e-5f) && Scale(0.0f) == 0.75f;
-            Check("hud ring: the component is the design at 0.75 about its bottom-left corner, which sits at 56 * H / 1080 (centre (164, 868) on 1080p, "
-                  "(218.67, 1157.33) on 1440p; box 216 x 264)",
+            const bool ok = kSize == 0.825f && At(c1080, 174.8f, 852.4f) && At(c1440, 233.0667f, 1440.0f - 303.4667f) &&
+                            At(b720, 37.3333f, 720.0f - 37.3333f) && At(tr1080, 293.6f, 733.6f) &&
+                            Near(Scale(1440.0f), 1.1f, 1e-5f) && Near(DesignScale(1440.0f), 1.3333333f, 1e-5f) && Scale(0.0f) == 0.825f;
+            Check("hud ring: the component is the design at 0.825 about its bottom-left corner, which sits at 56 * H / 1080 (centre (174.8, 852.4) on 1080p, "
+                  "(233.07, 1136.53) on 1440p; box 237.6 x 290.4)",
                   ok, F("1080 centre (%.2f, %.2f), 1440 centre (%.2f, %.2f), 720 corner (%.2f, %.2f), 1080 top-right (%.2f, %.2f)", c1080.x, c1080.y,
                         c1440.x, c1440.y, b720.x, b720.y, tr1080.x, tr1080.y));
         }
