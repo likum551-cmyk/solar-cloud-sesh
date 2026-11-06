@@ -30,6 +30,7 @@
 
 #include "metrics.h"
 #include "protocol/crc32.h"
+#include "sync/outfit.h"      // 0.5.4 outfit_items: the worn items -> look table (header only)
 
 #include <cstdarg>
 #include <cstdlib>
@@ -2702,6 +2703,68 @@ static void LookTests()
               d.RefusedWith(proto::RefuseReason::Protocol));
 }
 
+// 0.5.4 outfit_items: the worn items' clothes ride the look sync unchanged. The spawn outfit, the shirt / pants / shoes taken off in the
+// inventory (sync::inv::Apply, the server's own rules) and put through sync::outfit::Desired onto the look the engine would read back, reach
+// the other player as PeerLook with exactly the bare drawables (ValidLook takes legs 61 / feet 34); putting them back on restores the spawn
+// look byte for byte.
+static proto::Look WithOutfit(proto::Look l, const gage::sync::inv::Character& ch)
+{
+    const gage::sync::outfit::Want w = gage::sync::outfit::Desired(ch, gage::sync::outfit::Sex::Male);
+    for (int c = 0; c < gage::sync::outfit::kComponents; c++)
+        if (w.want[c])
+        {
+            l.components[(size_t)c].drawable = (uint16_t)w.drawable[c];
+            l.components[(size_t)c].texture = w.texture[c];
+        }
+    return l;
+}
+static void OutfitLookTest()
+{
+    namespace inv = gage::sync::inv;
+    Rig rig;
+    if (!rig.Start()) { Check("outfit look: server starts", false); return; }
+    Probe a(rig), b(rig);
+    a.Join("Alice");
+    b.Join("Bob");
+    const uint16_t aid = a.s.myId();
+    // the engine's spawn outfit (engine.cpp kPlayerOutfit): head 0/0, mask 0/0, hair 1/0, arms 8/0, legs 10/0, bag 0, shoes 8/0, neck 0,
+    // undershirt 15/0, armour 0, decal 0, top 8/10; palette 2
+    proto::Look spawn;
+    spawn.model = gage::sync::outfit::kFreemodeMale;
+    const int kD[12] = {0, 0, 1, 8, 10, 0, 8, 0, 15, 0, 0, 8}, kT[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10};
+    for (size_t i = 0; i < proto::kLookComponents; i++)
+    {
+        spawn.components[i].drawable = (uint16_t)kD[i];
+        spawn.components[i].texture = (uint8_t)kT[i];
+        spawn.components[i].palette = 2;
+    }
+    inv::Character kit = inv::StarterKit();
+    const proto::Look worn = WithOutfit(spawn, kit);
+    inv::Character bare = kit;
+    for (inv::Equip e : {inv::Equip::Shirt, inv::Equip::Pants, inv::Equip::Shoes})
+    {
+        inv::Op op;
+        op.kind = inv::OpKind::Use;   // USE on a worn item takes it off into the pockets
+        op.src = inv::Where::Equip;
+        op.si = (int16_t)inv::EquipIndex(e);
+        inv::Apply(bare, op);
+    }
+    const proto::Look off = WithOutfit(spawn, bare);
+    const bool sent = a.s.SendLook(off);
+    const bool arrived = rig.Until([&] { return LooksOf(b, aid).size() == 1; }, 2000);
+    rig.Pump(100);
+    const bool offOk = arrived && LooksOf(b, aid)[0] == off && off.components[11].drawable == 15 && off.components[3].drawable == 15 &&
+                       off.components[8].drawable == 15 && off.components[4].drawable == 61 && off.components[6].drawable == 34 &&
+                       off.components[2].drawable == 1 && proto::ValidLook(off);
+    a.s.SendLook(worn);
+    const bool back = rig.Until([&] { return LooksOf(b, aid).size() == 2; }, 2000);
+    rig.Pump(100);
+    Check("outfit look (0.5.4): shirt / pants / shoes taken off in the inventory reach the other player as PeerLook (top 15, arms 15, undershirt 15, "
+          "legs 61, feet 34, hair untouched); worn again, the spawn look comes back byte for byte",
+          sent && offOk && back && LooksOf(b, aid)[1] == spawn && worn == spawn,
+          "arrived " + std::to_string(LooksOf(b, aid).size()));
+}
+
 // The look rate limit: 2 at once, then 2 a second; over it the newest waits and wins.
 static void LookRateTest()
 {
@@ -4362,6 +4425,7 @@ int main()
     PedNetworkTests();
     LookTests();
     LookRateTest();
+    OutfitLookTest();   // 0.5.4 outfit_items
     std::printf("-- vehicles, combat and emotes (v4)\n");
     VehicleNetworkTests();
     VehicleLifetimeTests();
@@ -4392,7 +4456,7 @@ int main()
     // v4: the 9 v3 vehicle-codec checks became 7 v4 codec checks; + 4 vehicle, 2 vehicle-lifetime, 8 combat and 4 emote
     // network checks; + 28 authority-rule checks (12 hit binding and caps, 6 movement and fuel, 4 reconnect and connect
     // rate, 4 flood / Register / model lists, 2 emote rules).
-    const int expected = 195 + 1 + 12 + t6health::kNetworkChecks + t1net::kNetChecks + t4net::kT4NetChecks + r3t6::kNetChecks + r4t3::kNetChecks; // 0.4.5 melee audit +12; W8 +1 melee ceiling; T6 health network checks; T1 seats (reworded checks, not added, + the three-client scenario and the wire rules); T4 collisions (+3: VehicleImpact wire, head-on arbitration, the speed clamp)
+    const int expected = 195 + 1 + 12 + 1 /* 0.5.4 outfit look */ + t6health::kNetworkChecks + t1net::kNetChecks + t4net::kT4NetChecks + r3t6::kNetChecks + r4t3::kNetChecks; // 0.4.5 melee audit +12; W8 +1 melee ceiling; T6 health network checks; T1 seats (reworded checks, not added, + the three-client scenario and the wire rules); T4 collisions (+3: VehicleImpact wire, head-on arbitration, the speed clamp)
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

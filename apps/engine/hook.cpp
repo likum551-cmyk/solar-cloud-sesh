@@ -978,6 +978,18 @@ const HashMapping kCrossmap3889[] = {
     {native::IS_PED_IN_MELEE_COMBAT,                              0xFFAC548682B3D56E},
     {native::TASK_PUT_PED_DIRECTLY_INTO_MELEE,                    0x849ABF0CBD8EE0D6},
     {native::SET_PED_COMBAT_ATTRIBUTES,                           0xBE8796DB2B90A437},
+    // 0.5.4 inv_ped_view: YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced (and legacy) by name and signature; public hashes in hook.h.
+    {native::CREATE_CAM_WITH_PARAMS,                              0x2CB6AB601EB7D2D9},
+    {native::SET_CAM_ACTIVE,                                      0x4CBC5D1BC117616B},
+    {native::RENDER_SCRIPT_CAMS,                                  0xE37AF9002E782BA0},
+    {native::DESTROY_CAM,                                         0x85E6A1E36B5E2E4D},
+    {native::DOES_CAM_EXIST,                                      0x78411E34CF90EA8C},
+    {native::SET_CAM_COORD,                                       0x1761457F86AD0EE2},
+    {native::SET_CAM_ROT,                                         0x5E5CEC33463AD803},
+    {native::SET_CAM_FOV,                                         0x58BDA5D9262F5D30},
+    {native::IS_CAM_RENDERING,                                    0x8DE2438443E6A145},
+    {native::GET_FOLLOW_PED_CAM_VIEW_MODE,                        0x3B5989D5DB08A155},
+    {native::IS_PED_GETTING_INTO_A_VEHICLE,                       0x9D6DF8F3584AAC2B},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -5093,6 +5105,70 @@ bool World::ApplyPedLook(int32_t ped, const PedLook& look) {
     return true;
 }
 
+// 0.5.4 outfit_items: one component, validated first; the rest of the ped is not touched (no SET_PED_DEFAULT_COMPONENT_VARIATION).
+int World::SetPedComponentChecked(int32_t ped, int component, int drawable, int texture) {
+    if (!ped || component < 0 || component > 11 || drawable < 0 || texture < 0) return -1;
+    const uint64_t h = (uint64_t)(uint32_t)ped;
+    uint64_t vargs[] = { h, (uint64_t)(uint32_t)component, (uint64_t)(uint32_t)drawable, (uint64_t)(uint32_t)texture };
+    uint64_t ret[4] = {};
+    if (!CallNative(native::IS_PED_COMPONENT_VARIATION_VALID, vargs, 4, ret)) return -1;
+    if (!(uint32_t)ret[0]) return 0;
+    uint64_t args[] = { h, (uint64_t)(uint32_t)component, (uint64_t)(uint32_t)drawable, (uint64_t)(uint32_t)texture, 2 /* palette, as ApplyPedOutfit */ };
+    return CallNative(native::SET_PED_COMPONENT_VARIATION, args, 5, nullptr) ? 1 : -1;
+}
+
+// ---------------------------------------------------------------------------
+// 0.5.4 inv_ped_view: the scripted camera of the inventory's CHARACTER panel (libs/sync/ped_view.h). Script tick only.
+// ---------------------------------------------------------------------------
+int32_t World::CreateScriptCam(float x, float y, float z, float pitch, float yaw, float fov) {
+    static const char kName[] = "DEFAULT_SCRIPTED_CAMERA";   // R*'s scripts always pass this name (alloc8or)
+    uint64_t args[] = { (uint64_t)(uintptr_t)kName, FloatArg(x), FloatArg(y), FloatArg(z), FloatArg(pitch), FloatArg(0.0f), FloatArg(yaw),
+                        FloatArg(fov), 0 /* p8: not active yet */, 2 /* p9: rotation order */ };
+    uint64_t r[4] = {};
+    if (!CallNative(native::CREATE_CAM_WITH_PARAMS, args, 10, r)) return 0;
+    return (int32_t)(uint32_t)r[0];
+}
+bool World::SetScriptCamParams(int32_t cam, float x, float y, float z, float pitch, float yaw, float fov) {
+    if (!cam) return false;
+    const uint64_t c = (uint64_t)(uint32_t)cam;
+    uint64_t pos[] = { c, FloatArg(x), FloatArg(y), FloatArg(z) };
+    uint64_t rot[] = { c, FloatArg(pitch), FloatArg(0.0f), FloatArg(yaw), 2 /* rotation order */ };
+    uint64_t f[] = { c, FloatArg(fov) };
+    const bool a = CallNative(native::SET_CAM_COORD, pos, 4, nullptr);
+    const bool b = CallNative(native::SET_CAM_ROT, rot, 5, nullptr);
+    const bool d = CallNative(native::SET_CAM_FOV, f, 2, nullptr);
+    return a && b && d;
+}
+bool World::SetCamActive(int32_t cam, bool active) {
+    if (!cam) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)cam, (uint64_t)active };
+    return CallNative(native::SET_CAM_ACTIVE, args, 2, nullptr);
+}
+bool World::RenderScriptCams(bool render) {
+    // (render, ease false, easeTime 0, p3 true, p4 false, p5 0): R*'s scripts pass p3 TRUE
+    uint64_t args[] = { (uint64_t)render, 0, 0, 1, 0, 0 };
+    return CallNative(native::RENDER_SCRIPT_CAMS, args, 6, nullptr);
+}
+bool World::DestroyCam(int32_t cam) {
+    if (!cam) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)cam, 0 /* bScriptHostCam */ };
+    return CallNative(native::DESTROY_CAM, args, 2, nullptr);
+}
+bool World::DoesCamExist(int32_t cam) { return callPedBool(*this, native::DOES_CAM_EXIST, cam); }
+int World::IsCamRendering(int32_t cam) {
+    if (!cam) return 0;
+    uint64_t arg[] = { (uint64_t)(uint32_t)cam };
+    uint64_t r[4] = {};
+    if (!CallNative(native::IS_CAM_RENDERING, arg, 1, r)) return -1;
+    return (uint32_t)r[0] ? 1 : 0;
+}
+int World::FollowPedCamViewMode() {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_FOLLOW_PED_CAM_VIEW_MODE, nullptr, 0, r)) return -1;
+    return (int)(int32_t)(uint32_t)r[0];
+}
+bool World::IsPedGettingIntoVehicle(int32_t ped) { return callPedBool(*this, native::IS_PED_GETTING_INTO_A_VEHICLE, ped); }
+
 // ---------------------------------------------------------------------------
 // Vehicle sync, weapons/shots/damage, camera/aim. Script tick only. Same conventions as the
 // remote-ped block: bool = "the native could be called" unless hook.h says otherwise.
@@ -6966,6 +7042,18 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(GET_CONTROL_NORMAL),
         GAGE_NEW_NATIVE(SET_VEHICLE_HANDBRAKE),
         GAGE_NEW_NATIVE(SET_VEHICLE_BRAKE_LIGHTS),
+        // 0.5.4 inv_ped_view
+        GAGE_NEW_NATIVE(CREATE_CAM_WITH_PARAMS),
+        GAGE_NEW_NATIVE(SET_CAM_ACTIVE),
+        GAGE_NEW_NATIVE(RENDER_SCRIPT_CAMS),
+        GAGE_NEW_NATIVE(DESTROY_CAM),
+        GAGE_NEW_NATIVE(DOES_CAM_EXIST),
+        GAGE_NEW_NATIVE(SET_CAM_COORD),
+        GAGE_NEW_NATIVE(SET_CAM_ROT),
+        GAGE_NEW_NATIVE(SET_CAM_FOV),
+        GAGE_NEW_NATIVE(IS_CAM_RENDERING),
+        GAGE_NEW_NATIVE(GET_FOLLOW_PED_CAM_VIEW_MODE),
+        GAGE_NEW_NATIVE(IS_PED_GETTING_INTO_A_VEHICLE),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));

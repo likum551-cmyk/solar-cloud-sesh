@@ -621,6 +621,34 @@ namespace gage::game {
         constexpr uint64_t IS_PED_IN_MELEE_COMBAT                       = 0x4E209B2C1EAD5159;
         constexpr uint64_t TASK_PUT_PED_DIRECTLY_INTO_MELEE             = 0x1C6CD14A876FFE39;
         constexpr uint64_t SET_PED_COMBAT_ATTRIBUTES                    = 0x9F7794730795E019;
+        // 0.5.4 inv_ped_view (libs/sync/ped_view.h): the scripted camera that shows the player's own ped in the inventory's CHARACTER panel.
+        // Lookup tool natlookup.mjs 2026-11-07: YimMenu b3889 crossmap and YimMenuV2 enhanced AGREE for all 11 (and legacy has the same 3889
+        // hash); public hashes and signatures from alloc8or natives.json:
+        //   CREATE_CAM_WITH_PARAMS         public 0xB51194800B257161  3889 0x2CB6AB601EB7D2D9  Cam (const char* camName, float posX, posY, posZ,
+        //                                  float rotX, rotY, rotZ, float fov, BOOL p8, int p9); "DEFAULT_SCRIPTED_CAMERA", p9 = rotation order 2
+        //   SET_CAM_ACTIVE                 public 0x026FB97D0A425F84  3889 0x4CBC5D1BC117616B  void (Cam, BOOL active)
+        //   RENDER_SCRIPT_CAMS             public 0x07E5B515DB0636FC  3889 0xE37AF9002E782BA0  void (BOOL render, BOOL ease, int easeTime, BOOL p3,
+        //                                  BOOL p4, Any p5); render false = back to the gameplay camera
+        //   DESTROY_CAM                    public 0x865908C81A2C22E9  3889 0x85E6A1E36B5E2E4D  void (Cam, BOOL bScriptHostCam)
+        //   DOES_CAM_EXIST                 public 0xA7A932170592B50E  3889 0x78411E34CF90EA8C  BOOL (Cam)
+        //   SET_CAM_COORD                  public 0x4D41783FB745E42E  3889 0x1761457F86AD0EE2  void (Cam, float posX, posY, posZ)
+        //   SET_CAM_ROT                    public 0x85973643155D0B07  3889 0x5E5CEC33463AD803  void (Cam, float rotX, rotY, rotZ, int rotationOrder);
+        //                                  order "seems to always be set to 2" (alloc8or)
+        //   SET_CAM_FOV                    public 0xB13C14F66A00D047  3889 0x58BDA5D9262F5D30  void (Cam, float fieldOfView); 1..130
+        //   IS_CAM_RENDERING               public 0x02EC0AF5C5A49B7A  3889 0x8DE2438443E6A145  BOOL (Cam): the read-back that the shot is on screen
+        //   GET_FOLLOW_PED_CAM_VIEW_MODE   public 0x8D4D46230B2C353A  3889 0x3B5989D5DB08A155  int (); 4 = first person (logged, never changed)
+        //   IS_PED_GETTING_INTO_A_VEHICLE  public 0xBB062B2B5722478E  3889 0x9D6DF8F3584AAC2B  BOOL (Ped)
+        constexpr uint64_t CREATE_CAM_WITH_PARAMS                       = 0xB51194800B257161;
+        constexpr uint64_t SET_CAM_ACTIVE                               = 0x026FB97D0A425F84;
+        constexpr uint64_t RENDER_SCRIPT_CAMS                           = 0x07E5B515DB0636FC;
+        constexpr uint64_t DESTROY_CAM                                  = 0x865908C81A2C22E9;
+        constexpr uint64_t DOES_CAM_EXIST                               = 0xA7A932170592B50E;
+        constexpr uint64_t SET_CAM_COORD                                = 0x4D41783FB745E42E;
+        constexpr uint64_t SET_CAM_ROT                                  = 0x85973643155D0B07;
+        constexpr uint64_t SET_CAM_FOV                                  = 0xB13C14F66A00D047;
+        constexpr uint64_t IS_CAM_RENDERING                             = 0x02EC0AF5C5A49B7A;
+        constexpr uint64_t GET_FOLLOW_PED_CAM_VIEW_MODE                 = 0x8D4D46230B2C353A;
+        constexpr uint64_t IS_PED_GETTING_INTO_A_VEHICLE                = 0xBB062B2B5722478E;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -1058,6 +1086,21 @@ namespace gage::game {
         // cleared (-1); the head blend is applied when look.hasHead. False when ped is 0 or the
         // validator cannot be called (nothing is changed then).
         bool     ApplyPedLook(int32_t ped, const PedLook& look);
+        // 0.5.4 outfit_items: one component, checked with IS_PED_COMPONENT_VARIATION_VALID first (palette 2, as ApplyPedOutfit), without
+        // the default reset ApplyPedOutfit does. 1 = set, 0 = not valid on this ped (untouched), -1 = a native cannot be called.
+        int      SetPedComponentChecked(int32_t ped, int component, int drawable, int texture);
+
+        // -- 0.5.4 inv_ped_view: a scripted camera (script tick) -----------------
+        // Rotation order 2 (rot.x pitch, rot.z yaw; roll 0), fov in degrees. CreateScriptCam returns the handle, 0 = cannot call / failed.
+        int32_t  CreateScriptCam(float x, float y, float z, float pitch, float yaw, float fov);
+        bool     SetScriptCamParams(int32_t cam, float x, float y, float z, float pitch, float yaw, float fov);
+        bool     SetCamActive(int32_t cam, bool active);
+        bool     RenderScriptCams(bool render);                 // ease off; render false = back to the gameplay camera
+        bool     DestroyCam(int32_t cam);
+        bool     DoesCamExist(int32_t cam);
+        int      IsCamRendering(int32_t cam);                   // 1 yes, 0 no, -1 cannot call
+        int      FollowPedCamViewMode();                        // 4 = first person; -1 cannot call
+        bool     IsPedGettingIntoVehicle(int32_t ped);
 
         // -- vehicle sync (script tick) ----------------------------------------
         // Every bool is "the native could be called" (false for handle 0 or an unresolved

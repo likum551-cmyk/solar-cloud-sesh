@@ -93,6 +93,12 @@ namespace gage::game::Overlay {
     bool PopInventoryOp(std::string* encodedOp, uint32_t* seq);
     // 0.6: true while the Tab menu shows the inventory page (the engine hides GTA's radar under it). Any thread.
     bool InventoryOpen();
+    // 0.5.4 inv_ped_view (libs/sync/ped_view.h): InventoryPedViewFrame gives the display size of the last frame that drew the inventory page and
+    // how long ago that was (false = never drawn); the engine frames its scripted camera from it and treats a stale stamp as "closed".
+    // SetInventoryPedView(true) = the engine's camera is rendering: the CHARACTER panel shows its window onto the ped instead of the mannequin.
+    // Any thread.
+    bool InventoryPedViewFrame(float* W, float* H, double* agoMs);
+    void SetInventoryPedView(bool live);
     // 0.6 inv_rev3 (HKCU\Software\GAGE-MP, default on): the Tab menu opens on the REV3 inventory, admins also get the old menu as ADMIN;
     // off = the old Tab menu only (0.5.2). Any thread.
     void SetInventoryScreen(bool on);

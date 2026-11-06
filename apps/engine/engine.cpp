@@ -56,6 +56,9 @@
 #include "sync/minimap.h"
 #include "sync/minimap_size.h"
 #include "sync/noclip.h"
+#include "sync/inventory.h"    // 0.5.4 outfit_items: the server's inventory, decoded for the ped's clothes
+#include "sync/outfit.h"       // 0.5.4 outfit_items: worn items -> ped components
+#include "sync/ped_view.h"     // 0.5.4 inv_ped_view: the CHARACTER panel's camera
 #include "common/registry.h"
 
 #include <windows.h>
@@ -1280,6 +1283,48 @@ namespace {
     std::string g_invName;
     std::atomic<uint32_t> g_invStates{0}, g_invOpsSent{0}, g_invOpsUnsent{0}, g_invUsed{0};
 
+    // ===== 0.5.4 outfit_items + inv_ped_view (GI 2026-11-07) =====
+    // outfit_items (HKCU\Software\GAGE-MP, default on; 0 = 0.5.3: the worn clothing items change nothing on the ped): the SERVER's inventory
+    // decides the shirt, pants and shoes on the local freemode ped (libs/sync/outfit.h); TickOutfitItems sets what differs, PublishLook sends it.
+    // inv_ped_view (default on; 0 = 0.5.3: the mannequin): a scripted camera shows the player's own ped in the CHARACTER panel
+    // (libs/sync/ped_view.h, TickInvPedView). Both are read with the session's switches (InvCReadSwitches).
+    std::atomic<bool> g_outfitItems{true};
+    std::atomic<bool> g_invPedView{true};
+    std::mutex g_outfitMtx;                        // the join worker writes the server's inventory, the script tick reads it
+    sync::inv::Character g_outfitChar;             // the server's latest (never the overlay's prediction)
+    bool g_outfitHave = false;                     // a server inventory exists (false: none sent yet / the session ended)
+    uint32_t g_outfitSeq = 0;                      // +1 per InvState
+    std::atomic<bool> g_outfitRecheck{false};      // DressPlayer re-dressed the ped: compare at once, not at the next 1 s check
+
+    void InvCReadSwitches()
+    {
+        g_outfitItems.store(reg::Get(L"outfit_items") != L"0");
+        g_invPedView.store(reg::Get(L"inv_ped_view") != L"0");
+        GLOGI("engine: outfit items (0.5.4): outfit_items=%s", g_outfitItems.load()
+              ? "on (the server's worn shirt / pants / shoes items decide the ped's components; an empty slot is bare; LIVE-UNVERIFIED)"
+              : "OFF (the 0.5.3 behaviour: the items change nothing on the ped)");
+        GLOGI("engine: inventory ped view (0.5.4): inv_ped_view=%s", g_invPedView.load()
+              ? "on (a scripted camera frames our ped in the CHARACTER panel while the page is open; LIVE-UNVERIFIED)"
+              : "OFF (the 0.5.3 mannequin)");
+    }
+    // Join worker thread (OnInvState): keep the server's inventory for the outfit.
+    void OutfitNoteInventory(const std::string& blob)
+    {
+        sync::inv::Character c;
+        if (!sync::inv::Decode(blob, c))
+            return;                                // the overlay logs the undecodable snapshot; the ped keeps the last good one
+        std::lock_guard<std::mutex> lk(g_outfitMtx);
+        g_outfitChar = c;
+        g_outfitHave = true;
+        ++g_outfitSeq;
+    }
+    void OutfitClear()
+    {
+        std::lock_guard<std::mutex> lk(g_outfitMtx);
+        g_outfitHave = false;
+        ++g_outfitSeq;
+    }
+
     // With stock scripts off the per-tick entry-boot suppression has no script to kill; it then runs
     // once per entry (for its FORCE_GAME_STATE_PLAYING). Script tick only; EnterServer re-arms it.
     bool g_entryBootOnce = false;
@@ -2143,6 +2188,7 @@ namespace {
         g_vehLocks.store(reg::Get(L"veh_locks") != L"0");              // 0.4.22: the L key and the lock read-back on the copies (0 = neither)
         g_dsState = DoorsSeatsState();                                 // a new session: no pick waiting for a read-back, no lock answer pending, no keys
         LogDoorsSeatsSwitches();                                       // 0.4.22 (defined with the F / G entry)
+        InvCReadSwitches();                                            // 0.5.4: outfit_items / inv_ped_view
         {
             // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
             const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
@@ -2292,6 +2338,7 @@ namespace {
             g_adminParked.clear();
         }
         game::Overlay::ClearInventory();   // 0.6: the inventory page shows "unavailable" until the next server sends one
+        OutfitClear();                     // 0.5.4: no server inventory, no opinion about the clothes (the next entry dresses the ped in full)
         g_satietyAdd.store(0);
         GLOGI("engine: inventory (0.6) this session: %u states received, %u ops sent, %u not sent, %u food used", g_invStates.exchange(0),
               g_invOpsSent.exchange(0), g_invOpsUnsent.exchange(0), g_invUsed.exchange(0));
@@ -2767,6 +2814,7 @@ namespace {
                 else
                     game::brand::NoteDressed(when);
             }
+            g_outfitRecheck.store(true);   // 0.5.4 outfit_items: the full outfit is back on; the worn items decide again at once
         }
     }
 
@@ -3699,6 +3747,7 @@ namespace {
         if (g_invStates.fetch_add(1) == 0)
             GLOGI("engine: inventory (0.6): first InvState, %zu bytes", s.blob.size());
         game::Overlay::SetInventory(s.blob, s.ackSeq, name.c_str());
+        OutfitNoteInventory(s.blob);       // 0.5.4 outfit_items: the ped follows the server's worn items
     }
 
     // 0.6, join worker thread: food the server used for us.
@@ -4571,6 +4620,235 @@ namespace {
                   (unsigned)look.components[4].drawable, (unsigned)look.components[4].texture,
                   pl.hasHead ? "blend" : "none");
         }
+    }
+
+    // ===== 0.5.4 outfit_items: the worn items decide the ped's shirt, pants and shoes (script tick) =====
+    // The server's inventory (OutfitNoteInventory) -> sync::outfit::Desired -> compared with what the ped REALLY wears (ReadPedLook) -> each
+    // component that differs is set (validated first). Checked when the inventory changes, when the ped handle changes, right after DressPlayer
+    // (entry, ped guard) and once a second (a respawn or anything else that re-dresses the ped). A component that does not take after 3 tries
+    // for the same inventory is reported and left alone until the inventory or the ped changes. PublishLook (every 2 s) sends the result to the
+    // other players: the look sync itself is unchanged (PlayerLook / PeerLook, protocol v3).
+    void TickOutfitItems(int32_t lp, ULONG now)
+    {
+        if (!g_outfitItems.load() || !lp)
+            return;
+        static bool starterChecked = false;
+        if (!starterChecked) {
+            // The starter items ARE the spawn outfit's pieces: say so once, loudly if someone changed one side only.
+            starterChecked = true;
+            int checked = 0, differ = 0;
+            for (const char* key : {"tshirt", "jeans", "sneakers"}) {
+                const sync::inv::ItemDef* d = sync::inv::FindKey(key);
+                const sync::outfit::Parts p = sync::outfit::Worn(d ? d->id : 0, sync::outfit::Sex::Male);
+                for (int i = 0; i < p.n; ++i)
+                    for (const game::PedComponent& c : kPlayerOutfit)
+                        if (c.component == p.p[i].component) {
+                            ++checked;
+                            if (c.drawable != p.p[i].drawable || c.texture != p.p[i].texture) {
+                                ++differ;
+                                GLOGW("engine: outfit items (0.5.4): item %s sets component %d to %d/%d but the spawn outfit has %d/%d (%s): the two "
+                                      "must agree (libs/sync/outfit.h Worn, engine.cpp kPlayerOutfit)",
+                                      key, (int)p.p[i].component, (int)p.p[i].drawable, (int)p.p[i].texture, c.drawable, c.texture, c.what);
+                            }
+                        }
+            }
+            GLOGI("engine: outfit items (0.5.4): the starter items against the spawn outfit: %d components compared, %d differ", checked, differ);
+        }
+        sync::inv::Character ch;
+        bool have;
+        uint32_t seq;
+        {
+            std::lock_guard<std::mutex> lk(g_outfitMtx);
+            have = g_outfitHave;
+            seq = g_outfitSeq;
+            if (have)
+                ch = g_outfitChar;
+        }
+        if (!have)
+            return;                                // no server inventory: the spawn outfit stands (0.5.3)
+        static uint32_t seenSeq = ~0u;
+        static int32_t seenPed = 0;
+        static ULONG lastCheck = 0;
+        static int tries = 0;
+        static int lines = 0;
+        const bool changed = seq != seenSeq || lp != seenPed;
+        const bool redressed = g_outfitRecheck.exchange(false);
+        if (!changed && !redressed && now - lastCheck < 1000)
+            return;
+        if (changed || redressed)
+            tries = 0;
+        lastCheck = now;
+        seenSeq = seq;
+        seenPed = lp;
+        sync::outfit::Sex sex;
+        const uint32_t model = g_world->GetEntityModel(lp);
+        if (!sync::outfit::SexOfModel(model, sex)) {
+            static uint32_t loggedModel = 0;
+            if (loggedModel != model) {
+                loggedModel = model;
+                GLOGI("engine: outfit items (0.5.4): the ped is model 0x%08x, not a freemode ped: the items change nothing on it", (unsigned)model);
+            }
+            return;
+        }
+        const sync::outfit::Want want = sync::outfit::Desired(ch, sex);
+        game::PedLook pl{};
+        if (!g_world->ReadPedLook(lp, pl))
+            return;
+        const uint32_t mismatch = sync::outfit::Mismatch(want, pl.drawable, pl.texture);
+        if (!mismatch)
+            return;
+        if (tries >= 3) {
+            if (tries++ == 3)
+                GLOGW("engine: outfit items (0.5.4): components 0x%03x still differ after 3 tries; left alone until the inventory or the ped changes",
+                      (unsigned)mismatch);
+            return;
+        }
+        ++tries;
+        std::string what;
+        int set = 0, invalid = 0, failed = 0;
+        for (int c = 0; c < sync::outfit::kComponents; ++c) {
+            if (!(mismatch & (1u << c)))
+                continue;
+            const int r = g_world->SetPedComponentChecked(lp, c, want.drawable[c], want.texture[c]);
+            set += r == 1;
+            invalid += r == 0;
+            failed += r < 0;
+            char b[64];
+            std::snprintf(b, sizeof b, "%s%d: %d/%d -> %d/%d%s", what.empty() ? "" : ", ", c, (int)pl.drawable[c], (int)pl.texture[c],
+                          (int)want.drawable[c], (int)want.texture[c], r == 1 ? "" : (r == 0 ? " NOT VALID" : " CANNOT CALL"));
+            what += b;
+        }
+        if (lines < 200) {
+            ++lines;
+            const auto worn = [&](sync::inv::Equip e) {
+                const sync::inv::ItemDef* d = sync::inv::Find(ch.equip[sync::inv::EquipIndex(e)].item);
+                return d ? d->key : "bare";
+            };
+            GLOGI("engine: outfit items (0.5.4): %s (try %d): shirt=%s pants=%s shoes=%s; set %d, not valid %d, cannot call %d: %s",
+                  changed ? "inventory or ped changed" : (redressed ? "re-dressed" : "the ped drifted"), tries, worn(sync::inv::Equip::Shirt),
+                  worn(sync::inv::Equip::Pants), worn(sync::inv::Equip::Shoes), set, invalid, failed, what.c_str());
+        }
+    }
+
+    // ===== 0.5.4 inv_ped_view: the player's own ped in the CHARACTER panel (script tick) =====
+    // While the inventory page is open (and drawn), the ped alive and on foot: a scripted camera in front of the ped (libs/sync/ped_view.h
+    // Frame), the ped's heading frozen when it opened, its position followed every tick (a ragdoll or a push keeps it in the window). Anything
+    // else restores the gameplay camera at once: RENDER_SCRIPT_CAMS(false) + DESTROY_CAM (the gameplay camera itself was never touched, so it
+    // comes back exactly as it was, first person included). The overlay draws the window only while IS_CAM_RENDERING reads back yes.
+    struct PedViewCam
+    {
+        int32_t cam = 0;
+        float heading = 0;
+        sync::pedview::CamOut last;
+        float lastW = 0, lastH = 0;
+        int rendering = -2;                        // the last IS_CAM_RENDERING read-back (-2 = none yet)
+        sync::pedview::Gate gate = sync::pedview::Gate::Closed;
+        uint32_t opened = 0, createFails = 0;
+    };
+    PedViewCam g_pv;
+
+    void PedViewRestore(const char* why)
+    {
+        if (g_pv.cam) {
+            g_world->SetCamActive(g_pv.cam, false);
+            const bool back = g_world->RenderScriptCams(false);
+            g_world->DestroyCam(g_pv.cam);
+            const bool gone = !g_world->DoesCamExist(g_pv.cam);
+            GLOGI("engine: inventory ped view (0.5.4): camera off (%s): gameplay camera %s, cam %s", why, back ? "back" : "NOT RESTORED (cannot call)",
+                  gone ? "destroyed" : "STILL EXISTS");
+        }
+        g_pv.cam = 0;
+        g_pv.rendering = -2;
+        game::Overlay::SetInventoryPedView(false);
+    }
+
+    void TickInvPedView(int32_t lp)
+    {
+        namespace pv = sync::pedview;
+        float W = 0, H = 0;
+        double ago = 1e9;
+        const bool drawn = game::Overlay::InventoryPedViewFrame(&W, &H, &ago);
+        pv::GateIn gi;
+        gi.switchOn = g_invPedView.load();
+        gi.pageOpen = game::Overlay::InventoryOpen();
+        gi.drawnAgoMs = drawn ? ago : 1e9;
+        gi.ped = lp != 0;
+        if (gi.switchOn && gi.pageOpen && lp) {    // the natives only when it could matter
+            gi.dead = g_life != Life::Alive || g_world->IsPedDeadOrDying(lp);
+            gi.vehicle = g_world->IsPedInVehicle(lp) || g_world->IsPedGettingIntoVehicle(lp);
+        }
+        const pv::Gate gate = pv::Decide(gi);
+        if (gate != g_pv.gate) {
+            if (gate == pv::Gate::Live || g_pv.gate == pv::Gate::Live || gi.pageOpen)
+                GLOGI("engine: inventory ped view (0.5.4): %s -> %s", pv::GateName(g_pv.gate), pv::GateName(gate));
+            g_pv.gate = gate;
+        }
+        if (gate != pv::Gate::Live) {
+            if (g_pv.cam)
+                PedViewRestore(pv::GateName(gate));
+            return;
+        }
+        float x = 0, y = 0, z = 0;
+        if (!g_world->GetEntityCoords(lp, x, y, z)) {
+            if (g_pv.cam)
+                PedViewRestore("ped position unreadable");
+            return;
+        }
+        if (!g_pv.cam)
+            g_pv.heading = g_world->GetEntityHeading(lp);   // frozen while the page is open: the camera does not swing with the ped
+        pv::CamIn ci;
+        ci.W = W;
+        ci.H = H;
+        ci.px = x;
+        ci.py = y;
+        ci.pz = z;
+        ci.headingDeg = g_pv.heading;
+        const pv::CamOut o = pv::Frame(ci);
+        if (!o.ok) {
+            if (g_pv.cam)
+                PedViewRestore("no framing for this display");
+            return;
+        }
+        if (!g_pv.cam) {
+            if (g_pv.createFails >= 3)
+                return;                            // reported below; the mannequin stays
+            g_pv.cam = g_world->CreateScriptCam(o.x, o.y, o.z, o.pitchDeg, o.yawDeg, o.fovDeg);
+            if (!g_pv.cam) {
+                if (++g_pv.createFails == 3)
+                    GLOGW("engine: inventory ped view (0.5.4): CREATE_CAM_WITH_PARAMS failed 3 times; the mannequin stays this session");
+                return;
+            }
+            const bool active = g_world->SetCamActive(g_pv.cam, true);
+            const bool render = g_world->RenderScriptCams(true);
+            ++g_pv.opened;
+            g_pv.last = o;
+            g_pv.lastW = W;
+            g_pv.lastH = H;
+            float fx = 0, fy = 0, hx = 0, hy = 0;
+            const bool feet = pv::Project(o, W, H, x, y, z + pv::kFeetZ, fx, fy);
+            const bool head = pv::Project(o, W, H, x, y, z + pv::kHeadZ, hx, hy);
+            GLOGI("engine: inventory ped view (0.5.4): camera on #%u (cam %d, active %s, render %s): %.0fx%.0f, ped %.1f %.1f %.1f heading %.0f, "
+                  "camera %.2f m away, pitch %.1f yaw %.1f fov %.0f, ped middle at ndc %.2f %.2f, feet %s %.2f, head %s %.2f; "
+                  "follow-cam view mode %d (4 = first person)",
+                  g_pv.opened, g_pv.cam, active ? "yes" : "NO", render ? "yes" : "NO", W, H, x, y, z, g_pv.heading, o.dist, o.pitchDeg, o.yawDeg,
+                  o.fovDeg, o.ndcX, o.ndcY, feet ? "ndc" : "BEHIND", fy, head ? "ndc" : "BEHIND", hy, g_world->FollowPedCamViewMode());
+        } else {
+            const bool moved = std::fabs(o.x - g_pv.last.x) + std::fabs(o.y - g_pv.last.y) + std::fabs(o.z - g_pv.last.z) > 0.01f ||
+                               W != g_pv.lastW || H != g_pv.lastH;
+            if (moved) {
+                g_world->SetScriptCamParams(g_pv.cam, o.x, o.y, o.z, o.pitchDeg, o.yawDeg, o.fovDeg);
+                g_pv.last = o;
+                g_pv.lastW = W;
+                g_pv.lastH = H;
+            }
+        }
+        // the read-back: the window opens only while our camera is what the game renders
+        const int r = g_world->IsCamRendering(g_pv.cam);
+        if (r != g_pv.rendering) {
+            GLOGI("engine: inventory ped view (0.5.4): IS_CAM_RENDERING %s", r == 1 ? "yes (the panel shows the ped)" : (r == 0 ? "NO (the mannequin stays)" : "cannot call (the mannequin stays)"));
+            g_pv.rendering = r;
+        }
+        game::Overlay::SetInventoryPedView(r == 1);
     }
 
     // WEAPON_UNARMED by GET_HASH_KEY (script tick), checked once against the known constant.
@@ -14312,6 +14590,8 @@ namespace {
 
         int32_t lp = g_world->LocalPlayer();
         TickAmbient(inScript, lp, probe);              // T5: no ambient NPCs / traffic, every tick, before the connection / entry gates
+        if (inScript && g_world->spawnMode != 0)
+            TickInvPedView(lp);                        // 0.5.4 inv_ped_view: before every early return below, so a closed page always restores the camera
         if (!lp) {
             // Player not spawned yet (the overlay's own loader is up). Heartbeat so a stuck load is diagnosable from gage.log: PLAYER_PED_ID stays 0 while GTA
             // is still loading its world, or if our script-tick context never goes live (then GameWork
@@ -14598,6 +14878,7 @@ namespace {
             if (lp && g_life == Life::Alive && g_entry.load() == Entry::Done)
             {
                 WorkSection s(probe, kSecReadSend);
+                TickOutfitItems(lp, now);   // 0.5.4 outfit_items: the worn items' clothes first, so the look sent below already has them
                 PublishLook(lp, now);
             }
         }
