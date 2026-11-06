@@ -12,7 +12,6 @@
 #include "hook.h"
 #include "engine.h"
 #include "pack_stream.h"
-// #include "loading_screen.h"  // TODO: D3D11 in-game overlay (separate task)
 
 #include <windows.h>
 #include <winsock2.h>

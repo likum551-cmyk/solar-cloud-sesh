@@ -174,7 +174,6 @@ namespace gage::sync {
         }
 
         bool BigmapOn() const { return bigmapOn_; }
-        bool RefreshDone() const { return refreshDone_; }   // the flip has started for this entry (its OFF may still be owed)
         const Stats& Counters() const { return stats_; }
         void ClearCounters() { stats_ = Stats(); }
 

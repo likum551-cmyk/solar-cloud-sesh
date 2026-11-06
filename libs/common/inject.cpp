@@ -73,14 +73,6 @@ namespace gage::inject {
         return 0;
     }
 
-    LPCVOID RemoteExport(HANDLE hProc, const wchar_t* moduleName, const char* exportName)
-    {
-        LPCVOID p = nullptr;
-        if (ResolveRemoteExport(hProc, moduleName, exportName, &p) != 0)
-            return nullptr;
-        return p;
-    }
-
     // Poll until the export resolves in the target. A process that CreateProcessW
     // returned a moment ago has no (readable) module list yet: the snapshot fails
     // with ERROR_BAD_LENGTH / ERROR_PARTIAL_COPY or kernel32 is simply missing.
@@ -208,35 +200,6 @@ namespace gage::inject {
         if (p == want && IsWindowVisible(hwnd))
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
         return TRUE;
-    }
-
-    bool CloseProcessByName(const std::wstring& imageBaseName, DWORD graceMs)
-    {
-        DWORD pid = FindProcess(imageBaseName);
-        if (pid == 0)
-            return true; // nothing to close
-
-        // Ask it to close politely (the game gets a chance to save/confirm).
-        EnumWindows(EnumCloseProc, (LPARAM)pid);
-
-        // Wait for it to exit on its own.
-        DWORD start = GetTickCount();
-        while (GetTickCount() - start < graceMs)
-        {
-            if (FindProcess(imageBaseName) == 0)
-                return true;
-            Sleep(100);
-        }
-
-        // Still there -> force.
-        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if (h)
-        {
-            TerminateProcess(h, 0);
-            CloseHandle(h);
-            Sleep(150);
-        }
-        return FindProcess(imageBaseName) == 0;
     }
 
     bool CloseProcessByHandle(HANDLE hProc, DWORD graceMs)

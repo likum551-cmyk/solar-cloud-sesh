@@ -239,7 +239,8 @@ fi
 # Marks: the start, then 30 s and 10 s when they fit. Each mark is one `say` through the admin channel (the same
 # mechanism deploy-server.sh's own warning uses); the wait is wall-clock `sleep`.
 ADMIN_PORT=0; ADMIN_TOKEN=''
-[ -f "$CONF" ] && ADMIN_PORT=$(ops_js json-get "$CONF" adminPort 0)
+# a server.json json-get cannot read must cost only the in-game notice, never stop the release under set -e
+if [ -f "$CONF" ]; then ADMIN_PORT=$(ops_js json-get "$CONF" adminPort 0) || ADMIN_PORT=0; fi
 is_uint "$ADMIN_PORT" || ADMIN_PORT=0
 ADMIN_TOKEN=$(admin_token)
 

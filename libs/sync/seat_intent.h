@@ -78,7 +78,6 @@ namespace gage::sync {
         }
         bool Started() const { return started_; }
         bool Active() const { return active_; }
-        double BeganMs() const { return beganMs_; }
 
     private:
         EnterWatchCfg cfg_;
@@ -656,7 +655,6 @@ namespace gage::sync {
 
         Phase phase() const { return phase_; }
         bool Active() const { return phase_ != Phase::Idle && phase_ != Phase::Done; }
-        bool Tasked() const { return phase_ == Phase::Running; }
         int NetId() const { return netId_; }
         int Seat() const { return seat_; }
         bool Run() const { return run_; }
@@ -779,7 +777,6 @@ namespace gage::sync {
                 s.Add(kv.second.TakeStats());
             return s;
         }
-        size_t Puppets() const { return puppets_.size(); }
 
     private:
         SeatReplayCfg cfg_;

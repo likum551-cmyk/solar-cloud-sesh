@@ -64,18 +64,6 @@ inline float CoverHeadingErrDeg(float a, float b)
 
 // ================================================================== SENDER =================================================
 enum class CoverSenderState : uint8_t { None, GoingInto, In, AimingFrom, Leaving };
-inline const char* CoverSenderStateName(CoverSenderState s)
-{
-    switch (s)
-    {
-    case CoverSenderState::GoingInto:  return "going-into";
-    case CoverSenderState::In:         return "in-cover";
-    case CoverSenderState::AimingFrom: return "aiming-from-cover";
-    case CoverSenderState::Leaving:    return "leaving";
-    default:                           return "none";
-    }
-}
-
 struct CoverReads
 {
     bool  inCover = false;       // IS_PED_IN_COVER(ped, false)
@@ -380,7 +368,6 @@ public:
         }
     }
     uint32_t Opens() const { return opens_; }
-    double OpenUntil() const { return openUntil_; }
     void Reset() { *this = CoverBreaker(threshold_, holdMs_, maxHoldMs_); }
 private:
     int threshold_;

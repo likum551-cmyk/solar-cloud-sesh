@@ -443,7 +443,6 @@ namespace gage::sync {
             return p.show;
         }
         size_t Size() const { return c_.size(); }
-        uint32_t Uncallable() const { return uncallable_; }   // probes that could not be answered (not cached)
     private:
         size_t cap_;
         std::map<uint32_t, bool> c_;
@@ -892,10 +891,6 @@ namespace gage::sync {
         HealthBehaviour Behaviour() const { return behaviour_; }
         uint32_t Probes() const { return probes_; }
         uint32_t CeilingDrops() const { return drops_; }          // the +1 frame read found less than the probe left
-        uint32_t LateOff() const { return lateOff_; }             // the +1 s read disagreed with the tracker
-        int LastHp() const { return lastHp_; }
-        int LastMax() const { return lastMax_; }
-        bool Settling() const { return recheckPending_; }
 
         // Session start / ped swap / respawn / the tracker's request. `tick` numbers the script tick in progress.
         template <class P>

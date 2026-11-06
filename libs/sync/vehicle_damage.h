@@ -307,7 +307,6 @@ namespace gage::sync {
             return b;
         }
 
-        bool Suspect() const { return suspect_; }
         const PedalStats& Stats() const { return stats_; }
 
     private:
@@ -555,7 +554,6 @@ namespace gage::sync {
         const proto::VehicleDamage& Last() const { return out_; }
         uint8_t UnreliableParts() const { return parts_.Unreliable(); }
         uint8_t UnreliableDents() const { return dentUnreliable_; }
-        bool PetrolUnreliable() const { return petrolUnreliable_; }
         const DamageStats& Stats() const { return stats_; }
         bool Seen() const { return seen_; }
 
@@ -832,7 +830,6 @@ namespace gage::sync {
 
         float Gain() const { return gain_; }
         const ApplierStats& Stats() const { return stats_; }
-        bool Suspended(double nowMs) const { return nowMs < suspendUntil_; }
         bool Unfinished() const { return unfinished_; }
 
     private:

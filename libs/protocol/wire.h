@@ -72,6 +72,7 @@ namespace gage::wire {
         std::vector<uint8_t> take() { return std::move(buf_); }
         size_t size() const { return buf_.size(); }
         void clear() { buf_.clear(); }
+        void reserve(size_t n) { buf_.reserve(n); }   // the hot per-receiver encoders size the buffer once
 
     private:
         std::vector<uint8_t> buf_;

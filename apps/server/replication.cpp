@@ -492,7 +492,7 @@ namespace gage::server {
         const size_t header = proto::WorldHeaderBytes(nLeave, 1023); // count varint at its widest
         picked_.clear();
         if (header + sum <= cap)
-            picked_ = cands_;
+            picked_.swap(cands_);   // cands_ is not read again before the next receiver clears it; both keep their capacity
         else
         {
             // Over budget: highest accumulated priority first. Pairs starved long enough all sit at the

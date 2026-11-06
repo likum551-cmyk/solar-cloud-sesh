@@ -334,7 +334,6 @@ add_library(gage_mp SHARED
     apps/engine/present_hook.cpp
     apps/engine/net_guard.cpp
     apps/engine/engine.cpp
-    apps/engine/loading_screen.cpp
     apps/engine/brand_apparel.cpp
     apps/engine/pack_stream.cpp
     apps/engine/pack_enh.cpp
@@ -356,7 +355,6 @@ add_executable(gage_mp_test
     apps/engine/present_hook.cpp
     apps/engine/net_guard.cpp
     apps/engine/engine.cpp
-    apps/engine/loading_screen.cpp
     apps/engine/brand_apparel.cpp
     apps/engine/pack_stream.cpp
     apps/engine/pack_enh.cpp

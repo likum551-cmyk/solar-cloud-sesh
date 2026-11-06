@@ -430,6 +430,8 @@ namespace gage::proto {
             if (!MotionEncodable(v.k, v.rot, v.avx, v.avy, v.avz, v.steer) ||
                 (!v.motionOnly && (!VisualValid(v.tyres, v.tyresRim) || !VehicleDamageValid(v.dmg)))) return {};
         wire::Writer w;
+        // one allocation per frame (sent to every receiver every tick): a full state is under 96 bytes
+        w.reserve(8 + m.removed.size() + 2 * m.present.size() + 96 * m.vehicles.size());
         w.u8((uint8_t)Msg::VehicleWorld);
         w.u32(m.tick);
         w.u8((uint8_t)m.removed.size());

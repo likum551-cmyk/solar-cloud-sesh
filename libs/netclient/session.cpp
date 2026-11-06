@@ -466,6 +466,11 @@ namespace gage::net {
             malformed_++; // client-to-server types never arrive here
             return;
         }
+        // PeekType accepts the whole numeric range, so a type in a reserved gap matches no case above and would
+        // reach Push as the default Event (Disconnected): the engine would end a live session. Nothing in this
+        // switch surfaces a Disconnected (only HandleDisconnect does), and the switch stays default-free so
+        // -Wswitch still flags a new Msg value.
+        if (e.type == Event::Type::Disconnected) { malformed_++; return; }
         Push(std::move(e));
     }
 

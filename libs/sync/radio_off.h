@@ -140,16 +140,4 @@ namespace gage::sync {
         double  lastApplyMs_ = 0;
     };
 
-    inline const char* RadioApplyWhyName(RadioApplyWhy w)
-    {
-        switch (w)
-        {
-        case RadioApplyWhy::None: return "none";
-        case RadioApplyWhy::NewVehicle: return "new vehicle";
-        case RadioApplyWhy::ReadBackOn: return "read-back on";
-        case RadioApplyWhy::Periodic: return "periodic";
-        }
-        return "?";
-    }
-
 }  // namespace gage::sync

@@ -1611,13 +1611,18 @@ int CrispProfile(float w, float* rho, float* alpha)
 
 // The spec's glow: the arc (width w) blurred with a Gaussian of sigma: coverage at distance x from the centre line is
 // 0.5 * (erf((h - x) / (sigma sqrt 2)) + erf((h + x) / (sigma sqrt 2))), sampled out to h + 3 sigma.
+// Cut out under the crisp shape's SOLID body (every caller draws an opaque arc / needle over it): the mesh starts at h - 0.5, where the
+// crisp shape stops being fully opaque, with the real glow from there out, so the anti-aliased edge keeps its glow and a full-opacity frame
+// looks as before; a faded frame (a blink, a pulse) no longer shows the glow through the translucent body, like the spec's CSS group
+// opacity (the critic measured 0.58 for 0.50 before).
 int GlowProfile(float w, float sigma, float* rho, float* alpha)
 {
     const float h = w * 0.5f, sg = std::fmax(0.5f, sigma) * 1.41421356f;
     const float reach = h + 3.0f * std::fmax(0.5f, sigma);
-    const int nr = std::min(kRingMaxRings, std::max(4, (int)std::ceil(reach / 1.25f) + 1));
+    const float in = std::fmax(0.0f, h - 0.5f);
+    const int nr = std::min(kRingMaxRings, std::max(4, (int)std::ceil((reach - in) / 1.25f) + 1));
     for (int j = 0; j < nr; ++j) {
-        const float x = reach * (float)j / (float)(nr - 1);
+        const float x = in + (reach - in) * (float)j / (float)(nr - 1);
         rho[j] = x;
         alpha[j] = j == nr - 1 ? 0.0f : 0.5f * ((float)std::erf((h - x) / sg) + (float)std::erf((h + x) / sg));
     }
@@ -1676,8 +1681,17 @@ float RingText(ImDrawList* dl, const Fnt& f, float px, float x, float baseline, 
     return pen - x;
 }
 
-// Tabular numerals (the spec: fixed-width digits, left aligned in their slot): each digit centred in a cell `cell` px wide, starting at x.
-void RingNumber(ImDrawList* dl, const Fnt& f, float px, float cell, float x, float baseline, ImU32 col, int v)
+// A pill's 1 px border on the box's own outermost pixels (CSS border: 1px inside the box). ImGui's AddRect already insets the path by half a
+// pixel, so the box goes in snapped and unshifted (an extra +0.5 put the line on a pixel boundary: a soft 2 px line at half intensity).
+void StripBorder(ImDrawList* dl, ImVec2 s0, ImVec2 s1, float rr, ImU32 col)
+{
+    const ImVec2 a(std::floor(s0.x + 0.5f), std::floor(s0.y + 0.5f)), b(std::floor(s1.x + 0.5f), std::floor(s1.y + 0.5f));
+    dl->AddRect(a, b, col, std::fmax(0.0f, rr - 0.5f), 0, 1.0f);
+}
+
+// Tabular numerals (the spec: fixed-width digits, left aligned in their slot): each digit centred in its tabular slot, `cell` px from one digit
+// to the next. track: the letter-spacing inside `cell` (CSS adds it AFTER the glyph, so the slot the glyph is centred in is cell - track).
+void RingNumber(ImDrawList* dl, const Fnt& f, float px, float cell, float x, float baseline, ImU32 col, int v, float track = 0.0f)
 {
     if (!f.font)
         return;
@@ -1689,7 +1703,7 @@ void RingNumber(ImDrawList* dl, const Fnt& f, float px, float cell, float x, flo
     for (const char* p = buf; *p; ++p) {
         const ImFontGlyph* g = f.font->FindGlyph((ImWchar)(unsigned char)*p);
         const float adv = g ? g->AdvanceX * k : cell;
-        dl->AddText(f.font, px, ImVec2(std::floor(pen + (cell - adv) * 0.5f + 0.5f), std::floor(top + 0.5f)), col, p, p + 1);
+        dl->AddText(f.font, px, ImVec2(std::floor(pen + (cell - track - adv) * 0.5f + 0.5f), std::floor(top + 0.5f)), col, p, p + 1);
         pen += cell;
     }
 }
@@ -1735,7 +1749,7 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
     const ImVec2 s0 = P(ring::kStripX, ring::kStripY + ring::kStripH), s1 = P(ring::kStripX + ring::kStripW, ring::kStripY);
     const float rr = ring::kStripRound * k;
     dl->AddRectFilled(s0, s1, RingCol(ring::kStripGlass, a), rr);
-    dl->AddRect(ImVec2(s0.x + 0.5f, s0.y + 0.5f), ImVec2(s1.x - 0.5f, s1.y - 0.5f), RingCol(ring::kStripBorder, a), std::fmax(0.0f, rr - 0.5f), 0, 1.0f);
+    StripBorder(dl, s0, s1, rr, RingCol(ring::kStripBorder, a));
     // 7 labels, numerals, divider
     const float base = H - ring::kTextBaseY * k;
     // css px to ImGui px (line height): the em ratio of the face (TtfLineToEm); the tabular cell and the tracking stay css px
@@ -2066,6 +2080,9 @@ void IconGlowFill(ImFontAtlas* atlas, float scale)
             for (int x = 0; x < W; ++x) {
                 float acc = 0.0f;
                 for (int j = -kr; j <= kr; ++j) { const int yy = y + j; if (yy >= 0 && yy < H) acc += ker[(size_t)(j + kr)] * tmp[(size_t)yy * W + x]; }
+                // cut out under the icon's solid body (drawn opaque over it): a faded chip / arrow frame then fades as one group, like the
+                // spec's CSS; the anti-aliased fringe keeps its glow, so a full-opacity frame looks as before
+                if (a[(size_t)y * W + x] >= 0.999f) acc = 0.0f;
                 tex[(size_t)(r->Y + y) * tw + (r->X + x)] = (unsigned char)std::lround(std::min(1.0f, std::max(0.0f, acc)) * 255.0f);
             }
         ++baked;
@@ -2102,8 +2119,8 @@ void DrawChip(ImDrawList* dl, ImVec2 c, float D, car::Chip st, Icon ic, float a,
     if (lk.glow)
         DiscGlow(dl, c, R, car::kChipGlowSigma * k, RingCol(lk.glow, ao));
     dl->AddCircleFilled(c, R, RingCol(lk.fill, ao), 48);
-    const float bw = car::kChipBorder * k;
-    dl->AddCircle(c, R - bw * 0.5f, RingCol(lk.border, ao), 48, bw);
+    const float bw = std::fmax(1.0f, std::floor(car::kChipBorder * k + 0.5f));   // whole device pixels, centred on pixel centres
+    dl->AddCircle(c, R - (bw - 1.0f) * 0.5f, RingCol(lk.border, ao), 48, bw);   // AddCircle already insets by half a pixel
     const float is = D * 0.5f;
     const float ix = c.x - is * 0.5f, iy = c.y - is * 0.5f;
     if (lk.iconGlow)
@@ -2224,7 +2241,8 @@ void DrawCarCluster(ImDrawList* dl, float W, float H, float aDial, float aStrip,
         const float dim = cs.engineOn ? 1.0f : car::kEngineOffDim;
         {
             const ImVec2 b = P(car::SpeedRunX(spd), car::kSpeedBaseY);
-            RingNumber(dl, u.carBig, car::kSpeedPx * k * em, car::kSpeedDigitAdv * k, b.x, b.y, RingCol(red ? car::kEmber : car::kCream, a * dim), spd);
+            RingNumber(dl, u.carBig, car::kSpeedPx * k * em, car::kSpeedDigitAdv * k, b.x, b.y, RingCol(red ? car::kEmber : car::kCream, a * dim), spd,
+                       car::kSpeedTrack * k);
             const ImVec2 ub = P(car::kUnitX, car::kUnitBaseY);
             RingText(dl, u.carSmall, car::kUnitPx * k * em, ub.x, ub.y, RingCol(car::kMuted, a * dim), "KM/H", car::kUnitTrack * k);
         }
@@ -2271,7 +2289,7 @@ void DrawCarCluster(ImDrawList* dl, float W, float H, float aDial, float aStrip,
         const ImVec2 s0 = P(car::kStripX, car::kStripY + car::kStripH), s1 = P(car::kStripX + car::kStripW, car::kStripY);
         const float rr = car::kStripRound * k;
         dl->AddRectFilled(s0, s1, RingCol(gage::sync::hudring::kStripGlass, a), rr);
-        dl->AddRect(ImVec2(s0.x + 0.5f, s0.y + 0.5f), ImVec2(s1.x - 0.5f, s1.y - 0.5f), RingCol(gage::sync::hudring::kStripBorder, a), std::fmax(0.0f, rr - 0.5f), 0, 1.0f);
+        StripBorder(dl, s0, s1, rr, RingCol(gage::sync::hudring::kStripBorder, a));
         const car::Chip st[4] = {car::LockChip(cs), car::EngineChip(cs), car::BeltChip(cs), car::LightsChip(cs)};
         const Icon ic[4] = {cs.locked ? Icon::Lock : Icon::Unlock, Icon::Engine, cs.belted ? Icon::Belt : Icon::BeltOff,
                             cs.lights > 0 ? Icon::Lights : Icon::LightsOff};
@@ -3620,13 +3638,17 @@ void UiInit(float scale)
         const float em = TtfLineToEm(kOverlaySofiaBoldTtf, (std::size_t)kOverlaySofiaBoldTtfLen);
         u.sofiaEm = em > 0.5f && em < 2.0f ? em : 1.0f;
     }
+    constexpr float kSmallTextWeight = 1.22f;
     static const ImWchar kDigitRanges[] = { 0x0030, 0x0039, 0 };   // the 96 px speed: ten glyphs, not a 96 px Latin-1 atlas
-    const auto loadSofia = [&](float design, const ImWchar* ranges = kLatinRanges) {
+    // weight: stb_truetype's coverage is linear; the goldens (Skia) boost small text's contrast, so the 12-14 px faces came out 15-20 % lighter
+    // at the same peak (the critic's edge measurements): those faces are baked with RasterizerMultiply.
+    const auto loadSofia = [&](float design, const ImWchar* ranges = kLatinRanges, float weight = 1.0f) {
         Fnt f;
         f.design = design;
         f.base = f.px = std::fmax(8.0f, std::floor(design * u.sofiaEm * scale + 0.5f));   // baked at the size it is drawn at (ImGui px)
         ImFontConfig cfg;
         cfg.FontDataOwnedByAtlas = false;
+        cfg.RasterizerMultiply = weight;
         f.font = io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kOverlaySofiaBoldTtf), (int)kOverlaySofiaBoldTtfLen, f.base, &cfg, ranges);
         f.minPx = f.font ? 1.0f : 0.0f;    // 1 = the embedded face
         if (!f.font) {
@@ -3638,10 +3660,10 @@ void UiInit(float scale)
         return f;
     };
     u.ringNum = loadSofia(gage::sync::hudring::kNumPx);
-    u.ringLabel = loadSofia(gage::sync::hudring::kLabelPx);
+    u.ringLabel = loadSofia(gage::sync::hudring::kLabelPx, kLatinRanges, kSmallTextWeight);
     u.carBig = loadSofia(gage::sync::hudcar::kSpeedPx, kDigitRanges);
     u.carMid = loadSofia(gage::sync::hudcar::kFuelPx);
-    u.carSmall = loadSofia(gage::sync::hudcar::kUnitPx);
+    u.carSmall = loadSofia(gage::sync::hudcar::kUnitPx, kLatinRanges, kSmallTextWeight);
     u.sofiaOk = u.ringNum.minPx > 0.0f && u.ringLabel.minPx > 0.0f;
     // 0.4.31 the car cluster's icon glows, blurred on the CPU into the atlas (IconGlowFill): reserve, build here, fill before the backend uploads
     IconGlowReserve(io.Fonts, scale);

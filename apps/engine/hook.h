@@ -1401,10 +1401,6 @@ namespace gage::game {
     // attach. Does not install the tick hook (see HookTick).
     void Init(World& w);
 
-    // Retry native table resolution if Init ran before the game populated it.
-    // Call from Frame() — stops after ~30 retries. No-op once the table is found.
-    void retryNativeTableOnce();
-
     // The IDXGISwapChain* captured from the Present hook. Valid after
     // HookTick is installed. Use for D3D11 overlay rendering in Frame().
     void* GetSwapChain();

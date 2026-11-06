@@ -158,33 +158,8 @@ std::atomic<void (*)()> g_quitHandler{nullptr};
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-    // First, outside the ImGui path and whether or not the overlay is ready: GTA's answer to these
-    // is a "quit game?" screen that pauses the whole game. Ours is a card that pauses nothing: the
-    // first Alt+F4 / close opens it, a second one (or Enter) quits, Esc closes it. Without a ready
-    // overlay to draw the card, the first one quits as before.
-    const quit::Kind quitKind = quit::Classify(msg, (uintptr_t)wp, (intptr_t)lp);
-    if (quitKind != quit::Kind::None) {
-        if (void (*handler)() = g_quitHandler.load()) {
-            // Holding Alt+F4 auto-repeats WM_SYSKEYDOWN (lParam bit 30: the key was already down):
-            // only a fresh press answers the card.
-            if (quitKind == quit::Kind::AltF4 && (lp & (1 << 30)))
-                return 0;
-            if (!g.ready.load() || !OpenQuitPrompt())
-                handler();
-            return 0;
-        }
-    }
-    if (QuitPromptOpen() && msg == WM_KEYDOWN && !(lp & (1 << 30))) {
-        if (wp == VK_RETURN) {
-            if (void (*handler)() = g_quitHandler.load()) {
-                handler();
-                return 0;
-            }
-        } else if (wp == VK_ESCAPE) {
-            CloseQuitPrompt();
-            return 0;
-        }
-    }
+    if (detail::QuitGate(msg, wp, lp, g.ready.load()))
+        return 0;
     if (g.ready.load()) {
         bool openKeyChar = false;
         if (msg == WM_KEYDOWN && wp == 'T' && !(lp & (1 << 30)) && !g.wantKeyboard.load()) {
@@ -609,6 +584,38 @@ void EnsureBackend(IDXGISwapChain* sc)
 }
 
 } // namespace
+
+// First in both backends' WndProc, outside the ImGui path and whether or not the overlay is ready:
+// GTA's answer to Alt+F4 / close is a "quit game?" screen that pauses the whole game. Ours is a card
+// that pauses nothing: the first Alt+F4 / close opens it, a second one (or Enter) quits, Esc closes
+// it. Without a ready overlay to draw the card, the first one quits as before.
+bool detail::QuitGate(unsigned msg, unsigned long long wp, long long lp, bool overlayReady)
+{
+    const quit::Kind quitKind = quit::Classify(msg, (uintptr_t)wp, (intptr_t)lp);
+    if (quitKind != quit::Kind::None) {
+        if (void (*handler)() = g_quitHandler.load()) {
+            // Holding Alt+F4 auto-repeats WM_SYSKEYDOWN (lParam bit 30: the key was already down):
+            // only a fresh press answers the card.
+            if (quitKind == quit::Kind::AltF4 && (lp & (1 << 30)))
+                return true;
+            if (!overlayReady || !OpenQuitPrompt())
+                handler();
+            return true;
+        }
+    }
+    if (QuitPromptOpen() && msg == WM_KEYDOWN && !(lp & (1 << 30))) {
+        if (wp == VK_RETURN) {
+            if (void (*handler)() = g_quitHandler.load()) {
+                handler();
+                return true;
+            }
+        } else if (wp == VK_ESCAPE) {
+            CloseQuitPrompt();
+            return true;
+        }
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Public API

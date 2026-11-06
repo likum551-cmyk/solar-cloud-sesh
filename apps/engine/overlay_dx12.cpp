@@ -290,6 +290,9 @@ bool BlockedFromGame(UINT msg)
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    // Alt+F4 / close and the quit card first, exactly as on D3D11 (overlay.cpp)
+    if (gage::game::Overlay::detail::QuitGate(msg, wp, lp, g.ready.load()))
+        return 0;
     if (g.ready.load()) {
         bool openKeyChar = false;
         if (msg == WM_KEYDOWN && wp == 'T' && !(lp & (1 << 30)) && !g.wantKeyboard.load()) {

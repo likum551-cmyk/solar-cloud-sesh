@@ -1183,8 +1183,6 @@ static bool g_noSpActive = false;        // GtaThread::Tick is actually hooked
 // build (see tryDumpDecryptedImage). Defined here so Init (above the dump code)
 // can see it.
 static bool g_enhDump = false;
-int             g_nativeRetries = 0;
-const int       kMaxNativeRetries = 600; // retry up to ~600 frames (~10 s at 60 fps)
 
 // Check that `p` points to committed, readable memory (not junk/uninitialized).
 // Uses VirtualQuery — no SEH needed. Returns false for null, wild pointers,
@@ -6523,10 +6521,9 @@ void gage::game::Init(World& w) {
     const uint8_t* base = (const uint8_t*)w.module;
     const size_t size = (size_t)w.imageSize;
 
-    // Store for lazy retry from Frame() if the table is not populated yet.
+    // Kept for the native-table poller thread (it resolves the table once the game has populated it).
     g_imageBase = base;
     g_imageSize = size;
-    g_nativeRetries = 0;
 
     // ---- Build profile -------------------------------------------------------
     // Pick the per-build signature/offset set by the main module's file name.
@@ -7687,13 +7684,6 @@ DWORD WINAPI nativeTablePollerThread(LPVOID) {
     if (g_nativeTableReady)
         logNewNativeResolution();
     return 0;
-}
-
-// Called from engine.cpp Frame() as a fast-path check (no Sleep, no scan).
-// Once the poller thread sets g_nativeTableReady, this is a no-op.
-void gage::game::retryNativeTableOnce() {
-    // Nothing to do — the poller thread handles it.
-    // This function exists so engine.cpp doesn't need to change.
 }
 
 void* gage::game::GetSwapChain() {

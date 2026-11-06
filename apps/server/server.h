@@ -347,7 +347,6 @@ namespace gage::server {
         const VehicleStore::Vehicle* FindVehicle(uint16_t id) const { return vehicles_.Get(id); }
         // T4: VehicleUpdates whose velocity was over vehicleMaxSpeed (but under twice it) and was clamped, and driverless vehicles a driver took the control of.
         uint64_t VehicleSpeedClamps() const { return vehicles_.SpeedClamps(); }
-        uint64_t VehicleClaims() const { return vehicles_.Claims(); }
         // Console `heal`: full health (Config::playerHealth) for a live player; `kill`: health and
         // armour 0, dead, Killed (killer kServerId); `armor`: sets the armour. Each tells the player
         // with a Damage (attacker kServerId). False with *err for an unknown target or a dead one

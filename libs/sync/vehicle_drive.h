@@ -499,7 +499,6 @@ namespace gage::sync {
         void EndGrace(double cooldownMs);
         // 0.4.30: the ride-freedom tolerances (VehicleDriveConfig::rideTolM / tiltTolDeg) from a switch that can change at any Welcome.
         void SetRideFreedom(float tolM, float tiltDeg) { cfg_.rideTolM = tolM; cfg_.tiltTolDeg = tiltDeg; }
-        float OffAccumulator() const { return offAcc_; }
         const VehicleDriveStats& Stats() const { return stats_; }
 
     private:

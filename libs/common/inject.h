@@ -10,12 +10,6 @@ namespace gage::inject {
     constexpr DWORD kErrRemoteTimeout  = 0x80000001;
     constexpr DWORD kErrTargetNotReady = 0x80000002;
 
-    // Resolve an exported symbol inside the *target* process's copy of a
-    // module (ASLR-safe: we read the target's module base from a toolhelp
-    // snapshot and reuse the offset we observe in our own process).
-    // Returns nullptr when the module is not (yet) loaded in the target.
-    LPCVOID RemoteExport(HANDLE hProc, const wchar_t* moduleName, const char* exportName);
-
     // Inject a DLL by path into an already-open target process using the
     // classic remote-LoadLibrary technique:
     //   1. wait until kernel32!LoadLibraryW resolves in the target (a process
@@ -43,12 +37,7 @@ namespace gage::inject {
     // Find a live process by image name; returns its PID or 0.
     DWORD FindProcess(const std::wstring& imageBaseName);
 
-    // Gracefully close a running process by image name: post WM_CLOSE, wait up
-    // to `graceMs`, then TerminateProcess as a fallback. Returns true if the
-    // process is gone (or was never running); false if it is still alive.
-    bool CloseProcessByName(const std::wstring& imageBaseName, DWORD graceMs = 3000);
-
-    // Same, for one specific process the caller holds a handle to (needs
+    // Gracefully close one specific process the caller holds a handle to (needs
     // SYNCHRONIZE | PROCESS_TERMINATE). The handle pins the process object, so
     // a recycled PID can never be hit. Does not close the handle. Returns true
     // if the process is gone.

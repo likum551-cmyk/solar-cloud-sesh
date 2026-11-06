@@ -713,7 +713,6 @@ namespace gage::sync {
         Gait CurrentGait() const { return gait_; }
         // The task the controller last issued (None until the first): what the ped is latched on, for the 10 s log line.
         LocoTask LastTask() const { return lastTask_; }
-        float OffAccumulator() const { return offAcc_; } // m*s toward a persistent-error snap
         const LocoStats& Stats() const { return stats_; }
         // Sync A: the learned animation speed of a gait as a factor of its nominal (1 = as guessed), and the last move rate asked for
         float NominalScale(Gait g) const { return g == Gait::Walk ? nScale_[1] : g == Gait::Run ? nScale_[2] : g == Gait::Sprint ? nScale_[3] : 1.0f; }
@@ -723,7 +722,6 @@ namespace gage::sync {
         // R3 T2: what is known about coordinate writes on this puppet, whether a quiet window is open, level changes so far (the cap),
         // the ladder frozen by the cap, and the mean time from a task issue to the first gait the ped showed (-1 = none measured)
         WriteVerdict Verdict() const { return writeVerdict_; }
-        bool QuietOpen() const { return quietLeftMs_ > 0.0; }
         int LevelChangesTotal() const { return levelChangesTotal_; }
         bool LadderFrozen() const { return ladderFrozen_; }
         float MeanLatencyMs() const { return stats_.latencyN ? static_cast<float>(stats_.latencySumMs / stats_.latencyN) : -1.0f; }
@@ -1078,7 +1076,6 @@ namespace gage::sync {
         // ms left of an imposed level (Straight or NoRate), 0 = none
         double ActiveMs(LocoLevel level, double nowMs) const;
         void Reset() { *this = LevelWitness(); }
-        uint32_t Globals() const { return globals_; }
         static constexpr double kWitnessMs = 60000.0, kImposeStraightMs = 45000.0, kImposeNoRateMs = 120000.0, kImposePlacedMs = 45000.0;   // (R4 T1: Placed = the blend's rigid follow)
     private:
         struct Slot { bool have = false; int id = -1; double atMs = 0, untilMs = 0; };

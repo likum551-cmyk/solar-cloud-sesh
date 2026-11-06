@@ -155,8 +155,6 @@ namespace gage::proto {
     // One entry of a WorldCoarse packet as the server holds it.
     struct CoarseWire { uint16_t id = 0; QCoarse q; };
 
-    // Bytes of one coarse entry whose id is `idGap` above the previous id (gap varint + 6).
-    size_t CoarseEntryBytes(uint32_t idGap);
     // Bytes of a WorldCoarse packet header (type, tick, entry-count varint).
     size_t CoarseHeaderBytes(size_t nEntries);
 

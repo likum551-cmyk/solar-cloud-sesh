@@ -83,7 +83,6 @@ namespace gage::sync {
         uint32_t Loads() const { return loads_; }
         uint32_t Unloads() const { return unloads_; }
         double LastLoadMs() const { return lastLoadMs_; }   // first request of the last load to its HAS_ANIM_DICT_LOADED
-        double MaxLoadMs() const { return maxLoadMs_; }
 
     private:
         double retryMs_, recheckMs_;
@@ -205,7 +204,6 @@ namespace gage::sync {
         Progress Verdict() const { return progress_; }
         const Sample& First() const { return first_; }
         const Sample& At(size_t i) const { return samples_[i < kSamples ? i : kSamples - 1]; }
-        int DurationMs() const { return durationMs_; }
         // The +450 ms sample reads playing although a timed swing should be over: the clip holds or loops.
         bool TailStillPlaying() const { return samples_[2].taken && samples_[2].playing == 1 && durationMs_ > 0 && durationMs_ < 450; }
         // The clip is known to be longer than the time it is given (total time from the native): it is cut short.
@@ -643,7 +641,6 @@ namespace gage::sync {
         SwingAttempt PlanAt(size_t i) const { return SurveyPlanAt(i, loop_); }
         bool Active() const { return cycles_ > 0 && (step_ < (size_t)cycles_ * PlanSize() || nRequeue_ > 0); }
         bool Done() const { return cycles_ > 0 && step_ >= (size_t)cycles_ * PlanSize() && nRequeue_ == 0; }
-        uint32_t Cycles() const { return cycles_; }
         size_t Step() const { return step_; }
         size_t Planned() const { return (size_t)cycles_ * PlanSize(); }
         // The attempt for the next swing. The melee-task entry is skipped (and counted as a step) when it cannot be taken: that is decided
@@ -739,7 +736,6 @@ namespace gage::sync {
             winner_ = best;
             return best;
         }
-        int Winner() const { return winner_; }
 
     private:
         void SkipUnavailable()

@@ -47,6 +47,13 @@ namespace gage::game::Overlay::detail {
 
     // Chat or quick actions open (same as Overlay::Interactive).
     bool UiInteractive();
+
+    // Alt+F4 / close and the quit card's Enter / Esc (overlay.h SetQuitHandler), shared by both backends' WndProc
+    // subclasses before anything else: true = consumed (the WndProc returns 0, the game never sees it). overlayReady =
+    // the calling backend can draw the card; without it the first Alt+F4 / close calls the handler at once.
+    // (Until 0.4.32 the DX12 WndProc had no such step: Alt+F4 on Enhanced reached GTA's own pausing quit screen and
+    // the server only learnt of the leave by timeout.) Defined in overlay.cpp; msg / wp / lp are the Win32 values.
+    bool QuitGate(unsigned msg, unsigned long long wp, long long lp, bool overlayReady);
 }
 
 // DX12 backend (overlay_dx12.cpp), for GTA V Enhanced. The public Overlay::Init/Render/

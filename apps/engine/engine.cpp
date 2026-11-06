@@ -10,7 +10,6 @@
 // Every primitive degrades: if LocalPlayer/EntityPos/SpawnPed are unresolved
 // the frame simply does less. Nothing here blocks the render thread.
 #include "engine.h"
-#include "loading_screen.h"
 #include "overlay.h"
 #include "brand_apparel.h"
 #include "pack_stream.h"
@@ -248,7 +247,6 @@ namespace {
         sync::WaterEdge water;
         sync::ClimbWindow climb;
         sync::OneShotAudit audit;   // T2: did the game SHOW the jump / reload / stealth / swim / ragdoll we asked for (script tick)
-        uint32_t levelLogged = 0;   // T2: "engine: loco level" lines written for this puppet (rate limit)
         // R3 T2: the creation recipe of the puppet's ped (0 full, 1 lean, 2 alt: World::SpawnRemotePed), the repairs done on it
         // (LocoInput::repairsDone), the gait diagnostic of the last 10 s ("engine: gait") and its log-line budgets. Script tick only.
         int recipe = 0;
@@ -385,7 +383,6 @@ namespace {
         uint32_t netEpoch = 0, netLookSeq = 0, netEmoteSeq = 0;
     };
     // Last coarse (WorldCoarse, ~1 Hz) position per player id, for map blips later. Never drives a ped.
-    struct CoarsePos { float x = 0, y = 0, z = 0; double atMs = 0; };
 
     // What the join worker knows about one remote player (see THREADS above). The worker writes it under
     // g_peersMtx; the script tick reads it only in SyncNet. Counters (lookSeq, emoteSeq, epoch) tell SyncNet what
@@ -412,15 +409,14 @@ namespace {
     };
 
     // g_peersMtx guards g_peerNet, g_vehNet, g_sync (with the connection's one render clock, g_sync.Clock(), which the
-    // peds AND the vehicles read: sync plan W7), g_syncLive and g_coarse. Writers: the join
-    // worker thread (OnWelcome / OnJoined / OnLeft / OnWorld / OnCoarse / OnEnded and the v4 sinks) and, for a
+    // peds AND the vehicles read: sync plan W7), g_syncLive. Writers: the join
+    // worker thread (OnWelcome / OnJoined / OnLeft / OnWorld / OnEnded and the v4 sinks) and, for a
     // few lines at a time, the script tick (SyncNet, CommitNet, the vehicle interpolators). RemoteSync is
     // single-threaded: every call to it is made under this lock. No native is called while it is held.
     std::mutex g_peersMtx;
     std::map<int, PeerNet> g_peerNet;
     sync::RemoteSync g_sync;
     bool g_syncLive = false;                   // a Welcome configured g_sync for the current session
-    std::map<uint16_t, CoarsePos> g_coarse;
     // The game thread's peers (script tick only, no lock). Entries are made by SyncNet, removed by TickPeers.
     std::map<int, Peer> g_peers;
     // The script tick's copy of g_syncLive, and the time of the frame (the peds were sampled at it; the cars are
@@ -2187,7 +2183,6 @@ namespace {
             g_sync = sync::RemoteSync(cfg);
             g_sync.SetLocalId(myId);
             g_syncLive = true;
-            g_coarse.clear();
             // A new session restarts the server's tick counter, so its vehicle snapshots carry LOW stamps that
             // the old session's interpolators would drop as Stale for as long as the old session had run
             // (W4 review, fix 2). Every entry gets a fresh interpolator session (which empties its buffer) and
@@ -2237,7 +2232,6 @@ namespace {
     {
         PeersLock lk(g_peersMtx, false);
         g_sync.Remove(id);
-        g_coarse.erase(id);
         auto it = g_peerNet.find(id);
         if (it != g_peerNet.end())
             it->second.gone = true;                    // the script tick deletes the ped, releases the model, drops both entries
@@ -2275,7 +2269,6 @@ namespace {
         PeersLock lk(g_peersMtx, false);
         g_sync.Clear();
         g_syncLive = false;                            // the next Welcome sets it up again
-        g_coarse.clear();
         for (auto& kv : g_vehNet)
             kv.second.removed = true;                  // the script tick deletes the entities
         for (auto& kv : g_peerNet)
@@ -2311,24 +2304,6 @@ namespace {
             auto it = g_peerNet.find(id);
             if (it != g_peerNet.end())
                 it->second.despawn = true;             // the script tick deletes the ped (if it has one)
-        }
-    }
-
-    // Far players' coarse positions: kept for map blips only.
-    void OnCoarse(const proto::CoarseState& cs)
-    {
-        const double nowMs = NowMs();
-        const uint16_t me = join::MyId();
-        PeersLock lk(g_peersMtx, false);
-        if (!g_syncLive)
-            return;
-        for (const proto::CoarseEntry& e : cs.players)
-        {
-            if (e.id == me || e.id >= proto::kMaxPlayers || !IsJoinedPeer(e.id))
-                continue;
-            CoarsePos& c = g_coarse[e.id];
-            c.x = e.x; c.y = e.y; c.z = e.z;
-            c.atMs = nowMs;
         }
     }
 
@@ -3312,7 +3287,8 @@ namespace {
     // (and, for a peer, while its ped exists), released otherwise; the last release streams it out.
     void SyncEmoteDict(sync::EmoteDictHold& hold, bool wanted, const std::string& dict)
     {
-        const std::string remove = hold.Sync(g_animDicts, wanted ? dict : std::string());
+        static const std::string kNone;   // both arms lvalues: no copy of the dictionary name per peer per frame
+        const std::string remove = hold.Sync(g_animDicts, wanted ? dict : kNone);
         if (!remove.empty())
             g_world->RemoveAnimDict(remove.c_str());
     }
@@ -6982,7 +6958,6 @@ namespace {
     // line), count it, and tell the witness (two puppets finding the same failure make it machine-wide).
     void NoteLocoLevel(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
     {
-        ++pe.levelLogged;
         const bool shared = g_locoDegrade.Report(o.levelWhy, id, nowMs);
         if (g_locoLevelLines < 60)
         {
@@ -8498,6 +8473,9 @@ namespace {
         v.horn.Reset();                // 0.4.19: ... nor its horn or lights
         v.lightsKeep.Reset();
         v.lockKeep.Reset();            // 0.4.22: ... nor its door lock
+        v.vehClass = -2;               // a recycled id can be another model: read the class again (bike / mass / ride freedom)
+        v.lastContactFlag = false;     // the new entity's first contact is a rising edge again
+        v.divCheckAtMs = 0;            // a divergence check scheduled for the old entity would measure the new one
     }
 
     // ---- T3: vehicle visual state (Desync Overhaul round 2, protocol v6) -------------------------------------------------------
@@ -10297,7 +10275,8 @@ namespace {
             CancelEntryWalk(lp);
             return;
         }
-        std::vector<EntryCar> cars;
+        static std::vector<EntryCar> cars;             // script tick only: keeps its capacity (no allocation per on-foot frame)
+        cars.clear();
         GatherEntryCars(lpPos, cars);
         if (cars.empty())
         {
@@ -11816,10 +11795,11 @@ namespace {
                 float axis = 0.0f;
                 if (drivenByMe)
                     axisOk = g_world->GetControlNormal(0, kCtlVehMoveLR, axis);
-                const sync::SteerChoice sc = sync::ChooseSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), v.steerPrev, axisOk, axis);
+                const float wheelbase = VehicleWheelbaseM(v.handle);   // one model read (a native) per update, not two
+                const sync::SteerChoice sc = sync::ChooseSteer(vFwd, yaw, wheelbase, v.steerPrev, axisOk, axis);
                 u.steer = sc.steer;
                 v.steerPrev = u.steer;
-                g_vis.steerSent.Add(sc, axisOk, axis, sync::EstimateSteer(vFwd, yaw, VehicleWheelbaseM(v.handle), 0.0f), vFwd);
+                g_vis.steerSent.Add(sc, axisOk, axis, sync::EstimateSteer(vFwd, yaw, wheelbase, 0.0f), vFwd);
                 // 0.4.30 sign proof of the steering field: our own car's angle against the axis held over half (axis + = right, angle + = left)
                 float ownAngle = 0.0f;
                 if (axisOk && std::fabs(axis) > 0.5f && g_world->VehicleFieldsReady() && g_world->GetVehicleSteerAngle(v.handle, ownAngle) &&
@@ -14112,10 +14092,7 @@ namespace {
         int32_t lp = g_world->LocalPlayer();
         TickAmbient(inScript, lp, probe);              // T5: no ambient NPCs / traffic, every tick, before the connection / entry gates
         if (!lp) {
-            // Player not spawned yet — render the GAGE loading overlay.
-            void* sc = game::GetSwapChain();
-            // if (sc) game::RenderLoadingOverlay(sc, false);
-            // Heartbeat so a stuck load is diagnosable from gage.log: PLAYER_PED_ID stays 0 while GTA
+            // Player not spawned yet (the overlay's own loader is up). Heartbeat so a stuck load is diagnosable from gage.log: PLAYER_PED_ID stays 0 while GTA
             // is still loading its world, or if our script-tick context never goes live (then GameWork
             // only runs on the render thread, where the native has no script-thread TLS and returns 0).
             static std::atomic<ULONGLONG> firstNoPed{0}, lastNoPedLog{0};
@@ -14131,13 +14108,11 @@ namespace {
             return;
         }
 
-        // First frame with a valid player ped — dismiss the overlay and go live.
+        // First frame with a valid player ped: go live.
         {
             static bool loggedSpawn = false;
             if (!loggedSpawn) {
                 loggedSpawn = true;
-                void* sc = game::GetSwapChain();
-                // if (sc) game::RenderLoadingOverlay(sc, true);
                 GLOGI("engine: player ped spawned — engine going live (%s)",
                       inScript ? "script tick" : "render thread");
             }
@@ -14494,9 +14469,6 @@ namespace {
         if (!g_active || !g_world)
             return;
 
-        // If natives weren't found at Init time (too early), retry here.
-        game::retryNativeTableOnce();
-
         EnsureConnected();
 
         // The in-game UI is drawn from every present, whichever thread runs the game work.
@@ -14630,7 +14602,7 @@ namespace gage::engine {
         sinks.onJoined = OnJoined;
         sinks.onLeft = OnLeft;
         sinks.onWorld = OnWorld;
-        sinks.onCoarse = OnCoarse;
+        // onCoarse stays unset: far players' coarse positions had a store nothing read (no map blips are drawn); 0.4.32 removed it
         sinks.onLook = OnLook;
         sinks.onChat = OnChat;
         sinks.onEnded = OnEnded;
@@ -14698,7 +14670,6 @@ namespace gage::engine {
             g_vehNet.clear();
             g_sync.Clear();
             g_syncLive = false;
-            g_coarse.clear();
         }
     }
 

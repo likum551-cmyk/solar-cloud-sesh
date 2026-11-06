@@ -196,7 +196,6 @@ namespace gage::sync {
         uint8_t  Indicators() const { return ind_; }            // the state of the car we sit in (kVeh2Indicator* bits)
         bool     Belt() const { return belt_; }
         bool     BeltFlagWanted() const { return !belt_; }      // PED config flag 32: false while buckled
-        bool     EngineSeenRunning() const { return engineSeen_; }
         // The engine-off glyph: the engine has read stopped for engineOffHudMs (at once after our own Y). False while it reads running or unreadable.
         bool     EngineOffHud(double nowMs) const { return veh_ != 0 && engineOffSince_ >= 0.0 && nowMs - engineOffSince_ >= cfg_.engineOffHudMs; }
         const VehControlsStats& Stats() const { return stats_; }

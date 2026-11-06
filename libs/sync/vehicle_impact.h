@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace gage::sync::impact {
@@ -324,7 +325,6 @@ namespace gage::sync::impact {
         explicit ContactArbiter(const Cfg& c) : cfg_(c) {}
         const Cfg& cfg() const { return cfg_; }
         const Stats& stats() const { return stats_; }
-        void ResetStats() { stats_ = Stats(); }
 
         // A sample the vehicle's controller sent (in arrival order). A new controller restarts the history (another clock).
         void Note(uint16_t id, uint16_t ctrl, const ArbSample& s)
@@ -345,7 +345,7 @@ namespace gage::sync::impact {
         {
             if (id < kMaxIds) ring_[id] = Ring();
             for (auto it = pairs_.begin(); it != pairs_.end();)
-                it = (it->a == id || it->b == id) ? pairs_.erase(it) : it + 1;
+                it = (it->second.a == id || it->second.b == id) ? pairs_.erase(it) : std::next(it);
         }
 
         // The pose of vehicle `id` at server time tMs (interpolated between samples, extrapolated at most maxExtrapMs past the
@@ -430,15 +430,15 @@ namespace gage::sync::impact {
             double lastImpactT = -1e18;
         };
 
+        // Pair state lives only while the pair is within broadM (Examine erases it when the pair parts): the old linear table
+        // kept a row for every pair of controlled vehicles ever examined, so the lookup alone grew with N^4 per tick.
+        static uint32_t PairKey(uint16_t a, uint16_t b) { return (static_cast<uint32_t>(a) << 16) | b; }
         PairState& Pair(uint16_t a, uint16_t b)
         {
-            for (PairState& p : pairs_)
-                if (p.a == a && p.b == b) return p;
-            PairState p;
+            PairState& p = pairs_[PairKey(a, b)];
             p.a = a;
             p.b = b;
-            pairs_.push_back(p);
-            return pairs_.back();
+            return p;
         }
 
         // Boxes grown by the touch margin: the controllers' own physics keeps their tracks from overlapping (each stops at the
@@ -470,13 +470,26 @@ namespace gage::sync::impact {
             const ArbSample& na = ring_[A.id].At(0);
             const ArbSample& nb = ring_[B.id].At(0);
             const V2 d = na.p - nb.p;
-            PairState& ps = Pair(std::min(A.id, B.id), std::max(A.id, B.id));
+            const uint16_t lo = std::min(A.id, B.id), hi = std::max(A.id, B.id);
             if (Dot(d, d) > cfg_.broadM * cfg_.broadM)
             {
-                ps.scanT = -1e18;
-                ps.inContact = false;
+                // apart (by the NEWEST samples, which can be from different times: a lagging controller's car looks 14 m
+                // away from one it is touching). The row goes only once its impact cooldown has run out; inside it, keep
+                // lastImpactT and reset like the old code did, or a bounce rescanned from a fresh row would fire twice.
+                const auto it = pairs_.find(PairKey(lo, hi));
+                if (it != pairs_.end())
+                {
+                    if (std::max(na.tMs, nb.tMs) - it->second.lastImpactT >= cfg_.cooldownMs)
+                        pairs_.erase(it);
+                    else
+                    {
+                        it->second.scanT = -1e18;
+                        it->second.inContact = false;
+                    }
+                }
                 return;
             }
+            PairState& ps = Pair(lo, hi);
             const bool stillA = Len(na.v) < cfg_.stillMs && std::fabs(na.w) < 0.05;
             const bool stillB = Len(nb.v) < cfg_.stillMs && std::fabs(nb.w) < 0.05;
             // the common instant: the older of the two newest samples (a still car's pose is valid at any later time)
@@ -598,7 +611,7 @@ namespace gage::sync::impact {
         Cfg cfg_;
         Stats stats_;
         Ring ring_[kMaxIds];
-        std::vector<PairState> pairs_;
+        std::unordered_map<uint32_t, PairState> pairs_;
     };
 
     // ---- client side: what the local physics did, and what to apply ----

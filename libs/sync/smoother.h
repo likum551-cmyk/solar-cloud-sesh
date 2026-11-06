@@ -295,7 +295,6 @@ namespace gage::sync {
         // and the player's own delay estimate is just its class extra. nullptr (the default) = the standalone
         // smoother. The pointer must outlive the smoother (RemoteSync owns both and rebinds it when copied).
         void SetClock(NetClock* clock) { clock_ = clock; }
-        bool SharedClock() const { return clock_ != nullptr; }
 
         bool HasData() const { return count_ > 0; }
         bool Expired(double nowMs) const { return nowMs - lastRecvMs_ > cfg_.forgetAfterMs; }

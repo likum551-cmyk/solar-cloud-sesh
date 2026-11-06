@@ -395,6 +395,7 @@ namespace gage::proto {
     Bytes WorldPacketBuilder::Finish()
     {
         wire::Writer w;
+        w.reserve(size());
         w.u8((uint8_t)Msg::WorldState);
         w.u32(tick_);
         w.u8((uint8_t)left_.size());
@@ -522,11 +523,6 @@ namespace gage::proto {
     }
 
     // ---- the coarse channel -----------------------------------------------------------------------------
-
-    size_t CoarseEntryBytes(uint32_t idGap)
-    {
-        return VarintBytes(idGap) + kCoarsePayload;
-    }
 
     size_t CoarseHeaderBytes(size_t nEntries)
     {

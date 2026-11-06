@@ -33,9 +33,10 @@ namespace gage::sync::hudcar {
     constexpr float kTickOuterR = 148.0f, kTickMajorInnerR = 132.0f, kTickMinorInnerR = 141.0f;
     constexpr float kTickMajorW = 2.4f, kTickMinorW = 1.6f;
     constexpr float kDialNumR = 114.0f, kDialNumPx = 14.0f, kDialNumBaseDrop = 4.5f;
-    constexpr float kNeedleR = 140.0f, kNeedleLen = 28.0f, kNeedleW = 4.0f, kNeedleGlowSigma = 10.0f;
+    constexpr float kNeedleR = 140.0f, kNeedleLen = 28.0f, kNeedleW = 4.0f, kNeedleGlowSigma = 5.0f;   // spec 3.7 "glow 0 0 10px (sigma 5)"; the golden fits 4.5-5 (the arcs fit sigma = R)
     // the speed readout
     constexpr float kSpeedPx = 96.0f, kSpeedDigitAdv = 58.5625f, kSpeedBaseY = 318.0f;
+    constexpr float kSpeedTrack = -1.92f;   // the numeral's letter-spacing, included in kSpeedDigitAdv (CSS adds it after each glyph)
     constexpr float kUnitPx = 14.0f, kUnitTrack = 3.36f, kUnitX = 1661.69f, kUnitBaseY = 276.0f;
     constexpr float kEngineOffDim = 0.4f;
     // blinkers (bare 30 px arrows)
@@ -47,7 +48,8 @@ namespace gage::sync::hudcar {
     constexpr float kEFPx = 12.0f, kEFTrack = 1.2f, kEX = 1607.16f, kFX = 1753.30f, kEFBaseY = 189.0f;
     // the strip and its chips
     constexpr float kStripX = 1504.0f, kStripY = 56.0f, kStripW = 360.0f, kStripH = 64.0f, kStripRound = 32.0f;
-    constexpr float kChipD = 46.0f, kChipY = 65.0f, kChipBorder = 1.5f, kChipGlowSigma = 8.0f;
+    // kChipBorder: the spec says 1.5 px; Chrome draws a 1.5 css px border as 1 device px (the goldens' rim is 1 px)
+    constexpr float kChipD = 46.0f, kChipY = 65.0f, kChipBorder = 1.0f, kChipGlowSigma = 8.0f;
     constexpr float kChipX[4] = {1568.0f, 1630.0f, 1692.0f, 1754.0f};    // lock, engine, seatbelt, headlights
 
     // ---- colours --------------------------------------------------------------------------------------------------------------------

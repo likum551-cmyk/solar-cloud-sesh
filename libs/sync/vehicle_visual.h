@@ -252,7 +252,6 @@ namespace gage::sync {
         const VisualMask& Shown() const { return shown_; }
         const VisualMask& Pending() const { return pend_; }
         const VisualStats& Stats() const { return stats_; }
-        bool Suspended(double nowMs) const { return nowMs < suspendUntil_; }
 
     private:
         static int Idx(int group, int slot) { return group * kVisSlots + slot; }

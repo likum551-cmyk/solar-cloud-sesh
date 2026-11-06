@@ -191,13 +191,27 @@ namespace {
                 (void*)C->Rbx, (void*)C->Rbp, (void*)C->Rsi, (void*)C->Rdi, (void*)C->R8,
                 (void*)C->R9, (void*)C->R10, (void*)C->R11, (void*)C->R12, (void*)C->R13,
                 (void*)C->R14, (void*)C->R15);
+            // The fault address may itself be unmapped (a call through a null or stale pointer: an EXECUTE violation). A plain memcpy would fault
+            // again on this thread, and the re-entry guard above would terminate before the stack scan and the dump. Copy only what VirtualQuery
+            // says is committed and readable (the same rule as gage_loader.cpp's Readable).
             BYTE insn[16];
-            memcpy(insn, (void*)(uintptr_t)er->ExceptionAddress, 16);
-            char hex[56];
+            int got = 0;
+            {
+                const uintptr_t at = (uintptr_t)er->ExceptionAddress;
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (at >= 0x10000 && VirtualQuery((const void*)at, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                    !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                {
+                    const uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                    got = (int)(end - at < 16 ? end - at : 16);
+                    memcpy(insn, (const void*)at, (size_t)got);
+                }
+            }
+            char hex[56] = "unreadable";
             int p = 0;
-            for (int i = 0; i < 16; i++)
+            for (int i = 0; i < got; i++)
                 p += snprintf(hex + p, sizeof(hex) - p, "%02x ", insn[i]);
-            hex[p > 0 ? p - 1 : 0] = '\0';
+            if (p > 0) hex[p - 1] = '\0';
             GLOGW("gageinjector:   fault bytes: %s", hex);
             crash::LogStackScan("gageinjector:", C);
         }

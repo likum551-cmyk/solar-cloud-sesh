@@ -47,20 +47,6 @@ namespace gage::sync {
         Hide,          // an SP / stock-script / leftover blip
     };
 
-    inline const char* BlipVerdictName(BlipVerdict v)
-    {
-        switch (v)
-        {
-        case BlipVerdict::Invalid: return "invalid";
-        case BlipVerdict::KeepOwned: return "owned";
-        case BlipVerdict::KeepPlayer: return "player";
-        case BlipVerdict::KeepNorth: return "north";
-        case BlipVerdict::KeepWaypoint: return "waypoint";
-        case BlipVerdict::Hide: return "hide";
-        }
-        return "?";
-    }
-
     // The blips the engine made itself. Every ADD_BLIP_FOR_* site in the engine must Add its handle here and
     // Remove it when it removes the blip, or the sweep hides it like an SP blip.
     class OwnedBlips

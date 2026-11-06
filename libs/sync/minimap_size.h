@@ -257,14 +257,6 @@ namespace gage::sync {
         return o;
     }
 
-    inline bool SameTrio(const MinimapTrio& a, const MinimapTrio& b)
-    {
-        for (int r = 0; r < 3; ++r)
-            if (a.index[r] != b.index[r] || !SameComp(a.c[r], b.c[r]))
-                return false;
-        return true;
-    }
-
     // ---- when to write -----------------------------------------------------------------------------------------------
 
     // The engine feeds it what the table holds (script tick) and performs what it answers. The first complete, plausible read becomes the
@@ -339,18 +331,6 @@ namespace gage::sync {
         const MinimapTrio& Target() const { return target_; }
         const Stats& Counters() const { return stats_; }
         const std::string& Why() const { return why_; }   // why it is waiting / gave up (last)
-
-        static const char* PhaseName(Phase p)
-        {
-            switch (p)
-            {
-            case Phase::Off: return "off";
-            case Phase::Waiting: return "waiting for the table";
-            case Phase::Applied: return "applied";
-            case Phase::GaveUp: return "gave up";
-            }
-            return "?";
-        }
 
     private:
         Act NextWaiting(const MinimapTrio& cur, bool readable, double nowMs)

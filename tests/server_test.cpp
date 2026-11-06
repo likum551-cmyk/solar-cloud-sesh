@@ -1546,6 +1546,63 @@ static void ChatFloodTests()
 // G. Per-address connection cap
 // ===========================================================================
 
+// A server-to-client packet whose type byte sits in a reserved gap (32..39, 41..43) passes PeekType's range check and
+// matches no case of the session's switch. Before 0.4.32 it reached Push as the default Event (Disconnected), so the
+// engine ended a live session. A raw ENet host stands in for a server that sends one (a newer server, or a hostile one).
+static void ReservedTypeTest()
+{
+    if (enet_initialize() != 0) { Check("reserved type: enet_initialize", false); return; }   // WSAStartup is counted: pairs with the deinitialize below
+    ENetAddress addr;
+    enet_address_set_host(&addr, "127.0.0.1");
+    addr.port = 0;
+    ENetHost* host = enet_host_create(&addr, 2, proto::kChannelCount, 0, 0);
+    if (!host) { Check("reserved type: raw host starts", false); enet_deinitialize(); return; }
+    ENetAddress bound;
+    enet_socket_get_address(host->socket, &bound);
+    net::ClientSession s;
+    net::SessionOptions o;
+    o.host = "127.0.0.1";
+    o.port = bound.port;
+    o.name = "Gap";
+    o.connectTimeoutMs = 3000;
+    o.closeTimeoutMs = 500;
+    std::string err;
+    const bool connected = s.Connect(o, &err);
+    ENetPeer* peer = nullptr;
+    bool sent = false, sawDisconnected = false;
+    const auto t0 = Clock::now();
+    while (connected && MsSince(t0) < 1500)
+    {
+        ENetEvent ev;
+        while (enet_host_service(host, &ev, 0) > 0)
+        {
+            if (ev.type == ENET_EVENT_TYPE_CONNECT) peer = ev.peer;
+            if (ev.type == ENET_EVENT_TYPE_RECEIVE) enet_packet_destroy(ev.packet);
+        }
+        if (peer && !sent)
+        {
+            const uint8_t gap[] = { 33, 0, 0, 0, 0 };   // a type in the 32..39 gap, then a few bytes of "payload"
+            enet_peer_send(peer, proto::kChanReliable, enet_packet_create(gap, sizeof(gap), ENET_PACKET_FLAG_RELIABLE));
+            enet_host_flush(host);
+            sent = true;
+        }
+        s.Poll(0);
+        net::Event e;
+        while (s.NextEvent(e))
+            if (e.type == ET::Disconnected) sawDisconnected = true;
+        if (sent && s.malformed() > 0 && MsSince(t0) > 600) break;   // delivered, and a little time for a wrong event to surface
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    Check("reserved type: a server packet with a type in a reserved gap is counted malformed, not turned into a Disconnected event",
+          connected && sent && s.malformed() == 1 && !sawDisconnected && s.state() != net::SessionState::Closed,
+          "connected " + std::to_string(connected) + ", sent " + std::to_string(sent) + ", malformed " + std::to_string(s.malformed()) +
+          ", Disconnected event " + std::to_string(sawDisconnected) + (err.empty() ? "" : ", err " + err));
+    s.Abandon();
+    enet_host_destroy(host);
+    enet_deinitialize();
+}
+
+
 static void ConnectionCapTests()
 {
     {
@@ -3133,6 +3190,7 @@ int main()
     ChatFloodTests();
     std::printf("-- connection cap\n");
     ConnectionCapTests();
+    ReservedTypeTest();
     std::printf("-- bans\n");
     BanTests();
     std::printf("-- admin channel\n");
@@ -3159,7 +3217,7 @@ int main()
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 111 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks; // T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {

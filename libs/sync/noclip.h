@@ -325,7 +325,6 @@ namespace gage::sync::noclip {
         Phase   GetPhase() const { return phase_; }
         bool    Active() const { return phase_ != Phase::Off; }
         int32_t Entity() const { return entity_; }
-        Subject GetSubject() const { return subject_; }
         const Flags& Saved() const { return saved_; }
         const SafeSpot& Safe() const { return safe_; }
         uint32_t Starts() const { return starts_; }
