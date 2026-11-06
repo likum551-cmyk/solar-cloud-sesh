@@ -207,10 +207,13 @@ namespace gage::sync {
     // ---- the three components we resize ------------------------------------------------------------------------------
 
     constexpr int kRoleMinimap = 0, kRoleMask = 1, kRoleBlur = 2;
-    inline const char* RoleName(int r)
+    // The names of the three slots of one radar mode, in role order: the minimap (what 0.4.25 - 0.5.3 write) and, 0.5.4 ring_map_big, the big
+    // (expanded) radar, slots 3 / 4 / 5 of frontend.xml ("bigmap" L/B pos (-0.004, 0.022) size (0.364, 0.460417) in GI's 2026-11-07 log).
+    constexpr const char* kMinimapRoleNames[3] = {"minimap", "minimap_mask", "minimap_blur"};
+    constexpr const char* kBigmapRoleNames[3] = {"bigmap", "bigmap_mask", "bigmap_blur"};
+    inline const char* RoleName(int r, const char* const* names = kMinimapRoleNames)
     {
-        static const char* const n[3] = {"minimap", "minimap_mask", "minimap_blur"};
-        return r >= 0 && r < 3 ? n[r] : "?";
+        return r >= 0 && r < 3 ? names[r] : "?";
     }
 
     inline bool NameEqualsNoCase(const std::string& a, const char* b)
@@ -234,13 +237,13 @@ namespace gage::sync {
         bool AllFound() const { return index[0] >= 0 && index[1] >= 0 && index[2] >= 0; }
     };
 
-    // all: the table's entries (n of them). The first entry of each name wins.
-    inline MinimapTrio PickTrio(const MinimapComp* all, int n)
+    // all: the table's entries (n of them). The first entry of each name wins. names: the mode's three slot names (default: the minimap's).
+    inline MinimapTrio PickTrio(const MinimapComp* all, int n, const char* const* names = kMinimapRoleNames)
     {
         MinimapTrio t;
         for (int r = 0; r < 3; ++r)
             for (int i = 0; i < n; ++i)
-                if (NameEqualsNoCase(all[i].name, RoleName(r)))
+                if (NameEqualsNoCase(all[i].name, RoleName(r, names)))
                 {
                     t.c[r] = all[i];
                     t.index[r] = i;
@@ -336,6 +339,73 @@ namespace gage::sync {
         return p;
     }
 
+    // ---- 0.5.4 ring map round 2 (GI 2026-11-07: "map is just a square over the hp and sat bar, not a circle inside of it + make it more zoomed out") ----
+    // What the two 0.5.2 probes showed (radar_probe_1/2.bmp, 2560 x 1440, safe zone 0.97, the crop x 0-768 y 792-1440): the radar's map about 620 px
+    // wide from the safe-zone's left edge, its bottom on the safe-zone bottom (y 1418) and its top above the crop (y < 792), the player arrow at
+    // about (324, 1117), on both probes 68 s apart; the placement written to slots 0-2 asked for a 213 px square centred at (233, 1136) whose
+    // bottom is 173 px ABOVE the safe-zone bottom. Nothing of it moved with the write: it is the shape of the stock BIG radar (slot 3 "bigmap",
+    // frame top = 1418 + 0.022 H - 0.4604 H = 787, bottom on the corner; its blur 0.262 W = 671 px wide), whose slots 0.5.2 never wrote. The
+    // radar getters pick the slot by the radar mode each frame (Legacy +0x2cc6f0, read from the 3889 dump: mode 0 reads slot 3 while the byte at
+    // +0x1f6c8f7 is set, presumably the big-map flag; mode 3 reads slot 3 too), so a radar left in big mode ignores slots 0-2 (this also fits 0.4.25-0.4.27: "the table was written, the map never changed"). Why the big
+    // mode stays on is not proven (the engine's own flip logs "off 1"); MirroredTrio makes it irrelevant: the big radar's slots get the SAME frame /
+    // mask / blur geometry as the minimap's placement (names, alignment and slot indices of the big slots kept), so either mode lands in the ring.
+    inline MinimapTrio MirroredTrio(const MinimapTrio& bigOrig, const MinimapTrio& geometry)
+    {
+        MinimapTrio o = bigOrig;
+        for (int r = 0; r < 3; ++r)
+        {
+            o.c[r].posX = geometry.c[r].posX;
+            o.c[r].posY = geometry.c[r].posY;
+            o.c[r].sizeX = geometry.c[r].sizeX;
+            o.c[r].sizeY = geometry.c[r].sizeY;
+        }
+        return o;
+    }
+    inline bool SameGeometry(const MinimapTrio& a, const MinimapTrio& b)
+    {
+        for (int r = 0; r < 3; ++r)
+            if (!(a.c[r].posX == b.c[r].posX && a.c[r].posY == b.c[r].posY && a.c[r].sizeX == b.c[r].sizeX && a.c[r].sizeY == b.c[r].sizeY))
+                return false;
+        return true;
+    }
+
+    // ring_map_zoom (HKCU\Software\GAGE-MP): the SET_RADAR_ZOOM level held every tick while the ring map shows. alloc8or: "zoomLevel ranges from 0 to
+    // 1400 in R* Scripts" (0 = the game's own, speed-driven zoom; larger = further out). Unset = kRingMapZoomDefault; "0" = the game's own zoom (no
+    // call, the 0.5.3 behaviour); 1..1400 as given; above 1400 held to 1400; anything else the default (why says so).
+    constexpr int kRingMapZoomDefault = 1100, kRingMapZoomMax = 1400;
+    struct RingZoom
+    {
+        int level = kRingMapZoomDefault;
+        const char* why = nullptr;   // null = as asked (or unset)
+    };
+    inline RingZoom ParseRingMapZoom(const std::wstring& v)
+    {
+        RingZoom z;
+        size_t b = 0, e = v.size();
+        while (b < e && (v[b] == L' ' || v[b] == L'\t')) ++b;
+        while (e > b && (v[e - 1] == L' ' || v[e - 1] == L'\t')) --e;
+        if (b == e)
+            return z;
+        long x = 0;
+        for (size_t i = b; i < e; ++i)
+        {
+            if (v[i] < L'0' || v[i] > L'9' || i - b >= 6)
+            {
+                z.why = "; ring_map_zoom unreadable (a whole number 0..1400), the default taken";
+                return z;
+            }
+            x = x * 10 + (long)(v[i] - L'0');
+        }
+        if (x > kRingMapZoomMax)
+        {
+            z.level = kRingMapZoomMax;
+            z.why = "; ring_map_zoom above 1400, held to 1400";
+            return z;
+        }
+        z.level = (int)x;
+        return z;
+    }
+
     // ---- when to write -----------------------------------------------------------------------------------------------
 
     // The engine feeds it what the table holds (script tick) and performs what it answers. The first complete, plausible read becomes the
@@ -363,17 +433,31 @@ namespace gage::sync {
         {
             const float was = scale_;
             const bool wasPlaced = placed_;
+            const bool wasMirrored = mirrored_;
             scale_ = ClampRadarScale(scale);
             placed_ = false;
-            Retarget(wasPlaced || was != scale_);
+            mirrored_ = false;
+            Retarget(wasPlaced || wasMirrored || was != scale_);
         }
 
         // 0.5.2 ring_map: an absolute placement (RingPlacement) instead of a factor. Configure(float) switches back to the factor.
         void ConfigurePlacement(const MinimapPlacement& p)
         {
-            const bool changed = !placed_ || !(place_ == p);
+            const bool changed = !placed_ || mirrored_ || !(place_ == p);
             place_ = p;
             placed_ = true;
+            mirrored_ = false;
+            Retarget(changed);
+        }
+
+        // 0.5.4 ring_map_big: the target is another mode's geometry as it stands (MirroredTrio: the big radar's slots get the minimap placement's
+        // frame / mask / blur), not something computed from this trio's own stock values. Configure(float) switches back to the factor.
+        void ConfigureMirror(const MinimapTrio& geometry)
+        {
+            const bool changed = !mirrored_ || !SameGeometry(mirror_, geometry);
+            mirror_ = geometry;
+            mirrored_ = true;
+            placed_ = false;
             Retarget(changed);
         }
 
@@ -406,8 +490,9 @@ namespace gage::sync {
         }
 
         Phase PhaseNow() const { return phase_; }
-        float Scale() const { return placed_ ? 1.0f : scale_; }   // the factor (1 in placement mode: the overlay's dock rectangle is not used then)
+        float Scale() const { return placed_ || mirrored_ ? 1.0f : scale_; }   // the factor (1 in placement / mirror mode: the dock rectangle is not used)
         bool Placed() const { return placed_; }
+        bool Mirrored() const { return mirrored_; }
         const MinimapPlacement& Placement() const { return place_; }
         bool HasOriginal() const { return hasOrig_; }
         const MinimapTrio& Original() const { return orig_; }
@@ -417,8 +502,11 @@ namespace gage::sync {
 
     private:
         // Untouched: the factor 1 in scale mode (a placement always writes).
-        bool Untouched() const { return !placed_ && scale_ >= 1.0f; }
-        MinimapTrio MakeTarget(const MinimapTrio& orig) const { return placed_ ? PlacedTrio(orig, place_) : ScaledTrio(orig, scale_); }
+        bool Untouched() const { return !placed_ && !mirrored_ && scale_ >= 1.0f; }
+        MinimapTrio MakeTarget(const MinimapTrio& orig) const
+        {
+            return mirrored_ ? MirroredTrio(orig, mirror_) : placed_ ? PlacedTrio(orig, place_) : ScaledTrio(orig, scale_);
+        }
         void Retarget(bool changed)
         {
             if (phase_ == Phase::GaveUp || (hasOrig_ && !changed))
@@ -535,6 +623,8 @@ namespace gage::sync {
         float scale_ = 1.0f;
         bool placed_ = false;          // 0.5.2: place_ (ConfigurePlacement) instead of scale_
         MinimapPlacement place_;
+        bool mirrored_ = false;        // 0.5.4: mirror_'s geometry (ConfigureMirror) instead of scale_ / place_
+        MinimapTrio mirror_;
         bool hasOrig_ = false, forced_ = false, polled_ = false;
         double lastPollMs_ = 0.0, firstPollMs_ = -1.0, lastCheckMs_ = 0.0;
         MinimapTrio orig_, target_;

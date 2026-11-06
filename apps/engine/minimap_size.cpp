@@ -153,6 +153,13 @@ double       g_nextAttemptMs = 0.0;
 double       g_nextReadMs = 0.0;
 double       g_waitLogMs = -1e18;
 int          g_waitLogs = 0, g_rewriteLogs = 0;
+// 0.5.4 ring_map_big: the big radar's slots (bigmap / bigmap_mask / bigmap_blur) mirror the minimap placement (sync::MirroredTrio).
+bool            g_bigWanted = false;
+MinimapSizeGate g_bigGate;
+MinimapTrio     g_bigLastWritten;
+bool            g_bigVerified = false;
+int             g_bigLogs = 0;
+constexpr int   kMaxBigLogs = 12;
 
 constexpr int    kMaxAttempts = 6;       // the pattern not found yet: the code may not be decrypted; look again 5 s later, six times
 constexpr double kRetryMs = 5000.0, kReadEveryMs = 250.0, kWaitLogEveryMs = 10000.0;
@@ -247,7 +254,7 @@ void LogTableOnce(const MinimapComp* all) {
 }
 
 // Write the target's four floats into each of the three entries, read them back, and put the old bytes back on any mismatch.
-bool WriteTarget(const MinimapTrio& target, std::string& err) {
+bool WriteTarget(const MinimapTrio& target, std::string& err, const char* const* names = kMinimapRoleNames) {
     uint8_t snap[3][16];
     uint8_t* at[3];
     for (int r = 0; r < 3; ++r) {
@@ -260,13 +267,13 @@ bool WriteTarget(const MinimapTrio& target, std::string& err) {
         uint8_t tmp[kMinimapStride] = {};
         EncodeMinimapGeometry(tmp, target.c[r]);
         ok = WriteGuarded(at[r], tmp + kOffPosX, 16);
-        if (!ok) err = std::string("the write to ") + RoleName(r) + " was refused";
+        if (!ok) err = std::string("the write to ") + RoleName(r, names) + " was refused";
     }
     if (ok) {
         for (int r = 0; r < 3 && ok; ++r) {
             const MinimapComp got = DecodeMinimapComp(g_table + (size_t)target.index[r] * (size_t)kMinimapStride);
             ok = SameComp(got, target.c[r]);
-            if (!ok) err = std::string("the read-back of ") + RoleName(r) + " is " + Geo(got) + ", written " + Geo(target.c[r]);
+            if (!ok) err = std::string("the read-back of ") + RoleName(r, names) + " is " + Geo(got) + ", written " + Geo(target.c[r]);
         }
     }
     if (!ok)
@@ -293,7 +300,14 @@ void LogApplied(const MinimapTrio& before, const MinimapTrio& after) {
           (double)g_gate.Scale(), g_src.c_str(), after.index[0], after.index[1], after.index[2], line.c_str());
 }
 
+void StepMinimap(const MinimapComp* all, bool readable, double nowMs);
+void StepBig(const MinimapComp* all, bool readable, double nowMs);
+
 } // namespace
+
+void SetBigMirror(bool on) {
+    g_bigWanted = on;
+}
 
 void ConfigurePlacement(const MinimapPlacement& p, const char* sourceName) {
     const bool first = !g_configured || !g_gate.Placed();
@@ -307,7 +321,11 @@ void ConfigurePlacement(const MinimapPlacement& p, const char* sourceName) {
 }
 
 bool PlacementApplied() {
-    return g_res == Res::Ready && g_verified && g_gate.Placed() && g_gate.PhaseNow() == MinimapSizeGate::Phase::Applied;
+    const bool mini = g_res == Res::Ready && g_verified && g_gate.Placed() && g_gate.PhaseNow() == MinimapSizeGate::Phase::Applied;
+    // 0.5.4 ring_map_big: the big radar's slots too, unless they could not be written at all (then the minimap's alone, as 0.5.3)
+    const bool big = !g_bigWanted || g_bigGate.PhaseNow() == MinimapSizeGate::Phase::GaveUp ||
+                     (g_bigVerified && g_bigGate.Mirrored() && g_bigGate.PhaseNow() == MinimapSizeGate::Phase::Applied);
+    return mini && big;
 }
 
 void Configure(float scale, const char* sourceName) {
@@ -338,6 +356,13 @@ void Tick(double nowMs) {
     MinimapComp all[kMinimapEntries];
     const bool readable = ReadTable(all);
     if (readable) LogTableOnce(all);
+    StepMinimap(all, readable, nowMs);
+    StepBig(all, readable, nowMs);   // after the minimap step: a placement written this tick is mirrored in the same tick (one flip for both)
+}
+
+namespace {
+
+void StepMinimap(const MinimapComp* all, bool readable, double nowMs) {
     const MinimapTrio cur = readable ? PickTrio(all, kMinimapEntries) : MinimapTrio();
     const MinimapTrio prevOrig = g_gate.Original();   // before Next(): it may adopt a new stock value
     const MinimapSizeGate::Act act = g_gate.Next(cur, readable, nowMs);
@@ -384,6 +409,53 @@ void Tick(double nowMs) {
     g_lastWritten = target;
 }
 
+// 0.5.4 ring_map_big: once the minimap placement is in the table, the big radar's three slots get the same geometry (MirroredTrio), through their
+// own gate (wait for the slots, apply, re-assert what the game rewrites, give up after the same bounds). Its write sets the same TakeWritten latch.
+void StepBig(const MinimapComp* all, bool readable, double nowMs) {
+    if (g_bigGate.PhaseNow() == MinimapSizeGate::Phase::GaveUp) return;
+    if (g_bigWanted && g_gate.Placed()) {
+        if (!g_verified || g_gate.PhaseNow() != MinimapSizeGate::Phase::Applied) return;   // the minimap placement is not in the table (yet)
+        g_bigGate.ConfigureMirror(g_gate.Target());   // the same geometry is not written again
+    } else if (g_bigGate.Mirrored()) {
+        g_bigGate.Configure(1.0f);   // ring_map or ring_map_big switched off: the big radar's stock values go back once, from the saved originals
+    } else if (!g_bigGate.HasOriginal()) {
+        return;                      // never mirrored: nothing of ours in the big slots
+    }
+    const MinimapTrio cur = readable ? PickTrio(all, kMinimapEntries, kBigmapRoleNames) : MinimapTrio();
+    const MinimapSizeGate::Act act = g_bigGate.Next(cur, readable, nowMs);
+    if (act == MinimapSizeGate::Act::None) {
+        if (g_bigGate.PhaseNow() == MinimapSizeGate::Phase::GaveUp) {
+            g_bigVerified = false;
+            GLOGW("engine: ring map round 2 (0.5.4): the big radar's slots GAVE UP, left as they are (the ring map waits for the minimap slots only): %s",
+                  g_bigGate.Why().c_str());
+        }
+        return;
+    }
+    std::string err;
+    const MinimapTrio target = g_bigGate.Target();
+    if (!WriteTarget(target, err, kBigmapRoleNames)) {
+        g_bigVerified = false;
+        g_bigGate.WriteFailed();
+        GLOGW("engine: ring map round 2 (0.5.4): the big radar's write failed and the old bytes were put back: %s (failures %u)", err.c_str(),
+              g_bigGate.Counters().writeFailures);
+        return;
+    }
+    g_bigVerified = true;
+    g_written = true;
+    if (g_bigLogs < kMaxBigLogs) {
+        ++g_bigLogs;
+        std::string line;
+        for (int r = 0; r < 3; ++r)
+            line += std::string(r ? "; " : "") + RoleName(r, kBigmapRoleNames) + " (slot " + std::to_string(target.index[r]) + ") " +
+                    Geo(g_bigGate.Original().c[r]) + " -> " + Geo(target.c[r]);
+        GLOGI("engine: ring map round 2 (0.5.4): the ring placement %s into the big radar's slots, read back identical: %s",
+              !g_bigGate.Mirrored() ? "taken back (stock values)" : act == MinimapSizeGate::Act::Apply ? "MIRRORED" : "re-asserted", line.c_str());
+    }
+    g_bigLastWritten = target;
+}
+
+} // namespace
+
 float AppliedScale() {
     if (g_res != Res::Ready || !g_verified) return 1.0f;
     return g_gate.PhaseNow() == MinimapSizeGate::Phase::Applied ? g_gate.Scale() : 1.0f;
@@ -418,6 +490,14 @@ std::string Status() {
         if (ReadTable(all)) {
             const MinimapTrio t = PickTrio(all, kMinimapEntries);
             if (t.AllFound()) live = std::string("; table now: ") + RoleName(0) + " " + Geo(t.c[0]) + ", " + RoleName(1) + " " + Geo(t.c[1]);
+            if (g_bigWanted) {
+                const MinimapTrio bt = PickTrio(all, kMinimapEntries, kBigmapRoleNames);
+                const char* ph = g_bigGate.PhaseNow() == MinimapSizeGate::Phase::Applied ? (g_bigVerified ? "mirrored (read back)" : "NOT verified")
+                               : g_bigGate.PhaseNow() == MinimapSizeGate::Phase::GaveUp ? "GAVE UP"
+                               : g_bigGate.PhaseNow() == MinimapSizeGate::Phase::Waiting ? "waiting" : "not yet";
+                live += std::string("; big radar (0.5.4 ring_map_big) ") + ph + ", re-asserts " + std::to_string(g_bigGate.Counters().reasserts);
+                if (bt.AllFound()) live += std::string(", bigmap ") + Geo(bt.c[0]);
+            }
         }
         return std::string(b) + live;
     }

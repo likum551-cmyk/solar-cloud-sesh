@@ -3729,7 +3729,7 @@ void UiInit(float scale)
     static const ImWchar kDigitRanges[] = { 0x0030, 0x0039, 0 };   // the 96 px speed: ten glyphs, not a 96 px Latin-1 atlas
     // weight: stb_truetype's coverage is linear; the goldens (Skia) boost small text's contrast, so the 12-14 px faces came out 15-20 % lighter
     // at the same peak (the critic's edge measurements): those faces are baked with RasterizerMultiply.
-    // size: the component's kSize (0.5.1: the ring at 0.825, the car cluster at 0.6), so each face is baked at the size it is drawn at
+    // size: the component's kSize (0.5.1: the ring at 0.825; 0.5.4: the car cluster at 0.69), so each face is baked at the size it is drawn at
     const auto loadSofia = [&](float design, float size, const ImWchar* ranges = kLatinRanges, float weight = 1.0f) {
         Fnt f;
         f.design = design;

@@ -697,6 +697,8 @@ const HashMapping kCrossmap3889[] = {
     {native::END_SCALEFORM_MOVIE_METHOD,                       0xE6B753D52F4CA222},
     {native::SET_BIGMAP_ACTIVE,                                0xC2F71CC2AB70CFB1},
     {native::GET_SAFE_ZONE_SIZE,                               0x897B441FF18ECBBB},
+    // 0.5.4 ring_map_zoom: natlookup.mjs 2026-11-07, YimMenu b3889 and YimMenuV2 enhanced AGREE.
+    {native::SET_RADAR_ZOOM,                                   0x4D2F1CB87CBF249D},
     // freemode look (ApplyPedOutfit), same YimMenu b3889 source: natives.hpp enum index 4134 / 4135 /
     // 4140 -> crossmap.hpp[index]. Each also equals YimMenuV2 `enhanced` g_Crossmap[Natives.hpp index
     // 4214 / 4215 / 4220] (two separately indexed lists agreeing by native name). Not live-checked
@@ -4681,6 +4683,11 @@ bool World::ScaleformCallInt(int handle, const char* method, int arg, bool& bega
 bool World::SetBigmap(bool on) {
     uint64_t arg[] = { on ? 1u : 0u, 0 };    // SET_BIGMAP_ACTIVE(toggleBigMap, showFullMap = false)
     return CallNative(native::SET_BIGMAP_ACTIVE, arg, 2, nullptr);
+}
+
+bool World::SetRadarZoom(int level) {
+    uint64_t arg[] = { (uint64_t)(uint32_t)level };   // SET_RADAR_ZOOM(zoomLevel)
+    return CallNative(native::SET_RADAR_ZOOM, arg, 1, nullptr);
 }
 
 bool World::SafeZoneSize(float& out) {

@@ -64,7 +64,9 @@ namespace gage::sync::hudcar {
     // 0.4.34 GI after the first live look (2026-11-06): "make speedometer and its thing below about 50% smaller". The whole cluster (dial, fuel row,
     // strip, chips) is drawn at kSize of the design about its own bottom-right corner (kCompX + kCompW, kCompY), so the 56 px margins stay.
     // 0.5.1 GI after the 0.5.0 look: "make speedo about 20% bigger": 0.5 x 1.2.
-    constexpr float kSize = 0.6f;
+    // 0.5.4 GI (2026-11-07): "enlarge speedometer and its things by 15%": 0.6 x 1.15. The Sofia faces and the icon glows are baked at kSize
+    // (overlay_ui.cpp UiInit), so they follow; the anchor corner (56 px margins) does not move.
+    constexpr float kSize = 0.69f;
     inline float DesignScale(float displayH) { return hudring::DesignScale(displayH); }
     inline float Scale(float displayH) { return DesignScale(displayH) * kSize; }
     // x is measured from the RIGHT edge (the component's anchor), y from the bottom.

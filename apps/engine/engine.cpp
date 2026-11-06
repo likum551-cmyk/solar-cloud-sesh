@@ -51,6 +51,7 @@
 #include "sync/hypertune.h"
 #include "sync/vehicle_shake.h"
 #include "sync/pausemenu.h"
+#include "sync/overlay_input.h"   // 0.5.4 overlay_combat_block: the controls an open panel holds disabled
 #include "sync/radio_off.h"
 #include "sync/mapclear.h"
 #include "sync/minimap.h"
@@ -840,6 +841,10 @@ namespace {
     float              g_miniAppliedScale = 1.0f;     // what the game's table holds now (read back); the overlay's radar rectangle and the clearance check use it
     std::atomic<bool>  g_hudRing{true};               // 0.4.31 hud_ring (MinimapReadSwitches)
     std::atomic<bool>  g_ringMap{true};               // 0.5.2 ring_map: GTA's radar moved into the ring (MinimapReadSwitches)
+    std::atomic<bool>  g_ringMapBig{true};            // 0.5.4 ring_map_big: the placement also written to the big radar's slots (MinimapReadSwitches)
+    std::atomic<int>   g_ringMapZoom{sync::kRingMapZoomDefault};   // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM level each tick, 0 = the game's own zoom
+    std::atomic<bool>  g_overlayCombatBlock{true};    // 0.5.4 overlay_combat_block (sync/overlay_input.h)
+    bool               g_overlayCombatLogged = false; // script tick only
     void MinimapScaleRead()
     {
         const sync::ParsedScale p = sync::ParseMinimapScale(reg::Get(L"minimap_scale"));
@@ -868,6 +873,23 @@ namespace {
               g_hudRing.load() ? "on (the REV1 vitals ring bottom-left; minimap ignored)" : "OFF (the 0.4.30 vitals and GTA's radar per minimap)",
               !g_hudRing.load() ? "n/a (no ring)" : g_ringMap.load() ? "on (GTA's radar moved into the ring, its corners covered; LIVE-UNVERIFIED)"
                                                                    : "OFF (the ring without a map, GTA's radar hidden)");
+        // 0.5.4 (GI 2026-11-07: "map is just a square over the hp and sat bar, not a circle inside of it + make it more zoomed out"). Each default
+        // on, 0 = the 0.5.3 behaviour. ring_map_big: the 0.5.2 probes show GTA's BIG radar (the expanded one, table slots bigmap / _mask / _blur,
+        // never written by 0.5.2) on the safe-zone corner, about 620 px square on 1440p, over the whole ring; the ring placement goes into those
+        // slots too, so the radar lands in the ring in either mode. ring_map_zoom: SET_RADAR_ZOOM(level) every tick while the ring map shows.
+        g_ringMapBig.store(reg::Get(L"ring_map_big") != L"0");
+        {
+            const sync::RingZoom z = sync::ParseRingMapZoom(reg::Get(L"ring_map_zoom"));
+            g_ringMapZoom.store(z.level);
+            GLOGI("engine: ring map round 2 (0.5.4): ring_map_big=%s; ring_map_zoom=%d (%s)%s",
+                  g_ringMapBig.load() ? "on (the placement mirrored into the big radar's slots; LIVE-UNVERIFIED)" : "OFF (minimap slots only, as 0.5.3)",
+                  z.level, z.level == 0 ? "the game's own zoom, as 0.5.3" : "SET_RADAR_ZOOM every tick while the ring map shows; LIVE-UNVERIFIED",
+                  z.why ? z.why : "");
+        }
+        g_overlayCombatBlock.store(reg::Get(L"overlay_combat_block") != L"0");
+        GLOGI("engine: overlay input (0.5.4): overlay_combat_block=%s", g_overlayCombatBlock.load()
+                  ? "on (an open panel also holds attack2 / melee / weapon / sniper / vehicle-melee controls above 226; LIVE-UNVERIFIED)"
+                  : "OFF (controls 0-226 only, as 0.5.3)");
         const sync::BarsMode bm = sync::ParseBarsMode(reg::Get(L"minimap_bars"));
         g_barsMode.store((int)bm);
         g_barsReset.store(true);
@@ -4028,16 +4050,24 @@ namespace {
         // disable everything in one call are not in the 3889 crossmap, hence the loop.
         // While the pause menu (opened by TickPauseMenu, not pausing) is up, 199 / 200 / 202 stay
         // enabled: Esc, P and Backspace are how the player closes it.
+        // 0.5.4 overlay_combat_block (sync/overlay_input.h): the same loop also holds the attack / melee / weapon controls above 226 (INPUT_ATTACK2
+        // 257 is the left mouse button too: GI's shots fired through the Tab inventory).
         if (game::Overlay::Interactive())
         {
-            for (uint64_t control = 0; control < 227; ++control)
+            int held[sync::overlayinput::kMaxHeld];
+            const int n = sync::overlayinput::HeldControls(g_overlayCombatBlock.load(), g_pauseMenuActive, held, sync::overlayinput::kMaxHeld);
+            for (int i = 0; i < n; ++i)
             {
-                if (g_pauseMenuActive && (control == (uint64_t)sync::kControlFrontendPause ||
-                                          control == (uint64_t)sync::kControlFrontendPauseAlt ||
-                                          control == (uint64_t)sync::kControlFrontendCancel))
-                    continue;
-                uint64_t args[] = { 0, control, 1 };  // DISABLE_CONTROL_ACTION(0, control, true)
+                uint64_t args[] = { 0, (uint64_t)held[i], 1 };  // DISABLE_CONTROL_ACTION(0, control, true)
                 g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+            }
+            if (!g_overlayCombatLogged)
+            {
+                g_overlayCombatLogged = true;
+                GLOGI("engine: overlay input (0.5.4): a panel is open, %d pad-0 controls held disabled each tick (overlay_combat_block=%s)", n,
+                      g_overlayCombatBlock.load() ? "on: 0-226 plus attack2 257, weapon 261/262, melee 263/264, sniper zoom 274-277, veh fly attack2 331, "
+                                                    "veh melee 345-347"
+                                                  : "OFF: 0-226 only, the 0.5.3 set");
             }
         }
     }
@@ -4135,9 +4165,12 @@ namespace {
         uint32_t wSettled = 0, wHiddenTrue = 0, wRenderFalse = 0;     // radar wanted: IS_RADAR_HIDDEN reading true / IS_MINIMAP_RENDERING reading false are the bad answers
         uint32_t uSettled = 0, uHiddenFalse = 0;                        // radar not wanted: IS_RADAR_HIDDEN reading false is the bad answer
         uint32_t setupOk = 0, setupBeginRefused = 0, barsUncallable = 0, requestFailed = 0;
+        uint32_t zoomCalls = 0, zoomUncallable = 0;                     // 0.5.4 ring_map_zoom
     };
     constexpr double kMiniSettleMs = 500.0, kMiniSampleMs = 100.0, kMiniLogMs = 10000.0, kMiniSafeZoneMs = 2000.0;
     MinimapStats g_mini;
+    bool g_ringZoomLogged = false;            // 0.5.4: the first SET_RADAR_ZOOM's line (script tick only)
+    bool g_ringZoomHeld = false;              // 0.5.4: our level was set last tick (SET_RADAR_ZOOM(0) once when the ring map stops showing)
     float g_miniSafe = 1.0f;                  // GET_SAFE_ZONE_SIZE (read every kMiniSafeZoneMs; the player can change it in the settings)
     bool g_miniSafeOk = false;
     double g_miniSafeMs = -1e18;
@@ -4222,10 +4255,12 @@ namespace {
               s.wSettled, s.wHiddenTrue, s.wRenderFalse, s.uSettled, s.uHiddenFalse, s.hudHidden, s.prefOff, s.readUnresolved, s.waypointSamples, g_miniMovie,
               g_miniMovieLoaded ? "loaded" : "NOT loaded", s.setupOk, s.setupBeginRefused, s.barsUncallable, bs.requests, s.requestFailed, bs.refreshOn,
               bs.refreshOff, g_barsGate.BigmapOn() ? "YES" : "no", clearance.c_str());
+        const uint32_t zoomCalls = s.zoomCalls, zoomUncallable = s.zoomUncallable;
         g_barsGate.ClearCounters();
         s = MinimapStats();
-        GLOGI("engine: minimap size (0.4.25), last 10 s: %s; radar rectangle scale %.2f (what the overlay's vitals strip and the clearance check use)",
-              game::minimapsize::Status().c_str(), (double)g_miniAppliedScale);
+        GLOGI("engine: minimap size (0.4.25), last 10 s: %s; radar rectangle scale %.2f (what the overlay's vitals strip and the clearance check use); "
+              "ring map zoom (0.5.4) SET_RADAR_ZOOM(%d) calls %u, uncallable %u",
+              game::minimapsize::Status().c_str(), (double)g_miniAppliedScale, g_ringMapZoom.load(), zoomCalls, zoomUncallable);
     }
 
     // 0.4.25 minimap_scale: configure the table writer from the registry value (minimap=0 means the radar is hidden, so nothing is touched), let it run, and
@@ -4248,6 +4283,7 @@ namespace {
                 const sync::hudring::Pt c = sync::hudring::MapCentrePx(ui.displayH);
                 const sync::MinimapPlacement p = sync::RingPlacement(ui.displayW, ui.displayH, g_miniSafe, g_miniSafeOk, c.x, c.y,
                                                                      sync::hudring::MapSquarePx(ui.displayH));
+                game::minimapsize::SetBigMirror(g_ringMapBig.load());   // 0.5.4 ring_map_big: the big radar's slots get the same geometry
                 game::minimapsize::ConfigurePlacement(p, "ring_map");   // the same placement is not written again
                 g_miniCfgScale = -1.0f;
             }
@@ -4348,6 +4384,26 @@ namespace {
             ++(wanted ? s.radarOn : s.radarOff);
         else
             ++s.radarUncallable;
+        // 0.5.4 ring_map_zoom: the ring's map further out (GI: "make it more zoomed out"), held every tick while the radar shows in the ring.
+        const int zoom = g_ringMapZoom.load();
+        if (wanted && zoom > 0 && g_hudRing.load() && g_ringMap.load())
+        {
+            const bool ok = g_world->SetRadarZoom(zoom);
+            ++(ok ? s.zoomCalls : s.zoomUncallable);
+            if (!g_ringZoomLogged)
+            {
+                g_ringZoomLogged = true;
+                GLOGI("engine: ring map zoom (0.5.4): SET_RADAR_ZOOM(%d) %s, held every tick while the ring map shows", zoom,
+                      ok ? "called" : "FAILED (native not callable)");
+            }
+            g_ringZoomHeld = ok;
+        }
+        else if (g_ringZoomHeld)
+        {
+            // The ring map stopped showing (radar hidden, ring_map / hud_ring off): hand the zoom back to the game once, in case the level persists.
+            g_ringZoomHeld = false;
+            g_world->SetRadarZoom(0);
+        }
 
         // GTA's health / armour bars: the gate decides, this performs. The movie's loaded flag is read only when the gate could use it.
         sync::BarsInputs bi;
