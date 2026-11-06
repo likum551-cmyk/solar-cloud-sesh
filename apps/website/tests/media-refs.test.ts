@@ -31,11 +31,16 @@ function refs(): Map<string, string[]> {
 }
 
 describe('media references', () => {
-  it('finds the references and the files it checks (the hero still and the server art among them)', () => {
+  it('finds the references and the files it checks (the hero still and the reel among them)', () => {
     const r = refs();
-    expect(r.size).toBeGreaterThanOrEqual(4);
-    for (const name of ['still-skyline.webp', 'server-sol.webp']) expect(r.has(name)).toBe(true);
+    expect(r.size).toBeGreaterThanOrEqual(12);
+    for (const name of ['still-skyline.webp', 'reel-car.webp', 'reel-office.webp', 'reel-boulevard.webp', 'still-canal.webp']) expect(r.has(name)).toBe(true);
     expect(PRESENT.has('still-skyline.webp')).toBe(true);
+  });
+
+  // GI, 2026-11-06: the servers "without default gta poster": our own emblems, no key art on the landing page
+  it('shows no GTA V key-art poster on the landing page', () => {
+    expect(indexHtml).not.toMatch(/\/media\/(server-|cast-|franklin|michael|trevor)/);
   });
 
   it('names only files that exist in public/media', () => {

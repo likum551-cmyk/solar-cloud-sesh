@@ -179,6 +179,7 @@ button.plate--ghost:disabled { background: transparent; color: var(--ink-4); }
 .foot__nav a { font: 700 16px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; text-decoration: none; color: var(--ink-2); padding: 8px 0; }
 .foot__nav a:hover { color: var(--sun); }
 .foot__legal { margin-left: auto; max-width: 60ch; font-size: 14px; color: var(--ink-3); }
-@media (max-width: 760px) { .foot__legal { margin-left: 0; } }
+/* below 1100 px the legal line wraps onto its own row, where margin-left: auto floated it indented */
+@media (max-width: 1099px) { .foot__legal { margin-left: 0; flex-basis: 100%; } }
 /* No grain layer: a fixed full-window overlay blend made the browser re-composite the whole page over the
    playing footage on every frame (GI, 2026-11-06: "a bit laggy"). */

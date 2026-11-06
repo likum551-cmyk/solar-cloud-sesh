@@ -1,6 +1,10 @@
 # solar-rp.com: direction
 
-## Current (2026-11-06): community hub
+## Current (2026-11-06, evening): "Big RP project"
+
+GI on the community hub below: "grim asf", "What SOL runs today is what i dont like", servers "without default gta poster", "it needs more anim". GI picked "Big RP project" (bright and warm like the big GTA RP projects' pages) and our own server emblems. Each section has its own ground (hero photo, ember reel, sunset servers band, cream steps band, ember quests band, the canal still for the close), so no screen reads black. Tilted, floating in-game photos in gold-rim cut frames; counters that tick up; a photo marquee; SOL / LUNA / TERRA as cards with our own sun / moon / earth SVG emblems; steps that draw in on scroll. Motion is CSS transform / opacity only, with no video, no WebGL and no key art on the landing page (`tests/media-refs.test.ts`), and it is all off under reduced motion. Page map: `SHOTS.md`. System: `DESIGN.md`. Contract: `.impeccable/surfaces/apps-website-index-html.md`.
+
+## Retired: community hub (2026-11-06, afternoon)
 
 The trailer cold open below was rejected three times in one day ("too animated, make it more professional", "too many videos, a bit laggy", then "this is a joke, FULL REDESIGN, remove this disgusting 3D S"). GI chose the category standard played straight: a GTA RP project's home page in the manner of the big FiveM/RageMP projects' sites and Steam store pages. Hero = one dimmed in-game photo, the pitch, DOWNLOAD and SOL's live status; then servers, what SOL runs today, how to join, quests and coins, the download. No video, no 3D, no scroll-driven motion, type at human sizes, gold only for the primary action and the live dot. The page map is `SHOTS.md`; the direction contract is the surface brief `.impeccable/surfaces/apps-website-index-html.md`. Do not bring back the 3D S, a letterbox, title cards or full-window blends without GI asking for them by name.
 

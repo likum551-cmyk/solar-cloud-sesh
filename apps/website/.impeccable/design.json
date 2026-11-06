@@ -1,174 +1,211 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-06T22:00:00+04:00",
-  "title": "Design System: Solar RP website (solar-rp.com)",
+  "generatedAt": "2026-11-06T23:30:00+04:00",
+  "title": "Design System: Solar RP website",
   "designMd": "apps/website/DESIGN.md",
   "extensions": {
     "colorMeta": {
-      "ground": { "role": "neutral", "displayName": "Night Ground", "canonical": "#0a0907", "tonalRamp": ["#040302", "#0a0907", "#100e0b", "#17140f", "#201c16", "#7a7266", "#b3aa9a", "#f7f2e8"] },
-      "black": { "role": "neutral", "displayName": "Pit Black", "canonical": "#040302" },
-      "panel": { "role": "neutral", "displayName": "Panel", "canonical": "#100e0b" },
-      "panel-2": { "role": "neutral", "displayName": "Raised Panel", "canonical": "#17140f" },
-      "panel-3": { "role": "neutral", "displayName": "Slot", "canonical": "#201c16" },
-      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#f7f2e8", "tonalRamp": ["#201c16", "#3d3830", "#5c564c", "#7a7266", "#968e80", "#b3aa9a", "#d9d1c3", "#f7f2e8"] },
-      "ink-2": { "role": "neutral", "displayName": "Ink 2 (ledes, body)", "canonical": "#d9d1c3" },
-      "ink-3": { "role": "neutral", "displayName": "Ink 3 (labels, meta)", "canonical": "#b3aa9a" },
-      "ink-4": { "role": "neutral", "displayName": "Ink 4 (disabled, offline)", "canonical": "#7a7266" },
-      "line": { "role": "neutral", "displayName": "Hairline 12%", "canonical": "rgb(255 244 224 / 0.12)" },
-      "line-2": { "role": "neutral", "displayName": "Rule 20%", "canonical": "rgb(255 244 224 / 0.2)" },
-      "line-3": { "role": "neutral", "displayName": "Control Line 38%", "canonical": "rgb(255 244 224 / 0.38)" },
-      "sun": { "role": "primary", "displayName": "Sun Gold", "canonical": "#f2b134", "tonalRamp": ["#3a2805", "#5e420b", "#8a6210", "#c98d16", "#f2b134", "#ffc75a", "#ffdb94", "#fff0d1"] },
-      "sun-hi": { "role": "primary", "displayName": "Sun Lift (hover, focus ring)", "canonical": "#ffc75a" },
-      "sun-lo": { "role": "primary", "displayName": "Sun Pressed", "canonical": "#c98d16" },
-      "on-sun": { "role": "primary", "displayName": "Burnt Umber (text on gold)", "canonical": "#1a1206" },
-      "alarm": { "role": "tertiary", "displayName": "Ember Alarm (errors only)", "canonical": "#ff8f6b", "tonalRamp": ["#3d150a", "#662513", "#99391f", "#cc5a3a", "#ff8f6b", "#ffab8f", "#ffc8b5", "#ffe6dc"] }
+      "sun": { "role": "primary", "displayName": "Solar Gold", "canonical": "#f2b134", "tonalRamp": ["oklch(15% 0.03 75)", "oklch(27% 0.06 75)", "oklch(39% 0.09 75)", "oklch(51% 0.12 75)", "oklch(63% 0.14 75)", "oklch(75% 0.15 75)", "oklch(85% 0.12 80)", "oklch(95% 0.05 85)"] },
+      "sun-hi": { "role": "primary", "displayName": "Sun High", "canonical": "#ffc75a" },
+      "sun-lo": { "role": "primary", "displayName": "Sun Low", "canonical": "#c98d16" },
+      "on-sun": { "role": "primary", "displayName": "Burnt Ink", "canonical": "#1a1206" },
+      "ember": { "role": "secondary", "displayName": "Ember", "canonical": "#ff7a2f", "tonalRamp": ["oklch(15% 0.04 48)", "oklch(27% 0.08 48)", "oklch(39% 0.12 48)", "oklch(51% 0.16 48)", "oklch(63% 0.19 48)", "oklch(73% 0.18 48)", "oklch(84% 0.11 52)", "oklch(95% 0.04 55)"] },
+      "ember-deep": { "role": "secondary", "displayName": "Deep Ember", "canonical": "#c2410c", "tonalRamp": ["oklch(15% 0.04 40)", "oklch(27% 0.08 40)", "oklch(39% 0.13 40)", "oklch(51% 0.17 40)", "oklch(60% 0.18 40)", "oklch(72% 0.14 42)", "oklch(84% 0.08 45)", "oklch(95% 0.03 48)"] },
+      "rim-gold": { "role": "secondary", "displayName": "Rim Gold", "canonical": "#ffd27a" },
+      "band-gold": { "role": "secondary", "displayName": "Band Gold", "canonical": "#ffd166" },
+      "rose": { "role": "secondary", "displayName": "Sunset Rose", "canonical": "#ff4f6d", "tonalRamp": ["oklch(15% 0.05 15)", "oklch(27% 0.09 15)", "oklch(39% 0.14 15)", "oklch(51% 0.18 15)", "oklch(63% 0.21 15)", "oklch(73% 0.17 15)", "oklch(84% 0.10 15)", "oklch(95% 0.03 15)"] },
+      "luna": { "role": "tertiary", "displayName": "Luna Moonlight", "canonical": "#9cc2ff", "tonalRamp": ["oklch(15% 0.03 260)", "oklch(27% 0.06 260)", "oklch(39% 0.09 260)", "oklch(51% 0.11 260)", "oklch(63% 0.11 260)", "oklch(75% 0.10 260)", "oklch(85% 0.07 260)", "oklch(95% 0.02 260)"] },
+      "terra": { "role": "tertiary", "displayName": "Terra Green", "canonical": "#4fd18b", "tonalRamp": ["oklch(15% 0.04 155)", "oklch(27% 0.07 155)", "oklch(39% 0.10 155)", "oklch(51% 0.13 155)", "oklch(63% 0.15 155)", "oklch(75% 0.16 155)", "oklch(86% 0.10 155)", "oklch(95% 0.04 155)"] },
+      "ground": { "role": "neutral", "displayName": "Landing Ground", "canonical": "#0c0906", "tonalRamp": ["oklch(15% 0.01 60)", "oklch(25% 0.015 60)", "oklch(37% 0.02 60)", "oklch(49% 0.02 65)", "oklch(61% 0.02 70)", "oklch(73% 0.02 75)", "oklch(85% 0.02 80)", "oklch(95% 0.01 85)"] },
+      "ground-base": { "role": "neutral", "displayName": "Shared Ground (base.css, account pages)", "canonical": "#0a0907" },
+      "ember-dusk": { "role": "neutral", "displayName": "Ember Dusk (band seams)", "canonical": "#2a1208" },
+      "sunset-top": { "role": "neutral", "displayName": "Sunset Band Top", "canonical": "#34160a" },
+      "sunset-mid": { "role": "neutral", "displayName": "Sunset Band Mid", "canonical": "#7a2e0c" },
+      "sunset-hot": { "role": "neutral", "displayName": "Sunset Band Hot", "canonical": "#b4470f" },
+      "sunset-foot": { "role": "neutral", "displayName": "Sunset Band Foot", "canonical": "#5e250b" },
+      "ember-top": { "role": "neutral", "displayName": "Ember Band Top", "canonical": "#24100a" },
+      "ember-mid": { "role": "neutral", "displayName": "Ember Band Mid", "canonical": "#4a1d0b" },
+      "cream": { "role": "neutral", "displayName": "Cream Band", "canonical": "#f4ead8", "tonalRamp": ["oklch(15% 0.02 80)", "oklch(27% 0.03 80)", "oklch(39% 0.04 75)", "oklch(51% 0.04 75)", "oklch(63% 0.04 78)", "oklch(75% 0.04 80)", "oklch(86% 0.035 80)", "oklch(94% 0.03 80)"] },
+      "cream-ink": { "role": "neutral", "displayName": "Cream Ink", "canonical": "#1f150a" },
+      "cream-ink-2": { "role": "neutral", "displayName": "Cream Ink 2", "canonical": "#55432e" },
+      "band-ink": { "role": "neutral", "displayName": "Band Ink", "canonical": "#f0dfc6" },
+      "band-ink-bright": { "role": "neutral", "displayName": "Band Ink Bright", "canonical": "#f7ead6" },
+      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#f7f2e8" },
+      "ink-2": { "role": "neutral", "displayName": "Ink 2", "canonical": "#d9d1c3" },
+      "ink-3": { "role": "neutral", "displayName": "Ink 3", "canonical": "#b3aa9a" },
+      "ink-4": { "role": "neutral", "displayName": "Ink 4", "canonical": "#7a7266" },
+      "panel-3": { "role": "neutral", "displayName": "Disabled Panel", "canonical": "#201c16" },
+      "line": { "role": "neutral", "displayName": "Hairline", "canonical": "rgb(255 244 224 / 0.12)" },
+      "line-2": { "role": "neutral", "displayName": "Hairline 2", "canonical": "rgb(255 244 224 / 0.2)" },
+      "line-3": { "role": "neutral", "displayName": "Control Outline", "canonical": "rgb(255 244 224 / 0.38)" },
+      "alarm": { "role": "neutral", "displayName": "Alarm (errors only)", "canonical": "#ff8f6b" }
     },
     "typographyMeta": {
-      "display": { "displayName": "Hero", "purpose": "The landing H1 only, uppercase, max 15ch; 42-60px on phones." },
-      "headline": { "displayName": "Section title", "purpose": "Every section's title, uppercase, balanced." },
-      "name": { "displayName": "Server name", "purpose": "A server's name in its own section." },
-      "figure": { "displayName": "Figure", "purpose": "The status panel's server name, a reward amount." },
-      "title": { "displayName": "Title", "purpose": "Fact headings and quest titles (26-28px), uppercase." },
-      "plate-label": { "displayName": "Plate label", "purpose": "Plate text; 16/17/19/20-24/22-28px for xs/sm/md/lg/xl." },
-      "label-nav": { "displayName": "Nav label", "purpose": "Bar links; footer links 16px at 0.1em." },
-      "label": { "displayName": "Label", "purpose": "Status state, lead-ins, units, small caps links (15-17px, 0.08-0.1em)." },
-      "body-lead": { "displayName": "Lead", "purpose": "Section ledes and descriptions, ink-2, 46-52ch." },
-      "body": { "displayName": "Body", "purpose": "Running text, tabular figures; 16px in lists and steps." },
-      "body-strong": { "displayName": "Step title", "purpose": "Step titles, sentence case." },
-      "body-small": { "displayName": "Fine", "purpose": "Captions, meta, fact labels (13-15px, ink-3)." }
+      "display": { "displayName": "Display", "purpose": "Hero H1 and the close title, uppercase, over photos." },
+      "headline": { "displayName": "Headline", "purpose": "Section titles, uppercase, balanced." },
+      "server-name": { "displayName": "Server Name", "purpose": "SOL on its card; next names at clamp(40px, 3.6vw, 54px)." },
+      "figure": { "displayName": "Figure", "purpose": "Counting tally numbers in gold; quest reward at clamp(60px, 5.6vw, 88px)." },
+      "title": { "displayName": "Title", "purpose": "Quest titles, uppercase." },
+      "step-title": { "displayName": "Step Title", "purpose": "Step headings on the cream band, sentence case." },
+      "body": { "displayName": "Body", "purpose": "All prose; tabular numerals." },
+      "lede": { "displayName": "Lede", "purpose": "Section and hero ledes, max 44-46ch." },
+      "label": { "displayName": "Label", "purpose": "Caps terms, tags, pill text (14-18px, 0.1-0.14em)." },
+      "action": { "displayName": "Action", "purpose": "Plate labels; 17 / 20-24 / 22-28px for sm / lg / xl." }
     },
+    "cuts": [
+      { "name": "corner-cut", "value": "polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%)", "purpose": "The S mark's 45-degree top-right cut on every plate, card, pill, number and photo." },
+      { "name": "cut-sizes", "value": "8px xs plate, 9px sm plate, 10px pill, 12px plate, 14px lg plate / step number, 16px xl plate, 18px reel still, 20px next card, 22px frame / quest card, 30px SOL card / quests photo", "purpose": "The cut scales with the object." },
+      { "name": "cut-ring", "value": "clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w))", "purpose": "Outlines and focus rings that follow the cut, drawn on ::before / ::after." }
+    ],
     "shadows": [
-      { "name": "title-halo", "value": "text-shadow: 0 2px 24px rgb(0 0 0 / 0.35)", "purpose": "The hero H1 over the still." },
-      { "name": "nav-halo", "value": "text-shadow: 0 1px 12px rgb(0 0 0 / 0.7)", "purpose": "Bar links over the still before the bar turns solid." },
-      { "name": "bar-rule", "value": "box-shadow: 0 1px 0 rgb(255 244 224 / 0.12)", "purpose": "The solid bar's bottom edge." },
-      { "name": "live-halo", "value": "box-shadow: 0 0 0 3px rgb(242 177 52 / 0.18)", "purpose": "The online dot only." },
-      { "name": "hero-shade", "value": "linear-gradient(180deg, rgb(10 9 7 / 0.55) 0, rgb(10 9 7 / 0) 180px), linear-gradient(180deg, rgb(10 9 7 / 0) 55%, #0a0907 100%), linear-gradient(90deg, rgb(10 9 7 / 0.82) 0%, rgb(10 9 7 / 0.5) 36%, rgb(10 9 7 / 0.06) 70%, rgb(10 9 7 / 0.2) 100%)", "purpose": "Left-weighted grade on the hero still; the foot fades into the ground." }
+      { "name": "photo-float", "value": "filter: drop-shadow(0 30px 40px rgb(0 0 0 / 0.5))", "purpose": "Tilted in-game photos (0.45 on the quests photo)." },
+      { "name": "coin-glow", "value": "filter: drop-shadow(0 8px 18px rgb(242 177 52 / 0.45))", "purpose": "The quest coin." },
+      { "name": "headline-lift", "value": "text-shadow: 0 4px 30px rgb(0 0 0 / 0.35)", "purpose": "Display type over photos (0.4 on the close)." },
+      { "name": "nav-lift", "value": "text-shadow: 0 1px 12px rgb(0 0 0 / 0.7)", "purpose": "Bar links over the hero photo." },
+      { "name": "gold-breath", "value": "radial-gradient(closest-side, rgb(255 170 60 / 0.55), rgb(255 122 47 / 0.18) 60%, transparent) at inset -18px -26px", "purpose": "Breathing blob behind the primary Download only." },
+      { "name": "bar-solid", "value": "box-shadow: 0 1px 0 rgb(255 244 224 / 0.12)", "purpose": "The bar's bottom line once scrolled." }
+    ],
+    "grounds": [
+      { "name": "hero", "value": "still-skyline photo + radial gold 0.42 / rose 0.22 glow + left-to-right ground scrim 0.86 to 0.08, fading to ground at the foot" },
+      { "name": "reel", "value": "linear-gradient(180deg, ground, ember-dusk)" },
+      { "name": "sunset", "value": "radial gold 0.38 at 18% 30% + radial rose 0.22 at 88% 80% + linear-gradient(170deg, sunset-top, sunset-mid 35%, sunset-hot 68%, sunset-foot)" },
+      { "name": "cream", "value": "cream fill, cream-ink text" },
+      { "name": "ember", "value": "radial gold 0.3 at 80% 40% + linear-gradient(160deg, ember-top, ember-mid 55%, ember-dusk)" },
+      { "name": "close", "value": "still-canal photo + ember-dusk top fade + left scrim 0.82 to 0.05, full-width shade under 760px" }
     ],
     "motion": [
-      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Every entrance and plate press." },
-      { "name": "rise", "value": "700ms ease-out, opacity 0 and translateY 14px to rest; copy 80ms, status panel 220ms; once on load", "purpose": "The one authored moment: hero copy and status panel." },
-      { "name": "plate", "value": "background 160ms, transform 160ms ease-out", "purpose": "Plate hover and press." },
-      { "name": "field", "value": "border-color 150ms, box-shadow 150ms", "purpose": "Field hover and focus." },
-      { "name": "bar", "value": "background 300ms", "purpose": "Bar turning solid on scroll." },
-      { "name": "coin-gain", "value": "2200ms ease-out: gold 0-45%, back to ink", "purpose": "Account: balance after a claim." },
-      { "name": "paid-wipe", "value": "420ms linear, a 64px gold bar skewed -45deg crossing the row once, then removed", "purpose": "Account: the row just paid." },
-      { "name": "reduced-motion", "value": "no rise, no transitions on plates or fields, no coin or wipe animation", "purpose": "prefers-reduced-motion: reduce." }
+      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Every arrival, reveal and parallax." },
+      { "name": "plate-press", "value": "160ms background, 160ms transform", "purpose": "Plate hover and press." },
+      { "name": "arrive", "value": "1100ms, staggered 250 / 400 / 550ms, from translateY(60px) scale(0.92) opacity 0", "purpose": "Hero photo cards, once." },
+      { "name": "rise", "value": "900ms, from translateY(24px) opacity 0, delays 60-420ms", "purpose": "Hero copy, once." },
+      { "name": "reveal", "value": "900ms opacity + transform, stagger calc(var(--i) * 140ms); per block: rise 32px, SOL from -48px x scale 0.97, photo from +60px rotate 8deg, close rise 48px scale 0.97", "purpose": "Blocks as they scroll in (IntersectionObserver, threshold 0.04)." },
+      { "name": "steps-draw", "value": "line scale 1300ms (+200ms); numbers scale 0.4 rotate -12deg 800ms; text 700ms; stagger 220ms", "purpose": "How-to-join steps." },
+      { "name": "float", "value": "7s / 8s / 9s ease-in-out infinite, rotate +-1.5deg, translateY -10 to -18px", "purpose": "Hero photo cards." },
+      { "name": "parallax", "value": "translate by --px/--py x depth 26 / 14 / 8 px, 600ms", "purpose": "Hero stack on a fine pointer, while the hero is on screen." },
+      { "name": "breathe", "value": "3.2s (call) / 6s (stack sun), opacity and scale 1.06", "purpose": "Gold glows." },
+      { "name": "drift", "value": "14s alternate, translate3d(-3%, 2%) scale 1.08", "purpose": "Hero glow." },
+      { "name": "slide", "value": "60s linear, translateX(calc(-50% - 10px)), paused on hover", "purpose": "Reel marquee." },
+      { "name": "emblem-idle", "value": "rays spin 30s (6s on hover), sun pulse 3.6s, stars twinkle 2.6s, land 14s, coin flip 5s (1.2s on hover)", "purpose": "Server emblems and the coin." },
+      { "name": "count", "value": "1600ms, ease-out quart, on 60% visibility", "purpose": "Tally and reward figures." },
+      { "name": "reduced-motion", "value": "animation: none; transition: none; reveals forced visible", "purpose": "prefers-reduced-motion: reduce stops everything, scripts skip counters, reveals and parallax." }
     ],
     "breakpoints": [
-      { "name": "hero-split", "value": "min-width: 1001px" },
-      { "name": "two-column", "value": "min-width: 961px" },
-      { "name": "account-stack", "value": "max-width: 899px" },
-      { "name": "phone", "value": "max-width: 760px" },
-      { "name": "bar-compact", "value": "max-width: 560px" },
-      { "name": "quest-stack", "value": "max-width: 480px" }
-    ]
+      { "name": "phone-nav", "value": "560px" },
+      { "name": "next-2up", "value": "700px" },
+      { "name": "phone", "value": "760px" },
+      { "name": "steps-row", "value": "860px" },
+      { "name": "split", "value": "960px" },
+      { "name": "hero-split", "value": "1000px" },
+      { "name": "sol-facts", "value": "1100px" }
+    ],
+    "sharedPages": {
+      "files": "login/, signup/, account/ import src/base.css + src/account.css, not src/styles.css",
+      "tokensRelied": ["--ground (#0a0907)", "--black", "--panel", "--panel-2", "--panel-3", "--ink", "--ink-2", "--ink-3", "--ink-4", "--line", "--line-2", "--line-3", "--sun", "--sun-hi", "--on-sun", "--alarm", "--f-display", "--f-text", "--gutter", "--bar-h", "--ease-out"],
+      "components": ["plate (all sizes, ghost, disabled, busy)", "bar", "foot"],
+      "note": "The landing-only tokens (--ember, --ember-deep, --luna, --terra, --cream*, the #0c0906 ground override) are not visible to them."
+    }
   },
   "components": [
     {
       "name": "Primary Plate",
       "kind": "button",
-      "refersTo": "plate",
-      "description": "The gold action (Download, a form's submit), cut like the mark; focus is a ring that follows the cut.",
-      "html": "<a class=\"ds-plate\" href=\"#\">Download Solar Launcher</a> <a class=\"ds-plate ds-plate--sm\" href=\"#\">Download</a>",
-      "css": ".ds-plate { --c: 12px; position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 12px; height: 44px; padding: 0 22px; background: var(--sun, #f2b134); color: var(--on-sun, #1a1206); font: 800 19px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms, transform 160ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-plate:hover { background: var(--sun-hi, #ffc75a); } .ds-plate:active { background: var(--sun-lo, #c98d16); transform: translateY(1px); } .ds-plate::before, .ds-plate::after { --w: 1px; content: none; position: absolute; inset: 0; pointer-events: none; clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-plate:focus-visible { outline: none; } .ds-plate:focus-visible::before { content: ''; --w: 4px; background: var(--ink, #f7f2e8); } .ds-plate:focus-visible::after { content: ''; --w: 2px; background: var(--on-sun, #1a1206); } .ds-plate--sm { --c: 9px; height: 38px; padding: 0 16px; font-size: 17px; }"
+      "refersTo": "plate-primary",
+      "description": "The one gold action, cut at the top right like the S mark.",
+      "html": "<a class=\"ds-plate\" href=\"#\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" aria-hidden=\"true\"><path d=\"M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z\" fill=\"currentColor\"/></svg><span>Download Solar Launcher</span></a>",
+      "css": ".ds-plate { --c: 14px; position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 12px; height: 56px; padding: 0 30px; background: var(--sun, #f2b134); color: var(--on-sun, #1a1206); font: 800 22px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms, transform 160ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-plate:hover { background: var(--sun-hi, #ffc75a); } .ds-plate:active { background: var(--sun-lo, #c98d16); transform: translateY(1px); } .ds-plate:focus-visible { outline: none; } .ds-plate:focus-visible::before { --w: 4px; content: ''; position: absolute; inset: 0; background: #f7f2e8; clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-plate:focus-visible::after { --w: 2px; content: ''; position: absolute; inset: 0; background: #1a1206; clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); }"
     },
     {
       "name": "Ghost Plate",
       "kind": "button",
       "refersTo": "plate-ghost",
-      "description": "The quiet action: outlined by a 1px ring that follows the cut, never gold.",
-      "html": "<a class=\"ds-ghost\" href=\"#\">Create account</a>",
-      "css": ".ds-ghost { --c: 12px; position: relative; display: inline-flex; align-items: center; justify-content: center; height: 44px; padding: 0 22px; background: transparent; color: var(--ink, #f7f2e8); font: 800 19px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms; } .ds-ghost::before { --w: 1px; content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(255 244 224 / 0.38); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-ghost:hover { background: rgb(255 244 224 / 0.07); } .ds-ghost:active { background: rgb(255 244 224 / 0.11); } .ds-ghost:focus-visible { outline: 2px solid var(--sun-hi, #ffc75a); outline-offset: 3px; }"
+      "description": "The quiet action: a cut-following outline, never gold.",
+      "html": "<a class=\"ds-plate-ghost\" href=\"#\">Create account</a>",
+      "css": ".ds-plate-ghost { --c: 14px; --w: 1px; position: relative; display: inline-flex; align-items: center; height: 56px; padding: 0 30px; background: transparent; color: #f7f2e8; font: 800 22px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms; } .ds-plate-ghost::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(255 244 224 / 0.38); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-plate-ghost:hover { background: rgb(255 244 224 / 0.07); } .ds-plate-ghost:active { background: rgb(255 244 224 / 0.11); } .ds-plate-ghost:focus-visible { outline: 2px solid #ffc75a; outline-offset: 3px; }"
     },
     {
-      "name": "Server Status Panel",
+      "name": "Status Pill",
+      "kind": "chip",
+      "refersTo": "status-pill",
+      "description": "SOL's live state under the hero CTAs; the dot shows only for a measured state.",
+      "html": "<p class=\"ds-pill\"><span class=\"ds-pill__state\"><span class=\"ds-dot\"></span>Online</span><span class=\"ds-pill__name\">SOL</span><span class=\"ds-pill__meta\">Roleplay &middot; Europe</span></p>",
+      "css": ".ds-pill { --c: 10px; --w: 1px; position: relative; display: inline-flex; align-items: center; gap: 12px; margin: 0; padding: 10px 16px 10px 14px; background: rgb(12 9 6 / 0.72); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); font: 700 16px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; } .ds-pill::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(242 177 52 / 0.45); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-pill__state { display: inline-flex; align-items: center; gap: 8px; color: #f2b134; } .ds-pill__name { color: #f7f2e8; } .ds-pill__meta { color: #d9d1c3; letter-spacing: 0.08em; } .ds-dot { width: 9px; height: 9px; border-radius: 50%; background: #f2b134; box-shadow: 0 0 0 3px rgb(242 177 52 / 0.2); }"
+    },
+    {
+      "name": "Gold-Rim Photo Frame",
+      "kind": "custom",
+      "refersTo": "frame",
+      "description": "In-game photo in a cut frame whose 3px rim is the frame's own gold-to-ember fill, so the diagonal keeps its rim.",
+      "html": "<span class=\"ds-frame\"><span class=\"ds-frame__img\"></span></span>",
+      "css": ".ds-frame { --c: 22px; display: block; width: 320px; padding: 3px; background: linear-gradient(135deg, #ffd27a, #ff7a2f); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); filter: drop-shadow(0 30px 40px rgb(0 0 0 / 0.5)); } .ds-frame__img { --c: calc(22px - 1.24px); display: block; aspect-ratio: 16 / 9; background: linear-gradient(170deg, #34160a, #b4470f 70%, #5e250b); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); }"
+    },
+    {
+      "name": "Server Card (Next)",
       "kind": "card",
-      "refersTo": "status-panel",
-      "description": "The store-page info box beside the pitch; gold dot only for a measured online state, the Players row only with a measured count.",
-      "html": "<aside class=\"ds-status\"><div class=\"ds-status__head\"><h2 class=\"ds-status__name\">SOL</h2><p class=\"ds-status__state\" data-tone=\"online\"><span class=\"ds-dot\"></span>Online</p></div><dl class=\"ds-status__facts\"><div><dt>Players</dt><dd>12 / 100</dd></div><div><dt>Mode</dt><dd>Roleplay</dd></div><div><dt>Region</dt><dd>Europe</dd></div></dl></aside> <aside class=\"ds-status\"><div class=\"ds-status__head\"><h2 class=\"ds-status__name\">SOL</h2><p class=\"ds-status__state\" data-tone=\"offline\"><span class=\"ds-dot\"></span>Offline right now</p></div></aside>",
-      "css": ".ds-status { --c: 18px; --w: 1px; position: relative; width: 360px; padding: 24px 24px 20px; background: rgb(16 14 11 / 0.92); color: var(--ink, #f7f2e8); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); font: 400 17px/1.55 'Sofia Sans', system-ui, sans-serif; } .ds-status::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(255 244 224 / 0.2); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-status__head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid rgb(255 244 224 / 0.12); } .ds-status__name { margin: 0; font: 800 44px/0.9 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.02em; } .ds-status__state { margin: 0 6px 0 0; display: inline-flex; align-items: center; gap: 9px; font: 700 17px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; } .ds-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3, #b3aa9a); } .ds-status__state[data-tone='online'] .ds-dot { background: var(--sun, #f2b134); box-shadow: 0 0 0 3px rgb(242 177 52 / 0.18); } .ds-status__state[data-tone='offline'] { color: var(--ink-3, #b3aa9a); } .ds-status__state[data-tone='offline'] .ds-dot { background: var(--ink-4, #7a7266); } .ds-status__facts { margin: 0; } .ds-status__facts > div { display: flex; justify-content: space-between; gap: 16px; padding: 11px 0; border-bottom: 1px solid rgb(255 244 224 / 0.12); } .ds-status__facts dt { font-size: 14px; color: var(--ink-3, #b3aa9a); } .ds-status__facts dd { margin: 0; font-size: 15px; font-weight: 600; text-align: right; }"
+      "refersTo": "server-card-next",
+      "description": "LUNA / TERRA card on the sunset band: own emblem, caps name, tag in the server colour, cut ring at 60% of it.",
+      "html": "<div class=\"ds-band\"><article class=\"ds-next\" style=\"--col:#9cc2ff\"><svg class=\"ds-emblem\" viewBox=\"0 0 120 120\" aria-hidden=\"true\"><defs><mask id=\"ds-m-luna\"><rect width=\"120\" height=\"120\" fill=\"#fff\"/><circle cx=\"72\" cy=\"50\" r=\"24\" fill=\"#000\"/></mask></defs><path class=\"ds-emblem__badge\" d=\"M2 2H94L118 26V118H2Z\"/><circle cx=\"58\" cy=\"62\" r=\"28\" fill=\"#9cc2ff\" mask=\"url(#ds-m-luna)\"/><g fill=\"#eef4ff\"><path d=\"M88 74l5 5-5 5-5-5z\"/><path d=\"M96 92l3.5 3.5L96 99l-3.5-3.5z\"/></g></svg><div><div class=\"ds-next__top\"><h3 class=\"ds-next__name\">LUNA</h3><p class=\"ds-next__tag\">Next</p></div><p class=\"ds-next__desc\">The moon. Opens after SOL, in the same launcher, with the same account.</p></div></article></div>",
+      "css": ".ds-band { padding: 32px; background: linear-gradient(170deg, #34160a 0%, #7a2e0c 35%, #b4470f 68%, #5e250b 100%); } .ds-next { --c: 20px; --w: 1px; position: relative; display: flex; gap: 22px; align-items: center; padding: 22px 26px; background: rgb(12 9 6 / 0.42); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 400ms; color: #f7f2e8; } .ds-next::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: color-mix(in srgb, var(--col) 60%, transparent); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-next:hover { background: rgb(12 9 6 / 0.6); } .ds-emblem { width: 96px; height: 96px; flex: none; overflow: visible; } .ds-emblem__badge { fill: color-mix(in srgb, var(--col) 16%, rgb(12 9 6 / 0.55)); stroke: var(--col); stroke-width: 1.5; } .ds-next__top { display: flex; align-items: baseline; gap: 14px; } .ds-next__name { margin: 0; font: 800 54px/0.9 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.02em; } .ds-next__tag { margin: 0; font: 700 15px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.14em; text-transform: uppercase; color: var(--col); } .ds-next__desc { margin: 8px 0 0; font: 400 16px/1.55 'Sofia Sans', system-ui, sans-serif; color: #f0dfc6; }"
     },
     {
-      "name": "Quest Card",
-      "kind": "card",
-      "refersTo": "quest-card",
-      "description": "A raised panel with the 18px cut: the quest on the left, the reward as a figure on the right.",
-      "html": "<div class=\"ds-quest\"><div><h3 class=\"ds-quest__title\">Link your Discord</h3><p class=\"ds-quest__desc\">Connect your Discord account to your Solar RP account.</p></div><p class=\"ds-quest__reward\"><span class=\"ds-quest__amount\">500</span>coins</p></div>",
-      "css": ".ds-quest { --c: 18px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: center; width: 520px; padding: 24px 28px; background: var(--panel-2, #17140f); color: var(--ink, #f7f2e8); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); } .ds-quest__title { margin: 0; font: 800 28px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.02em; text-transform: uppercase; } .ds-quest__desc { margin: 8px 0 0; font: 400 15px/1.55 'Sofia Sans', system-ui, sans-serif; color: var(--ink-2, #d9d1c3); } .ds-quest__reward { margin: 0; text-align: right; font: 700 15px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3, #b3aa9a); white-space: nowrap; } .ds-quest__amount { display: block; margin-bottom: 4px; font: 800 44px/0.9 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.01em; color: var(--ink, #f7f2e8); }"
-    },
-    {
-      "name": "Join Step",
+      "name": "Step Number",
       "kind": "custom",
       "refersTo": "step-number",
-      "description": "A numbered step: 48px slot-grey number plate with a 10px cut, a sentence-case title and one line.",
-      "html": "<ol class=\"ds-steps\"><li><span class=\"ds-steps__n\">1</span><h3>Download Solar Launcher</h3><p>Install it on Windows 10 or 11.</p></li><li><span class=\"ds-steps__n\">2</span><h3>Create your account</h3><p>One account for this site, the launcher and the servers.</p></li></ol>",
-      "css": ".ds-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, 260px); gap: 32px 48px; color: var(--ink, #f7f2e8); font-family: 'Sofia Sans', system-ui, sans-serif; } .ds-steps li { padding-top: 22px; border-top: 1px solid rgb(255 244 224 / 0.2); } .ds-steps__n { --c: 10px; display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: 18px; background: var(--panel-3, #201c16); font: 800 28px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); } .ds-steps h3 { margin: 0; font-size: 19px; font-weight: 700; line-height: 1.3; } .ds-steps p { margin: 6px 0 0; font-size: 16px; color: var(--ink-2, #d9d1c3); }"
+      "description": "How-to-join step on the cream band: gold-to-ember cut number, Sofia Sans title and text.",
+      "html": "<div class=\"ds-cream\"><div class=\"ds-step\"><span class=\"ds-step__n\">1</span><div><h3 class=\"ds-step__t\">Download Solar Launcher</h3><p class=\"ds-step__p\">Install it on Windows 10 or 11. It finds your GTA V by itself.</p></div></div></div>",
+      "css": ".ds-cream { padding: 32px; background: #f4ead8; color: #1f150a; } .ds-step { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 20px; align-items: start; } .ds-step__n { --c: 14px; display: grid; place-items: center; width: 72px; height: 72px; background: linear-gradient(135deg, #ffcf6b, #f2b134 40%, #ff7a2f); color: #1f150a; font: 800 40px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); } .ds-step__t { margin: 6px 0 8px; font: 700 23px/1.25 'Sofia Sans', system-ui, sans-serif; } .ds-step__p { margin: 0; max-width: 36ch; font: 400 16px/1.55 'Sofia Sans', system-ui, sans-serif; color: #55432e; }"
     },
     {
-      "name": "Text Field",
-      "kind": "input",
-      "refersTo": "field-input",
-      "description": "Square 50px field on raised panel; focus turns the border gold, an error turns it alarm.",
-      "html": "<label class=\"ds-field\"><span class=\"ds-field__label\">Email</span><input class=\"ds-field__input\" value=\"player@example.com\"></label> <label class=\"ds-field is-invalid\"><span class=\"ds-field__label\">Username</span><input class=\"ds-field__input\" value=\"a\"><span class=\"ds-field__error\">Use 3 to 20 letters, numbers or underscores.</span></label>",
-      "css": ".ds-field { display: grid; width: 320px; font-family: 'Sofia Sans', system-ui, sans-serif; } .ds-field__label { margin-bottom: 8px; font: 600 15px/1.2 'Sofia Sans', system-ui, sans-serif; color: var(--ink-2, #d9d1c3); } .ds-field__input { height: 50px; padding: 0 14px; font: 400 17px/1 'Sofia Sans', system-ui, sans-serif; color: var(--ink, #f7f2e8); background: var(--panel-2, #17140f); border: 1px solid rgb(255 244 224 / 0.38); border-radius: 0; caret-color: var(--sun, #f2b134); transition: border-color 150ms, box-shadow 150ms; } .ds-field__input:hover { border-color: rgb(255 244 224 / 0.55); } .ds-field__input:focus { outline: none; border-color: var(--sun, #f2b134); box-shadow: inset 0 0 0 1px var(--sun, #f2b134); } .ds-field.is-invalid .ds-field__input { border-color: var(--alarm, #ff8f6b); } .ds-field__error { margin-top: 8px; font-size: 15px; line-height: 1.4; font-weight: 600; color: var(--alarm, #ff8f6b); }"
-    },
-    {
-      "name": "Chip",
-      "kind": "chip",
-      "refersTo": "chip",
-      "description": "Square condensed-caps tag; confirmed state turns gold.",
-      "html": "<span class=\"ds-chip\">Not verified</span> <span class=\"ds-chip ds-chip--ok\">Verified</span>",
-      "css": ".ds-chip { display: inline-flex; align-items: center; padding: 5px 8px; font: 700 13px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3, #b3aa9a); box-shadow: inset 0 0 0 1px rgb(255 244 224 / 0.2); white-space: nowrap; } .ds-chip--ok { color: var(--sun, #f2b134); box-shadow: inset 0 0 0 1px rgb(242 177 52 / 0.6); }"
+      "name": "Tally",
+      "kind": "custom",
+      "refersTo": "figure",
+      "description": "Hero counter row: caps term, counting gold figure, short note, hairline top in gold.",
+      "html": "<dl class=\"ds-tally\"><div><dt>Servers</dt><dd>3</dd><p>SOL open, LUNA and TERRA next</p></div><div><dt>Street NPCs</dt><dd>0</dd><p>every person you meet is a player</p></div></dl>",
+      "css": ".ds-tally { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 28px; margin: 0; padding: 24px; background: #0c0906; } .ds-tally > div { padding-top: 14px; border-top: 1px solid rgb(242 177 52 / 0.4); } .ds-tally dt { font: 700 14px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.14em; text-transform: uppercase; color: #b3aa9a; } .ds-tally dd { margin: 8px 0 0; font: 800 60px/0.9 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; color: #f2b134; font-variant-numeric: tabular-nums; } .ds-tally p { margin: 6px 0 0; font: 400 14px/1.4 'Sofia Sans', system-ui, sans-serif; color: #b3aa9a; }"
     },
     {
       "name": "Top Bar",
       "kind": "nav",
-      "refersTo": "bar",
-      "description": "64px bar: condensed caps links in ink-2, Log in, and a small gold Download plate; solid ground with a hairline once scrolled.",
-      "html": "<header class=\"ds-bar\"><span class=\"ds-bar__brand\">SOLAR RP</span><nav class=\"ds-bar__nav\"><a href=\"#\">Servers</a><a href=\"#\">How to join</a><a href=\"#\">Quests</a></nav><a class=\"ds-bar__link\" href=\"#\">Log in</a><a class=\"ds-bar__dl\" href=\"#\">Download</a></header>",
-      "css": ".ds-bar { display: flex; align-items: center; gap: 32px; height: 64px; padding: 0 32px; background: var(--ground, #0a0907); box-shadow: 0 1px 0 rgb(255 244 224 / 0.12); } .ds-bar__brand { font: 800 26px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.04em; color: var(--ink, #f7f2e8); } .ds-bar__nav { display: flex; gap: 32px; margin-left: auto; } .ds-bar__nav a, .ds-bar__link { padding: 10px 0; font: 700 19px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; color: var(--ink-2, #d9d1c3); } .ds-bar__nav a:hover, .ds-bar__link:hover { color: var(--ink, #f7f2e8); } .ds-bar__nav a:focus-visible, .ds-bar__link:focus-visible, .ds-bar__dl:focus-visible { outline: 2px solid var(--sun-hi, #ffc75a); outline-offset: 3px; } .ds-bar__dl { display: inline-flex; align-items: center; height: 38px; padding: 0 16px; background: var(--sun, #f2b134); color: var(--on-sun, #1a1206); font: 800 17px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - 9px) 0, 100% 9px, 100% 100%, 0 100%); transition: background 160ms; } .ds-bar__dl:hover { background: var(--sun-hi, #ffc75a); }"
+      "refersTo": "nav",
+      "description": "Fixed bar: caps section links, account link and a small Download plate; scrim at rest, opaque once scrolled.",
+      "html": "<header class=\"ds-bar\"><nav class=\"ds-bar__nav\"><a href=\"#\">Servers</a><a href=\"#\">How to join</a><a href=\"#\">Quests</a></nav><a class=\"ds-bar__link\" href=\"#\">Log in</a><a class=\"ds-bar__plate\" href=\"#\">Download</a></header>",
+      "css": ".ds-bar { display: flex; align-items: center; gap: 32px; height: 64px; padding: 0 24px; background: #0c0906; box-shadow: 0 1px 0 rgb(255 244 224 / 0.12); } .ds-bar__nav { display: flex; gap: 28px; margin-left: auto; } .ds-bar__nav a, .ds-bar__link { font: 700 19px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; color: #d9d1c3; padding: 10px 0; } .ds-bar__nav a:hover, .ds-bar__link:hover { color: #f7f2e8; } .ds-bar a:focus-visible { outline: 2px solid #ffc75a; outline-offset: 3px; } .ds-bar__plate { --c: 9px; display: inline-flex; align-items: center; height: 38px; padding: 0 16px; background: #f2b134; color: #1a1206; font: 800 17px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms; } .ds-bar__plate:hover { background: #ffc75a; }"
     }
   ],
   "narrative": {
-    "northStar": "The Project's Front Desk",
-    "overview": "A GTA RP project's home page, played straight: what the server is, whether it is up, how to get in, in that order. The page is a warm near-black ground with one dimmed in-game still at the top, a short column of sections divided by hairlines, condensed caps headings at human sizes, and one gold action. It reads like the big FiveM/RageMP projects' sites and a Steam store page: an info panel beside the pitch, facts in rows, steps in three columns, a download block that says what the file is and what it needs.\n\nThis world replaced a trailer cold open (letterbox, a three.js 3D S, giant title cards, footage loops, full-window blends) that the owner rejected three times on 2026-11-06, ending \"this is a joke, FULL REDESIGN, remove this disgusting 3D S\", after \"too animated, make it more professional\" and \"too many videos, a bit laggy\". Those rejections are standing rules here, not history.\n\nDensity is moderate and even: sections of 56-96px vertical padding, a 1440px measure, every claim backed by a live value or a shipped feature. Real GTA V stills carry all the colour; the chrome stays neutral warm ink.",
+    "northStar": "Golden Hour Over Los Santos",
+    "overview": "A big, warm RP project home that is already moving when it opens. The page never sits on one ground: it walks from a sunset photo through an ember reel, a sunset band, a cream band and a second ember band, and closes on the river at golden hour. Bands meet edge to edge, joined only by short gradient fades of the ember-dusk tone, so no viewport reads as black. Gold and ember light lives inside each band as soft radial glows; it never floats over the page as a full-window layer.\n\nImagery is in-game footage only, framed in the S mark's 45-degree top-right cut with a gold rim that follows the diagonal. The servers are drawn with the project's own SVG emblems (sun, moon, earth on a cut badge), never GTA key art. Names and numbers are tall Sofia Sans Extra Condensed 800 caps; sentences are Sofia Sans. Motion is CSS transform and opacity loops plus scroll reveals; a script only drives counters, reveals and pointer parallax, and reduced motion stops all of it.\n\nThe confirmed rejections are the owner's: the dark quiet hub (\"grim asf\"), the 3D S, hero video, and any default GTA poster as server art.",
     "keyCharacteristics": [
-      "One dimmed in-game still per page, never video, never a montage.",
-      "Warm near-black ground, opaque panels, 1px warm hairlines; no glass, no blur.",
-      "One gold: the primary action and a state the system has measured or confirmed.",
-      "Sofia Sans Extra Condensed 800 caps for headings and labels at human sizes (hero max 88px); Sofia Sans for every sentence.",
-      "The mark's single 45-degree top-right cut on plates and panels; no radius anywhere except the status dot.",
-      "One authored motion: the hero copy and status panel rise once on load."
+      "Per-section grounds: photo, ember, sunset, cream, ember, photo.",
+      "Gold and ember radial glows contained inside their band.",
+      "One silhouette everywhere: the top-right 45-degree cut (clip-path), on plates, cards, pills, numbers and photos.",
+      "Gold-rim cut frames on every in-game photo outside the reel.",
+      "Own emblems with idle loops (rays turn, stars twinkle, land drifts, coin flips).",
+      "Extra Condensed 800 caps for names and numbers; Sofia Sans for prose; tabular numerals throughout."
     ],
     "rules": [
-      { "name": "The Measured Gold Rule", "body": "Gold fills only the primary action and a state the system has measured or confirmed: a server that reported itself online, a verified email, a password rule met, coins paid, a claimed quest segment. A static \"Open\" gets no dot at all; an unmeasured value is never gold. Gold as interaction feedback (focus ring, link hover, field focus border, caret) is allowed; gold as decoration is not.", "section": "colors" },
-      { "name": "The Picture Carries Colour Rule", "body": "Type, panels and chrome stay warm-neutral; any colour beyond the one gold comes from the GTA V still behind it.", "section": "colors" },
-      { "name": "The Alarm Is Not Gold Rule", "body": "Errors take Ember Alarm, never gold; a failing password rule before submit is plain ink-2, it turns alarm only after a submit.", "section": "colors" },
-      { "name": "The Human Size Rule", "body": "Headings stop at human sizes: the hero H1 tops out at 88px (5.5rem), section titles at 62px. No giant slogans, no title cards.", "section": "typography" },
-      { "name": "The Name Face Rule", "body": "The condensed face is for names, headings, figures, plate labels and short caps labels. Every sentence is Sofia Sans in sentence case.", "section": "typography" },
-      { "name": "The Opaque Rule", "body": "Panels, plates and bars are opaque or near-opaque (the status panel is 92% panel over the still). No backdrop blur, no glass, no translucent bar over moving content.", "section": "elevation" },
-      { "name": "The No Full-Window Blend Rule", "body": "No fixed full-window overlay, grain layer or blend mode over the page; the shade belongs to the image it grades.", "section": "elevation" },
-      { "name": "The One Cut Rule", "body": "One corner, top right, 45 degrees. No border radius, no other notches, no rotated or skewed panels.", "section": "shapes" }
+      { "name": "The Ground Walks Rule", "body": "Every section owns its ground (photo, ember gradient, sunset gradient or cream). A new landing section picks one of these grounds; it never sits on bare ground with a glow on it.", "section": "colors" },
+      { "name": "The Glow Stays Home Rule", "body": "Glows are radial gradients inside a band or behind one element (the gold call's breathing blob, the stack's sun). No fixed or full-window glow, grain or blend layer.", "section": "colors" },
+      { "name": "The One Gold Action Rule", "body": "Solid gold fill means \"act\". The quiet action is the ghost plate (outlined with line-3), never a second gold.", "section": "colors" },
+      { "name": "The Caps Are For Names Rule", "body": "Extra Condensed caps carry names, numbers, labels and calls; a sentence is always Sofia Sans in sentence case.", "section": "typography" },
+      { "name": "The Light Not Lift Rule", "body": "Elements gain presence through warm light behind them and a soft drop shadow on photos; nothing uses a hard or offset shadow.", "section": "elevation" }
     ],
     "dos": [
-      "Do use one dimmed in-game GTA V still per page, graded only on the side the type stands on, with its source recorded in `ASSETS.md`.",
-      "Do spend gold on the primary action and on states the system has measured or confirmed (The Measured Gold Rule).",
-      "Do show a live value only when the API returned it; hide the row otherwise.",
-      "Do keep headings at human sizes: hero at most 88px, section titles at most 62px.",
-      "Do cut plates and panels with the single top-right 45-degree corner, and draw outlines on cut shapes as evenodd rings.",
-      "Do put facts in hairline rows and keep sentences in Sofia Sans, sentence case, 42-52ch.",
-      "Do keep the bar opaque once anything moves under it."
+      "**Do** give every new landing section one of the established grounds (photo under a scrim, ember gradient, sunset gradient, cream) and join it to its neighbour with an ember-dusk fade.",
+      "**Do** cut every plate, card, pill, number and photo at the top-right 45 degrees, scaled to the object (8-30 px), and draw outlines as cut-following rings.",
+      "**Do** frame in-game photos in the gold-rim cut frame; use in-game footage only.",
+      "**Do** keep loops on transform and opacity, start them under the `.enter` class, and stop every animation and transition under `prefers-reduced-motion: reduce` with content left in its final, visible state.",
+      "**Do** put the final value in the markup of anything that counts or reveals, so a page whose script never runs still reads right.",
+      "**Do** keep the solid gold fill for the one action; the secondary action is the ghost plate.",
+      "**Do** use Deep Ember for accents on cream and Band Gold for accents on the sunset band."
     ],
     "donts": [
-      "Don't add a 3D logo or any real-time 3D; the owner rejected the 3D S (\"remove this disgusting 3D S\").",
-      "Don't use video, footage loops or a montage; the owner rejected it (\"too many videos, a bit laggy\").",
-      "Don't add scroll-driven motion, letterboxes, title cards or giant slogans (\"too animated, make it more professional\").",
-      "Don't add fixed full-window overlays, grain layers or blend modes over the page.",
-      "Don't use gold as decoration or for an unmeasured state; a static \"Open\" gets no dot.",
-      "Don't invent counts, prices, quotes, rules, testimonials or features; only what the shipped client and SOL do, and Discord stays \"soon\" with no link until an invite exists.",
-      "Don't show Rockstar or GTA V logos, Pricedown, or anything that implies an official Rockstar product.",
-      "Don't use glass, backdrop blur, border radius or drop shadows on panels and plates.",
-      "Don't set sentences in the condensed face."
+      "**Don't** use GTA key art or a default GTA poster to represent a server; servers get their own emblems.",
+      "**Don't** add a fixed or full-window glow, grain or blend layer over the page.",
+      "**Don't** use video or WebGL on the landing page.",
+      "**Don't** round corners or use box shadows on cut shapes; the clip-path cuts them off.",
+      "**Don't** use alarm for anything but errors and the maintenance state.",
+      "**Don't** use Luna or Terra outside their own server card.",
+      "**Don't** show an unmeasured number: a live dot or player count appears only when the server reports it."
     ]
   }
 }

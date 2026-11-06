@@ -47,6 +47,8 @@ const OWN = [
   ...['sol', 'luna', 'terra'].map((n) => `server-${n}.webp`),
   // the HUD plates: crops of a render of the client's own overlay code (ASSETS.md); not remade by encode-media.mjs
   'hud-ring.webp', 'hud-car.webp',
+  // the reel: 960x540 WebP q80 copies of the stills above and the launcher's (ASSETS.md); made by hand with ffmpeg
+  ...['skyline', 'beach', 'canal', 'pool', 'observatory', 'downtown', 'freeway', 'streets', 'car', 'vinewood', 'office', 'boulevard'].map((n) => `reel-${n}.webp`),
 ];
 const ownMissing = OWN.filter((f) => !fs.existsSync(path.join(OUT, f)));
 if (ownMissing.length) {
