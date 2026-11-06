@@ -35,19 +35,10 @@ html, body { background: var(--ground); }
 .cta__status:empty { display: none; }
 .plate__icon { width: 20px; height: 20px; flex: none; }
 
-/* a photo in a cut frame with a thin cream edge, like a print (the edge is the frame's own fill showing
-   round the picture, so the diagonal keeps it) */
-.frame {
-  --c: 22px; --w: 3px;
-  display: block; padding: var(--w);
-  background: rgb(244 234 216 / 0.9);
-  clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%);
-}
-.frame img {
-  --c: calc(22px - 1.24px);
-  width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: cover;
-  clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%);
-}
+/* a photo printed with a thin cream edge: square corners (a print has no cut; the 45-degree cut stays on
+   buttons, the pill and cards) */
+.frame { display: block; padding: 4px; background: #f4ead8; }
+.frame img { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: cover; }
 
 /* live dot: only for a measured "online" (servers.ts); open and next carry no dot */
 .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: none; }
@@ -105,17 +96,6 @@ html, body { background: var(--ground); }
 /* with a live count the line is long: on a phone the meta moves whole onto its own line */
 @media (max-width: 560px) { .pill { flex-wrap: wrap; row-gap: 8px; } }
 
-/* two plain facts under the call, label beside value */
-.facts { display: grid; gap: 10px; margin-top: 34px; max-width: 560px; padding-top: 18px; border-top: 1px solid var(--line-2); }
-.facts > div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 16px; align-items: baseline; }
-.facts dt { font: 700 14px/1.4 var(--f-display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-3); }
-.facts dd { font-size: 15px; color: var(--ink-2); }
-/* GI 2026-11-07: "into editions add cracked Coming soon" */
-.facts__soon {
-  display: inline-block; margin-left: 8px; padding: 3px 7px; vertical-align: 1px;
-  font: 700 12px/1 var(--f-display); letter-spacing: 0.12em; text-transform: uppercase;
-  color: var(--sun); box-shadow: inset 0 0 0 1px rgb(242 177 52 / 0.55);
-}
 
 /* the photo stack: three in-game shots, tilted, floating, following the pointer (main.ts sets --px / --py) */
 .stack { --px: 0; --py: 0; position: relative; height: clamp(320px, 42vw, 580px); }
@@ -174,7 +154,8 @@ html, body { background: var(--ground); }
 .emblem--xl { width: clamp(140px, 14vw, 200px); height: auto; }
 .emblem__ring { fill: none; stroke: var(--col); stroke-width: 2; opacity: 0.55; }
 .emblem__body { fill: var(--col); }
-.emblem__globe { fill: none; stroke: var(--col); stroke-width: 5; }
+/* LUNA's crescent shadow and TERRA's land: the ground laid over the disc */
+.emblem__shade { fill: rgb(12 9 6 / 0.45); }
 
 .sol {
   --col: var(--sun); --c: 30px;
@@ -186,7 +167,6 @@ html, body { background: var(--ground); }
   clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%);
 }
 @media (min-width: 760px) { .sol { grid-template-columns: auto minmax(0, 1fr); } }
-@media (min-width: 1100px) { .sol { grid-template-columns: auto minmax(0, 1fr) minmax(240px, 300px); } }
 .sol__top { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
 .sol__name { font: 800 clamp(72px, 8vw, 120px)/0.85 var(--f-display); letter-spacing: 0.02em; }
 .sol__state {
@@ -197,13 +177,6 @@ html, body { background: var(--ground); }
 .sol__state .dot { background: var(--on-sun); }
 .sol__mode { margin-top: 14px; font: 700 18px/1.3 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--band-gold); }
 .sol__desc { margin: 12px 0 26px; max-width: 52ch; font-size: 18px; color: var(--band-ink); }
-.sol__facts { display: grid; align-self: stretch; align-content: center; }
-@media (min-width: 760px) and (max-width: 1099px) { .sol__facts { grid-column: 2; } }
-@media (min-width: 1100px) { .sol__facts { padding-left: 32px; border-left: 1px solid rgb(255 209 102 / 0.25); } }
-.sol__facts > div { display: flex; justify-content: space-between; gap: 16px; padding: 12px 0; border-top: 1px solid rgb(255 209 102 / 0.18); }
-.sol__facts > div:first-child { border-top: 0; }
-.sol__facts dt { font: 700 15px/1.4 var(--f-display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--band-gold); }
-.sol__facts dd { font-size: 16px; text-align: right; color: var(--band-ink); }
 
 /* the planned servers are a list, not more cards: mark, name, state, one line, ruled off */
 .next { list-style: none; margin: 28px 0 0; padding: 0; }
@@ -226,9 +199,10 @@ html, body { background: var(--ground); }
 .join .section__lede { color: var(--cream-ink-2); }
 .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 28px; counter-reset: none; }
 .steps li { padding-top: 18px; border-top: 2px solid var(--cream-ink); }
-.steps__n { font: 700 15px/1 var(--f-display); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ember-deep); }
-.steps h3 { font: 700 23px/1.25 var(--f-text); margin: 12px 0 8px; }
-.steps li > p:last-child { color: var(--cream-ink-2); font-size: 16px; max-width: 36ch; }
+/* a big numeral in the display face; #a8360a holds 5.5:1 on the cream */
+.steps__n { font: 800 clamp(72px, 7vw, 112px)/0.85 var(--f-display); color: #a8360a; }
+.steps h3 { font: 700 23px/1.25 var(--f-text); margin: 14px 0 8px; }
+.steps li > p:last-child { color: var(--cream-ink-2); font-size: 16px; max-width: 44ch; }
 @media (min-width: 860px) { .steps { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 40px; } }
 
 /* ---------- 5. quests, on an ember band ---------- */
@@ -260,8 +234,6 @@ html, body { background: var(--ground); }
 .quest__reward small { font-size: 0.36em; letter-spacing: 0.12em; text-transform: uppercase; color: var(--band-ink); }
 .quests .plate[hidden] { display: none; }
 .quests__photo { margin: 0; transform: rotate(1.5deg); filter: drop-shadow(0 26px 34px rgb(0 0 0 / 0.45)); }
-.quests__photo .frame { --c: 30px; }
-.quests__photo .frame img { --c: calc(30px - 1.24px); }
 /* the ember band runs into the river photo */
 .quests::after { content: ''; position: absolute; inset: auto 0 0 0; height: 120px; pointer-events: none; background: linear-gradient(180deg, transparent, var(--band-seam)); }
 
@@ -314,8 +286,6 @@ html, body { background: var(--ground); }
   .cta .plate--lg { width: 100%; }
   /* critic r3: the lede ran over the bright sky at 3.2:1; the copy band gets a 0.78 shade (the cards sit above it) */
   .hero::before { background: linear-gradient(180deg, rgb(12 9 6 / 0.55) 0%, rgb(12 9 6 / 0.78) 38%, rgb(12 9 6 / 0.82) 72%, var(--ground) 100%); }
-  .facts > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
-  .facts__soon { margin: 6px 0 0; }
   .quest { grid-template-columns: minmax(0, 1fr); }
   .needs > div { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   /* the phone close gets a full-width shade so the headline and the release line hold contrast over the sky */

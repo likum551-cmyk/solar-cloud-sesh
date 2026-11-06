@@ -21,10 +21,10 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="preload" href="/media/still-skyline.webp" as="image" fetchpriority="high" />
   <script src="/enter.js"></script>
-  <script type="module" crossorigin src="/assets/main-DViy4mac.js"></script>
+  <script type="module" crossorigin src="/assets/main-Ck2E9anq.js"></script>
   <link rel="modulepreload" crossorigin href="/assets/store-1fxLXhI_.js">
   <link rel="stylesheet" crossorigin href="/assets/store-Dp7eIqJ-.css">
-  <link rel="stylesheet" crossorigin href="/assets/main-5eJwew4Z.css">
+  <link rel="stylesheet" crossorigin href="/assets/main-Ca2oGsz1.css">
 </head>
 <body>
   <a class="skip" href="#download">Skip to download</a>
@@ -49,7 +49,7 @@
       <div class="wrap hero__grid">
         <div class="hero__copy">
           <h1 class="hero__title" id="hero-title">GTA V roleplay on our own servers</h1>
-          <p class="hero__lede">Our own launcher, our own game client, our own servers. Install once, press PLAY, and you are in Los Santos.</p>
+          <p class="hero__lede">No NPCs on the streets: everyone you pass on SOL is another player. Runs on GTA V Legacy and Enhanced, with cracked copies coming soon.</p>
           <div class="cta">
             <a class="plate plate--lg js-download" href="#download"><svg class="plate__icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z" fill="currentColor"/></svg><span class="js-download-label">Download Solar Launcher</span></a>
             <a class="plate plate--lg plate--ghost js-foot-guest" href="/signup/">Create account</a>
@@ -62,10 +62,6 @@
             </p>
             <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
           </div>
-          <dl class="facts">
-            <div><dt>Editions</dt><dd>GTA V Legacy and Enhanced <span class="facts__soon">Cracked: coming soon</span></dd></div>
-            <div><dt>Streets</dt><dd>No NPC traffic or pedestrians, only players</dd></div>
-          </dl>
         </div>
 
         <div class="stack" aria-hidden="true">
@@ -112,34 +108,32 @@
               <h3 class="sol__name">SOL</h3>
               <p class="sol__state js-srv-tone" data-tone="open"><span class="dot" aria-hidden="true"></span><span class="js-srv-state">Open</span></p>
             </div>
-            <p class="sol__mode">Roleplay</p>
+            <p class="sol__mode">Roleplay &middot; Europe</p>
             <p class="sol__desc">Roleplay across Los Santos and Blaine County on our own server software. The server checks what every client sends, and every car's lights, sirens, steering and damage are shared with every player.</p>
             <a class="plate plate--lg js-download" href="#download"><span class="js-download-label">Download Solar Launcher</span></a>
           </div>
-          <dl class="sol__facts">
-            <div><dt>Region</dt><dd>Europe</dd></div>
-            <div><dt>Map</dt><dd>Los Santos and Blaine County</dd></div>
-            <div><dt>Client</dt><dd class="js-release-version">Solar Launcher</dd></div>
-          </dl>
         </article>
 
         <ul class="next" aria-label="Planned servers">
           <li class="moon" data-reveal style="--i:1">
-            <!-- LUNA: the ring and a crescent -->
+            <!-- LUNA: the same filled disc as SOL, with a crescent shadow laid over it -->
             <svg class="emblem" viewBox="0 0 120 120" aria-hidden="true">
-              <defs><mask id="m-luna"><rect width="120" height="120" fill="#fff"/><circle cx="76" cy="48" r="34" fill="#000"/></mask></defs>
+              <defs><clipPath id="c-luna"><circle cx="60" cy="60" r="40"/></clipPath></defs>
               <circle class="emblem__ring" cx="60" cy="60" r="56"/>
-              <circle class="emblem__body" cx="60" cy="60" r="40" mask="url(#m-luna)"/>
+              <circle class="emblem__body" cx="60" cy="60" r="40"/>
+              <circle class="emblem__shade" cx="78" cy="48" r="38" clip-path="url(#c-luna)"/>
             </svg>
             <h3 class="next__name">LUNA</h3>
             <p class="next__tag">Planned</p>
             <p class="next__desc">Shows up in the launcher's server list the day it opens.</p>
           </li>
           <li class="earth" data-reveal style="--i:2">
-            <!-- TERRA: the ring and a globe (outline, one meridian, two parallels) -->
+            <!-- TERRA: the same filled disc, with land cut in the S mark's 45-degree blocks -->
             <svg class="emblem" viewBox="0 0 120 120" aria-hidden="true">
+              <defs><clipPath id="c-terra"><circle cx="60" cy="60" r="40"/></clipPath></defs>
               <circle class="emblem__ring" cx="60" cy="60" r="56"/>
-              <g class="emblem__globe"><circle cx="60" cy="60" r="38"/><ellipse cx="60" cy="60" rx="16" ry="38"/><path d="M22 60h76M28 41h64M28 79h64"/></g>
+              <circle class="emblem__body" cx="60" cy="60" r="40"/>
+              <g class="emblem__shade" clip-path="url(#c-terra)"><path d="M18 34h30l8 8v12H40l-8 8H18z"/><path d="M58 64h22l8 8v28H66l-8-8z"/><path d="M70 22h20l12 12v10H78l-8-8z"/></g>
             </svg>
             <h3 class="next__name">TERRA</h3>
             <p class="next__tag">Planned</p>
@@ -154,21 +148,20 @@
       <div class="wrap">
         <div class="head" data-reveal>
           <h2 class="section__title" id="join-title">How to join</h2>
-          <p class="section__lede">You need GTA V for PC. The launcher does the rest.</p>
         </div>
         <ol class="steps" data-reveal="steps">
           <li style="--i:0">
-            <p class="steps__n">Step 1</p>
+            <p class="steps__n" aria-hidden="true">1</p>
             <h3>Download Solar Launcher</h3>
             <p>Install it on Windows 10 or 11. It finds your GTA V by itself, or you point it at the folder once.</p>
           </li>
           <li style="--i:1">
-            <p class="steps__n">Step 2</p>
+            <p class="steps__n" aria-hidden="true">2</p>
             <h3>Pick SOL</h3>
             <p>The launcher lists our servers and shows which are up. Choose SOL.</p>
           </li>
           <li style="--i:2">
-            <p class="steps__n">Step 3</p>
+            <p class="steps__n" aria-hidden="true">3</p>
             <h3>Press PLAY</h3>
             <p>The launcher starts GTA V with the Solar RP client, joins the server, and tells you every step while it does.</p>
           </li>
