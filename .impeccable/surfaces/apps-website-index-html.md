@@ -7,22 +7,22 @@ related_targets: ["apps/website/src/main.ts"]
 
 # solar-rp.com landing page
 
-Scope: the public site at solar-rp.com (apps/website, static, served by Caddy). Mode: Persuade. Visitor: a GTA V PC player arriving from a link or video; action: download Solar Launcher. Proof: real GTA V footage and key art, the real launcher on screen, the release's real version, size and SHA-256 from the signed manifest. Constraints: NOON palette and the brand kit; no Rockstar/GTA V logos or Pricedown; never imply an official product; no invented counts, prices or quotes; Discord not available yet (shown as "soon", no link).
+Scope: the public site at solar-rp.com (apps/website, static, served by Caddy). Mode: Persuade. Visitor: a GTA V PC player arriving from a link, a video or Discord; action: download Solar Launcher (then create an account). Proof: the live SOL status from /api/v1/servers, the release's real version, size and SHA-256 from the signed manifest, real GTA V imagery. Constraints: NOON palette and the brand kit; no Rockstar/GTA V logos or Pricedown; never imply an official product; no invented counts, prices, quotes, rules or features (only what the 0.5.x client and SOL really do); Discord has no invite yet (shown as "soon", no link).
 
-Owner verdict on the first structure round (install sheet / loading screen / minute one): none; "it needs to be cool, gta5 themed, and wicked animations, gsap, lenis, three.js". Direction tournament (apps/website/DIRECTION.md): B Sundown Cold Open plus A's character beat.
+History: the trailer cold open (letterboxed footage, a three.js 3D S, giant title cards) was rejected three times on 2026-11-06, ending "this is a joke, FULL REDESIGN, remove this disgusting 3D S". The owner chose the category standard played straight ("Community hub"), references: the big FiveM/RageMP RP projects' sites (gta5rp.com, eclipse-rp.net) and Steam store pages. Roll skipped: owner-pinned direction.
+
+Decisions: phones (below 560px) keep only Log in and Download in the bar; the section links are dropped on purpose, since the page is one short scroll. Gold dot = a measured "online" only; without a count the Players row is hidden, never filled with a stand-in. No launcher screenshot with demo numbers. Open: real in-game screenshots (HUD ring, car cluster, inventory) from GI for a product gallery; server rules and an RP feature list from GI; the Discord invite.
 
 ## Direction contract
 
-THESIS: a GTA V trailer cold open you scroll: letterboxed golden-haze Los Santos, our own 3D S standing in the shot, single-line title cards cut by a 45-degree gold slash. Refuses the category default (centred headline over a dimmed screenshot, feature-card grid, "join our Discord" hero).
+THESIS: a GTA RP project's home page, played straight: what the server is, whether it is up, how to get in, in that order. Refuses the trailer: no 3D logo, no video, no scroll-driven motion, no giant slogans.
 
-OWN-WORLD: ground #0a0907, warm ink #f7f2e8, one Solar gold #f2b134 (the S's lower hook, DOWNLOAD, the slash wipe); Sofia Sans Extra Condensed 800 caps for every title, Sofia Sans for reading; every plate and panel square-cornered except one 45-degree top-right cut; footage and key art carry all other colour; one grain and haze layer over everything, the S included.
+OWN-WORLD: ground #0a0907, panels #100e0b/#17140f with 1px warm hairlines, ink #f7f2e8, one gold #f2b134 for the primary action and the live dot only; Sofia Sans Extra Condensed 800 caps for headings at human sizes (max ~5.5rem), Sofia Sans for reading; the mark's 45-degree cut on plates and panels only; real GTA V stills, dimmed, carry colour.
 
-STORY: this is GTA V, on our own servers and our own client; it is real (the city, the launcher, the signed release); one button gets you in. Download.
+STORY: Solar RP is GTA V roleplay on our own servers; SOL is open now (live status); download the launcher, pick SOL, press PLAY; an account (optional to play today) holds quests and coins.
 
-FIRST VIEWPORT: full-width city loop letterboxed 2.39:1 between black bars; the 3D S at about 55% of the frame height, left third, against the dark building mass, yaw -9 degrees, gold hook catching the sun; to its right lower third: kicker, small lockup, the gold DOWNLOAD plate with version and size; top bar: lockup left, Servers / Get in, small DOWNLOAD right.
+FIRST VIEWPORT: one wide in-game photo (Los Santos skyline at dusk) under a left-weighted shade, full width, ~86svh; left: H1 "GTA V roleplay on our own servers", one-line lede, gold DOWNLOAD plate + ghost "Create account", release meta; right/bottom: the SOL status panel (state, players/max when the API has them, EU, Roleplay). Bar: lockup, Servers / How to join / Quests, Log in, Download.
 
-FORM: Sundown Cold Open (B) from DIRECTION.md, fused with Cover Grid's character beat; seed key dafa037f (surface roll declined by the owner, direction pinned by the owner's brief and the tournament).
-
-Signature interaction: scroll turns the S and sends it into the sun while the letterbox opens; the 45-degree gold slash wipe between title cards.
+FORM: community hub (owner's pick, the standing exit, canon at full fidelity); seed key: none (owner-pinned).
 
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance

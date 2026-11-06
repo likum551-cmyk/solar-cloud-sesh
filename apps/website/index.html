@@ -19,7 +19,7 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-  <link rel="preload" href="/media/hero.webp" as="image" />
+  <link rel="preload" href="/media/still-skyline.webp" as="image" fetchpriority="high" />
   <script src="/enter.js"></script>
 </head>
 <body>
@@ -31,181 +31,173 @@
     </a>
     <nav class="bar__nav" aria-label="Sections">
       <a href="#servers">Servers</a>
-      <a href="#get-in">Get in</a>
+      <a href="#join">How to join</a>
+      <a href="#quests">Quests</a>
     </nav>
     <a class="bar__account js-account-link" href="/login/">Log in</a>
     <a class="plate plate--sm js-download" href="#download"><span class="js-download-label">Download</span></a>
   </header>
 
   <main>
-    <!-- 1. Opening shot: the bottom letterbox bar is the credits band -->
+    <!-- 1. What it is, whether it is up, the button -->
     <section class="hero" aria-labelledby="hero-title">
-      <div class="hero__stage">
-        <div class="hero__front">
-          <div class="hero__frame">
-            <!-- the skyline at dusk, forward then back: one shot, no seam -->
-            <video class="hero__video js-loop" poster="/media/hero.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/hero.webm" type="video/webm; codecs=vp9" /><source src="/media/hero.mp4" type="video/mp4" /></video>
-            <div class="hero__shade" aria-hidden="true"></div>
+      <!-- Downtown Los Santos at dusk from the hills (an in-game still) -->
+      <img class="hero__img" src="/media/still-skyline.webp" alt="" width="1920" height="1080" fetchpriority="high" decoding="async" />
+      <div class="hero__shade" aria-hidden="true"></div>
+      <div class="wrap hero__grid">
+        <div class="hero__copy">
+          <h1 class="hero__title" id="hero-title">GTA V roleplay on our own servers</h1>
+          <p class="hero__lede">Solar RP is a roleplay network for GTA V on PC with its own launcher, its own game client and its own servers. Install once, press PLAY, and you are in Los Santos.</p>
+          <div class="cta">
+            <a class="plate plate--lg js-download" href="#download"><span class="js-download-label">Download Solar Launcher</span></a>
+            <a class="plate plate--lg plate--ghost js-foot-guest" href="/signup/">Create account</a>
           </div>
-          <div class="stage3d" data-stage="hero" aria-hidden="true"></div>
-          <div class="haze" aria-hidden="true"></div>
-          <div class="letterbox letterbox--top" aria-hidden="true"></div>
-          <div class="letterbox letterbox--bottom" aria-hidden="true"></div>
-          <div class="hero__copy">
-          <h1 class="hero__title" id="hero-title"><span class="line">Los Santos.</span> <span class="line">Our servers.</span></h1>
-          <div class="hero__credits">
-            <p class="hero__lede">GTA V roleplay on our own network. <span>Own launcher, own client, own servers.</span></p>
-            <div class="cta">
-              <a class="plate plate--lg js-download" href="#download"><span class="js-download-label">Download Solar Launcher</span></a>
-              <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
-            </div>
-          </div>
-          </div>
-          <img class="mark-fallback" src="/mark.svg" alt="" aria-hidden="true" />
+          <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
         </div>
+
+        <aside class="status cut js-status" aria-labelledby="status-name" data-server="sol">
+          <div class="status__head">
+            <h2 class="status__name" id="status-name">SOL</h2>
+            <p class="status__state js-status-state" data-tone="open"><span class="dot" aria-hidden="true"></span><span class="js-status-label">Open</span></p>
+          </div>
+          <dl class="status__facts">
+            <div class="js-status-players" hidden><dt>Players</dt><dd class="js-status-count"></dd></div>
+            <div><dt>Mode</dt><dd>Roleplay</dd></div>
+            <div><dt>Region</dt><dd>Europe</dd></div>
+            <div><dt>Game</dt><dd>GTA V Legacy and Enhanced</dd></div>
+            <div><dt>Client</dt><dd class="js-release-version">Solar Launcher</dd></div>
+          </dl>
+          <p class="status__note js-status-note">Pick SOL in Solar Launcher and press PLAY.</p>
+          <a class="status__link" href="#join">How to join</a>
+        </aside>
       </div>
     </section>
 
-    <!-- 2. Title cards: three shots, three compositions -->
-    <section class="cards" aria-label="What Solar RP is">
-        <article class="card card--low">
-          <img class="card__img" src="/media/still-beach.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
-          <div class="card__shade" aria-hidden="true"></div>
-          <div class="card__copy">
-            <h2 class="card__title">Our own servers.</h2>
-            <p class="card__fact">SOL runs our own server software: our rules, our world state, and anti-cheat checks on the server.</p>
-          </div>
-        </article>
-        <article class="card card--high">
-          <img class="card__img" src="/media/still-pool.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
-          <div class="card__shade" aria-hidden="true"></div>
-          <div class="card__copy">
-            <h2 class="card__title">Our own client.</h2>
-            <p class="card__fact">The Solar RP engine runs inside your GTA V and connects it to our servers, over our own protocol.</p>
-          </div>
-        </article>
-        <article class="card card--mid">
-          <img class="card__img" src="/media/still-canal.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
-          <div class="card__shade" aria-hidden="true"></div>
-          <div class="card__copy">
-            <h2 class="card__title">One button in.</h2>
-            <p class="card__fact">Open Solar Launcher, pick SOL, press PLAY. It starts GTA V and drops you in.</p>
-          </div>
-        </article>
-    </section>
-
-    <!-- 3. Characters: three key-art panels -->
-    <section class="cast" aria-label="Los Santos">
-        <figure class="panel">
-          <img src="/media/cast-michael.webp" alt="" width="1200" height="1620" loading="lazy" decoding="async" />
-          <figcaption class="panel__line">The city you know.</figcaption>
-        </figure>
-        <figure class="panel">
-          <img src="/media/cast-franklin.webp" alt="" width="1200" height="1620" loading="lazy" decoding="async" />
-          <figcaption class="panel__line">The rules are ours.</figcaption>
-        </figure>
-        <figure class="panel">
-          <img src="/media/cast-trevor.webp" alt="" width="1200" height="1620" loading="lazy" decoding="async" />
-          <figcaption class="panel__line">Roleplay first.</figcaption>
-        </figure>
-    </section>
-
-    <!-- 4. Servers -->
-    <section class="servers" id="servers" aria-labelledby="servers-title">
+    <!-- 2. Servers -->
+    <section class="servers section" id="servers" aria-labelledby="servers-title">
       <div class="wrap">
-        <div class="servers__head">
-          <h2 class="section-title" id="servers-title">The Solar system</h2>
-          <p class="section-lede">Three servers, named for the sun, the moon and the earth. SOL is open; LUNA and TERRA are next.</p>
+        <div class="section__head">
+          <h2 class="section__title" id="servers-title">Servers</h2>
+          <p class="section__lede">Our servers are named for the sun, the moon and the earth. SOL is the first.</p>
         </div>
-        <div class="servers__grid">
-          <article class="server server--open">
-            <img class="server__img" src="/media/server-sol.webp" alt="" loading="lazy" decoding="async" />
-            <div class="server__body">
-              <span class="state state--open">Open</span>
-              <h3 class="server__name">SOL</h3>
-              <p class="server__meta">EU &middot; Roleplay</p>
-            </div>
-          </article>
-          <article class="server">
-            <img class="server__img" src="/media/server-luna.webp" alt="" loading="lazy" decoding="async" />
-            <span class="tape" aria-hidden="true">Soon</span>
-            <div class="server__body">
-              <h3 class="server__name">LUNA<span class="visually-hidden">, opening soon</span></h3>
-              <p class="server__meta">EU &middot; Freeroam</p>
-            </div>
-          </article>
-          <article class="server">
-            <img class="server__img" src="/media/server-terra.webp" alt="" loading="lazy" decoding="async" />
-            <span class="tape" aria-hidden="true">Soon</span>
-            <div class="server__body">
-              <h3 class="server__name">TERRA<span class="visually-hidden">, opening soon</span></h3>
-              <p class="server__meta">EU &middot; Racing</p>
-            </div>
-          </article>
+        <article class="srv">
+          <img class="srv__img" src="/media/server-sol.webp" alt="" width="1843" height="1620" loading="lazy" decoding="async" />
+          <div class="srv__main">
+            <h3 class="srv__name">SOL</h3>
+            <p class="srv__desc">Our roleplay server, on our own server software. Join it from Solar Launcher.</p>
+            <dl class="srv__facts">
+              <div><dt>Status</dt><dd class="js-srv-state">Open</dd></div>
+              <div><dt>Map</dt><dd>Los Santos and Blaine County</dd></div>
+            </dl>
+          </div>
+        </article>
+        <p class="srv-next"><span class="srv-next__label">Next</span> LUNA, a freeroam server, and TERRA, for racing.</p>
+      </div>
+    </section>
+
+    <!-- 3. What SOL runs today: only what the shipped client and server do -->
+    <section class="game section" id="game" aria-labelledby="game-title">
+      <div class="wrap">
+        <div class="section__head">
+          <h2 class="section__title" id="game-title">What SOL runs today</h2>
+          <p class="section__lede">The Solar RP client runs inside your GTA V and talks to SOL over our own protocol. This is what it does now.</p>
+        </div>
+        <div class="game__grid">
+        <figure class="hud">
+          <div class="hud__plates">
+            <img class="hud__plate cut" src="/media/hud-ring.webp" alt="The Solar RP vitals ring: health on the left arc, saturation on the right, both at 100" width="820" height="900" loading="lazy" decoding="async" />
+            <img class="hud__plate cut" src="/media/hud-car.webp" alt="The Solar RP car cluster: speed dial at 460 km/h, fuel 100 percent, both blinkers, and lock, engine, seatbelt and headlight chips" width="900" height="900" loading="lazy" decoding="async" />
+          </div>
+          <figcaption>The vitals ring and the car cluster, drawn by the Solar RP client's own overlay code with demo values, off the game. In game, GTA V's map sits inside the ring.</figcaption>
+        </figure>
+        <ul class="facts">
+          <li>
+            <h3>The streets are players</h3>
+            <p>No ambient traffic and no pedestrians: the people and cars you pass are other players.</p>
+          </li>
+          <li>
+            <h3>A HUD made for roleplay</h3>
+            <p>A vitals ring with the map inside it, and a car cluster with speed, fuel, blinkers, lights, lock and seatbelt.</p>
+          </li>
+          <li>
+            <h3>Cars look the same on every screen</h3>
+            <p>Lights, sirens, steering, tyres, windows and damage are shared between players.</p>
+          </li>
+          <li>
+            <h3>The server has the last word</h3>
+            <p>SOL keeps the world state and checks what every client sends.</p>
+          </li>
+        </ul>
         </div>
       </div>
     </section>
 
-    <!-- 5. Get in: three steps, each beside its launcher screen -->
-    <section class="getin" id="get-in" aria-labelledby="getin-title">
-      <div class="getin__stage">
-        <h2 class="section-title getin__title" id="getin-title">In three steps</h2>
+    <!-- 4. How to join -->
+    <section class="join section" id="join" aria-labelledby="join-title">
+      <div class="wrap">
+        <div class="section__head">
+          <h2 class="section__title" id="join-title">How to join</h2>
+          <p class="section__lede">You need GTA V for PC. The launcher does the rest.</p>
+        </div>
         <ol class="steps">
-          <li class="step">
-            <span class="step__n" aria-hidden="true">01</span>
-            <div class="step__text">
-              <h3>Download</h3>
-              <p>Install Solar Launcher on Windows. It finds your GTA V by itself, or you point it at the folder once.</p>
-            </div>
-            <figure class="step__fig">
-              <img class="step__shot" src="/shots/launcher-signin.webp" alt="Solar Launcher's first screen over GTA V footage" loading="lazy" decoding="async" width="1240" height="800" />
-              <figcaption class="shot-note">Demo screen</figcaption>
-            </figure>
+          <li>
+            <span class="steps__n" aria-hidden="true">1</span>
+            <h3>Download Solar Launcher</h3>
+            <p>Install it on Windows 10 or 11. It finds your GTA V by itself, or you point it at the folder once.</p>
           </li>
-          <li class="step">
-            <span class="step__n" aria-hidden="true">02</span>
-            <div class="step__text">
-              <h3>Open it, pick SOL</h3>
-              <p>The launcher lists our servers and shows which are up and how full they are.</p>
-            </div>
-            <figure class="step__fig">
-              <img class="step__shot" src="/shots/launcher-play.webp" alt="Solar Launcher's Play screen with the SOL server chosen" loading="lazy" decoding="async" width="1240" height="800" />
-              <figcaption class="shot-note">Demo screen: the player count and ping are sample data, not live</figcaption>
-            </figure>
+          <li>
+            <span class="steps__n" aria-hidden="true">2</span>
+            <h3>Pick SOL</h3>
+            <p>The launcher lists our servers and shows which are up. Choose SOL.</p>
           </li>
-          <li class="step">
-            <span class="step__n" aria-hidden="true">03</span>
-            <div class="step__text">
-              <h3>Press PLAY</h3>
-              <p>The launcher starts GTA V with the Solar RP engine and joins the server. It tells you every step while it does.</p>
-            </div>
-            <figure class="step__fig">
-              <img class="step__shot" src="/shots/launcher-launch.webp" alt="Solar Launcher launching GTA V into SOL, step by step" loading="lazy" decoding="async" width="1240" height="800" />
-              <figcaption class="shot-note">Demo screen</figcaption>
-            </figure>
+          <li>
+            <span class="steps__n" aria-hidden="true">3</span>
+            <h3>Press PLAY</h3>
+            <p>The launcher starts GTA V with the Solar RP client, joins the server, and tells you every step while it does.</p>
           </li>
         </ol>
       </div>
     </section>
 
-    <!-- 6. Close: the decision, with what it needs -->
-    <section class="close" id="download" aria-labelledby="close-title">
-      <!-- the Galileo Observatory at night over the lit city -->
-      <img class="close__img" src="/media/still-close.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
-      <div class="close__shade" aria-hidden="true"></div>
-      <div class="stage3d stage3d--close" data-stage="close" aria-hidden="true"></div>
-      <div class="close__copy">
-        <h2 class="close__title" id="close-title">Los Santos is waiting.</h2>
-        <div class="cta cta--center">
-          <a class="plate plate--xl js-download js-download-main" href="#download" aria-disabled="true"><span class="js-download-label">Download Solar Launcher</span></a>
-          <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
+    <!-- 5. Quests and coins -->
+    <section class="quests section" id="quests" aria-labelledby="quests-title">
+      <div class="wrap quests__grid">
+        <div class="quests__copy">
+          <h2 class="section__title" id="quests-title">Quests and coins</h2>
+          <p>Your account earns coins for quests. You find them on your account page.</p>
+          <div class="cta">
+            <a class="plate plate--ghost js-foot-guest" href="/signup/">Create account</a>
+            <a class="plate plate--ghost js-foot-member" href="/account/" hidden>Your quests</a>
+          </div>
         </div>
-        <dl class="needs">
-          <div><dt>System</dt><dd>Windows 10 or 11, 64-bit</dd></div>
-          <div><dt>Game</dt><dd>GTA V for PC, Legacy or Enhanced, on Steam, Epic Games or the Rockstar Games Launcher</dd></div>
-        </dl>
-        <p class="hash js-release-hash" hidden>SHA-256 <code class="js-sha"></code></p>
-        <p class="cta__status js-release-status" role="status"></p>
+        <div class="quest cut">
+          <div class="quest__main">
+            <h3 class="quest__title">Link your Discord</h3>
+            <p class="quest__desc">Connect your Discord account to your Solar RP account. Opens with Discord login on this site.</p>
+          </div>
+          <p class="quest__reward"><span class="quest__amount">500</span> coins</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 6. Download: what the file is and what it needs -->
+    <section class="download section" id="download" aria-labelledby="download-title">
+      <div class="wrap download__grid">
+        <div class="download__copy">
+          <h2 class="section__title" id="download-title">Install and play</h2>
+          <div class="cta">
+            <a class="plate plate--xl js-download js-download-main" href="#download" aria-disabled="true"><span class="js-download-label">Download Solar Launcher</span></a>
+          </div>
+          <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
+          <p class="cta__status js-release-status" role="status"></p>
+        </div>
+        <div class="download__info">
+          <dl class="needs">
+            <div><dt>System</dt><dd>Windows 10 or 11, 64-bit</dd></div>
+            <div><dt>Game</dt><dd>GTA V for PC, Legacy or Enhanced, on Steam, Epic Games or the Rockstar Games Launcher</dd></div>
+          </dl>
+          <p class="hash js-release-hash" hidden>SHA-256 <code class="js-sha"></code></p>
+        </div>
       </div>
     </section>
   </main>

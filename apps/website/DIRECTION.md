@@ -1,5 +1,11 @@
 # solar-rp.com: direction
 
+## Current (2026-11-06): community hub
+
+The trailer cold open below was rejected three times in one day ("too animated, make it more professional", "too many videos, a bit laggy", then "this is a joke, FULL REDESIGN, remove this disgusting 3D S"). GI chose the category standard played straight: a GTA RP project's home page in the manner of the big FiveM/RageMP projects' sites and Steam store pages. Hero = one dimmed in-game photo, the pitch, DOWNLOAD and SOL's live status; then servers, what SOL runs today, how to join, quests and coins, the download. No video, no 3D, no scroll-driven motion, type at human sizes, gold only for the primary action and the live dot. The page map is `SHOTS.md`; the direction contract is the surface brief `.impeccable/surfaces/apps-website-index-html.md`. Do not bring back the 3D S, a letterbox, title cards or full-window blends without GI asking for them by name.
+
+## Retired: the trailer cold open (2026-11-02 to 2026-11-06)
+
 Owner brief (2026-11-02): "it needs to be cool, gta5 themed, and wicked animations, gsap, lenis, three.js anything." Rejected: a calm install-sheet page, a loading-screen page, a timestamped walkthrough. Discord: not yet (the page says "Discord soon", no link).
 
 Fixed by the project: NOON palette and the Solar RP brand kit (`brand/solar/solar-rp-noon`), real GTA V footage and key art (the launcher's loops, the three official loading-screen splashes), no Rockstar/GTA V logos, no Pricedown, never implying an official Rockstar product. Home-made 3D GTA scenes are banned (rejected twice); the only real-time 3D is our own S mark, extruded from the brand vector, and WebGL treatment of real footage.

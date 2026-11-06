@@ -19,7 +19,8 @@ export const PARTIALS: Record<string, string> = {
     <a class="bar__brand" href="/" aria-label="Solar RP home">${LOCKUP}</a>
     <nav class="bar__nav" aria-label="Site">
       <a href="/#servers">Servers</a>
-      <a href="/#get-in">Get in</a>
+      <a href="/#join">How to join</a>
+      <a href="/#quests">Quests</a>
     </nav>
     <a class="bar__account js-account-link" href="/login/">Log in</a>
     <a class="plate plate--sm" href="/#download">Download</a>
@@ -34,7 +35,6 @@ export const PARTIALS: Record<string, string> = {
         <a class="js-foot-guest" href="/login/">Log in</a>
         <a class="js-foot-member" href="/account/" hidden>Your account</a>
       </nav>
-      <p class="foot__discord">Discord: soon</p>
       <p class="foot__legal">Solar RP is not affiliated with Rockstar Games or Take-Two Interactive. Footage and artwork: Grand Theft Auto V, &copy; Rockstar Games.</p>
     </div>
   </footer>`,

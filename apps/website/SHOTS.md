@@ -1,16 +1,14 @@
-# Shot list
+# Page map
 
-2026-11-06, GI: "too animated, make it more professional". The page scrolls as a page: no pinning, no scrubbed timelines, no gold slab wipes, no per-letter reveals, no zooms. The one authored moment is the arrival (the hero title rises 16 px and fades in on the S's curve, expo-out 1.4 s). The S stands still in the hero and the close (it turns up to 2 degrees with the pointer) and renders only while its shot is on screen and its pose changes. The previous trailer structure (pinned beats, slab cuts) is in git history before this date.
+2026-11-06, after three rejections of the trailer page ("too animated", "too many videos, laggy", then "FULL REDESIGN, remove this disgusting 3D S"), GI chose a community hub: the page a big GTA RP project ships, played straight. No video, no 3D, no scroll-driven motion. The one authored moment is the hero's arrival (the pitch, then the status panel, rise 14 px and fade in, 700 ms, CSS only; none under reduced motion). The trailer page is in git history up to commit 5ab40f9.
 
-Then, GI: "too many videos and it's a bit laggy". One video, the hero; every other shot is a still. Native scrolling (no smoothing library), no full-window grain or blend layers.
+| # | Section | Image | Copy and data |
+|---|---|---|---|
+| 1 | Hero (84svh, at most 880 px) | `still-skyline` under a left-weighted shade (phones: a 4:3 band above the copy) | H1 "GTA V roleplay on our own servers", lede, gold DOWNLOAD (version and size from the signed manifest) + ghost "Create account" (guests only). SOL status panel: state from `GET /api/v1/servers` (`src/servers.ts`), a Players row only when the server reports a count (gold dot only then), mode, region, game editions, client version from the manifest; with no SOL row it keeps a neutral "Open" |
+| 2 | Servers | `server-sol` key art | SOL (roleplay, Europe, live status) as one large row; one "Next" line for LUNA (freeroam) and TERRA (racing) |
+| 3 | What SOL runs today | `hud-ring`, `hud-car`: the client's own overlay render, captioned as demo values off the game (in-game screenshots from GI pending) | Four facts the shipped client and server really do, beside the HUD plates: no ambient traffic or pedestrians, the HUD, shared car state, server authority |
+| 4 | How to join | none (the launcher screenshot showed demo player counts and was removed) | 1 Download, 2 Pick SOL, 3 Press PLAY, three across (no account step: the launcher does not sign in with an account yet, see the signup page note) |
+| 5 | Quests and coins | none | Coins for quests on the account page; the one seeded quest as a row: "Link your Discord", 500 coins, opens with Discord login |
+| 6 | Install and play | none (panel ground) | DOWNLOAD again, system / game / account needs, SHA-256, footer |
 
-| # | Section | Image | 3D S | Copy |
-|---|---|---|---|---|
-| 1 | Hero, one screen | video `hero` (the skyline at dusk, forward then back, no seam), letterboxed 2.39:1 on desktop (black bars), cropped on phones | At rest right of the title, yaw -11 deg; settles in on load | Title, lede, DOWNLOAD plate with version and size from the signed manifest |
-| 2 | Title cards, 3 x 100vh in flow (phones: square plates, the copy on the ground under each) | stills `still-beach`, `still-pool`, `still-canal`; each shade is a soft pool behind its copy only | none | "Our own servers." / "Our own client." / "One button in.", a short fact line under each |
-| 3 | Characters, a triptych on wide screens | key art portraits `cast-michael`, `cast-franklin`, `cast-trevor` | none | "The city you know." "The rules are ours." "Roleplay first." |
-| 4 | Servers | key art `server-sol`, `server-luna`, `server-terra` | none | SOL (EU, roleplay, open), LUNA (freeroam, soon), TERRA (racing, soon) |
-| 5 | Get in | launcher screenshots, one beside each step on wide screens | none | 01 Download, 02 pick SOL, 03 PLAY |
-| 6 | Close | still `still-close` (the Galileo Observatory at night over the lit city), rising out of the ground, dark only at the foot | Fades in in the sky above the main dome as the section enters; does not move | "Los Santos is waiting." DOWNLOAD again, what you need, SHA-256, footer |
-
-Reduced motion or Save-Data: no arrival; the hero stays on its poster and the S is rendered once at its hero pose.
+Not on the page until GI supplies them: server rules, an RP feature list (jobs, gangs, police, housing), the Discord invite.

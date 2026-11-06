@@ -31,12 +31,11 @@ function refs(): Map<string, string[]> {
 }
 
 describe('media references', () => {
-  it('finds the references and the files it checks (the hero reel among them)', () => {
+  it('finds the references and the files it checks (the hero still and the server art among them)', () => {
     const r = refs();
-    expect(r.size).toBeGreaterThanOrEqual(10);
-    expect(r.has('hero.webm')).toBe(true);
-    expect(r.has('hero.mp4')).toBe(true);
-    expect(PRESENT.has('hero.webm')).toBe(true);
+    expect(r.size).toBeGreaterThanOrEqual(4);
+    for (const name of ['still-skyline.webp', 'server-sol.webp']) expect(r.has(name)).toBe(true);
+    expect(PRESENT.has('still-skyline.webp')).toBe(true);
   });
 
   it('names only files that exist in public/media', () => {
@@ -44,19 +43,11 @@ describe('media references', () => {
     expect(missing).toEqual([]);
   });
 
-  // GI, 2026-11-06: "too many videos and it's a bit laggy": the hero is the one moving shot
-  it('plays one video, the hero, with a VP9 WebM source before its H.264 MP4 and a poster', () => {
-    const videos = [...indexHtml.matchAll(/<video\b[^>]*>([\s\S]*?)<\/video>/g)];
-    expect(videos.length).toBe(1);
-    expect(videos[0]![0]).toMatch(/class="hero__video\b/);
-    for (const v of videos) {
-      const tag = v[0];
-      expect(tag).toMatch(/poster="\/media\/[a-z]+\.webp"/);
-      expect(tag).not.toMatch(/<video\b[^>]*\ssrc=/);
-      const webm = tag.indexOf('type="video/webm; codecs=vp9"');
-      const mp4 = tag.indexOf('type="video/mp4"');
-      expect(webm).toBeGreaterThan(0);
-      expect(mp4).toBeGreaterThan(webm);
-    }
+  // GI, 2026-11-06: "too many videos, a bit laggy", then "FULL REDESIGN, remove this disgusting 3D S": the
+  // landing page is stills only, with no WebGL stage
+  it('plays no video and mounts no 3D stage', () => {
+    expect(indexHtml).not.toMatch(/<video\b/);
+    expect(indexHtml).not.toMatch(/stage3d|data-stage=/);
+    expect(mainTs).not.toMatch(/mark3d|from 'three'/);
   });
 });

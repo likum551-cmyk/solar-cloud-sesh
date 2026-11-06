@@ -52,6 +52,7 @@ const CLIPS = {
 // title cards and the close: one frame each, picked from a sample of the shot. The Vinewood sign shot
 // (fon_0m00) was dropped after review: it shows the backs of the letters, which read as rusty billboards.
 const STILLS = {
+  skyline: { file: 'fon_25m38', at: 0.2, grade: WARM }, // the hero: Downtown at dusk from the hills, the city lit
   beach: { file: 'fon_4m05', at: 6, grade: WARM }, // Vespucci Beach at sunset, the pier wheel
   pool: { file: 'fon_2m58', at: 9.8, grade: NIGHT }, // a lit pool straight down at night, dark terrace round it
   canal: { file: 'fon_1m46', at: 3, grade: WARM }, // down the river canal to Downtown, golden hour

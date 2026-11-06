@@ -53,21 +53,11 @@
   --f-display: 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif;
   --f-text: 'Sofia Sans', system-ui, sans-serif;
   --gutter: clamp(20px, 4vw, 64px);
-  /* the one left edge of the page (bar, hero copy, card copy, sections, footer): the gutter, or a centred
-     1800 px measure on very wide screens */
-  --edge: max(var(--gutter), calc((100vw - 1800px) / 2));
-  /* the ground between footage plates */
-  --plate: clamp(8px, 1vw, 16px);
-  --cut: 14px;
+  /* the one left edge of the page (bar, sections, footer): the gutter, or a centred 1440 px measure on
+     wide screens */
+  --edge: max(var(--gutter), calc((100vw - 1440px) / 2));
   --bar-h: 64px;
-  /* the 2.39:1 letterbox, only on landscape windows (a portrait window of any width gets none) */
-  --lb: 0px;
-  /* the bottom bar is the credits band: at least room for the download plate */
-  --band: max(var(--lb), 116px);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-}
-@media (min-aspect-ratio: 16/10) and (min-width: 761px) {
-  :root { --lb: max(0px, calc((100svh - 100vw / 2.39) / 2)); }
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -160,7 +150,7 @@ button.plate--ghost:disabled { background: transparent; color: var(--ink-4); }
   background: linear-gradient(180deg, rgb(10 9 7 / 0.72), rgb(10 9 7 / 0));
   transition: background 300ms;
 }
-/* opaque: footage and the S passing under a translucent, blurred bar smear into the glow NOON bans */
+/* opaque: pictures passing under a translucent, blurred bar smear into the glow NOON bans */
 .bar.is-solid { background: var(--ground); box-shadow: 0 1px 0 var(--line); }
 .bar__brand { display: block; line-height: 0; filter: drop-shadow(0 1px 10px rgb(0 0 0 / 0.5)); }
 /* 28px: at 24 the S of the lockup read as a "5" */
@@ -185,7 +175,6 @@ button.plate--ghost:disabled { background: transparent; color: var(--ink-4); }
 .foot { background: var(--ground); border-top: 1px solid var(--line); padding: 36px 0 calc(36px + env(safe-area-inset-bottom)); }
 .foot__row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 32px; }
 .foot__mark { width: 16px; height: 32px; flex: none; }
-.foot__discord { font: 700 16px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); }
 .foot__nav { display: flex; gap: 22px; }
 .foot__nav a { font: 700 16px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; text-decoration: none; color: var(--ink-2); padding: 8px 0; }
 .foot__nav a:hover { color: var(--sun); }

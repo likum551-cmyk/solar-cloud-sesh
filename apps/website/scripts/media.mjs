@@ -42,9 +42,11 @@ if (copied + same !== FILES.length) { console.error('media: count mismatch'); pr
 // the site's own encodes must be there too (a fresh checkout has them; encode-media.mjs remakes them)
 const OWN = [
   'hero.webm', 'hero.mp4', 'hero.webp',
-  ...['beach', 'pool', 'canal', 'close'].map((n) => `still-${n}.webp`),
+  ...['skyline', 'beach', 'pool', 'canal', 'close'].map((n) => `still-${n}.webp`),
   ...['michael', 'franklin', 'trevor'].map((n) => `cast-${n}.webp`),
   ...['sol', 'luna', 'terra'].map((n) => `server-${n}.webp`),
+  // the HUD plates: crops of a render of the client's own overlay code (ASSETS.md); not remade by encode-media.mjs
+  'hud-ring.webp', 'hud-car.webp',
 ];
 const ownMissing = OWN.filter((f) => !fs.existsSync(path.join(OUT, f)));
 if (ownMissing.length) {

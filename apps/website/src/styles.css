@@ -1,289 +1,202 @@
-/* solar-rp.com. NOON: warm night ground and ink, one Solar gold. GTA V footage and key art carry
-   every other colour. Square corners everywhere except one 45-degree top-right cut, the mark's; the
-   gold arrives as plates and tape, never as glow.
-   Every section is a framed shot in plain document flow, with or without JavaScript: nothing pins or
-   scrubs (GI, 2026-11-06: "too animated, make it more professional"). The footage is what moves. */
+/* solar-rp.com landing page: a community hub (GI, 2026-11-06). One dimmed in-game photo with the pitch and
+   SOL's status, then the servers, what SOL runs today, how to join, quests and the download. Gold is the
+   primary action and the live dot only; panels carry the mark's 45-degree cut; type at human sizes. */
 
-/* ---------- 1. hero: the opening shot ---------- */
-.hero { position: relative; background: var(--black); }
-.hero__stage { position: relative; height: 100svh; min-height: 560px; overflow: hidden; isolation: isolate; }
-.hero__front { position: absolute; inset: 0; z-index: 1; background: var(--black); }
-.hero__frame { position: absolute; inset: 0; z-index: 0; }
-.hero__video { width: 100%; height: 100%; object-fit: cover; object-position: 55% 40%; }
-/* ground under the title (bottom left); the S stands in the clear haze on the right */
-.hero__shade {
-  position: absolute; inset: 0;
-  background:
-    linear-gradient(0deg, rgb(10 9 7 / 0.8) 0%, rgb(10 9 7 / 0.32) 30%, rgb(10 9 7 / 0) 52%),
-    linear-gradient(90deg, rgb(10 9 7 / 0.45) 0%, rgb(10 9 7 / 0) 50%),
-    /* the skyline's sky is pale gold: deepen it above the horizon so the S's cream half stands off it */
-    linear-gradient(180deg, rgb(48 30 12 / 0.36) 0%, rgb(48 30 12 / 0.18) 28%, rgb(48 30 12 / 0) 50%),
-    /* ground under the nav where no letterbox covers the sky (portrait, tablets) */
-    linear-gradient(180deg, rgb(10 9 7 / 0.75), rgb(10 9 7 / 0) 18%);
+/* ---------- shared section grammar ---------- */
+.section { padding-block: clamp(56px, 6vw, 96px); }
+.section + .section { border-top: 1px solid var(--line); }
+.section__head {
+  display: grid; gap: 14px 48px; align-items: end;
+  grid-template-columns: minmax(0, 1fr);
+  margin-bottom: clamp(28px, 3.6vw, 44px);
 }
-.stage3d { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
-.stage3d canvas { display: block; width: 100%; height: 100%; }
-/* the footage's haze laid over the mark too, so both sit in one light */
-.haze {
-  position: absolute; inset: 0; z-index: 2; pointer-events: none;
-  /* a plain alpha layer, not a blend: a blend over playing video costs a re-composite every frame */
-  background: radial-gradient(60% 50% at 62% 18%, rgb(255 214 150 / 0.1), rgb(255 214 150 / 0) 70%);
+@media (min-width: 961px) { .section__head { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.section__title {
+  font: 800 clamp(40px, 4.2vw, 62px)/0.95 var(--f-display);
+  letter-spacing: 0.01em; text-transform: uppercase; text-wrap: balance;
 }
-.letterbox { position: absolute; left: 0; right: 0; z-index: 3; height: var(--lb); background: var(--black); }
-/* the top bar is only as tall as the nav: the footage gets the rest */
-.letterbox--top { top: 0; height: min(var(--lb), var(--bar-h)); }
-.letterbox--bottom { bottom: 0; }
-/* the title stands on the frame line and crosses it; the credits band is the bottom bar */
-.hero__copy { --title: clamp(64px, 10.6vw, 204px); position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; }
-/* about a third of the second line lies on the black (-0.13em only made up for the 0.84 line box,
-   which left the capitals standing exactly on the edge, as if chopped) */
-.hero__title {
-  padding: 0 var(--edge);
-  margin-bottom: -0.34em;
-  font: 800 var(--title)/0.84 var(--f-display);
-  letter-spacing: -0.004em; text-transform: uppercase;
-  text-shadow: 0 2px 30px rgb(0 0 0 / 0.4);
-  position: relative; z-index: 1;
-}
-.hero__title .line { display: block; }
-/* the arrival's start (public/enter.js sets .enter before the first paint; main.ts takes over and removes
-   it). The failsafe shows the title after 4 s if main.ts never runs. */
-.enter .hero__title { opacity: 0; transform: translateY(16px); animation: enter-failsafe 0.6s ease-out 1.5s forwards; }
-@keyframes enter-failsafe { to { opacity: 1; transform: none; } }
-.hero__credits {
-  min-height: var(--band);
-  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 32px;
-  /* the capitals reach 0.21em into the band (0.34em of line box minus the 0.13em under the baseline);
-     at 1920x1080 this keeps the plate inside the 138px bar */
-  padding: calc(0.21 * var(--title) + 20px) var(--edge) 14px;
-}
-.hero__lede {
-  font: 700 clamp(16px, 1.15vw, 19px)/1.25 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink);
-}
-.hero__lede span { display: block; color: var(--ink-3); }
-/* wide screens: the title grows faster than the bar, so the lede takes one line and keeps its air */
-@media (min-width: 1600px) { .hero__lede span { display: inline; margin-left: 0.3em; } }
-.cta { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 22px; }
-.cta__meta { font: 600 15px/1.2 var(--f-display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); text-shadow: 0 1px 2px rgb(0 0 0 / 0.8), 0 1px 12px rgb(0 0 0 / 0.75); }
-.cta__status { margin-top: 12px; font-size: 15px; color: var(--ink-3); min-height: 1lh; }
-/* shown only when WebGL is not available and the 3D stage never starts */
-.mark-fallback {
-  display: none;
-  position: absolute; z-index: 1;
-  left: 70%; top: 44%; height: calc((100svh - 2 * var(--lb)) * 0.5); width: auto; aspect-ratio: 1 / 2;
-  transform: translate(-50%, -50%);
-  filter: drop-shadow(0 18px 30px rgb(0 0 0 / 0.5));
-}
-.no-webgl .mark-fallback { display: block; }
+.section__lede { max-width: 52ch; font-size: 18px; color: var(--ink-2); text-wrap: pretty; }
+@media (min-width: 961px) { .section__lede { justify-self: end; } }
 
-@media (max-width: 760px) {
-  .hero__video { object-position: 31% 50%; } /* the Downtown towers (x 36% of the skyline shot) */
-  .hero__shade { background: linear-gradient(0deg, rgb(10 9 7 / 0.94) 0%, rgb(10 9 7 / 0.6) 40%, rgb(10 9 7 / 0) 64%), linear-gradient(180deg, rgb(10 9 7 / 0.75), rgb(10 9 7 / 0) 30%); }
-  .hero__title { font-size: clamp(52px, 15.5vw, 92px); margin-bottom: 0; }
-  /* one full-width column: space-between would shrink the track to the lede and the plate with it */
-  .hero__credits { display: grid; grid-template-columns: minmax(0, 1fr); padding: 16px var(--gutter) max(24px, env(safe-area-inset-bottom)); }
-  .cta { display: grid; }
-  .mark-fallback { left: 50%; top: 30%; height: 30svh; }
-  .plate--lg, .plate--xl { width: 100%; }
+/* links inside running text */
+.section p a, .needs a {
+  color: var(--ink); text-decoration: underline; text-decoration-color: var(--line-3);
+  text-underline-offset: 3px; text-decoration-thickness: 1px;
 }
+.section p a:hover, .needs a:hover { color: var(--sun-hi); text-decoration-color: currentColor; }
 
-/* ---------- 2. title cards: three footage plates on the ground ---------- */
-/* Each shot is a plate with ground (--plate) around it, so two shots never butt edge to edge; the copy
-   keeps the page's one left edge (--edge) measured from the window, not from the plate. */
-.cards, .cast { display: grid; gap: var(--plate); padding: var(--plate) var(--plate) 0; background: var(--black); }
-.card { position: relative; height: calc(100svh - 2 * var(--plate)); min-height: 520px; overflow: hidden; isolation: isolate; }
-.card__img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.card__shade { position: absolute; inset: 0; }
-.card__copy { position: absolute; z-index: 2; left: calc(var(--edge) - var(--plate)); right: calc(var(--edge) - var(--plate)); }
-/* the second step of the type scale: the hero (10.6vw) is the only line above 150 px */
-.card__title {
-  font: 800 clamp(52px, 7.2vw, 132px)/0.84 var(--f-display);
-  letter-spacing: -0.005em; text-transform: uppercase;
-  text-shadow: 0 2px 28px rgb(0 0 0 / 0.5);
-}
-.card__fact { margin-top: clamp(12px, 1.8vh, 20px); max-width: 44ch; font-size: clamp(17px, 1.3vw, 21px); color: var(--ink-2); text-shadow: 0 1px 14px rgb(0 0 0 / 0.8); }
-/* Each shade is a soft pool behind its copy only, at most 0.6: the rest of the shot keeps its own light (a
-   full-frame scrim took 64-86 % of the stills' brightness and read as mud). */
-/* low: title on the ground line, bottom left */
-.card--low .card__copy { bottom: clamp(36px, 9vh, 96px); }
-.card--low .card__shade { background: radial-gradient(ellipse 58% 46% at 18% 86%, rgb(10 9 7 / 0.6), rgb(10 9 7 / 0) 100%); }
-/* high: hung from the top right, on the dark terrace round the pool */
-.card--high .card__copy { top: calc(var(--bar-h) + clamp(16px, 5vh, 56px)); text-align: right; }
-.card--high .card__fact { margin-left: auto; }
-.card--high .card__shade { background: radial-gradient(ellipse 52% 40% at 80% 20%, rgb(10 9 7 / 0.45), rgb(10 9 7 / 0) 100%); }
-/* mid: centred on the canal water, below the Downtown towers at the end of the river */
-.card--mid .card__copy { top: 64%; transform: translateY(-50%); text-align: center; }
-/* the fact line sits on bright moving water: full ink, and the shade centred on the copy (64-77%) */
-.card--mid .card__fact { margin-inline: auto; color: var(--ink); }
-.card--mid .card__shade { background: radial-gradient(56% 36% at 50% 68%, rgb(10 9 7 / 0.55), rgb(10 9 7 / 0) 100%); }
-/* Phones: a full-height card drew a 1080 px frame 2.3x too large. Each shot is a square plate instead (about
-   1:1 with the source on a 3x screen) and the copy stands on the ground under it, clear of the picture. */
-@media (max-width: 760px) {
-  .card { height: auto; min-height: 0; background: var(--black); }
-  .card__img { position: relative; display: block; aspect-ratio: 1; height: auto; }
-  .card__shade { display: none; }
-  .card .card__copy { position: static; transform: none; text-align: left; padding: 22px calc(var(--edge) - var(--plate)) 40px; }
-  .card .card__fact { margin-inline: 0; color: var(--ink-2); }
-  .card--low .card__img { object-position: 33% 50%; } /* the tall palm (x 27%) and the pier wheel (x 46%) */
-}
+.cta { display: flex; flex-wrap: wrap; gap: 12px; }
+.cta__meta { margin-top: 14px; font-size: 14px; color: var(--ink-3); }
+.cta__status:not(:empty) { margin-top: 14px; font-size: 15px; color: var(--alarm); }
 
-/* ---------- 3. cast: key art plates (a triptych on wide screens) ---------- */
-/* no ground under the last plates: they meet the servers' --ground directly (a --black strip there read
-   as a misregistered band) */
-.panel { position: relative; height: 60svh; min-height: 420px; overflow: hidden; }
-/* the portrait crops are centred on each character by encode-media.mjs, so one aim fits all three */
-.panel img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }
-/* the line sits bottom-left over light key art (pink sky, Franklin's cream sleeve): ground rises under it */
-.panel::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.92) 0%, rgb(10 9 7 / 0.66) 24%, rgb(10 9 7 / 0) 54%), linear-gradient(90deg, rgb(10 9 7 / 0.4) 0%, rgb(10 9 7 / 0) 56%); }
-.panel__line {
-  position: absolute; z-index: 2; left: calc(var(--edge) - var(--plate)); right: calc(var(--edge) - var(--plate)); bottom: clamp(28px, 6vh, 64px);
-  font: 800 clamp(44px, 5.6vw, 96px)/0.86 var(--f-display); letter-spacing: -0.004em; text-transform: uppercase;
-  text-wrap: balance; text-shadow: 0 4px 40px rgb(0 0 0 / 0.4);
+/* A panel cut like the mark: the top-right corner at 45 degrees. The clip-path would cut a border off at
+   the diagonal, so the 1px outline is a ring drawn by ::before (one evenodd polygon, the plates' method in
+   base.css: the diagonal's inner points move by --w * tan(22.5deg) = 0.4142 --w). */
+.cut {
+  --c: 18px; --w: 1px;
+  position: relative;
+  clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%);
 }
-@media (min-width: 901px) {
-  .cast { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .panel { height: min(78svh, 760px); }
-  .panel__line { left: clamp(20px, 2vw, 32px); right: clamp(20px, 2vw, 32px); font-size: clamp(32px, 3vw, 56px); }
-  /* the first plate's line keeps the page edge */
-  .panel:nth-child(1) .panel__line { left: calc(var(--edge) - var(--plate)); }
-}
-
-/* ---------- section heads (the third step of the type scale) ---------- */
-.section-title { font: 800 clamp(44px, 5.6vw, 96px)/0.86 var(--f-display); letter-spacing: 0; text-transform: uppercase; text-wrap: balance; }
-.section-lede { margin-top: 18px; max-width: 52ch; font-size: clamp(17px, 1.3vw, 19px); color: var(--ink-2); }
-/* wide screens: the lede beside the title, on its baseline, so the head is one band and not a heading
-   with an empty right half */
-@media (min-width: 1101px) {
-  .servers__head { display: grid; grid-template-columns: auto minmax(0, 46ch); justify-content: space-between; align-items: end; gap: 48px; }
-  .servers__head .section-lede { margin-top: 0; }
-}
-
-/* ---------- 4. servers ---------- */
-.servers { padding: clamp(96px, 16vh, 180px) 0 clamp(72px, 12vh, 140px); background: var(--ground); }
-.servers__grid {
-  margin-top: clamp(36px, 6vh, 64px);
-  display: grid; gap: 14px;
-  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
-  grid-template-rows: repeat(2, minmax(220px, 31vh));
-}
-.server {
-  position: relative; overflow: hidden; isolation: isolate;
-  background: var(--panel);
-  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
-}
-.server--open { grid-row: span 2; }
-.server__img {
-  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-  /* "soon": near-monochrome but still a picture (grey at half brightness read as an image that failed) */
-  filter: grayscale(0.85) brightness(0.7) contrast(1.08);
-  transform: scale(1.02);
-  transition: filter 500ms var(--ease-out), transform 900ms var(--ease-out);
-}
-.server--open .server__img { filter: none; }
-.server:hover .server__img { filter: none; transform: scale(1.05); }
-.server::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.82), rgb(10 9 7 / 0) 48%); z-index: 0; }
-/* the open server's gold frame follows the cut corner: a ring with an evenodd hole, like the plates (an
-   inset box-shadow is cut off at the diagonal by the card's clip-path) */
-.server--open::before {
-  --w: 2px;
-  content: ''; position: absolute; inset: 0; z-index: 3; background: var(--sun); pointer-events: none;
+.cut::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none; background: var(--line-2);
   clip-path: polygon(evenodd,
-    0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%, 0 0,
+    0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0,
     var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)),
-    calc(100% - var(--w)) calc(var(--cut) + 0.4142 * var(--w)), calc(100% - var(--cut) - 0.4142 * var(--w)) var(--w), var(--w) var(--w));
-}
-.server__body { position: absolute; z-index: 2; left: clamp(20px, 2.4vw, 32px); bottom: clamp(18px, 2.4vw, 30px); right: 20px; }
-.server__name { margin-top: 10px; font: 800 clamp(56px, 6vw, 112px)/0.84 var(--f-display); letter-spacing: 0.01em; }
-.server:not(.server--open) .server__name { font-size: clamp(44px, 4.4vw, 76px); color: var(--ink-2); }
-.server__meta { margin-top: 8px; font: 700 15px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
-.state {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 10px; background: rgb(10 9 7 / 0.72); box-shadow: inset 0 0 0 1px var(--line-2);
-  font: 700 13px/1 var(--f-display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-2);
-}
-.state--open { color: var(--sun); box-shadow: inset 0 0 0 1px rgb(242 177 52 / 0.6); }
-/* diagonal tape across the cut corner of a server that is not open yet */
-.tape {
-  position: absolute; z-index: 3; top: 26px; right: -52px; width: 200px;
-  transform: rotate(45deg);
-  padding: 7px 0; text-align: center;
-  background: var(--sun); color: var(--on-sun);
-  font: 800 15px/1 var(--f-display); letter-spacing: 0.28em; text-transform: uppercase;
-}
-@media (max-width: 760px) {
-  .servers__grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-auto-rows: auto; }
-  .server { min-height: 34svh; }
-  .server--open { grid-row: auto; min-height: 46svh; }
+    calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w));
 }
 
-/* ---------- 5. get in: three steps, each beside its launcher screen ---------- */
-.getin { padding: clamp(48px, 7vh, 88px) 0 clamp(40px, 6vh, 64px); background: linear-gradient(180deg, var(--ground), var(--panel) 40%, var(--ground)); }
-.getin__stage { margin-inline: var(--edge); }
-.steps { list-style: none; padding: 0; margin-top: clamp(40px, 7vh, 80px); display: grid; gap: clamp(56px, 9vh, 104px); }
-.step { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 18px clamp(18px, 3vw, 40px); align-items: end; }
-.step__n { font: 800 clamp(96px, 12vw, 180px)/0.78 var(--f-display); color: var(--sun); letter-spacing: -0.02em; }
-.step__text h3 { font: 800 clamp(34px, 3.4vw, 54px)/0.9 var(--f-display); text-transform: uppercase; }
-.step__text p { margin-top: 12px; max-width: 40ch; color: var(--ink-2); }
-.step__fig { grid-column: 1 / -1; position: relative; }
-.step__shot {
-  width: 100%; height: auto;
-  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
-  box-shadow: 0 30px 60px rgb(0 0 0 / 0.5);
+/* ---------- 1. hero ---------- */
+.hero {
+  position: relative; isolation: isolate;
+  display: grid; align-items: end;
+  min-height: min(84svh, 880px);
+  padding: calc(var(--bar-h) + clamp(48px, 10vh, 120px)) 0 clamp(32px, 5vh, 56px);
+  overflow: hidden;
 }
-/* under the window, never on it: the shots carry sample names and counts, and must say so legibly */
-.shot-note { margin-top: 10px; font: 400 14px/1.4 var(--f-text); color: var(--ink-3); }
-/* wide screens: the step (number over text) on the left, centred against its launcher screen on the right */
-@media (min-width: 901px) {
-  .steps { gap: clamp(40px, 6vh, 72px); }
-  .step {
-    grid-template-columns: minmax(0, 4fr) minmax(0, 7fr); grid-template-rows: 1fr auto auto 1fr;
-    gap: 0 clamp(36px, 5vw, 88px); align-items: start;
+.hero__img {
+  position: absolute; inset: 0; z-index: -2;
+  width: 100%; height: 100%; object-fit: cover; object-position: 50% 72%;
+  filter: contrast(1.1) saturate(1.08);
+}
+/* the copy side carries the dark; the skyline stays visible on the right; the foot fades into the ground */
+.hero__shade {
+  position: absolute; inset: 0; z-index: -1;
+  background:
+    linear-gradient(180deg, rgb(10 9 7 / 0.55) 0, rgb(10 9 7 / 0) 180px),
+    linear-gradient(180deg, rgb(10 9 7 / 0) 55%, var(--ground) 100%),
+    linear-gradient(90deg, rgb(10 9 7 / 0.82) 0%, rgb(10 9 7 / 0.5) 36%, rgb(10 9 7 / 0.06) 70%, rgb(10 9 7 / 0.2) 100%);
+}
+.hero__grid {
+  display: grid; gap: 40px 64px; align-items: end;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 1001px) { .hero__grid { grid-template-columns: minmax(0, 1fr) minmax(320px, 380px); } }
+.hero__title {
+  max-width: 15ch;
+  font: 800 clamp(48px, 6vw, 88px)/0.92 var(--f-display);
+  letter-spacing: 0.005em; text-transform: uppercase; text-wrap: balance;
+  text-shadow: 0 2px 24px rgb(0 0 0 / 0.35);
+}
+.hero__lede { max-width: 46ch; margin: 22px 0 30px; font-size: clamp(17px, 1.25vw, 19px); color: var(--ink-2); text-wrap: pretty; }
+
+/* SOL's status: an info panel, the way a store page sums up a product */
+.status { background: rgb(16 14 11 / 0.92); padding: 24px 24px 20px; }
+.status__head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+.status__name { font: 800 44px/0.9 var(--f-display); letter-spacing: 0.02em; }
+.status__state { display: inline-flex; align-items: center; gap: 9px; margin-right: 6px; font: 700 17px/1 var(--f-display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink); white-space: nowrap; }
+/* gold means measured: only a server that reported itself online gets the gold dot */
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink-3); flex: none; }
+/* no measured state yet (the static "Open"): no dot at all, so nothing reads as live or as offline */
+.status__state[data-tone='open'] .dot { display: none; }
+.status__state[data-tone='online'] .dot { background: var(--sun); box-shadow: 0 0 0 3px rgb(242 177 52 / 0.18); }
+.status__state[data-tone='offline'] .dot { background: var(--ink-4); }
+.status__state[data-tone='offline'] { color: var(--ink-3); }
+.status__state[data-tone='maintenance'] .dot { background: var(--alarm); }
+.status__facts > div { display: flex; justify-content: space-between; gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.status__facts > div[hidden] { display: none; }
+.status__facts dt { font-size: 14px; color: var(--ink-3); }
+.status__facts dd { font-size: 15px; font-weight: 600; text-align: right; }
+.status__note { margin-top: 16px; font-size: 15px; color: var(--ink-2); }
+.status__link {
+  display: inline-block; margin-top: 12px; padding: 6px 0;
+  font: 700 16px/1 var(--f-display); letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink); text-decoration: underline; text-decoration-color: var(--line-3); text-underline-offset: 5px;
+}
+.status__link:hover { color: var(--sun-hi); text-decoration-color: currentColor; }
+
+/* the one authored moment: the pitch and the panel arrive once (enter.js sets .enter unless reduced motion) */
+@keyframes rise { from { opacity: 0; transform: translateY(14px); } }
+.enter .hero__copy { animation: rise 700ms var(--ease-out) 80ms both; }
+.enter .status { animation: rise 700ms var(--ease-out) 220ms both; }
+
+/* ---------- 2. servers ---------- */
+.srv {
+  display: grid; gap: 24px 48px; align-items: center;
+  grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+}
+.srv__img { width: 100%; height: auto; aspect-ratio: 16 / 10; object-fit: cover; object-position: 50% 22%; background: var(--panel-2); }
+.srv__name { font: 800 clamp(44px, 4.4vw, 64px)/0.9 var(--f-display); letter-spacing: 0.02em; }
+.srv__desc { margin-top: 14px; max-width: 52ch; font-size: 18px; color: var(--ink-2); text-wrap: pretty; }
+.srv__facts { display: flex; flex-wrap: wrap; gap: 12px 48px; margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--line); }
+.srv__facts dt { font-size: 13px; color: var(--ink-3); }
+.srv__facts dd { font-size: 17px; font-weight: 600; }
+.srv-next { margin-top: clamp(28px, 3vw, 40px); padding: 16px 0; border-block: 1px solid var(--line); font-size: 16px; color: var(--ink-2); }
+.srv-next__label { margin-right: 14px; font: 700 16px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink); }
+@media (max-width: 760px) {
+  .srv { grid-template-columns: minmax(0, 1fr); }
+  .srv__desc { font-size: 16px; }
+}
+
+/* ---------- 3. what SOL runs ---------- */
+.facts { list-style: none; margin: 0; padding: 0; display: grid; gap: 0 48px; grid-template-columns: minmax(0, 1fr); }
+.game__grid { display: grid; gap: 36px 64px; align-items: start; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 961px) { .game__grid { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); } }
+/* the HUD: two plates of the client's own overlay render, cut like the mark */
+.hud__plates { display: grid; grid-template-columns: minmax(0, 820fr) minmax(0, 900fr); gap: 12px; align-items: end; }
+.hud__plate { --c: 22px; width: 100%; height: auto; background: var(--panel-2); }
+.hud figcaption { margin-top: 14px; max-width: 60ch; font-size: 14px; color: var(--ink-3); }
+.facts li { padding: 22px 0 24px; border-top: 1px solid var(--line-2); }
+.facts h3 { font: 800 26px/1 var(--f-display); letter-spacing: 0.02em; text-transform: uppercase; }
+.facts p { margin-top: 10px; color: var(--ink-2); font-size: 16px; max-width: 46ch; }
+
+/* ---------- 4. how to join ---------- */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 32px 48px; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 761px) { .steps { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.steps li { padding-top: 22px; border-top: 1px solid var(--line-2); }
+.steps__n {
+  --c: 10px;
+  display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: 18px;
+  background: var(--panel-3); color: var(--ink);
+  font: 800 28px/1 var(--f-display);
+  clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%);
+}
+.steps h3 { font-size: 19px; font-weight: 700; line-height: 1.3; }
+.steps p { margin-top: 6px; color: var(--ink-2); font-size: 16px; max-width: 42ch; }
+
+/* ---------- 5. quests ---------- */
+.quests__grid { display: grid; gap: 32px 72px; align-items: center; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 961px) { .quests__grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.quests__copy .section__title { margin-bottom: 16px; }
+.quests__copy > p { max-width: 46ch; font-size: 18px; color: var(--ink-2); }
+.quests__copy .cta { margin-top: 24px; }
+.quest {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; align-items: center;
+  padding: 24px 28px; background: var(--panel-2);
+}
+.quest__title { font: 800 28px/1 var(--f-display); letter-spacing: 0.02em; text-transform: uppercase; }
+.quest__desc { margin-top: 8px; font-size: 15px; color: var(--ink-2); }
+.quest__reward { text-align: right; font: 700 15px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
+.quest__amount { display: block; margin-bottom: 4px; font: 800 44px/0.9 var(--f-display); letter-spacing: 0.01em; color: var(--ink); }
+@media (max-width: 480px) { .quest { grid-template-columns: minmax(0, 1fr); } .quest__reward { text-align: left; } }
+
+/* ---------- 6. download ---------- */
+.download { background: var(--panel); }
+.download__grid { display: grid; gap: 36px 72px; align-items: start; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 961px) { .download__grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.download__copy .section__title { margin-bottom: 28px; }
+.needs > div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 16px; padding: 14px 0; border-top: 1px solid var(--line); }
+.needs > div:last-child { border-bottom: 1px solid var(--line); }
+.needs dt { font-size: 14px; color: var(--ink-3); padding-top: 2px; }
+.needs dd { font-size: 16px; }
+.hash { margin-top: 18px; font-size: 13px; color: var(--ink-3); }
+.hash code { display: block; margin-top: 4px; font: 13px/1.5 ui-monospace, 'Cascadia Mono', Consolas, monospace; color: var(--ink-2); overflow-wrap: anywhere; }
+
+/* ---------- phones: the photo is a band above the copy, not a wash behind it ---------- */
+@media (max-width: 760px) {
+  .hero { display: block; min-height: 0; padding: 0 0 40px; }
+  .hero__img { position: relative; inset: auto; z-index: -2; height: auto; aspect-ratio: 4 / 3; object-position: 42% 74%; }
+  .hero__shade {
+    inset: 0 0 auto 0; height: calc(100vw * 3 / 4);
+    background:
+      linear-gradient(180deg, rgb(10 9 7 / 0.6) 0, rgb(10 9 7 / 0) 96px),
+      linear-gradient(180deg, rgb(10 9 7 / 0) 45%, var(--ground) 100%);
   }
-  .step__n { grid-column: 1; grid-row: 2; font-size: clamp(72px, 5.6vw, 104px); }
-  .step__text { grid-column: 1; grid-row: 3; padding-top: 16px; }
-  .step__fig { grid-column: 2; grid-row: 1 / -1; width: 100%; max-width: 960px; justify-self: end; }
-}
-
-/* ---------- 6. close: centred, the decision and what it needs ---------- */
-.close { position: relative; min-height: calc(100svh - var(--foot-h, 0px)); display: grid; align-items: end; overflow: hidden; isolation: isolate; background: var(--ground); }
-/* The picture starts below the section's top and rises out of the ground the get-in section ends on (no
-   hard edge), so the main dome sits low enough for the S to stand in the sky above it, not on the building
-   (closePose in main.ts reads this box and the object-position). Wide screens have little spare width:
-   100% brings the dome (x 57 % of the frame) nearest the centre; phones have a lot, and 58% centres it. */
-.close__img {
-  --top: clamp(56px, 14svh, 180px);
-  position: absolute; left: 0; top: var(--top); width: 100%; height: calc(100% - var(--top)); z-index: 0;
-  object-fit: cover; object-position: 100% 0%;
-  -webkit-mask-image: linear-gradient(180deg, transparent 0%, #000 9%); mask-image: linear-gradient(180deg, transparent 0%, #000 9%);
-}
-/* dark only where the copy is: the CTA and the requirements at the foot */
-.close__shade { position: absolute; inset: 0; z-index: 0; background: linear-gradient(180deg, rgb(10 9 7 / 0) 44%, rgb(10 9 7 / 0.5) 66%, rgb(10 9 7 / 0.9) 100%); }
-@media (max-width: 760px) {
-  .close__img { object-position: 58% 0%; }
-  /* the copy is taller than the picture's lower half here: the download plate lands on the lit facade */
-  .close__shade { background: linear-gradient(180deg, rgb(10 9 7 / 0) 34%, rgb(10 9 7 / 0.66) 50%, rgb(10 9 7 / 0.9) 100%); }
-}
-.stage3d--close { z-index: 1; }
-.close__copy { position: relative; z-index: 2; width: min(64rem, 100% - 2 * var(--gutter)); margin: 0 auto; padding: 38svh 0 clamp(56px, 10vh, 112px); text-align: center; }
-.close__title { font: 800 clamp(56px, 7.6vw, 136px)/0.84 var(--f-display); text-transform: uppercase; text-wrap: balance; text-shadow: 0 4px 40px rgb(0 0 0 / 0.4); }
-.cta--center { margin-top: clamp(24px, 4vh, 40px); justify-content: center; }
-.needs {
-  margin: clamp(28px, 5vh, 48px) auto 0; max-width: 46rem;
-  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-  border-top: 1px solid var(--line-2); text-align: left;
-}
-.needs > div { padding: 18px 24px 0 0; }
-.needs > div + div { padding-left: 24px; border-left: 1px solid var(--line); }
-.needs dt { font: 700 14px/1 var(--f-display); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3); }
-.needs dd { margin-top: 8px; font-size: 16px; color: var(--ink); }
-.hash { margin-top: 22px; font: 600 13px/1.5 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-3); max-width: 100%; }
-.hash code { display: block; margin-top: 4px; font: 400 13px/1.5 ui-monospace, 'Cascadia Mono', Consolas, monospace; letter-spacing: 0; text-transform: none; color: var(--ink-2); overflow-wrap: anywhere; }
-@media (max-width: 760px) {
-  .close__copy { padding-top: 34svh; }
-  .needs { grid-template-columns: minmax(0, 1fr); }
-  .needs > div + div { padding-left: 0; border-left: 0; border-top: 1px solid var(--line); margin-top: 16px; }
+  .hero__grid { position: relative; margin-top: -56px; }
+  .hero__title { font-size: clamp(42px, 12.5vw, 60px); }
+  .cta .plate--lg { flex: 1 1 100%; }
+  .status { padding: 20px 18px 18px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .plate, .server__img { transition: none; }
+  .enter .hero__copy, .enter .status { animation: none; }
 }
