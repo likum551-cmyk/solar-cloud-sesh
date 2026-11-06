@@ -1,0 +1,5 @@
+{"name":"slot_stack","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.filled","fill":"#F7F2E812","border":{"w":1.5,"style":"solid","color":"#F7F2E829"}},
+{"op":"icon","name":"bottle","x":16,"y":16,"size":32,"color":"#D9D1C3FF"},
+{"op":"text","text":"\u00d76","x":40,"baseline":9,"w":16,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":40,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}]}
+]}

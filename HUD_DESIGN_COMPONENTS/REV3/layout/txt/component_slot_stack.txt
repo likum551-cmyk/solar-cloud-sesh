@@ -1,0 +1,5 @@
+# component_slot_stack   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (16, 16)  size 32  #D9D1C3FF
+text  "×6"  x 40  baseline 9  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 40)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]

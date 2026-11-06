@@ -1,0 +1,4 @@
+# component_slot_hover   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F7F2E81F  border 1.5px solid #F7F2E857  # slot.hover
+icon  radio  (16, 16)  size 32  #F7F2E8FF

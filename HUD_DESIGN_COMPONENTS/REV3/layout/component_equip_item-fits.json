@@ -1,0 +1,5 @@
+{"name":"equip_item-fits","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.jacket.target","fill":"#F2B1341A","border":{"w":1.5,"style":"dashed","color":"#F2B134B3"}},
+{"op":"icon","name":"jacket","x":20,"y":28,"size":26,"color":"#F2B134FF","glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}},
+{"op":"text","text":"JACKET","x":14.08,"baseline":10,"w":37.84,"size":10,"weight":700,"color":"#F2B134FF","anchor":"center","ax":33,"tracking":1}
+]}

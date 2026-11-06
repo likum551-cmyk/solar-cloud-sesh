@@ -1,0 +1,4 @@
+{"name":"slot_hover","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.hover","fill":"#F7F2E81F","border":{"w":1.5,"style":"solid","color":"#F7F2E857"}},
+{"op":"icon","name":"radio","x":16,"y":16,"size":32,"color":"#F7F2E8FF"}
+]}

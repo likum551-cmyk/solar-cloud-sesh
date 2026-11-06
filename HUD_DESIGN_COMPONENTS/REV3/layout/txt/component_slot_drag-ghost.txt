@@ -1,0 +1,5 @@
+# component_slot_drag-ghost   origin = bottom-left of the component (sprite padding 48 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (-2.56, -2.56, 69.12, 69.12)  r17.28  fill #F7F2E824  border 1.62px solid #F7F2E866  shadow [#00000080 offset(0,-12) blur 24 sigma 12; #F2B13459 offset(0,0) blur 16 sigma 8]  scale 1.08  # slot.ghost
+icon  bandage  (14.72, 14.72)  size 34.56  #F7F2E8FF
+text  "×6"  x 40.64  baseline 7.16  w 17.28  13px/700  #F7F2E8FF  tabular  anchor left (ax 40.64)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]

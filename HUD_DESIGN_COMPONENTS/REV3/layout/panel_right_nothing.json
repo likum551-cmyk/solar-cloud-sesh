@@ -1,0 +1,16 @@
+{"name":"panel_right_nothing","units":"px","origin":"bottom-left of this component (screen for screens)","size":[1920, 1080],"ops":[
+{"op":"rect","x":1210,"y":172,"w":646,"h":800,"radius":32,"role":"panel","fill":"#0A0907BD","border":{"w":1,"style":"solid","color":"#F7F2E824"}},
+{"op":"text","text":"NEARBY","x":1243,"baseline":923,"w":100.75,"size":28,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":1243,"tracking":0.28},
+{"op":"rect","x":1475,"y":911,"w":350,"h":40,"radius":20,"role":"pill","fill":"#F7F2E80D","border":{"w":1,"style":"solid","color":"#F7F2E81F"},"opacity":0.55},
+{"op":"icon","name":"car","x":1497.94,"y":922,"size":16,"color":"#A9A295FF","opacity":0.55},
+{"op":"text","text":"VEHICLE","x":1520.94,"baseline":927,"w":55.11,"size":12,"weight":700,"color":"#A9A295FF","anchor":"center","ax":1548.5,"tracking":1.44,"opacity":0.55},
+{"op":"icon","name":"drop","x":1611.89,"y":922,"size":16,"color":"#A9A295FF","opacity":0.55},
+{"op":"text","text":"GROUND","x":1634.89,"baseline":927,"w":55.22,"size":12,"weight":700,"color":"#A9A295FF","anchor":"center","ax":1662.5,"tracking":1.44,"opacity":0.55},
+{"op":"icon","name":"stash","x":1732.61,"y":922,"size":16,"color":"#A9A295FF","opacity":0.55},
+{"op":"text","text":"STASH","x":1755.61,"baseline":927,"w":41.78,"size":12,"weight":700,"color":"#A9A295FF","anchor":"center","ax":1776.5,"tracking":1.44,"opacity":0.55},
+{"op":"rect","x":1486,"y":625,"w":96,"h":96,"radius":48,"fill":"#F7F2E808","border":{"w":1.5,"style":"dashed","color":"#F7F2E829"}},
+{"op":"icon","name":"car","x":1515,"y":652,"size":40,"color":"#A9A295FF","opacity":0.5},
+{"op":"text","text":"NOTHING IN REACH","x":1434.59,"baseline":581,"w":198.83,"size":18,"weight":700,"color":"#A9A295FF","anchor":"center","ax":1534,"tracking":2.88},
+{"op":"text","text":"No vehicle, drop or stash within 2 m.","x":1425.1,"baseline":550,"w":217.8,"size":14,"weight":500,"color":"#A9A295FF","anchor":"center","ax":1534},
+{"op":"text","text":"Walk up to a car and press TAB, or drop an item to see it here.","x":1365.34,"baseline":527,"w":337.33,"size":13,"weight":500,"color":"#A9A295B3","anchor":"center","ax":1534}
+]}

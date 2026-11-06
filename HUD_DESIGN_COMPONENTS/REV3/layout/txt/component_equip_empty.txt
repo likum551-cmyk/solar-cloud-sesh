@@ -1,0 +1,5 @@
+# component_equip_empty   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.hat.empty
+icon  hat  (20, 28)  size 26  #A9A295FF  opacity 0.45
+text  "HAT"  x 22.77  baseline 10  w 20.45  10px/700  #A9A295CC  tracking 1px  anchor center (ax 32.99)

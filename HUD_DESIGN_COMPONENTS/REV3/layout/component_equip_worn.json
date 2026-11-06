@@ -1,0 +1,4 @@
+{"name":"equip_worn","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.hat.filled","fill":"#F7F2E812","border":{"w":1.5,"style":"solid","color":"#F7F2E829"}},
+{"op":"icon","name":"hat","x":17,"y":15,"size":32,"color":"#D9D1C3FF"}
+]}

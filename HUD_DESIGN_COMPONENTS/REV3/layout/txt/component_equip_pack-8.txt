@@ -1,0 +1,6 @@
+# component_equip_pack-8   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.pack.filled
+icon  backpack  (19, 28)  size 28  #D9D1C3FF
+rect  (4.99, 6, 54.02, 16)  r8  fill #F2B134FF
+text  "8 SLOTS"  x 11.99  baseline 11  w 40.02  10px/700  #0A0907FF  tracking 0.6px  anchor center (ax 32)

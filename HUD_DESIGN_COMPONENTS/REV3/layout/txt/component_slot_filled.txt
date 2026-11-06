@@ -1,0 +1,4 @@
+# component_slot_filled   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  phone  (16, 16)  size 32  #D9D1C3FF

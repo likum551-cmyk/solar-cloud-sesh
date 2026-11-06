@@ -1,0 +1,5 @@
+{"name":"equip_pack-empty","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.pack.empty","fill":"#F2B1340D","border":{"w":1.5,"style":"dashed","color":"#F2B13473"}},
+{"op":"icon","name":"backpack","x":19,"y":26,"size":28,"color":"#F2B134FF","opacity":0.6},
+{"op":"text","text":"PACK","x":19.25,"baseline":10,"w":27.5,"size":10,"weight":700,"color":"#F2B134BF","anchor":"center","ax":33,"tracking":1}
+]}

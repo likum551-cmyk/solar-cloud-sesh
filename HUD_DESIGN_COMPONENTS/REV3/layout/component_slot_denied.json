@@ -1,0 +1,5 @@
+{"name":"slot_denied","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.deny","fill":"#E5603A29","border":{"w":1.5,"style":"solid","color":"#E5603A99"},"shadow":[{"color":"#E5603A59","x":0,"y":-0.0,"blur":16,"sigma":8,"spread":0,"inset":false}]},
+{"op":"icon","name":"cash","x":16,"y":16,"size":32,"color":"#E5603AFF","glow":{"color":"#E5603ABF","blur":5,"sigma":2.5}},
+{"op":"text","text":"1.2k","x":29.47,"baseline":9,"w":26.53,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":29.47,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}]}
+]}

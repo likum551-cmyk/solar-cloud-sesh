@@ -1,0 +1,4 @@
+{"name":"equip_selected","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.hat.selected","fill":"#F2B13424","border":{"w":1.5,"style":"solid","color":"#F2B13499"},"shadow":[{"color":"#F2B13459","x":0,"y":-0.0,"blur":16,"sigma":8,"spread":0,"inset":false}]},
+{"op":"icon","name":"hat","x":17,"y":15,"size":32,"color":"#F2B134FF","glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}}
+]}

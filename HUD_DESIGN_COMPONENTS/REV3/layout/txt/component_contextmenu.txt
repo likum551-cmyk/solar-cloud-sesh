@@ -1,0 +1,19 @@
+# component_contextmenu   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [210, 254]
+rect  (0, 0, 210, 254)  r24  fill #0A0907E6  border 1px solid #F7F2E824  # panel
+rect  (9, 209, 194, 36)  r12  fill #F2B13424  # menu.row.hover
+icon  medkit  (21, 219)  size 16  #F2B134FF
+text  "USE"  x 47  baseline 223.5  w 26.83  13px/700  #F2B134FF  tracking 1.3px  anchor left (ax 47)
+icon  person  (21, 181)  size 16  #D9D1C3FF
+text  "GIVE"  x 47  baseline 185.5  w 32.17  13px/700  #F7F2E8FF  tracking 1.3px  anchor left (ax 47)
+icon  chev  (177, 182)  size 14  #A9A295FF
+icon  drop  (21, 143)  size 16  #D9D1C3FF
+text  "DROP"  x 47  baseline 147.5  w 37.19  13px/700  #F7F2E8FF  tracking 1.3px  anchor left (ax 47)
+icon  box  (21, 105)  size 16  #D9D1C3FF
+text  "SPLIT"  x 47  baseline 109.5  w 38.09  13px/700  #F7F2E8FF  tracking 1.3px  anchor left (ax 47)
+icon  ring  (21, 67)  size 16  #D9D1C3FF
+text  "BIND TO SLOT"  x 47  baseline 71.5  w 93.34  13px/700  #F7F2E8FF  tracking 1.3px  anchor left (ax 47)
+icon  chev  (177, 68)  size 14  #A9A295FF
+rect  (17, 50, 178, 1)  r0  fill #F7F2E81F
+icon  search  (21, 17)  size 16  #A9A295FF
+text  "INSPECT"  x 47  baseline 21.5  w 58.28  13px/700  #A9A295FF  tracking 1.3px  anchor left (ax 47)

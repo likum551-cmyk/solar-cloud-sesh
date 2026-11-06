@@ -1,0 +1,3 @@
+{"name":"slot_empty","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.empty","fill":"#F7F2E80A","border":{"w":1.5,"style":"solid","color":"#F7F2E81A"}}
+]}

@@ -1,0 +1,5 @@
+# component_equip_pack-empty   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F2B1340D  border 1.5px dashed #F2B13473  # equip.pack.empty
+icon  backpack  (19, 26)  size 28  #F2B134FF  opacity 0.6
+text  "PACK"  x 19.25  baseline 10  w 27.5  10px/700  #F2B134BF  tracking 1px  anchor center (ax 33)

@@ -1,0 +1,4 @@
+{"name":"slot_locked","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.locked","fill":"#F7F2E805","border":{"w":1.5,"style":"dashed","color":"#F7F2E81F"}},
+{"op":"icon","name":"lock","x":20.5,"y":20.5,"size":23,"color":"#A9A295FF","opacity":0.35}
+]}

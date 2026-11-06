@@ -1,0 +1,47 @@
+# panel_right_vehicle-moto   origin = bottom-left of the screen, y up, px, #RRGGBBAA, paint order top to bottom
+# size [1920, 1080]
+rect  (1210, 172, 646, 800)  r32  fill #0A0907BD  border 1px solid #F7F2E824  # panel
+text  "NEARBY"  x 1243  baseline 923  w 100.75  28px/700  #F7F2E8FF  tracking 0.28px  anchor left (ax 1243)
+rect  (1475, 911, 350, 40)  r20  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (1480, 914, 114, 32)  r16  fill #F2B13424  border 1.5px solid #F2B13499
+icon  car  (1497.94, 922)  size 16  #F2B134FF
+text  "VEHICLE"  x 1520.94  baseline 927  w 55.11  12px/700  #F2B134FF  tracking 1.44px  anchor center (ax 1548.5)
+icon  drop  (1611.89, 922)  size 16  #A9A295FF
+text  "GROUND"  x 1634.89  baseline 927  w 55.22  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1662.5)
+icon  stash  (1732.61, 922)  size 16  #A9A295FF
+text  "STASH"  x 1755.61  baseline 927  w 41.78  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1776.5)
+rect  (1243, 811, 582, 76)  r24  fill #F7F2E80D  border 1px solid #F7F2E81F  # card
+rect  (1256, 822, 52, 52)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829
+icon  moto  (1268, 834)  size 28  #D9D1C3FF
+text  "Bati 801"  x 1324  baseline 856  w 72.13  20px/700  #F7F2E8FF  anchor left (ax 1324)
+rect  (1324, 820, 88, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "SOL 0713"  x 1340.22  baseline 827.5  w 55.55  11px/700  #A9A295FF  tracking 1.32px  anchor center (ax 1368)
+rect  (1420, 820, 112, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "MOTORCYCLE"  x 1436.25  baseline 827.5  w 79.5  11px/700  #A9A295FF  tracking 1.32px  anchor center (ax 1476)
+rect  (1678, 832, 136, 32)  r16  fill #D9D1C31A  border 1.5px solid #D9D1C34D  # chip.bone
+icon  unlock  (1700.94, 841)  size 14  #D9D1C3FF
+text  "UNLOCKED"  x 1720.94  baseline 845  w 70.13  12px/700  #D9D1C3FF  tracking 1.44px  anchor center (ax 1756.01)
+rect  (1243, 747, 582, 40)  r24  fill #F7F2E80D  border 1px solid #F7F2E81F  # card
+text  "NO GLOVEBOX ON THIS VEHICLE"  x 1262  baseline 763  w 219.44  12px/700  #A9A295FF  tracking 1.92px  anchor left (ax 1262)
+text  "TOP CASE · 4 SLOTS"  x 1243  baseline 710  w 145.45  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 1243)
+text  "1.6 / 15 KG"  x 1756.52  baseline 710  w 68.48  12px/700  #D9D1C3FF  tracking 1.2px  anchor right (ax 1825)
+rect  (1243, 695, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (1243, 695, 62.09, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (1243, 619, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  torch  (1259, 635)  size 32  #D9D1C3FF
+rect  (1254, 626, 42, 3)  r2  fill #F7F2E829
+rect  (1254, 626, 30.23, 3)  r2  fill #D9D1C3FF
+rect  (1317, 619, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bandage  (1333, 635)  size 32  #D9D1C3FF
+text  "×4"  x 1357  baseline 628  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1357)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1391, 619, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (1407, 635)  size 32  #D9D1C3FF
+text  "×2"  x 1431  baseline 628  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1431)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1465, 619, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1243, 209, 582, 56)  r28  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (1252, 216, 124, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+text  "TAKE ALL"  x 1281.81  baseline 232.5  w 64.36  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 1313.99)
+rect  (1384, 216, 112, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+icon  lock  (1409.91, 228)  size 16  #F7F2E8FF
+text  "LOCK"  x 1432.91  baseline 232.5  w 37.19  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 1451.51)
+text  "SHIFT + CLICK TO MOVE"  x 1667.41  baseline 233  w 146.59  11px/700  #A9A295FF  tracking 1.54px  anchor right (ax 1814)

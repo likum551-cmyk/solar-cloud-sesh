@@ -1,0 +1,21 @@
+# component_tooltip   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [300, 196]
+rect  (0, 0, 300, 196)  r24  fill #0A0907E6  border 1px solid #F7F2E824  # panel
+text  "Medkit"  x 19  baseline 161  w 54.33  18px/700  #F7F2E8FF  anchor left (ax 19)
+rect  (207, 155, 76, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "MEDICAL"  x 220.33  baseline 163  w 49.34  10px/700  #A9A295FF  tracking 1.4px  anchor center (ax 245)
+text  "Restores 35 HP over 8 s. Single use."  x 19  baseline 133  w 197.39  13px/500  #D9D1C3FF  anchor left (ax 19)
+rect  (19, 112, 264, 1)  r0  fill #F7F2E81F
+text  "QUANTITY"  x 19  baseline 89  w 57.55  10px/700  #A9A295FF  tracking 1.6px  anchor left (ax 19)
+text  "2 / 5"  x 19  baseline 71  w 30.28  16px/700  #F7F2E8FF  anchor left (ax 19)
+text  "UNIT"  x 113  baseline 89  w 27.73  10px/700  #A9A295FF  tracking 1.6px  anchor left (ax 113)
+text  "0.6 kg"  x 113  baseline 71  w 41.58  16px/700  #F7F2E8FF  anchor left (ax 113)
+text  "STACK"  x 197  baseline 89  w 36.84  10px/700  #A9A295FF  tracking 1.6px  anchor left (ax 197)
+text  "1.2 kg"  x 197  baseline 71  w 41.06  16px/700  #F7F2E8FF  anchor left (ax 197)
+rect  (19, 54, 264, 1)  r0  fill #F7F2E81F
+rect  (19, 19, 42.5, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "RMB"  x 28  baseline 26.5  w 24.5  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 40.25)
+text  "menu"  x 69.5  baseline 26.5  w 32.09  13px/600  #D9D1C3FF  anchor left (ax 69.5)
+rect  (117.59, 19, 50.69, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "SHIFT"  x 126.59  baseline 26.5  w 32.69  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 142.94)
+text  "move"  x 176.28  baseline 26.5  w 31.08  13px/600  #D9D1C3FF  anchor left (ax 176.28)

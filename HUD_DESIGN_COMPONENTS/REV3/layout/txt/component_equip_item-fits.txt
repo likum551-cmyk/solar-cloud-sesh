@@ -1,0 +1,5 @@
+# component_equip_item-fits   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F2B1341A  border 1.5px dashed #F2B134B3  # equip.jacket.target
+icon  jacket  (20, 28)  size 26  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "JACKET"  x 14.08  baseline 10  w 37.84  10px/700  #F2B134FF  tracking 1px  anchor center (ax 33)

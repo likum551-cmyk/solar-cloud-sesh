@@ -1,0 +1,6 @@
+{"name":"equip_pack-denied","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.pack.deny","fill":"#E5603A29","border":{"w":1.5,"style":"solid","color":"#E5603A99"},"shadow":[{"color":"#E5603A59","x":0,"y":-0.0,"blur":16,"sigma":8,"spread":0,"inset":false}]},
+{"op":"icon","name":"backpack","x":19,"y":28,"size":28,"color":"#E5603AFF","glow":{"color":"#E5603ABF","blur":5,"sigma":2.5}},
+{"op":"rect","x":4.99,"y":6,"w":54.02,"h":16,"radius":8,"fill":"#F2B134FF"},
+{"op":"text","text":"8 SLOTS","x":11.99,"baseline":11,"w":40.02,"size":10,"weight":700,"color":"#0A0907FF","anchor":"center","ax":32,"tracking":0.6}
+]}

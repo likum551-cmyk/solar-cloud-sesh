@@ -1,0 +1,4 @@
+{"name":"slot_drop-target","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.target","fill":"#F2B1341A","border":{"w":1.5,"style":"dashed","color":"#F2B134B3"}},
+{"op":"icon","name":"plus","x":20.5,"y":20.5,"size":23,"color":"#F2B134FF","opacity":0.85,"glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}}
+]}

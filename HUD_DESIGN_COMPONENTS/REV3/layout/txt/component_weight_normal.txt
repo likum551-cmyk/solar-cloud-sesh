@@ -1,0 +1,8 @@
+# component_weight_normal   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [238, 40]
+rect  (0, 0, 238, 40)  r20  fill #F7F2E80F  border 1px solid #F7F2E824  # pill
+icon  weight  (15, 10)  size 18  #D9D1C3FF
+text  "14.2"  x 43  baseline 13  w 43.09  20px/700  #F7F2E8FF  tabular  anchor left (ax 43)
+text  "/ 27 KG"  x 91.09  baseline 13  w 46.14  12px/700  #A9A295FF  tracking 1.2px  anchor left (ax 91.09)
+rect  (159, 16, 66, 6)  r3  fill #F7F2E829  # bar.track
+rect  (159, 16, 34.69, 6)  r3  fill #D9D1C3FF  # bar.fill

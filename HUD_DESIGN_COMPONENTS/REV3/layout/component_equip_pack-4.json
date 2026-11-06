@@ -1,0 +1,6 @@
+{"name":"equip_pack-4","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.pack.filled","fill":"#F7F2E812","border":{"w":1.5,"style":"solid","color":"#F7F2E829"}},
+{"op":"icon","name":"backpack","x":19,"y":28,"size":28,"color":"#D9D1C3FF"},
+{"op":"rect","x":5.09,"y":6,"w":53.81,"h":16,"radius":8,"fill":"#F2B134FF"},
+{"op":"text","text":"4 SLOTS","x":12.09,"baseline":11,"w":39.81,"size":10,"weight":700,"color":"#0A0907FF","anchor":"center","ax":32,"tracking":0.6}
+]}

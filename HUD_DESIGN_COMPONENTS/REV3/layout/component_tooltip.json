@@ -1,0 +1,21 @@
+{"name":"tooltip","units":"px","origin":"bottom-left of this component (screen for screens)","size":[300, 196],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":300,"h":196,"radius":24,"role":"panel","fill":"#0A0907E6","border":{"w":1,"style":"solid","color":"#F7F2E824"}},
+{"op":"text","text":"Medkit","x":19,"baseline":161,"w":54.33,"size":18,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":19},
+{"op":"rect","x":207,"y":155,"w":76,"h":22,"radius":11,"role":"chip.ghost","fill":"#F7F2E812","border":{"w":1,"style":"solid","color":"#F7F2E81F"}},
+{"op":"text","text":"MEDICAL","x":220.33,"baseline":163,"w":49.34,"size":10,"weight":700,"color":"#A9A295FF","anchor":"center","ax":245,"tracking":1.4},
+{"op":"text","text":"Restores 35 HP over 8 s. Single use.","x":19,"baseline":133,"w":197.39,"size":13,"weight":500,"color":"#D9D1C3FF","anchor":"left","ax":19},
+{"op":"rect","x":19,"y":112,"w":264,"h":1,"radius":0,"fill":"#F7F2E81F"},
+{"op":"text","text":"QUANTITY","x":19,"baseline":89,"w":57.55,"size":10,"weight":700,"color":"#A9A295FF","anchor":"left","ax":19,"tracking":1.6},
+{"op":"text","text":"2 / 5","x":19,"baseline":71,"w":30.28,"size":16,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":19},
+{"op":"text","text":"UNIT","x":113,"baseline":89,"w":27.73,"size":10,"weight":700,"color":"#A9A295FF","anchor":"left","ax":113,"tracking":1.6},
+{"op":"text","text":"0.6 kg","x":113,"baseline":71,"w":41.58,"size":16,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":113},
+{"op":"text","text":"STACK","x":197,"baseline":89,"w":36.84,"size":10,"weight":700,"color":"#A9A295FF","anchor":"left","ax":197,"tracking":1.6},
+{"op":"text","text":"1.2 kg","x":197,"baseline":71,"w":41.06,"size":16,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":197},
+{"op":"rect","x":19,"y":54,"w":264,"h":1,"radius":0,"fill":"#F7F2E81F"},
+{"op":"rect","x":19,"y":19,"w":42.5,"h":22,"radius":7,"fill":"#F7F2E81F","border":{"w":1,"style":"solid","color":"#F7F2E82E"}},
+{"op":"text","text":"RMB","x":28,"baseline":26.5,"w":24.5,"size":11,"weight":700,"color":"#F7F2E8FF","anchor":"center","ax":40.25,"tracking":0.88},
+{"op":"text","text":"menu","x":69.5,"baseline":26.5,"w":32.09,"size":13,"weight":600,"color":"#D9D1C3FF","anchor":"left","ax":69.5},
+{"op":"rect","x":117.59,"y":19,"w":50.69,"h":22,"radius":7,"fill":"#F7F2E81F","border":{"w":1,"style":"solid","color":"#F7F2E82E"}},
+{"op":"text","text":"SHIFT","x":126.59,"baseline":26.5,"w":32.69,"size":11,"weight":700,"color":"#F7F2E8FF","anchor":"center","ax":142.94,"tracking":0.88},
+{"op":"text","text":"move","x":176.28,"baseline":26.5,"w":31.08,"size":13,"weight":600,"color":"#D9D1C3FF","anchor":"left","ax":176.28}
+]}

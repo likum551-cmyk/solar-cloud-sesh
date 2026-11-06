@@ -1,0 +1,16 @@
+# panel_right_nothing   origin = bottom-left of the screen, y up, px, #RRGGBBAA, paint order top to bottom
+# size [1920, 1080]
+rect  (1210, 172, 646, 800)  r32  fill #0A0907BD  border 1px solid #F7F2E824  # panel
+text  "NEARBY"  x 1243  baseline 923  w 100.75  28px/700  #F7F2E8FF  tracking 0.28px  anchor left (ax 1243)
+rect  (1475, 911, 350, 40)  r20  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill  opacity 0.55
+icon  car  (1497.94, 922)  size 16  #A9A295FF  opacity 0.55
+text  "VEHICLE"  x 1520.94  baseline 927  w 55.11  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1548.5)  opacity 0.55
+icon  drop  (1611.89, 922)  size 16  #A9A295FF  opacity 0.55
+text  "GROUND"  x 1634.89  baseline 927  w 55.22  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1662.5)  opacity 0.55
+icon  stash  (1732.61, 922)  size 16  #A9A295FF  opacity 0.55
+text  "STASH"  x 1755.61  baseline 927  w 41.78  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1776.5)  opacity 0.55
+rect  (1486, 625, 96, 96)  r48  fill #F7F2E808  border 1.5px dashed #F7F2E829
+icon  car  (1515, 652)  size 40  #A9A295FF  opacity 0.5
+text  "NOTHING IN REACH"  x 1434.59  baseline 581  w 198.83  18px/700  #A9A295FF  tracking 2.88px  anchor center (ax 1534)
+text  "No vehicle, drop or stash within 2 m."  x 1425.1  baseline 550  w 217.8  14px/500  #A9A295FF  anchor center (ax 1534)
+text  "Walk up to a car and press TAB, or drop an item to see it here."  x 1365.34  baseline 527  w 337.33  13px/500  #A9A295B3  anchor center (ax 1534)

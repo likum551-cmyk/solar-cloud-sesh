@@ -1,0 +1,5 @@
+{"name":"slot_selected","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.selected","fill":"#F2B13424","border":{"w":1.5,"style":"solid","color":"#F2B13499"},"shadow":[{"color":"#F2B13459","x":0,"y":-0.0,"blur":16,"sigma":8,"spread":0,"inset":false}]},
+{"op":"icon","name":"medkit","x":16,"y":16,"size":32,"color":"#F2B134FF","glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}},
+{"op":"text","text":"\u00d72","x":40,"baseline":9,"w":16,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":40,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}]}
+]}

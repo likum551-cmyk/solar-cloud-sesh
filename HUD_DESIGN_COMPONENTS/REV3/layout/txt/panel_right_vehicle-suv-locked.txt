@@ -1,0 +1,120 @@
+# panel_right_vehicle-suv-locked   origin = bottom-left of the screen, y up, px, #RRGGBBAA, paint order top to bottom
+# size [1920, 1080]
+rect  (1210, 172, 646, 800)  r32  fill #0A0907BD  border 1px solid #F7F2E824  # panel
+text  "NEARBY"  x 1243  baseline 923  w 100.75  28px/700  #F7F2E8FF  tracking 0.28px  anchor left (ax 1243)
+rect  (1475, 911, 350, 40)  r20  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (1480, 914, 114, 32)  r16  fill #F2B13424  border 1.5px solid #F2B13499
+icon  car  (1497.94, 922)  size 16  #F2B134FF
+text  "VEHICLE"  x 1520.94  baseline 927  w 55.11  12px/700  #F2B134FF  tracking 1.44px  anchor center (ax 1548.5)
+icon  drop  (1611.89, 922)  size 16  #A9A295FF
+text  "GROUND"  x 1634.89  baseline 927  w 55.22  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1662.5)
+icon  stash  (1732.61, 922)  size 16  #A9A295FF
+text  "STASH"  x 1755.61  baseline 927  w 41.78  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1776.5)
+rect  (1243, 811, 582, 76)  r24  fill #F7F2E80D  border 1px solid #F7F2E81F  # card
+rect  (1256, 822, 52, 52)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829
+icon  car  (1268, 834)  size 28  #D9D1C3FF
+text  "Granger"  x 1324  baseline 856  w 69.84  20px/700  #F7F2E8FF  anchor left (ax 1324)
+rect  (1324, 820, 88, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "SOL 4821"  x 1340.11  baseline 827.5  w 55.78  11px/700  #A9A295FF  tracking 1.32px  anchor center (ax 1368)
+rect  (1420, 820, 52, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "SUV"  x 1433.95  baseline 827.5  w 24.09  11px/700  #A9A295FF  tracking 1.32px  anchor center (ax 1446)
+rect  (1678, 832, 136, 32)  r16  fill #F2B13424  border 1.5px solid #F2B13499  # chip.amber
+icon  lock  (1710.3, 841)  size 14  #F2B134FF
+text  "LOCKED"  x 1730.3  baseline 845  w 51.41  12px/700  #F2B134FF  tracking 1.44px  anchor center (ax 1756)
+text  "GLOVEBOX · 8 SLOTS"  x 1243  baseline 778  w 150.88  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 1243)
+text  "— / 12 KG"  x 1759.88  baseline 778  w 65.13  12px/700  #A9A295FF  tracking 1.68px  anchor right (ax 1825.01)
+rect  (1243, 763, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (1243, 763, 0, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (1243, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1263.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1317, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1337.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1391, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1411.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1465, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1485.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1539, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1559.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1613, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1633.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1687, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1707.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1761, 687, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1781.5, 707.5)  size 23  #A9A295FF  opacity 0.35
+text  "TRUNK · 32 SLOTS"  x 1243  baseline 650  w 132.8  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 1243)
+text  "— / 110 KG"  x 1752.05  baseline 650  w 72.95  12px/700  #A9A295FF  tracking 1.68px  anchor right (ax 1825)
+rect  (1243, 635, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (1243, 635, 0, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (1243, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1263.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1317, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1337.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1391, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1411.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1465, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1485.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1539, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1559.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1613, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1633.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1687, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1707.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1761, 559, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1781.5, 579.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1243, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1263.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1317, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1337.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1391, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1411.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1465, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1485.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1539, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1559.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1613, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1633.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1687, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1707.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1761, 485, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1781.5, 505.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1243, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1263.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1317, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1337.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1391, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1411.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1465, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1485.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1539, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1559.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1613, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1633.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1687, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1707.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1761, 411, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1781.5, 431.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1243, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1263.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1317, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1337.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1391, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1411.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1465, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1485.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1539, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1559.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1613, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1633.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1687, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1707.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1761, 337, 64, 64)  r16  fill #F7F2E805  border 1.5px dashed #F7F2E81F  # slot.locked
+icon  lock  (1781.5, 357.5)  size 23  #A9A295FF  opacity 0.35
+rect  (1322, 499, 424, 120)  r24  fill #0A0907E6  border 1px solid #F7F2E824
+icon  lock  (1520, 566.5)  size 28  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "VEHICLE LOCKED"  x 1465.69  baseline 547.5  w 136.63  14px/700  #F7F2E8FF  tracking 2.24px  anchor left (ax 1465.69)
+text  "Unlock it with your key to open storage."  x 1423.55  baseline 526.5  w 220.91  13px/500  #A9A295FF  anchor left (ax 1423.55)
+rect  (1243, 209, 582, 56)  r28  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (1252, 216, 130, 40)  r20  fill #F2B134FF  shadow [#F2B13459 offset(0,0) blur 16 sigma 8]  # button.solid
+icon  unlock  (1276.77, 228)  size 16  #0A0907FF
+text  "UNLOCK"  x 1299.77  baseline 232.5  w 57.47  13px/700  #0A0907FF  tracking 1.56px  anchor center (ax 1328.5)
+text  "KEY REQUIRED"  x 1724.8  baseline 233  w 89.2  11px/700  #A9A295FF  tracking 1.54px  anchor right (ax 1814)

@@ -1,0 +1,5 @@
+# component_slot_denied   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #E5603A29  border 1.5px solid #E5603A99  shadow [#E5603A59 offset(0,0) blur 16 sigma 8]  # slot.deny
+icon  cash  (16, 16)  size 32  #E5603AFF  glow #E5603ABF blur 5 sigma 2.5
+text  "1.2k"  x 29.47  baseline 9  w 26.53  13px/700  #F7F2E8FF  tabular  anchor left (ax 29.47)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]

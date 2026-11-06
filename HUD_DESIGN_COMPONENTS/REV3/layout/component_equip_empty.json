@@ -1,0 +1,5 @@
+{"name":"equip_empty","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.hat.empty","fill":"#F7F2E80A","border":{"w":1.5,"style":"solid","color":"#F7F2E81A"}},
+{"op":"icon","name":"hat","x":20,"y":28,"size":26,"color":"#A9A295FF","opacity":0.45},
+{"op":"text","text":"HAT","x":22.77,"baseline":10,"w":20.45,"size":10,"weight":700,"color":"#A9A295CC","anchor":"center","ax":32.99,"tracking":1}
+]}

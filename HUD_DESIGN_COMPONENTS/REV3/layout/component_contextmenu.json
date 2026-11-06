@@ -1,0 +1,19 @@
+{"name":"contextmenu","units":"px","origin":"bottom-left of this component (screen for screens)","size":[210, 254],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":210,"h":254,"radius":24,"role":"panel","fill":"#0A0907E6","border":{"w":1,"style":"solid","color":"#F7F2E824"}},
+{"op":"rect","x":9,"y":209,"w":194,"h":36,"radius":12,"role":"menu.row.hover","fill":"#F2B13424"},
+{"op":"icon","name":"medkit","x":21,"y":219,"size":16,"color":"#F2B134FF"},
+{"op":"text","text":"USE","x":47,"baseline":223.5,"w":26.83,"size":13,"weight":700,"color":"#F2B134FF","anchor":"left","ax":47,"tracking":1.3},
+{"op":"icon","name":"person","x":21,"y":181,"size":16,"color":"#D9D1C3FF"},
+{"op":"text","text":"GIVE","x":47,"baseline":185.5,"w":32.17,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":47,"tracking":1.3},
+{"op":"icon","name":"chev","x":177,"y":182,"size":14,"color":"#A9A295FF"},
+{"op":"icon","name":"drop","x":21,"y":143,"size":16,"color":"#D9D1C3FF"},
+{"op":"text","text":"DROP","x":47,"baseline":147.5,"w":37.19,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":47,"tracking":1.3},
+{"op":"icon","name":"box","x":21,"y":105,"size":16,"color":"#D9D1C3FF"},
+{"op":"text","text":"SPLIT","x":47,"baseline":109.5,"w":38.09,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":47,"tracking":1.3},
+{"op":"icon","name":"ring","x":21,"y":67,"size":16,"color":"#D9D1C3FF"},
+{"op":"text","text":"BIND TO SLOT","x":47,"baseline":71.5,"w":93.34,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":47,"tracking":1.3},
+{"op":"icon","name":"chev","x":177,"y":68,"size":14,"color":"#A9A295FF"},
+{"op":"rect","x":17,"y":50,"w":178,"h":1,"radius":0,"fill":"#F7F2E81F"},
+{"op":"icon","name":"search","x":21,"y":17,"size":16,"color":"#A9A295FF"},
+{"op":"text","text":"INSPECT","x":47,"baseline":21.5,"w":58.28,"size":13,"weight":700,"color":"#A9A295FF","anchor":"left","ax":47,"tracking":1.3}
+]}

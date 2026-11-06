@@ -1,0 +1,292 @@
+# screen_pack-4_nearby-vehicle   origin = bottom-left of the screen, y up, px, #RRGGBBAA, paint order top to bottom
+# size [1920, 1080]
+rect  (64, 172, 448, 800)  r32  fill #0A0907BD  border 1px solid #F7F2E824  # panel
+text  "CHARACTER"  x 97  baseline 923  w 154.41  28px/700  #F7F2E8FF  tracking 0.28px  anchor left (ax 97)
+rect  (331, 914, 150, 34)  r17  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "MARA QUILL"  x 366.86  baseline 928  w 78.27  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 406)
+rect  (139, 477, 300, 300)  r0  gradient radial-gradient(closest-side, rgba(242, 177, 52, 0.13), rgba(242, 177, 52, 0))
+svg   (177, 355, 224, 532)  # mannequin (markup in the json)
+rect  (97, 823, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.hat.filled
+icon  hat  (114, 838)  size 32  #D9D1C3FF
+rect  (97, 745, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.glasses.filled
+icon  glasses  (114, 760)  size 32  #D9D1C3FF
+rect  (97, 667, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.mask.empty
+icon  mask  (117, 695)  size 26  #A9A295FF  opacity 0.45
+text  "MASK"  x 115.2  baseline 677  w 29.59  10px/700  #A9A295CC  tracking 1px  anchor center (ax 130)
+rect  (97, 589, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.ears.empty
+icon  ears  (117, 617)  size 26  #A9A295FF  opacity 0.45
+text  "EARS"  x 116.47  baseline 599  w 27.06  10px/700  #A9A295CC  tracking 1px  anchor center (ax 130)
+rect  (97, 511, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.neck.empty
+icon  chain  (117, 539)  size 26  #A9A295FF  opacity 0.45
+text  "NECK"  x 115.71  baseline 521  w 28.58  10px/700  #A9A295CC  tracking 1px  anchor center (ax 130)
+rect  (97, 433, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.watch.filled
+icon  watch  (114, 448)  size 32  #D9D1C3FF
+rect  (97, 355, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.wrist.empty
+icon  bracelet  (117, 383)  size 26  #A9A295FF  opacity 0.45
+text  "WRIST"  x 113.19  baseline 365  w 33.63  10px/700  #A9A295CC  tracking 1px  anchor center (ax 130)
+rect  (417, 823, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.jacket.filled
+icon  jacket  (434, 838)  size 32  #D9D1C3FF
+rect  (417, 745, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.shirt.filled
+icon  tee  (434, 760)  size 32  #D9D1C3FF
+rect  (417, 667, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.armor.empty
+icon  vest  (437, 695)  size 26  #A9A295FF  opacity 0.45
+text  "ARMOR"  x 431.25  baseline 677  w 37.5  10px/700  #A9A295CC  tracking 1px  anchor center (ax 450)
+rect  (417, 589, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.pack.filled
+icon  backpack  (436, 617)  size 28  #D9D1C3FF
+rect  (422.09, 595, 53.81, 16)  r8  fill #F2B134FF
+text  "4 SLOTS"  x 429.09  baseline 600  w 39.81  10px/700  #0A0907FF  tracking 0.6px  anchor center (ax 449)
+rect  (417, 511, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # equip.gloves.empty
+icon  gloves  (437, 539)  size 26  #A9A295FF  opacity 0.45
+text  "GLOVES"  x 429.56  baseline 521  w 40.88  10px/700  #A9A295CC  tracking 1px  anchor center (ax 450)
+rect  (417, 433, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.pants.filled
+icon  pants  (434, 448)  size 32  #D9D1C3FF
+rect  (417, 355, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # equip.shoes.filled
+icon  shoe  (434, 370)  size 32  #D9D1C3FF
+text  "QUICK SLOTS"  x 97  baseline 314  w 96.22  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 97)
+text  "PRESS 1 – 4"  x 391.8  baseline 314  w 89.2  12px/700  #A9A295FF  tracking 2.4px  anchor right (ax 481)
+rect  (97, 203, 384, 96)  r48  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (110, 214, 72, 72)  r18  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (128, 232)  size 36  #D9D1C3FF
+text  "×3"  x 158  baseline 223  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 158)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+text  "1"  x 119  baseline 270  w 5.77  12px/700  #F7F2E88C  anchor left (ax 119)
+rect  (206, 214, 72, 72)  r18  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  medkit  (224, 232)  size 36  #D9D1C3FF
+text  "×2"  x 254  baseline 223  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 254)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+text  "2"  x 215  baseline 270  w 6.63  12px/700  #F7F2E88C  anchor left (ax 215)
+rect  (302, 214, 72, 72)  r18  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  radio  (320, 232)  size 36  #D9D1C3FF
+text  "3"  x 311  baseline 270  w 6.75  12px/700  #F7F2E88C  anchor left (ax 311)
+rect  (398, 214, 72, 72)  r18  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+icon  plus  (416, 232)  size 36  #A9A295FF  opacity 0.55
+text  "4"  x 407  baseline 270  w 6.84  12px/700  #F7F2E88C  anchor left (ax 407)
+rect  (538, 172, 646, 800)  r32  fill #0A0907BD  border 1px solid #F7F2E824  # panel
+text  "INVENTORY"  x 571  baseline 923  w 144.73  28px/700  #F7F2E8FF  tracking 0.28px  anchor left (ax 571)
+rect  (571, 857, 160, 36)  r18  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+icon  search  (586, 866)  size 16  #A9A295FF
+text  "Search"  x 612  baseline 870  w 42.22  14px/500  #A9A295FF  anchor left (ax 612)
+rect  (745, 857, 56, 36)  r18  fill #F2B13424  border 1.5px solid #F2B13499  # chip.amber
+text  "ALL"  x 761.47  baseline 872  w 23.06  12px/700  #F2B134FF  tracking 1.44px  anchor center (ax 773)
+rect  (809, 857, 70, 36)  r18  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "TOOLS"  x 823.05  baseline 872  w 41.89  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 844)
+rect  (887, 857, 66, 36)  r18  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "FOOD"  x 902.41  baseline 872  w 35.19  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 920)
+rect  (961, 857, 90, 36)  r18  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "MEDICAL"  x 977.23  baseline 872  w 57.53  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1006)
+rect  (1059, 857, 70, 36)  r18  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "DOCS"  x 1076.02  baseline 872  w 35.95  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1093.99)
+text  "POCKETS · 16 SLOTS"  x 571  baseline 816  w 149.41  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 571)
+text  "6.2 / 15 KG"  x 1083.67  baseline 816  w 69.33  12px/700  #D9D1C3FF  tracking 1.2px  anchor right (ax 1153)
+rect  (571, 801, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (571, 801, 239, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (571, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  phone  (587, 741)  size 32  #D9D1C3FF
+rect  (645, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  card  (661, 741)  size 32  #D9D1C3FF
+rect  (719, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  key  (735, 741)  size 32  #D9D1C3FF
+rect  (793, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  cash  (809, 741)  size 32  #D9D1C3FF
+text  "1.2k"  x 822.47  baseline 734  w 26.53  13px/700  #F7F2E8FF  tabular  anchor left (ax 822.47)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (867, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (883, 741)  size 32  #D9D1C3FF
+text  "×3"  x 907  baseline 734  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 907)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (941, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  burger  (957, 741)  size 32  #D9D1C3FF
+text  "×2"  x 981  baseline 734  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 981)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1015, 725, 64, 64)  r16  fill #F2B13424  border 1.5px solid #F2B13499  shadow [#F2B13459 offset(0,0) blur 16 sigma 8]  # slot.selected
+icon  medkit  (1031, 741)  size 32  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "×2"  x 1055  baseline 734  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1055)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1089, 725, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bandage  (1105, 741)  size 32  #D9D1C3FF
+text  "×6"  x 1129  baseline 734  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1129)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (571, 651, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  torch  (587, 667)  size 32  #D9D1C3FF
+rect  (582, 658, 42, 3)  r2  fill #F7F2E829
+rect  (582, 658, 30.23, 3)  r2  fill #D9D1C3FF
+rect  (645, 651, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  radio  (661, 667)  size 32  #D9D1C3FF
+rect  (719, 651, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  notebook  (735, 667)  size 32  #D9D1C3FF
+rect  (793, 651, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  map  (809, 667)  size 32  #D9D1C3FF
+rect  (867, 651, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (941, 651, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1015, 651, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1089, 651, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (915, 911, 238, 40)  r20  fill #F7F2E80F  border 1px solid #F7F2E824  # pill
+icon  weight  (930, 921)  size 18  #D9D1C3FF
+text  "8.7"  x 958  baseline 924  w 30.48  20px/700  #F7F2E8FF  tabular  anchor left (ax 958)
+text  "/ 20 KG"  x 993.48  baseline 924  w 46.69  12px/700  #A9A295FF  tracking 1.2px  anchor left (ax 993.48)
+rect  (1074, 927, 66, 6)  r3  fill #F7F2E829  # bar.track
+rect  (1074, 927, 28.59, 6)  r3  fill #D9D1C3FF  # bar.fill
+text  "BACKPACK · POUCH · 4 SLOTS"  x 571  baseline 614  w 216.63  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 571)
+text  "2.5 / 5 KG"  x 1091.27  baseline 614  w 61.73  12px/700  #D9D1C3FF  tracking 1.2px  anchor right (ax 1153)
+rect  (571, 599, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (571, 599, 291, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (571, 523, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (587, 539)  size 32  #D9D1C3FF
+text  "×2"  x 611  baseline 532  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 611)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (645, 523, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  burger  (661, 539)  size 32  #D9D1C3FF
+text  "×2"  x 685  baseline 532  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 685)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (719, 523, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bandage  (735, 539)  size 32  #D9D1C3FF
+text  "×6"  x 759  baseline 532  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 759)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (793, 523, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  battery  (809, 539)  size 32  #D9D1C3FF
+text  "×3"  x 833  baseline 532  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 833)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (571, 281, 582, 150)  r24  fill #F7F2E80D  border 1px solid #F7F2E81F  # card
+rect  (592, 338, 72, 72)  r18  fill #F2B13424  border 1.5px solid #F2B13499  shadow [#F2B13459 offset(0,0) blur 16 sigma 8]  # slot.selected
+icon  medkit  (610, 356)  size 36  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "Medkit"  x 684  baseline 389  w 72.44  24px/700  #F7F2E8FF  anchor left (ax 684)
+rect  (684, 352, 76, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "MEDICAL"  x 697.33  baseline 360  w 49.34  10px/700  #A9A295FF  tracking 1.4px  anchor center (ax 722)
+text  "Restores 35 HP over 8 s. Single use."  x 684  baseline 329  w 212.56  14px/500  #D9D1C3FF  anchor left (ax 684)
+text  "QUANTITY"  x 684  baseline 308  w 57.55  10px/700  #A9A295FF  tracking 1.6px  anchor left (ax 684)
+text  "2 / 5"  x 684  baseline 290  w 32.95  16px/700  #F7F2E8FF  tabular  anchor left (ax 684)
+text  "UNIT"  x 784  baseline 308  w 27.73  10px/700  #A9A295FF  tracking 1.6px  anchor left (ax 784)
+text  "0.6 kg"  x 784  baseline 290  w 43.78  16px/700  #F7F2E8FF  tabular  anchor left (ax 784)
+text  "STACK"  x 874  baseline 308  w 36.84  10px/700  #A9A295FF  tracking 1.6px  anchor left (ax 874)
+text  "1.2 kg"  x 874  baseline 290  w 43.78  16px/700  #F7F2E8FF  tabular  anchor left (ax 874)
+text  "BIND TO QUICK SLOT"  x 1015.09  baseline 400  w 118.91  10px/700  #A9A295FF  tracking 1.6px  anchor right (ax 1134)
+rect  (1004, 360, 28, 28)  r14  fill #D9D1C31A  border 1.5px solid #D9D1C34D  # chip.bone
+text  "1"  x 1015.11  baseline 371  w 5.77  12px/700  #D9D1C3FF  anchor center (ax 1018)
+rect  (1038, 360, 28, 28)  r14  fill #F2B13424  border 1.5px solid #F2B13499  # chip.amber
+text  "2"  x 1048.69  baseline 371  w 6.63  12px/700  #F2B134FF  anchor center (ax 1052.01)
+rect  (1072, 360, 28, 28)  r14  fill #D9D1C31A  border 1.5px solid #D9D1C34D  # chip.bone
+text  "3"  x 1082.63  baseline 371  w 6.75  12px/700  #D9D1C3FF  anchor center (ax 1086.01)
+rect  (1106, 360, 28, 28)  r14  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "4"  x 1116.58  baseline 371  w 6.84  12px/700  #A9A295FF  anchor center (ax 1120)
+rect  (571, 209, 582, 56)  r28  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (580, 216, 40, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+icon  minus  (592, 228)  size 16  #F7F2E8FF
+text  "1"  x 635.7  baseline 230  w 12.61  20px/700  #F7F2E8FF  tabular  anchor center (ax 642)
+rect  (664, 216, 40, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+icon  plus  (676, 228)  size 16  #F7F2E8FF
+rect  (718, 216, 118, 40)  r20  fill #F2B134FF  shadow [#F2B13459 offset(0,0) blur 16 sigma 8]  # button.solid
+text  "USE"  x 763.19  baseline 232.5  w 27.61  13px/700  #0A0907FF  tracking 1.56px  anchor center (ax 777)
+rect  (846, 216, 92, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+text  "GIVE"  x 875.39  baseline 232.5  w 33.2  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 891.99)
+rect  (948, 216, 92, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+text  "DROP"  x 974.88  baseline 232.5  w 38.23  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 994)
+rect  (1050, 216, 96, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+text  "SPLIT"  x 1078.3  baseline 232.5  w 39.39  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 1097.99)
+rect  (1210, 172, 646, 800)  r32  fill #0A0907BD  border 1px solid #F7F2E824  # panel
+text  "NEARBY"  x 1243  baseline 923  w 100.75  28px/700  #F7F2E8FF  tracking 0.28px  anchor left (ax 1243)
+rect  (1475, 911, 350, 40)  r20  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (1480, 914, 114, 32)  r16  fill #F2B13424  border 1.5px solid #F2B13499
+icon  car  (1497.94, 922)  size 16  #F2B134FF
+text  "VEHICLE"  x 1520.94  baseline 927  w 55.11  12px/700  #F2B134FF  tracking 1.44px  anchor center (ax 1548.5)
+icon  drop  (1611.89, 922)  size 16  #A9A295FF
+text  "GROUND"  x 1634.89  baseline 927  w 55.22  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1662.5)
+icon  stash  (1732.61, 922)  size 16  #A9A295FF
+text  "STASH"  x 1755.61  baseline 927  w 41.78  12px/700  #A9A295FF  tracking 1.44px  anchor center (ax 1776.5)
+rect  (1243, 811, 582, 76)  r24  fill #F7F2E80D  border 1px solid #F7F2E81F  # card
+rect  (1256, 822, 52, 52)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829
+icon  car  (1268, 834)  size 28  #D9D1C3FF
+text  "Granger"  x 1324  baseline 856  w 69.84  20px/700  #F7F2E8FF  anchor left (ax 1324)
+rect  (1324, 820, 88, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "SOL 4821"  x 1340.11  baseline 827.5  w 55.78  11px/700  #A9A295FF  tracking 1.32px  anchor center (ax 1368)
+rect  (1420, 820, 52, 22)  r11  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "SUV"  x 1433.95  baseline 827.5  w 24.09  11px/700  #A9A295FF  tracking 1.32px  anchor center (ax 1446)
+rect  (1678, 832, 136, 32)  r16  fill #D9D1C31A  border 1.5px solid #D9D1C34D  # chip.bone
+icon  unlock  (1700.94, 841)  size 14  #D9D1C3FF
+text  "UNLOCKED"  x 1720.94  baseline 845  w 70.13  12px/700  #D9D1C3FF  tracking 1.44px  anchor center (ax 1756.01)
+text  "GLOVEBOX · 8 SLOTS"  x 1243  baseline 778  w 150.88  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 1243)
+text  "0.2 / 12 KG"  x 1755.47  baseline 778  w 69.53  12px/700  #D9D1C3FF  tracking 1.2px  anchor right (ax 1825)
+rect  (1243, 763, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (1243, 763, 8.19, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (1243, 687, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  key  (1259, 703)  size 32  #D9D1C3FF
+rect  (1317, 687, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  card  (1333, 703)  size 32  #D9D1C3FF
+rect  (1391, 687, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  map  (1407, 703)  size 32  #D9D1C3FF
+rect  (1465, 687, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1539, 687, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1613, 687, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1687, 687, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1761, 687, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+text  "TRUNK · 32 SLOTS"  x 1243  baseline 650  w 132.8  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 1243)
+text  "16.7 / 110 KG"  x 1742.06  baseline 650  w 82.94  12px/700  #D9D1C3FF  tracking 1.2px  anchor right (ax 1825)
+rect  (1243, 635, 582, 4)  r2  fill #F7F2E829  # bar.track
+rect  (1243, 635, 88.39, 4)  r2  fill #D9D1C3FF  # bar.fill
+rect  (1243, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  can  (1259, 575)  size 32  #D9D1C3FF
+rect  (1317, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  wrench  (1333, 575)  size 32  #D9D1C3FF
+rect  (1328, 566, 42, 3)  r2  fill #F7F2E829
+rect  (1328, 566, 24.36, 3)  r2  fill #D9D1C3FF
+rect  (1391, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  box  (1407, 575)  size 32  #D9D1C3FF
+rect  (1465, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (1481, 575)  size 32  #D9D1C3FF
+text  "×8"  x 1505  baseline 568  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1505)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1539, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  burger  (1555, 575)  size 32  #D9D1C3FF
+text  "×5"  x 1579  baseline 568  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1579)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1613, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  medkit  (1629, 575)  size 32  #D9D1C3FF
+text  "×2"  x 1653  baseline 568  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1653)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1687, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  battery  (1703, 575)  size 32  #D9D1C3FF
+text  "×6"  x 1727  baseline 568  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 1727)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1761, 559, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bandage  (1777, 575)  size 32  #D9D1C3FF
+text  "×12"  x 1792.81  baseline 568  w 24.19  13px/700  #F7F2E8FF  tabular  anchor left (ax 1792.81)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+rect  (1243, 485, 64, 64)  r16  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  camera  (1259, 501)  size 32  #D9D1C3FF
+rect  (1254, 492, 42, 3)  r2  fill #F7F2E829
+rect  (1254, 492, 38.22, 3)  r2  fill #D9D1C3FF
+rect  (1317, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1391, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1465, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1539, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1613, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1687, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1761, 485, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1243, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1317, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1391, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1465, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1539, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1613, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1687, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1761, 411, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1243, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1317, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1391, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1465, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1539, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1613, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1687, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1761, 337, 64, 64)  r16  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+rect  (1243, 209, 582, 56)  r28  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (1252, 216, 124, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+text  "TAKE ALL"  x 1281.81  baseline 232.5  w 64.36  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 1313.99)
+rect  (1384, 216, 112, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+icon  lock  (1409.91, 228)  size 16  #F7F2E8FF
+text  "LOCK"  x 1432.91  baseline 232.5  w 37.19  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 1451.51)
+text  "SHIFT + CLICK TO MOVE"  x 1667.41  baseline 233  w 146.59  11px/700  #A9A295FF  tracking 1.54px  anchor right (ax 1814)
+rect  (476.69, 106, 966.63, 40)  r20  fill #0A0907BD  border 1px solid #F7F2E824
+rect  (503.69, 115, 50.69, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "SHIFT"  x 512.69  baseline 122.5  w 32.69  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 529.04)
+text  "click · quick move"  x 562.38  baseline 122.5  w 99.67  13px/600  #D9D1C3FF  anchor left (ax 562.38)
+rect  (686.05, 115, 37.55, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "ALT"  x 695.05  baseline 122.5  w 19.55  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 704.82)
+text  "drag · half stack"  x 731.59  baseline 122.5  w 88.89  13px/600  #D9D1C3FF  anchor left (ax 731.59)
+rect  (844.48, 115, 46.66, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "CTRL"  x 853.48  baseline 122.5  w 28.66  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 867.81)
+text  "drag · split"  x 899.14  baseline 122.5  w 58.3  13px/600  #D9D1C3FF  anchor left (ax 899.14)
+rect  (981.44, 115, 42.5, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "RMB"  x 990.44  baseline 122.5  w 24.5  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 1002.69)
+text  "menu"  x 1031.94  baseline 122.5  w 32.09  13px/600  #D9D1C3FF  anchor left (ax 1031.94)
+rect  (1088.03, 115, 44.39, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "MMB"  x 1097.03  baseline 122.5  w 26.39  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 1110.22)
+text  "drop"  x 1140.42  baseline 122.5  w 25.67  13px/600  #D9D1C3FF  anchor left (ax 1140.42)
+rect  (1190.09, 115, 40.3, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "1–4"  x 1199.09  baseline 122.5  w 22.3  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 1210.24)
+text  "use quick slot"  x 1238.39  baseline 122.5  w 77.16  13px/600  #D9D1C3FF  anchor left (ax 1238.39)
+rect  (1339.55, 115, 38.97, 22)  r7  fill #F7F2E81F  border 1px solid #F7F2E82E
+text  "TAB"  x 1348.55  baseline 122.5  w 20.97  11px/700  #F7F2E8FF  tracking 0.88px  anchor center (ax 1359.03)
+text  "close"  x 1386.52  baseline 122.5  w 29.8  13px/600  #D9D1C3FF  anchor left (ax 1386.52)

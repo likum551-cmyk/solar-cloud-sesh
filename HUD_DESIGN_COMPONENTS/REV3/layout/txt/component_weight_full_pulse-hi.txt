@@ -1,0 +1,8 @@
+# component_weight_full_pulse-hi   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [238, 40]
+rect  (0, 0, 238, 40)  r20  fill #E5603A1A  border 1.5px solid #E5603A80  # pill
+icon  weight  (15, 10)  size 18  #E5603AFF
+text  "27.0"  x 43  baseline 13  w 43.09  20px/700  #E5603AFF  tabular  anchor left (ax 43)
+text  "/ 27 KG"  x 91.09  baseline 13  w 46.14  12px/700  #A9A295FF  tracking 1.2px  anchor left (ax 91.09)
+rect  (159, 16, 66, 6)  r3  fill #F7F2E829  # bar.track
+rect  (159, 16, 66, 6)  r3  fill #E5603AFF  # bar.fill

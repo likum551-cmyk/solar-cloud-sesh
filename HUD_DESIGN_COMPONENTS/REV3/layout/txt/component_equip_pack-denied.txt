@@ -1,0 +1,6 @@
+# component_equip_pack-denied   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #E5603A29  border 1.5px solid #E5603A99  shadow [#E5603A59 offset(0,0) blur 16 sigma 8]  # equip.pack.deny
+icon  backpack  (19, 28)  size 28  #E5603AFF  glow #E5603ABF blur 5 sigma 2.5
+rect  (4.99, 6, 54.02, 16)  r8  fill #F2B134FF
+text  "8 SLOTS"  x 11.99  baseline 11  w 40.02  10px/700  #0A0907FF  tracking 0.6px  anchor center (ax 32)

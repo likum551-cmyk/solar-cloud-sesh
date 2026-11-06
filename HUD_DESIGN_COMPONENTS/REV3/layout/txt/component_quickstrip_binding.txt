@@ -1,0 +1,17 @@
+# component_quickstrip_binding   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [384, 96]
+rect  (0, 0, 384, 96)  r48  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (13, 11, 72, 72)  r18  fill #F2B1341A  border 1.5px dashed #F2B134B3  # slot.target
+icon  bottle  (31, 29)  size 36  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "×3"  x 61  baseline 20  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 61)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+text  "1"  x 22  baseline 67  w 5.77  12px/700  #F7F2E88C  anchor left (ax 22)
+rect  (109, 11, 72, 72)  r18  fill #F2B1341A  border 1.5px dashed #F2B134B3  # slot.target
+icon  medkit  (127, 29)  size 36  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "×2"  x 157  baseline 20  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 157)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+text  "2"  x 118  baseline 67  w 6.63  12px/700  #F7F2E88C  anchor left (ax 118)
+rect  (205, 11, 72, 72)  r18  fill #F2B1341A  border 1.5px dashed #F2B134B3  # slot.target
+icon  radio  (223, 29)  size 36  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5
+text  "3"  x 214  baseline 67  w 6.75  12px/700  #F7F2E88C  anchor left (ax 214)
+rect  (301, 11, 72, 72)  r18  fill #F2B1341A  border 1.5px dashed #F2B134B3  # slot.target
+icon  plus  (324, 34)  size 26  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5  opacity 0.85
+text  "4"  x 310  baseline 67  w 6.84  12px/700  #F7F2E88C  anchor left (ax 310)

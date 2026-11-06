@@ -1,0 +1,15 @@
+# component_quickstrip_unbound   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [384, 96]
+rect  (0, 0, 384, 96)  r48  fill #F7F2E80D  border 1px solid #F7F2E81F  # pill
+rect  (13, 11, 72, 72)  r18  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+icon  plus  (31, 29)  size 36  #A9A295FF  opacity 0.55
+text  "1"  x 22  baseline 67  w 5.77  12px/700  #F7F2E88C  anchor left (ax 22)
+rect  (109, 11, 72, 72)  r18  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+icon  plus  (127, 29)  size 36  #A9A295FF  opacity 0.55
+text  "2"  x 118  baseline 67  w 6.63  12px/700  #F7F2E88C  anchor left (ax 118)
+rect  (205, 11, 72, 72)  r18  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+icon  plus  (223, 29)  size 36  #A9A295FF  opacity 0.55
+text  "3"  x 214  baseline 67  w 6.75  12px/700  #F7F2E88C  anchor left (ax 214)
+rect  (301, 11, 72, 72)  r18  fill #F7F2E80A  border 1.5px solid #F7F2E81A  # slot.empty
+icon  plus  (319, 29)  size 36  #A9A295FF  opacity 0.55
+text  "4"  x 310  baseline 67  w 6.84  12px/700  #F7F2E88C  anchor left (ax 310)

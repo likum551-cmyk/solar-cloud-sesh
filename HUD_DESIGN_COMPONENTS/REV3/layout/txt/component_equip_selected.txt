@@ -1,0 +1,4 @@
+# component_equip_selected   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F2B13424  border 1.5px solid #F2B13499  shadow [#F2B13459 offset(0,0) blur 16 sigma 8]  # equip.hat.selected
+icon  hat  (17, 15)  size 32  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5

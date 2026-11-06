@@ -1,0 +1,5 @@
+{"name":"equip_wrong-slot","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"equip.hat.deny","fill":"#E5603A29","border":{"w":1.5,"style":"solid","color":"#E5603A99"},"shadow":[{"color":"#E5603A59","x":0,"y":-0.0,"blur":16,"sigma":8,"spread":0,"inset":false}]},
+{"op":"icon","name":"hat","x":20,"y":28,"size":26,"color":"#E5603AFF","glow":{"color":"#E5603ABF","blur":5,"sigma":2.5}},
+{"op":"text","text":"HAT","x":22.77,"baseline":10,"w":20.45,"size":10,"weight":700,"color":"#E5603AFF","anchor":"center","ax":32.99,"tracking":1}
+]}

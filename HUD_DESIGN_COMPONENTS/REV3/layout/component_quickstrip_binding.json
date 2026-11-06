@@ -1,0 +1,17 @@
+{"name":"quickstrip_binding","units":"px","origin":"bottom-left of this component (screen for screens)","size":[384, 96],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":384,"h":96,"radius":48,"role":"pill","fill":"#F7F2E80D","border":{"w":1,"style":"solid","color":"#F7F2E81F"}},
+{"op":"rect","x":13,"y":11,"w":72,"h":72,"radius":18,"role":"slot.target","fill":"#F2B1341A","border":{"w":1.5,"style":"dashed","color":"#F2B134B3"}},
+{"op":"icon","name":"bottle","x":31,"y":29,"size":36,"color":"#F2B134FF","glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}},
+{"op":"text","text":"\u00d73","x":61,"baseline":20,"w":16,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":61,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}]},
+{"op":"text","text":"1","x":22,"baseline":67,"w":5.77,"size":12,"weight":700,"color":"#F7F2E88C","anchor":"left","ax":22},
+{"op":"rect","x":109,"y":11,"w":72,"h":72,"radius":18,"role":"slot.target","fill":"#F2B1341A","border":{"w":1.5,"style":"dashed","color":"#F2B134B3"}},
+{"op":"icon","name":"medkit","x":127,"y":29,"size":36,"color":"#F2B134FF","glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}},
+{"op":"text","text":"\u00d72","x":157,"baseline":20,"w":16,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":157,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}]},
+{"op":"text","text":"2","x":118,"baseline":67,"w":6.63,"size":12,"weight":700,"color":"#F7F2E88C","anchor":"left","ax":118},
+{"op":"rect","x":205,"y":11,"w":72,"h":72,"radius":18,"role":"slot.target","fill":"#F2B1341A","border":{"w":1.5,"style":"dashed","color":"#F2B134B3"}},
+{"op":"icon","name":"radio","x":223,"y":29,"size":36,"color":"#F2B134FF","glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}},
+{"op":"text","text":"3","x":214,"baseline":67,"w":6.75,"size":12,"weight":700,"color":"#F7F2E88C","anchor":"left","ax":214},
+{"op":"rect","x":301,"y":11,"w":72,"h":72,"radius":18,"role":"slot.target","fill":"#F2B1341A","border":{"w":1.5,"style":"dashed","color":"#F2B134B3"}},
+{"op":"icon","name":"plus","x":324,"y":34,"size":26,"color":"#F2B134FF","opacity":0.85,"glow":{"color":"#F2B134CC","blur":5,"sigma":2.5}},
+{"op":"text","text":"4","x":310,"baseline":67,"w":6.84,"size":12,"weight":700,"color":"#F7F2E88C","anchor":"left","ax":310}
+]}

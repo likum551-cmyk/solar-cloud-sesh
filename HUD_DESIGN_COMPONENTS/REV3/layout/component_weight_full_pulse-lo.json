@@ -1,0 +1,8 @@
+{"name":"weight_full_pulse-lo","units":"px","origin":"bottom-left of this component (screen for screens)","size":[238, 40],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":238,"h":40,"radius":20,"role":"pill","fill":"#E5603A1A","border":{"w":1.5,"style":"solid","color":"#E5603A80"}},
+{"op":"icon","name":"weight","x":15,"y":10,"size":18,"color":"#E5603AFF"},
+{"op":"text","text":"27.0","x":43,"baseline":13,"w":43.09,"size":20,"weight":700,"color":"#E5603AFF","anchor":"left","ax":43,"tabular":true},
+{"op":"text","text":"/ 27 KG","x":91.09,"baseline":13,"w":46.14,"size":12,"weight":700,"color":"#A9A295FF","anchor":"left","ax":91.09,"tracking":1.2},
+{"op":"rect","x":159,"y":16,"w":66,"h":6,"radius":3,"role":"bar.track","fill":"#F7F2E829"},
+{"op":"rect","x":159,"y":16,"w":66,"h":6,"radius":3,"role":"bar.fill","fill":"#E5603AFF","opacity":0.4}
+]}

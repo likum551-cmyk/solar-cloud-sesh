@@ -1,0 +1,5 @@
+{"name":"slot_drag-ghost","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":48,"ops":[
+{"op":"rect","x":-2.56,"y":-2.56,"w":69.12,"h":69.12,"radius":17.28,"role":"slot.ghost","fill":"#F7F2E824","border":{"w":1.62,"style":"solid","color":"#F7F2E866"},"shadow":[{"color":"#00000080","x":0,"y":-12,"blur":24,"sigma":12,"spread":0,"inset":false},{"color":"#F2B13459","x":0,"y":-0.0,"blur":16,"sigma":8,"spread":0,"inset":false}],"scale":1.08},
+{"op":"icon","name":"bandage","x":14.72,"y":14.72,"size":34.56,"color":"#F7F2E8FF"},
+{"op":"text","text":"\u00d76","x":40.64,"baseline":7.16,"w":17.28,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":40.64,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}]}
+]}

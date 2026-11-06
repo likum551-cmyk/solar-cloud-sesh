@@ -1,0 +1,4 @@
+# component_slot_drop-target   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [64, 64]
+rect  (0, 0, 64, 64)  r16  fill #F2B1341A  border 1.5px dashed #F2B134B3  # slot.target
+icon  plus  (20.5, 20.5)  size 23  #F2B134FF  glow #F2B134CC blur 5 sigma 2.5  opacity 0.85

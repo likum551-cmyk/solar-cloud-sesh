@@ -1,0 +1,5 @@
+{"name":"slot_drag-source","units":"px","origin":"bottom-left of this component (screen for screens)","size":[64, 64],"sprite_padding":24,"ops":[
+{"op":"rect","x":0,"y":0,"w":64,"h":64,"radius":16,"role":"slot.source","fill":"#F7F2E808","border":{"w":1.5,"style":"dashed","color":"#F7F2E847"},"opacity":0.55},
+{"op":"icon","name":"burger","x":16,"y":16,"size":32,"color":"#D9D1C3FF","opacity":0.55},
+{"op":"text","text":"\u00d72","x":40,"baseline":9,"w":16,"size":13,"weight":700,"color":"#F7F2E8FF","anchor":"left","ax":40,"tabular":true,"shadow":[{"color":"#00000099","x":0,"y":-1,"blur":2,"sigma":1,"spread":0,"inset":false}],"opacity":0.55}
+]}

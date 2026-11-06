@@ -1,0 +1,28 @@
+# component_splitdialog   origin = bottom-left of the component (sprite padding 24 px is NOT included), y up, px, #RRGGBBAA, paint order top to bottom
+# size [320, 294]
+rect  (0, 0, 320, 294)  r24  fill #0A0907E6  border 1px solid #F7F2E824  # panel
+text  "SPLIT STACK"  x 25  baseline 262  w 92.59  12px/700  #A9A295FF  tracking 2.4px  anchor left (ax 25)
+rect  (25, 187, 56, 56)  r14  fill #F7F2E812  border 1.5px solid #F7F2E829  # slot.filled
+icon  bottle  (39, 201)  size 28  #D9D1C3FF
+text  "×6"  x 57  baseline 196  w 16  13px/700  #F7F2E8FF  tabular  anchor left (ax 57)  text-shadow [#00000099 offset(0,-1) blur 2 sigma 1]
+text  "Water"  x 97  baseline 223  w 47.19  18px/700  #F7F2E8FF  anchor left (ax 97)
+text  "6 in stack · 0.5 kg each"  x 97  baseline 202  w 116  12px/600  #A9A295FF  anchor left (ax 97)
+rect  (25, 125, 44, 44)  r22  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+icon  minus  (39, 139)  size 16  #F7F2E8FF
+text  "3"  x 150.29  baseline 136  w 21.42  34px/700  #F7F2E8FF  tabular  anchor center (ax 161)
+rect  (253, 125, 44, 44)  r22  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+icon  plus  (267, 139)  size 16  #F7F2E8FF
+rect  (25, 81, 48, 28)  r14  fill #F2B13424  border 1.5px solid #F2B13499  # chip.amber
+text  "1/2"  x 39.59  baseline 92  w 18.81  12px/700  #F2B134FF  tracking 0.48px  anchor center (ax 49)
+rect  (81, 81, 48, 28)  r14  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "1/3"  x 95.53  baseline 92  w 18.94  12px/700  #A9A295FF  tracking 0.48px  anchor center (ax 105)
+rect  (137, 81, 48, 28)  r14  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "2/3"  x 151.06  baseline 92  w 19.88  12px/700  #A9A295FF  tracking 0.48px  anchor center (ax 161)
+rect  (193, 81, 48, 28)  r14  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "1/4"  x 207.77  baseline 92  w 18.47  12px/700  #A9A295FF  tracking 0.48px  anchor center (ax 217)
+rect  (249, 81, 48, 28)  r14  fill #F7F2E812  border 1px solid #F7F2E81F  # chip.ghost
+text  "3/4"  x 263.41  baseline 92  w 19.19  12px/700  #A9A295FF  tracking 0.48px  anchor center (ax 273.01)
+rect  (25, 23, 128, 40)  r20  fill #F7F2E812  border 1px solid #F7F2E824  # button.ghost
+text  "CANCEL"  x 61.14  baseline 39.5  w 55.7  13px/700  #F7F2E8FF  tracking 1.56px  anchor center (ax 88.99)
+rect  (169, 23, 128, 40)  r20  fill #F2B134FF  shadow [#F2B13459 offset(0,0) blur 16 sigma 8]  # button.solid
+text  "SPLIT"  x 213.3  baseline 39.5  w 39.39  13px/700  #0A0907FF  tracking 1.56px  anchor center (ax 233)
