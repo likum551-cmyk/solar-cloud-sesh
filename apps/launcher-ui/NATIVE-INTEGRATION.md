@@ -21,15 +21,7 @@ Source of truth for the shapes: `src/lib/bridge.ts`. Incoming messages are zod-v
 
 **Embedding.** Point CMake's `GAGE_UI_HTML_IN` at `${CMAKE_SOURCE_DIR}/apps/launcher-ui/dist/index.html`. Today it points at `docs/archive/web-legacy/dist/index.html`. `tools/embed_ui.cmake` needs no change, because the file is plain bytes like before. `CMakeLists.txt` is owned by the platform agent, so this one-line change goes through them.
 
-**Installer.** `dist/assets/**` ships next to the exe as `{app}\launcher-assets\`. Remove the old tree first, so a renamed or deleted asset never lingers:
-
-```iss
-[InstallDelete]
-Type: filesandordirs; Name: "{app}\launcher-assets"
-
-[Files]
-Source: "..\apps\launcher-ui\dist\assets\*"; DestDir: "{app}\launcher-assets"; Flags: recursesubdirs ignoreversion
-```
+**Installer.** `dist/assets/**` ships next to the exe as `{app}\launcher-assets\`, replaced whole so a renamed or deleted asset never lingers. `installer/gage-mp.iss` stages it as `launcher-assets.new` (with `ui.new`, the DLLs and the exe) and swaps everything in together after the last file is on disk (`CommitStaged`). Never delete the tree in `[InstallDelete]`: that runs before `[Files]`, and a silent update that then aborted (0.5.1 / 0.5.2, a DLL still loaded by the Rockstar Launcher) left the new exe with no footage and nothing to retry.
 
 ---
 
@@ -204,7 +196,7 @@ The server-list polling (every 15 s) stops on the same visibility, game and laun
 4. Add `toggleMaximize`, `tokenGet`/`tokenSet`/`tokenClear` (DPAPI), `openExternal` (https only) and `joinToken`.
 5. Send `window`, `game`, `launchStage`, `joinTokenNeeded` and `deepLink`; add launch result code 12.
 6. Registry: `join_token` and `server_id` for the engine, deleted after use; the engine sends `join_token` in its connect packet.
-7. Installer: the `{app}\launcher-assets` tree (delete, then copy) and the `gage-mp://` protocol keys; second-instance URL forwarding over `WM_COPYDATA`.
+7. Installer: the `{app}\launcher-assets` tree (staged, then swapped in with the exe) and the `gage-mp://` protocol keys; second-instance URL forwarding over `WM_COPYDATA`.
 8. Verify inside the exe:
    - the boot cover, then the sign-in reel (`skyline`) playing and, about 10 s in, passing through the dark over 1.5 s into the next shot (`canal`), never a hard cut;
    - drag, snap and double-click on the rail;

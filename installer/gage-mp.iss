@@ -78,10 +78,21 @@ WelcomeLabel2=This will install [name/ver] on your computer.%n%nSolar RP finds m
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [InstallDelete]
-; the in-game UI is replaced whole, so no file from an older version lingers
-Type: filesandordirs; Name: "{app}\ui"
-; the launcher UI's 3D set too: the exe serves only what its manifest.json lists
-Type: filesandordirs; Name: "{app}\launcher-assets"
+; ui\ (the in-game UI) and launcher-assets\ (the launcher UI's footage and stills; the exe serves
+; only what its manifest.json lists) are replaced whole, so no file from an older version lingers.
+; They are NOT deleted here: [InstallDelete] runs before [Files], and a setup that then aborts
+; keeps no rollback copy. 0.5.1 and 0.5.2 (2026-11-06) aborted on gage_launch_shim.dll, which the
+; Rockstar Launcher.exe still had loaded, after the exe was already replaced: the launcher was
+; left with no footage and a version that said it was up to date. [Files] stages everything as
+; <name>.new and CommitStaged (after the last [Files] entry) swaps it in; only staging leftovers of an earlier
+; setup are removed here.
+Type: filesandordirs; Name: "{app}\ui.new"
+Type: filesandordirs; Name: "{app}\launcher-assets.new"
+Type: files; Name: "{app}\{#AppExe}.new"
+Type: files; Name: "{app}\gageinjector.dll.new"
+Type: files; Name: "{app}\gage_loader.dll.new"
+Type: files; Name: "{app}\gage_mp.dll.new"
+Type: files; Name: "{app}\gage_launch_shim.dll.new"
 ; migration: earlier GAGE-MP versions shipped a bundled engine runtime in rage\
 ; and an anti-cheat shim, gage_eac.dll. Neither is part of Solar RP any more, so an
 ; upgrade removes them
@@ -94,13 +105,22 @@ Type: files; Name: "{autoprograms}\{#OldShortcut}"
 Type: files; Name: "{autodesktop}\{#OldShortcut}"
 
 [Files]
-Source: "{#BinDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\gageinjector.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\gage_loader.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\gage_mp.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\gage_launch_shim.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\ui\*"; DestDir: "{app}\ui"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#BinDir}\launcher-assets\*"; DestDir: "{app}\launcher-assets"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Everything a release replaces is staged as <name>.new and swapped in by CommitStaged, all or
+; none, once every file is on disk: an aborted setup does not roll back a file it already
+; replaced, and the exe carries the version the updater compares. A setup that stops or cannot
+; swap leaves the previous version whole (exe, chain DLLs whose hashes it bakes, footage), and
+; the updater installs the release again on its next check. A DLL another process still has
+; loaded (the shim stays in the Rockstar Launcher.exe after the game) cannot be overwritten or
+; deleted but can be renamed, so the swap never stops on one.
+Source: "{#BinDir}\ui\*"; DestDir: "{app}\ui.new"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BinDir}\launcher-assets\*"; DestDir: "{app}\launcher-assets.new"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BinDir}\gageinjector.dll"; DestDir: "{app}"; DestName: "gageinjector.dll.new"; Flags: ignoreversion
+Source: "{#BinDir}\gage_loader.dll"; DestDir: "{app}"; DestName: "gage_loader.dll.new"; Flags: ignoreversion
+Source: "{#BinDir}\gage_mp.dll"; DestDir: "{app}"; DestName: "gage_mp.dll.new"; Flags: ignoreversion
+Source: "{#BinDir}\gage_launch_shim.dll"; DestDir: "{app}"; DestName: "gage_launch_shim.dll.new"; Flags: ignoreversion
+; The commit runs after this, the LAST [Files] entry, and not at ssPostInstall: Setup runs the
+; [Run] entries (the updater's restart) before ssPostInstall, which would start the old exe.
+Source: "{#BinDir}\{#AppExe}"; DestDir: "{app}"; DestName: "{#AppExe}.new"; Flags: ignoreversion; AfterInstall: CommitStaged
 
 [Icons]
 Name: "{autoprograms}\{#LauncherName}"; Filename: "{app}\{#AppExe}"
@@ -127,6 +147,23 @@ Type: files; Name: "{app}\gage.log*"
 Type: filesandordirs; Name: "{app}\webview2"
 Type: filesandordirs; Name: "{app}\client_resources"
 Type: filesandordirs; Name: "{app}\rage"
+; what CommitStaged swapped in (the uninstall log names only the <name>.new staging paths), and
+; its leftovers: <name>.new of a failed commit, <name>.old<n> of a file that was still in use
+Type: files; Name: "{app}\{#AppExe}"
+Type: files; Name: "{app}\{#AppExe}.new"
+Type: files; Name: "{app}\{#AppExe}.old*"
+Type: files; Name: "{app}\gageinjector.dll"
+Type: files; Name: "{app}\gage_loader.dll"
+Type: files; Name: "{app}\gage_mp.dll"
+Type: files; Name: "{app}\gage_launch_shim.dll"
+Type: files; Name: "{app}\*.dll.new"
+Type: files; Name: "{app}\*.dll.old*"
+Type: filesandordirs; Name: "{app}\ui"
+Type: filesandordirs; Name: "{app}\launcher-assets"
+Type: filesandordirs; Name: "{app}\ui.new"
+Type: filesandordirs; Name: "{app}\launcher-assets.new"
+Type: filesandordirs; Name: "{app}\ui.old*"
+Type: filesandordirs; Name: "{app}\launcher-assets.old*"
 Type: dirifempty; Name: "{app}"
 
 [Code]
@@ -170,6 +207,116 @@ begin
     Waited := Waited + 250;
   end;
   Log('launcher mutex gone after ' + IntToStr(Waited) + ' ms');
+end;
+
+// The items CommitStaged has swapped so far: {app}\<name> and where its previous copy went
+// ('' = there was none).
+var
+  SwappedFinal, SwappedOld: TArrayOfString;
+
+function Exists(const P: String): Boolean;
+begin
+  Result := DirExists(P) or FileExists(P);
+end;
+
+// Deletes a file or a whole folder; False when something in it is in use.
+function Remove(const P: String): Boolean;
+begin
+  if DirExists(P) then
+    Result := DelTree(P, True, True, True)
+  else
+    Result := DeleteFile(P);
+end;
+
+// {app}\<Name>.new (a file or a folder staged by [Files]) replaces {app}\<Name>. The current one
+// is renamed aside whole, never deleted in place, so it can be put back; a rename also works on
+// a DLL another process has loaded (only a handle opened without delete sharing stops it).
+function SwapIn(const Name: String): Boolean;
+var
+  Final, Staged, Old: String;
+  N: Integer;
+begin
+  Result := False;
+  Final := ExpandConstant('{app}\' + Name);
+  Staged := Final + '.new';
+  if not Exists(Staged) then
+  begin
+    Log('commit: ' + Staged + ' is missing: ' + Name + ' was not staged');
+    Exit;
+  end;
+  Old := '';
+  if Exists(Final) then
+  begin
+    // a leftover of an earlier setup goes first; one still in use stays under its own name
+    N := 1;
+    Old := Final + '.old1';
+    while Exists(Old) and not Remove(Old) and (N < 100) do
+    begin
+      N := N + 1;
+      Old := Final + '.old' + IntToStr(N);
+    end;
+    if not RenameFile(Final, Old) then
+    begin
+      Log('commit: could not move ' + Final + ' aside (something in it is in use)');
+      Exit;
+    end;
+  end;
+  if not RenameFile(Staged, Final) then
+  begin
+    Log('commit: could not move ' + Staged + ' to ' + Final);
+    if (Old <> '') and not RenameFile(Old, Final) then Log('commit: could not put ' + Old + ' back');
+    Exit;
+  end;
+  SetArrayLength(SwappedFinal, GetArrayLength(SwappedFinal) + 1);
+  SetArrayLength(SwappedOld, GetArrayLength(SwappedOld) + 1);
+  SwappedFinal[GetArrayLength(SwappedFinal) - 1] := Final;
+  SwappedOld[GetArrayLength(SwappedOld) - 1] := Old;
+  Log('commit: swapped in ' + Final);
+  Result := True;
+end;
+
+// Puts back what SwapIn swapped, newest first; the new copies go back to <name>.new, which the
+// next setup's [InstallDelete] removes.
+procedure UndoSwaps();
+var
+  I: Integer;
+begin
+  for I := GetArrayLength(SwappedFinal) - 1 downto 0 do
+  begin
+    if not RenameFile(SwappedFinal[I], SwappedFinal[I] + '.new') then
+      Log('undo: could not move ' + SwappedFinal[I] + ' back to staging')
+    else if (SwappedOld[I] <> '') and not RenameFile(SwappedOld[I], SwappedFinal[I]) then
+      Log('undo: could not put ' + SwappedOld[I] + ' back')
+    else
+      Log('undo: restored ' + SwappedFinal[I]);
+  end;
+end;
+
+// All or none: the launcher UI's footage (launcher-assets), the in-game UI (ui), the chain DLLs
+// and the exe that expects them (it bakes the DLLs' hashes). The exe goes last: it carries the
+// version, so when anything fails the previous version stays whole and the launcher's updater
+// installs this release again. An old copy still in use (a DLL loaded elsewhere) stays as
+// <name>.old<n> until a later setup can delete it.
+procedure CommitStaged();
+var
+  I: Integer;
+begin
+  SetArrayLength(SwappedFinal, 0);
+  SetArrayLength(SwappedOld, 0);
+  if SwapIn('launcher-assets') and SwapIn('ui') and SwapIn('gage_launch_shim.dll') and
+     SwapIn('gageinjector.dll') and SwapIn('gage_loader.dll') and SwapIn('gage_mp.dll') and
+     SwapIn('{#AppExe}') then
+  begin
+    Log('commit: version {#AppVersion} is in place');
+    for I := 0 to GetArrayLength(SwappedOld) - 1 do
+      if (SwappedOld[I] <> '') and not Remove(SwappedOld[I]) then
+        Log('commit: could not delete ' + SwappedOld[I] + '; the next setup removes it');
+  end
+  else
+  begin
+    UndoSwaps();
+    Log('commit FAILED: the previous version stays; the launcher installs {#AppVersion} again on its next update check');
+  end;
 end;
 
 function InitializeSetup(): Boolean;
