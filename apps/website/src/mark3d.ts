@@ -118,7 +118,7 @@ function envScene(poster: Texture): { scene: Scene; dispose(): void } {
   scene.add(strip);
   // Studio rig behind the camera, where the front faces look: a tall graded softbox with a hard edge
   // and a black flag beside it. The faces see a few degrees of this, so the edge crosses them as one
-  // clean highlight line, and the env rotation (Pose.sweep) moves it across during the fly-past.
+  // clean highlight line; the env rotation (Pose.sweep) sets where it falls in each stage.
   const grad = softboxTexture();
   const boxGeo = new PlaneGeometry(5.2, 7.5);
   const boxMat = new MeshBasicMaterial({ map: grad, color: new Color(3.2, 3.0, 2.7), side: DoubleSide });

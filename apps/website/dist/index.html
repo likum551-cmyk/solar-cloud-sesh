@@ -20,10 +20,11 @@
   <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="preload" href="/media/hero.webp" as="image" />
-  <script type="module" crossorigin src="/assets/main-H9HSivKF.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/store-C-6o9CLr.js">
-  <link rel="stylesheet" crossorigin href="/assets/store-mlPAqNcE.css">
-  <link rel="stylesheet" crossorigin href="/assets/main-dr6IWE_g.css">
+  <script src="/enter.js"></script>
+  <script type="module" crossorigin src="/assets/main-mCo8PwMR.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/store-BDFcqJ9J.js">
+  <link rel="stylesheet" crossorigin href="/assets/store-DrBHlS1O.css">
+  <link rel="stylesheet" crossorigin href="/assets/main-LzNigMUc.css">
 </head>
 <body>
   <a class="skip" href="#download">Skip to download</a>
@@ -41,11 +42,9 @@
   </header>
 
   <main>
-    <!-- 1. Cold open: the bottom letterbox bar is the credits band -->
+    <!-- 1. Opening shot: the bottom letterbox bar is the credits band -->
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero__stage">
-        <!-- the next shot waits under the hero; the closing slab reveals it, then the cards take over -->
-        <img class="hero__next" src="/media/beach.webp" alt="" aria-hidden="true" decoding="async" />
         <div class="hero__front">
           <div class="hero__frame">
             <!-- the skyline at dusk, forward then back: one shot, no seam -->
@@ -68,14 +67,12 @@
           </div>
           <img class="mark-fallback" src="/mark.svg" alt="" aria-hidden="true" />
         </div>
-        <div class="slab slab--hero" aria-hidden="true"></div>
       </div>
     </section>
 
-    <!-- 2. Title cards: three shots, three compositions, cut by gold slabs -->
+    <!-- 2. Title cards: three shots, three compositions -->
     <section class="cards" aria-label="What Solar RP is">
-      <div class="cards__stage">
-        <article class="card card--low" data-card="0">
+        <article class="card card--low">
           <video class="card__video js-loop" poster="/media/beach.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/beach.webm" type="video/webm; codecs=vp9" /><source src="/media/beach.mp4" type="video/mp4" /></video>
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
@@ -83,43 +80,38 @@
             <p class="card__fact">SOL runs our own server software: our rules, our world state, and anti-cheat checks on the server.</p>
           </div>
         </article>
-        <article class="card card--high" data-card="1">
+        <article class="card card--high">
           <video class="card__video js-loop" poster="/media/streets.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/streets.webm" type="video/webm; codecs=vp9" /><source src="/media/streets.mp4" type="video/mp4" /></video>
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">Our own client.</h2>
             <p class="card__fact">The Solar RP engine runs inside your GTA V and connects it to our servers, over our own protocol.</p>
           </div>
-          <div class="slab" aria-hidden="true"></div>
         </article>
-        <article class="card card--mid" data-card="2">
+        <article class="card card--mid">
           <video class="card__video js-loop" poster="/media/canal.webp" muted loop playsinline preload="none" aria-hidden="true"><source src="/media/canal.webm" type="video/webm; codecs=vp9" /><source src="/media/canal.mp4" type="video/mp4" /></video>
           <div class="card__shade" aria-hidden="true"></div>
           <div class="card__copy">
             <h2 class="card__title">One button in.</h2>
             <p class="card__fact">Open Solar Launcher, pick SOL, press PLAY. It starts GTA V and drops you in.</p>
           </div>
-          <div class="slab" aria-hidden="true"></div>
         </article>
-      </div>
     </section>
 
-    <!-- 3. Characters: each panel opens on the face -->
+    <!-- 3. Characters: three key-art panels -->
     <section class="cast" aria-label="Los Santos">
-      <div class="cast__stage">
-        <figure class="panel" data-panel="0" data-fx="0.535" data-fy="0.17">
+        <figure class="panel">
           <img src="/media/michael.webp" alt="" width="2320" height="1497" loading="lazy" decoding="async" />
           <figcaption class="panel__line">The city you know.</figcaption>
         </figure>
-        <figure class="panel" data-panel="1" data-fx="0.557" data-fy="0.2">
+        <figure class="panel">
           <img src="/media/franklin.webp" alt="" width="2320" height="1497" loading="lazy" decoding="async" />
           <figcaption class="panel__line">The rules are ours.</figcaption>
         </figure>
-        <figure class="panel" data-panel="2" data-fx="0.48" data-fy="0.19">
+        <figure class="panel">
           <img src="/media/trevor.webp" alt="" width="2320" height="1497" loading="lazy" decoding="async" />
           <figcaption class="panel__line">Roleplay first.</figcaption>
         </figure>
-      </div>
     </section>
 
     <!-- 4. Servers -->
@@ -156,12 +148,12 @@
       </div>
     </section>
 
-    <!-- 5. Get in: one launcher window, three screens -->
+    <!-- 5. Get in: three steps, each beside its launcher screen -->
     <section class="getin" id="get-in" aria-labelledby="getin-title">
       <div class="getin__stage">
         <h2 class="section-title getin__title" id="getin-title">In three steps</h2>
         <ol class="steps">
-          <li class="step" data-step="0">
+          <li class="step">
             <span class="step__n" aria-hidden="true">01</span>
             <div class="step__text">
               <h3>Download</h3>
@@ -172,7 +164,7 @@
               <figcaption class="shot-note">Demo screen</figcaption>
             </figure>
           </li>
-          <li class="step" data-step="1">
+          <li class="step">
             <span class="step__n" aria-hidden="true">02</span>
             <div class="step__text">
               <h3>Open it, pick SOL</h3>
@@ -183,7 +175,7 @@
               <figcaption class="shot-note">Demo screen: the player count and ping are sample data, not live</figcaption>
             </figure>
           </li>
-          <li class="step" data-step="2">
+          <li class="step">
             <span class="step__n" aria-hidden="true">03</span>
             <div class="step__text">
               <h3>Press PLAY</h3>

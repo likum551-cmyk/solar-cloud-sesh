@@ -1,22 +1,15 @@
 /* solar-rp.com. NOON: warm night ground and ink, one Solar gold. GTA V footage and key art carry
    every other colour. Square corners everywhere except one 45-degree top-right cut, the mark's; the
-   gold arrives as slabs, plates and tape, never as glow.
-   Without JavaScript or with reduced motion every section is a plain framed shot in flow; the
-   `.motion` class on <html> switches on the pinned, scrubbed trailer layout. */
+   gold arrives as plates and tape, never as glow.
+   Every section is a framed shot in plain document flow, with or without JavaScript: nothing pins or
+   scrubs (GI, 2026-11-06: "too animated, make it more professional"). The footage is what moves. */
 
-/* ---------- gold slabs: the cut between shots (a band that crosses the frame, never a fill) ---------- */
-.slab { display: none; }
-.motion .slab { display: block; position: absolute; inset: 0; z-index: 3; background: var(--sun); pointer-events: none; clip-path: polygon(0 0, 0 0, 0 0, 0 0); }
-
-/* ---------- 1. hero: the cold open ---------- */
+/* ---------- 1. hero: the opening shot ---------- */
 .hero { position: relative; background: var(--black); }
 .hero__stage { position: relative; height: 100svh; min-height: 560px; overflow: hidden; isolation: isolate; }
-.hero__next { display: none; }
-.motion .hero__next { display: block; position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; }
 .hero__front { position: absolute; inset: 0; z-index: 1; background: var(--black); }
-.motion .slab--hero { z-index: 6; }
 .hero__frame { position: absolute; inset: 0; z-index: 0; }
-.hero__video { width: 100%; height: 100%; object-fit: cover; object-position: 55% 40%; transform-origin: 50% 40%; }
+.hero__video { width: 100%; height: 100%; object-fit: cover; object-position: 55% 40%; }
 /* ground under the title (bottom left); the S stands in the clear haze on the right */
 .hero__shade {
   position: absolute; inset: 0;
@@ -38,14 +31,14 @@
 }
 .letterbox { position: absolute; left: 0; right: 0; z-index: 3; height: var(--lb); background: var(--black); }
 /* the top bar is only as tall as the nav: the footage gets the rest */
-.letterbox--top { top: 0; transform-origin: 50% 0; height: min(var(--lb), var(--bar-h)); }
-.letterbox--bottom { bottom: 0; transform-origin: 50% 100%; }
+.letterbox--top { top: 0; height: min(var(--lb), var(--bar-h)); }
+.letterbox--bottom { bottom: 0; }
 /* the title stands on the frame line and crosses it; the credits band is the bottom bar */
 .hero__copy { --title: clamp(64px, 10.6vw, 204px); position: absolute; z-index: 4; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; }
 /* about a third of the second line lies on the black (-0.13em only made up for the 0.84 line box,
    which left the capitals standing exactly on the edge, as if chopped) */
 .hero__title {
-  padding: 0 var(--gutter);
+  padding: 0 var(--edge);
   margin-bottom: -0.34em;
   font: 800 var(--title)/0.84 var(--f-display);
   letter-spacing: -0.004em; text-transform: uppercase;
@@ -53,12 +46,16 @@
   position: relative; z-index: 1;
 }
 .hero__title .line { display: block; }
+/* the arrival's start (public/enter.js sets .enter before the first paint; main.ts takes over and removes
+   it). The failsafe shows the title after 4 s if main.ts never runs. */
+.enter .hero__title { opacity: 0; transform: translateY(16px); animation: enter-failsafe 0.6s ease-out 1.5s forwards; }
+@keyframes enter-failsafe { to { opacity: 1; transform: none; } }
 .hero__credits {
   min-height: var(--band);
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 32px;
   /* the capitals reach 0.21em into the band (0.34em of line box minus the 0.13em under the baseline);
      at 1920x1080 this keeps the plate inside the 138px bar */
-  padding: calc(0.21 * var(--title) + 20px) var(--gutter) 14px;
+  padding: calc(0.21 * var(--title) + 20px) var(--edge) 14px;
 }
 .hero__lede {
   font: 700 clamp(16px, 1.15vw, 19px)/1.25 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink);
@@ -90,23 +87,21 @@
   .plate--lg, .plate--xl { width: 100%; }
 }
 
-/* ---------- 2. title cards: three compositions ---------- */
-.cards { position: relative; background: var(--black); }
-/* the cards pin starts exactly where the hero's ends: their first screen lies under the finished hero,
-   which paints above it (transparent once its slab has cut away the front) */
-.motion .hero { z-index: 2; background: transparent; }
-.motion .cards { z-index: 1; margin-top: -100svh; }
-.cards__stage { position: relative; }
-.card { position: relative; height: 100svh; min-height: 520px; overflow: hidden; isolation: isolate; }
+/* ---------- 2. title cards: three footage plates on the ground ---------- */
+/* Each shot is a plate with ground (--plate) around it, so two shots never butt edge to edge; the copy
+   keeps the page's one left edge (--edge) measured from the window, not from the plate. */
+.cards, .cast { display: grid; gap: var(--plate); padding: var(--plate) var(--plate) 0; background: var(--black); }
+.card { position: relative; height: calc(100svh - 2 * var(--plate)); min-height: 520px; overflow: hidden; isolation: isolate; }
 .card__video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .card__shade { position: absolute; inset: 0; }
-.card__copy { position: absolute; z-index: 2; left: var(--gutter); right: var(--gutter); }
+.card__copy { position: absolute; z-index: 2; left: calc(var(--edge) - var(--plate)); right: calc(var(--edge) - var(--plate)); }
+/* the second step of the type scale: the hero (10.6vw) is the only line above 150 px */
 .card__title {
-  font: 800 clamp(64px, 12.5vw, 220px)/0.82 var(--f-display);
+  font: 800 clamp(52px, 7.2vw, 132px)/0.84 var(--f-display);
   letter-spacing: -0.005em; text-transform: uppercase;
   text-shadow: 0 4px 40px rgb(0 0 0 / 0.35);
 }
-.card__fact { margin-top: clamp(14px, 2vh, 24px); max-width: 44ch; font-size: clamp(17px, 1.35vw, 20px); color: var(--ink-2); text-shadow: 0 1px 14px rgb(0 0 0 / 0.8); }
+.card__fact { margin-top: clamp(12px, 1.8vh, 20px); max-width: 44ch; font-size: clamp(17px, 1.3vw, 21px); color: var(--ink-2); text-shadow: 0 1px 14px rgb(0 0 0 / 0.8); }
 /* low: title on the ground line, bottom left */
 .card--low .card__copy { bottom: clamp(36px, 9vh, 96px); }
 .card--low .card__shade { background: linear-gradient(0deg, rgb(10 9 7 / 0.86) 0%, rgb(10 9 7 / 0.35) 40%, rgb(10 9 7 / 0) 64%), linear-gradient(90deg, rgb(10 9 7 / 0.5), rgb(10 9 7 / 0) 55%); }
@@ -115,16 +110,17 @@
 .card--high .card__fact { margin-left: auto; }
 /* the street block from above is lit concrete edge to edge: the shade holds dark through the fact line */
 .card--high .card__shade { background: linear-gradient(180deg, rgb(10 9 7 / 0.86) 0%, rgb(10 9 7 / 0.66) 30%, rgb(10 9 7 / 0.28) 50%, rgb(10 9 7 / 0) 68%), linear-gradient(270deg, rgb(10 9 7 / 0.5), rgb(10 9 7 / 0) 60%); }
-/* mid: dead centre over the horizon, the widest line on the page */
-/* on the canal water, below the Downtown towers at the end of the river */
+/* mid: centred on the canal water, below the Downtown towers at the end of the river */
 .card--mid .card__copy { top: 64%; transform: translateY(-50%); text-align: center; }
-.card--mid .card__title { font-size: clamp(64px, 14.5vw, 260px); }
 /* the fact line sits on bright moving water: full ink, and the shade centred on the copy (64-77%) */
 .card--mid .card__fact { margin-inline: auto; color: var(--ink); }
 .card--mid .card__shade { background: radial-gradient(64% 40% at 50% 68%, rgb(10 9 7 / 0.72), rgb(10 9 7 / 0) 100%); }
 /* phones see about a quarter of each 16:9 shot: aim that quarter at the subject */
 @media (max-width: 760px) {
   .card--high .card__video { object-position: 8% 50%; }
+  /* a narrow right-aligned paragraph reads ragged: on phones the high card's copy sits on the left edge */
+  .card--high .card__copy { text-align: left; }
+  .card--high .card__fact { margin-left: 0; }
   .card--high .card__shade { background: linear-gradient(180deg, rgb(10 9 7 / 0.88) 0%, rgb(10 9 7 / 0.72) 42%, rgb(10 9 7 / 0.3) 62%, rgb(10 9 7 / 0) 80%); }
   .card--low .card__video { object-position: 33% 50%; } /* the tall palm (x 30%) and the pier wheel (x 37%) */
   .card--mid .card__video { object-position: 50% 50%; } /* the towers at the end of the canal */
@@ -132,28 +128,32 @@
   .card--mid .card__shade { background: radial-gradient(90% 40% at 50% 70%, rgb(10 9 7 / 0.66), rgb(10 9 7 / 0) 100%); }
 }
 
-.motion .cards__stage { height: 100svh; min-height: 520px; overflow: hidden; }
-.motion .card { position: absolute; inset: 0; height: auto; min-height: 0; }
-.motion .card[data-card='1'], .motion .card[data-card='2'] { clip-path: polygon(110% 0, 110% 0, 110% 100%, 110% 100%); }
-
-/* ---------- 3. cast: key art panels ---------- */
-.cast { position: relative; background: var(--ground); }
-.cast__stage { position: relative; }
-.panel { position: relative; height: 92svh; min-height: 520px; overflow: hidden; }
+/* ---------- 3. cast: key art plates (a triptych on wide screens) ---------- */
+/* no ground under the last plates: they meet the servers' --ground directly (a --black strip there read
+   as a misregistered band) */
+.panel { position: relative; height: 60svh; min-height: 420px; overflow: hidden; }
 .panel img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: 62% 22%; }
+/* each crop is aimed at the face (the face's position in the key art) */
+.panel:nth-child(1) img { object-position: 53.5% 17%; } /* Michael */
+.panel:nth-child(2) img { object-position: 55.7% 20%; } /* Franklin */
+.panel:nth-child(3) img { object-position: 48% 19%; } /* Trevor */
 /* the line sits bottom-left over light key art (pink sky, Franklin's cream sleeve): ground rises under it */
 .panel::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.92) 0%, rgb(10 9 7 / 0.66) 24%, rgb(10 9 7 / 0) 54%), linear-gradient(90deg, rgb(10 9 7 / 0.4) 0%, rgb(10 9 7 / 0) 56%); }
 .panel__line {
-  position: absolute; z-index: 2; left: var(--gutter); right: var(--gutter); bottom: clamp(32px, 8vh, 88px);
-  font: 800 clamp(56px, 10vw, 176px)/0.84 var(--f-display); letter-spacing: -0.004em; text-transform: uppercase;
-  text-shadow: 0 4px 40px rgb(0 0 0 / 0.4);
+  position: absolute; z-index: 2; left: calc(var(--edge) - var(--plate)); right: calc(var(--edge) - var(--plate)); bottom: clamp(28px, 6vh, 64px);
+  font: 800 clamp(44px, 5.6vw, 96px)/0.86 var(--f-display); letter-spacing: -0.004em; text-transform: uppercase;
+  text-wrap: balance; text-shadow: 0 4px 40px rgb(0 0 0 / 0.4);
 }
-.motion .cast__stage { height: 100svh; min-height: 520px; overflow: hidden; }
-.motion .panel { position: absolute; inset: 0; height: auto; min-height: 0; visibility: hidden; background: var(--ground); }
-.motion .panel[data-panel='0'] { visibility: visible; }
+@media (min-width: 901px) {
+  .cast { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .panel { height: min(78svh, 760px); }
+  .panel__line { left: clamp(20px, 2vw, 32px); right: clamp(20px, 2vw, 32px); font-size: clamp(32px, 3vw, 56px); }
+  /* the first plate's line keeps the page edge */
+  .panel:nth-child(1) .panel__line { left: calc(var(--edge) - var(--plate)); }
+}
 
-/* ---------- section heads ---------- */
-.section-title { font: 800 clamp(48px, 7vw, 112px)/0.86 var(--f-display); letter-spacing: 0; text-transform: uppercase; text-wrap: balance; }
+/* ---------- section heads (the third step of the type scale) ---------- */
+.section-title { font: 800 clamp(44px, 5.6vw, 96px)/0.86 var(--f-display); letter-spacing: 0; text-transform: uppercase; text-wrap: balance; }
 .section-lede { margin-top: 18px; max-width: 52ch; font-size: clamp(17px, 1.3vw, 19px); color: var(--ink-2); }
 
 /* ---------- 4. servers ---------- */
@@ -179,9 +179,18 @@
 .server--open .server__img { filter: saturate(1) brightness(0.78); }
 .server:hover .server__img { filter: saturate(1) brightness(0.86); transform: scale(1.05); }
 .server::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.88), rgb(10 9 7 / 0) 62%); z-index: 0; }
-.server--open::before { content: ''; position: absolute; inset: 0; z-index: 3; box-shadow: inset 0 0 0 2px var(--sun); pointer-events: none; }
+/* the open server's gold frame follows the cut corner: a ring with an evenodd hole, like the plates (an
+   inset box-shadow is cut off at the diagonal by the card's clip-path) */
+.server--open::before {
+  --w: 2px;
+  content: ''; position: absolute; inset: 0; z-index: 3; background: var(--sun); pointer-events: none;
+  clip-path: polygon(evenodd,
+    0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%, 0 0,
+    var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)),
+    calc(100% - var(--w)) calc(var(--cut) + 0.4142 * var(--w)), calc(100% - var(--cut) - 0.4142 * var(--w)) var(--w), var(--w) var(--w));
+}
 .server__body { position: absolute; z-index: 2; left: clamp(20px, 2.4vw, 32px); bottom: clamp(18px, 2.4vw, 30px); right: 20px; }
-.server__name { margin-top: 10px; font: 800 clamp(64px, 8vw, 150px)/0.84 var(--f-display); letter-spacing: 0.01em; }
+.server__name { margin-top: 10px; font: 800 clamp(56px, 6vw, 112px)/0.84 var(--f-display); letter-spacing: 0.01em; }
 .server:not(.server--open) .server__name { font-size: clamp(44px, 4.4vw, 76px); color: var(--ink-2); }
 .server__meta { margin-top: 8px; font: 700 15px/1 var(--f-display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
 .state {
@@ -204,9 +213,9 @@
   .server--open { grid-row: auto; min-height: 46svh; }
 }
 
-/* ---------- 5. get in: one launcher window, three screens ---------- */
+/* ---------- 5. get in: three steps, each beside its launcher screen ---------- */
 .getin { padding: clamp(80px, 12vh, 140px) 0 clamp(96px, 14vh, 160px); background: linear-gradient(180deg, var(--ground), var(--panel) 40%, var(--ground)); }
-.getin__stage { width: min(1280px, 100% - 2 * var(--gutter)); margin-inline: auto; }
+.getin__stage { margin-inline: var(--edge); }
 .steps { list-style: none; padding: 0; margin-top: clamp(40px, 7vh, 80px); display: grid; gap: clamp(56px, 9vh, 104px); }
 .step { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 18px clamp(18px, 3vw, 40px); align-items: end; }
 .step__n { font: 800 clamp(96px, 12vw, 180px)/0.78 var(--f-display); color: var(--sun); letter-spacing: -0.02em; }
@@ -220,46 +229,26 @@
 }
 /* under the window, never on it: the shots carry sample names and counts, and must say so legibly */
 .shot-note { margin-top: 12px; font: 600 14px/1.3 var(--f-display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
-/* the pinned layout: steps on the left, ONE window on the right whose screen is cut by the slab */
-@media (min-width: 901px) and (min-height: 680px) {
-  .motion .getin { padding: 0; }
-  .motion .getin__stage {
-    position: relative; width: 100%; height: 100svh; min-height: 680px; overflow: hidden;
-    padding: calc(var(--bar-h) + clamp(20px, 5vh, 56px)) var(--gutter) 0;
+/* wide screens: the step (number over text) on the left, centred against its launcher screen on the right */
+@media (min-width: 901px) {
+  .steps { gap: clamp(40px, 6vh, 72px); }
+  .step {
+    grid-template-columns: minmax(0, 4fr) minmax(0, 7fr); grid-template-rows: 1fr auto auto 1fr;
+    gap: 0 clamp(36px, 5vw, 88px); align-items: start;
   }
-  .motion .getin__title { width: 30vw; font-size: clamp(48px, 5.2vw, 96px); }
-  .motion .steps { width: calc(100vw - var(--win-w) - 3 * var(--gutter)); margin-top: clamp(20px, 4vh, 44px); gap: clamp(14px, 2.6vh, 28px); }
-  .motion .getin__stage { --win-w: min(1240px, 62vw, (100svh - var(--bar-h) - 120px) * 1.55); }
-  .motion .step { display: block; position: static; }
-  .motion .step__text { transition: opacity 300ms; opacity: 0.6; }
-  .motion .step.is-on .step__text { opacity: 1; }
-  .motion .step__text h3 { font-size: clamp(30px, 2.6vw, 44px); }
-  .motion .step__text p { font-size: 16px; margin-top: 8px; }
-  .motion .step__n {
-    position: absolute; left: var(--gutter); bottom: clamp(16px, 4vh, 40px);
-    font-size: clamp(150px, 17vw, 300px); visibility: hidden;
-  }
-  .motion .step.is-on .step__n { visibility: visible; }
-  .motion .step__fig {
-    position: absolute; right: var(--gutter); top: calc(var(--bar-h) + (100svh - var(--bar-h) - var(--win-w) / 1.55) / 2);
-    width: var(--win-w);
-  }
-  .motion .step__fig .step__shot { box-shadow: none; }
-  .motion .getin__stage::after {
-    /* one shadow under the window, so the three stacked screens read as one */
-    content: ''; position: absolute; z-index: -1; right: var(--gutter); width: var(--win-w); aspect-ratio: 1.55;
-    top: calc(var(--bar-h) + (100svh - var(--bar-h) - var(--win-w) / 1.55) / 2);
-    box-shadow: 0 40px 80px rgb(0 0 0 / 0.55);
-  }
+  .step__n { grid-column: 1; grid-row: 2; font-size: clamp(72px, 5.6vw, 104px); }
+  .step__text { grid-column: 1; grid-row: 3; padding-top: 16px; }
+  .step__fig { grid-column: 2; grid-row: 1 / -1; width: 100%; max-width: 960px; justify-self: end; }
 }
 
 /* ---------- 6. close: centred, the decision and what it needs ---------- */
 .close { position: relative; min-height: 100svh; display: grid; align-items: end; overflow: hidden; isolation: isolate; background: var(--black); }
 .close__video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 0; }
-.close__shade { position: absolute; inset: 0; z-index: 0; background: linear-gradient(0deg, rgb(10 9 7 / 0.92) 0%, rgb(10 9 7 / 0.6) 46%, rgb(10 9 7 / 0.35) 100%); }
+/* the top rises out of the ground the get-in section ends on, so the join has no hard grey edge */
+.close__shade { position: absolute; inset: 0; z-index: 0; background: linear-gradient(180deg, var(--ground) 0%, rgb(10 9 7 / 0.35) 22%, rgb(10 9 7 / 0.6) 54%, rgb(10 9 7 / 0.92) 100%); }
 .stage3d--close { z-index: 1; }
 .close__copy { position: relative; z-index: 2; width: min(64rem, 100% - 2 * var(--gutter)); margin: 0 auto; padding: 38svh 0 clamp(56px, 10vh, 112px); text-align: center; }
-.close__title { font: 800 clamp(60px, 9.4vw, 170px)/0.84 var(--f-display); text-transform: uppercase; text-wrap: balance; text-shadow: 0 4px 40px rgb(0 0 0 / 0.4); }
+.close__title { font: 800 clamp(56px, 7.6vw, 136px)/0.84 var(--f-display); text-transform: uppercase; text-wrap: balance; text-shadow: 0 4px 40px rgb(0 0 0 / 0.4); }
 .cta--center { margin-top: clamp(24px, 4vh, 40px); justify-content: center; }
 .needs {
   margin: clamp(28px, 5vh, 48px) auto 0; max-width: 46rem;
@@ -279,5 +268,5 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .plate, .server__img, .step__text { transition: none; }
+  .plate, .server__img { transition: none; }
 }

@@ -53,6 +53,11 @@
   --f-display: 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif;
   --f-text: 'Sofia Sans', system-ui, sans-serif;
   --gutter: clamp(20px, 4vw, 64px);
+  /* the one left edge of the page (bar, hero copy, card copy, sections, footer): the gutter, or a centred
+     1800 px measure on very wide screens */
+  --edge: max(var(--gutter), calc((100vw - 1800px) / 2));
+  /* the ground between footage plates */
+  --plate: clamp(8px, 1vw, 16px);
   --cut: 14px;
   --bar-h: 64px;
   /* the 2.39:1 letterbox, only on landscape windows (a portrait window of any width gets none) */
@@ -95,7 +100,7 @@ h1, h2, h3, p, figure, ol, dl, dd { margin: 0; }
 }
 .skip:focus-visible { transform: none; }
 
-.wrap { width: min(1280px, 100% - 2 * var(--gutter)); margin-inline: auto; }
+.wrap { margin-inline: var(--edge); }
 
 /* ---------- plates (the gold action, cut like the mark) ---------- */
 .plate {
@@ -151,11 +156,11 @@ button.plate--ghost:disabled { background: transparent; color: var(--ink-4); }
   position: fixed; inset: 0 0 auto 0; z-index: 40;
   height: var(--bar-h);
   display: flex; align-items: center; gap: clamp(16px, 3vw, 40px);
-  padding: 0 var(--gutter);
+  padding: 0 var(--edge);
   background: linear-gradient(180deg, rgb(10 9 7 / 0.72), rgb(10 9 7 / 0));
   transition: background 300ms;
 }
-/* opaque: a gold slab passing under a translucent, blurred bar smeared into the glow NOON bans */
+/* opaque: footage and the S passing under a translucent, blurred bar smear into the glow NOON bans */
 .bar.is-solid { background: var(--ground); box-shadow: 0 1px 0 var(--line); }
 .bar__brand { display: block; line-height: 0; filter: drop-shadow(0 1px 10px rgb(0 0 0 / 0.5)); }
 /* 28px: at 24 the S of the lockup read as a "5" */
