@@ -37,6 +37,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11ShaderResourceView;
 
 namespace gage::game::brand {
 
@@ -57,6 +58,45 @@ namespace gage::game::brand {
 
     // Restore the two vtable slots and drop every D3D object. Safe to call twice and when never installed.
     void Shutdown();
+
+    // ---- 0.5.5 swap layer: the same two hooks for another client (apps/engine/radar_mask.cpp, the ring map's round mask) -----------------
+    // One PSSetShaderResources / CreateShaderResourceView hook pair serves both: brand targets are found by fingerprint, swap clients name the
+    // stock view themselves (Replace). Poll() installs the hooks when brand_apparel is on OR a client called Want(), and runs the brand pump only
+    // when brand_apparel is on. A device change (or Shutdown) tears everything down and bumps Generation(): every handle from before is dead.
+    namespace swap {
+        void Want();                    // any thread: a client needs the hooks (Poll installs them even with brand_apparel=0)
+        bool Installed();               // both vtable slots patched on the game's D3D11 device
+        bool NotD3D11();                // Poll saw a swap chain without a D3D11 device (Enhanced / D3D12): nothing will ever install
+        uint32_t Generation();
+        ID3D11Device* Device();         // render thread, while Installed(): the hooked device / immediate context (not AddRef'd)
+        ID3D11DeviceContext* Context();
+        // Render thread: the game's binds of `stock` hand it `repl` (both AddRef'd, released at teardown) while the entry is active. Returns the
+        // handle, or -1 (hooks not installed, `stock` already replaced, table full). active = false registers it inactive (binds counted, not swapped).
+        int Replace(ID3D11ShaderResourceView* stock, ID3D11ShaderResourceView* repl, bool active = true);
+        // Any thread: start / stop handing out `repl` (the stock view is bound as the game asked while off). `generation` = Generation() when
+        // the handle was issued. False = no such swap entry in this install.
+        bool SetActive(int handle, uint32_t generation, bool on);
+        // Any thread: the entry of this install is in place (the stock view's slot says "replaced by `handle`", our view registered).
+        bool Holds(int handle, uint32_t generation);
+        struct SwapCounters {
+            uint64_t subst = 0;         // binds the hook rewrote to `repl`
+            uint64_t lastTick = 0;      // GetTickCount64() of the last one (0 = never)
+            uint32_t verified = 0;      // read-backs (the first and every 256th) that found `repl` in the context's slot
+            uint32_t verifyMiss = 0;    // read-backs that did not
+            uint64_t seen = 0;          // binds of `stock` the hook saw, active or not
+            uint64_t lastSeenTick = 0;  // GetTickCount64() of the last one (0 = never)
+            bool active = false;
+        };
+        SwapCounters Counters(int handle);   // any thread
+        // The probe recorder (render thread, except ProbeSetWindow): while armed, every 2D view of one of `sizes` that the game binds is kept
+        // with the set of windows (1..32) it was bound in, counting only render frames 3+ of a window.
+        struct ProbeSize { uint32_t w, h; };
+        bool ProbeArm(const ProbeSize* sizes, int n);          // clears the last probe; false = hooks not installed / bad sizes
+        void ProbeSetWindow(uint32_t window);                  // any thread (the script tick): 0 = none, 1..32
+        void ProbeFrame();                                     // render thread, once per Present (Poll calls it)
+        struct ProbeCand { ID3D11ShaderResourceView* srv = nullptr; uint32_t w = 0, h = 0; uint32_t seen = 0; uint64_t binds = 0; };
+        std::vector<ProbeCand> ProbeTake(uint32_t* overflow = nullptr);   // disarm; each srv is AddRef'd for the caller
+    }
 
     struct Stats {
         bool     enabled = false;
@@ -89,6 +129,10 @@ namespace gage::game::brand {
         bool AddTarget(const char* name, uint64_t tailHash, bool bc3, int baseSize, int levels,
                        const std::vector<Decal>& decals);                       // register an extra fingerprint
         bool InstallOn(ID3D11Device* dev, ID3D11DeviceContext* immediateCtx);   // hook this device's vtables
+        // 0.5.5: what Poll() sets from Enabled(): false = brand_apparel=0, the hooks serve swap clients only (no tee classification, nothing
+        // queued). Default true. PendingCount = views queued for a tee readback.
+        void SetBrandOn(bool on);
+        size_t PendingCount();
         void Pump(ID3D11DeviceContext* immediateCtx);                           // the per-frame work of Poll()
     }
 

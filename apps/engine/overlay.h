@@ -76,6 +76,10 @@ namespace gage::game::Overlay {
     // annulus over the radar square's corners (hudring::MapRadiusPx out to the disc) and the map shows through the hole, with the design's vignette
     // and amber map ring at the hole's edge. false = the full glass disc (map off). Any thread.
     void SetRingMap(bool open);
+    // 0.5.5 ring_map_round: true = GTA's radar is clipped round by our mask and the table holds the round placement, so an open hole is
+    // hudring::MapRoundRadiusPx (the amber ring's outer edge on the arcs' inner edge) and the ring's glow goes under the arcs. false = 0.5.4's
+    // hole (MapRadiusPx). Only matters while SetRingMap(true). Any thread.
+    void SetRingMapRound(bool round);
 
     // v8 accounts: true = this player may use the admin commands (/heal, /fix, /spawn, /tp, /noclip, /gun, /car, the Cars page spawn), so the
     // overlay may offer them. The engine sets it from the server's AccountInfo (kAcctCommands: an admin role, or a guest on a server that does

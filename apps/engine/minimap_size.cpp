@@ -10,6 +10,7 @@
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/minimap_size.h"
+#include "sync/ring_round.h"
 
 #include <windows.h>
 
@@ -505,6 +506,94 @@ std::string Status() {
         return "size: GAVE UP (" + g_gate.Why() + ")";
     }
     return "size: ?";
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.5.5 ring_map_blip_clip: FiveM's minimapIsRect (sync::ringround::kClipLayoutLegacy)
+// ---------------------------------------------------------------------------------------------
+namespace {
+enum class ClipRes { Unresolved, Ready, Refused };
+ClipRes     g_clipRes = ClipRes::Unresolved;
+std::string g_clipWhy;
+uint8_t*    g_clipFlag = nullptr;
+size_t      g_clipRva = 0;
+uint32_t    g_clipWrites = 0, g_clipWriteFails = 0;
+
+void ResolveClip() {
+    const Image im = GameImage();
+    if (!im.base || !im.size) { g_clipRes = ClipRes::Refused; g_clipWhy = "the game image could not be read"; return; }
+    if (LayoutForExe() != &kMinimapLayoutLegacy) {
+        g_clipRes = ClipRes::Refused;
+        g_clipWhy = "not Legacy GTA5.exe: the flag's pattern is pinned for 3889 only";
+        return;
+    }
+    const sync::MinimapLayout& L = sync::ringround::kClipLayoutLegacy;
+    const ULONGLONG t0 = GetTickCount64();
+    const uint8_t* hits[4] = {};
+    int have = 0;
+    for (const Run& r : ReadableRuns(im)) {
+        have = FindLayoutHits(L, r.p, r.n, hits, 4, have);
+        if (have >= 4) break;
+    }
+    const unsigned long ms = (unsigned long)(GetTickCount64() - t0);
+    if (have != 1) {
+        g_clipRes = ClipRes::Refused;
+        g_clipWhy = "the pattern matched " + std::to_string(have) + " places (expected exactly 1)";
+        return;
+    }
+    const uint8_t* hit = hits[0];
+    if (hit < im.base + L.spanBefore || !IsReadable(hit - L.spanBefore, (size_t)(L.spanBefore + L.spanAfter))) {
+        g_clipRes = ClipRes::Refused;
+        g_clipWhy = "the code around the hit is not readable";
+        return;
+    }
+    const sync::ringround::ClipResolve r = sync::ringround::ResolveClipFlag(hit, im.base, im.size);
+    if (!r.ok) { g_clipRes = ClipRes::Refused; g_clipWhy = r.why; return; }
+    uint8_t* flag = const_cast<uint8_t*>(im.base) + r.flagOff;
+    if (!IsReadable(flag, 1) || (*flag != 0 && *flag != 1)) {
+        g_clipRes = ClipRes::Refused;
+        g_clipWhy = "the flag is not a readable bool";
+        return;
+    }
+    g_clipFlag = flag;
+    g_clipRva = r.flagOff;
+    g_clipRes = ClipRes::Ready;
+    GLOGI("engine: ring map round mask (0.5.5): blip clip flag found by FiveM's pattern, unique: pattern at GTA5.exe+0x%lx (3889 dumps: 0x%lx), flag at +0x%lx "
+          "(3889 dumps: 0x%lx), holds %u (1 = rectangle, the game's default); scan %lu ms",
+          (unsigned long)(hit - im.base), (unsigned long)sync::ringround::kClipHit3889, (unsigned long)r.flagOff,
+          (unsigned long)sync::ringround::kClipFlag3889, (unsigned)*flag, ms);
+}
+} // namespace
+
+bool SetBlipClipRound(bool round) {
+    if (g_clipRes == ClipRes::Unresolved) {
+        if (!round) return false;                  // nothing to put back before we ever asked for round
+        ResolveClip();
+        if (g_clipRes == ClipRes::Refused) GLOGW("engine: ring map round mask (0.5.5): blip clip flag NOT used: %s", g_clipWhy.c_str());
+    }
+    if (g_clipRes != ClipRes::Ready) return false;
+    const uint8_t want = round ? 0 : 1;
+    if (!IsReadable(g_clipFlag, 1)) return false;
+    if (*g_clipFlag == want) return true;
+    if (g_clipWriteFails >= 3) return false;
+    if (!WriteGuarded(g_clipFlag, &want, 1) || *g_clipFlag != want) {
+        ++g_clipWriteFails;
+        GLOGW("engine: ring map round mask (0.5.5): blip clip flag write of %u not read back (%u failures)", (unsigned)want, g_clipWriteFails);
+        return false;
+    }
+    ++g_clipWrites;
+    return true;
+}
+
+std::string BlipClipStatus() {
+    char b[200];
+    if (g_clipRes == ClipRes::Unresolved) return "blip clip: not looked up yet (only once the map is round)";
+    if (g_clipRes == ClipRes::Refused) return "blip clip: refused (" + g_clipWhy + ")";
+    const int now = IsReadable(g_clipFlag, 1) ? (int)*g_clipFlag : -1;
+    std::snprintf(b, sizeof(b), "blip clip: flag +0x%lx holds %d (%s), %u write(s), %u failure(s)", (unsigned long)g_clipRva, now,
+                  now == 0 ? "ROUND: off-radar blips clamp to the circle" : now == 1 ? "rectangle, the game's default" : "unreadable", g_clipWrites,
+                  g_clipWriteFails);
+    return b;
 }
 
 } // namespace gage::game::minimapsize

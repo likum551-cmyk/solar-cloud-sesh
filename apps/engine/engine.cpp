@@ -15,7 +15,9 @@
 #include "pack_stream.h"
 #include "pack_meta.h"
 #include "minimap_size.h"
+#include "radar_mask.h"        // 0.5.5 ring_map_round: the radar's own mask swapped for a circle
 #include "sync/hud_ring.h"     // 0.5.2 ring_map: where the map square goes (MapCentrePx / MapSquarePx)
+#include "sync/ring_round.h"   // 0.5.5 ring_map_round: the gate, the box fit
 #include "quit_gate.h"
 #include "ambient.h"
 #include "common/common.h"
@@ -847,6 +849,9 @@ namespace {
     std::atomic<bool>  g_ringMap{true};               // 0.5.2 ring_map: GTA's radar moved into the ring (MinimapReadSwitches)
     std::atomic<bool>  g_ringMapBig{true};            // 0.5.4 ring_map_big: the placement also written to the big radar's slots (MinimapReadSwitches)
     std::atomic<int>   g_ringMapZoom{sync::kRingMapZoomDefault};   // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM level each tick, 0 = the game's own zoom
+    std::atomic<bool>  g_ringMapRound{true};          // 0.5.5 ring_map_round: GTA's radar clipped round by our mask, the map grown to the arcs
+    std::atomic<bool>  g_ringBlipClip{true};          // 0.5.5 ring_map_blip_clip: off-radar blips clamp to the circle while the map is round
+    std::atomic<float> g_ringFitX{sync::ringround::kBoxFitX}, g_ringFitY{sync::ringround::kBoxFitY};   // 0.5.5 ring_map_round_fit
     std::atomic<bool>  g_overlayCombatBlock{true};    // 0.5.4 overlay_combat_block (sync/overlay_input.h)
     bool               g_overlayCombatLogged = false; // script tick only
     void MinimapScaleRead()
@@ -890,6 +895,22 @@ namespace {
                   z.level, z.level == 0 ? "the game's own zoom, as 0.5.3" : "SET_RADAR_ZOOM every tick while the ring map shows; LIVE-UNVERIFIED",
                   z.why ? z.why : "");
         }
+        // 0.5.5 (GI 2026-11-07: "fill out the current design HUD circle to the point where it doesn't go over hp and satiety and there's no gap
+        // either"). ring_map_round (default on; 0 = the 0.5.4 map): the radar's own mask texture is swapped for a circle (radar_mask.h) and, only
+        // while that swap is confirmed by the bind hook, the map grows to the arcs. ring_map_blip_clip (default on; 0 = blips clamp to the square's
+        // edge as before): FiveM's minimapIsRect flag set to round while the map is round. ring_map_round_fit = "fx,fy": the radar box fit.
+        g_ringMapRound.store(reg::Get(L"ring_map_round") != L"0");
+        g_ringBlipClip.store(reg::Get(L"ring_map_blip_clip") != L"0");
+        const sync::ringround::BoxFit fit = sync::ringround::ParseBoxFit(reg::Get(L"ring_map_round_fit"));
+        g_ringFitX.store(fit.fx);
+        g_ringFitY.store(fit.fy);
+        if (g_hudRing.load() && g_ringMap.load() && g_ringMapRound.load())
+            game::radarmask::Enable(true);
+        GLOGI("engine: ring map round mask (0.5.5): ring_map_round=%s; ring_map_blip_clip=%s; ring_map_round_fit=%.3f,%.3f (%s%s)",
+              g_ringMapRound.load() ? "on (the radar's mask swapped for a circle, the map grown to the arcs once the swap is confirmed; LIVE-UNVERIFIED)"
+                                    : "OFF (the 0.5.4 map: the square's inscribed circle)",
+              g_ringBlipClip.load() ? "on (blips clamp to the circle while the map is round; LIVE-UNVERIFIED)" : "OFF",
+              (double)fit.fx, (double)fit.fy, fit.overridden ? "override" : "default, from the 0.5.4 radar probes", fit.why ? fit.why : "");
         g_overlayCombatBlock.store(reg::Get(L"overlay_combat_block") != L"0");
         GLOGI("engine: overlay input (0.5.4): overlay_combat_block=%s", g_overlayCombatBlock.load()
                   ? "on (an open panel also holds attack2 / melee / weapon / sniper / vehicle-melee controls above 226; LIVE-UNVERIFIED)"
@@ -4393,6 +4414,7 @@ namespace {
             game::Overlay::Init(sc);                  // backs off by itself after a failure
         game::Overlay::Render(sc);
         game::brand::Poll(sc);                        // the GAGE-MP mark on the tee: D3D11 hooks + readbacks, no natives
+        game::radarmask::Poll(sc);                    // 0.5.5 ring_map_round: the probe's evaluation, the mask readback and swap (same hooks)
     }
 
     // Script tick only. lp is the local ped.
@@ -4644,6 +4666,379 @@ namespace {
               game::minimapsize::Status().c_str(), (double)g_miniAppliedScale, g_ringMapZoom.load(), zoomCalls, zoomUncallable);
     }
 
+    // ---- 0.5.5 ring_map_round (libs/sync/ring_round.h, apps/engine/radar_mask.h) -------------------------------------------------------------
+    // The script half of the round mask: the sizes of the game's two radar masks (GET_TEXTURE_RESOLUTION), the probe's windows (DRAW_SPRITE of each
+    // mask in its own windows, the radar held hidden meanwhile), and the gate that lets the placement grow only while the bind hook keeps handing
+    // the radar our circle. Script tick only.
+    enum class RoundStep { Idle, Sizing, Arming, Settle, Windows, Evaluating, Replacing, Done, GaveUp };
+    const char* RoundStepName(RoundStep s)
+    {
+        switch (s)
+        {
+        case RoundStep::Idle: return "idle";
+        case RoundStep::Sizing: return "asking the mask sizes";
+        case RoundStep::Arming: return "arming the probe";
+        case RoundStep::Settle: return "radar hidden, settling";
+        case RoundStep::Windows: return "probing";
+        case RoundStep::Evaluating: return "evaluating";
+        case RoundStep::Replacing: return "replacing";
+        case RoundStep::Done: return "done";
+        case RoundStep::GaveUp: return "gave up";
+        }
+        return "?";
+    }
+    struct RoundState
+    {
+        RoundStep step = RoundStep::Idle;
+        int runs = 0, sizeTries = 0, ticks = 0, win = 0;
+        double nextMs = 0.0, stepMs = 0.0;
+        const char* dict = nullptr;              // the dictionary name GET_TEXTURE_RESOLUTION knew
+        uint32_t size[2][2] = {};                // radarmasksm / radarmasklg w x h (0 = unknown)
+        int plan[16] = {};
+        int planN = 0;
+        std::string outcome = "not started";     // the last probe's result, for the 10 s line
+        sync::ringround::RoundGate gate;
+        sync::ringround::RoundGateOut out;       // the gate's verdict of the last tick (TickMinimapSize places from it on the next)
+        bool cfgRound = false;                   // the placement handed to minimapsize is the grown one
+        bool written = false;                    // ... and has been written since it was handed over
+        double cfgMs = 0.0;
+        bool landed = false;                     // written, read back, not in the big-radar flip (what the round hole and a shrink wait for)
+        double shrinkSinceMs = -1.0;
+        bool shrinkStuck = false;                // a shrink that never landed: our masks stay handed out from then on (logged)
+        bool active = false;                     // our masks handed out (radarmask::SetActive)
+        uint32_t activeCalls = 0;
+        bool shown = false;
+        double shownSinceMs = 0.0;
+        uint64_t bindsAtLog = 0, substAtLog = 0;
+        uint32_t transitionsLogged = 0;
+        bool probesRearmed = false;              // the two radar probe images retaken once the map first went round (radar_probe_3 / _4)
+        double roundOpenMs = 0.0;
+        int roundProbes = 0;
+    };
+    RoundState g_round;
+    constexpr int kRoundWinTicks = 10, kRoundSettleTicks = 15, kRoundMaxRuns = 2, kRoundMaxSizeTries = 4;
+    constexpr double kRoundRetryMs = 15000.0, kRoundStepTimeoutMs = 4000.0, kRoundShrinkMaxMs = 3000.0;
+    constexpr const char* kRoundDicts[2] = {"platform:/textures/graphics", "graphics"};
+
+    // The size of `name` in the first dictionary GET_TEXTURE_RESOLUTION knows it in (the game answers about 4 x 4 for a texture it has not got).
+    bool RoundTextureSize(const char* name, const char*& dict, uint32_t& w, uint32_t& h)
+    {
+        for (const char* d : kRoundDicts)
+        {
+            if (dict && d != dict)
+                continue;
+            float fw = 0.0f, fh = 0.0f;
+            if (!g_world->TextureResolution(d, name, fw, fh))
+                return false;
+            if (fw > 4.5f && fh > 4.5f && fw < 8192.0f && fh < 8192.0f)
+            {
+                dict = d;
+                w = (uint32_t)(fw + 0.5f);
+                h = (uint32_t)(fh + 0.5f);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Returns true while the radar must stay hidden for the probe. wantedBase: the radar would show this tick.
+    bool TickRingRound(double nowMs, bool wantedBase)
+    {
+        namespace rr = sync::ringround;
+        RoundState& R = g_round;
+        const bool on = g_hudRing.load() && g_ringMap.load() && g_ringMapRound.load();
+        const game::radarmask::Status st = game::radarmask::GetStatus();
+        auto fail = [&](const std::string& why) {
+            ++R.runs;
+            game::brand::swap::ProbeSetWindow(0);
+            game::radarmask::Reset();
+            R.outcome = why;
+            R.step = R.runs >= kRoundMaxRuns ? RoundStep::GaveUp : RoundStep::Idle;
+            R.nextMs = nowMs + kRoundRetryMs;
+            GLOGW("engine: ring map round mask (0.5.5): probe run %d %s: %s", R.runs, R.step == RoundStep::GaveUp ? "failed, GIVING UP (the 0.5.4 map stays)" : "failed, retrying in 15 s",
+                  why.c_str());
+        };
+        bool hold = false;
+        if (on && !st.notD3D11 && st.hooks)
+        {
+            switch (R.step)
+            {
+            case RoundStep::Idle:
+            {
+                const bool needSmall = !game::radarmask::Live(game::radarmask::kSmall);
+                const bool needBig = !game::radarmask::Live(game::radarmask::kBig);
+                if ((needSmall || needBig) && wantedBase && nowMs >= R.nextMs && R.runs < kRoundMaxRuns)
+                {
+                    R.step = RoundStep::Sizing;
+                    R.stepMs = nowMs;
+                }
+                break;
+            }
+            case RoundStep::Sizing:
+            {
+                const char* dict = nullptr;
+                uint32_t w = 0, h = 0;
+                if (!RoundTextureSize(game::radarmask::kTexName[0], dict, w, h))
+                {
+                    if (++R.sizeTries >= kRoundMaxSizeTries)
+                    {
+                        R.runs = kRoundMaxRuns - 1;   // nothing a retry would change
+                        fail("GET_TEXTURE_RESOLUTION knows no radarmasksm in \"platform:/textures/graphics\" or \"graphics\" (or the native is not callable)");
+                    }
+                    else
+                    {
+                        R.step = RoundStep::Idle;
+                        R.nextMs = nowMs + 2000.0;
+                    }
+                    break;
+                }
+                R.dict = dict;
+                R.size[0][0] = w;
+                R.size[0][1] = h;
+                uint32_t bw = 0, bh = 0;
+                if (RoundTextureSize(game::radarmask::kTexName[1], dict, bw, bh) && !(bw == w && bh == h))
+                {
+                    R.size[1][0] = bw;
+                    R.size[1][1] = bh;
+                }
+                GLOGI("engine: ring map round mask (0.5.5): GET_TEXTURE_RESOLUTION(\"%s\"): radarmasksm %ux%u, radarmasklg %s", R.dict, w, h,
+                      R.size[1][0] ? (std::to_string(R.size[1][0]) + "x" + std::to_string(R.size[1][1])).c_str() : "unknown (not probed)");
+                const bool smallLive = game::radarmask::Live(game::radarmask::kSmall), bigLive = game::radarmask::Live(game::radarmask::kBig);
+                if (!game::radarmask::RequestArm(smallLive ? 0 : R.size[0][0], smallLive ? 0 : R.size[0][1], bigLive ? 0 : R.size[1][0], bigLive ? 0 : R.size[1][1]))
+                {
+                    fail("the probe could not be requested (radar_mask busy)");
+                    break;
+                }
+                // windows: each mask drawn in three windows, nothing between (the order interleaves them so a stray draw cannot fit one pattern)
+                R.planN = 0;
+                for (int rep = 0; rep < 3; ++rep)
+                {
+                    if (!smallLive) { R.plan[R.planN++] = game::radarmask::kSmall; R.plan[R.planN++] = -1; }
+                    if (!bigLive && R.size[1][0]) { R.plan[R.planN++] = game::radarmask::kBig; R.plan[R.planN++] = -1; }
+                }
+                R.step = RoundStep::Arming;
+                R.stepMs = nowMs;
+                hold = true;
+                break;
+            }
+            case RoundStep::Arming:
+                hold = true;
+                if (st.phase == game::radarmask::Phase::Armed)
+                {
+                    R.step = RoundStep::Settle;
+                    R.ticks = 0;
+                }
+                else if (st.phase == game::radarmask::Phase::Failed || nowMs - R.stepMs > kRoundStepTimeoutMs)
+                    fail("the probe recorder did not arm (" + st.why + ")");
+                break;
+            case RoundStep::Settle:
+                hold = true;   // the radar hidden this long before the first window, so its own binds of the mask are over
+                if (++R.ticks >= kRoundSettleTicks)
+                {
+                    R.step = RoundStep::Windows;
+                    R.win = 0;
+                    R.ticks = 0;
+                }
+                break;
+            case RoundStep::Windows:
+            {
+                hold = true;
+                if (R.win >= R.planN)
+                {
+                    if (!game::radarmask::RequestFinish(R.plan, R.planN))
+                        fail("the probe could not be finished (radar_mask not armed)");
+                    else
+                    {
+                        R.step = RoundStep::Evaluating;
+                        R.stepMs = nowMs;
+                    }
+                    break;
+                }
+                game::brand::swap::ProbeSetWindow((uint32_t)R.win + 1);
+                const int kind = R.plan[R.win];
+                if (kind >= 0)
+                {
+                    // under the ring's glass, 1 % of the screen, alpha 1 of 255: invisible, but the game binds the texture to draw it
+                    const game::Overlay::UiState ui = game::Overlay::LastUiState();
+                    const float H = ui.valid && ui.displayH > 0.0f ? ui.displayH : 1080.0f, W = ui.valid && ui.displayW > 0.0f ? ui.displayW : 1920.0f;
+                    const sync::hudring::Pt c = sync::hudring::MapCentrePx(H);
+                    g_world->DrawSprite(R.dict, game::radarmask::kTexName[kind], c.x / W, c.y / H, 0.01f, 0.01f, 1);
+                }
+                if (++R.ticks >= kRoundWinTicks)
+                {
+                    ++R.win;
+                    R.ticks = 0;
+                }
+                break;
+            }
+            case RoundStep::Evaluating:
+                hold = true;
+                if (st.phase == game::radarmask::Phase::Done)
+                {
+                    R.step = RoundStep::Replacing;
+                    R.stepMs = nowMs;
+                }
+                else if (nowMs - R.stepMs > kRoundStepTimeoutMs)
+                    fail("the render thread did not evaluate the probe in 4 s");
+                break;
+            case RoundStep::Replacing:
+            {
+                // the radar may show again: the readback and the swap run on the render thread, the gate waits for them
+                const bool smallOk = game::radarmask::Live(game::radarmask::kSmall);
+                const bool smallSettled = smallOk || !st.k[0].found || (!st.k[0].why.empty() && st.k[0].why.find("REPLACED") == std::string::npos &&
+                                                                        st.k[0].stockHash != 0);
+                if (smallOk && (!st.k[1].found || game::radarmask::Live(game::radarmask::kBig) || st.k[1].stockHash != 0 || nowMs - R.stepMs > kRoundStepTimeoutMs))
+                {
+                    R.step = RoundStep::Done;
+                    R.outcome = "radarmasksm: " + st.k[0].why + (st.k[1].probed || st.k[1].found ? "; radarmasklg: " + st.k[1].why : "");
+                    GLOGI("engine: ring map round mask (0.5.5): probe run %d done: %s", R.runs + 1, R.outcome.c_str());
+                }
+                else if ((!smallOk && smallSettled) || nowMs - R.stepMs > kRoundStepTimeoutMs)
+                    fail("radarmasksm: " + st.k[0].why + (st.k[1].probed ? "; radarmasklg: " + st.k[1].why : ""));
+                break;
+            }
+            case RoundStep::Done:
+                // a device change kills the replacements: probe again
+                if (!game::radarmask::Live(game::radarmask::kSmall))
+                {
+                    R.step = RoundStep::Idle;
+                    R.runs = 0;
+                    R.sizeTries = 0;
+                    R.outcome = "the replacement died (device change?): probing again";
+                }
+                break;
+            case RoundStep::GaveUp:
+                break;
+            }
+        }
+        else if (R.step != RoundStep::Idle && R.step != RoundStep::Done && R.step != RoundStep::GaveUp)
+        {
+            game::brand::swap::ProbeSetWindow(0);   // switched off (or no hooks) in the middle of a probe
+            game::radarmask::Reset();
+            R.step = RoundStep::Idle;
+        }
+
+        // the gate (libs/sync/ring_round.h RoundGate): what was configured last has landed when it was written, the table still holds it and
+        // the big-radar flip that re-reads it is over
+        R.landed = R.written && game::minimapsize::PlacementApplied() && !g_barsGate.BigmapOn();
+        // shown, for the staleness rule: not during our own big-radar flip (the radar draws with radarmasklg then, and re-lays itself out), and
+        // a fresh grace after it
+        const bool shownBase = wantedBase && !hold && !g_barsGate.BigmapOn();
+        if (shownBase && !R.shown)
+            R.shownSinceMs = nowMs;
+        R.shown = shownBase;
+        rr::RoundInputs in;
+        in.switchOn = on;
+        in.d3d11 = st.hooks && !st.notD3D11;
+        in.smallReplaced = game::radarmask::Live(game::radarmask::kSmall);
+        in.bigReplaced = game::radarmask::Live(game::radarmask::kBig);
+        in.bigMirror = g_ringMapBig.load();
+        const game::brand::swap::SwapCounters sc = game::brand::swap::Counters(st.k[0].handle);
+        in.smallBinds = in.smallReplaced ? sc.seen : 0;
+        in.lastBindMs = -1.0;
+        // the last bind of EITHER identified mask (the player's own big radar draws with radarmasklg, and that is no reason to shrink)
+        ULONGLONG lastSeen = in.smallReplaced ? sc.lastSeenTick : 0;
+        if (in.bigReplaced)
+        {
+            const ULONGLONG b = game::brand::swap::Counters(st.k[1].handle).lastSeenTick;
+            if (b > lastSeen)
+                lastSeen = b;
+        }
+        if (lastSeen)
+        {
+            const ULONGLONG t = GetTickCount64();
+            in.lastBindMs = nowMs - (double)(t > lastSeen ? t - lastSeen : 0);
+        }
+        in.radarShown = shownBase;
+        in.shownSinceMs = R.shownSinceMs;
+        in.nowMs = nowMs;
+        bool landed = R.landed;
+        if (R.out.shrinking && !landed && R.shrinkSinceMs >= 0.0 && nowMs - R.shrinkSinceMs > kRoundShrinkMaxMs)
+        {
+            // the 0.5.4 placement did not land in time (minimapsize gave up?): stop hiding the radar, keep our circle handed out so whatever box
+            // the game holds is at least round under the annulus
+            landed = true;
+            if (!R.shrinkStuck)
+                GLOGW("engine: ring map round mask (0.5.5): the shrink back to 0.5.4 did not land in %.0f ms (%s); the radar shows again with our circle "
+                      "kept on", kRoundShrinkMaxMs, game::minimapsize::Status().c_str());
+            R.shrinkStuck = true;
+        }
+        const rr::RoundGateOut o = R.gate.Update(in, landed);
+        if (o.changed)
+        {
+            R.shrinkSinceMs = o.round ? -1.0 : nowMs;
+            if (R.transitionsLogged < 16)
+            {
+                ++R.transitionsLogged;
+                GLOGI("engine: ring map round mask (0.5.5): map %s: %s (binds of the mask %llu, substitutions %llu, read back %u ok / %u missed)",
+                      o.round ? "GROWS to the arcs" : "back to the 0.5.4 size (radar held hidden until it lands)", rr::RoundWhyName(o.why),
+                      (unsigned long long)sc.seen, (unsigned long long)sc.subst, sc.verified, sc.verifyMiss);
+            }
+        }
+        R.out = o;
+        // our circle is handed out once the grown placement is written (before the flip re-reads it), and until a shrink has landed
+        const bool active = (o.round && R.cfgRound && R.written) || o.shrinking || R.shrinkStuck;
+        if (active != R.active)
+        {
+            R.active = active;
+            ++R.activeCalls;
+            const int n = game::radarmask::SetActive(active);
+            if (R.activeCalls <= 16)
+                GLOGI("engine: ring map round mask (0.5.5): our circle %s (%d mask(s))", active ? "HANDED OUT" : "withdrawn, the game's own mask is bound", n);
+        }
+        game::minimapsize::SetBlipClipRound(g_ringBlipClip.load() && o.round && R.cfgRound && R.landed);
+        return hold || o.hold;
+    }
+
+    // The round hole in the overlay: the grown placement has landed and our circle is handed out.
+    bool RingRoundOpen()
+    {
+        return g_round.out.round && g_round.cfgRound && g_round.landed && g_round.active;
+    }
+
+    // The 10 s line (TickMinimap, right after LogMinimap's).
+    void LogRingRound(float displayH)
+    {
+        namespace rr = sync::ringround;
+        RoundState& R = g_round;
+        const game::radarmask::Status st = game::radarmask::GetStatus();
+        const game::brand::swap::SwapCounters sc = game::brand::swap::Counters(st.k[0].handle);
+        const game::brand::swap::SwapCounters bc = game::brand::swap::Counters(st.k[1].handle);
+        const bool smallLive = game::radarmask::Live(game::radarmask::kSmall), bigLive = game::radarmask::Live(game::radarmask::kBig);
+        const uint64_t subst = smallLive ? sc.subst : 0, binds = smallLive ? sc.seen : 0;
+        const uint64_t delta = subst >= R.substAtLog ? subst - R.substAtLog : subst;
+        const uint64_t bindsDelta = binds >= R.bindsAtLog ? binds - R.bindsAtLog : binds;
+        R.substAtLog = subst;
+        R.bindsAtLog = binds;
+        const ULONGLONG t = GetTickCount64();
+        char place[260];
+        if (RingRoundOpen() && displayH > 0.0f)
+        {
+            const rr::BoxFit fit = {g_ringFitX.load(), g_ringFitY.load(), false, nullptr};
+            const rr::BoxPx ask = rr::RoundAskPx(displayH, fit);
+            std::snprintf(place, sizeof(place), "ROUND: hole r %.1f px (design %.1f), GTA's circle r %.1f px (design %.2f), asked box %.1f x %.1f px (fit %.3f, %.3f)",
+                          (double)sync::hudring::MapRoundRadiusPx(displayH), (double)(sync::hudring::MapRoundRadiusPx(displayH) / sync::hudring::Scale(displayH)),
+                          (double)(rr::kMaskCircleR * sync::hudring::Scale(displayH)), (double)rr::kMaskCircleR, (double)ask.w, (double)ask.h, (double)fit.fx,
+                          (double)fit.fy);
+        }
+        else
+            std::snprintf(place, sizeof(place), "0.5.4 size: hole r %.1f px (the square's inscribed circle)%s",
+                          displayH > 0.0f ? (double)sync::hudring::MapRadiusPx(displayH) : 0.0,
+                          R.out.round ? " (grown placement on its way: not landed yet)" : R.out.shrinking ? " (shrinking: radar held hidden until it lands)" : "");
+        const std::string lastSubst = sc.lastTick ? std::to_string((unsigned long long)(t > sc.lastTick ? t - sc.lastTick : 0)) + " ms ago" : "never";
+        GLOGI("engine: ring map round mask (0.5.5), last 10 s: %s; grows %u / shrinks %u%s; mask found %s (probe %s, run %d: %s); radarmasksm %s %ux%u %s %u mip(s) "
+              "stock hash %016llx: radar binds %llu (+%llu in 10 s), our circle %s, binds swapped %llu (+%llu in 10 s, last %s), read back %u ok / %u missed; "
+              "radarmasklg %s (binds %llu, swapped %llu); %s; placement %s; hooks %s",
+              rr::RoundWhyName(R.out.why), R.gate.Grows(), R.gate.Shrinks(), R.shrinkStuck ? " (a shrink never landed: our circle kept on)" : "", smallLive ? "YES" : "no",
+              RoundStepName(R.step), R.runs + (R.step == RoundStep::Done ? 1 : 0), R.outcome.c_str(),
+              smallLive ? "REPLACED" : st.k[0].found ? "found, not replaced" : "not found", st.k[0].w, st.k[0].h, sync::ringround::TexFmtName(st.k[0].fmt), st.k[0].mips,
+              (unsigned long long)st.k[0].stockHash, (unsigned long long)binds, (unsigned long long)bindsDelta, R.active ? "HANDED OUT" : "not handed out",
+              (unsigned long long)subst, (unsigned long long)delta, lastSubst.c_str(), sc.verified, sc.verifyMiss,
+              bigLive ? "REPLACED" : st.k[1].found ? "found, not replaced" : st.k[1].probed ? "not found" : "not probed", (unsigned long long)(bigLive ? bc.seen : 0),
+              (unsigned long long)(bigLive ? bc.subst : 0), game::minimapsize::BlipClipStatus().c_str(), place,
+              st.notD3D11 ? "NOT D3D11 (Enhanced: skipped)" : st.hooks ? "installed" : "not installed");
+    }
+
     // 0.4.25 minimap_scale: configure the table writer from the registry value (minimap=0 means the radar is hidden, so nothing is touched), let it run, and
     // ask the radar's movie to flip once after every write so the "minimap" component is re-read. Script tick only.
     float g_miniCfgScale = -1.0f;                 // the factor last handed to minimapsize (-1 = never)
@@ -4662,10 +5057,25 @@ namespace {
             if (ui.valid && ui.displayW > 0.0f && ui.displayH > 0.0f)
             {
                 const sync::hudring::Pt c = sync::hudring::MapCentrePx(ui.displayH);
-                const sync::MinimapPlacement p = sync::RingPlacement(ui.displayW, ui.displayH, g_miniSafe, g_miniSafeOk, c.x, c.y,
-                                                                     sync::hudring::MapSquarePx(ui.displayH));
+                // 0.5.5 ring_map_round: the grown box while the round gate says so (its previous tick; libs/sync/ring_round.h RoundGate)
+                const bool round = g_round.out.round;
+                sync::MinimapPlacement p;
+                if (round)
+                {
+                    const sync::ringround::BoxFit fit = {g_ringFitX.load(), g_ringFitY.load(), false, nullptr};
+                    const sync::ringround::BoxPx ask = sync::ringround::RoundAskPx(ui.displayH, fit);
+                    p = sync::RingPlacementBox(ui.displayW, ui.displayH, g_miniSafe, g_miniSafeOk, c.x, c.y, ask.w, ask.h);
+                }
+                else
+                    p = sync::RingPlacement(ui.displayW, ui.displayH, g_miniSafe, g_miniSafeOk, c.x, c.y, sync::hudring::MapSquarePx(ui.displayH));
+                if (round != g_round.cfgRound)
+                {
+                    g_round.cfgRound = round;
+                    g_round.written = false;             // the table holds the other placement until the next write
+                    g_round.cfgMs = nowMs;
+                }
                 game::minimapsize::SetBigMirror(g_ringMapBig.load());   // 0.5.4 ring_map_big: the big radar's slots get the same geometry
-                game::minimapsize::ConfigurePlacement(p, "ring_map");   // the same placement is not written again
+                game::minimapsize::ConfigurePlacement(p, round ? "ring_map_round" : "ring_map");   // the same placement is not written again
                 g_miniCfgScale = -1.0f;
             }
         }
@@ -4680,7 +5090,10 @@ namespace {
         }
         game::minimapsize::Tick(nowMs);
         if (game::minimapsize::TakeWritten())
+        {
             g_barsGate.RequestFlip();
+            g_round.written = true;                      // 0.5.5: the configured placement (round or 0.5.4) is in the table now
+        }
         g_miniAppliedScale = game::minimapsize::AppliedScale();
     }
 
@@ -4699,11 +5112,15 @@ namespace {
         {
             g_ringMapSinceMs = -1.0;
             game::Overlay::SetRingMap(false);
+            game::Overlay::SetRingMapRound(false);
             return;
         }
         if (g_ringMapSinceMs < 0.0)
             g_ringMapSinceMs = nowMs;
         const bool open = nowMs - g_ringMapSinceMs >= kRingMapSettleMs;
+        // 0.5.5 ring_map_round: the hole grows to the arcs only while the grown placement has landed and our circle is handed out
+        const bool round = RingRoundOpen();
+        game::Overlay::SetRingMapRound(round);
         game::Overlay::SetRingMap(open);
         if (open && !g_ringOpenLogged)
         {
@@ -4712,6 +5129,15 @@ namespace {
         }
         if (g_ringProbes < 2 && nowMs - g_ringMapSinceMs >= kRingProbeAtMs[g_ringProbes])
             game::Overlay::RequestRadarProbe(++g_ringProbes);
+        // 0.5.5: the same two captures once the ROUND map has been open for as long (radar_probe_3 / _4.bmp), so its circle can be measured
+        if (round && open && !g_round.probesRearmed && g_ringProbes >= 2)
+        {
+            g_round.probesRearmed = true;
+            g_round.roundOpenMs = nowMs;
+            GLOGI("engine: ring map round mask (0.5.5): the ROUND map hole is open; radar probes 3 and 4 follow at 2.5 s and 20 s");
+        }
+        if (round && open && g_round.probesRearmed && g_round.roundProbes < 2 && nowMs - g_round.roundOpenMs >= kRingProbeAtMs[g_round.roundProbes])
+            game::Overlay::RequestRadarProbe(3 + g_round.roundProbes++);
     }
 
     void TickMinimap(double nowMs)
@@ -4736,7 +5162,10 @@ namespace {
         in.pauseMenuActive = g_pauseMenuActive;
         // 0.6: the REV3 inventory page covers the screen; GTA's radar would show through its dim, so it is hidden while the page is open.
         const bool invOpen = game::Overlay::InventoryOpen();
-        const bool wanted = sync::RadarWanted(in) && !invOpen;
+        const bool wantedBase = sync::RadarWanted(in) && !invOpen;
+        // 0.5.5 ring_map_round: the mask probe and a shrink that has not landed yet hold the radar hidden (TickRingRound)
+        const bool roundHold = TickRingRound(nowMs, wantedBase);
+        const bool wanted = wantedBase && !roundHold;
         if (wanted != g_miniWanted)
         {
             g_miniWanted = wanted;
@@ -4744,8 +5173,9 @@ namespace {
             if (g_miniTransitions < 24)
             {
                 ++g_miniTransitions;
-                GLOGI("engine: minimap (0.4.22): radar %s (minimap=%s, entry %s, pause menu %s, inventory %s)", wanted ? "SHOWN" : "hidden", in.switchOn ? "on" : "OFF",
-                      in.entryDone ? "done" : "not done", in.pauseMenuActive ? "up" : "closed", invOpen ? "open" : "closed");
+                GLOGI("engine: minimap (0.4.22): radar %s (minimap=%s, entry %s, pause menu %s, inventory %s%s)", wanted ? "SHOWN" : "hidden", in.switchOn ? "on" : "OFF",
+                      in.entryDone ? "done" : "not done", in.pauseMenuActive ? "up" : "closed", invOpen ? "open" : "closed",
+                      roundHold && wantedBase ? ", held hidden by the 0.5.5 round mask probe / shrink" : "");
             }
         }
         if (!in.entryDone)
@@ -4866,6 +5296,11 @@ namespace {
             {
                 g_miniLogMs = nowMs;
                 LogMinimap(nowMs, wanted);
+                if (g_hudRing.load() && g_ringMap.load())
+                {
+                    const game::Overlay::UiState ui = game::Overlay::LastUiState();
+                    LogRingRound(ui.valid ? ui.displayH : 0.0f);
+                }
             }
         }
     }

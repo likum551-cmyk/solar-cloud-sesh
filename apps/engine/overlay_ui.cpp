@@ -162,6 +162,7 @@ std::atomic<bool>     g_invRev3{true};        // 0.6 inv_rev3 (SetInventoryScree
 std::atomic<bool>     g_invPageOpen{false};   // InventoryOpen(): the Tab menu is open on the inventory page (render thread writes)
 // 0.5.2 ring_map (SetRingMap): GTA's radar sits in the ring, so the disc is an annulus and the map shows through its hole.
 std::atomic<bool>     g_ringMapOpen{false};
+std::atomic<bool>     g_ringMapRound{false};   // 0.5.5 ring_map_round (SetRingMapRound): GTA clips the radar round, the hole grows to the arcs
 // 0.4.22 vehicle controls: the key bits pressed since the engine last took them (and when the newest came), and the strip's state packed in
 // one word so a frame never draws half of one push: bit 0 left on, 1 right on, 2-3 lights (0..2), 4 belt buckled, 5 belt warning, 6 engine off, 7 shown;
 // 0.4.27 state row: 8 lock known, 9 locked, 10 the on-foot lock flash.
@@ -1793,11 +1794,26 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
 
     // 1 disc glass; 0.5.2 ring_map open: an annulus from the map's edge out to the disc instead, over the radar square's corners, so GTA's map
     // (drawn by the game under the overlay) shows through the hole as a circle
+    // 0.5.5 ring_map_round: GTA clips the radar round itself (our mask), so the hole grows to the arcs (MapRoundRadiusPx: the amber ring's outer
+    // edge on the arcs' inner edge). The annulus stays opaque from the hole to the disc: it covers the part of GTA's circle that lies between
+    // them (ringround::kMaskCircleR is aimed midway, a box-fit error margin), as it covered 0.5.4's square corners.
     const bool mapOpen = g_ringMapOpen.load();
-    const float mr = ring::MapRadiusPx(H), dr = ring::kDiscR * k;
+    const bool mapRound = mapOpen && g_ringMapRound.load();
+    const float mr = mapRound ? ring::MapRoundRadiusPx(H) : ring::MapRadiusPx(H), dr = ring::kDiscR * k;
+    const float mw = ring::MapRingWidthPx(H);
+    // the amber ring's glow, outside only (spec 3.4: the r 120 circle blurred, sigma 11)
+    auto mapRingGlow = [&]() {
+        float rho[kRingMaxRings], gal[kRingMaxRings];
+        const int ng = GlowProfile(mw, ring::kMapGlowSigma * k, rho, gal);
+        for (int j = 0; j < ng; ++j)
+            rho[j] += mr + mw * 0.5f;   // the profile's outer side only: from the stroke's edge outwards
+        RadialBand(dl, c, rho, gal, ng, RingCol(ring::kMapRingGlow, a));
+    };
     if (mapOpen) {
         const float rr[4] = {mr - 0.5f, mr + 0.5f, dr - 0.5f, dr + 0.5f}, al[4] = {0.0f, 1.0f, 1.0f, 0.0f};
         RadialBand(dl, c, rr, al, 4, RingCol(ring::kMapAnnulus, a));
+        if (mapRound)
+            mapRingGlow();   // round: the ring touches the arcs, so its glow goes UNDER them (the tracks and fills stay as designed on top)
     } else {
         dl->AddCircleFilled(c, dr, RingCol(ring::kDiscGlass, a), 96);
     }
@@ -1822,13 +1838,9 @@ void DrawVitalsRing(ImDrawList* dl, float W, float H, float a, double nowMs, UiS
     if (mapOpen) {
         const float vr[2] = {mr * ring::kMapVignetteFrom, mr}, va[2] = {0.0f, 1.0f};
         RadialBand(dl, c, vr, va, 2, RingCol(ring::kMapVignette, a));
-        const float w = std::fmax(1.0f, ring::kMapRingW * k), rc = mr + w * 0.5f;
-        float rho[kRingMaxRings], gal[kRingMaxRings];
-        const int ng = GlowProfile(w, ring::kMapGlowSigma * k, rho, gal);
-        for (int j = 0; j < ng; ++j)
-            rho[j] += rc;   // the profile's outer side only: from the stroke's edge outwards
-        RadialBand(dl, c, rho, gal, ng, RingCol(ring::kMapRingGlow, a));
-        const float br[4] = {mr - 0.5f, mr + 0.5f, mr + w - 0.5f, mr + w + 0.5f}, ba[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+        if (!mapRound)
+            mapRingGlow();   // the spec's order (3.4 after 3.3): over the disc, clear of the arcs at 0.5.4's radius
+        const float br[4] = {mr - 0.5f, mr + 0.5f, mr + mw - 0.5f, mr + mw + 0.5f}, ba[4] = {0.0f, 1.0f, 1.0f, 0.0f};
         RadialBand(dl, c, br, ba, 4, RingCol(ring::kMapRing, a));
     }
     // 6 strip: the pill and its 1 px border inside the box
@@ -4083,6 +4095,7 @@ void SetHudRing(bool on) { g_hudRing.store(on); }
 void SetInventoryScreen(bool on) { g_invRev3.store(on); }
 bool InventoryOpen() { return g_invPageOpen.load(); }
 void SetRingMap(bool open) { g_ringMapOpen.store(open); }
+void SetRingMapRound(bool round) { g_ringMapRound.store(round); }
 
 // v8 accounts (overlay.h): whether the admin actions may be offered; the server checks each one anyway.
 static std::atomic<bool> g_isAdmin{false};

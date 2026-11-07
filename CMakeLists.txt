@@ -355,6 +355,7 @@ add_library(gage_mp SHARED
     apps/engine/pack_stream.cpp
     apps/engine/pack_enh.cpp
     apps/engine/minimap_size.cpp
+    apps/engine/radar_mask.cpp
 )
 target_link_libraries(gage_mp PRIVATE gage_common gage_netclient gage_sync gage_overlay winhttp ws2_32)
 set_target_properties(gage_mp PROPERTIES
@@ -376,13 +377,15 @@ add_executable(gage_mp_test
     apps/engine/pack_stream.cpp
     apps/engine/pack_enh.cpp
     apps/engine/minimap_size.cpp
+    apps/engine/radar_mask.cpp
 )
 target_link_libraries(gage_mp_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
 set_target_properties(gage_mp_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
-# brand_apparel_test.exe: the branded-tee texture swap (hash, BC1 encoder, composite, D3D11 hooks on a WARP device), never shipped
-add_executable(brand_apparel_test tests/brand_apparel_test.cpp apps/engine/brand_apparel.cpp)
-target_link_libraries(brand_apparel_test PRIVATE gage_common d3d11 dxgi)
+# brand_apparel_test.exe: the branded-tee texture swap (hash, BC1 encoder, composite, D3D11 hooks on a WARP device) and, since 0.5.5, the
+# shared swap layer's client API + the radar round mask (apps/engine/radar_mask.cpp) end to end on the same device; never shipped
+add_executable(brand_apparel_test tests/brand_apparel_test.cpp apps/engine/brand_apparel.cpp apps/engine/radar_mask.cpp)
+target_link_libraries(brand_apparel_test PRIVATE gage_common gage_sync d3d11 dxgi)
 set_target_properties(brand_apparel_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
 # present_hook_test.exe: the Present hook (vtable slot + watchdog + inline fallback) on a fake vtable, then the production

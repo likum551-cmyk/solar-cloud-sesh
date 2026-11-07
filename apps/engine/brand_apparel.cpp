@@ -335,8 +335,18 @@ struct Repl {
     std::atomic<ID3D11ShaderResourceView*> srv{ nullptr };   // what the bind hook hands the game
     ID3D11ShaderResourceView* orig = nullptr;                // the stock SRV, kept alive so its address is never reused
     ID3D11Texture2D*          tex = nullptr;
-    int                       target = -1;
+    std::atomic<int>          target{ -1 };                  // a brand target, or -1 for a swap::Replace client (0.5.5 radar mask)
+    // 0.5.5: what the bind hook really did with this entry. subst counts the binds it rewrote; every kVerifyEvery-th one (and the first) is
+    // read back from the context right after the call (PSGetShaderResources) and counted as verified or missed.
+    std::atomic<uint64_t> subst{ 0 };
+    std::atomic<uint64_t> lastTick{ 0 };                     // GetTickCount64() of the last substitution
+    std::atomic<uint32_t> verified{ 0 }, verifyMiss{ 0 };
+    // seen counts every bind of the stock view, substituted or not; `on` = false leaves the game's view in place (swap::SetActive)
+    std::atomic<uint64_t> seen{ 0 };
+    std::atomic<uint64_t> lastSeenTick{ 0 };
+    std::atomic<bool>     on{ true };
 };
+constexpr uint64_t kVerifyEvery = 256;
 constexpr int kMaxRepl = 64;
 Repl g_repl[kMaxRepl];
 std::atomic<int> g_replCount{ 0 };
@@ -358,6 +368,34 @@ struct Job {
     ULONGLONG                 startedAt;
 };
 std::vector<Job> g_jobs;                   // Pump thread only
+
+// 0.5.5 swap clients (radar_mask.cpp): the hooks are wanted even with brand_apparel=0; every teardown bumps the generation (handles die)
+std::atomic<bool>     g_swapWanted{ false };
+std::atomic<uint32_t> g_generation{ 1 };
+
+// ---------------------------------------------------------------------------------------------------------
+// 0.5.5 probe recorder: while armed, every 2D texture view of an armed size that the game binds is remembered with the set of probe windows it
+// was bound in (render-thread frames 3+ of a window only: GTA renders the script's frame a frame or two late). radar_mask.cpp draws the texture
+// it is looking for in some windows and nothing in others; the view bound in exactly its windows is the game's own texture of that name.
+// ---------------------------------------------------------------------------------------------------------
+struct ProbeEnt {
+    std::atomic<uintptr_t> key{ 0 };
+    std::atomic<uint32_t>  verdict{ 0 };     // 0 unseen, 1 not a candidate, 2 candidate, 3 being classified
+    std::atomic<uint32_t>  seen{ 0 };        // bit k = bound in window k + 1
+    std::atomic<uint64_t>  binds{ 0 };
+    ID3D11ShaderResourceView* held = nullptr;   // candidates: AddRef'd until ProbeTake / teardown
+    uint32_t w = 0, h = 0;
+};
+constexpr uint32_t kProbeSlots = 8192, kProbeMaxCands = 64, kProbeMaxSizes = 4, kProbeSkipFrames = 3;
+ProbeEnt g_probeTab[kProbeSlots];
+std::atomic<bool>     g_probeArmed{ false };
+std::atomic<uint32_t> g_probeWinReq{ 0 };     // the script thread's window (0 = none)
+uint32_t              g_probeFrameWin = 0;    // render thread: the window this frame belongs to
+uint32_t              g_probeFramesIn = 0;    // render thread: frames since it changed
+std::atomic<uint32_t> g_probeRecording{ 0 };  // the window the bind hook records into now (0 = none)
+uint32_t              g_probeSizes[kProbeMaxSizes][2] = {};
+int                   g_probeSizeCount = 0;
+std::atomic<uint32_t> g_probeCands{ 0 }, g_probeOverflow{ 0 };
 
 // counters
 std::atomic<uint64_t> g_binds{ 0 };
@@ -397,6 +435,9 @@ CreateSRVFn g_origCreate = nullptr;
 void**      g_ctxVtbl = nullptr;
 void**      g_devVtbl = nullptr;
 std::atomic<bool> g_active{ false };
+// 0.5.5: brand_apparel is on (Poll sets it from Enabled()). Off = the hooks are installed only for a swap client (ring_map_round): the bind hook
+// looks up existing entries but classifies nothing, so no game view is queued (and pinned) for a tee readback that PumpImpl would never run.
+std::atomic<bool> g_brandOn{ true };
 std::atomic<bool> g_hooksInstalled{ false };
 ID3D11Device*        g_dev = nullptr;      // owned references (AddRef'd in InstallHooks, released in Teardown)
 ID3D11DeviceContext* g_ctx = nullptr;
@@ -457,8 +498,64 @@ uint32_t Classify(Slot* sl, ID3D11ShaderResourceView* srv, uint32_t seen) {
         res->Release();
     }
     const uint32_t fin = state | keep;
-    sl->info.store(fin, std::memory_order_release);
+    // 0.5.5: a swap::Replace that claimed the view meanwhile (kTarget) wins; a queued entry for it is dropped by StartJobs / FinishJob
+    uint32_t claimed = kClassifying | keep;
+    if (!sl->info.compare_exchange_strong(claimed, fin, std::memory_order_acq_rel)) return claimed;
     return fin;
+}
+
+// 0.5.5 probe recorder, from the bind hook while armed (the game binds from its render thread; the CAS keeps a second thread out anyway).
+void ProbeRecord(ID3D11ShaderResourceView* const* pp, UINT num) {
+    const uint32_t win = g_probeRecording.load(std::memory_order_relaxed);
+    for (UINT i = 0; i < num; ++i) {
+        ID3D11ShaderResourceView* s = pp[i];
+        if (!s) continue;
+        const uintptr_t key = (uintptr_t)s;
+        uint32_t idx = (uint32_t)(((uint64_t)key >> 4) * 0x9E3779B97F4A7C15ULL >> (64 - 13));
+        ProbeEnt* e = nullptr;
+        for (int probe = 0; probe < 64; ++probe, idx = (idx + 1) & (kProbeSlots - 1)) {
+            uintptr_t k = g_probeTab[idx].key.load(std::memory_order_acquire);
+            if (k == key) { e = &g_probeTab[idx]; break; }
+            if (k == 0) {
+                if (g_probeTab[idx].key.compare_exchange_strong(k, key, std::memory_order_acq_rel) || k == key) { e = &g_probeTab[idx]; break; }
+            }
+        }
+        if (!e) continue;
+        uint32_t v = e->verdict.load(std::memory_order_acquire);
+        if (v == 0) {
+            uint32_t expect = 0;
+            if (!e->verdict.compare_exchange_strong(expect, 3, std::memory_order_acq_rel)) continue;
+            uint32_t fin = 1;
+            ID3D11Resource* res = nullptr;
+            s->GetResource(&res);
+            if (res) {
+                D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+                res->GetType(&dim);
+                ID3D11Texture2D* tex = nullptr;
+                if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D && SUCCEEDED(res->QueryInterface(IID_ID3D11Texture2D, (void**)&tex)) && tex) {
+                    D3D11_TEXTURE2D_DESC d;
+                    tex->GetDesc(&d);
+                    tex->Release();
+                    for (int z = 0; z < g_probeSizeCount && fin == 1; ++z)
+                        if (d.Width == g_probeSizes[z][0] && d.Height == g_probeSizes[z][1] && d.ArraySize == 1 && !(d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
+                            if (g_probeCands.load() >= kProbeMaxCands) { g_probeOverflow.fetch_add(1); break; }
+                            g_probeCands.fetch_add(1);
+                            s->AddRef();
+                            e->held = s;
+                            e->w = d.Width;
+                            e->h = d.Height;
+                            fin = 2;
+                        }
+                }
+                res->Release();
+            }
+            e->verdict.store(fin, std::memory_order_release);
+            v = fin;
+        }
+        if (v != 2) continue;
+        e->binds.fetch_add(1, std::memory_order_relaxed);
+        if (win >= 1 && win <= 32) e->seen.fetch_or(1u << (win - 1), std::memory_order_relaxed);
+    }
 }
 
 void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* self, UINT start, UINT num, ID3D11ShaderResourceView* const* pp) {
@@ -468,25 +565,47 @@ void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* self, UINT start, UINT 
         orig(self, start, num, pp);
         return;
     }
+    if (g_probeArmed.load(std::memory_order_relaxed)) ProbeRecord(pp, num);   // the stock views, before any substitution
     ID3D11ShaderResourceView* local[128];
     bool copied = false;
+    int verifySlot = -1;          // one substitution per call is read back (every kVerifyEvery-th of its entry)
+    UINT verifyAt = 0;
+    const bool brandOn = g_brandOn.load(std::memory_order_relaxed);
     for (UINT i = 0; i < num; ++i) {
         ID3D11ShaderResourceView* s = pp[i];
         if (!s) continue;
-        Slot* sl = FindSlot((uintptr_t)s, true);
-        if (!sl) { g_tableFull.fetch_add(1, std::memory_order_relaxed); continue; }
+        Slot* sl = FindSlot((uintptr_t)s, brandOn);   // brand off: look up swap entries only, insert nothing
+        if (!sl) { if (brandOn) g_tableFull.fetch_add(1, std::memory_order_relaxed); continue; }
         uint32_t info = sl->info.load(std::memory_order_acquire);
         if ((info & kStateMask) == kUnclassified) {
+            if (!brandOn) continue;                    // brand off: nothing is classified or queued for a tee readback
             if ((info & kRetryMask) && (int32_t)(GetTickCount() - sl->notBefore.load(std::memory_order_relaxed)) < 0) continue;
             info = Classify(sl, s, info);
         }
         if ((info & kStateMask) != kTarget) continue;
-        ID3D11ShaderResourceView* r = g_repl[info >> 8].srv.load(std::memory_order_acquire);
+        Repl& rp = g_repl[(info >> 8) & 0xff];
+        ID3D11ShaderResourceView* r = rp.srv.load(std::memory_order_acquire);
         if (!r) continue;
+        const ULONGLONG nowTick = GetTickCount64();
+        rp.seen.fetch_add(1, std::memory_order_relaxed);
+        rp.lastSeenTick.store(nowTick, std::memory_order_relaxed);
+        if (!rp.on.load(std::memory_order_acquire)) continue;
         if (!copied) { for (UINT j = 0; j < num; ++j) local[j] = pp[j]; copied = true; }
         local[i] = r;
+        const uint64_t n = rp.subst.fetch_add(1, std::memory_order_relaxed);
+        rp.lastTick.store(nowTick, std::memory_order_relaxed);
+        if (verifySlot < 0 && n % kVerifyEvery == 0) { verifySlot = (int)((info >> 8) & 0xff); verifyAt = i; }
     }
     orig(self, start, num, copied ? local : pp);
+    if (verifySlot >= 0) {
+        // read back what the context holds now: proof that the game's draw sees our view, not just that we passed it on
+        ID3D11ShaderResourceView* got = nullptr;
+        self->PSGetShaderResources(start + verifyAt, 1, &got);
+        Repl& rp = g_repl[verifySlot];
+        if (got && got == rp.srv.load(std::memory_order_acquire)) rp.verified.fetch_add(1, std::memory_order_relaxed);
+        else rp.verifyMiss.fetch_add(1, std::memory_order_relaxed);
+        if (got) got->Release();
+    }
 }
 
 HRESULT STDMETHODCALLTYPE HookCreateSRV(ID3D11Device* self, ID3D11Resource* res, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc,
@@ -549,9 +668,14 @@ bool InstallHooks(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     g_ctxVtbl = cvt; g_devVtbl = dvt; g_dev = dev; g_ctx = ctx;
     g_hooksInstalled.store(true);
     g_active.store(true);
-    GLOGI("brand apparel: hooks installed (device %p, context %p, PSSetShaderResources %p, CreateShaderResourceView %p); "
-          "watching for %u stock texture fingerprint(s)",
-          (void*)dev, (void*)ctx, (void*)g_origPS, (void*)g_origCreate, (unsigned)g_targets.size());
+    if (g_brandOn.load())
+        GLOGI("brand apparel: hooks installed (device %p, context %p, PSSetShaderResources %p, CreateShaderResourceView %p); "
+              "watching for %u stock texture fingerprint(s)",
+              (void*)dev, (void*)ctx, (void*)g_origPS, (void*)g_origCreate, (unsigned)g_targets.size());
+    else
+        GLOGI("brand apparel: hooks installed for the 0.5.5 radar round mask only (brand_apparel=0: no tee fingerprinting, nothing classified or "
+              "queued; device %p, context %p, PSSetShaderResources %p, CreateShaderResourceView %p)",
+              (void*)dev, (void*)ctx, (void*)g_origPS, (void*)g_origCreate);
     return true;
 }
 
@@ -569,8 +693,16 @@ void SetSlotState(ID3D11ShaderResourceView* srv, uint32_t info) {
     if (Slot* sl = FindSlot((uintptr_t)srv, true)) sl->info.store(info, std::memory_order_release);
 }
 
+// 0.5.5: the view's slot is kTarget, i.e. a swap::Replace client claimed it (a brand target only becomes kTarget at the end of its own job)
+bool ClaimedBySwap(ID3D11ShaderResourceView* srv) {
+    Slot* sl = FindSlot((uintptr_t)srv, false);
+    return sl && (sl->info.load(std::memory_order_acquire) & kStateMask) == kTarget;
+}
+
 void FailJob(Job& j, uint32_t state = kNotTarget) {
-    SetSlotState(j.srv, state);
+    // 0.5.5: a swap::Replace client may have claimed this view while its readback ran; its verdict stands
+    Slot* sl = FindSlot((uintptr_t)j.srv, false);
+    if (!sl || (sl->info.load(std::memory_order_acquire) & kStateMask) != kTarget) SetSlotState(j.srv, state);
     ReleaseJob(j);
 }
 
@@ -640,8 +772,11 @@ bool ApplyTarget(ID3D11Device* dev, const Job& j, int ti, std::vector<std::vecto
     r.orig = j.srv;
     j.srv->AddRef();                                      // keep the stock SRV's address unique for the life of the process
     r.tex = tex;
-    r.target = ti;
-    SetSlotState(nsrv, kNotTarget);                       // if the game ever re-binds what it read back from the context, no re-scan
+    r.target.store(ti);
+    // 0.5.5: a slot index a swap client used before a teardown starts clean (always on, fresh counters)
+    r.on.store(true);
+    r.subst.store(0); r.lastTick.store(0); r.verified.store(0); r.verifyMiss.store(0); r.seen.store(0); r.lastSeenTick.store(0);
+    SetSlotState(nsrv, kNotTarget);                      // if the game ever re-binds what it read back from the context, no re-scan
     r.srv.store(nsrv, std::memory_order_release);
     g_replCount.store(slot + 1);
     SetSlotState(j.srv, kTarget | ((uint32_t)slot << 8));
@@ -657,6 +792,7 @@ bool ApplyTarget(ID3D11Device* dev, const Job& j, int ti, std::vector<std::vecto
 
 // 0 = still waiting, 1 = finished (job released), -1 = failed (job released)
 int FinishJob(ID3D11DeviceContext* ctx, ID3D11Device* dev, Job& j) {
+    if (ClaimedBySwap(j.srv)) { ReleaseJob(j); return 1; }   // 0.5.5: a swap client replaced it while the readback ran
     // which block size? the formats of every target in the list are BC1 or BC3; read it off the descriptor
     const bool bc3 = IsBcFormat(j.desc.Format, true);
     const int bpb = bc3 ? 16 : 8;
@@ -689,8 +825,12 @@ int FinishJob(ID3D11DeviceContext* ctx, ID3D11Device* dev, Job& j) {
         // A texture the game can still write to (not IMMUTABLE) may have been created empty and filled by streaming:
         // look again a couple of times, 1.5 s, 3 s and 4.5 s later, before giving up on it.
         if (willRetry && rsl) {
-            rsl->notBefore.store(GetTickCount() + 1500u * (tries + 1), std::memory_order_relaxed);
-            rsl->info.store(kUnclassified | ((tries + 1) << 16), std::memory_order_release);
+            // 0.5.5: only a slot still in the tee pipeline goes back to unclassified; a swap::Replace claim (kTarget) stays
+            uint32_t cur = rsl->info.load(std::memory_order_acquire);
+            if ((cur & kStateMask) != kTarget) {
+                rsl->notBefore.store(GetTickCount() + 1500u * (tries + 1), std::memory_order_relaxed);
+                rsl->info.compare_exchange_strong(cur, kUnclassified | ((tries + 1) << 16), std::memory_order_acq_rel);
+            }
             ReleaseJob(j);
             return 1;
         }
@@ -710,6 +850,7 @@ void StartJobs(ID3D11DeviceContext* ctx, ID3D11Device* dev, int budget) {
         if (!g_pending.empty()) { p = g_pending.back(); g_pending.pop_back(); }
         ReleaseSRWLockExclusive(&g_pendLock);
         if (!p.srv) return;
+        if (ClaimedBySwap(p.srv)) { p.srv->Release(); if (p.tex) p.tex->Release(); continue; }   // 0.5.5: out of the tee pipeline
         D3D11_TEXTURE2D_DESC sd = p.desc;
         sd.Usage = D3D11_USAGE_STAGING;
         sd.BindFlags = 0;
@@ -773,6 +914,23 @@ void PumpImpl(ID3D11DeviceContext* ctx) {
     }
 }
 
+// 0.5.5: disarm the probe recorder and drop every candidate it holds (render thread, or teardown).
+void ProbeClear() {
+    g_probeArmed.store(false);
+    g_probeRecording.store(0);
+    for (uint32_t i = 0; i < kProbeSlots; ++i) {
+        ProbeEnt& e = g_probeTab[i];
+        if (!e.key.load(std::memory_order_relaxed)) continue;
+        if (e.held) { e.held->Release(); e.held = nullptr; }
+        e.verdict.store(0); e.seen.store(0); e.binds.store(0); e.w = e.h = 0;
+        e.key.store(0);
+    }
+    g_probeCands.store(0);
+    g_probeOverflow.store(0);
+    g_probeFrameWin = 0;
+    g_probeFramesIn = 0;
+}
+
 // Restore both vtable slots and drop every D3D object we hold (jobs, queue, replacements, our device/context
 // references) and every verdict. Runs on the render thread (Poll) or at engine shutdown; the bind hook is told to
 // stand down first.
@@ -794,7 +952,12 @@ void Teardown(const char* why) {
         if (ID3D11ShaderResourceView* s = g_repl[i].srv.exchange(nullptr)) s->Release();
         if (g_repl[i].tex) { g_repl[i].tex->Release(); g_repl[i].tex = nullptr; }
         if (g_repl[i].orig) { g_repl[i].orig->Release(); g_repl[i].orig = nullptr; }
+        g_repl[i].target.store(-1);
+        g_repl[i].subst.store(0); g_repl[i].lastTick.store(0); g_repl[i].verified.store(0); g_repl[i].verifyMiss.store(0);
+        g_repl[i].seen.store(0); g_repl[i].lastSeenTick.store(0); g_repl[i].on.store(true);
     }
+    ProbeClear();
+    g_generation.fetch_add(1);                         // every swap::Replace handle handed out so far is dead now
     if (g_srvSeen.load() != 0) {                       // nothing was ever classified: skip walking 4 MB of untouched table
         for (uint32_t i = 0; i < kSlotCount; ++i) {
             if (g_slots[i].key.load(std::memory_order_relaxed)) { g_slots[i].key.store(0); g_slots[i].info.store(0); g_slots[i].notBefore.store(0); }
@@ -822,8 +985,14 @@ bool Enabled() {
     return enabled == 1;
 }
 
+namespace {
+std::atomic<int> g_notD3D11{ 0 };   // 0.5.5: 1 = Poll saw a swap chain without a D3D11 device (swap::NotD3D11)
+}
+
 void Poll(void* swapChain) {
-    if (!swapChain || !Enabled()) return;
+    const bool brand = Enabled();
+    g_brandOn.store(brand);   // before any install: with brand off the bind hook classifies (and queues) nothing
+    if (!swapChain || !(brand || g_swapWanted.load())) return;
     static bool loggedNotD3D11 = false;
     static bool gaveUp = false;
     if (gaveUp) return;
@@ -834,6 +1003,7 @@ void Poll(void* swapChain) {
             loggedNotD3D11 = true;
             GLOGI("brand apparel: skipped: the swap chain has no ID3D11Device (Direct3D 12 / Enhanced): the texture swap is D3D11 only");
         }
+        g_notD3D11.store(1);
         gaveUp = true;
         return;
     }
@@ -844,7 +1014,10 @@ void Poll(void* swapChain) {
             if (g_dev && g_dev != dev) GLOGI("brand apparel: the game's device changed (%p -> %p); re-installing", (void*)g_dev, (void*)dev);
             InstallHooks(dev, ctx);     // tears the old install down itself when the device or context differs
         }
-        if (g_hooksInstalled.load()) PumpImpl(ctx);
+        if (g_hooksInstalled.load()) {
+            swap::ProbeFrame();
+            if (brand) PumpImpl(ctx);
+        }
         ctx->Release();
     }
     dev->Release();
@@ -879,6 +1052,118 @@ Stats GetStats() {
 }
 
 // ===========================================================================================================
+// 0.5.5 swap layer: the same two hooks for another client (radar_mask.cpp)
+// ===========================================================================================================
+namespace swap {
+
+void Want() { g_swapWanted.store(true); }
+bool Installed() { return g_hooksInstalled.load(); }
+bool NotD3D11() { return g_notD3D11.load() != 0; }
+uint32_t Generation() { return g_generation.load(); }
+ID3D11Device* Device() { return g_dev; }
+ID3D11DeviceContext* Context() { return g_ctx; }
+
+int Replace(ID3D11ShaderResourceView* stock, ID3D11ShaderResourceView* repl, bool active) {
+    if (!stock || !repl || !g_hooksInstalled.load()) return -1;
+    if (Slot* sl = FindSlot((uintptr_t)stock, false)) {
+        const uint32_t info = sl->info.load(std::memory_order_acquire);
+        if ((info & kStateMask) == kTarget) return -1;      // already replaced (by brand or an earlier call)
+    }
+    const int slot = g_replCount.load();
+    if (slot >= kMaxRepl) return -1;
+    Slot* ss = FindSlot((uintptr_t)stock, true);
+    if (!ss) return -1;
+    Repl& r = g_repl[slot];
+    stock->AddRef();
+    repl->AddRef();
+    r.orig = stock;
+    r.tex = nullptr;
+    r.target.store(-1);
+    r.subst.store(0); r.lastTick.store(0); r.verified.store(0); r.verifyMiss.store(0);
+    r.seen.store(0); r.lastSeenTick.store(0); r.on.store(active);
+    SetSlotState(repl, kNotTarget);                         // our own view is never classified or probed as a stock one
+    r.srv.store(repl, std::memory_order_release);
+    g_replCount.store(slot + 1);
+    // the view may sit in the tee pipeline (kClassifying / kCandidate: a pending entry or a readback job holds it): kTarget takes it out of
+    // there, every later step of that pipeline (Classify's final store, FinishJob, the retry) leaves a kTarget slot alone
+    ss->info.store(kTarget | ((uint32_t)slot << 8), std::memory_order_release);
+    return slot;
+}
+
+bool Holds(int handle, uint32_t generation) {
+    if (handle < 0 || handle >= g_replCount.load() || generation != g_generation.load() || !g_hooksInstalled.load()) return false;
+    const Repl& r = g_repl[handle];
+    if (r.target.load() != -1 || !r.orig || !r.srv.load(std::memory_order_acquire)) return false;
+    Slot* sl = FindSlot((uintptr_t)r.orig, false);
+    return sl && sl->info.load(std::memory_order_acquire) == (kTarget | ((uint32_t)handle << 8));
+}
+
+SwapCounters Counters(int handle) {
+    SwapCounters c;
+    if (handle < 0 || handle >= g_replCount.load()) return c;
+    const Repl& r = g_repl[handle];
+    c.subst = r.subst.load();
+    c.lastTick = r.lastTick.load();
+    c.verified = r.verified.load();
+    c.verifyMiss = r.verifyMiss.load();
+    c.seen = r.seen.load();
+    c.lastSeenTick = r.lastSeenTick.load();
+    c.active = r.on.load();
+    return c;
+}
+
+bool SetActive(int handle, uint32_t generation, bool on) {
+    // swap clients only (never a brand entry), and only a handle of the current install (after a teardown the index may name something else)
+    if (handle < 0 || handle >= g_replCount.load() || generation != g_generation.load() || g_repl[handle].target.load() != -1) return false;
+    g_repl[handle].on.store(on, std::memory_order_release);
+    return true;
+}
+
+bool ProbeArm(const ProbeSize* sizes, int n) {
+    if (!g_hooksInstalled.load() || !sizes || n <= 0 || n > (int)kProbeMaxSizes) return false;
+    ProbeClear();
+    for (int i = 0; i < n; ++i) { g_probeSizes[i][0] = sizes[i].w; g_probeSizes[i][1] = sizes[i].h; }
+    g_probeSizeCount = n;
+    g_probeWinReq.store(0);
+    g_probeArmed.store(true);
+    return true;
+}
+
+void ProbeSetWindow(uint32_t window) { g_probeWinReq.store(window <= 32 ? window : 0); }
+
+void ProbeFrame() {
+    if (!g_probeArmed.load()) return;
+    const uint32_t w = g_probeWinReq.load();
+    if (w != g_probeFrameWin) { g_probeFrameWin = w; g_probeFramesIn = 0; }
+    else ++g_probeFramesIn;
+    // the first frames after a change may still show the previous script frame: not recorded
+    g_probeRecording.store(g_probeFramesIn >= kProbeSkipFrames ? w : 0);
+}
+
+std::vector<ProbeCand> ProbeTake(uint32_t* overflow) {
+    std::vector<ProbeCand> out;
+    g_probeArmed.store(false);
+    g_probeRecording.store(0);
+    if (overflow) *overflow = g_probeOverflow.load();
+    for (uint32_t i = 0; i < kProbeSlots; ++i) {
+        ProbeEnt& e = g_probeTab[i];
+        if (e.held) {
+            ProbeCand c;
+            c.srv = e.held;                                  // the reference goes to the caller
+            c.w = e.w; c.h = e.h;
+            c.seen = e.seen.load();
+            c.binds = e.binds.load();
+            out.push_back(c);
+            e.held = nullptr;
+        }
+    }
+    ProbeClear();
+    return out;
+}
+
+}  // namespace swap
+
+// ===========================================================================================================
 // Test seam
 // ===========================================================================================================
 namespace testing {
@@ -897,6 +1182,7 @@ int CompositeChain(int width, int levels, int bytesPerBlock, int baseSize, const
 
 void Reset() {
     Shutdown();
+    g_brandOn.store(true);
     for (uint32_t i = 0; i < kSlotCount; ++i) { g_slots[i].key.store(0); g_slots[i].info.store(0); }
     {
         std::lock_guard<std::mutex> lock(g_targetsMu);
@@ -919,6 +1205,13 @@ bool AddTarget(const char* name, uint64_t tailHash, bool bc3, int baseSize, int 
 
 bool InstallOn(ID3D11Device* dev, ID3D11DeviceContext* ctx) { return InstallHooks(dev, ctx); }
 void Pump(ID3D11DeviceContext* ctx) { PumpImpl(ctx); }
+void SetBrandOn(bool on) { g_brandOn.store(on); }
+size_t PendingCount() {
+    AcquireSRWLockExclusive(&g_pendLock);
+    const size_t n = g_pending.size();
+    ReleaseSRWLockExclusive(&g_pendLock);
+    return n;
+}
 
 }  // namespace testing
 
