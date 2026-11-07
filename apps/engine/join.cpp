@@ -464,6 +464,10 @@ namespace {
                     if (peers.onInvNearby)
                         timed("invNearby", [&] { peers.onInvNearby(e.invNearby); });
                     break;
+                case net::Event::Type::WorldClock:
+                    if (peers.onWorldClock)
+                        timed("worldClock", [&] { peers.onWorldClock(e.worldClock, session.rttMs()); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())

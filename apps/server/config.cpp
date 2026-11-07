@@ -210,6 +210,24 @@ namespace gage::server {
             return fail("invGroundExpireSeconds must be 10..86400");
         if (cfg.invMaxPiles < 16 || cfg.invMaxPiles > 65536)
             return fail("invMaxPiles must be 16..65536");
+        // ---- 0.5.7 world clock ----
+        if (cfg.worldClock > 1)
+            return fail("worldClock must be 0 or 1");
+        if (cfg.clockStartMs < 0 || cfg.clockStartMs >= sync::wclock::kDayMs)
+            return fail("clockStart must be a time of day 00:00..23:59:59");
+        if (cfg.clockScaleMilli > sync::wclock::kMaxScaleMilli)
+            return fail("clockScale must be 0..3600");
+        if (cfg.weatherFixed >= 0 && !sync::wclock::ValidWeather((uint8_t)cfg.weatherFixed))
+            return fail("weather must be \"cycle\" or a weather name");
+        if (cfg.weatherFixed < -1 || cfg.weatherFixed > 255)
+            return fail("weather must be \"cycle\" or a weather name");
+        if (cfg.weatherCycle.empty() || cfg.weatherCycle.size() > sync::wclock::kMaxCycleEntries)
+            return fail("weatherCycle must hold 1..32 entries");
+        for (const sync::wclock::CycleEntry& e : cfg.weatherCycle)
+            if (!sync::wclock::ValidWeather(e.weather) || e.minutes < 1 || e.minutes > sync::wclock::kMaxCycleMinutes)
+                return fail("weatherCycle: every entry must be a weather name and 1..1440 minutes");
+        if (cfg.weatherTransitionSeconds > sync::wclock::kMaxTransMs / 1000)
+            return fail("weatherTransitionSeconds must be 0..600");
 
         // ---- world replication ----
         for (const ReplKey& k : kReplKeys)
@@ -495,6 +513,65 @@ namespace gage::server {
                 if (!WholeNumber(v, 16, 65536, n)) return fail("\"invMaxPiles\" must be a whole number 16..65536");
                 out.invMaxPiles = n;
             }
+            // ---- 0.5.7 world clock ----
+            else if (key == "worldClock")
+            {
+                if (!WholeNumber(v, 0, 1, n)) return fail("\"worldClock\" must be 0 or 1");
+                out.worldClock = n;
+            }
+            else if (key == "clockStart")
+            {
+                int64_t ms = 0;
+                if (v.t != JVal::Str || !sync::wclock::ParseClockTime(v.s, ms))
+                    return fail("\"clockStart\" must be a time of day \"HH:MM\" or \"HH:MM:SS\" (00:00..23:59:59)");
+                out.clockStartMs = ms;
+            }
+            else if (key == "clockScale")
+            {
+                // A number (fractions allowed): game ms per real ms, kept in thousandths.
+                if (v.t != JVal::Num || !std::isfinite(v.n) || v.n < 0.0 || v.n * 1000.0 > (double)sync::wclock::kMaxScaleMilli + 0.5)
+                    return fail("\"clockScale\" must be a number 0..3600 (game ms per real ms: 30 = GTA's own rate, 0 = frozen)");
+                out.clockScaleMilli = (uint32_t)std::llround(v.n * 1000.0);
+            }
+            else if (key == "weather")
+            {
+                if (v.t != JVal::Str) return fail("\"weather\" must be a string: \"cycle\" or a weather name");
+                std::string lower = v.s;
+                for (char& ch : lower)
+                    if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+                const int w = sync::wclock::FindWeather(v.s);
+                if (lower == "cycle")
+                    out.weatherFixed = -1;
+                else if (w >= 0)
+                    out.weatherFixed = w;
+                else
+                    return fail("\"weather\" must be \"cycle\" or one of EXTRASUNNY, CLEAR, CLOUDS, SMOG, FOGGY, OVERCAST, RAIN, THUNDER, CLEARING, "
+                                "NEUTRAL, SNOW, BLIZZARD, SNOWLIGHT, XMAS, HALLOWEEN");
+            }
+            else if (key == "weatherCycle")
+            {
+                const std::string why = "\"weatherCycle\" must be an array of 1..32 [\"WEATHER\", minutes 1..1440] pairs";
+                if (v.t != JVal::Arr || v.a.empty() || v.a.size() > sync::wclock::kMaxCycleEntries) return fail(why);
+                std::vector<sync::wclock::CycleEntry> cyc;
+                for (const JVal& e : v.a)
+                {
+                    uint32_t mins = 0;
+                    if (e.t != JVal::Arr || e.a.size() != 2 || e.a[0].t != JVal::Str || !WholeNumber(e.a[1], 1, sync::wclock::kMaxCycleMinutes, mins))
+                        return fail(why);
+                    const int w = sync::wclock::FindWeather(e.a[0].s);
+                    if (w < 0) return fail(why + " (unknown weather \"" + e.a[0].s + "\")");
+                    sync::wclock::CycleEntry ce;
+                    ce.weather = (uint8_t)w;
+                    ce.minutes = mins;
+                    cyc.push_back(ce);
+                }
+                out.weatherCycle = cyc;
+            }
+            else if (key == "weatherTransitionSeconds")
+            {
+                if (!WholeNumber(v, 0, sync::wclock::kMaxTransMs / 1000, n)) return fail("\"weatherTransitionSeconds\" must be a whole number 0..600");
+                out.weatherTransitionSeconds = n;
+            }
             else if (key == "adminPort")
             {
                 if (!WholeNumber(v, 0, 65535, n)) return fail("\"adminPort\" must be a whole number 0..65535 (0 = off)");
@@ -713,7 +790,8 @@ namespace gage::server {
             {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
                                     "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, inventoryDir, invWorld, invGroundReach, "
-                                    "invTrunkReach, invGroundExpireSeconds, invMaxPiles, adminPort, adminToken, "
+                                    "invTrunkReach, invGroundExpireSeconds, invMaxPiles, worldClock, clockStart, clockScale, weather, weatherCycle, "
+                                    "weatherTransitionSeconds, adminPort, adminToken, "
                                     "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
                                     "vehicleMaxSpeed, contactLagCapMs, vehicleLocks, vehicleLockDistance, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "
                                     "meleeDamagePercent, explosiveDamagePercent, runOverDamagePercent, headshotPercent, "

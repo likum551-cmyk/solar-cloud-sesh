@@ -11,6 +11,7 @@
 #include "protocol/protocol.h"
 #include "protocol/query.h"
 #include "replconfig.h"
+#include "sync/world_clock.h"
 
 #include <cstdint>
 #include <functional>
@@ -165,6 +166,21 @@ namespace gage::server {
         uint32_t invTrunkReach = 4;             // 1..20 m
         uint32_t invGroundExpireSeconds = 600;  // 10..86400
         uint32_t invMaxPiles = 2048;            // 16..65536
+
+        // ---- server.json keys: 0.5.7 world clock and weather (libs/sync/world_clock.h, docs/api/server.md "World clock") ----
+        // worldClock 1 = the server owns the time of day and the weather and sends them (WorldClock) to every client; 0 = never sent (each
+        // client keeps the game's own clock and weather, the 0.5.6 behaviour). clockStart "HH:MM[:SS]" = the time at server start (not
+        // persisted: every start begins there). clockScale = game ms per real ms (30 = GTA's own rate, a 48-minute day; 0 = frozen; up to
+        // 3600). weather "cycle" = weatherCycle, or one weather name (EXTRASUNNY, CLEAR, CLOUDS, SMOG, FOGGY, OVERCAST, RAIN, THUNDER,
+        // CLEARING, NEUTRAL, SNOW, BLIZZARD, SNOWLIGHT, XMAS, HALLOWEEN). weatherCycle [[name, real minutes], ...]: 1..32 entries of 1..1440
+        // minutes (default sync::wclock::DefaultCycle, 90 minutes of sun / clear / clouds / overcast / rain / clearing). A change of weather
+        // blends over weatherTransitionSeconds (0..600; 0 = at once).
+        uint32_t worldClock = 1;                                         // 0 | 1
+        int64_t clockStartMs = sync::wclock::kDefaultStartMs;            // game ms of day, 0..86399999
+        uint32_t clockScaleMilli = sync::wclock::kGtaScaleMilli;         // 0..kMaxScaleMilli (thousandths)
+        int weatherFixed = -1;                                           // -1 = the cycle, else a sync::wclock::kWeathers index
+        std::vector<sync::wclock::CycleEntry> weatherCycle = sync::wclock::DefaultCycle();
+        uint32_t weatherTransitionSeconds = sync::wclock::kDefaultTransMs / 1000;   // 0..600
 
         // ---- server.json keys: local admin control channel (admin.h) ----
         // adminPort: loopback-only TCP port for the admin line protocol; 0 (default) =

@@ -1403,6 +1403,50 @@ namespace gage::proto {
         return true;
     }
 
+    // ---- v8, 0.5.7 world clock ----
+    namespace {
+        bool ValidWorldClock(const WorldClock& m)
+        {
+            return m.gameMs < kClockDayMs && m.scaleMilli <= kMaxClockScaleMilli && m.weatherFrom < kMaxWeatherId && m.weatherTo < kMaxWeatherId &&
+                   m.transTotalMs <= kMaxWeatherTransMs && m.transElapsedMs <= m.transTotalMs &&
+                   (m.transTotalMs != 0 || m.weatherFrom == m.weatherTo) && (m.flags & ~kClockCycle) == 0;
+        }
+    }
+
+    Bytes Encode(const WorldClock& m)
+    {
+        if (!ValidWorldClock(m)) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::WorldClock);
+        w.u16(m.rev);
+        w.u32(m.gameMs);
+        w.u32(m.scaleMilli);
+        w.u8(m.weatherFrom);
+        w.u8(m.weatherTo);
+        w.u32(m.transElapsedMs);
+        w.u32(m.transTotalMs);
+        w.u8(m.flags);
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, WorldClock& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::WorldClock)) return false;
+        WorldClock m;
+        m.rev = r.u16();
+        m.gameMs = r.u32();
+        m.scaleMilli = r.u32();
+        m.weatherFrom = r.u8();
+        m.weatherTo = r.u8();
+        m.transElapsedMs = r.u32();
+        m.transTotalMs = r.u32();
+        m.flags = r.u8();
+        if (!r.done() || !ValidWorldClock(m)) return false;
+        out = m;
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, InvUsed& out)
     {
         wire::Reader r(p, n);
@@ -1766,6 +1810,7 @@ namespace gage::proto {
         case Msg::InvSnap:          return "InvSnap";
         case Msg::InvNearby:        return "InvNearby";
         case Msg::InvReport:        return "InvReport";
+        case Msg::WorldClock:       return "WorldClock";
         }
         return "?";
     }

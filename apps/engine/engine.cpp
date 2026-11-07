@@ -20,6 +20,7 @@
 #include "sync/ring_round.h"   // 0.5.5 ring_map_round: the gate, the box fit
 #include "quit_gate.h"
 #include "ambient.h"
+#include "world_clock.h"       // 0.5.7: the server's time of day and weather
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/smoother.h"
@@ -2258,6 +2259,7 @@ namespace {
         g_dsState = DoorsSeatsState();                                 // a new session: no pick waiting for a read-back, no lock answer pending, no keys
         LogDoorsSeatsSwitches();                                       // 0.4.22 (defined with the F / G entry)
         InvCReadSwitches();                                            // 0.5.4: outfit_items / inv_ped_view
+        game::worldclock::ReadSwitch();                                // 0.5.7: world_clock
         {
             // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
             const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
@@ -2406,6 +2408,7 @@ namespace {
             std::lock_guard<std::mutex> lk(g_cmdMtx);
             g_adminParked.clear();
         }
+        game::worldclock::OnEnded();       // 0.5.7: the next script tick gives the clock and the weather back to the game
         game::Overlay::ClearInventory();   // 0.6: the inventory page shows "unavailable" until the next server sends one
         OutfitClear();                     // 0.5.4: no server inventory, no opinion about the clothes (the next entry dresses the ped in full)
         g_satietyAdd.store(0);
@@ -15470,6 +15473,8 @@ namespace {
             TickRadioOff(lp, NowMs());                 // 0.4.19: no vehicle radio, no radio wheel / its slow-mo (libs/sync/radio_off.h)
         if (inScript && mayChange)
             TickMinimap(NowMs());                      // 0.4.22: GTA's radar after the entry + its bars hidden + the vitals dock (libs/sync/minimap.h)
+        if (inScript && mayChange)
+            game::worldclock::Tick(*g_world);          // 0.5.7: the server's time of day and weather held (or released) (world_clock.h)
         if (inScript && mayChange && lp) {
             // Auto-mount the add-on car packs through the game's own DLC loader, if armed (pack_mount=1; default off),
             // and hand the Tab menu's car browser the list whenever it (or the loading state) changes.
@@ -15946,6 +15951,7 @@ namespace gage::engine {
         sinks.onInvUsed = OnInvUsed;
         sinks.onInvSnap = OnInvSnap;               // 0.5.4 inventory world
         sinks.onInvNearby = OnInvNearby;
+        sinks.onWorldClock = game::worldclock::OnClock;   // 0.5.7 world clock
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

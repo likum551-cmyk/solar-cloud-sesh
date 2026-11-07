@@ -99,6 +99,12 @@
 //    vehicle id, and a 0.5.4 client (it answered the join's empty InvNearby with an InvReport) gets InvSnap (weapons, a rev)
 //    instead of InvState plus InvNearby whenever its ground pile / trunk in reach changes; its InvReports turn the ped's weapons
 //    into inventory items (sync::invw::Reconcile, only for a report stamped with the current rev).
+//  * 0.5.7 world clock (libs/sync/world_clock.h; Config::worldClock, docs/api/server.md "World clock"): the server owns the time of day (a
+//    line: anchor + elapsed x clockScale) and the weather (a fixed one or the cycle, every change a blend over weatherTransitionSeconds). A
+//    joining player gets a WorldClock after its inventory messages; every player gets one after each change (console `time`, `timescale`,
+//    `weather`, or the chat commands /time /timescale /weather of a VERIFIED ADMIN only: they change the world for everybody, so a guest is
+//    never allowed, unlike the self-only AdminCmds), when the cycle starts or ends a blend, and every 30 s as a resync. Not persisted: a start
+//    begins at clockStart.
 #pragma once
 
 #include "announce.h"
@@ -419,6 +425,18 @@ namespace gage::server {
         const sync::invw::World& InventoryWorld() const { return invWorld_; }
         void ExpireGround();
 
+        // ---- 0.5.7 world clock (libs/sync/world_clock.h; Config::worldClock, docs/api/server.md "World clock") ----
+        // The console's `time HH:MM[:SS]`, `timescale X` and `weather NAME|cycle` (and the chat commands /time /timescale /weather of a
+        // verified admin). Each change re-anchors the clock (nothing else moves), bumps the rev, logs a `world clock:` line and sends every
+        // player a WorldClock. `by` names who asked, for the log. SetWeather(-1) = back to the cycle. False with *err for a value out of range
+        // or a server with worldClock 0.
+        bool SetClockTime(int64_t gameMs, const std::string& by, std::string* err = nullptr);
+        bool SetClockScale(uint32_t scaleMilli, const std::string& by, std::string* err = nullptr);
+        bool SetWeather(int weather, const std::string& by, std::string* err = nullptr);
+        // The WorldClock the server would send right now (tests, the console's status line).
+        proto::WorldClock WorldClockNow() const;
+        uint64_t WorldClocksSent() const { return clockSent_; }
+
         // ---- admin ----
         // These are the programmatic form of the console commands; Execute() calls them.
         //
@@ -510,6 +528,21 @@ namespace gage::server {
         std::vector<VehClass> vehClass_;                  // per vehicle id: the GTA class a client reported (for the trunk size)
         uint64_t invWorldAtMs_ = 0, invWorldLogAtMs_ = 0;
         Stats invLogMark_;
+        // ---- 0.5.7 world clock ----
+        void SendWorldClock(Conn& c);                     // one player's WorldClock (the join, the resync)
+        void BroadcastWorldClock(const std::string& why); // every player's, after a change
+        void TickWorldClock(uint64_t nowMs);              // a weather phase change of the cycle, the 30 s resync
+        std::string DescribeWorldClock(uint64_t nowMs) const;
+        // The console / chat grammar of time / timescale / weather: true when `cmd` is one of them (output says what happened, *ok whether
+        // it was accepted).
+        bool WorldClockCommand(const std::string& cmd, const std::string& arg, const std::string& by, std::string& output, bool* ok);
+        bool ChatCommand(Conn& c, const std::string& text);   // a /time /timescale /weather line from a player (true = handled, not chat)
+        sync::wclock::Clock clock_;
+        sync::wclock::WeatherPlan weather_;
+        sync::wclock::WeatherView clockPhase_;            // the weather phase of the last broadcast (a change of phase is sent at once)
+        uint16_t clockRev_ = 0;
+        uint64_t clockResyncAtMs_ = 0;
+        uint64_t clockSent_ = 0;
         void OnState(Conn& c, const uint8_t* data, size_t len);
         void OnChat(Conn& c, const uint8_t* data, size_t len);
         void OnLook(Conn& c, const uint8_t* data, size_t len);
