@@ -1573,3 +1573,54 @@ Live tests: `tests/inventory_world_net_tests.h` (in `server_test`: the handshake
 report's gain into the hand, the rev gate, ground drops and pickups through the real server and session, expiry, trunks with reach and lock,
 `invWorld 0`); the rules are `tests/inventory_world_tests.h` (in `gameplay_test`); every message is in the decode fuzz
 corpus. The engine half (ped natives, the NEARBY panel) is live-unverified.
+
+## 0.5.7: world clock (`WorldClock` 55; still v8)
+
+The server owns the time of day and the weather (GI 2026-11-07: "each player has their own night / day"). The model and
+the pure rules are `libs/sync/world_clock.h`; the server side is `Server::WorldClockNow` / `SendWorldClock` /
+`BroadcastWorldClock` / `TickWorldClock`; the client side is `apps/engine/world_clock.{h,cpp}`.
+
+**Compatibility.** No version bump. A 0.5.6 or older client's `PeekType` refuses type 55 (above its `kMsgLast`), so its
+session counts the packet as malformed and drops it, with no event and no disconnect (the same path `server_test`'s
+reserved-type check proves for a gap type); the engine never reads that counter. The server therefore sends it to every
+client, with no gate. A 0.5.7 client on a 0.5.6 server never receives one and keeps the game's own clock.
+
+### 55 `WorldClock` (server to client, reliable): 22 bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 55 |
+| 2 | `u16` rev: +1 on every admin change (time, scale, weather); a resync or a cycle step keeps it |
+| 4 | `u32` gameMs: the game time of day AT THE MOMENT OF SENDING, 0..86399999 |
+| 4 | `u32` scaleMilli: game ms per real ms in thousandths, 0..3600000 (30000 = GTA's own rate, 1 game minute per 2 real s; 0 = frozen) |
+| 1 | `u8` weatherFrom: a weather index (below) |
+| 1 | `u8` weatherTo |
+| 4 | `u32` transElapsedMs: real ms into the blend from `weatherFrom` to `weatherTo` |
+| 4 | `u32` transTotalMs: the blend's length, 0..600000; 0 = steady (then `weatherFrom == weatherTo`) |
+| 1 | `u8` flags: bit 0 `kClockCycle` (the weather follows the server's cycle; information only); other bits refused |
+
+Refused by Decode (and never encoded): gameMs past a day, a scale above 3600000, an index of 32 or more, elapsed past the
+total, a blend without a length (`total 0` with `from != to`), an unknown flag, a short or a long packet.
+
+Weather indices (wire-stable; the name is what `SET_WEATHER_TYPE_NOW_PERSIST` takes, the hash `GET_HASH_KEY` of it):
+0 EXTRASUNNY, 1 CLEAR, 2 CLOUDS, 3 SMOG, 4 FOGGY, 5 OVERCAST, 6 RAIN, 7 THUNDER, 8 CLEARING, 9 NEUTRAL, 10 SNOW,
+11 BLIZZARD, 12 SNOWLIGHT, 13 XMAS, 14 HALLOWEEN. A client that does not know an index keeps the weather it shows and
+still follows the clock.
+
+**When it is sent.** To a joiner right after its inventory messages (`Accept`), to everybody on every admin change
+(console or chat), when the cycle's weather starts or ends a blend, and every 30 s (the resync).
+
+**The receiver.** It places the server's moment at its receive time minus half the session's smoothed round trip, then
+runs `gameMs + (now - that) * scale` on its own monotonic clock (`sync::wclock::FromWire` / `GameMsAt` / `WeatherAt`).
+The error is the one-way latency's asymmetry times the scale, about 1 game second per 33 ms at GTA's rate, so all
+machines show the same minute; each resync re-anchors it. The engine holds the game on it: `PAUSE_CLOCK(true)` plus
+`SET_CLOCK_TIME` whenever the target second changes, a `GET_CLOCK_*` read-back every second (more than 2 s off =
+a mismatch, re-asserted at once); a steady weather is `SET_WEATHER_TYPE_NOW_PERSIST(name)`, a blend
+`SET_CURR_WEATHER_STATE(fromHash, toHash, progress)` re-issued every 500 ms or 1 % of progress, read back with
+`GET_CURR_WEATHER_STATE` every 2 s. The session's end releases both (`PAUSE_CLOCK(false)`, `CLEAR_WEATHER_TYPE_PERSIST`).
+Switch: `world_clock` in `HKCU\Software\GAGE-MP` (default on; `0` = the 0.5.6 behaviour, nothing applied).
+
+Tests: `tests/world_clock_tests.h` (in `gameplay_test`: the clock line, the weather plan, two clients with different
+round trips, the holds, the codec), `tests/world_clock_net_tests.h` (in `server_test`: join, console and admin chat
+changes through the real server and session, guests refused, `worldClock 0`, the server.json keys), and the decode
+fuzz corpus. The engine half (the natives in the game) is live-unverified.

@@ -699,6 +699,16 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_SAFE_ZONE_SIZE,                               0x897B441FF18ECBBB},
     // 0.5.4 ring_map_zoom: natlookup.mjs 2026-11-07, YimMenu b3889 and YimMenuV2 enhanced AGREE.
     {native::SET_RADAR_ZOOM,                                   0x4D2F1CB87CBF249D},
+    // 0.5.7 world clock: natlookup.mjs 2026-11-07, YimMenu b3889 and YimMenuV2 enhanced AGREE for all nine.
+    {native::PAUSE_CLOCK,                                      0xB9C1EC5EDDAAA115},
+    {native::SET_CLOCK_TIME,                                   0xCBE10A13619B9FAA},
+    {native::GET_CLOCK_HOURS,                                  0x5295501D0862870D},
+    {native::GET_CLOCK_MINUTES,                                0x18E502A71E28968C},
+    {native::GET_CLOCK_SECONDS,                                0x4BA5A16068183C5E},
+    {native::SET_WEATHER_TYPE_NOW_PERSIST,                     0xE38A58649E049502},
+    {native::SET_CURR_WEATHER_STATE,                           0x2D213D9B5D0FE42B},
+    {native::GET_CURR_WEATHER_STATE,                           0x239D73A1DE006629},
+    {native::CLEAR_WEATHER_TYPE_PERSIST,                       0xA21EFB60FCA3D0F6},
     // 0.5.5 ring_map_round: natlookup.mjs 2026-11-07, YimMenu b3889 and YimMenuV2 enhanced AGREE.
     {native::GET_TEXTURE_RESOLUTION,                           0x32D86930C15E1159},
     {native::DRAW_SPRITE,                                      0xFFA2B456A81EA1EB},
@@ -4713,6 +4723,58 @@ bool World::SetRadarZoom(int level) {
     return CallNative(native::SET_RADAR_ZOOM, arg, 1, nullptr);
 }
 
+bool World::ClockPause(bool paused) {
+    uint64_t arg[] = { paused ? 1u : 0u };   // PAUSE_CLOCK(toggle)
+    return CallNative(native::PAUSE_CLOCK, arg, 1, nullptr);
+}
+
+bool World::ClockSet(int hour, int minute, int second) {
+    uint64_t arg[] = { (uint64_t)(uint32_t)hour, (uint64_t)(uint32_t)minute, (uint64_t)(uint32_t)second };
+    return CallNative(native::SET_CLOCK_TIME, arg, 3, nullptr);
+}
+
+bool World::ClockGet(int& hour, int& minute, int& second) {
+    hour = minute = second = -1;
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_CLOCK_HOURS, nullptr, 0, r)) return false;
+    hour = (int)(int32_t)(uint32_t)r[0];
+    r[0] = 0;
+    if (!CallNative(native::GET_CLOCK_MINUTES, nullptr, 0, r)) return false;
+    minute = (int)(int32_t)(uint32_t)r[0];
+    r[0] = 0;
+    if (!CallNative(native::GET_CLOCK_SECONDS, nullptr, 0, r)) return false;
+    second = (int)(int32_t)(uint32_t)r[0];
+    return true;
+}
+
+bool World::WeatherNowPersist(const char* name) {
+    if (!name) return false;
+    uint64_t arg[] = { (uint64_t)(uintptr_t)name };   // SET_WEATHER_TYPE_NOW_PERSIST(weatherType)
+    return CallNative(native::SET_WEATHER_TYPE_NOW_PERSIST, arg, 1, nullptr);
+}
+
+bool World::WeatherMix(uint32_t fromHash, uint32_t toHash, float pct) {
+    uint64_t arg[] = { (uint64_t)fromHash, (uint64_t)toHash, FloatArg(pct) };   // SET_CURR_WEATHER_STATE(from, to, percentWeather2)
+    return CallNative(native::SET_CURR_WEATHER_STATE, arg, 3, nullptr);
+}
+
+bool World::WeatherGet(uint32_t& fromHash, uint32_t& toHash, float& pct) {
+    fromHash = toHash = 0;
+    pct = 0.0f;
+    uint64_t a = 0, b = 0, p = 0;   // the native writes a Hash, a Hash and a float into the low 4 bytes of each slot
+    uint64_t arg[] = { (uint64_t)(uintptr_t)&a, (uint64_t)(uintptr_t)&b, (uint64_t)(uintptr_t)&p };
+    if (!CallNative(native::GET_CURR_WEATHER_STATE, arg, 3, nullptr)) return false;
+    fromHash = (uint32_t)a;
+    toHash = (uint32_t)b;
+    const uint32_t bits = (uint32_t)p;
+    std::memcpy(&pct, &bits, sizeof pct);
+    return true;
+}
+
+bool World::WeatherClearPersist() {
+    return CallNative(native::CLEAR_WEATHER_TYPE_PERSIST, nullptr, 0, nullptr);
+}
+
 bool World::TextureResolution(const char* dict, const char* name, float& w, float& h) {
     w = h = 0.0f;
     if (!dict || !name) return false;
@@ -6918,6 +6980,16 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(END_SCALEFORM_MOVIE_METHOD),
         GAGE_NEW_NATIVE(SET_BIGMAP_ACTIVE),
         GAGE_NEW_NATIVE(GET_SAFE_ZONE_SIZE),
+        // 0.5.7 world clock
+        GAGE_NEW_NATIVE(PAUSE_CLOCK),
+        GAGE_NEW_NATIVE(SET_CLOCK_TIME),
+        GAGE_NEW_NATIVE(GET_CLOCK_HOURS),
+        GAGE_NEW_NATIVE(GET_CLOCK_MINUTES),
+        GAGE_NEW_NATIVE(GET_CLOCK_SECONDS),
+        GAGE_NEW_NATIVE(SET_WEATHER_TYPE_NOW_PERSIST),
+        GAGE_NEW_NATIVE(SET_CURR_WEATHER_STATE),
+        GAGE_NEW_NATIVE(GET_CURR_WEATHER_STATE),
+        GAGE_NEW_NATIVE(CLEAR_WEATHER_TYPE_PERSIST),
         // remote-player ped driving, sender state readers, appearance read/apply.
         GAGE_NEW_NATIVE(SET_ENTITY_COORDS_NO_OFFSET),
         GAGE_NEW_NATIVE(SET_ENTITY_VELOCITY),

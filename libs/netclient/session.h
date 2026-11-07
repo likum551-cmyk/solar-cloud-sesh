@@ -108,6 +108,7 @@ namespace gage::net {
             InvUsed,         // v8 (0.6): the server consumed one item for us (satiety for the client to add)
             InvSnap,         // v8 (0.5.4 inventory world): InvState with weapons (codec v2), its rev and a strip list
             InvNearby,       // v8 (0.5.4): the world containers in reach (empty list = none); the first one is also the offer
+            WorldClock,      // v8 (0.5.7): the server's time of day, its rate and the weather (join, every change, every 30 s)
         };
         Type type = Type::Disconnected;
 
@@ -147,6 +148,7 @@ namespace gage::net {
         proto::InvUsed invUsed;             // v8 (0.6): the item used and the satiety it gives
         proto::InvSnap invSnap;             // v8 (0.5.4): blob = sync::inv::Encode (v2), rev, flags, strip
         proto::InvNearby invNearby;         // v8 (0.5.4): blobs = sync::inv::EncodeBox
+        proto::WorldClock worldClock;       // v8 (0.5.7): gameMs is the server's time of day at its send (libs/sync/world_clock.h FromWire)
     };
 
     class ClientSession

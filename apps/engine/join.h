@@ -148,6 +148,9 @@ namespace gage::join {
         // world containers in reach (the first one, an empty list, is the server's offer of the inventory world).
         std::function<void(const proto::InvSnap&)> onInvSnap;
         std::function<void(const proto::InvNearby&)> onInvNearby;
+        // v8 (0.5.7 world clock): the server's clock and weather (on join, on every admin change, every 30 s); rttMs = the
+        // session's smoothed round trip when it arrived (the receiver places the server's send moment half of it ago).
+        std::function<void(const proto::WorldClock&, uint32_t rttMs)> onWorldClock;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;

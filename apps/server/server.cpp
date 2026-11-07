@@ -40,6 +40,8 @@ namespace gage::server {
         constexpr uint64_t kDropLogEveryUntrustedMs = 10000;
         // At most one "you are flooding" notice per player per this long.
         constexpr uint64_t kFloodNoticeEveryMs = 1000;
+        // 0.5.7: every player gets the world clock again this often (a resync; changes go out at once).
+        constexpr uint64_t kClockResyncMs = 30000;
 
         enum DropKind
         {
@@ -533,6 +535,22 @@ namespace gage::server {
             ", " + std::to_string(cfg_.vehiclesPerIp) + " vehicles per address");
         Log("bans: " + std::to_string(bans_.entries().size()) + " entries from " +
             (cfg_.bansFile.empty() ? std::string("memory only") : cfg_.bansFile));
+        // 0.5.7 world clock: the time of day starts at clockStart on every start (not persisted), the weather at the cycle's first entry
+        // (or the fixed weather), with no blend.
+        {
+            const uint64_t now = net::NowMs();
+            clock_ = sync::wclock::Clock();
+            clock_.SetTime((int64_t)now, cfg_.clockStartMs);
+            clock_.scaleMilli = cfg_.clockScaleMilli;
+            weather_ = sync::wclock::WeatherPlan();
+            weather_.Configure(cfg_.weatherFixed, cfg_.weatherCycle, cfg_.weatherTransitionSeconds * 1000u, (int64_t)now);
+            clockPhase_ = weather_.At((int64_t)now);
+            clockRev_ = 1;
+            clockSent_ = 0;
+            clockResyncAtMs_ = now + kClockResyncMs;
+            Log(cfg_.worldClock ? "world clock: on (every client shows this time and weather), " + DescribeWorldClock(now)
+                                : std::string("world clock: OFF (worldClock 0): clients keep the game's own clock and weather"));
+        }
         if (admin_->running())
             Log("admin channel on 127.0.0.1:" + std::to_string(admin_->port()) + " (loopback only, token required)");
 
@@ -757,6 +775,7 @@ namespace gage::server {
             BroadcastWorld();
             BroadcastVehicles(nowMs);
             TickInventoryWorld(nowMs);   // 0.5.4: after the vehicles moved (trunk positions, despawns)
+            TickWorldClock(nowMs);       // 0.5.7: a weather phase change of the cycle at once, else the 30 s resync
             stats_.ticks++;
             metrics_.ticks++;
             if (host_) enet_host_flush(host_);
@@ -1861,6 +1880,8 @@ namespace gage::server {
         }
         // 0.6: then its inventory.
         LoadInventory(c);
+        // 0.5.7: then the world's time of day and weather (an older client drops the unknown type).
+        SendWorldClock(c);
         proto::PlayerJoined self;
         self.id = c.id;
         self.name = c.name;
@@ -1994,6 +2015,220 @@ namespace gage::server {
         return !in(cfg_.vehicleModelDeny);
     }
 
+    // ---- 0.5.7 world clock --------------------------------------------------------------------------------------------------
+
+    proto::WorldClock Server::WorldClockNow() const
+    {
+        const int64_t now = (int64_t)net::NowMs();
+        const sync::wclock::WeatherView v = weather_.At(now);
+        proto::WorldClock m;
+        m.rev = clockRev_;
+        m.gameMs = (uint32_t)clock_.GameMsAt(now);
+        m.scaleMilli = clock_.scaleMilli;
+        m.weatherTo = v.to;
+        m.weatherFrom = v.Steady() ? v.to : v.from;
+        if (!v.Steady())
+        {
+            m.transElapsedMs = v.elapsedMs;
+            m.transTotalMs = v.totalMs;
+        }
+        m.flags = weather_.Cycling() ? proto::kClockCycle : 0;
+        return m;
+    }
+
+    std::string Server::DescribeWorldClock(uint64_t nowMs) const
+    {
+        namespace wc = sync::wclock;
+        const sync::wclock::WeatherView v = weather_.At((int64_t)nowMs);
+        std::string s = wc::FormatHms(clock_.GameMsAt((int64_t)nowMs)) + " at x" + wc::FormatScale(clock_.scaleMilli) +
+                        (clock_.scaleMilli == wc::kGtaScaleMilli ? " (GTA's own rate)" : clock_.scaleMilli == 0 ? " (frozen)" : "") + ", weather ";
+        if (v.Steady())
+            s += wc::WeatherName(v.to);
+        else
+            s += std::string(wc::WeatherName(v.from)) + " -> " + wc::WeatherName(v.to) + " " + std::to_string((int)(v.Progress() * 100.0f)) + "% (" +
+                 std::to_string(v.elapsedMs / 1000) + " of " + std::to_string(v.totalMs / 1000) + " s)";
+        s += weather_.Cycling() ? ", cycle of " + std::to_string(weather_.Cycle().size()) + " (" + std::to_string(weather_.CycleLapMs() / 60000) + " min a lap)"
+                                : std::string(", fixed");
+        s += ", rev " + std::to_string(clockRev_);
+        return s;
+    }
+
+    void Server::SendWorldClock(Conn& c)
+    {
+        if (!cfg_.worldClock) return;
+        SendTo(c, proto::kChanReliable, proto::Encode(WorldClockNow()), true);
+        clockSent_++;
+    }
+
+    void Server::BroadcastWorldClock(const std::string& why)
+    {
+        if (!cfg_.worldClock) return;
+        const uint64_t now = net::NowMs();
+        const proto::Bytes b = proto::Encode(WorldClockNow());
+        for (auto& kv : players_)
+        {
+            SendTo(*kv.second, proto::kChanReliable, b, true);
+            clockSent_++;
+        }
+        clockPhase_ = weather_.At((int64_t)now);
+        clockResyncAtMs_ = now + kClockResyncMs;
+        if (!why.empty())
+            Log("world clock: " + why + "; now " + DescribeWorldClock(now) + "; sent to " + std::to_string(players_.size()) + " players");
+    }
+
+    void Server::TickWorldClock(uint64_t nowMs)
+    {
+        if (!cfg_.worldClock) return;
+        const sync::wclock::WeatherView v = weather_.At((int64_t)nowMs);
+        if (!v.SamePhase(clockPhase_))
+        {
+            BroadcastWorldClock(v.Steady() ? std::string("the cycle's weather settled on ") + sync::wclock::WeatherName(v.to)
+                                            : std::string("the cycle's weather turns ") + sync::wclock::WeatherName(v.from) + " -> " +
+                                                  sync::wclock::WeatherName(v.to));
+            return;
+        }
+        if (nowMs >= clockResyncAtMs_)
+            BroadcastWorldClock("");   // the resync: no log line
+    }
+
+    bool Server::SetClockTime(int64_t gameMs, const std::string& by, std::string* err)
+    {
+        if (!cfg_.worldClock || gameMs < 0 || gameMs >= sync::wclock::kDayMs)
+        {
+            if (err) *err = !cfg_.worldClock ? "the world clock is off (server.json worldClock 0)" : "the time must be 00:00..23:59:59";
+            return false;
+        }
+        clock_.SetTime((int64_t)net::NowMs(), gameMs);
+        ++clockRev_;
+        BroadcastWorldClock("time set to " + sync::wclock::FormatHms(gameMs) + " by " + by);
+        return true;
+    }
+
+    bool Server::SetClockScale(uint32_t scaleMilli, const std::string& by, std::string* err)
+    {
+        if (!cfg_.worldClock || scaleMilli > sync::wclock::kMaxScaleMilli)
+        {
+            if (err) *err = !cfg_.worldClock ? "the world clock is off (server.json worldClock 0)" : "the time scale must be 0..3600";
+            return false;
+        }
+        clock_.SetScale((int64_t)net::NowMs(), scaleMilli);
+        ++clockRev_;
+        BroadcastWorldClock("time scale set to " + sync::wclock::FormatScale(scaleMilli) + " by " + by);
+        return true;
+    }
+
+    bool Server::SetWeather(int weather, const std::string& by, std::string* err)
+    {
+        if (!cfg_.worldClock || (weather >= 0 && !sync::wclock::ValidWeather((uint8_t)weather)) || weather < -1)
+        {
+            if (err) *err = !cfg_.worldClock ? "the world clock is off (server.json worldClock 0)" : "unknown weather";
+            return false;
+        }
+        const int64_t now = (int64_t)net::NowMs();
+        if (weather < 0)
+            weather_.SetCycle(now);
+        else
+            weather_.SetFixed(now, (uint8_t)weather);
+        ++clockRev_;
+        BroadcastWorldClock(std::string("weather set to ") + (weather < 0 ? "the cycle" : sync::wclock::WeatherName((uint8_t)weather)) + " by " + by);
+        return true;
+    }
+
+    bool Server::WorldClockCommand(const std::string& cmd, const std::string& arg, const std::string& by, std::string& output, bool* ok)
+    {
+        namespace wc = sync::wclock;
+        if (cmd != "time" && cmd != "timescale" && cmd != "weather") return false;
+        *ok = false;
+        if (!cfg_.worldClock)
+        {
+            output = "the world clock is off (server.json worldClock 0)";
+            return true;
+        }
+        if (arg.empty())
+        {
+            output = DescribeWorldClock(net::NowMs());
+            *ok = true;
+            return true;
+        }
+        std::string why;
+        if (cmd == "time")
+        {
+            int64_t ms = 0;
+            if (!wc::ParseClockTime(arg, ms))
+                output = "usage: time [HH:MM or HH:MM:SS]";
+            else if (!SetClockTime(ms, by, &why))
+                output = why;
+            else
+            {
+                output = "time set to " + wc::FormatHms(ms);
+                *ok = true;
+            }
+            return true;
+        }
+        if (cmd == "timescale")
+        {
+            uint32_t milli = 0;
+            if (!wc::ParseScale(arg, milli))
+                output = "usage: timescale [0..3600] (game ms per real ms: 30 = GTA's own rate, 0 = frozen)";
+            else if (!SetClockScale(milli, by, &why))
+                output = why;
+            else
+            {
+                output = "time scale set to " + wc::FormatScale(milli);
+                *ok = true;
+            }
+            return true;
+        }
+        std::string lower = arg;
+        for (char& ch : lower)
+            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        const int w = lower == "cycle" ? -1 : wc::FindWeather(arg);
+        if (lower != "cycle" && w < 0)
+            output = "usage: weather [cycle | EXTRASUNNY | CLEAR | CLOUDS | SMOG | FOGGY | OVERCAST | RAIN | THUNDER | CLEARING | NEUTRAL | SNOW | "
+                     "BLIZZARD | SNOWLIGHT | XMAS | HALLOWEEN]";
+        else if (!SetWeather(w, by, &why))
+            output = why;
+        else
+        {
+            output = std::string("weather set to ") + (w < 0 ? "the cycle" : wc::WeatherName((uint8_t)w)) +
+                     (weather_.TransMs() ? " (blending over " + std::to_string(weather_.TransMs() / 1000) + " s)" : std::string());
+            *ok = true;
+        }
+        return true;
+    }
+
+    bool Server::ChatCommand(Conn& c, const std::string& text)
+    {
+        if (text.empty() || text[0] != '/') return false;
+        const size_t sp = text.find(' ');
+        std::string cmd = text.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
+        for (char& ch : cmd)
+            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        if (cmd != "time" && cmd != "timescale" && cmd != "weather") return false;
+        const std::string arg = sp == std::string::npos ? std::string() : Trim(text.substr(sp + 1));
+        const std::string who = "id=" + std::to_string(c.id) + " " + c.name;
+        if (!c.adminRate.Take(net::NowMs()))
+        {
+            Notice(c, "Too many commands. Wait a moment.");
+            return true;
+        }
+        // They change the world for every player: a verified admin only (a guest never, unlike the self-only AdminCmds).
+        if (!c.isAdmin)
+        {
+            stats_.adminRefused++;
+            Log("world clock: /" + cmd + (arg.empty() ? "" : " " + arg) + " by " + who + " REFUSED (not a verified admin)");
+            Notice(c, "Only admins can change the time or weather on this server.");
+            return true;
+        }
+        stats_.adminAllowed++;
+        std::string out;
+        bool ok = false;
+        WorldClockCommand(cmd, arg, who + " (admin)", out, &ok);
+        if (out.size() > proto::kMaxChat) out.resize(proto::kMaxChat);
+        Notice(c, out);
+        return true;
+    }
+
     void Server::Notice(Conn& c, const std::string& text)
     {
         proto::ChatMessage notice;
@@ -2033,6 +2268,9 @@ namespace gage::server {
             Notice(c, "Message not sent: it was empty or contained control or invalid characters.");
             return;
         }
+        // 0.5.7: /time /timescale /weather are the server's own commands (the engine sends any slash command it does not know as chat).
+        if (ChatCommand(c, m.text))
+            return;
         proto::ChatMessage out;
         out.fromId = c.id;
         out.text = m.text;
@@ -3785,6 +4023,12 @@ namespace gage::server {
             }
             return ClearInventory(arg, &output) ? CommandResult::Ok : CommandResult::Error;
         }
+        {
+            // 0.5.7: time [HH:MM[:SS]] | timescale [X] | weather [NAME|cycle] (no argument: the clock's status).
+            bool ok = false;
+            if (WorldClockCommand(cmd, arg, "the console", output, &ok))
+                return ok ? CommandResult::Ok : CommandResult::Error;
+        }
         if (cmd == "vehicles")
         {
             const std::vector<proto::VehicleState> all = Vehicles();
@@ -3843,7 +4087,8 @@ namespace gage::server {
         {
             output = "commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | "
                      "banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | "
-                     "armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | vehicles | quit";
+                     "armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | time [HH:MM[:SS]] | "
+                     "timescale [0..3600] | weather [NAME|cycle] | vehicles | quit";
             return CommandResult::Ok;
         }
         if (cmd == "quit" || cmd == "exit" || cmd == "stop")

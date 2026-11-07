@@ -20,7 +20,7 @@ namespace gage::net {
         uint8_t ChannelFor(proto::Msg t)
         {
             // Everything not listed here is reliable, including the 0.5.4 inventory world's InvSnap, InvNearby (S->C) and
-            // InvReport (C->S): each carries a whole state the receiver must not miss.
+            // InvReport (C->S): each carries a whole state the receiver must not miss. So is 0.5.7's WorldClock (an admin change must arrive).
             return t == proto::Msg::WorldState || t == proto::Msg::WorldCoarse || t == proto::Msg::VehicleWorld ||
                            t == proto::Msg::PlayerState || t == proto::Msg::VehicleUpdate || t == proto::Msg::LinkInfo   // R3 T5: LinkInfo rides the state channel
                        ? proto::kChanState
@@ -491,6 +491,11 @@ namespace gage::net {
             if (!joined) return;
             if (!proto::Decode(data, len, e.invNearby)) { malformed_++; return; }
             e.type = Event::Type::InvNearby;
+            break;
+        case proto::Msg::WorldClock:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.worldClock)) { malformed_++; return; }
+            e.type = Event::Type::WorldClock;
             break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:

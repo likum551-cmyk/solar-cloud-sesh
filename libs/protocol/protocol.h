@@ -76,6 +76,9 @@
 //   * 0.5.4 inventory world (still v8, additive and negotiated): InvSnap (52, S->C), InvNearby (53, S->C), InvReport (54, C->S),
 //     all reliable, and InvOp's op may be 19 bytes (a ground pile or trunk side). A 0.5.3 client counts 52/53 as malformed
 //     and ignores them; the server sends InvSnap / the 19-byte form only to a client that answered with an InvReport.
+//   * 0.5.7 world clock (still v8, additive): Msg::WorldClock (55, S->C reliable), the server's time of day, its rate and the weather
+//     (libs/sync/world_clock.h). A 0.5.6 or older client's PeekType refuses type 55 (above its kMsgLast), so its session counts the
+//     packet as malformed and drops it, and nothing in the engine acts on that counter: the message is safe to send to everybody.
 //
 // v5 against v4: sample times, one controller per vehicle, ownership and combat that kills in a fair time
 // (docs/SYNC-PLAN.md; the byte layouts are in docs/api/protocol.md).
@@ -226,8 +229,9 @@ namespace gage::proto {
         InvSnap          = 52, // S->C reliable (v8, 0.5.4 inventory world): InvState with weapons (codec v2), a revision, a strip list
         InvNearby        = 53, // S->C reliable (v8, 0.5.4): the world containers in reach (a ground pile, a trunk); empty = none
         InvReport        = 54, // C->S reliable (v8, 0.5.4): the ped's weapons, current weapon and nearby vehicle classes
+        WorldClock       = 55, // S->C reliable (v8, 0.5.7): the server's time of day, its rate and the weather (join, every change, every 30 s)
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::InvReport;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::WorldClock;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -965,6 +969,31 @@ namespace gage::proto {
     struct InvVehClass { uint16_t veh = 0; uint8_t cls = 0; };
     struct InvReport { uint32_t rev = 0; uint32_t current = 0; uint8_t flags = 0; std::vector<InvPedWeapon> weapons; std::vector<InvVehClass> vehicles; };
 
+    // ---- v8, 0.5.7 world clock (docs/api/protocol.md "0.5.7 world clock"; the rules are libs/sync/world_clock.h) ----
+    // WorldClock (S->C reliable): sent after the join's inventory messages, after every admin change of the time, rate or weather, when the
+    // weather cycle starts a transition, and every 30 s as a resync. `gameMs` is the server's game time of day (ms after midnight) AT THE
+    // MOMENT IT SENT this; the client places that moment at its receive time minus half its round trip and runs the clock on from there at
+    // `scaleMilli` / 1000 game ms per real ms (30000 = GTA's own rate, 0 = frozen). The weather is a wire-stable index into
+    // sync::wclock::kWeathers: steady on `weatherTo` when transTotalMs is 0, else a blend from `weatherFrom` to `weatherTo`, transElapsedMs
+    // of transTotalMs in at the send. `rev` counts the server's changes (1 at start; a resync repeats it). flags: kClockCycle = the weather
+    // comes from the server's cycle (informational).
+    // [55][u16 rev][u32 gameMs][u32 scaleMilli][u8 weatherFrom][u8 weatherTo][u32 transElapsedMs][u32 transTotalMs][u8 flags] = 22 bytes.
+    constexpr size_t kWorldClockBytes = 22;
+    constexpr uint32_t kClockDayMs = 86400000;
+    constexpr uint32_t kMaxClockScaleMilli = 3600000;   // a game day in 24 real seconds
+    constexpr uint8_t kMaxWeatherId = 32;               // indices 0..31 decode (sync::wclock::kWeathers defines 15; a client ignores one it lacks)
+    constexpr uint32_t kMaxWeatherTransMs = 600000;
+    constexpr uint8_t kClockCycle = 0x01;
+    struct WorldClock
+    {
+        uint16_t rev = 0;
+        uint32_t gameMs = 0;
+        uint32_t scaleMilli = 30000;
+        uint8_t weatherFrom = 0, weatherTo = 0;
+        uint32_t transElapsedMs = 0, transTotalMs = 0;
+        uint8_t flags = 0;
+    };
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -1027,6 +1056,7 @@ namespace gage::proto {
     Bytes Encode(const InvSnap& m);      // v8 0.5.4: {} for an empty / over-cap blob or more than kMaxInvStrip strips
     Bytes Encode(const InvNearby& m);    // v8 0.5.4: {} for more than kMaxInvNearby boxes or a blob over kMaxInvBlob
     Bytes Encode(const InvReport& m);    // v8 0.5.4: {} for more than kMaxInvReportWeapons / kMaxInvReportVehicles
+    Bytes Encode(const WorldClock& m);   // v8 0.5.7: {} for any field Decode would refuse
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -1087,6 +1117,9 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, InvSnap& out);     // v8 0.5.4: empty / over-cap blob, unknown flags, too many strips
     bool Decode(const uint8_t* p, size_t n, InvNearby& out);   // v8 0.5.4: too many boxes, box id 0, unknown flags, over-cap blob
     bool Decode(const uint8_t* p, size_t n, InvReport& out);   // v8 0.5.4: unknown flags, too many weapons or vehicles, hash 0
+    // v8 0.5.7: exactly kWorldClockBytes; refuses gameMs >= kClockDayMs, scaleMilli over kMaxClockScaleMilli, a weather id >= kMaxWeatherId,
+    // transTotalMs over kMaxWeatherTransMs, transElapsedMs over transTotalMs, a steady state (total 0) whose from and to differ, unknown flags.
+    bool Decode(const uint8_t* p, size_t n, WorldClock& out);
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would

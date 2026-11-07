@@ -362,8 +362,8 @@ struct Probe
                                       "VehicleResult", "Damage",       "Killed",       "RespawnOk",  "PeerAnim",
                                       "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact", "LinkInfo",
                                       "AccountInfo",  "AdminResult", "InvState",   "InvUsed",    "InvSnap",
-                                      "InvNearby"};
-        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::InvNearby + 1, "a name per event type");
+                                      "InvNearby",    "WorldClock"};
+        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::WorldClock + 1, "a name per event type");
         std::string out;
         for (const net::Event& e : events) out += std::string(names[(int)e.type]) + " ";
         return out;

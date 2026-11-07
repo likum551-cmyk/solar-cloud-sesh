@@ -76,6 +76,12 @@ working directory the server is started in.
 | `invTrunkReach` | integer | `4` | 1..20 m. A vehicle's trunk is in reach within this distance of the vehicle's position (any side: the server knows the car's centre), and always for a player seated in it. The trunk is listed once a 0.5.4 client within 6 m reported the car's GTA class (its size comes from the class; bicycles, boats, aircraft and trains have none). A locked car's trunk is listed locked to everyone outside it except its key holders (spawner, last driver). |
 | `invGroundExpireSeconds` | integer | `600` | 10..86400. A pile vanishes this long after something was last put in it, or at once when emptied. Piles and trunks live in memory only: a restart clears them; a trunk's contents land in a pile where the vehicle last stood when it goes. |
 | `invMaxPiles` | integer | `2048` | 16..65536. Past this many piles a drop that would open a new one is refused (the item stays with the player) and a gone vehicle's trunk stacks that find no pile are lost (logged). |
+| `worldClock` | integer | `1` | 0 or 1. 0.5.7 world clock (docs/api/protocol.md "0.5.7"): the server owns the time of day and the weather and sends them (`WorldClock` 55) on join, on every change and every 30 s, so every player sees the same sky. `0` = never sent: each client keeps the game's own clock and weather (the 0.5.6 behaviour), and the `time` / `timescale` / `weather` commands answer an error. Older clients drop the message unread. |
+| `clockStart` | string | `"12:00"` | `"HH:MM"` or `"HH:MM:SS"`, 00:00..23:59:59. The time of day when the server starts. The clock is **not saved**: every start begins here. |
+| `clockScale` | number | `30` | 0..3600, fractions allowed (kept in thousandths). Game ms per real ms: `30` = GTA's own rate (1 game minute per 2 real seconds, a 48-minute day), `0` = frozen, `60` = twice as fast. |
+| `weather` | string | `"cycle"` | `"cycle"` = follow `weatherCycle`, or one weather name (any case): EXTRASUNNY, CLEAR, CLOUDS, SMOG, FOGGY, OVERCAST, RAIN, THUNDER, CLEARING, NEUTRAL, SNOW, BLIZZARD, SNOWLIGHT, XMAS, HALLOWEEN. |
+| `weatherCycle` | array | 8 entries, 90 min | 1..32 `["NAME", minutes]` pairs, 1..1440 real minutes each, played in order and repeated. The default is `[["EXTRASUNNY", 20], ["CLEAR", 15], ["CLOUDS", 12], ["OVERCAST", 8], ["RAIN", 6], ["CLEARING", 6], ["CLOUDS", 10], ["CLEAR", 13]]`: no snow, xmas, halloween, blizzard or thunder. Each entry's first `weatherTransitionSeconds` blend in from the previous one. |
+| `weatherTransitionSeconds` | integer | `45` | 0..600. How long a change of weather (the cycle's next entry, or an admin's `weather`) blends from the old sky to the new one; `0` = at once. A player who joins mid-blend starts at the same point. |
 | `adminPort` | integer | `0` (off) | 0..65535. Loopback TCP port of the [admin channel](#6-the-admin-channel-loopback-tcp). `0` disables it. |
 | `adminToken` | string | `""` | 16..128 printable ASCII characters, no spaces. **Required when `adminPort` is not 0.** When the file sets none, the server uses the environment variable `GAGE_ADMIN_TOKEN`. |
 | `platformUrl` | string | `""` (off) | v8 accounts: the platform's **internal** listener origin, `http://host:port` with no path (e.g. `http://127.0.0.1:8788`). Set: every join token is verified there (`POST /internal/game/verify`) and a verified player's leave ends its platform session (`POST /internal/game/session-end`); `""`: tokens are ignored and every player is a guest. |
@@ -646,6 +652,37 @@ Empties the player's pockets, pack, worn items and quick slots, and sends the pl
 * Output: `cleared the inventory of <name>`
 * Errors: `usage: clearinv <id|name>`; `no player "<target>"`.
 
+### `time [HH:MM[:SS]]` (0.5.7)
+
+Sets the world's time of day for every player at once (a new `WorldClock` with a higher rev); the clock runs on from
+there at the current scale. Without an argument it prints the clock's status, the same for `timescale` and `weather`
+(`18:30:15 at x30.000 (GTA's own rate), weather CLOUDS -> RAIN 27% (12 of 45 s), cycle of 8 (90 min a lap), rev 3`).
+
+* Output: `time set to 06:30:00`; log `world clock: time set to 06:30:00 by the console; now ...; sent to <n> players`
+* Errors: `usage: time [HH:MM or HH:MM:SS]`; `the world clock is off (server.json worldClock 0)`.
+
+### `timescale [0..3600]` (0.5.7)
+
+Game ms per real ms from now on (`30` = GTA's own rate, `0` = frozen); the time shown does not jump.
+
+* Output: `time scale set to 30.000`
+* Errors: `usage: timescale [0..3600] (...)`; `the world clock is off (...)`.
+
+### `weather [NAME|cycle]` (0.5.7)
+
+A fixed weather (any case: EXTRASUNNY, CLEAR, CLOUDS, SMOG, FOGGY, OVERCAST, RAIN, THUNDER, CLEARING, NEUTRAL, SNOW,
+BLIZZARD, SNOWLIGHT, XMAS, HALLOWEEN), or `cycle` to go back to `weatherCycle` from its first entry. Either way the sky
+blends from what it shows now over `weatherTransitionSeconds`.
+
+* Output: `weather set to RAIN (blending over 45 s)` / `weather set to the cycle (...)`
+* Errors: `usage: weather [cycle | EXTRASUNNY | ...]`; `the world clock is off (...)`.
+
+**In chat.** A player can type `/time`, `/timescale` and `/weather` with the same arguments. Only a **verified admin**
+(an account whose roles meet `adminRoles`) may: everyone else, guests included even on a server without
+`requireAccount`, gets the notice `Only admins can change the time or weather on this server.` and the log line
+`world clock: /time ... by id=<id> <name> REFUSED (not a verified admin)`, because the change affects every player.
+The commands share the admin command rate limit; the answer comes back as a server notice and is never relayed as chat.
+
 ### `vehicles`
 
 Lists the networked vehicles: a `vehicles <count>/<maxVehicles>` header, then one line per vehicle with id, model hash,
@@ -654,7 +691,7 @@ position, body/engine health, fuel (permille), `adopted` or `spawned`, `locked`,
 
 ### `help`
 
-`commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | vehicles | quit`
+`commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | time [HH:MM[:SS]] | timescale [0..3600] | weather [NAME|cycle] | vehicles | quit`
 
 ### `quit` (aliases `exit`, `stop`)
 
@@ -1005,6 +1042,10 @@ Every line starts with `[YYYY-MM-DD HH:MM:SS.mmmZ]` (UTC). The ones you will gre
 | `inventory world: op of id=<id> <name> refused: <why>` | 0.5.4: an op on a trunk / pile was refused (out of reach, gone, locked, dead, the rules, too many piles); the player is sent the truth again |
 | `inventory world: <n> trunk(s) of gone vehicles emptied onto the ground (...)` | 0.5.4: vehicles went; their trunks' contents became piles |
 | `inventory world: last 60 s: reports <n> (stale <s>), weapons gained ..., ground drops ..., box ops ... (refused ...), piles expired ...; now <p> piles ..., <t> trunks, <c> 0.5.4 clients so far` | 0.5.4: the minute's summary (only when something happened) |
+| `world clock: on (...), <status>` / `world clock: OFF (...)` | 0.5.7: the clock at start (`worldClock`) |
+| `world clock: time set to ... by <who>` / `time scale set to ...` / `weather set to ...; now <status>; sent to <n> players` | 0.5.7: an admin change (console or a verified admin's chat command), broadcast to everyone |
+| `world clock: the cycle's weather turns <A> -> <B>` / `settled on <B>` | 0.5.7: the cycle's next blend started or ended (broadcast; the 30 s resyncs are not logged) |
+| `world clock: /<cmd> ... by id=<id> <name> REFUSED (not a verified admin)` | 0.5.7: a chat command from someone who may not change the sky |
 | `stopped` | clean stop |
 
 ---

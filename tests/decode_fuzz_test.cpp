@@ -376,6 +376,9 @@ static std::vector<Case> Corpus()
     }
     { InvReport m; m.rev = 9; m.current = 0x1B06D571u; m.flags = kInvReportPedValid; m.weapons = {{0x1B06D571u, 0x743D4F54u, 120}, {0x99B507EAu, 0, 0}};
       m.vehicles = {{12, 1}, {13, 2}}; v.push_back(Make("InvReport", m)); }
+    // 0.5.7 world clock: a transition (CLOUDS -> RAIN, 12 s of 45 in) at 18:30:15, GTA's own rate, from the cycle
+    { WorldClock m; m.rev = 3; m.gameMs = 66615000; m.scaleMilli = 30000; m.weatherFrom = 2; m.weatherTo = 6; m.transElapsedMs = 12000;
+      m.transTotalMs = 45000; m.flags = kClockCycle; v.push_back(Make("WorldClock", m)); }
     for (Case& c : v)
         if (c.name.rfind("VehicleWorld", 0) == 0 || c.name.rfind("VehicleUpdate", 0) == 0 || c.name == "VehicleCmd register") c.lossy = true;
     return v;

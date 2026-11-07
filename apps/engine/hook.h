@@ -234,6 +234,17 @@ namespace gage::game {
         // 0.5.4 ring_map_zoom. alloc8or HUD::SET_RADAR_ZOOM 0x096EF57A0C999BBA void (int zoomLevel), "0 to 1400 in R* Scripts"; 3889 hash in
         // kCrossmap3889 (natlookup.mjs 2026-11-07: YimMenu b3889 idx 1539 and YimMenuV2 enhanced idx 1579 AGREE).
         constexpr uint64_t SET_RADAR_ZOOM                                   = 0x096EF57A0C999BBA;  // void (int zoomLevel)
+        // 0.5.7 world clock (apps/engine/world_clock.cpp). alloc8or CLOCK:: / MISC:: signatures; every 3889 hash in kCrossmap3889 was
+        // looked up with natlookup.mjs 2026-11-07: YimMenu b3889 and YimMenuV2 enhanced AGREE for all nine.
+        constexpr uint64_t PAUSE_CLOCK                                      = 0x4055E40BD2DBEC1D;  // void (BOOL toggle)
+        constexpr uint64_t SET_CLOCK_TIME                                   = 0x47C3B5848C3E45D8;  // void (int hour, int minute, int second)
+        constexpr uint64_t GET_CLOCK_HOURS                                  = 0x25223CA6B4D20B7F;  // int ()
+        constexpr uint64_t GET_CLOCK_MINUTES                                = 0x13D2B8ADD79640F2;  // int ()
+        constexpr uint64_t GET_CLOCK_SECONDS                                = 0x494E97C2EF27C470;  // int ()
+        constexpr uint64_t SET_WEATHER_TYPE_NOW_PERSIST                     = 0xED712CA327900C8A;  // void (const char* weatherType)
+        constexpr uint64_t SET_CURR_WEATHER_STATE                           = 0x578C752848ECFA0C;  // void (Hash from, Hash to, float percentWeather2)
+        constexpr uint64_t GET_CURR_WEATHER_STATE                           = 0xF3BBE884A14BB413;  // void (Hash* from, Hash* to, float* percentWeather2)
+        constexpr uint64_t CLEAR_WEATHER_TYPE_PERSIST                       = 0xCCC39339BEF76CF5;  // void ()
         // 0.5.5 ring_map_round (the radar-mask probe, apps/engine/radar_mask.h). alloc8or GRAPHICS::GET_TEXTURE_RESOLUTION 0x35736EE65BD00C11
         // Vector3 (const char* textureDict, const char* textureName) and GRAPHICS::DRAW_SPRITE 0xE7FFAE5EBF23D890 void (const char* textureDict,
         // const char* textureName, float screenX, float screenY, float width, float height, float heading, int red, int green, int blue, int alpha,
@@ -967,6 +978,14 @@ namespace gage::game {
         bool     SetBigmap(bool on);
         // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM(level), 0 = the game's own zoom, up to 1400 = furthest. False when the native does not resolve.
         bool     SetRadarZoom(int level);
+        // 0.5.7 world clock. Each returns false when its native does not resolve.
+        bool     ClockPause(bool paused);                          // PAUSE_CLOCK(paused)
+        bool     ClockSet(int hour, int minute, int second);       // SET_CLOCK_TIME
+        bool     ClockGet(int& hour, int& minute, int& second);    // GET_CLOCK_HOURS / _MINUTES / _SECONDS
+        bool     WeatherNowPersist(const char* name);              // SET_WEATHER_TYPE_NOW_PERSIST(name): instant, held
+        bool     WeatherMix(uint32_t fromHash, uint32_t toHash, float pct); // SET_CURR_WEATHER_STATE(from, to, 0..1 towards `to`)
+        bool     WeatherGet(uint32_t& fromHash, uint32_t& toHash, float& pct); // GET_CURR_WEATHER_STATE
+        bool     WeatherClearPersist();                            // CLEAR_WEATHER_TYPE_PERSIST: the game's own weather again
         // 0.5.5 ring_map_round: GET_TEXTURE_RESOLUTION(dict, name) as w x h (false when the native does not resolve; a missing texture reads
         // as the game's own answer, which the caller judges), and DRAW_SPRITE(dict, name, x, y, w, h, 0, r, g, b, alpha, false, 0) in screen
         // fractions (the probe draws a mask sprite at alpha 1 under the ring's glass). False when the native does not resolve.
