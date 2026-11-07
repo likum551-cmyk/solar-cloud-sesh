@@ -3095,6 +3095,7 @@ static void TestSyncD()
 #include "ped_view_tests.h"    // 0.5.4 inv_ped_view: the CHARACTER panel's window and the camera framing the ped in it
 #include "inventory_world_tests.h"   // 0.5.4 inventory world: weapons as items, the hand, codec v2, ground piles, trunks, the weapon reconcile
 #include "ring_round_tests.h"  // 0.5.5 ring_map_round: radii, the asked box, the gate, the mask and its codecs, the blip clip pattern
+#include "belt_sound_tests.h"  // 0.5.9 seatbelt sound: when B clicks, the synthesized sounds, the player against a fake sink (includes apps/engine/belt_audio.cpp)
 
 int main()
 {
@@ -3167,6 +3168,7 @@ int main()
     invworld::RunPure();                            // 0.5.4 (tests/inventory_world_tests.h)
     ringround_t::RunPure();                         // 0.5.5 ring_map_round (tests/ring_round_tests.h)
     ringround_t::RunDump();                         // its blip clip pattern against the Legacy dumps (not counted; SKIP without them)
+    beltsound_t::RunPure();                         // 0.5.9 seatbelt sound (tests/belt_sound_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3192,7 +3194,8 @@ int main()
                        + outfitt::kChecks     // + 0.5.4 outfit items 9
                        + pedview_t::kChecks   // + 0.5.4 inventory ped view 7
                        + invworld::kChecks    // + 0.5.4 the inventory world 14
-                       + ringround_t::kChecks;   // + 0.5.5 the ring map round mask 15
+                       + ringround_t::kChecks    // + 0.5.5 the ring map round mask 15
+                       + beltsound_t::kChecks;   // + 0.5.9 the seatbelt sound 24
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

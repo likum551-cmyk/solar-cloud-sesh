@@ -356,8 +356,9 @@ add_library(gage_mp SHARED
     apps/engine/pack_enh.cpp
     apps/engine/minimap_size.cpp
     apps/engine/radar_mask.cpp
+    apps/engine/belt_audio.cpp
 )
-target_link_libraries(gage_mp PRIVATE gage_common gage_netclient gage_sync gage_overlay winhttp ws2_32)
+target_link_libraries(gage_mp PRIVATE gage_common gage_netclient gage_sync gage_overlay winhttp ws2_32 winmm)   # winmm: 0.5.9 seatbelt sound (PlaySound)
 set_target_properties(gage_mp PROPERTIES
     PREFIX ""
     SUFFIX ".dll"
@@ -378,8 +379,9 @@ add_executable(gage_mp_test
     apps/engine/pack_enh.cpp
     apps/engine/minimap_size.cpp
     apps/engine/radar_mask.cpp
+    apps/engine/belt_audio.cpp
 )
-target_link_libraries(gage_mp_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
+target_link_libraries(gage_mp_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32 winmm)
 set_target_properties(gage_mp_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
 # brand_apparel_test.exe: the branded-tee texture swap (hash, BC1 encoder, composite, D3D11 hooks on a WARP device) and, since 0.5.5, the
@@ -463,7 +465,7 @@ set_target_properties(vehicle_drive_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${C
 
 # gameplay_test.exe: vitals / respawn gate / hit batcher / emote arbiter / vehicle link, never shipped
 add_executable(gameplay_test tests/gameplay_test.cpp)
-target_link_libraries(gameplay_test PRIVATE gage_sync)
+target_link_libraries(gameplay_test PRIVATE gage_sync Threads::Threads)   # 0.5.9: the seatbelt sound's player thread (tests/belt_sound_tests.h)
 set_target_properties(gameplay_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)
 
 # pack_profile_test.exe: the per-build car-pack profile (apps/engine/pack_profile.h: Legacy patterns pinned to the shipped text, every
