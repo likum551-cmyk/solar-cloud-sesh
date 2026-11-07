@@ -103,14 +103,14 @@ namespace hudcar_t {
                   ok && Near(a, 1.0f, 1e-6f) && Near(b, 0.2f, 1e-6f) && Near(c, 1.0f, 1e-6f) && Near(d, 1.0f, 1e-6f), F("%.3f %.3f %.3f %.3f", a, b, c, d));
         }
         {
-            // bottom-RIGHT anchor; 0.5.4 the cluster at kSize (0.69 = 0.5.1's 0.6 x 1.15, GI 2026-11-07) about its own bottom-right corner (56 * H / 1080
-            // from the right and the bottom, unchanged): on 1080p the dial centre is (1739.8, 850.12) screen y-down (0.6: (1756, 872.8)); on a 2560x1080
-            // ultrawide it keeps 180.2 px from the right edge
+            // bottom-RIGHT anchor; 0.5.5 the cluster at kSize (0.745 = 0.5.4's 0.69 x 1.08, GI 2026-11-07 "speedo 5-10% bigger") about its own
+            // bottom-right corner (56 * H / 1080 from the right and the bottom, unchanged): on 1080p the dial centre is (1729.9, 836.26) screen y-down
+            // (0.69: (1739.8, 850.12)); on a 2560x1080 ultrawide it keeps 190.1 px from the right edge
             const Pt c1080 = ToScreen({kCx, kCy}, 1920.0f, 1080.0f), cUw = ToScreen({kCx, kCy}, 2560.0f, 1080.0f), c1440 = ToScreen({kCx, kCy}, 2560.0f, 1440.0f);
             const Pt corner = ToScreen({kCompX + kCompW, kCompY}, 1920.0f, 1080.0f), tl = ToScreen({kCompX, kCompY + kCompH}, 1920.0f, 1080.0f);
-            const bool ok = kSize == 0.69f && At(c1080, 1739.8f, 850.12f) && At(cUw, 2379.8f, 850.12f) && At(c1440, 2319.7333f, 1440.0f - 306.5067f) &&
-                            At(corner, 1864.0f, 1024.0f) && At(tl, 1615.6f, 725.92f) && Near(Scale(1080.0f), 0.69f, 1e-6f);
-            Check("hud car: the cluster is the design at 0.69 about its bottom-right corner (56 * H / 1080 from the right edge and the bottom; box 248.4 x 298.08)", ok,
+            const bool ok = kSize == 0.745f && At(c1080, 1729.9f, 836.26f) && At(cUw, 2369.9f, 836.26f) && At(c1440, 2306.5333f, 1440.0f - 324.9867f) &&
+                            At(corner, 1864.0f, 1024.0f) && At(tl, 1595.8f, 702.16f) && Near(Scale(1080.0f), 0.745f, 1e-6f);
+            Check("hud car: the cluster is the design at 0.745 about its bottom-right corner (56 * H / 1080 from the right edge and the bottom; box 268.2 x 321.84)", ok,
                   F("1080 (%.2f, %.2f), uw (%.2f, %.2f), 1440 (%.2f, %.2f), top-left (%.2f, %.2f)", c1080.x, c1080.y, cUw.x, cUw.y, c1440.x, c1440.y, tl.x, tl.y));
         }
     }
