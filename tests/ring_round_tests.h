@@ -5,7 +5,9 @@
 //      hole and the disc for a box-fit error up to 6 % either way
 //   B. the asked box (RoundAskPx, RingPlacementBox: the square case is RingPlacement exactly), ParseBoxFit
 //   C. the gate: every RoundDecide reason; RoundGate grows only on positive evidence, holds the radar on a shrink until it lands, never flaps
-//   D. the mask: AnalyzeStockMask accepts a soft grey rectangle and refuses colour / bright edges; BuildRoundMask's circle; the codecs
+//   D. the mask: AnalyzeStockMask accepts a soft grey rectangle and refuses colour / bright edges / lopsided / blob shapes; BuildRoundMask's
+//      circle; the codecs
+//   F. (0.5.6) the census pick: exactly one mask-like view in a complete census; an incomplete census never picks; a pinned hash + shape wins
 //   E. the blip clip pattern on a synthetic image (resolves, a changed check byte is refused)
 #pragma once
 
@@ -22,7 +24,7 @@ namespace ringround_t {
     using namespace gage::sync::ringround;
     namespace hr = gage::sync::hudring;
 
-    constexpr int kChecks = 15;
+    constexpr int kChecks = 19;
 
     inline bool NearF(double a, double b, double tol) { return std::fabs(a - b) <= tol; }
 
@@ -354,6 +356,85 @@ namespace ringround_t {
             Check("ring map round: codec round trips (RGBA8 / BGRA8 / A8 / R8 exact, BC1 / BC3 alpha / BC4 mean error <= 3 of 255, sizes per format); a soft "
                   "rectangle still analyses as a mask after BC1 and after BC4 (by its red channel: centre 255, not 76)",
                   ok && sr && r4, got + F("BC4 centre %d", s4.insideValue));
+        }
+        // D4. (0.5.6) the stricter mask shape: the soft rectangle is symmetric and flat inside; a soft rectangle with one long ramp (bright centre,
+        //     dark edges, but lopsided) and a grey Gaussian blob (bright centre, dark rim, no flat inside) are refused, each for its own reason
+        {
+            const std::vector<Rgba> m = SoftRect(512, 512, 255, 0, 33);
+            std::vector<Rgba> lop((size_t)512 * 512), blob((size_t)512 * 512);
+            for (int y = 0; y < 512; ++y)
+                for (int x = 0; x < 512; ++x)
+                {
+                    const int dl = x, dr = 511 - x, dy = y < 511 - y ? y : 511 - y;
+                    const float tl = dl >= 13 ? 1.0f : dl / 13.0f, tr = dr >= 180 ? 1.0f : dr / 180.0f, ty = dy >= 13 ? 1.0f : dy / 13.0f;
+                    float t = tl < tr ? tl : tr;
+                    t = t < ty ? t : ty;
+                    const uint8_t g = (uint8_t)(255.0f * t + 0.5f);
+                    lop[(size_t)y * 512 + (size_t)x] = {g, g, g, 255};
+                    const double rx = (x - 255.5) / 256.0, ry = (y - 255.5) / 256.0;
+                    const uint8_t b = (uint8_t)(255.0 * std::exp(-(rx * rx + ry * ry) / (2.0 * 0.3 * 0.3)) + 0.5);
+                    blob[(size_t)y * 512 + (size_t)x] = {b, b, b, 255};
+                }
+            const StockMask a = AnalyzeStockMask(TexFmt::BC1, m, 512, 512), b = AnalyzeStockMask(TexFmt::BC1, lop, 512, 512),
+                            c = AnalyzeStockMask(TexFmt::BC1, blob, 512, 512);
+            Check("ring map round 0.5.6: the soft rectangle is mirror-symmetric and flat inside (a mask); a lopsided one and a grey Gaussian blob are not",
+                  a.ok && a.symErr < 0.5 && a.flat > 0.6 && !b.ok && b.why.find("symmetric") != std::string::npos && !c.ok &&
+                      c.why.find("flat inside") != std::string::npos,
+                  a.why + " | " + b.why + " | " + c.why);
+        }
+        // F1. (0.5.6) the census pick, complete census: exactly one mask-like view is found (wherever it sits among 70); none, two, and an empty
+        //     census are no pick
+        {
+            std::vector<CensusEntry> e(70);
+            for (int i = 0; i < 70; ++i)
+                e[(size_t)i] = {0x1000u + (uint64_t)i, true, false};
+            std::vector<CensusEntry> one = e, none = e, two = e;
+            one[41].shape = true;
+            two[41].shape = two[7].shape = true;
+            const CensusPick p1 = PickMask(one, 0, nullptr, 0), p0 = PickMask(none, 0, nullptr, 0), p2 = PickMask(two, 0, nullptr, 0),
+                             pe = PickMask({}, 0, nullptr, 0);
+            Check("ring map round 0.5.6: census pick: the one mask-like view of 70 is found; none -> no mask, two -> ambiguous, an empty census -> no view",
+                  p1.verdict == PickVerdict::Found && p1.index == 41 && p1.Ok() && p0.verdict == PickVerdict::NoMaskShape && !p0.Ok() &&
+                      p2.verdict == PickVerdict::Ambiguous && !p2.Ok() && pe.verdict == PickVerdict::NoViews && !pe.Ok(),
+                  PickText(p1) + " | " + PickText(p0) + " | " + PickText(p2) + " | " + PickText(pe));
+        }
+        // F2. (0.5.6) an incomplete census never picks, even with exactly one mask-like view among those it holds: views past the cap (or binds it
+        //     could not classify), and a view whose readback failed
+        {
+            std::vector<CensusEntry> e(64);
+            for (int i = 0; i < 64; ++i)
+                e[(size_t)i] = {0x2000u + (uint64_t)i, true, i == 9};
+            std::vector<CensusEntry> unread = e;
+            unread[50].read = false;
+            const CensusPick po = PickMask(e, 3, nullptr, 0), pu = PickMask(unread, 0, nullptr, 0), pc = PickMask(e, 0, nullptr, 0);
+            Check("ring map round 0.5.6: census pick: 3 views not recorded -> incomplete (no pick), one view not read back -> incomplete; the same census "
+                  "complete -> found (the control)",
+                  po.verdict == PickVerdict::Incomplete && !po.Ok() && pu.verdict == PickVerdict::Incomplete && !pu.Ok() && pc.verdict == PickVerdict::Found &&
+                      pc.index == 9,
+                  PickText(po) + " | " + PickText(pu) + " | " + PickText(pc));
+        }
+        // F3. (0.5.6) a pinned stock hash: the one mask-like view carrying it wins over other mask-like views and over an incomplete census; a pinned
+        //     hash on a view that does not look like a mask does not count; two pinned views are ambiguous
+        {
+            const uint64_t pins[2] = {0xabcdef0123456789ULL, 0x1111222233334444ULL};
+            std::vector<CensusEntry> e(20);
+            for (int i = 0; i < 20; ++i)
+                e[(size_t)i] = {0x3000u + (uint64_t)i, true, false};
+            e[3].shape = e[12].shape = true;
+            e[12].hash = pins[0];
+            std::vector<CensusEntry> noShape = e;
+            noShape[12].shape = false;
+            noShape[3].shape = false;
+            std::vector<CensusEntry> twoPins = e;
+            twoPins[3].hash = pins[1];
+            const CensusPick pa = PickMask(e, 0, pins, 2), pi = PickMask(e, 5, pins, 2), pn = PickMask(noShape, 0, pins, 2), p2 = PickMask(twoPins, 0, pins, 2),
+                             pz = PickMask(e, 0, nullptr, 0), p2i = PickMask(twoPins, 5, pins, 2);
+            Check("ring map round 0.5.6: census pick: a pinned hash + mask shape wins over a second mask-like view and over 5 unrecorded views; pinned "
+                  "without the shape -> no mask; two pinned -> ambiguous (also in an incomplete census: the pinned conflict is the reason); no pins -> ambiguous (the control)",
+                  pa.verdict == PickVerdict::FoundPinned && pa.index == 12 && pi.verdict == PickVerdict::FoundPinned && pi.index == 12 &&
+                      pn.verdict == PickVerdict::NoMaskShape && !pn.Ok() && p2.verdict == PickVerdict::Ambiguous && !p2.Ok() &&
+                      pz.verdict == PickVerdict::Ambiguous && p2i.verdict == PickVerdict::Ambiguous && !p2i.Ok(),
+                  PickText(pa) + " | " + PickText(pi) + " | " + PickText(pn) + " | " + PickText(p2) + " | " + PickText(pz) + " | " + PickText(p2i));
         }
         // E1. the blip clip pattern on a synthetic image: unique hit, the flag resolved through the rip-relative displacement; a changed check
         //     byte is refused (the pin is binding)

@@ -374,28 +374,38 @@ std::atomic<bool>     g_swapWanted{ false };
 std::atomic<uint32_t> g_generation{ 1 };
 
 // ---------------------------------------------------------------------------------------------------------
-// 0.5.5 probe recorder: while armed, every 2D texture view of an armed size that the game binds is remembered with the set of probe windows it
-// was bound in (render-thread frames 3+ of a window only: GTA renders the script's frame a frame or two late). radar_mask.cpp draws the texture
-// it is looking for in some windows and nothing in others; the view bound in exactly its windows is the game's own texture of that name.
+// 0.5.6 census (replaces 0.5.5's windowed probe recorder, which overflowed its 64 entries live and could not tell views apart by when they were
+// bound): while armed, every distinct 2D view of an armed size and format that the game binds is kept with its bind count. A dedupe table of
+// kCensusSlots keys says which views were seen (and what they were: verdict); the kept ones sit in g_censusCand[0, cap). Everything the census
+// cannot keep is COUNTED (overflow / otherFormat per size, lost for any size), so radar_mask.cpp can refuse to pick from an incomplete census.
 // ---------------------------------------------------------------------------------------------------------
-struct ProbeEnt {
+struct CensusEnt {
     std::atomic<uintptr_t> key{ 0 };
-    std::atomic<uint32_t>  verdict{ 0 };     // 0 unseen, 1 not a candidate, 2 candidate, 3 being classified
-    std::atomic<uint32_t>  seen{ 0 };        // bit k = bound in window k + 1
-    std::atomic<uint64_t>  binds{ 0 };
-    ID3D11ShaderResourceView* held = nullptr;   // candidates: AddRef'd until ProbeTake / teardown
-    uint32_t w = 0, h = 0;
+    std::atomic<uint32_t>  verdict{ 0 };     // 0 unseen, 1 not of an armed size, 2 kept (in g_censusCand[cand]), 3 being classified,
+                                             // 4 an armed size past the cap, 5 an armed size in a format not asked for
+    uint32_t cand = 0;
 };
-constexpr uint32_t kProbeSlots = 8192, kProbeMaxCands = 64, kProbeMaxSizes = 4, kProbeSkipFrames = 3;
-ProbeEnt g_probeTab[kProbeSlots];
-std::atomic<bool>     g_probeArmed{ false };
-std::atomic<uint32_t> g_probeWinReq{ 0 };     // the script thread's window (0 = none)
-uint32_t              g_probeFrameWin = 0;    // render thread: the window this frame belongs to
-uint32_t              g_probeFramesIn = 0;    // render thread: frames since it changed
-std::atomic<uint32_t> g_probeRecording{ 0 };  // the window the bind hook records into now (0 = none)
-uint32_t              g_probeSizes[kProbeMaxSizes][2] = {};
-int                   g_probeSizeCount = 0;
-std::atomic<uint32_t> g_probeCands{ 0 }, g_probeOverflow{ 0 };
+struct CensusCandRt {
+    std::atomic<bool> ready{ false };        // filled (srv AddRef'd); a claimed entry not ready at CensusTake counts as lost
+    ID3D11ShaderResourceView* srv = nullptr;
+    uint32_t w = 0, h = 0, format = 0, mips = 0;
+    int size = -1;
+    std::atomic<uint64_t> binds{ 0 };
+};
+constexpr uint32_t kCensusSlots = 65536, kCensusProbe = 128;
+CensusEnt    g_censusTab[kCensusSlots];
+CensusCandRt g_censusCand[swap::kCensusMaxCap];
+std::atomic<bool>     g_censusArmed{ false };
+std::atomic<uint32_t> g_censusBusy{ 0 };      // bind hooks inside CensusRecord (CensusTake waits them out)
+uint32_t              g_censusSizes[swap::kCensusMaxSizes][2] = {};
+int                   g_censusSizeCount = 0;
+uint32_t              g_censusFormats[swap::kCensusMaxFormats] = {};
+int                   g_censusFormatCount = 0;
+std::atomic<uint32_t> g_censusN{ 0 };         // entries of g_censusCand claimed (can run past the cap: those are overflow, not kept)
+std::atomic<uint32_t> g_censusCap{ swap::kCensusDefaultCap };
+std::atomic<uint32_t> g_censusOverflow[swap::kCensusMaxSizes] = {}, g_censusOtherFmt[swap::kCensusMaxSizes] = {};
+std::atomic<uint32_t> g_censusLost{ 0 };
+std::atomic<uint64_t> g_censusBinds{ 0 };
 
 // counters
 std::atomic<uint64_t> g_binds{ 0 };
@@ -504,27 +514,28 @@ uint32_t Classify(Slot* sl, ID3D11ShaderResourceView* srv, uint32_t seen) {
     return fin;
 }
 
-// 0.5.5 probe recorder, from the bind hook while armed (the game binds from its render thread; the CAS keeps a second thread out anyway).
-void ProbeRecord(ID3D11ShaderResourceView* const* pp, UINT num) {
-    const uint32_t win = g_probeRecording.load(std::memory_order_relaxed);
+// 0.5.6 census, from the bind hook while armed (the game binds from its render thread; the CASes keep a second thread consistent anyway).
+// Only the FIRST bind of a view costs D3D calls (its description); later binds are a table lookup and a counter.
+void CensusRecord(ID3D11ShaderResourceView* const* pp, UINT num) {
     for (UINT i = 0; i < num; ++i) {
         ID3D11ShaderResourceView* s = pp[i];
         if (!s) continue;
+        g_censusBinds.fetch_add(1, std::memory_order_relaxed);
         const uintptr_t key = (uintptr_t)s;
-        uint32_t idx = (uint32_t)(((uint64_t)key >> 4) * 0x9E3779B97F4A7C15ULL >> (64 - 13));
-        ProbeEnt* e = nullptr;
-        for (int probe = 0; probe < 64; ++probe, idx = (idx + 1) & (kProbeSlots - 1)) {
-            uintptr_t k = g_probeTab[idx].key.load(std::memory_order_acquire);
-            if (k == key) { e = &g_probeTab[idx]; break; }
+        uint32_t idx = (uint32_t)(((uint64_t)key >> 4) * 0x9E3779B97F4A7C15ULL >> (64 - 16));
+        CensusEnt* e = nullptr;
+        for (uint32_t probe = 0; probe < kCensusProbe; ++probe, idx = (idx + 1) & (kCensusSlots - 1)) {
+            uintptr_t k = g_censusTab[idx].key.load(std::memory_order_acquire);
+            if (k == key) { e = &g_censusTab[idx]; break; }
             if (k == 0) {
-                if (g_probeTab[idx].key.compare_exchange_strong(k, key, std::memory_order_acq_rel) || k == key) { e = &g_probeTab[idx]; break; }
+                if (g_censusTab[idx].key.compare_exchange_strong(k, key, std::memory_order_acq_rel) || k == key) { e = &g_censusTab[idx]; break; }
             }
         }
-        if (!e) continue;
+        if (!e) { g_censusLost.fetch_add(1, std::memory_order_relaxed); continue; }   // never silent: this view could have been any size
         uint32_t v = e->verdict.load(std::memory_order_acquire);
         if (v == 0) {
             uint32_t expect = 0;
-            if (!e->verdict.compare_exchange_strong(expect, 3, std::memory_order_acq_rel)) continue;
+            if (!e->verdict.compare_exchange_strong(expect, 3, std::memory_order_acq_rel)) continue;   // another thread classifies it right now
             uint32_t fin = 1;
             ID3D11Resource* res = nullptr;
             s->GetResource(&res);
@@ -536,25 +547,41 @@ void ProbeRecord(ID3D11ShaderResourceView* const* pp, UINT num) {
                     D3D11_TEXTURE2D_DESC d;
                     tex->GetDesc(&d);
                     tex->Release();
-                    for (int z = 0; z < g_probeSizeCount && fin == 1; ++z)
-                        if (d.Width == g_probeSizes[z][0] && d.Height == g_probeSizes[z][1] && d.ArraySize == 1 && !(d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
-                            if (g_probeCands.load() >= kProbeMaxCands) { g_probeOverflow.fetch_add(1); break; }
-                            g_probeCands.fetch_add(1);
-                            s->AddRef();
-                            e->held = s;
-                            e->w = d.Width;
-                            e->h = d.Height;
-                            fin = 2;
+                    int z = -1;
+                    if (d.ArraySize == 1 && d.SampleDesc.Count == 1 && !(d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE))
+                        for (int q = 0; q < g_censusSizeCount; ++q)
+                            if (d.Width == g_censusSizes[q][0] && d.Height == g_censusSizes[q][1]) { z = q; break; }
+                    if (z >= 0) {
+                        bool fmtOk = false;
+                        for (int q = 0; q < g_censusFormatCount; ++q)
+                            if ((uint32_t)d.Format == g_censusFormats[q]) { fmtOk = true; break; }
+                        if (!fmtOk) {
+                            g_censusOtherFmt[z].fetch_add(1, std::memory_order_relaxed);
+                            fin = 5;
+                        } else {
+                            const uint32_t at = g_censusN.fetch_add(1, std::memory_order_acq_rel);
+                            if (at >= g_censusCap.load(std::memory_order_relaxed)) {
+                                g_censusOverflow[z].fetch_add(1, std::memory_order_relaxed);
+                                fin = 4;
+                            } else {
+                                CensusCandRt& c = g_censusCand[at];
+                                s->AddRef();
+                                c.srv = s;
+                                c.w = d.Width; c.h = d.Height; c.format = (uint32_t)d.Format; c.mips = d.MipLevels; c.size = z;
+                                c.binds.store(0, std::memory_order_relaxed);
+                                c.ready.store(true, std::memory_order_release);
+                                e->cand = at;
+                                fin = 2;
+                            }
                         }
+                    }
                 }
                 res->Release();
             }
             e->verdict.store(fin, std::memory_order_release);
             v = fin;
         }
-        if (v != 2) continue;
-        e->binds.fetch_add(1, std::memory_order_relaxed);
-        if (win >= 1 && win <= 32) e->seen.fetch_or(1u << (win - 1), std::memory_order_relaxed);
+        if (v == 2) g_censusCand[e->cand].binds.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -565,7 +592,11 @@ void STDMETHODCALLTYPE HookPSSetSRV(ID3D11DeviceContext* self, UINT start, UINT 
         orig(self, start, num, pp);
         return;
     }
-    if (g_probeArmed.load(std::memory_order_relaxed)) ProbeRecord(pp, num);   // the stock views, before any substitution
+    if (g_censusArmed.load(std::memory_order_acquire)) {                     // 0.5.6: the stock views, before any substitution
+        g_censusBusy.fetch_add(1, std::memory_order_acq_rel);
+        if (g_censusArmed.load(std::memory_order_acquire)) CensusRecord(pp, num);
+        g_censusBusy.fetch_sub(1, std::memory_order_acq_rel);
+    }
     ID3D11ShaderResourceView* local[128];
     bool copied = false;
     int verifySlot = -1;          // one substitution per call is read back (every kVerifyEvery-th of its entry)
@@ -914,21 +945,34 @@ void PumpImpl(ID3D11DeviceContext* ctx) {
     }
 }
 
-// 0.5.5: disarm the probe recorder and drop every candidate it holds (render thread, or teardown).
-void ProbeClear() {
-    g_probeArmed.store(false);
-    g_probeRecording.store(0);
-    for (uint32_t i = 0; i < kProbeSlots; ++i) {
-        ProbeEnt& e = g_probeTab[i];
+// 0.5.6: disarm the census, wait out a bind hook still inside it, and drop every view it holds (render thread, or teardown).
+void CensusDisarm() {
+    g_censusArmed.store(false, std::memory_order_release);
+    for (int spins = 0; g_censusBusy.load(std::memory_order_acquire) != 0; ++spins) {
+        if (spins < 64) YieldProcessor(); else Sleep(0);
+    }
+}
+void CensusClear() {
+    CensusDisarm();
+    for (uint32_t i = 0; i < kCensusSlots; ++i) {
+        CensusEnt& e = g_censusTab[i];
         if (!e.key.load(std::memory_order_relaxed)) continue;
-        if (e.held) { e.held->Release(); e.held = nullptr; }
-        e.verdict.store(0); e.seen.store(0); e.binds.store(0); e.w = e.h = 0;
+        e.verdict.store(0);
+        e.cand = 0;
         e.key.store(0);
     }
-    g_probeCands.store(0);
-    g_probeOverflow.store(0);
-    g_probeFrameWin = 0;
-    g_probeFramesIn = 0;
+    for (uint32_t i = 0; i < swap::kCensusMaxCap; ++i) {
+        CensusCandRt& c = g_censusCand[i];
+        if (c.srv) { c.srv->Release(); c.srv = nullptr; }
+        c.ready.store(false);
+        c.binds.store(0);
+        c.w = c.h = c.format = c.mips = 0;
+        c.size = -1;
+    }
+    g_censusN.store(0);
+    for (int z = 0; z < swap::kCensusMaxSizes; ++z) { g_censusOverflow[z].store(0); g_censusOtherFmt[z].store(0); }
+    g_censusLost.store(0);
+    g_censusBinds.store(0);
 }
 
 // Restore both vtable slots and drop every D3D object we hold (jobs, queue, replacements, our device/context
@@ -956,8 +1000,8 @@ void Teardown(const char* why) {
         g_repl[i].subst.store(0); g_repl[i].lastTick.store(0); g_repl[i].verified.store(0); g_repl[i].verifyMiss.store(0);
         g_repl[i].seen.store(0); g_repl[i].lastSeenTick.store(0); g_repl[i].on.store(true);
     }
-    ProbeClear();
-    g_generation.fetch_add(1);                         // every swap::Replace handle handed out so far is dead now
+    CensusClear();
+    g_generation.fetch_add(1);                        // every swap::Replace handle handed out so far is dead now
     if (g_srvSeen.load() != 0) {                       // nothing was ever classified: skip walking 4 MB of untouched table
         for (uint32_t i = 0; i < kSlotCount; ++i) {
             if (g_slots[i].key.load(std::memory_order_relaxed)) { g_slots[i].key.store(0); g_slots[i].info.store(0); g_slots[i].notBefore.store(0); }
@@ -1014,10 +1058,7 @@ void Poll(void* swapChain) {
             if (g_dev && g_dev != dev) GLOGI("brand apparel: the game's device changed (%p -> %p); re-installing", (void*)g_dev, (void*)dev);
             InstallHooks(dev, ctx);     // tears the old install down itself when the device or context differs
         }
-        if (g_hooksInstalled.load()) {
-            swap::ProbeFrame();
-            if (brand) PumpImpl(ctx);
-        }
+        if (g_hooksInstalled.load() && brand) PumpImpl(ctx);
         ctx->Release();
     }
     dev->Release();
@@ -1119,45 +1160,40 @@ bool SetActive(int handle, uint32_t generation, bool on) {
     return true;
 }
 
-bool ProbeArm(const ProbeSize* sizes, int n) {
-    if (!g_hooksInstalled.load() || !sizes || n <= 0 || n > (int)kProbeMaxSizes) return false;
-    ProbeClear();
-    for (int i = 0; i < n; ++i) { g_probeSizes[i][0] = sizes[i].w; g_probeSizes[i][1] = sizes[i].h; }
-    g_probeSizeCount = n;
-    g_probeWinReq.store(0);
-    g_probeArmed.store(true);
+bool CensusArm(const CensusSize* sizes, int n, const uint32_t* formats, int nFormats) {
+    if (!g_hooksInstalled.load() || !sizes || n <= 0 || n > kCensusMaxSizes || !formats || nFormats <= 0 || nFormats > kCensusMaxFormats) return false;
+    CensusClear();
+    for (int i = 0; i < n; ++i) { g_censusSizes[i][0] = sizes[i].w; g_censusSizes[i][1] = sizes[i].h; }
+    g_censusSizeCount = n;
+    for (int i = 0; i < nFormats; ++i) g_censusFormats[i] = formats[i];
+    g_censusFormatCount = nFormats;
+    g_censusArmed.store(true, std::memory_order_release);
     return true;
 }
 
-void ProbeSetWindow(uint32_t window) { g_probeWinReq.store(window <= 32 ? window : 0); }
+bool CensusArmed() { return g_censusArmed.load(); }
 
-void ProbeFrame() {
-    if (!g_probeArmed.load()) return;
-    const uint32_t w = g_probeWinReq.load();
-    if (w != g_probeFrameWin) { g_probeFrameWin = w; g_probeFramesIn = 0; }
-    else ++g_probeFramesIn;
-    // the first frames after a change may still show the previous script frame: not recorded
-    g_probeRecording.store(g_probeFramesIn >= kProbeSkipFrames ? w : 0);
-}
-
-std::vector<ProbeCand> ProbeTake(uint32_t* overflow) {
-    std::vector<ProbeCand> out;
-    g_probeArmed.store(false);
-    g_probeRecording.store(0);
-    if (overflow) *overflow = g_probeOverflow.load();
-    for (uint32_t i = 0; i < kProbeSlots; ++i) {
-        ProbeEnt& e = g_probeTab[i];
-        if (e.held) {
-            ProbeCand c;
-            c.srv = e.held;                                  // the reference goes to the caller
-            c.w = e.w; c.h = e.h;
-            c.seen = e.seen.load();
-            c.binds = e.binds.load();
-            out.push_back(c);
-            e.held = nullptr;
-        }
+Census CensusTake() {
+    Census out;
+    if (!g_censusArmed.load()) return out;
+    CensusDisarm();
+    const uint32_t cap = g_censusCap.load();
+    const uint32_t claimed = g_censusN.load();
+    out.cap = cap;
+    for (uint32_t i = 0; i < claimed && i < cap; ++i) {
+        CensusCandRt& c = g_censusCand[i];
+        if (!c.ready.load(std::memory_order_acquire) || !c.srv) { ++out.lost; continue; }   // claimed, never filled: a view we know nothing about
+        CensusCand o;
+        o.srv = c.srv;                                       // the reference goes to the caller
+        c.srv = nullptr;
+        o.w = c.w; o.h = c.h; o.format = c.format; o.mips = c.mips; o.size = c.size;
+        o.binds = c.binds.load();
+        out.cands.push_back(o);
     }
-    ProbeClear();
+    for (int z = 0; z < kCensusMaxSizes; ++z) { out.overflow[z] = g_censusOverflow[z].load(); out.otherFormat[z] = g_censusOtherFmt[z].load(); }
+    out.lost += g_censusLost.load();
+    out.binds = g_censusBinds.load();
+    CensusClear();
     return out;
 }
 
@@ -1183,6 +1219,7 @@ int CompositeChain(int width, int levels, int bytesPerBlock, int baseSize, const
 void Reset() {
     Shutdown();
     g_brandOn.store(true);
+    g_censusCap.store(swap::kCensusDefaultCap);
     for (uint32_t i = 0; i < kSlotCount; ++i) { g_slots[i].key.store(0); g_slots[i].info.store(0); }
     {
         std::lock_guard<std::mutex> lock(g_targetsMu);
@@ -1206,6 +1243,7 @@ bool AddTarget(const char* name, uint64_t tailHash, bool bc3, int baseSize, int 
 bool InstallOn(ID3D11Device* dev, ID3D11DeviceContext* ctx) { return InstallHooks(dev, ctx); }
 void Pump(ID3D11DeviceContext* ctx) { PumpImpl(ctx); }
 void SetBrandOn(bool on) { g_brandOn.store(on); }
+void SetCensusCap(uint32_t cap) { g_censusCap.store(cap == 0 ? swap::kCensusDefaultCap : cap > swap::kCensusMaxCap ? swap::kCensusMaxCap : cap); }
 size_t PendingCount() {
     AcquireSRWLockExclusive(&g_pendLock);
     const size_t n = g_pending.size();

@@ -568,10 +568,20 @@ namespace gage::sync::ringround {
         std::string why;          // !ok: what failed (logged)
         Rgba inside, outside;     // the centre's and the corners' average texel
         int insideValue = 0, outsideValue = 0, edgeValue = 0;   // the edge: the mean value along the four sides
+        double symErr = 0.0;      // 0.5.6: mean |value - its mirror image's|, left-right and top-bottom averaged (0..255)
+        double flat = 0.0;        // 0.5.6: share of texels at >= kFlatLevel of the centre value (the mask's flat inside)
     };
+    // 0.5.6 (the census reads back EVERY same-size view the game binds, dozens of 512 x 512 ones): the radar mask is also mirror-symmetric (the
+    // 0.5.4 probes: its contour centred within 1.5 px on both axes) and flat inside (a 13 px ramp on a ~190 px box: about 75 % of it at full
+    // value), which a spec / AO map or a light cookie with a dark rim is not. Generous on purpose: the tolerances only have to keep other textures
+    // out, and every candidate's numbers are logged.
+    constexpr double kFlatLevel = 0.85;   // "at the centre value": >= 85 % of it
+    constexpr double kFlatMin = 0.30;     // the share of the texture that must be flat inside
+    inline double SymTol(int centre) { return 4.0 + centre / 32.0; }   // 12 of 255 at a white centre
     // A mask looks like: grey (r, g, b within 24 of each other at the centre and corners), a bright centre (value >= 64), and edges and corners well
-    // below it (each <= 60 % of the centre). Anything else is not the radar mask: the swap is refused (a wrong texture made round would be worse
-    // than a square map).
+    // below it (each <= 60 % of the centre), mirror-symmetric on both axes (mean error <= SymTol) and flat inside (>= kFlatMin of the texels at
+    // >= kFlatLevel of the centre). Anything else is not the radar mask: the swap is refused (a wrong texture made round would be worse than a
+    // square map).
     inline StockMask AnalyzeStockMask(TexFmt f, const std::vector<Rgba>& px, int w, int h)
     {
         StockMask m;
@@ -629,15 +639,37 @@ namespace gage::sync::ringround {
             const int a = c.r, b = c.g, d = c.b;
             return std::abs(a - b) <= 24 && std::abs(b - d) <= 24 && std::abs(a - d) <= 24;
         };
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), "centre %d (rgba %u %u %u %u), corners %d, edges %d", m.insideValue, m.inside.r, m.inside.g, m.inside.b,
-                      m.inside.a, m.outsideValue, m.edgeValue);
+        {
+            // mirror error and the flat share, one pass over the texels
+            double sx = 0.0, sy = 0.0;
+            long flatN = 0;
+            const double flatAt = m.insideValue * kFlatLevel;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    const int v = TexelValue(f, at(x, y));
+                    sx += std::abs(v - TexelValue(f, at(w - 1 - x, y)));
+                    sy += std::abs(v - TexelValue(f, at(x, h - 1 - y)));
+                    if (v >= flatAt)
+                        ++flatN;
+                }
+            const double n = (double)w * (double)h;
+            m.symErr = (sx + sy) / (2.0 * n);
+            m.flat = (double)flatN / n;
+        }
+        char buf[240];
+        std::snprintf(buf, sizeof(buf), "centre %d (rgba %u %u %u %u), corners %d, edges %d, mirror error %.1f, flat %.0f %%", m.insideValue, m.inside.r,
+                      m.inside.g, m.inside.b, m.inside.a, m.outsideValue, m.edgeValue, m.symErr, m.flat * 100.0);
         if (!grey(m.inside) || !grey(m.outside))
             m.why = std::string("not grey: ") + buf;
         else if (m.insideValue < 64)
             m.why = std::string("centre too dark for a mask: ") + buf;
         else if (m.outsideValue * 10 > m.insideValue * 6 || m.edgeValue * 10 > m.insideValue * 6)
             m.why = std::string("edges not dark (not a mask shape): ") + buf;
+        else if (m.symErr > SymTol(m.insideValue))
+            m.why = std::string("not mirror-symmetric (not a mask shape): ") + buf;
+        else if (m.flat < kFlatMin)
+            m.why = std::string("not flat inside (a blob, not a mask): ") + buf;
         else
         {
             m.ok = true;
@@ -696,6 +728,116 @@ namespace gage::sync::ringround {
             h *= 0x100000001b3ULL;
         }
         return h;
+    }
+
+    // ---- 6b. the census pick (0.5.6) -----------------------------------------------------------------------------------------------------
+    // 0.5.5 told the masks apart by bind WINDOWS (draw a mask in some windows, nothing in others, hide the radar meanwhile). Live (GI 2026-11-07,
+    // Legacy) every view of the masks' sizes was bound in EVERY window, render frames outnumber script ticks ~70 : 1, and 62 + 2 views of those
+    // sizes overflowed the 64-entry table: nothing found, the radar hidden for 2.9 s and 1.4 s for nothing. 0.5.6 picks by CONTENT: the bind hook
+    // keeps every distinct view of the mask's size (radar_mask.cpp reads each back, no stall) and this rule picks the one that looks like a mask.
+    //   - pinned: a view whose stock hash is a known radar-mask hash AND looks like a mask wins on its own (content identity), even when the census
+    //     is incomplete or other views look like masks too; two such views = ambiguous;
+    //   - otherwise the census must be COMPLETE (no view of that size left unrecorded: past the cap, unplaceable, or not read back), because an
+    //     unread view could be a second mask-like one: incomplete = no pick, however many matches;
+    //   - then exactly one view must look like a mask (none = no mask, two or more = ambiguous: never a guess).
+    struct CensusEntry
+    {
+        uint64_t hash = 0;     // FNV-1a 64 over its mips (valid when read)
+        bool read = false;     // read back and analysed
+        bool shape = false;    // AnalyzeStockMask says it looks like a mask
+    };
+    enum class PickVerdict
+    {
+        Found,         // the one view that looks like a mask, in a complete census
+        FoundPinned,   // the one view with a pinned stock hash that looks like a mask
+        NoViews,       // the census holds no view of that size (complete)
+        NoMaskShape,   // complete, none looks like a mask
+        Ambiguous,     // two or more look like a mask (or carry a pinned hash)
+        Incomplete,    // some views of that size were not recorded or not read back: no pick
+    };
+    inline const char* PickVerdictName(PickVerdict v)
+    {
+        switch (v)
+        {
+        case PickVerdict::Found: return "FOUND";
+        case PickVerdict::FoundPinned: return "FOUND (pinned hash)";
+        case PickVerdict::NoViews: return "no view of that size bound";
+        case PickVerdict::NoMaskShape: return "no view looks like a mask";
+        case PickVerdict::Ambiguous: return "AMBIGUOUS (not guessing)";
+        case PickVerdict::Incomplete: return "INCOMPLETE census (not guessing)";
+        }
+        return "?";
+    }
+    struct CensusPick
+    {
+        PickVerdict verdict = PickVerdict::NoViews;
+        int index = -1;              // Found / FoundPinned: the entry
+        int views = 0, read = 0, shapes = 0, pinned = 0;
+        uint32_t notRecorded = 0;
+        bool Ok() const { return index >= 0; }
+    };
+    // entries: every view of that size the census kept; notRecorded: views of that size it saw and could not keep (past the cap) plus binds it
+    // could not classify at all (any size: they could have been this one).
+    inline CensusPick PickMask(const std::vector<CensusEntry>& entries, uint32_t notRecorded, const uint64_t* pins, int nPins)
+    {
+        CensusPick p;
+        p.views = (int)entries.size();
+        p.notRecorded = notRecorded;
+        int shapeAt = -1, pinAt = -1;
+        for (int i = 0; i < (int)entries.size(); ++i)
+        {
+            const CensusEntry& e = entries[(size_t)i];
+            if (!e.read)
+                continue;
+            ++p.read;
+            if (!e.shape)
+                continue;
+            ++p.shapes;
+            shapeAt = i;
+            for (int k = 0; k < nPins && pins; ++k)
+                if (pins[k] == e.hash)
+                {
+                    ++p.pinned;
+                    pinAt = i;
+                    break;
+                }
+        }
+        if (p.pinned == 1)
+        {
+            p.verdict = PickVerdict::FoundPinned;
+            p.index = pinAt;
+            return p;
+        }
+        if (p.pinned > 1)
+        {
+            p.verdict = PickVerdict::Ambiguous;
+            return p;
+        }
+        if (notRecorded > 0 || p.read < p.views)
+        {
+            p.verdict = PickVerdict::Incomplete;
+            return p;
+        }
+        if (p.views == 0)
+            p.verdict = PickVerdict::NoViews;
+        else if (p.shapes == 0)
+            p.verdict = PickVerdict::NoMaskShape;
+        else if (p.shapes > 1)
+            p.verdict = PickVerdict::Ambiguous;
+        else
+        {
+            p.verdict = PickVerdict::Found;
+            p.index = shapeAt;
+        }
+        return p;
+    }
+    // "FOUND: 1 of 13 views looks like a mask (13 read back, 0 not recorded)" and friends, for the log
+    inline std::string PickText(const CensusPick& p)
+    {
+        char b[200];
+        std::snprintf(b, sizeof(b), "%s: %d of %d view(s) look like a mask%s (%d read back, %u not recorded)", PickVerdictName(p.verdict), p.shapes, p.views,
+                      p.pinned ? (p.pinned == 1 ? ", 1 with a pinned hash" : ", several with a pinned hash") : "", p.read, (unsigned)p.notRecorded);
+        return b;
     }
 
     // ---- 7. the blip clip flag (FiveM SET_MINIMAP_CLIP_TYPE) -----------------------------------------------------------------------------
