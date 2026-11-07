@@ -864,6 +864,7 @@ namespace {
     std::atomic<bool>  g_ringMap{true};               // 0.5.2 ring_map: GTA's radar moved into the ring (MinimapReadSwitches)
     std::atomic<bool>  g_ringMapBig{true};            // 0.5.4 ring_map_big: the placement also written to the big radar's slots (MinimapReadSwitches)
     std::atomic<int>   g_ringMapZoom{sync::kRingMapZoomDefault};   // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM level each tick, 0 = the game's own zoom
+    std::atomic<bool>  g_radarBigmapOff{true};        // 0.5.8 radar_bigmap_off: SET_BIGMAP_ACTIVE(false) held while the ring map shows (outside our flip)
     std::atomic<bool>  g_ringMapRound{true};          // 0.5.5 ring_map_round: GTA's radar clipped round by our mask, the map grown to the arcs
     std::atomic<bool>  g_ringBlipClip{false};          // 0.5.5 ring_map_blip_clip: off-radar blips clamp to the circle while the map is round
     std::atomic<float> g_ringFitX{sync::ringround::kBoxFitX}, g_ringFitY{sync::ringround::kBoxFitY};   // 0.5.5 ring_map_round_fit
@@ -907,9 +908,18 @@ namespace {
             g_ringMapZoom.store(z.level);
             GLOGI("engine: ring map round 2 (0.5.4): ring_map_big=%s; ring_map_zoom=%d (%s)%s",
                   g_ringMapBig.load() ? "on (the placement mirrored into the big radar's slots; LIVE-UNVERIFIED)" : "OFF (minimap slots only, as 0.5.3)",
-                  z.level, z.level == 0 ? "the game's own zoom, as 0.5.3" : "SET_RADAR_ZOOM every tick while the ring map shows; LIVE-UNVERIFIED",
+                  z.level, z.level == 0 ? "the game's own zoom (0.5.8 default)" : "SET_RADAR_ZOOM every tick while the ring map shows; LIVE-UNVERIFIED",
                   z.why ? z.why : "");
         }
+        // 0.5.8 radar_bigmap_off (default on; 0 = 0.5.7): GI after 0.5.7, "again too zoomed out". The 0.5.7 run bound radarmasklg (the EXPANDED
+        // radar's mask) about once a frame and radarmasksm never, the probes showed the same wide view at zoom 600 as at 1100, and the 0.5.2 probes
+        // showed the expanded radar's own box on the corner: the radar stays expanded, where SET_RADAR_ZOOM does not set the span. No native reads
+        // the mode back, so SET_BIGMAP_ACTIVE(false, false) is HELD every tick while the ring map shows, except during our own big-radar flip.
+        g_radarBigmapOff.store(reg::Get(L"radar_bigmap_off") != L"0");
+        GLOGI("engine: ring map (0.5.8): radar_bigmap_off=%s", g_radarBigmapOff.load()
+                                                                    ? "on (SET_BIGMAP_ACTIVE(false, false) held every tick while the ring map shows, outside "
+                                                                      "our flip; LIVE-UNVERIFIED)"
+                                                                    : "OFF (0.5.7: the expanded radar is left as the game has it)");
         // 0.5.5 (GI 2026-11-07: "fill out the current design HUD circle to the point where it doesn't go over hp and satiety and there's no gap
         // either"). ring_map_round (default on; 0 = the 0.5.4 map): the radar's own mask texture is swapped for a circle (radar_mask.h) and, only
         // while that swap is confirmed by the bind hook, the map grows to the arcs. ring_map_blip_clip (default OFF for the first live round, one
@@ -4716,6 +4726,7 @@ namespace {
         uint32_t uSettled = 0, uHiddenFalse = 0;                        // radar not wanted: IS_RADAR_HIDDEN reading false is the bad answer
         uint32_t setupOk = 0, setupBeginRefused = 0, barsUncallable = 0, requestFailed = 0;
         uint32_t zoomCalls = 0, zoomUncallable = 0;                     // 0.5.4 ring_map_zoom
+        uint32_t bigmapOffCalls = 0, bigmapOffUncallable = 0;           // 0.5.8 radar_bigmap_off
     };
     constexpr double kMiniSettleMs = 500.0, kMiniSampleMs = 100.0, kMiniLogMs = 10000.0, kMiniSafeZoneMs = 2000.0;
     MinimapStats g_mini;
@@ -4805,12 +4816,14 @@ namespace {
               s.wSettled, s.wHiddenTrue, s.wRenderFalse, s.uSettled, s.uHiddenFalse, s.hudHidden, s.prefOff, s.readUnresolved, s.waypointSamples, g_miniMovie,
               g_miniMovieLoaded ? "loaded" : "NOT loaded", s.setupOk, s.setupBeginRefused, s.barsUncallable, bs.requests, s.requestFailed, bs.refreshOn,
               bs.refreshOff, g_barsGate.BigmapOn() ? "YES" : "no", clearance.c_str());
-        const uint32_t zoomCalls = s.zoomCalls, zoomUncallable = s.zoomUncallable;
+        const uint32_t zoomCalls = s.zoomCalls, zoomUncallable = s.zoomUncallable, offCalls = s.bigmapOffCalls, offUncallable = s.bigmapOffUncallable;
         g_barsGate.ClearCounters();
         s = MinimapStats();
         GLOGI("engine: minimap size (0.4.25), last 10 s: %s; radar rectangle scale %.2f (what the overlay's vitals strip and the clearance check use); "
-              "ring map zoom (0.5.4) SET_RADAR_ZOOM(%d) calls %u, uncallable %u",
-              game::minimapsize::Status().c_str(), (double)g_miniAppliedScale, g_ringMapZoom.load(), zoomCalls, zoomUncallable);
+              "ring map zoom (0.5.4) SET_RADAR_ZOOM(%d) calls %u, uncallable %u; expanded radar held off (0.5.8 radar_bigmap_off=%s) SET_BIGMAP_ACTIVE(false) "
+              "calls %u, uncallable %u",
+              game::minimapsize::Status().c_str(), (double)g_miniAppliedScale, g_ringMapZoom.load(), zoomCalls, zoomUncallable,
+              g_radarBigmapOff.load() ? "on" : "OFF", offCalls, offUncallable);
     }
 
     // ---- 0.5.5 ring_map_round (libs/sync/ring_round.h, apps/engine/radar_mask.h) -------------------------------------------------------------
@@ -4851,7 +4864,7 @@ namespace {
         uint32_t activeCalls = 0;
         bool shown = false;
         double shownSinceMs = 0.0;
-        uint64_t bindsAtLog = 0, substAtLog = 0;
+        uint64_t bindsAtLog = 0, substAtLog = 0, bigBindsAtLog = 0;
         uint32_t transitionsLogged = 0;
         bool probesRearmed = false;              // the two radar probe images retaken once the map first went round (radar_probe_3 / _4)
         double roundOpenMs = 0.0;
@@ -5027,13 +5040,15 @@ namespace {
         in.bigReplaced = game::radarmask::Live(game::radarmask::kBig);
         in.bigMirror = g_ringMapBig.load();
         const game::brand::swap::SwapCounters sc = game::brand::swap::Counters(st.k[0].handle);
-        in.smallBinds = in.smallReplaced ? sc.seen : 0;
+        const game::brand::swap::SwapCounters bcIn = game::brand::swap::Counters(st.k[1].handle);
+        // 0.5.8: the binds of EITHER identified mask (0.5.7 live: the radar bound only radarmasklg, so the small-only count never confirmed)
+        in.maskBinds = rr::MaskBinds(in.smallReplaced, sc.seen, in.bigReplaced, bcIn.seen);
         in.lastBindMs = -1.0;
         // the last bind of EITHER identified mask (the player's own big radar draws with radarmasklg, and that is no reason to shrink)
         ULONGLONG lastSeen = in.smallReplaced ? sc.lastSeenTick : 0;
         if (in.bigReplaced)
         {
-            const ULONGLONG b = game::brand::swap::Counters(st.k[1].handle).lastSeenTick;
+            const ULONGLONG b = bcIn.lastSeenTick;
             if (b > lastSeen)
                 lastSeen = b;
         }
@@ -5063,9 +5078,11 @@ namespace {
             if (R.transitionsLogged < 16)
             {
                 ++R.transitionsLogged;
-                GLOGI("engine: ring map round mask (0.5.6): map %s: %s (binds of the mask %llu, substitutions %llu, read back %u ok / %u missed)",
+                GLOGI("engine: ring map round mask (0.5.6): map %s: %s (binds of the masks %llu: small %llu, big %llu; small substitutions %llu, read back %u ok / %u missed; "
+                      "big substitutions %llu)",
                       o.round ? "GROWS to the arcs" : "back to the 0.5.4 size (radar held hidden until it lands)", rr::RoundWhyName(o.why),
-                      (unsigned long long)sc.seen, (unsigned long long)sc.subst, sc.verified, sc.verifyMiss);
+                      (unsigned long long)in.maskBinds, (unsigned long long)sc.seen, (unsigned long long)bcIn.seen, (unsigned long long)sc.subst, sc.verified,
+                      sc.verifyMiss, (unsigned long long)bcIn.subst);
             }
         }
         R.out = o;
@@ -5103,6 +5120,9 @@ namespace {
         const uint64_t bindsDelta = binds >= R.bindsAtLog ? binds - R.bindsAtLog : binds;
         R.substAtLog = subst;
         R.bindsAtLog = binds;
+        const uint64_t bigBinds = bigLive ? bc.seen : 0;
+        const uint64_t bigBindsDelta = bigBinds >= R.bigBindsAtLog ? bigBinds - R.bigBindsAtLog : bigBinds;
+        R.bigBindsAtLog = bigBinds;
         const ULONGLONG t = GetTickCount64();
         char place[260];
         if (RingRoundOpen() && displayH > 0.0f)
@@ -5129,14 +5149,14 @@ namespace {
         }
         GLOGI("engine: ring map round mask (0.5.6), last 10 s: %s; grows %u / shrinks %u%s; mask found %s (census %s, run %d: %s); radarmasksm %s %ux%u %s %u mip(s) "
               "stock hash %016llx: radar binds %llu (+%llu in 10 s), our circle %s, binds swapped %llu (+%llu in 10 s, last %s), read back %u ok / %u missed; "
-              "radarmasklg %s (binds %llu, swapped %llu); %s; placement %s; hooks %s",
+              "radarmasklg %s (binds %llu (+%llu in 10 s), swapped %llu); %s; placement %s; hooks %s",
               rr::RoundWhyName(R.out.why), R.gate.Grows(), R.gate.Shrinks(), R.shrinkStuck ? " (a shrink never landed: our circle kept on)" : "", smallLive ? "YES" : "no",
               RoundStepName(R.step), R.runs + (R.step == RoundStep::Done || R.step == RoundStep::Census ? 1 : 0), census.c_str(),
               smallLive ? "REPLACED" : st.k[0].found ? "found, not replaced" : "not found", st.k[0].w, st.k[0].h, sync::ringround::TexFmtName(st.k[0].fmt), st.k[0].mips,
               (unsigned long long)st.k[0].stockHash, (unsigned long long)binds, (unsigned long long)bindsDelta, R.active ? "HANDED OUT" : "not handed out",
               (unsigned long long)subst, (unsigned long long)delta, lastSubst.c_str(), sc.verified, sc.verifyMiss,
-              bigLive ? "REPLACED" : st.k[1].found ? "found, not replaced" : st.k[1].probed ? "not found" : "not looked for", (unsigned long long)(bigLive ? bc.seen : 0),
-              (unsigned long long)(bigLive ? bc.subst : 0), game::minimapsize::BlipClipStatus().c_str(), place,
+              bigLive ? "REPLACED" : st.k[1].found ? "found, not replaced" : st.k[1].probed ? "not found" : "not looked for", (unsigned long long)bigBinds,
+              (unsigned long long)bigBindsDelta, (unsigned long long)(bigLive ? bc.subst : 0), game::minimapsize::BlipClipStatus().c_str(), place,
               st.notD3D11 ? "NOT D3D11 (Enhanced: skipped)" : st.hooks ? "installed" : "not installed");
     }
 
@@ -5199,26 +5219,35 @@ namespace {
     }
 
     // 0.5.2 ring_map: the overlay opens the ring's map hole only while the table holds the placement, the radar is shown, the big radar is off (a
-    // flip re-lays the radar out: it is the big map for its duration) and all of that has held for kRingMapSettleMs. Round 1 of the round map also
+    // flip re-lays the radar out: it is the big map for its duration) and all of that has held for sync::kHoleSettleMs. Round 1 of the round map also
     // saves the bottom-left of the frame twice (Overlay::RequestRadarProbe, D3D11 only) so the radar's real landing place can be measured.
-    constexpr double kRingMapSettleMs = 800.0;
+    // 0.5.8: the settle is sync::RingHoleTimer (libs/sync/minimap.h, kHoleSettleMs 800 ms); a hole closed only by the radar's hide (the
+    // inventory, the pause menu) reopens kHoleReshowMs after the re-show (GI: "pressing tab and closing lags out the map for 0.5s").
     constexpr double kRingProbeAtMs[2] = {2500.0, 20000.0};
-    double g_ringMapSinceMs = -1.0;     // when all the conditions first held (-1 = not now)
+    sync::RingHoleTimer g_ringHole;
+    double g_ringMapSinceMs = -1.0;     // when all the conditions first held (-1 = not now; backdated on a quick re-show)
     int g_ringProbes = 0;
     bool g_ringOpenLogged = false;
+    uint32_t g_ringReshowsLogged = 0;
     void TickRingMap(double nowMs, bool wanted)
     {
-        const bool ready = g_hudRing.load() && g_ringMap.load() && wanted && game::minimapsize::PlacementApplied() && !g_barsGate.BigmapOn();
-        if (!ready)
+        const bool layoutOk = g_hudRing.load() && g_ringMap.load() && game::minimapsize::PlacementApplied() && !g_barsGate.BigmapOn();
+        const uint32_t reshowsBefore = g_ringHole.Reshows();
+        const bool open = g_ringHole.Update(layoutOk, wanted, nowMs);
+        g_ringMapSinceMs = g_ringHole.Since();
+        if (!layoutOk || !wanted)
         {
-            g_ringMapSinceMs = -1.0;
             game::Overlay::SetRingMap(false);
             game::Overlay::SetRingMapRound(false);
             return;
         }
-        if (g_ringMapSinceMs < 0.0)
-            g_ringMapSinceMs = nowMs;
-        const bool open = nowMs - g_ringMapSinceMs >= kRingMapSettleMs;
+        if (g_ringHole.Reshows() != reshowsBefore && g_ringReshowsLogged < 4)
+        {
+            ++g_ringReshowsLogged;
+            GLOGI("engine: ring map (0.5.8): the radar shows again with nothing re-laid out since the hole was open: it reopens in %.0f ms, not %.0f "
+                  "(%u quick re-shows so far; only the first 4 are logged)",
+                  sync::kHoleReshowMs, sync::kHoleSettleMs, g_ringHole.Reshows());
+        }
         // 0.5.5 ring_map_round: the hole grows to the arcs only while the grown placement has landed and our circle is handed out
         const bool round = RingRoundOpen();
         game::Overlay::SetRingMapRound(round);
@@ -5324,7 +5353,8 @@ namespace {
         if (wanted && g_barsGate.Mode() != sync::BarsMode::Off && bi.haveHandle)
             g_miniMovieLoaded = g_world->ScaleformLoaded(g_miniMovie);
         bi.loaded = bi.haveHandle && g_miniMovieLoaded;
-        switch (g_barsGate.Next(bi, nowMs))
+        const sync::BarsAction barsAct = g_barsGate.Next(bi, nowMs);
+        switch (barsAct)
         {
         case sync::BarsAction::None:
             break;
@@ -5354,6 +5384,10 @@ namespace {
             break;
         }
         }
+        // 0.5.8 radar_bigmap_off: the expanded radar held off while the ring map shows; never during our own flip (BigmapOn, which also covers a
+        // RefreshOn issued this tick), and not on the tick the flip's own OFF was just issued
+        if (g_radarBigmapOff.load() && wanted && g_hudRing.load() && g_ringMap.load() && !g_barsGate.BigmapOn() && barsAct != sync::BarsAction::RefreshOff)
+            ++(g_world->SetBigmap(false) ? s.bigmapOffCalls : s.bigmapOffUncallable);
 
         // Passive read-backs (every mode, so minimap=0 shows the radar really is hidden).
         if (nowMs - g_miniSampleMs >= kMiniSampleMs)

@@ -13,8 +13,9 @@
 
 namespace minimaptest {
 
-    // 28 for 0.4.22, 8 for the 0.4.25 radar scale (rectangle, vitals strip, flip request), then minimap_size_tests.h's own.
-    constexpr int kScaleChecks = 8;
+    // 28 for 0.4.22, 8 for the 0.4.25 radar scale (rectangle, vitals strip, flip request) + 1 for the 0.5.8 ring hole timer, then
+    // minimap_size_tests.h's own.
+    constexpr int kScaleChecks = 9;
     constexpr int kChecks = 28 + kScaleChecks + minimapsizetest::kChecks;
 
     // The engine's scale (overlay_ui.cpp: S(v) = round(v * scale), scale = displayH / 1080 clamped to 0.75..3).
@@ -420,6 +421,56 @@ namespace minimaptest {
             const auto v = Drive(g, 5, t, on);
             Check("minimap scale: in bars setup-only mode the ask is honoured: one flip pair, the setup calls go on", v[0] == BarsAction::RefreshOn && v[1] == BarsAction::RefreshOff
                   && Count(v, BarsAction::Setup) == 3 && g.Counters().refreshOn == 1, Names(v));
+        }
+        {
+            // 0.5.8 RingHoleTimer (GI: "pressing tab and closing lags out the map for 0.5s"). Script ticks of 10 ms.
+            // When the hole first opens, after a run of `shown` ticks from t; -1 = not within 3 s.
+            auto openAt = [](RingHoleTimer& h, double& t, bool layoutOk) {
+                for (int i = 0; i < 300; ++i, t += 10.0)
+                    if (h.Update(layoutOk, true, t))
+                        return t;
+                return -1.0;
+            };
+            auto hide = [](RingHoleTimer& h, double& t, int ticks, bool layoutOk) {
+                bool any = false;
+                for (int i = 0; i < ticks; ++i, t += 10.0)
+                    any = h.Update(layoutOk, false, t) || any;
+                return any;
+            };
+            // (a) cold: the full settle; (b) open, the inventory hides the radar 2 s, closes: open again within kHoleReshowMs (+ a tick)
+            RingHoleTimer a;
+            double t = 0.0;
+            const double cold = openAt(a, t, true);
+            t += 10.0;
+            const bool hiddenShut = !hide(a, t, 200, true);
+            const double t2 = t;
+            const double re = openAt(a, t, true);
+            // (c) the same, but a flip / write (layoutOk false) during the hide: the full settle again
+            RingHoleTimer c;
+            double tc = 0.0;
+            openAt(c, tc, true);
+            hide(c, tc, 50, true);
+            c.Update(false, false, tc);
+            tc += 10.0;
+            hide(c, tc, 50, true);
+            const double t3 = tc;
+            const double reFlip = openAt(c, tc, true);
+            // (d) hidden before it ever opened (300 ms in): the full settle on the re-show
+            RingHoleTimer d;
+            double td = 0.0;
+            for (int i = 0; i < 30; ++i, td += 10.0)
+                d.Update(true, true, td);
+            hide(d, td, 20, true);
+            const double t4 = td;
+            const double reEarly = openAt(d, td, true);
+            char detail[200];
+            std::snprintf(detail, sizeof detail, "cold %.0f re %.0f (after %.0f) flip %.0f early %.0f reshows %u/%u", cold, re - t2, t2, reFlip - t3,
+                          reEarly - t4, a.Reshows(), d.Reshows());
+            Check("ring map hole (0.5.8): cold open after the 800 ms settle; shut while the inventory hides the radar; reopened within 60 ms of the re-show "
+                  "(was 800); a flip during the hide, or a hide before it ever opened, takes the full settle",
+                  cold >= kHoleSettleMs && cold <= kHoleSettleMs + 10.0 && hiddenShut && re >= t2 && re - t2 <= kHoleReshowMs + 10.0 &&
+                      a.Reshows() == 1 && reFlip - t3 >= kHoleSettleMs && reEarly - t4 >= kHoleSettleMs && d.Reshows() == 0,
+                  detail);
         }
 
         minimapsizetest::RunPure();

@@ -188,6 +188,50 @@ namespace gage::sync {
         Stats stats_;
     };
 
+    // ---- 0.5.8: when the ring's map hole may open -------------------------------------------------------------------------
+    // 0.5.2 opened the hole only after the conditions (the table holds the placement, no big-radar flip, the radar shown) held for kHoleSettleMs,
+    // because a write or a flip re-lays the radar out over several frames. GI after 0.5.7: "pressing tab (opening inv) and closing lags out the
+    // map for 0.5s": closing the inventory only re-shows the radar (DISPLAY_RADAR(true)); nothing re-laid it out, yet the full settle ran again.
+    // Now a hole that was OPEN and closed only because the radar was hidden reopens kHoleReshowMs after the radar shows again; anything that
+    // touches the layout in between (a write, a flip, a switch: layoutOk false) or a hole that never opened takes the full settle.
+    constexpr double kHoleSettleMs = 800.0, kHoleReshowMs = 50.0;
+    class RingHoleTimer
+    {
+    public:
+        // layoutOk: the switches are on, the table holds the placement, no big-radar flip runs. shown: the radar is wanted this tick.
+        bool Update(bool layoutOk, bool shown, double nowMs)
+        {
+            if (!layoutOk)
+            {
+                since_ = -1.0;
+                resume_ = false;
+                return false;
+            }
+            if (!shown)
+            {
+                if (since_ >= 0.0 && nowMs - since_ >= kHoleSettleMs)
+                    resume_ = true;   // it was open: only the radar's hide closes it
+                since_ = -1.0;
+                return false;
+            }
+            if (since_ < 0.0)
+            {
+                since_ = resume_ ? nowMs - (kHoleSettleMs - kHoleReshowMs) : nowMs;
+                if (resume_)
+                    ++reshows_;
+                resume_ = false;
+            }
+            return nowMs - since_ >= kHoleSettleMs;
+        }
+        double Since() const { return since_; }     // < 0: not counting (the hole is shut)
+        uint32_t Reshows() const { return reshows_; }
+
+    private:
+        double since_ = -1.0;
+        bool resume_ = false;
+        uint32_t reshows_ = 0;
+    };
+
     // ---- where the radar is, and whether anything of ours is in the way -----------------------------------------------
 
     struct ScreenRect

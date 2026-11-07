@@ -267,7 +267,7 @@ void Replace(int kind, Seen& s) {
     };
     if (!dev) { fail("no device"); return; }
     std::vector<std::vector<Rgba>> mips;
-    BuildRoundMask(w, h, levels, s.sm.inside, MaskOutside(s.sm), mips);
+    BuildRoundMask(w, h, levels, s.sm.inside, MaskOutside(s.sm), mips, SupportBox(s.sm));   // 0.5.8: inscribed in the stock's support box
     std::vector<std::vector<uint8_t>> enc((size_t)levels);
     std::vector<D3D11_SUBRESOURCE_DATA> sd((size_t)levels);
     for (int l = 0; l < levels; ++l) {
@@ -303,9 +303,11 @@ void Replace(int kind, Seen& s) {
     KindStatus& ks = g_status.k[kind];
     ks.handle = handle;
     ks.replaced = true;
-    char b[240];
-    std::snprintf(b, sizeof(b), "; REPLACED: %dx%d %s %d mip(s) (stock centre value %d, corners %d) -> our circle (registered; handed out only with the grown map)",
-                  w, h, TexFmtName(s.fmt), levels, s.sm.insideValue, s.sm.outsideValue);
+    char b[360];
+    std::snprintf(b, sizeof(b), "; REPLACED: %dx%d %s %d mip(s) (stock centre value %d, corners %d) -> our circle in the support box x %.3f..%.3f y %.3f..%.3f "
+                  "(registered; handed out only with the grown map)",
+                  w, h, TexFmtName(s.fmt), levels, s.sm.insideValue, s.sm.outsideValue, (double)s.sm.boxX0, (double)s.sm.boxX1, (double)s.sm.boxY0,
+                  (double)s.sm.boxY1);
     ks.why += b;
     g_status.generation = swap::Generation();
     GLOGI("radar mask census (0.5.6): %s replaced by our circle (stock FNV-1a 64 %016llx; registered inactive: the bind hook hands it out while the engine's gate "

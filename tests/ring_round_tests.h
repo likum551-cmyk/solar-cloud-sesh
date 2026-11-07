@@ -24,7 +24,7 @@ namespace ringround_t {
     using namespace gage::sync::ringround;
     namespace hr = gage::sync::hudring;
 
-    constexpr int kChecks = 20;   // 0.5.7: + F4 (the pinned top-faded mask)
+    constexpr int kChecks = 22;   // 0.5.7: + F4 (the pinned top-faded mask); 0.5.8: + F5 (binds of either mask), F6 (the support box)
 
     inline bool NearF(double a, double b, double tol) { return std::fabs(a - b) <= tol; }
 
@@ -94,7 +94,7 @@ namespace ringround_t {
                 in.smallReplaced = true;
                 in.bigReplaced = true;
                 in.bigMirror = true;
-                in.smallBinds = binds;
+                in.maskBinds = binds;
                 in.lastBindMs = lastBindMs;
                 in.radarShown = isShown;
                 in.shownSinceMs = shownSinceMs;
@@ -186,7 +186,7 @@ namespace ringround_t {
         {
             RoundInputs g;
             g.switchOn = g.d3d11 = g.smallReplaced = g.bigReplaced = g.bigMirror = true;
-            g.smallBinds = kConfirmBinds;
+            g.maskBinds = kConfirmBinds;
             g.radarShown = true;
             g.shownSinceMs = 0.0;
             g.nowMs = 2000.0;
@@ -198,7 +198,7 @@ namespace ringround_t {
             nobig.bigReplaced = false;
             nobigOk.bigReplaced = false;
             nobigOk.bigMirror = false;
-            unconf.smallBinds = kConfirmBinds - 1;
+            unconf.maskBinds = kConfirmBinds - 1;
             stale.lastBindMs = 2000.0 - kStaleMs - 1.0;
             grace.shownSinceMs = 1800.0;
             grace.lastBindMs = -1.0;      // 200 ms into a show: no bind yet is no staleness
@@ -217,7 +217,7 @@ namespace ringround_t {
             RoundGate gt;
             RoundInputs in;
             in.switchOn = in.d3d11 = in.smallReplaced = in.bigReplaced = in.bigMirror = true;
-            in.smallBinds = 100;
+            in.maskBinds = 100;
             in.lastBindMs = 900.0;      // binds from the last showing
             in.radarShown = false;
             in.nowMs = 1000.0;
@@ -237,7 +237,7 @@ namespace ringround_t {
             RoundGate gt;
             RoundInputs in;
             in.switchOn = in.d3d11 = in.smallReplaced = in.bigReplaced = in.bigMirror = true;
-            in.smallBinds = 100;
+            in.maskBinds = 100;
             in.radarShown = true;
             in.shownSinceMs = 0.0;
             in.lastBindMs = 1000.0;
@@ -469,6 +469,66 @@ namespace ringround_t {
                   analysed && pp.verdict == PickVerdict::FoundPinned && pp.index == 8 && pg.verdict == PickVerdict::NoMaskShape && !pg.Ok() &&
                       pz.verdict == PickVerdict::NoMaskShape && !pz.Ok(),
                   f.why + " | " + PickText(pp) + " | " + PickText(pg) + " | " + PickText(pz));
+        }
+        // F5. (0.5.8) GI's 0.5.7 run: both masks replaced, then radarmasksm bound 0 times and radarmasklg 7546 times in 50 s. The evidence is the
+        //     binds of EITHER mask: that showing confirms and the gate grows the map; the big mask's binds do not count when it is not replaced
+        //     (the control), and with the small mask's binds alone (0.5.7's rule) it would not have confirmed
+        {
+            RoundInputs in;
+            in.switchOn = in.d3d11 = in.smallReplaced = in.bigReplaced = in.bigMirror = true;
+            in.radarShown = true;
+            in.shownSinceMs = 0.0;
+            in.nowMs = 2000.0;
+            in.lastBindMs = 1995.0;
+            in.maskBinds = MaskBinds(true, 0, true, 7546);
+            RoundGate g;
+            const RoundGateOut o = g.Update(in, true);
+            RoundInputs ctl = in;
+            ctl.maskBinds = MaskBinds(true, 0, false, 7546);
+            RoundInputs old = in;
+            old.maskBinds = 0;   // 0.5.7: the small mask's binds only
+            Check("ring map round 0.5.8: big-mask binds alone (small 0, big 7546, as GI's 0.5.7 run) confirm and the map GROWS; an unreplaced big "
+                  "mask's binds count for nothing; the small-only count (0.5.7) stays NotConfirmed",
+                  in.maskBinds == 7546 && o.why == RoundWhy::Grow && o.round && o.changed && ctl.maskBinds == 0 &&
+                      RoundDecide(ctl) == RoundWhy::NotConfirmed && RoundDecide(old) == RoundWhy::NotConfirmed,
+                  F("binds %llu why %s round %d ctl %llu", (unsigned long long)in.maskBinds, RoundWhyName(o.why), (int)o.round,
+                    (unsigned long long)ctl.maskBinds));
+        }
+        // F6. (0.5.8) GI's 0.5.7 census: the small mask's content fills only the left ~70 % of its 512 x 256 texture (bands left->right 20 129 130
+        //     130 129 24 0 0). A stock mask padded like that has its support box measured (x 0..0.70, y the whole height) and our circle is the
+        //     ellipse inscribed in THAT box: its centre is the box's centre, the padding stays dark, and it is round within the box (the same
+        //     half-value fraction of each semi-axis); a mask with no padding keeps the whole texture (0.5.5-0.5.7)
+        {
+            const int cw = 358;   // 358 / 512 = 0.699
+            const std::vector<Rgba> content = SoftRect(cw, 256, 186, 0, 13);
+            std::vector<Rgba> padded((size_t)512 * 256, Rgba{0, 0, 0, 255});
+            for (int y = 0; y < 256; ++y)
+                for (int x = 0; x < cw; ++x)
+                    padded[(size_t)y * 512 + (size_t)x] = content[(size_t)y * (size_t)cw + (size_t)x];
+            const StockMask s = AnalyzeStockMask(TexFmt::BC1, padded, 512, 256);
+            const StockMask full = AnalyzeStockMask(TexFmt::BC1, SoftRect(512, 256, 186, 0, 13), 512, 256);
+            const bool box = s.boxX0 < 0.01f && NearF(s.boxX1, 0.699, 0.006) && s.boxY0 < 0.01f && s.boxY1 > 0.99f && full.boxX0 < 0.01f && full.boxX1 > 0.99f &&
+                             full.boxY1 > 0.99f && s.why.find("support x") != std::string::npos;
+            std::vector<std::vector<Rgba>> mips;
+            BuildRoundMask(512, 256, 1, s.inside, MaskOutside(s), mips, SupportBox(s));
+            const std::vector<Rgba>& l0 = mips[0];
+            auto at = [&](int x, int y) { return (int)l0[(size_t)y * 512 + (size_t)x].r; };
+            const int cx = (int)(0.5f * (s.boxX0 + s.boxX1) * 512.0f), cy = 128;
+            const bool centre = at(cx, cy) == s.inside.r;
+            const bool padDark = at(400, 128) == 0 && at(511, 128) == 0 && at(cw + 4, 128) == 0;
+            int xh = cx, yv = cy;
+            while (xh < 511 && at(xh, cy) >= s.inside.r / 2)
+                ++xh;
+            while (yv < 255 && at(cx, yv) >= s.inside.r / 2)
+                ++yv;
+            const double semiX = 0.5 * (s.boxX1 - s.boxX0) * 512.0, semiY = 0.5 * (s.boxY1 - s.boxY0) * 256.0;
+            const double fx = (xh - cx) / semiX, fy = (yv - cy) / semiY;
+            const bool round = std::fabs(fx - fy) <= 0.02 && fx > 0.95;
+            Check("ring map round 0.5.8: a stock mask padded to 512 x 256 (content 358 wide) has its support box measured (x 0..0.699, full height; an "
+                  "unpadded one keeps the whole texture) and our circle is inscribed in it: centre at the box's centre, the padding dark, round in the box",
+                  box && centre && padDark && round,
+                  F("box x %.3f..%.3f y %.3f..%.3f (full x ..%.3f) centre %d (%d) pad %d %d fx %.3f fy %.3f", (double)s.boxX0, (double)s.boxX1,
+                    (double)s.boxY0, (double)s.boxY1, (double)full.boxX1, at(cx, cy), (int)s.inside.r, at(400, 128), at(cw + 4, 128), fx, fy));
         }
         // E1. the blip clip pattern on a synthetic image: unique hit, the flag resolved through the rip-relative displacement; a changed check
         //     byte is refused (the pin is binding)

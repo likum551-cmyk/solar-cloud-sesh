@@ -131,6 +131,13 @@ namespace gage::sync::ringround {
 
     // The evidence is the hook's count of the radar's binds of the STOCK view (swap::Counters seen), not of substitutions: the replacement is
     // handed out only while the map is grown (RoundGate), and the binds are what says the identified view is the one the radar really draws.
+    // 0.5.8: the binds of EITHER identified mask (MaskBinds). GI's 0.5.7 run (2026-11-07 12:08, Legacy, 1440p): both masks found by their pinned
+    // hashes and replaced, then radarmasksm bound 0 times in 50 s while radarmasklg was bound 7546 times (about once a frame): the radar on the
+    // corner draws with the BIG mask, so 0.5.7's small-only count never reached kConfirmBinds and the map never grew.
+    inline uint64_t MaskBinds(bool smallLive, uint64_t smallSeen, bool bigLive, uint64_t bigSeen)
+    {
+        return (smallLive ? smallSeen : 0) + (bigLive ? bigSeen : 0);
+    }
     struct RoundInputs
     {
         bool switchOn = false;       // ring_map_round && ring_map && hud_ring
@@ -138,7 +145,7 @@ namespace gage::sync::ringround {
         bool smallReplaced = false;  // radarmasksm: our view registered for the game's
         bool bigReplaced = false;    // radarmasklg: likewise
         bool bigMirror = false;      // ring_map_big
-        uint64_t smallBinds = 0;     // the radar's binds of the minimap mask since it was registered
+        uint64_t maskBinds = 0;      // the radar's binds of the identified masks since they were registered (MaskBinds)
         double lastBindMs = -1.0;    // the last bind of either identified mask (same clock as nowMs; < 0 = never): the big radar draws with radarmasklg
         bool radarShown = false;     // DISPLAY_RADAR(true) this tick and not in the engine's own big-radar flip
         double shownSinceMs = 0.0;   // since when, continuously
@@ -154,7 +161,7 @@ namespace gage::sync::ringround {
             return RoundWhy::NoMask;
         if (in.bigMirror && !in.bigReplaced)
             return RoundWhy::NoBigMask;
-        if (in.smallBinds < kConfirmBinds)
+        if (in.maskBinds < kConfirmBinds)
             return RoundWhy::NotConfirmed;
         if (in.radarShown)
         {
@@ -576,7 +583,14 @@ namespace gage::sync::ringround {
         // 0, flat 34 %, mirror error 32.3: the small radar's mask is not mirror-symmetric (GTA fades the small radar along one side), so the
         // full shape rule refused the real mask and the 0.5.4 square stayed.
         bool basic = false;
+        // 0.5.8: the SUPPORT box, the bounding box of every texel above 1/16 of the centre value, as fractions of the texture (x0, y0 inclusive,
+        // x1, y1 exclusive). GI's 0.5.7 census: the small mask's content fills only the left ~70 % of its 512 x 256 texture (bands left->right
+        // 20 129 130 130 129 24 0 0: a 1.41 : 1 soft rectangle padded to a power of two, the radar's own 1.42 : 1 box), so GTA samples that part
+        // only and a circle inscribed in the whole texture would show cut on the right. Our circle is inscribed in this box (BuildRoundMask).
+        float boxX0 = 0.0f, boxY0 = 0.0f, boxX1 = 1.0f, boxY1 = 1.0f;
     };
+    constexpr int kSupportDiv = 16;           // a texel belongs to the support above centre / kSupportDiv
+    constexpr float kSupportMinFrac = 0.25f;  // a support box narrower than this (either axis) is not trusted: the whole texture is used
     // 0.5.6 (the census reads back EVERY same-size view the game binds, dozens of 512 x 512 ones): the radar mask is also mirror-symmetric (the
     // 0.5.4 probes: its contour centred within 1.5 px on both axes) and flat inside (a 13 px ramp on a ~190 px box: about 75 % of it at full
     // value), which a spec / AO map or a light cookie with a dark rim is not. Generous on purpose: the tolerances only have to keep other textures
@@ -660,6 +674,28 @@ namespace gage::sync::ringround {
                         ++flatN;
                 }
             const double n = (double)w * (double)h;
+            // 0.5.8: the support box (see StockMask)
+            int bx0 = w, by0 = h, bx1 = -1, by1 = -1;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    if (TexelValue(f, at(x, y)) * kSupportDiv > m.insideValue)
+                    {
+                        bx0 = x < bx0 ? x : bx0;
+                        by0 = y < by0 ? y : by0;
+                        bx1 = x > bx1 ? x : bx1;
+                        by1 = y > by1 ? y : by1;
+                    }
+            if (bx1 >= bx0 && by1 >= by0 && m.insideValue > 0)
+            {
+                const float fx0 = (float)bx0 / (float)w, fx1 = (float)(bx1 + 1) / (float)w, fy0 = (float)by0 / (float)h, fy1 = (float)(by1 + 1) / (float)h;
+                if (fx1 - fx0 >= kSupportMinFrac && fy1 - fy0 >= kSupportMinFrac)
+                {
+                    m.boxX0 = fx0;
+                    m.boxX1 = fx1;
+                    m.boxY0 = fy0;
+                    m.boxY1 = fy1;
+                }
+            }
             m.symX = sx / n;
             m.symY = sy / n;
             m.symErr = (sx + sy) / (2.0 * n);
@@ -688,10 +724,11 @@ namespace gage::sync::ringround {
                 o += std::snprintf(pb + o, sizeof(pb) - (size_t)o, " %ld", cn[i] ? cols[i] / cn[i] : 0L);
             prof = pb;
         }
-        char buf[400];
-        std::snprintf(buf, sizeof(buf), "centre %d (rgba %u %u %u %u), corners %d, edges %d, mirror error %.1f (left-right %.1f, top-bottom %.1f), flat %.0f %%%s",
+        char buf[480];
+        std::snprintf(buf, sizeof(buf), "centre %d (rgba %u %u %u %u), corners %d, edges %d, mirror error %.1f (left-right %.1f, top-bottom %.1f), flat %.0f %%%s, "
+                      "support x %.3f..%.3f y %.3f..%.3f",
                       m.insideValue, m.inside.r, m.inside.g, m.inside.b, m.inside.a, m.outsideValue, m.edgeValue, m.symErr, m.symX, m.symY, m.flat * 100.0,
-                      prof.c_str());
+                      prof.c_str(), (double)m.boxX0, (double)m.boxX1, (double)m.boxY0, (double)m.boxY1);
         if (!grey(m.inside) || !grey(m.outside))
             m.why = std::string("not grey: ") + buf;
         else if (m.insideValue < 64)
@@ -718,14 +755,24 @@ namespace gage::sync::ringround {
     // Coverage of the ellipse inscribed in a w x h texture at texel (x, y), 4 x 4 supersampled: 1 inside, 0 outside, a linear ramp of
     // kFeather (fraction of the semi-axis) INSIDE the ellipse, so the texture's edge texels are 0 and the shape touches the box's edge at 4 points.
     constexpr float kFeather = 0.02f;
-    inline float EllipseCoverage(int x, int y, int w, int h)
+    // 0.5.8: the ellipse is inscribed in the box (bx0, by0) - (bx1, by1), fractions of the texture (the stock mask's support box); outside the
+    // box the coverage is 0. The default box is the whole texture (0.5.5-0.5.7).
+    struct MaskBox
     {
+        float x0 = 0.0f, y0 = 0.0f, x1 = 1.0f, y1 = 1.0f;
+    };
+    inline MaskBox SupportBox(const StockMask& m) { return {m.boxX0, m.boxY0, m.boxX1, m.boxY1}; }
+    inline float EllipseCoverage(int x, int y, int w, int h, const MaskBox& box = MaskBox())
+    {
+        const float bw = box.x1 - box.x0, bh = box.y1 - box.y0;
+        if (!(bw > 0.0f) || !(bh > 0.0f))
+            return 0.0f;
         float s = 0.0f;
         for (int j = 0; j < 4; ++j)
             for (int i = 0; i < 4; ++i)
             {
-                const float u = ((float)x + (i + 0.5f) / 4.0f) / (float)w * 2.0f - 1.0f;
-                const float v = ((float)y + (j + 0.5f) / 4.0f) / (float)h * 2.0f - 1.0f;
+                const float u = (((float)x + (i + 0.5f) / 4.0f) / (float)w - box.x0) / bw * 2.0f - 1.0f;
+                const float v = (((float)y + (j + 0.5f) / 4.0f) / (float)h - box.y0) / bh * 2.0f - 1.0f;
                 const float d = std::sqrt(u * u + v * v);
                 float c = (1.0f - d) / kFeather;
                 c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
@@ -741,7 +788,8 @@ namespace gage::sync::ringround {
     // Every level of the circle mask (level 0 = w x h): texel = Blend(outside, inside, coverage). The outside is black with the stock corners'
     // alpha (0 where the stock fades alpha, 255 for an opaque BC1), the inside is the stock centre's own texel, so the map keeps its stock brightness.
     inline Rgba MaskOutside(const StockMask& m) { return {0, 0, 0, m.outside.a}; }
-    inline void BuildRoundMask(int w, int h, int levels, const Rgba& inside, const Rgba& outside, std::vector<std::vector<Rgba>>& mips)
+    inline void BuildRoundMask(int w, int h, int levels, const Rgba& inside, const Rgba& outside, std::vector<std::vector<Rgba>>& mips,
+                               const MaskBox& box = MaskBox())
     {
         mips.assign(levels > 0 ? (size_t)levels : 0, {});
         for (int l = 0; l < levels; ++l)
@@ -751,7 +799,7 @@ namespace gage::sync::ringround {
             v.resize((size_t)lw * (size_t)lh);
             for (int y = 0; y < lh; ++y)
                 for (int x = 0; x < lw; ++x)
-                    v[(size_t)y * (size_t)lw + (size_t)x] = Blend(outside, inside, EllipseCoverage(x, y, lw, lh));
+                    v[(size_t)y * (size_t)lw + (size_t)x] = Blend(outside, inside, EllipseCoverage(x, y, lw, lh, box));
         }
     }
 
