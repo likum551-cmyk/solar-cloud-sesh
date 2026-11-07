@@ -19,12 +19,16 @@
 #pragma once
 #include "common/common.h"
 #include "ambient.h"
+#include "sync/character.h"
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
 
 namespace gage::game {
+
+    // 0.5.9: a character's face in GTA's units (World::ApplyCharacterFace).
+    using FaceArgs = ::gage::sync::chr::FacePlan;
 
     // -----------------------------------------------------------------------
     // FloatArg: encode a float as a uint64_t for native argument passing.
@@ -299,6 +303,15 @@ namespace gage::game {
         constexpr uint64_t SET_PED_PROP_INDEX                     = 0x93376B65A266EB5F;
         constexpr uint64_t CLEAR_PED_PROP                         = 0x0943E5B8E078E76E;
         constexpr uint64_t GET_PED_HEAD_BLEND_DATA                = 0x2746BD9D88C5C5D0;
+        // 0.5.9 characters (libs/sync/character.h PlanFace): the face of a freemode ped. alloc8or names and hashes; every
+        // kCrossmap3889 row AGREES between YimMenu b3889 and YimMenuV2 enhanced / legacy (natlookup.mjs, 2026-11-07).
+        constexpr uint64_t SET_PED_MICRO_MORPH                    = 0x71A5C1DBA060049E;   // the face feature (old _SET_PED_FACE_FEATURE)
+        constexpr uint64_t SET_PED_HEAD_OVERLAY                   = 0x48F44967FA05CC1E;
+        constexpr uint64_t SET_PED_HEAD_OVERLAY_TINT              = 0x497BF74A7B9CB952;   // old _SET_PED_HEAD_OVERLAY_COLOR
+        constexpr uint64_t SET_PED_HAIR_TINT                      = 0x4CFFC65454C93A49;   // old _SET_PED_HAIR_COLOR
+        constexpr uint64_t SET_HEAD_BLEND_EYE_COLOR               = 0x50B56988B170AFDF;   // old _SET_PED_EYE_COLOR
+        constexpr uint64_t GET_HEAD_BLEND_EYE_COLOR               = 0x76BBA2CEE66D47E9;
+        constexpr uint64_t GET_PED_HEAD_OVERLAY                   = 0xA60EF3B6461A4D43;
 
         // vehicle sync: orientation, seats, enter/leave tasks, health, siren/horn/colours/locks,
         // ownership. Public hashes from alloc8or natives.json; each kCrossmap3889 row AGREES with
@@ -1137,6 +1150,16 @@ namespace gage::game {
         // 0.5.4 outfit_items: one component, checked with IS_PED_COMPONENT_VARIATION_VALID first (palette 2, as ApplyPedOutfit), without
         // the default reset ApplyPedOutfit does. 1 = set, 0 = not valid on this ped (untouched), -1 = a native cannot be called.
         int      SetPedComponentChecked(int32_t ped, int component, int drawable, int texture);
+        // 0.5.9 characters: a character's face on a freemode ped (libs/sync/character.h PlanFace, already in GTA's units): the head
+        // blend, the 20 micro morphs, the 13 head overlays with their tints, the hair (component 2, checked like SetPedComponentChecked)
+        // and its tint, the eye colour; then reads back the eye colour, the eyebrows overlay and the hair drawable. Script tick only.
+        struct FaceResult
+        {
+            int  calls = 0, failed = 0;     // natives called / the ones that could not be called
+            bool hairSet = false;           // component 2 was valid and set
+            int  eyeRead = -1, browsRead = -1, hairRead = -1;   // the read-backs (-1 = unread)
+        };
+        bool     ApplyCharacterFace(int32_t ped, const FaceArgs& face, FaceResult* out = nullptr);
 
         // -- 0.5.4 inv_ped_view: a scripted camera (script tick) -----------------
         // Rotation order 2 (rot.x pitch, rot.z yaw; roll 0), fov in degrees. CreateScriptCam returns the handle, 0 = cannot call / failed.

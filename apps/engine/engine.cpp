@@ -21,6 +21,7 @@
 #include "quit_gate.h"
 #include "ambient.h"
 #include "world_clock.h"       // 0.5.7: the server's time of day and weather
+#include "characters.h"        // 0.5.9: the server's characters (roster, our face, the peers' faces)
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/smoother.h"
@@ -280,6 +281,11 @@ namespace {
         bool lookModelFailed = false; // look.model did not stream in: the kCompanionModel stand-in, retried
         double lookFailedAtMs = 0;    // when it failed / the last retry gave up (NowMs)
         uint32_t pedModel = 0;
+        // 0.5.9 characters: the player's face (PeerNet::face, copied by SyncNet); faceDirty until it is on the ped. Put on right after
+        // every look (ApplyPeerLook) and on its own when only the face changed (characters::ApplyPeer).
+        sync::chr::Appearance face;
+        bool hasFace = false, faceDirty = false;
+        uint32_t netFaceSeq = 0;
         double spawnSinceMs = 0;  // NowMs() of the first spawn attempt of the current ped (0 = none)
         // A model we asked GTA to stream (SpawnRemotePed's REQUEST_MODEL, or a stand-in retry) and
         // have not handed back: released (SET_MODEL_AS_NO_LONGER_NEEDED) whenever we stop trying it.
@@ -424,6 +430,10 @@ namespace {
         int16_t  reactBone = -1;     // ... the newest bone
         uint16_t reactAttacker = proto::kNoPlayer; // ... the newest attacker
         uint32_t epoch = 0;          // bumped when a new player takes over an id before the tick removed the old one
+        sync::chr::Appearance face;  // 0.5.9: the newest PeerFace (the player's active character), decoded
+        bool hasFace = false;
+        bool faceBadLogged = false;  // ... one "does not decode" line per peer entry
+        uint32_t faceSeq = 0;        // bumped when `face` changed
     };
 
     // g_peersMtx guards g_peerNet, g_vehNet, g_sync (with the connection's one render clock, g_sync.Clock(), which the
@@ -2329,6 +2339,7 @@ namespace {
         LogDoorsSeatsSwitches();                                       // 0.4.22 (defined with the F / G entry)
         InvCReadSwitches();                                            // 0.5.4: outfit_items / inv_ped_view
         game::worldclock::ReadSwitch();                                // 0.5.7: world_clock
+        game::characters::ReadSwitch();                                // 0.5.9: char_face
         {
             // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
             const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
@@ -2437,6 +2448,7 @@ namespace {
             // tick removed the old entry: none of the old player's look or ped carries over (SyncNet
             // resets the tick's side when it sees the epoch change).
             pe.hasLook = false;
+            pe.hasFace = false;                        // 0.5.9: nor its character's face
             pe.despawn = true;
             pe.killedAtMs = 0;                         // nor its death or emote
             pe.emoteKind = 0;
@@ -2478,6 +2490,7 @@ namespace {
             g_adminParked.clear();
         }
         game::worldclock::OnEnded();       // 0.5.7: the next script tick gives the clock and the weather back to the game
+        game::characters::OnEnded();       // 0.5.9: no roster until the next server sends one
         game::Overlay::ClearInventory();   // 0.6: the inventory page shows "unavailable" until the next server sends one
         OutfitClear();                     // 0.5.4: no server inventory, no opinion about the clothes (the next entry dresses the ped in full)
         g_satietyAdd.store(0);
@@ -2565,6 +2578,33 @@ namespace {
         pe.look = pl.look;
         pe.hasLook = true;
         ++pe.lookSeq;                                  // SyncNet: lookDirty, and a new model gets another try
+    }
+
+    // 0.5.9: another player's character face (PeerFace). Decoded here; a blob that does not decode is dropped with one line per peer
+    // and session (the server only sends what it validated, so that is a version skew). The script tick puts it on the ped.
+    void OnPeerFace(const proto::PeerFace& pf)
+    {
+        if (pf.id >= proto::kMaxPlayers || pf.id == join::MyId())
+            return;
+        sync::chr::Appearance a;
+        const bool ok = sync::chr::DecodeLook(pf.blob, a);
+        PeersLock lk(g_peersMtx, false);
+        if (!IsJoinedPeer(pf.id))
+            return;                                    // PeerFace follows its PlayerJoined on the same reliable channel
+        PeerNet& pe = g_peerNet[pf.id];
+        if (!ok)
+        {
+            if (!pe.faceBadLogged)
+                GLOGW("engine: character face (0.5.9): peer id=%u (%s): a face of %u bytes does not decode; ignored", (unsigned)pf.id,
+                      pe.name.c_str(), (unsigned)pf.blob.size());
+            pe.faceBadLogged = true;
+            return;
+        }
+        if (pe.hasFace && pe.face == a)
+            return;
+        pe.face = a;
+        pe.hasFace = true;
+        ++pe.faceSeq;
     }
 
     // ---- protocol v4 sinks (join worker) ----------------------------------------------------
@@ -2968,6 +3008,7 @@ namespace {
                     game::brand::NoteDressed(when);
             }
             g_outfitRecheck.store(true);   // 0.5.4 outfit_items: the full outfit is back on; the worn items decide again at once
+            game::characters::NoteRedressed();   // 0.5.9: the fixed head is back on; the active character's face goes on again
         }
     }
 
@@ -5855,7 +5896,16 @@ namespace {
         pe.weaponShown = weapon;
     }
 
-    // Puts the peer's stored look on its ped (its model must be look.model). Script tick.
+    // 0.5.9: the peer's character face on its ped (characters::ApplyPeer: nothing when char_face=0 or the ped's model is not the freemode
+    // model of the face's sex). Script tick.
+    void ApplyPeerFace(Peer& pe, int id)
+    {
+        pe.faceDirty = false;
+        if (pe.hasFace && pe.ped)
+            game::characters::ApplyPeer(*g_world, pe.ped, pe.pedModel, pe.face, id, pe.name);
+    }
+
+    // Puts the peer's stored look on its ped (its model must be look.model), then its face. Script tick.
     void ApplyPeerLook(Peer& pe, int id)
     {
         pe.lookDirty = false;
@@ -5865,6 +5915,7 @@ namespace {
             PeerLog(true, "engine: remote peer id=%d (%s): look not applied (model 0x%08x)", id, pe.name.c_str(),
                     (unsigned)pe.look.model);
         }
+        ApplyPeerFace(pe, id);                         // 0.5.9: the look's fixed head and hair are replaced by the character's
     }
 
     // peer_drive=place (stage 1): the ped is set onto the smoothed pose, every frame. No tasks, so
@@ -9333,6 +9384,7 @@ namespace {
                 // player's look or death carries over (its emote was ended by the bumped emoteSeq).
                 pe.netEpoch = n.epoch;
                 pe.hasLook = pe.lookDirty = pe.lookModelFailed = false;
+                pe.hasFace = pe.faceDirty = false;     // 0.5.9
                 pe.killedAtMs = 0;
                 // ... and its ped and model are the old player's: OnJoined's id-reuse branch asked for a despawn, but
                 // OnWorld clears that request when the new player shows up in relevance, so ask again here (W4 review).
@@ -9347,6 +9399,13 @@ namespace {
                 pe.lookDirty = true;
                 pe.lookFailLogged = false;
                 pe.lookModelFailed = false;
+            }
+            if (pe.netFaceSeq != n.faceSeq)
+            {
+                pe.netFaceSeq = n.faceSeq;             // 0.5.9: a new character face
+                pe.face = n.face;
+                pe.hasFace = n.hasFace;
+                pe.faceDirty = n.hasFace;
             }
             if (n.killedAtMs != 0)
             {
@@ -9670,6 +9729,9 @@ namespace {
                     else
                         pe.lookDirty = false;          // its model did not load: the stand-in stays for now
                 }
+                // 0.5.9: only the face changed (a character switch or edit with the same look), or the ped has no look to wait for.
+                if (pe.ped && pe.faceDirty && !pe.lookDirty)
+                    ApplyPeerFace(pe, it->first);
                 if (!pe.poseOk)
                 {
                     // No data (yet), out of relevance or silent. A spawn in progress stops here: its
@@ -9728,6 +9790,7 @@ namespace {
                         pe.haveLastTarget = false;
                         pe.lastMove = proto::kMoveIdle;
                         SetupPeerPed(pe, it->first);    // v4: hit pool, shot / death / seat / emote edges
+                        pe.faceDirty = pe.hasFace;      // 0.5.9: a fresh ped has the default head (ApplyPeerLook or the face path puts it on)
                         if (pe.hasLook && model == pe.look.model)
                             ApplyPeerLook(pe, it->first);
                         else
@@ -15956,6 +16019,7 @@ namespace {
             if (lp && g_life == Life::Alive && g_entry.load() == Entry::Done)
             {
                 WorkSection s(probe, kSecReadSend);
+                game::characters::TickLocal(*g_world, lp, g_world->GetEntityModel(lp));   // 0.5.9: our active character's face (on a change only)
                 TickOutfitItems(lp, now);   // 0.5.4 outfit_items: the worn items' clothes first, so the look sent below already has them
                 PublishLook(lp, now);
             }
@@ -16200,6 +16264,9 @@ namespace gage::engine {
         sinks.onInvSnap = OnInvSnap;               // 0.5.4 inventory world
         sinks.onInvNearby = OnInvNearby;
         sinks.onWorldClock = game::worldclock::OnClock;   // 0.5.7 world clock
+        sinks.onCharRoster = game::characters::OnRoster;  // 0.5.9 characters
+        sinks.onCharResult = game::characters::OnResult;
+        sinks.onPeerFace = OnPeerFace;
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

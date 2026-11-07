@@ -151,6 +151,11 @@ namespace gage::join {
         // v8 (0.5.7 world clock): the server's clock and weather (on join, on every admin change, every 30 s); rttMs = the
         // session's smoothed round trip when it arrived (the receiver places the server's send moment half of it ago).
         std::function<void(const proto::WorldClock&, uint32_t rttMs)> onWorldClock;
+        // v8 (0.5.9 characters): our roster (after the join's WorldClock and after every applied CharOp), the answer to one of our
+        // SendCharOp calls, and another player's character face (after its PlayerJoined; again after it changed).
+        std::function<void(const proto::CharRoster&)> onCharRoster;
+        std::function<void(const proto::CharResult&)> onCharResult;
+        std::function<void(const proto::PeerFace&)> onPeerFace;
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;
@@ -183,6 +188,9 @@ namespace gage::join {
     bool SendInvOp(const proto::InvOp& o);
     // v8 (0.5.4): what our ped holds (reliable; latest-wins: a newer call before the worker sends replaces the pending one).
     bool SendInvReport(const proto::InvReport& r);
+    // v8 (0.5.9): a character op (reliable, in order, at most 8 waiting). Answered by onCharResult (same seq). The worker drops it
+    // (logged) when this connection never got a CharRoster: an older server would refuse the unknown type.
+    bool SendCharOp(const proto::CharOp& o);
 
     // Our own movement and on-foot state (protocol v3 PedState), unreliable and
     // latest-wins: a newer call before the worker sends replaces the pending one.

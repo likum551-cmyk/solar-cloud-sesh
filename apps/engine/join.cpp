@@ -52,6 +52,7 @@ namespace {
         std::deque<Emote> emotes;
         std::deque<proto::AdminCmd> adminCmds;   // v8
         std::deque<proto::InvOp> invOps;         // v8 (0.6)
+        std::deque<proto::CharOp> charOps;       // v8 (0.5.9)
         bool haveInvReport = false;              // v8 (0.5.4): the newest unsent InvReport (a newer one replaces it)
         proto::InvReport invReport;
 
@@ -208,12 +209,14 @@ namespace {
                 std::deque<Shared::Emote> emotes;
                 std::deque<proto::AdminCmd> adminCmds;
                 std::deque<proto::InvOp> invOps;
+                std::deque<proto::CharOp> charOps;
                 bool haveInvReport = false;
                 proto::InvReport invReport;
                 {
                     std::lock_guard<std::mutex> lk(S.mu);
                     adminCmds.swap(S.adminCmds);
                     invOps.swap(S.invOps);
+                    charOps.swap(S.charOps);
                     haveInvReport = S.haveInvReport;
                     if (haveInvReport)
                         invReport = std::move(S.invReport);
@@ -243,6 +246,10 @@ namespace {
                         GLOGW("join: inventory op seq %u not sent", (unsigned)o.seq);
                 if (haveInvReport && !session.SendInvReport(invReport))
                     GLOGW("join: inventory report (rev %u) not sent", (unsigned)invReport.rev);
+                for (const proto::CharOp& o : charOps)
+                    if (!session.SendCharOp(o))
+                        GLOGW("join: character op %u (seq %u) not sent%s", (unsigned)o.op, (unsigned)o.seq,
+                              session.charactersOffered() ? "" : ": this server never offered characters");
                 // v4, reliable ones first (they are ordered on their own channel anyway).
                 for (const proto::VehicleCmd& c : vehCmds)
                     if (!session.SendVehicleCmd(c))
@@ -468,6 +475,18 @@ namespace {
                     if (peers.onWorldClock)
                         timed("worldClock", [&] { peers.onWorldClock(e.worldClock, session.rttMs()); });
                     break;
+                case net::Event::Type::CharRoster:
+                    if (peers.onCharRoster)
+                        timed("charRoster", [&] { peers.onCharRoster(e.charRoster); });
+                    break;
+                case net::Event::Type::CharResult:
+                    if (peers.onCharResult)
+                        timed("charResult", [&] { peers.onCharResult(e.charResult); });
+                    break;
+                case net::Event::Type::PeerFace:
+                    if (peers.onPeerFace)
+                        timed("peerFace", [&] { peers.onPeerFace(e.face); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())
@@ -642,6 +661,18 @@ namespace gage::join {
         if (S.invOps.size() >= 64)
             return false;
         S.invOps.push_back(o);
+        return true;
+    }
+
+    bool SendCharOp(const proto::CharOp& o)
+    {
+        Shared& S = Sh();
+        if (!S.live.load() || proto::Encode(o).empty())
+            return false;
+        std::lock_guard<std::mutex> lk(S.mu);
+        if (S.charOps.size() >= 8)
+            return false;
+        S.charOps.push_back(o);
         return true;
     }
 
@@ -840,6 +871,7 @@ namespace gage::join {
             S.emotes.clear();
             S.adminCmds.clear();
             S.invOps.clear();
+            S.charOps.clear();
             S.haveInvReport = false;
             S.stop.store(false);
             S.live.store(false);
