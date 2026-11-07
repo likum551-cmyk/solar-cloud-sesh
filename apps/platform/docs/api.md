@@ -3985,9 +3985,11 @@ Unset and empty variables take the default. Integers are plain base-10 digits; f
 | `LOGIN_LOCKOUT_BASE_SECONDS` | `30` | First lockout length. Each further failure doubles it. |
 | `LOGIN_LOCKOUT_MAX_SECONDS` | `3600` | Upper bound of a lockout. Must be at least the base. |
 | `LOGIN_FAILURE_WINDOW_SECONDS` | `900` | Failures are forgotten after this much calm, measured from the later of the last failure and the end of the lock. |
-| `EMAIL_DRIVER` | `outbox` | `outbox` writes mail to the `email_outbox` table (development); `console` logs it. Neither delivers mail and neither keeps a live token: bodies are redacted, and only with `NODE_ENV=development` is the full link logged. Plug a real `EmailSender` into `buildDeps()` before launch. |
-| `EMAIL_FROM` | `GAGE-MP <no-reply@gage-mp.invalid>` | Sender shown on outgoing mail. |
+| `EMAIL_DRIVER` | `outbox` | `resend` delivers through Resend's HTTP API (needs `RESEND_API_KEY` and an `EMAIL_FROM` on a domain verified in Resend; a redacted copy of every mail still goes to `email_outbox`). `outbox` writes mail to the `email_outbox` table (development); `console` logs it. Neither of those two delivers mail or keeps a live token: bodies are redacted, and only with `NODE_ENV=development` is the full link logged. |
+| `EMAIL_FROM` | `Solar RP <no-reply@gage-mp.invalid>` | Sender shown on outgoing mail. With `EMAIL_DRIVER=resend` it must be an address on the verified domain (e.g. `Solar RP <no-reply@solar-rp.com>`); a `.invalid` address is refused at boot. |
 | `EMAIL_LINK_BASE_URL` | `gage-mp://auth` | Base of the links in mail. The default `gage-mp://auth` opens the launcher, which POSTs the token (verification and reset tokens are never consumed by a GET). |
+| `RESEND_API_KEY` | _unset_ | Resend API key (sending access is enough). Required with `EMAIL_DRIVER=resend`, ignored otherwise. Never logged. |
+| `RESEND_API_BASE` | `https://api.resend.com` | Resend API base URL (only changed in tests). |
 | `DISCORD_CLIENT_ID` | _unset_ | Discord application id. Discord login is on only when both id and secret are set. |
 | `DISCORD_CLIENT_SECRET` | _unset_ | Discord application secret. Never logged, never sent to the browser. |
 | `DISCORD_REDIRECT_URI` | _unset_ | The redirect URI registered with Discord. Defaults to `<PUBLIC_API_URL>/v1/auth/discord/callback`. |

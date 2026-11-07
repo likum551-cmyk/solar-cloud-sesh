@@ -37,9 +37,11 @@ export interface Config {
     failureWindowSeconds: number;
   };
 
-  emailDriver: 'outbox' | 'console';
+  emailDriver: 'outbox' | 'console' | 'resend';
   emailFrom: string;
   emailLinkBaseUrl: string;
+  /** EMAIL_DRIVER=resend: Resend's HTTP API (https://resend.com/docs/api-reference/emails/send-email). Null with any other driver. */
+  resend: { apiKey: string; apiBase: string } | null;
 
   discord: { clientId: string; clientSecret: string; redirectUri: string; apiBase: string; flowTtlSeconds: number } | null;
   /** The website's public origin (scheme://host[:port]). A web Discord link flow returns to <siteOrigin>/account/; never taken from a request. */
@@ -125,9 +127,11 @@ export const envSchema = z.object({
   LOGIN_LOCKOUT_MAX_SECONDS: intVar(1, 604_800).default(3600),
   LOGIN_FAILURE_WINDOW_SECONDS: intVar(1, 604_800).default(900),
 
-  EMAIL_DRIVER: z.enum(['outbox', 'console']).default('outbox'),
-  EMAIL_FROM: z.string().min(3).default('GAGE-MP <no-reply@gage-mp.invalid>'),
+  EMAIL_DRIVER: z.enum(['outbox', 'console', 'resend']).default('outbox'),
+  EMAIL_FROM: z.string().min(3).default('Solar RP <no-reply@gage-mp.invalid>'),
   EMAIL_LINK_BASE_URL: z.string().min(3).default('gage-mp://auth'),
+  RESEND_API_KEY: z.string().min(1).optional(),
+  RESEND_API_BASE: urlVar.default('https://api.resend.com'),
 
   DISCORD_CLIENT_ID: z.string().min(1).optional(),
   DISCORD_CLIENT_SECRET: z.string().min(1).optional(),
@@ -219,6 +223,13 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   if (e.DISCORD_CLIENT_ID === undefined && e.DISCORD_CLIENT_SECRET !== undefined) {
     issues.push('DISCORD_CLIENT_ID is required when DISCORD_CLIENT_SECRET is set');
   }
+  // Resend delivers for real: it needs its key, and a sender on a domain verified in Resend (the built-in .invalid address never is).
+  if (e.EMAIL_DRIVER === 'resend') {
+    if (e.RESEND_API_KEY === undefined) issues.push('RESEND_API_KEY is required when EMAIL_DRIVER=resend');
+    if (/\.invalid>?\s*$/i.test(e.EMAIL_FROM)) {
+      issues.push('EMAIL_FROM must be an address on your Resend-verified domain when EMAIL_DRIVER=resend (e.g. "Solar RP <no-reply@solar-rp.com>")');
+    }
+  }
   const databaseUrl = e.DATABASE_URL ?? (production ? undefined : 'pglite:memory');
   if (databaseUrl === undefined) issues.push('DATABASE_URL is required when NODE_ENV=production');
   else if (!/^(postgres(ql)?:\/\/|pglite:)/.test(databaseUrl)) issues.push('DATABASE_URL must start with postgres://, postgresql:// or pglite:');
@@ -267,6 +278,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     emailDriver: e.EMAIL_DRIVER,
     emailFrom: e.EMAIL_FROM,
     emailLinkBaseUrl: e.EMAIL_LINK_BASE_URL.replace(/\/+$/, ''),
+    resend: e.EMAIL_DRIVER === 'resend' && e.RESEND_API_KEY !== undefined ? { apiKey: e.RESEND_API_KEY, apiBase: e.RESEND_API_BASE } : null,
 
     discord:
       e.DISCORD_CLIENT_ID !== undefined && e.DISCORD_CLIENT_SECRET !== undefined

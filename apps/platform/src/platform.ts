@@ -6,6 +6,7 @@ import type { Config } from './config.js';
 import type { Deps } from './deps.js';
 import { openDatabase, type Db, type DbHandle } from './db/index.js';
 import { ConsoleEmailSender, OutboxEmailSender, type EmailSender } from './email.js';
+import { ResendEmailSender } from './email-resend.js';
 import { createApp } from './http/app.js';
 import { startMaintenance } from './maintenance.js';
 import { UdpServerStatusService, udpProber, type Prober, type ServerStatusService } from './servers/status.js';
@@ -37,11 +38,22 @@ export interface Built {
 }
 
 /**
- * The built-in (non-delivering) mail drivers. Both keep live tokens out of the database and the log
- * except in development, where the link is logged so a developer can follow it.
+ * The mail driver. `resend` delivers; `outbox` / `console` deliver nothing. All keep live tokens out of
+ * the database and the log except in development, where the link is logged so a developer can follow it.
  */
-export function createEmailSender(config: Config, db: Db, clock: () => Date, logger: Logger): EmailSender {
+export function createEmailSender(config: Config, db: Db, clock: () => Date, logger: Logger, fetchImpl?: typeof fetch): EmailSender {
   const logLinks = config.nodeEnv === 'development';
+  if (config.emailDriver === 'resend' && config.resend) {
+    // Real delivery; a redacted copy still goes to the outbox table (never the link: logLinks off) for support.
+    return new ResendEmailSender({
+      apiKey: config.resend.apiKey,
+      apiBase: config.resend.apiBase,
+      from: config.emailFrom,
+      logger,
+      record: new OutboxEmailSender(db, clock, {}),
+      ...(fetchImpl ? { fetchImpl } : {}),
+    });
+  }
   return config.emailDriver === 'console' ? new ConsoleEmailSender(logger, { logLinks }) : new OutboxEmailSender(db, clock, { logger, logLinks });
 }
 
@@ -54,7 +66,7 @@ export async function buildDeps(opts: PlatformOptions): Promise<Built> {
   // One limiter for every argon2 call in the process (login, register, reset, password change).
   hashLimiter.configure({ maxConcurrent: config.argon2.maxConcurrent, maxQueue: config.argon2.maxQueue });
 
-  const email = opts.email ?? createEmailSender(config, db, clock, logger);
+  const email = opts.email ?? createEmailSender(config, db, clock, logger, opts.fetchImpl);
   const discord =
     opts.discord !== undefined ? opts.discord : config.discord ? new HttpDiscordClient(config.discord, opts.fetchImpl ?? fetch) : null;
   const payments = opts.payments ?? [new FakeProvider(config.fakeWebhookSecret, config.publicApiUrl, clock)];
@@ -70,7 +82,9 @@ export async function buildDeps(opts: PlatformOptions): Promise<Built> {
     });
 
   if (config.nodeEnv === 'production') {
-    if (!opts.email) logger.warn(`EMAIL_DRIVER=${config.emailDriver} does not deliver mail: plug a real EmailSender into buildDeps() before launch (verification and reset emails will not reach players)`);
+    if (!opts.email && config.emailDriver !== 'resend') {
+      logger.warn(`EMAIL_DRIVER=${config.emailDriver} does not deliver mail: set EMAIL_DRIVER=resend with RESEND_API_KEY before launch (verification and reset emails will not reach players)`);
+    }
     if (payments.some((p) => p instanceof FakeProvider)) logger.warn('the FAKE payment provider is active in production (ALLOW_FAKE_PAYMENTS_IN_PRODUCTION=1): orders can be paid with a forged signature only if FAKE_WEBHOOK_SECRET leaks, but nothing is charged');
   }
 

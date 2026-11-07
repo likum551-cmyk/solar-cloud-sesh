@@ -111,9 +111,9 @@ export function verifyEmailMessage(linkBase: string, to: string, username: strin
   return {
     to,
     template: 'verify_email',
-    subject: 'Verify your GAGE-MP email',
+    subject: 'Verify your Solar RP email',
     text:
-      `Hi ${username},\n\nConfirm your email address to finish setting up your GAGE-MP account:\n\n` +
+      `Hi ${username},\n\nConfirm your email address to finish setting up your Solar RP account:\n\n` +
       `${linkBase}/verify-email?token=${encodeURIComponent(token)}\n\n` +
       `If the link does not open the launcher, paste this code into the verification screen:\n${token}\n\n` +
       `The code is valid for ${ttlHours} hours and works once. If you did not create this account, ignore this email.\n`,
@@ -125,9 +125,9 @@ export function passwordResetMessage(linkBase: string, to: string, username: str
   return {
     to,
     template: 'password_reset',
-    subject: 'Reset your GAGE-MP password',
+    subject: 'Reset your Solar RP password',
     text:
-      `Hi ${username},\n\nSomeone asked to reset the password of your GAGE-MP account. To choose a new one open:\n\n` +
+      `Hi ${username},\n\nSomeone asked to reset the password of your Solar RP account. To choose a new one open:\n\n` +
       `${linkBase}/reset-password?token=${encodeURIComponent(token)}\n\n` +
       `or paste this code into the reset screen:\n${token}\n\n` +
       `The code is valid for ${ttlMinutes} minutes and works once. If this was not you, ignore this email: your password has not changed.\n`,
@@ -139,9 +139,9 @@ export function accountExistsMessage(to: string, username: string): EmailMessage
   return {
     to,
     template: 'account_exists',
-    subject: 'You already have a GAGE-MP account',
+    subject: 'You already have a Solar RP account',
     text:
-      `Hi ${username},\n\nSomeone tried to register a GAGE-MP account with this email address, but it already has one. ` +
+      `Hi ${username},\n\nSomeone tried to register a Solar RP account with this email address, but it already has one. ` +
       `If that was you, log in or use "Forgot password". If not, no action is needed.\n`,
   };
 }
@@ -150,9 +150,9 @@ export function passwordChangedMessage(to: string, username: string): EmailMessa
   return {
     to,
     template: 'password_changed',
-    subject: 'Your GAGE-MP password was changed',
+    subject: 'Your Solar RP password was changed',
     text:
-      `Hi ${username},\n\nThe password of your GAGE-MP account was just changed and every other device was signed out. ` +
+      `Hi ${username},\n\nThe password of your Solar RP account was just changed and every other device was signed out. ` +
       `If this was not you, reset your password immediately and contact support.\n`,
   };
 }
@@ -161,9 +161,9 @@ export function discordLinkedMessage(to: string, username: string, discordName: 
   return {
     to,
     template: 'discord_linked',
-    subject: 'A Discord account was linked to your GAGE-MP account',
+    subject: 'A Discord account was linked to your Solar RP account',
     text:
-      `Hi ${username},\n\nThe Discord account ${discordName === null ? '' : `"${plain(discordName)}" `}was just linked to your GAGE-MP account. ` +
+      `Hi ${username},\n\nThe Discord account ${discordName === null ? '' : `"${plain(discordName)}" `}was just linked to your Solar RP account. ` +
       `From now on it can be used to sign in to it.\n\n` +
       `If this was you, nothing more is needed. If it was not, someone else has access to your account: change your password at once ` +
       `(this signs your other devices out), unlink the Discord account in the launcher settings, and contact support.\n`,
@@ -175,9 +175,9 @@ export function discordUnlinkedMessage(to: string, username: string, discordName
   return {
     to,
     template: 'discord_unlinked',
-    subject: 'A Discord account was unlinked from your GAGE-MP account',
+    subject: 'A Discord account was unlinked from your Solar RP account',
     text:
-      `Hi ${username},\n\nThe Discord account ${discordName === null ? '' : `"${plain(discordName)}" `}was just unlinked from your GAGE-MP account, ` +
+      `Hi ${username},\n\nThe Discord account ${discordName === null ? '' : `"${plain(discordName)}" `}was just unlinked from your Solar RP account, ` +
       `so it can no longer be used to sign in to it.\n\n` +
       `If this was you, nothing more is needed. If it was not, change your password at once (this signs your other devices out) and contact support.\n`,
     meta: { discord: discordName === null ? null : plain(discordName) },

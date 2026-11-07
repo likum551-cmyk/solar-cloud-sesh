@@ -139,7 +139,10 @@ CORS_ORIGINS=https://app.gage
 
 # --- accounts ------------------------------------------------------------------------------
 REQUIRE_VERIFIED_EMAIL=1
-EMAIL_FROM=GAGE-MP <no-reply@example.invalid>
+# Real delivery through Resend: verify the sending domain in Resend first, then
+EMAIL_DRIVER=resend
+RESEND_API_KEY=re_xxxxxxxx
+EMAIL_FROM=Solar RP <no-reply@example.com>
 EMAIL_LINK_BASE_URL=gage-mp://auth
 # Discord login (optional; register the redirect URI <PUBLIC_API_URL>/v1/auth/discord/callback)
 #DISCORD_CLIENT_ID=
