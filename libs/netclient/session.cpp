@@ -21,7 +21,7 @@ namespace gage::net {
         {
             // Everything not listed here is reliable, including the 0.5.4 inventory world's InvSnap, InvNearby (S->C) and
             // InvReport (C->S): each carries a whole state the receiver must not miss. So is 0.5.7's WorldClock (an admin change must arrive),
-            // and 0.5.9's CharRoster / CharOp / CharResult / PeerFace (a character change or a face must not be lost).
+            // and 0.5.9's CharRoster / CharOp / CharResult / PeerFace / PeerName (a character change, a face or a name must not be lost).
             return t == proto::Msg::WorldState || t == proto::Msg::WorldCoarse || t == proto::Msg::VehicleWorld ||
                            t == proto::Msg::PlayerState || t == proto::Msg::VehicleUpdate || t == proto::Msg::LinkInfo   // R3 T5: LinkInfo rides the state channel
                        ? proto::kChanState
@@ -514,6 +514,11 @@ namespace gage::net {
             if (!joined) return;
             if (!proto::Decode(data, len, e.face)) { malformed_++; return; }
             e.type = Event::Type::PeerFace;
+            break;
+        case proto::Msg::PeerName:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.peerName)) { malformed_++; return; }
+            e.type = Event::Type::PeerName;
             break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:

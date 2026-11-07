@@ -191,17 +191,22 @@ namespace outfitt {
                   again == 2 && idle == 0 && ped.d[11] == 15 && ped.d[3] == 15, F("again %d idle %d", again, idle));
         }
         {
-            // female: no item has a female look yet, so a worn item leaves its components alone; an empty slot is bare
+            // 0.5.9 female characters: the worn starter items are the female pieces (Blue T-Shirt 11/0/6 + arms 3/0 + no undershirt 8/14,
+            // Black Chinos 4/3, White Sports 6/4/1); an empty pants slot is briefs 4/15; the male table is untouched
             inv::Character ch = inv::StarterKit();
             const of::Want worn = of::Desired(ch, of::Sex::Female);
+            const of::Want male = of::Desired(ch, of::Sex::Male);
             inv::Apply(ch, TakeOff(inv::Equip::Pants));
             const of::Want noPants = of::Desired(ch, of::Sex::Female);
             of::Sex s1, s2, s3;
             const bool models = of::SexOfModel(0x705E61F2u, s1) && s1 == of::Sex::Male && of::SexOfModel(0x9C9EFFD8u, s2) && s2 == of::Sex::Female &&
                                 !of::SexOfModel(0x12345678u, s3);
-            Check("outfit: on the female freemode ped the worn starter items set nothing (no female looks yet), an empty pants slot is briefs 4/15; "
-                  "only the two freemode models have a sex",
-                  worn.Count() == 0 && noPants.Count() == 1 && noPants.want[4] && noPants.drawable[4] == 15 && models);
+            const bool fem = worn.Count() == 5 && worn.drawable[11] == 0 && worn.texture[11] == 6 && worn.drawable[3] == 0 && worn.drawable[8] == 14 &&
+                             worn.drawable[4] == 3 && worn.drawable[6] == 4 && worn.texture[6] == 1;
+            Check("outfit: on the female freemode ped the worn starter items are the female tee / chinos / sports shoes, an empty pants slot is "
+                  "briefs 4/15, the male pieces stay 11/8/10, 4/10, 6/8; only the two freemode models have a sex",
+                  fem && noPants.Count() == 5 && noPants.want[4] && noPants.drawable[4] == 15 && male.drawable[11] == 8 && male.texture[11] == 10 &&
+                      male.drawable[4] == 10 && male.drawable[6] == 8 && models);
         }
         {
             // the engine reads the SERVER's snapshot: Desired over Encode -> Decode equals Desired over the character; an unmanaged item

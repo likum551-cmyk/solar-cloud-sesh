@@ -22,14 +22,16 @@ namespace gage::game::Overlay::detail::inv3 {
     void Fill(ImFontAtlas* atlas, float scale);
     void Reset();   // UiReset: the ImGui context went away (the pushed snapshot survives)
 
-    // The pages of the Tab menu: the inventory, and for admins the old quick actions / cars pages under ADMIN.
-    enum class Page { Inventory, Admin };
+    // The pages of the Tab menu: the inventory, 0.5.9 stage 4 the characters (select screen + creator) while the server sent a roster and
+    // char_screens is on, and for admins the old quick actions / cars pages under ADMIN.
+    enum class Page { Inventory, Admin, Characters };
 
     struct FrameIn {
         float W = 0, H = 0;        // display size
         float a = 1.0f;            // the menu's fade (0..1)
         bool justOpened = false;   // first frame after Tab
-        bool isAdmin = false;      // show the INVENTORY | ADMIN pill
+        bool isAdmin = false;      // show the ADMIN tab
+        bool characters = false;   // 0.5.9 stage 4: show the CHARACTERS tab (CharactersAvailable)
         Page page = Page::Inventory;
         std::string playerName;    // the local player's name (the CHARACTER chip when the server has sent no inventory)
     };
@@ -39,12 +41,16 @@ namespace gage::game::Overlay::detail::inv3 {
         bool typing = false;           // the search box has the keyboard (Tab still closes; the chat keys are not ours anyway)
     };
 
-    // The top pill (INVENTORY | ADMIN), drawn only for admins, on both pages. Returns the page clicked (or in.page).
+    // The top pill (INVENTORY | CHARACTERS | ADMIN), drawn when there are two tabs or more, on every page. Returns the page clicked (or in.page).
     Page DrawTopTabs(const FrameIn& in);
-    // The whole REV3 screen (dim, hint bar, three panels, overlays). Call when in.page == Inventory.
+    // The whole REV3 screen (dim, hint bar, three panels, overlays). Call when in.page == Inventory or Characters (the CHARACTERS page).
     FrameOut DrawScreen(const FrameIn& in);
     // Esc while the screen is open: closes the innermost thing (drag, split dialog, menu, search focus). false = nothing was open.
     bool HandleEsc();
+    // 0.5.9 stage 4: the CHARACTERS page exists (char_screens on and the server sent a roster this session). Any thread.
+    bool CharactersAvailable();
+    // Esc on the CHARACTERS page: closes the delete dialog, then a name field's focus, then the creator (its draft is dropped). false = nothing.
+    bool HandleCharEsc();
     // 0.5.6 weapon_keys: quick slot k (0..3) used while no panel is open (the number keys 1-4 in the world); true = a UseQuick was sent.
     // QuickKeysOn: the switch (Overlay::SetQuickKeys). Render thread.
     bool QuickKey(int k);

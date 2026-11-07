@@ -236,8 +236,9 @@ namespace gage::proto {
         CharOp           = 57, // C->S reliable (v8, 0.5.9): select / create / save a character (only after a CharRoster)
         CharResult       = 58, // S->C reliable (v8, 0.5.9): the answer to one CharOp
         PeerFace         = 59, // S->C reliable (v8, 0.5.9): another player's character appearance (face, overlays, hair colour, eyes)
+        PeerName         = 60, // S->C reliable (v8, 0.5.9): the name another player is now shown by (its character changed or was renamed)
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::PeerFace;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::PeerName;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -1009,15 +1010,19 @@ namespace gage::proto {
     // CharResult (S->C reliable): the answer to every CharOp (same seq, op, slot); `code` = sync::chr::Code, `text` for the player.
     // PeerFace (S->C reliable): player `id`'s active character look (sync::chr::EncodeLook), after its PlayerJoined (newcomers get every
     // player's after the join burst, after the CharRoster) and after every change.
+    // PeerName (S->C reliable, stage 4): player `id` is now shown as `name` (ValidName; its active character's sync::chr::PublicName) after a
+    // character switch or a rename. The join itself carries the character name in PlayerJoined; a client that does not know the type keeps
+    // the name from PlayerJoined. CharOp Delete (op 4): `blob` = the typed confirmation "First Last" (sync::chr::ParseConfirm).
     constexpr size_t kMaxCharBlob = 512;
     constexpr uint8_t kCharRosterGuest = 0x01;
-    constexpr uint8_t kCharOpLast = 3;     // == sync::chr::kOpLast (tests/character_tests.h checks)
-    constexpr uint8_t kCharCodeLast = 11;  // == sync::chr::kCodeLast
+    constexpr uint8_t kCharOpLast = 4;     // == sync::chr::kOpLast (tests/character_tests.h checks)
+    constexpr uint8_t kCharCodeLast = 14;  // == sync::chr::kCodeLast
     constexpr uint8_t kCharSlots = 3;      // == sync::chr::kMaxSlots
     struct CharRoster { uint8_t flags = 0; std::string blob; };
     struct CharOp { uint16_t seq = 0; uint8_t op = 0; uint8_t slot = 0; std::string blob; };
     struct CharResult { uint16_t seq = 0; uint8_t op = 0; uint8_t slot = 0; uint8_t code = 0; std::string text; };
     struct PeerFace { uint16_t id = 0; std::string blob; };
+    struct PeerName { uint16_t id = 0; std::string name; };
 
     using Bytes = std::vector<uint8_t>;
 
@@ -1086,6 +1091,7 @@ namespace gage::proto {
     Bytes Encode(const CharOp& m);       // v8 0.5.9: {} for seq 0, an unknown op, a slot >= kCharSlots, an over-cap blob
     Bytes Encode(const CharResult& m);   // v8 0.5.9: {} for an unknown op or code, a slot >= kCharSlots, a text over kMaxRefuseText
     Bytes Encode(const PeerFace& m);     // v8 0.5.9: {} for an id >= kMaxPlayers or an empty / over-cap blob
+    Bytes Encode(const PeerName& m);     // v8 0.5.9: {} for an id >= kMaxPlayers or a name that fails ValidName
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -1153,6 +1159,7 @@ namespace gage::proto {
     bool Decode(const uint8_t* p, size_t n, CharOp& out);
     bool Decode(const uint8_t* p, size_t n, CharResult& out);
     bool Decode(const uint8_t* p, size_t n, PeerFace& out);
+    bool Decode(const uint8_t* p, size_t n, PeerName& out);   // an id >= kMaxPlayers or a name that fails ValidName is malformed
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would

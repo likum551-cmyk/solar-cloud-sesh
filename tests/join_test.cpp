@@ -136,6 +136,7 @@ struct Heard {
     std::vector<proto::CharRoster> rosters;
     std::vector<proto::CharResult> charResults;
     std::vector<proto::PeerFace> faces;
+    std::vector<proto::PeerName> names;   // stage 4
 
     void Clear() {
         std::lock_guard<std::mutex> lk(mu);
@@ -143,7 +144,7 @@ struct Heard {
         chats.clear(); ended = 0; events.clear();
         welcomes = 0; welcomeId = 0xFFFF; welcomeTickHz = 0; welcomeHealth = -1;
         accounts = 0; accountFlags = 0; adminResults.clear();
-        rosters.clear(); charResults.clear(); faces.clear();
+        rosters.clear(); charResults.clear(); faces.clear(); names.clear();
     }
     bool HasEvent(const std::string& name, const std::string& payloadPart) {
         std::lock_guard<std::mutex> lk(mu);
@@ -207,6 +208,10 @@ static void InstallSinks() {
     s.onPeerFace = [](const proto::PeerFace& f) {
         std::lock_guard<std::mutex> lk(g_heard.mu);
         g_heard.faces.push_back(f);
+    };
+    s.onPeerName = [](const proto::PeerName& n) {
+        std::lock_guard<std::mutex> lk(g_heard.mu);
+        g_heard.names.push_back(n);
     };
     join::SetPeerSinks(std::move(s));
     join::SetEventSink([](const char* ev, const char* payload) {
@@ -386,14 +391,15 @@ int main() {
     g_heard.selfId = sess.myId;
     Check("the server lists the adapter's player by name", Until(&bob, [&] { return ServerHasPlayer(sr, "Alice"); }, 2000));
     Check("event 'connected' carries the server name", g_heard.HasEvent("connected", "GAGE Join Test"));
-    Check("Bob (already in) is announced to the adapter with his name",
+    // 0.5.9 stage 4: a player is announced by its character's name; Bob's instant character is "Bob <a surname>"
+    Check("Bob (already in) is announced to the adapter with his character's name (Bob + a surname)",
           Until(&bob, [&] {
               std::lock_guard<std::mutex> lk(g_heard.mu);
-              for (auto& j : g_heard.joined) if (j.first == bob.id && j.second == "Bob") return true;
+              for (auto& j : g_heard.joined) if (j.first == bob.id && j.second.rfind("Bob ", 0) == 0 && j.second.size() > 6) return true;
               return false;
           }, 2000));
     Check("event 'playerJoined' carries id and name as JSON",
-          g_heard.HasEvent("playerJoined", "\"id\":" + std::to_string(bob.id) + ",\"name\":\"Bob\""));
+          g_heard.HasEvent("playerJoined", "\"id\":" + std::to_string(bob.id) + ",\"name\":\"Bob "));
 
     // 0.5.9 characters: the join burst's roster and Bob's face reach the sinks; a CharOp queued by the engine goes out on the worker and
     // its answer comes back.
@@ -431,6 +437,29 @@ int main() {
             return false;
         }, 2000);
         Check("SendCharOp: a Select goes out on the worker and onCharResult hears Ok", answered, queued ? "queued" : "not queued");
+        // stage 4: Bob renames his instant character; the adapter hears PeerName with the new name
+        chr::Roster br;
+        bool bobRoster = false;
+        for (auto it = bob.events.rbegin(); it != bob.events.rend() && !bobRoster; ++it)
+            if (it->type == net::Event::Type::CharRoster) bobRoster = chr::DecodeRoster(it->charRoster.blob, br);
+        bool renamed = false;
+        if (bobRoster && br.Active()) {
+            chr::Character c = *br.Active();
+            c.first = "Bobby";
+            c.last = "Tables";
+            proto::CharOp save;
+            save.seq = 5;
+            save.op = (uint8_t)chr::Op::Save;
+            save.slot = br.active;
+            save.blob = chr::EncodeCharacter(c);
+            renamed = bob.s.SendCharOp(save) && Until(&bob, [&] {
+                std::lock_guard<std::mutex> lk(g_heard.mu);
+                for (auto& n : g_heard.names)
+                    if (n.id == bob.id && n.name == "Bobby Tables") return true;
+                return false;
+            }, 2000);
+        }
+        Check("onPeerName: Bob renames his character and the adapter hears PeerName \"Bobby Tables\" for him", renamed, bobRoster ? "roster" : "no roster");
     }
 
     // Chat, both ways. The server echoes a line to its sender too.
@@ -680,7 +709,7 @@ int main() {
     }
 
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
-    const int expected = 49 + 2 + 1 + 2 + 1 + 1 + 2 + 3;   // + vehicle mailbox 2 + playerHealth 1 + sample time 2 (sync plan W6) + refusal reason/text 1 + RefusalIsFinal 1 + v8 accounts 2 + 0.5.9 characters 3
+    const int expected = 49 + 2 + 1 + 2 + 1 + 1 + 2 + 4;   // + vehicle mailbox 2 + playerHealth 1 + sample time 2 (sync plan W6) + refusal reason/text 1 + RefusalIsFinal 1 + v8 accounts 2 + 0.5.9 characters 4
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);
         return 1;

@@ -112,6 +112,7 @@ namespace gage::net {
             CharRoster,      // v8 (0.5.9): our characters (sync::chr::DecodeRoster), after the join's WorldClock and after every applied CharOp
             CharResult,      // v8 (0.5.9): the answer to one SendCharOp
             PeerFace,        // v8 (0.5.9): another player's character look (sync::chr::DecodeLook), after its PlayerJoined
+            PeerName,        // v8 (0.5.9): another player is now shown by another name (a character switch or a rename)
         };
         Type type = Type::Disconnected;
 
@@ -155,6 +156,7 @@ namespace gage::net {
         proto::CharRoster charRoster;       // v8 (0.5.9): blob = sync::chr::EncodeRoster
         proto::CharResult charResult;       // v8 (0.5.9): seq / op / slot of our CharOp, code = sync::chr::Code
         proto::PeerFace face;               // v8 (0.5.9): blob = sync::chr::EncodeLook of player face.id's active character
+        proto::PeerName peerName;           // v8 (0.5.9): the name player peerName.id is shown by from now on
     };
 
     class ClientSession

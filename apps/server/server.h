@@ -217,6 +217,9 @@ namespace gage::server {
         uint64_t charSaves = 0;        // rosters written
         uint64_t charSaveFailures = 0; // rosters that could not be written (logged)
         uint64_t facesSent = 0;        // PeerFace messages (replays and broadcasts)
+        uint64_t charsDeleted = 0;     // stage 4: Delete ops applied
+        uint64_t charsRenamed = 0;     // stage 4: admin renames applied
+        uint64_t namesSent = 0;        // stage 4: PeerName broadcasts (a switch or a rename changed the shown name)
         uint64_t statesAccepted = 0;
         uint64_t statesStale = 0;      // seq not newer than the last accepted
         uint64_t statesInvalid = 0;    // decoded, but outside the world box / limits
@@ -305,6 +308,7 @@ namespace gage::server {
     {
         uint16_t id = 0;
         std::string name;
+        std::string shownName; // 0.5.9 stage 4: what the other players see (the active character's PublicName; `name` with characters off)
         std::string address; // dotted IPv4
         bool hasState = false; // false until the player has sent a PlayerState
         proto::Kinematics k;   // the last accepted state (meaningful only when hasState)
@@ -444,6 +448,11 @@ namespace gage::server {
         bool RosterOf(const std::string& target, sync::chr::Roster& out) const;
         // Names the name index holds (saved rosters plus the online guests'), and the start's scan of characterDir.
         size_t CharacterNamesIndexed() const { return charStore_.IndexedNames(); }
+        // Stage 4 (GI: "an admin can rename (console + verified-admin command, logged)"): the active character of an ONLINE player
+        // (`target` = id, account name or shown character name) gets `first` `last` (ValidNamePart, free); saved, the player's roster
+        // resent, the others told (PeerName). `by` names the admin in the log. Console `charname`, chat `/charname` (verified admins).
+        bool RenameCharacter(const std::string& target, const std::string& first, const std::string& last, const std::string& by,
+                             std::string* msg = nullptr);
 
         // ---- 0.5.7 world clock (libs/sync/world_clock.h; Config::worldClock, docs/api/server.md "World clock") ----
         // The console's `time HH:MM[:SS]`, `timescale X` and `weather NAME|cycle` (and the chat commands /time /timescale /weather of a
@@ -550,6 +559,7 @@ namespace gage::server {
         void SendCharRoster(Conn& c);
         void SendFaces(Conn& c);                          // every other player's PeerFace to `c` (the join burst)
         void BroadcastFace(Conn& c);                      // `c`'s PeerFace to everyone else
+        void UpdateShownName(Conn& c, const char* why);   // stage 4: recompute shownName; a change of a joined player goes out as PeerName
         void OnCharOp(Conn& c, const uint8_t* data, size_t len);
         CharacterStore charStore_;
         struct VehClass { uint64_t born = 0; int cls = -1; };

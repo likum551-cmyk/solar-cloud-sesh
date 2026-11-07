@@ -330,10 +330,14 @@ struct Probe
             if (e.type == ET::PlayerLeft && e.left.id == id && e.left.reason == r) return true;
         return false;
     }
+    // 0.5.9 stage 4: PlayerJoined carries the CHARACTER name; a player's instant character is "<account name> <surname>", so `name` matches
+    // the account name exactly (characters 0) or as the first word of the character name.
     bool SawJoined(uint16_t id, const std::string& name) const
     {
         for (const net::Event& e : events)
-            if (e.type == ET::PlayerJoined && e.joined.id == id && e.joined.name == name) return true;
+            if (e.type == ET::PlayerJoined && e.joined.id == id &&
+                (e.joined.name == name || e.joined.name.compare(0, name.size() + 1, name + " ") == 0))
+                return true;
         return false;
     }
     // This client's latest full-detail view of another player, or null (never seen, or it left the
@@ -363,8 +367,9 @@ struct Probe
                                       "VehicleResult", "Damage",       "Killed",       "RespawnOk",  "PeerAnim",
                                       "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact", "LinkInfo",
                                       "AccountInfo",  "AdminResult", "InvState",   "InvUsed",    "InvSnap",
-                                      "InvNearby",    "WorldClock",  "CharRoster", "CharResult", "PeerFace"};
-        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::PeerFace + 1, "a name per event type");
+                                      "InvNearby",    "WorldClock",  "CharRoster", "CharResult", "PeerFace",
+                                      "PeerName"};
+        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::PeerName + 1, "a name per event type");
         std::string out;
         for (const net::Event& e : events) out += std::string(names[(int)e.type]) + " ";
         return out;

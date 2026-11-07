@@ -181,7 +181,10 @@ controls (heredity, face, features, then save) and a select screen.
 **Left out, and why:**
 
 - **Delete** (72 h pending, purge timer) and **paid rename / re-customise**: GI asked for creation and slots; a delete touches the per-character
-  inventory files and the platform slot count, so it is its own round.
+  inventory files and the platform slot count, so it is its own round. **Stage 4 (GI 2026-11-07) added Delete differently:** at once from the
+  select screen, confirmed by typing the character's full name, never the last character nor the one being played, its inventory removed
+  (no 72 h pending, no purge timer, no ban / jail checks: Solar RP has no jail yet). The name is free in the creator until the first save there,
+  then only an admin renames (`charname`); no paid rename.
 - **Clothes at creation:** Solar RP's clothes are inventory items (0.5.4 `outfit_items`); a new character wears the starter outfit.
 - **Starting money, licences, quests, spawn choice (house / faction):** Solar RP has none of these systems yet.
 - **The creator location on the hillside, the logo prop, the gesture clips:** the port edits the player's own ped where it stands (no Rockstar

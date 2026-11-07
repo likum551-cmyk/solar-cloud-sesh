@@ -10,7 +10,7 @@
 
 namespace charnet {
 
-    constexpr int kChecks = 19;
+    constexpr int kChecks = 25;   // 0.5.9 stage 4: + 6 (shown names 2, admin rename 2, delete 2)
     namespace chr = gage::sync::chr;
     namespace inv = gage::sync::inv;
 
@@ -66,6 +66,25 @@ namespace charnet {
             if (Send(op, slot, blob, &want) == -2) return -2;
             rig.Until([&] { p.Drain(); return ResultOf(want) >= 0; }, 2000);
             return ResultOf(want);
+        }
+        // Stage 4: the name player `id` was announced with (PlayerJoined) and the newest PeerName for it (empty when none).
+        std::string JoinedName(uint16_t id) const
+        {
+            for (const net::Event& e : p.events)
+                if (e.type == ET::PlayerJoined && e.joined.id == id) return e.joined.name;
+            return std::string();
+        }
+        std::string NewName(uint16_t id) const
+        {
+            for (auto it = p.events.rbegin(); it != p.events.rend(); ++it)
+                if (it->type == ET::PeerName && it->peerName.id == id) return it->peerName.name;
+            return std::string();
+        }
+        bool HeardServer(const std::string& part) const
+        {
+            for (const net::Event& e : p.events)
+                if (e.type == ET::Chat && e.chat.fromId == proto::kServerId && e.chat.text.find(part) != std::string::npos) return true;
+            return false;
         }
         // The newest PeerFace for player `id` (false when none).
         bool FaceOf(uint16_t id, chr::Appearance& out) const
@@ -152,6 +171,17 @@ namespace charnet {
             Check("characters live: a newcomer gets every player's face (PeerFace) after its own roster, the others get the newcomer's after "
                   "its PlayerJoined, and each equals that player's active character",
                   aIn && faces && order, gus.Describe() + " | " + alice.Describe());
+            // stage 4 (GI: the CHARACTER name is shown): both PlayerJoined carry the other's character name, not the player name; the
+            // server keeps the account name for itself (Players().name) next to the shown one
+            const std::string gusShown = gr.Active() ? chr::PublicName(*gr.Active()) : std::string("?");
+            const std::string aliceShown = ar.Active() ? chr::PublicName(*ar.Active()) : std::string("?");
+            bool infoOk = false;
+            for (const server::PlayerInfo& pi : rig.srv.Players())
+                if (pi.id == gusId) infoOk = pi.name == "Gus" && pi.shownName == gusShown;
+            Check("characters live: PlayerJoined announces each player by its character's name (not the player name), the server still lists "
+                  "the account name with it",
+                  al.JoinedName(gusId) == gusShown && g.JoinedName(aliceId) == aliceShown && gusShown != "Gus" && infoOk,
+                  al.JoinedName(gusId) + " | " + g.JoinedName(aliceId) + " (want " + gusShown + " | " + aliceShown + ")");
         }
         // 3. Save: the instant character renamed and restyled once; the peer sees the new face; a second rename is NameFixed
         {
@@ -172,6 +202,12 @@ namespace charnet {
             const int r2 = g.Op(chr::Op::Save, 0, &again);
             chr::Roster still;
             g.Roster(still);
+            rig.Until([&] { alice.Drain(); return al.NewName(gusId) == "Gus Newman"; }, 2000);
+            Check("characters live: the rename reaches the other player as PeerName \"Gus Newman\" (one, logged as 'is now shown as'), the renamer "
+                  "gets none for itself",
+                  al.NewName(gusId) == "Gus Newman" && g.NewName(gusId).empty() && rig.LogHas("is now shown as \"Gus Newman\"") &&
+                      rig.srv.stats().namesSent >= 1,
+                  al.NewName(gusId));
             Check("characters live: Save renames the instant character and changes its look (Ok + a new CharRoster), the other player gets the "
                   "new face; a second rename is NameFixed and changes nothing",
                   C(r1) == chr::Code::Ok && after.Active() && after.Active()->last == "Newman" && after.Active()->look == edit.look &&
@@ -210,16 +246,39 @@ namespace charnet {
             Check("characters live: 8 CharOps at once are all answered, the ones past the bucket (5 at once, 1 a second) as RateLimited",
                   ok >= 3 && ok <= 5 && limited >= 3 && ok + limited == 8, std::to_string(ok) + " ok, " + std::to_string(limited) + " limited");
         }
+        // 5b. stage 4: the console renames by the CHARACTER name ("gus_newman"); a guest's /charname is refused (verified admins only)
+        {
+            std::string out;
+            const int rostersBefore = gus.Count(ET::CharRoster);
+            const bool done = rig.srv.Execute("charname gus_newman Gustav Newmann", out) == server::CommandResult::Ok;
+            rig.Until([&] { alice.Drain(); gus.Drain(); return al.NewName(gusId) == "Gustav Newmann" && gus.Count(ET::CharRoster) > rostersBefore; }, 2000);
+            chr::Roster now;
+            g.Roster(now);
+            Check("characters live: console 'charname gus_newman Gustav Newmann' finds Gus by his character name, renames the active character "
+                  "(his roster resent, a notice, PeerName to Alice, logged 'admin rename by the console')",
+                  done && now.Active() && now.Active()->Display() == "Gustav Newmann" && al.NewName(gusId) == "Gustav Newmann" &&
+                      g.HeardServer("renamed your character to Gustav Newmann") && rig.LogHas("admin rename by the console"),
+                  out);
+            gus.s.SendChat("/charname " + std::to_string(aliceId) + " Abc Def");
+            rig.Until([&] { gus.Drain(); return g.HeardServer("Only admins can rename"); }, 2000);
+            chr::Roster aNow;
+            alice.Drain();
+            al.Roster(aNow);
+            Check("characters live: a guest's /charname is refused (notice, log REFUSED) and Alice keeps her name",
+                  g.HeardServer("Only admins can rename") && rig.LogHas("/charname " + std::to_string(aliceId) + " Abc Def by") &&
+                      rig.LogHas("REFUSED (not a verified admin)") && aNow.Active() && aNow.Active()->first != "Abc",
+                  gus.Describe());
+        }
         // 6. a guest's names are given back when it leaves
         {
             gus.s.Disconnect();
             rig.Until([&] { return rig.srv.Players().size() == 1; }, 3000);
             rig.Pump(1100);   // a token back
             chr::Character mine = ar.Active() ? *ar.Active() : chr::Character();
-            mine.first = "Gus";
-            mine.last = "Newman";
+            mine.first = "Gustav";
+            mine.last = "Newmann";
             const int r = al.Op(chr::Op::Save, 0, &mine);
-            Check("characters live: after the guest Gus Newman leaves, another player may take that name (a guest's names are not kept)",
+            Check("characters live: after the guest Gustav Newmann leaves, another player may take that name (a guest's names are not kept)",
                   C(r) == chr::Code::Ok, std::to_string(r));
         }
         // 7. a malformed CharOp (op 9) cuts the sender off (Protocol)
@@ -379,6 +438,52 @@ namespace charnet {
                 c.Roster(stay);
                 Check("characters saves: while dead a Select of another character is NotNow and the active one stays",
                       C(back1) == chr::Code::Ok && C(dead) == chr::Code::NotNow && stay.active == 1, std::to_string(back1) + " " + std::to_string(dead) + " " + kerr);
+                pia.s.Disconnect();
+                rig.Until([&] { return rig.srv.Players().empty(); }, 3000);
+            }
+            // 3b. stage 4 Delete (GI: "from the select screen, confirmed by typing the character's name; its inventory file is removed too;
+            // the last remaining character can't be deleted; a deleted slot becomes free again"). Pia rejoins on slot 1 (Ann Lee).
+            {
+                Probe pia(rig);
+                Client c{rig, pia};
+                const bool in = v8acct::JoinWith(rig, pia, "x", "tok-pia3");
+                c.WaitRoster();
+                const bool annFile = fs::exists(invPaths.PathFor("acc-player", 1), ec);
+                const int playing = c.OpRaw(chr::Op::Delete, 1, "Ann Lee");        // Ann is the one being played
+                rig.Pump(1100);
+                const int to0 = c.Op(chr::Op::Select, 0);
+                const int wrong = c.OpRaw(chr::Op::Delete, 1, "Ann Leee");
+                const int noName = c.OpRaw(chr::Op::Delete, 1, "AnnLee");
+                rig.Pump(1100);
+                chr::Roster still;
+                c.Roster(still);
+                Check("characters saves: Delete refuses the character in play (Playing), a typed name that is not hers or not two words "
+                      "(NotConfirmed), and nothing is removed",
+                      in && annFile && C(playing) == chr::Code::Playing && C(to0) == chr::Code::Ok && C(wrong) == chr::Code::NotConfirmed &&
+                          C(noName) == chr::Code::NotConfirmed && still.Has(1) && fs::exists(invPaths.PathFor("acc-player", 1), ec),
+                      std::to_string(playing) + " " + std::to_string(to0) + " " + std::to_string(wrong) + " " + std::to_string(noName));
+                const int gone = c.OpRaw(chr::Op::Delete, 1, "ann lee");           // the name is compared case-insensitively
+                chr::Roster after;
+                c.Roster(after);
+                const bool fileGone = !fs::exists(invPaths.PathFor("acc-player", 1), ec) && !fs::exists(invPaths.PathFor("acc-player", 1) + ".deleted", ec);
+                server::CharacterStore reread(cfg.characterDir);
+                chr::Roster disk;
+                const bool onDisk = reread.Load("acc-player", disk) == server::CharacterStore::Loaded::Saved && !disk.Has(1) && disk.Has(0);
+                rig.Pump(1100);
+                const int last = c.OpRaw(chr::Op::Delete, 0, "Pia Player");        // the only one left
+                chr::Character ann;                                                 // the slot and the name are free again
+                ann.first = "Ann";
+                ann.last = "Lee";
+                ann.look = chr::DefaultAppearance(77);
+                ann.look.sex = chr::Sex::Female;
+                ann.look.hair = 38;
+                const int again = c.Op(chr::Op::Create, 1, &ann);
+                Check("characters saves: Delete with the typed name (any case) frees slot 1 (roster resent and saved without her), removes her "
+                      "inventory file (no .deleted left, logged); the last character is LastOne; the slot and the name take a new Ann Lee",
+                      C(gone) == chr::Code::Ok && !after.Has(1) && after.Count() == 1 && fileGone && onDisk && C(last) == chr::Code::LastOne &&
+                          C(again) == chr::Code::Ok && rig.LogHas("deleted slot 1 \"Ann Lee\"; its inventory") && rig.LogHas(" removed") &&
+                          rig.srv.stats().charsDeleted == 1,
+                      std::to_string(gone) + " " + std::to_string(last) + " " + std::to_string(again));
                 pia.s.Disconnect();
                 rig.Until([&] { return rig.srv.Players().empty(); }, 3000);
             }

@@ -13,6 +13,7 @@
 #include "sync/inventory.h"
 #include "sync/ped_view.h"      // 0.5.4 inv_ped_view: the CHARACTER panel's window (shared with the engine's camera framing)
 #include "sync/ped_preview.h"   // 0.5.8 inv_ped_mode: the backdrop colour behind the frontend ped
+#include "sync/char_screens.h"  // 0.5.9 stage 4 char_screens: the CHARACTERS page (select + creator)
 #include "overlay_sofia3b.h"   // kOverlaySofia3BoldTtf: Sofia Sans Bold (REV3's conversion, SIL OFL 1.1, brand/fonts/rev3)
 #include "overlay_sofia3s.h"    // kOverlaySofia3SemiTtf: SemiBold
 #include "overlay_sofia3m.h"    // kOverlaySofia3MediumTtf: Medium
@@ -53,6 +54,8 @@
 #endif
 
 namespace inv = gage::sync::inv;
+namespace chr = gage::sync::chr;
+namespace cs = gage::sync::chr::screens;
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // The engine's side: the server's snapshots in, the player's ops out (overlay.h). Any thread; the render thread takes them in DrawScreen.
@@ -178,6 +181,98 @@ void SetInventoryPedView(bool live)
 {
     g_pedViewLive.store(live);
     g_pedViewLiveAt.store(GetTickCount64());
+}
+
+// ---- 0.5.9 stage 4 char_screens: the CHARACTERS page (rules libs/sync/char_screens.h, the page itself below in detail::inv3) ----------------
+namespace {
+    struct CharStore {
+        std::mutex m;
+        bool on = true;                        // char_screens (SetCharacterScreens)
+        bool have = false, guest = false;      // a roster arrived this session
+        chr::Roster roster;
+        uint32_t seq = 0;                      // +1 per roster (the page re-reads)
+        // the last answer
+        uint32_t resultSeq = 0;                // +1 per answer
+        uint16_t rSeq = 0;
+        uint8_t rOp = 0, rSlot = 0, rCode = 0;
+        std::string rText;
+        // the page's ops for the engine
+        struct Out { uint16_t seq; uint8_t op, slot; std::string blob; };
+        std::deque<Out> out;
+        uint16_t nextSeq = 1;
+        // the creator's draft for the preview
+        bool draftOpen = false;
+        chr::Appearance draft;
+        uint32_t draftRev = 0;
+        unsigned long long draftAt = 0;        // GetTickCount64 of the last frame that drew the creator
+    };
+    CharStore& CS() { static CharStore* s = new CharStore; return *s; }   // never freed (as St())
+}
+
+void SetCharacterScreens(bool on)
+{
+    std::lock_guard<std::mutex> lk(CS().m);
+    CS().on = on;
+}
+
+void SetCharacterRoster(const std::string& blob, bool guest)
+{
+    chr::Roster r;
+    if (!chr::DecodeRoster(blob, r))
+        return;   // the engine already logged it (characters::OnRoster)
+    std::lock_guard<std::mutex> lk(CS().m);
+    CS().roster = r;
+    CS().have = true;
+    CS().guest = guest;
+    ++CS().seq;
+}
+
+void ClearCharacters()
+{
+    std::lock_guard<std::mutex> lk(CS().m);
+    CS().have = false;
+    CS().out.clear();
+    CS().draftOpen = false;
+    ++CS().seq;
+}
+
+void SetCharacterResult(uint16_t seq, uint8_t op, uint8_t slot, uint8_t code, const std::string& text)
+{
+    std::lock_guard<std::mutex> lk(CS().m);
+    CharStore& s = CS();
+    s.rSeq = seq;
+    s.rOp = op;
+    s.rSlot = slot;
+    s.rCode = code;
+    s.rText = text;
+    ++s.resultSeq;
+}
+
+bool PopCharacterOp(uint16_t* seq, uint8_t* op, uint8_t* slot, std::string* blob)
+{
+    std::lock_guard<std::mutex> lk(CS().m);
+    CharStore& s = CS();
+    if (s.out.empty())
+        return false;
+    CharStore::Out& o = s.out.front();
+    if (seq) *seq = o.seq;
+    if (op) *op = o.op;
+    if (slot) *slot = o.slot;
+    if (blob) *blob = std::move(o.blob);
+    s.out.pop_front();
+    return true;
+}
+
+bool CharacterDraft(chr::Appearance* look, uint32_t* rev)
+{
+    std::lock_guard<std::mutex> lk(CS().m);
+    const CharStore& s = CS();
+    const unsigned long long now = GetTickCount64();
+    if (!s.draftOpen || !s.draftAt || now < s.draftAt || now - s.draftAt > 500)
+        return false;   // the creator is not on screen (a closed menu stops the stamp)
+    if (look) *look = s.draft;
+    if (rev) *rev = s.draftRev;
+    return true;
 }
 
 }  // namespace gage::game::Overlay
@@ -432,7 +527,7 @@ bool WantIcon(const char* n, float size)
 bool WantGlow(const char* n, float size)
 {
     switch ((int)size) {
-    case 16: return OneOf(n, {"backpack", "wrench"});                         // the active top tab
+    case 16: return OneOf(n, {"backpack", "wrench", "person"});               // the active top tab (person: 0.5.9 CHARACTERS)
     case 23: return OneOf(n, {"plus"});                                         // an empty drop target
     case 26: case 32: return ItemGlyph(n);                                      // equipment fits / denied; a selected or denied slot
     case 28: return OneOf(n, {"backpack"});                                     // the PACK slot denied
@@ -2465,18 +2560,24 @@ void DrawGhost(ImVec2 mouse)
 
 void TopTabsInto(ImDrawList* dl, const FrameIn& in, Page& page)
 {
-    if (!in.isAdmin)
-        return;
     struct Tab { const char* glyph; const char* label; Page p; };
-    static const Tab kTabs[2] = {{"backpack", "INVENTORY", Page::Inventory}, {"wrench", "ADMIN", Page::Admin}};
-    float tw[2];
-    // two equal tabs and equal end padding, so the pill's divide sits on the screen's centre line (critic round 1: 6 px off)
+    static const Tab kAll[3] = {{"backpack", "INVENTORY", Page::Inventory}, {"person", "CHARACTERS", Page::Characters}, {"wrench", "ADMIN", Page::Admin}};
+    Tab kTabs[3];
+    int n = 0;
+    kTabs[n++] = kAll[0];
+    if (in.characters) kTabs[n++] = kAll[1];   // 0.5.9 stage 4
+    if (in.isAdmin) kTabs[n++] = kAll[2];
+    if (n < 2)
+        return;
+    float tw[3];
+    // equal tabs and equal end padding, so the pill sits on the screen's centre line (critic round 1: 6 px off)
     float tmax = 114.0f;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < n; ++i)
         tmax = std::max(tmax, std::ceil(16.0f + 7.0f + TextWDesign(B12, kTabs[i].label, 1.44f) + 36.0f));
-    tw[0] = tw[1] = tmax;
+    for (int i = 0; i < n; ++i)
+        tw[i] = tmax;
     // centred between the screen top (y 1080) and the panels' tops (972): 34 px each side of the 40 px pill
-    const float w = 4.0f + tw[0] + tw[1] + 4.0f, x0 = 960.0f - w * 0.5f, y0 = 1006.0f;
+    const float w = 4.0f + tmax * (float)n + 4.0f, x0 = 960.0f - w * 0.5f, y0 = 1006.0f;
     ImDrawList* keep = g.dl;
     g.dl = dl;
     const Rc pill = Box(x0, y0, w, 40);
@@ -2485,7 +2586,7 @@ void TopTabsInto(ImDrawList* dl, const FrameIn& in, Page& page)
     Border(pill, 20, kCardBorder, 1.0f);
     const ImVec2 m = DesignOf(ImGui::GetIO().MousePos);
     float x = x0 + 4.0f;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < n; ++i) {
         const bool on = page == kTabs[i].p;
         const bool hv = In(m, x, y0 + 3, tw[i], 32);
         if (on) {
@@ -2675,6 +2776,541 @@ void HandleInput(const FrameIn& in)
     if (tipNow != u.tipRef) {
         u.tipRef = tipNow;
         u.tipSince = u.now;
+    }
+}
+
+// =============================================================================================================================================
+// 0.5.9 stage 4 char_screens: the CHARACTERS page (GI 2026-11-07). Rules: libs/sync/char_screens.h; the server (CharOp / CharResult) decides.
+// Left: the CHARACTER panel with the ped window (the engine's 0.5.8 frontend preview / 0.5.4 camera follow the same page stamp, and show the
+// creator's draft while the creator is open: CharacterDraft). Right: one wide panel, either the select screen (3 slot cards) or the creator
+// (names, four sections of rows with < > steppers, SAVE / CREATE). The delete dialog asks for the character's full name.
+// =============================================================================================================================================
+struct ChUi {
+    bool have = false, guest = false;
+    chr::Roster roster;
+    uint32_t seenSeq = ~0u, seenResult = 0;
+    bool creator = false;
+    cs::Draft draft;
+    cs::Section section = cs::Section::Heritage;
+    int nameFocus = -1;          // 0 the first name, 1 the last name
+    int confirmSlot = -1;        // the delete dialog's slot (-1 = closed)
+    std::string confirm;
+    uint16_t waitSeq = 0;        // the op whose answer is awaited (the buttons wait meanwhile)
+    uint8_t waitOp = 0;
+    double waitAt = 0.0;
+    std::string status;
+    bool statusBad = false;
+    double statusAt = -100.0;
+    bool clickUsed = false;      // a click this frame already did something
+};
+ChUi& CU() { static ChUi* c = new ChUi; return *c; }
+
+void CharStatus(const std::string& s, bool bad)
+{
+    ChUi& c = CU();
+    c.status = s;
+    c.statusBad = bad;
+    c.statusAt = ImGui::GetTime();
+}
+
+void CharPublishDraft(bool open)
+{
+    ChUi& c = CU();
+    std::lock_guard<std::mutex> lk(CS().m);
+    CharStore& s = CS();
+    s.draftOpen = open;
+    if (open) {
+        s.draft = c.draft.ch.look;
+        s.draftRev = c.draft.rev;
+        s.draftAt = GetTickCount64();
+    }
+}
+
+void CharCloseCreator()
+{
+    ChUi& c = CU();
+    c.creator = false;
+    c.nameFocus = -1;
+    CharPublishDraft(false);
+}
+
+// Queue an op for the engine (PopCharacterOp). 0 = the queue is full (8 waiting).
+uint16_t CharSend(chr::Op op, int slot, const std::string& blob)
+{
+    ChUi& c = CU();
+    uint16_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lk(CS().m);
+        CharStore& s = CS();
+        if (s.out.size() >= 8)
+            return 0;
+        seq = s.nextSeq++;
+        if (s.nextSeq == 0) s.nextSeq = 1;
+        s.out.push_back(CharStore::Out{seq, (uint8_t)op, (uint8_t)slot, blob});
+    }
+    c.waitSeq = seq;
+    c.waitOp = (uint8_t)op;
+    c.waitAt = ImGui::GetTime();
+    GLOGI("inventory: characters page: %s slot %d sent (seq %u)", chr::ToString(op), slot + 1, (unsigned)seq);
+    return seq;
+}
+
+// The store -> the page (render thread, every frame the page is drawn).
+void CharSync()
+{
+    ChUi& c = CU();
+    bool newRoster = false, newResult = false;
+    uint16_t rSeq = 0;
+    uint8_t rOp = 0, rSlot = 0, rCode = 0;
+    std::string rText;
+    {
+        std::lock_guard<std::mutex> lk(CS().m);
+        CharStore& s = CS();
+        if (s.seq != c.seenSeq) {
+            c.seenSeq = s.seq;
+            c.have = s.have;
+            c.guest = s.guest;
+            c.roster = s.roster;
+            newRoster = true;
+        }
+        if (s.resultSeq != c.seenResult) {
+            c.seenResult = s.resultSeq;
+            rSeq = s.rSeq; rOp = s.rOp; rSlot = s.rSlot; rCode = s.rCode; rText = s.rText;
+            newResult = true;
+        }
+    }
+    if (newResult && c.waitSeq && rSeq == c.waitSeq) {
+        c.waitSeq = 0;
+        const chr::Code code = rCode <= chr::kCodeLast ? (chr::Code)rCode : chr::Code::BadSlot;
+        if (code == chr::Code::Ok) {
+            const chr::Character* ch = rSlot < chr::kMaxSlots && c.roster.Has(rSlot) ? &c.roster.chars[rSlot] : nullptr;
+            switch ((chr::Op)rOp) {
+            case chr::Op::Select: CharStatus("Now playing " + (ch ? ch->Display() : std::string("slot ") + std::to_string(rSlot + 1)) + ".", false); break;
+            case chr::Op::Create: CharStatus("Created in slot " + std::to_string(rSlot + 1) + ". Press PLAY to play it.", false); CharCloseCreator(); break;
+            case chr::Op::Save: CharStatus("Saved.", false); CharCloseCreator(); break;
+            case chr::Op::Delete: CharStatus("Deleted. The slot is free again.", false); c.confirmSlot = -1; c.confirm.clear(); break;
+            }
+        } else {
+            CharStatus(chr::PlayerText(code), true);
+        }
+    } else if (newResult && !c.waitSeq && rCode != (uint8_t)chr::Code::Ok) {
+        CharStatus(chr::PlayerText(rCode <= chr::kCodeLast ? (chr::Code)rCode : chr::Code::BadSlot), true);
+    }
+    if (c.waitSeq && ImGui::GetTime() - c.waitAt > 10.0) {
+        c.waitSeq = 0;   // no answer in 10 s (the session dropped the op): the buttons work again
+        CharStatus("The server did not answer. Try again.", true);
+    }
+    if (newRoster) {
+        // a dialog or an edit whose character went away (deleted elsewhere, a slot refunded) closes
+        if (c.confirmSlot >= 0 && cs::CardOf(c.roster, c.confirmSlot) != cs::Card::Ready) { c.confirmSlot = -1; c.confirm.clear(); }
+        if (c.creator && c.draft.mode == cs::Mode::Edit) {
+            const cs::Card k = cs::CardOf(c.roster, c.draft.slot);
+            if (!c.have || (k != cs::Card::Playing && k != cs::Card::Ready)) CharCloseCreator();
+        }
+        if (c.creator && c.draft.mode == cs::Mode::Create && c.waitSeq == 0 && cs::CardOf(c.roster, c.draft.slot) != cs::Card::Free)
+            CharCloseCreator();
+    }
+}
+
+// A ghost or solid button with its click (design box). `enabled` false draws it dimmed and ignores the click.
+bool CharButton(float x, float y, float w, const char* label, bool solid, bool enabled, ImVec2 d)
+{
+    ChUi& c = CU();
+    const bool hv = enabled && In(d, x, y, w, 40);
+    if (solid)
+        ButtonSolid(x, y, w, 40, label, enabled, hv);
+    else if (enabled)
+        ButtonGhost(x, y, w, 40, label, 1.0f, hv);
+    else
+        ButtonGhost(x, y, w, 40, label, 0.4f, false);
+    if (hv && !c.clickUsed && ImGui::IsMouseClicked(0)) {
+        c.clickUsed = true;
+        return true;
+    }
+    return false;
+}
+
+// A text box (the name fields, the delete confirmation): the box, its text or placeholder, the caret while focused.
+void CharField(float x, float y, float w, const std::string& text, const char* placeholder, bool focus, bool bad)
+{
+    const Rc r = Box(x, y, w, 40);
+    Fill(r, 12, focus ? 0xF7F2E814 : kCardFill);
+    Border(r, 12, bad ? 0xE5603A99 : (focus ? 0xF2B13499 : kCardBorder), focus || bad ? 1.5f : 1.0f);
+    g.dl->PushClipRect(Box(x + 12, y, w - 24, 40).a, Box(x + 12, y, w - 24, 40).b, true);
+    if (!text.empty())
+        Text(M14, x + 14, y + 14, kCream, text.c_str());
+    else
+        Text(M14, x + 14, y + 14, kMuted, placeholder);
+    if (focus && std::fmod(ImGui::GetTime(), 1.0) < 0.55) {
+        const float cx = x + 14.0f + (text.empty() ? 0.0f : TextWDesign(M14, text.c_str())) + 1.0f;
+        Fill(Box(cx, y + 11, 1.5f, 17), 0, kAmber);
+    }
+    g.dl->PopClipRect();
+}
+
+// Typed characters / Backspace into a string. `filter` = the name rule (letters, a capital first); otherwise printable ASCII up to `cap`.
+void CharType(std::string& s, bool nameRule, size_t cap)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    for (int i = 0; i < io.InputQueueCharacters.Size; ++i) {
+        const unsigned ch = io.InputQueueCharacters[i];
+        if (nameRule)
+            cs::TypeNameChar(s, ch);
+        else if (ch >= 0x20 && ch < 0x7F && s.size() < cap)
+            s.push_back((char)ch);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace, true) && !s.empty())
+        s.pop_back();
+}
+
+void CharHints(bool creator)
+{
+    struct Hint { const char* key; const char* label; };
+    static const Hint kSelect[] = {{"CLICK", "play \xC2\xB7 edit \xC2\xB7 delete"}, {"CTRL+TAB", "next page"}, {"TAB", "close"}};
+    static const Hint kCreator[] = {{"< >", "change"}, {"WHEEL", "change the row under the cursor"}, {"ESC", "back to the slots"}, {"TAB", "close"}};
+    const Hint* h = creator ? kCreator : kSelect;
+    const size_t n = creator ? sizeof(kCreator) / sizeof(kCreator[0]) : sizeof(kSelect) / sizeof(kSelect[0]);
+    float content = 0.0f;
+    for (size_t i = 0; i < n; ++i)
+        content += (i ? 24.0f : 0.0f) + KeycapW(h[i].key) + 8.0f + TextWDesign(S13, h[i].label);
+    const float w = content + 54.0f, x0 = 960.0f - w * 0.5f;
+    Panel(x0, 106, w, 40, 20, kPanelGlass);
+    float x = x0 + 27.0f;
+    for (size_t i = 0; i < n; ++i) {
+        if (i) x += 24.0f;
+        Keycap(x, 115, h[i].key);
+        x += KeycapW(h[i].key) + 8.0f;
+        Text(S13, x, 122.5f, kBone, h[i].label);
+        x += TextWDesign(S13, h[i].label);
+    }
+}
+
+// The left panel: the ped window (or the mannequin), the name chip, and two lines under the window.
+void CharLeft(const std::string& name, const char* line1, const char* line2)
+{
+    const bool pedView = PedViewLive();
+    if (pedView)
+        PanelWithWindow();
+    else {
+        Panel(64, 172, 448, 800, 32, kPanelGlass);
+        RadialGlow(139, 477, 300, 0xF2B13421);
+        const Rc m = Box(177, 355, 224, 532);
+        if (B().manikin.rect >= 0)
+            AtlasImage(B().manikin, m.a.x, m.a.y, (m.b.x - m.a.x), C(kCream, g.a * 0.085f));
+    }
+    Text(B28, 97, 923, kCream, "CHARACTER", 0.28f);
+    std::string nm = name.empty() ? std::string("NO CHARACTER") : name;
+    for (char& ch : nm) ch = (char)std::toupper((unsigned char)ch);
+    const float tw = TextWDesign(B12, nm.c_str(), 1.44f);
+    const float w = std::max(150.0f, std::min(280.0f, tw + 30.0f));
+    ChipBox(481.0f - w, 914, w, 34, Chip::Ghost);
+    Text(B12, 481.0f - w * 0.5f, 928, kMuted, nm.c_str(), 1.44f, kCenter);
+    if (line1 && *line1) Text(B12, 97, 296, kMuted, line1, 2.4f);
+    if (line2 && *line2) Text(M13, 97, 266, kBone, line2);
+    if (!pedView) Text(M13, 97, 236, kMuted, "The ped window opens with the ped preview on.");
+}
+
+const char* SexWord(chr::Sex s) { return s == chr::Sex::Female ? "FEMALE" : "MALE"; }
+
+void DrawCharSelect(ImVec2 d)
+{
+    ChUi& c = CU();
+    const chr::Character* act = c.roster.Active();
+    {
+        std::string l1;
+        if (act) l1 = "SLOT " + std::to_string(c.roster.active + 1) + " \xC2\xB7 " + SexWord(act->look.sex);
+        CharLeft(act ? act->Display() : std::string(), l1.c_str(), act ? "Playing now." : "");
+    }
+    Panel(538, 172, 1318, 800, 32, kPanelGlass);
+    Text(B28, 571, 923, kCream, "CHARACTERS", 0.28f);
+    {
+        char lab[48];
+        std::snprintf(lab, sizeof lab, "%d OF %d SLOTS", (int)c.roster.slots, chr::kMaxSlots);
+        const float w = TextWDesign(B12, lab, 1.44f) + 30.0f;
+        ChipBox(1823.0f - w, 914, w, 34, Chip::Ghost);
+        Text(B12, 1823.0f - w * 0.5f, 928, kMuted, lab, 1.44f, kCenter);
+    }
+    const bool waiting = c.waitSeq != 0;
+    for (int slot = 0; slot < chr::kMaxSlots; ++slot) {
+        const float x = 571.0f + 426.0f * (float)slot, y = 300.0f, w = 400.0f, h = 576.0f;
+        const cs::Card card = cs::CardOf(c.roster, slot);
+        const uint8_t acts = cs::ActionsOf(c.roster, slot);
+        const Rc r = Box(x, y, w, h);
+        const bool hv = In(d, x, y, w, h);
+        if (card == cs::Card::Playing) {
+            Fill(r, 24, 0xF2B1340F);
+            Border(r, 24, 0xF2B13499, 1.5f);
+        } else if (card == cs::Card::Locked || card == cs::Card::Free) {
+            Fill(r, 24, hv && card == cs::Card::Free ? 0xF7F2E80A : 0xF7F2E805);
+            Dashed(r, 24, card == cs::Card::Free ? 0xF2B13466 : 0xF7F2E81F, 1.5f);
+        } else {
+            Fill(r, 24, hv ? 0xF7F2E812 : kCardFill);
+            Border(r, 24, kCardBorder, 1.0f);
+        }
+        char sl[16];
+        std::snprintf(sl, sizeof sl, "SLOT %d", slot + 1);
+        Text(B12, x + 28, y + h - 44, kMuted, sl, 2.4f);
+        {
+            const char* lab = card == cs::Card::Playing ? "PLAYING" : card == cs::Card::Ready ? "READY" : card == cs::Card::Free ? "EMPTY"
+                            : card == cs::Card::Locked ? "LOCKED" : "STORED";
+            const Chip chip = card == cs::Card::Playing ? Chip::Amber : card == cs::Card::Ready ? Chip::Bone : Chip::Ghost;
+            const float cw = TextWDesign(B12, lab, 1.44f) + 28.0f;
+            ChipBox(x + w - 28 - cw, y + h - 58, cw, 30, chip);
+            Text(B12, x + w - 28 - cw * 0.5f, y + h - 47, ChipText(chip), lab, 1.44f, kCenter);
+        }
+        const bool has = card == cs::Card::Playing || card == cs::Card::Ready || card == cs::Card::Stored;
+        if (has) {
+            const chr::Character& ch = c.roster.chars[slot];
+            Text(B34, x + 28, y + h - 128, kCream, ch.first.c_str());
+            Text(B34, x + 28, y + h - 172, kCream, ch.last.c_str());
+            std::string sub = std::string(ch.look.sex == chr::Sex::Female ? "Female" : "Male") + " \xC2\xB7 " +
+                              ((ch.flags & chr::kCharCustomised) ? "made in the creator" : "instant character, name still free to change");
+            Text(M13, x + 28, y + h - 206, kMuted, sub.c_str());
+        } else if (card == cs::Card::Free) {
+            Icon("plus", x + w * 0.5f - 18.0f, y + 330, 36, kAmber, 0.85f);
+            Text(B18, x + w * 0.5f, y + 296, kCream, "EMPTY SLOT", 2.88f, kCenter);
+        } else {
+            Icon("lock", x + w * 0.5f - 11.5f, y + 330, 23, kMuted);
+            Text(B18, x + w * 0.5f, y + 296, kMuted, "LOCKED", 2.88f, kCenter);
+        }
+        Text(M13, card == cs::Card::Locked || card == cs::Card::Free ? x + w * 0.5f : x + 28, card == cs::Card::Locked || card == cs::Card::Free ? y + 266 : y + 96,
+             card == cs::Card::Locked ? kBone : kMuted, cs::CardNote(card), 0.0f, card == cs::Card::Locked || card == cs::Card::Free ? kCenter : kLeft);
+        // the actions
+        const float bx = x + 28, by = y + 28;
+        if (acts & cs::kActPlay) {
+            if (CharButton(bx, by, 128, "PLAY", true, !waiting, d))
+                CharSend(chr::Op::Select, slot, std::string());
+        }
+        if (acts & cs::kActEdit) {
+            const bool only = !(acts & cs::kActPlay);
+            if (CharButton(only ? bx : bx + 136, by, only ? 344 : 96, only ? "EDIT CHARACTER" : "EDIT", false, !waiting, d)) {
+                if (cs::BeginEdit(c.roster, slot, c.draft)) {
+                    c.creator = true;
+                    c.section = cs::Section::Heritage;
+                    c.nameFocus = -1;
+                    c.status.clear();
+                }
+            }
+        }
+        if (acts & cs::kActDelete) {
+            if (CharButton(bx + 240, by, 104, "DELETE", false, !waiting, d)) {
+                c.confirmSlot = slot;
+                c.confirm.clear();
+            }
+        }
+        if (acts & cs::kActCreate) {
+            for (int sx = 0; sx < 2; ++sx)
+                if (CharButton(bx + 176.0f * (float)sx, by, 168, sx ? "CREATE FEMALE" : "CREATE MALE", true, !waiting, d)) {
+                    const uint32_t seed = (uint32_t)(GetTickCount64() & 0xFFFFFFFFu) ^ (uint32_t)(slot * 7919);
+                    if (cs::BeginCreate(c.roster, slot, sx ? chr::Sex::Female : chr::Sex::Male, seed, c.draft)) {
+                        c.creator = true;
+                        c.section = cs::Section::Heritage;
+                        c.nameFocus = 0;
+                        c.status.clear();
+                    }
+                }
+        }
+    }
+    // the status line, and the guest note
+    const double age = ImGui::GetTime() - c.statusAt;
+    if (waiting)
+        Text(M13, 571, 236, kMuted, "Waiting for the server...");
+    else if (!c.status.empty() && age < 10.0)
+        Text(M13, 571, 236, c.statusBad ? kEmber : kAmber, c.status.c_str(), 0.0f, kLeft, false, age > 8.0 ? (float)(10.0 - age) * 0.5f : 1.0f);
+    if (c.guest)
+        Text(M13, 1823, 236, kMuted, "Guest session: your characters are not kept. Log in to Solar Launcher to keep them.", 0.0f, kRight);
+}
+
+void DrawCharConfirm(ImVec2 d, float W, float H)
+{
+    ChUi& c = CU();
+    if (c.confirmSlot < 0 || !c.roster.Has(c.confirmSlot))
+        return;
+    const chr::Character& ch = c.roster.chars[c.confirmSlot];
+    g.dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), C(kDim, g.a * 0.7f));
+    const Rc card = Box(660, 380, 600, 320);
+    Shadow(card, 24, 0x00000080, 16.0f, 12.0f);
+    Fill(card, 24, kOverlayGlass);
+    Border(card, 24, kGlassBorder, 1.0f);
+    Text(B18, 692, 654, kCream, "DELETE CHARACTER", 2.88f);
+    const std::string line = "Type \"" + ch.Display() + "\" to delete this character and its inventory.";
+    Text(M13, 692, 618, kBone, line.c_str());
+    Text(M13, 692, 596, kMuted, "This cannot be undone. The slot becomes free again.");
+    CharType(c.confirm, false, chr::kMaxConfirmLen);
+    const bool match = cs::ConfirmMatches(c.confirm, ch);
+    CharField(692, 520, 536, c.confirm, "First Last", true, !c.confirm.empty() && !match && c.confirm.size() >= ch.Display().size());
+    const bool waiting = c.waitSeq != 0;
+    if (CharButton(692, 420, 140, "CANCEL", false, true, d)) {
+        c.confirmSlot = -1;
+        c.confirm.clear();
+        return;
+    }
+    const bool go = CharButton(1088, 420, 140, "DELETE", true, match && !waiting, d) ||
+                    (match && !waiting && ImGui::IsKeyPressed(ImGuiKey_Enter, false));
+    if (go)
+        CharSend(chr::Op::Delete, c.confirmSlot, c.confirm);
+    c.clickUsed = true;   // the dialog is modal: nothing under it takes this frame's click
+}
+
+void DrawCharCreator(ImVec2 d)
+{
+    ChUi& c = CU();
+    cs::Draft& dr = c.draft;
+    const ImGuiIO& io = ImGui::GetIO();
+    {
+        const std::string nm = dr.ch.first.empty() && dr.ch.last.empty() ? std::string() : dr.ch.first + " " + dr.ch.last;
+        const std::string l1 = "SLOT " + std::to_string(dr.slot + 1) + " \xC2\xB7 " + SexWord(dr.ch.look.sex);
+        CharLeft(nm, l1.c_str(), "The preview follows about a second after a change.");
+    }
+    Panel(538, 172, 1318, 800, 32, kPanelGlass);
+    Text(B28, 571, 923, kCream, dr.mode == cs::Mode::Create ? "NEW CHARACTER" : "EDIT CHARACTER", 0.28f);
+    // the names
+    const bool clicked = ImGui::IsMouseClicked(0) && !c.clickUsed;
+    if (dr.nameEditable) {
+        Text(B12, 571, 880, kMuted, "FIRST NAME", 2.4f);
+        Text(B12, 955, 880, kMuted, "LAST NAME", 2.4f);
+        if (clicked) {
+            if (In(d, 571, 826, 360, 40)) c.nameFocus = 0;
+            else if (In(d, 955, 826, 360, 40)) c.nameFocus = 1;
+            else c.nameFocus = -1;
+        }
+        if (c.nameFocus == 0) CharType(dr.ch.first, true, chr::kNameMaxLen);
+        if (c.nameFocus == 1) CharType(dr.ch.last, true, chr::kNameMaxLen);
+        const char* h0 = cs::NameHint(dr.ch.first, chr::NamePart::First);
+        const char* h1 = cs::NameHint(dr.ch.last, chr::NamePart::Last);
+        CharField(571, 826, 360, dr.ch.first, "First", c.nameFocus == 0, !dr.ch.first.empty() && *h0 && dr.ch.first.size() >= chr::kNameMinLen);
+        CharField(955, 826, 360, dr.ch.last, "Last", c.nameFocus == 1, !dr.ch.last.empty() && *h1 && dr.ch.last.size() >= chr::kNameMinLen);
+        Text(M13, 571, 806, *h0 ? kMuted : kBone, *h0 ? h0 : "OK");
+        Text(M13, 955, 806, *h1 ? kMuted : kBone, *h1 ? h1 : "OK");
+        Text(M13, 1340, 846, kMuted, "Fixed after the first save.");
+    } else {
+        Text(B12, 571, 880, kMuted, "NAME", 2.4f);
+        Icon("lock", 571, 836, 14, kMuted);
+        Text(B20, 593, 840, kCream, dr.ch.Display().c_str());
+        Text(M13, 571, 806, kMuted, "The name is fixed after the first save in the creator. An admin can rename a character.");
+    }
+    {
+        const char* sw = SexWord(dr.ch.look.sex);
+        const float cw = TextWDesign(B12, sw, 1.44f) + 28.0f;
+        ChipBox(1823.0f - cw, 914, cw, 34, Chip::Bone);
+        Text(B12, 1823.0f - cw * 0.5f, 928, kBone, sw, 1.44f, kCenter);
+    }
+    // the section tabs
+    {
+        float x = 571.0f;
+        for (int s = 0; s < cs::kSections; ++s) {
+            const char* lab = cs::ToString((cs::Section)s);
+            const float w = TextWDesign(B12, lab, 1.44f) + 36.0f;
+            const bool on = (int)c.section == s;
+            const bool hv = In(d, x, 740, w, 36);
+            const Chip chip = on ? Chip::Amber : (hv ? Chip::Bone : Chip::Ghost);
+            ChipBox(x, 740, w, 36, chip);
+            Text(B12, x + w * 0.5f, 755, ChipText(chip), lab, 1.44f, kCenter);
+            if (hv && clicked && !c.clickUsed) {
+                c.section = (cs::Section)s;
+                c.clickUsed = true;
+            }
+            x += w + 10.0f;
+        }
+    }
+    // the rows
+    cs::Row rows[cs::kMaxRows];
+    const int n = cs::Rows(c.section, dr, rows, cs::kMaxRows);
+    const int cols = n > 10 ? 2 : 1;
+    const int per = (n + cols - 1) / cols;
+    const float top = 716.0f, bottom = 268.0f;
+    const float rowH = per > 0 ? std::min(52.0f, (top - bottom) / (float)per) : 52.0f;
+    const float colW = cols == 2 ? 610.0f : 820.0f;
+    for (int i = 0; i < n; ++i) {
+        const int col = i / per, k = i % per;
+        const float cx = 571.0f + (colW + 32.0f) * (float)col, ry = top - rowH * (float)(k + 1);
+        const bool hv = In(d, cx, ry, colW, rowH);
+        if (hv) Fill(Box(cx - 8, ry + 2, colW + 16, rowH - 4), 10, 0xF7F2E80A);
+        const float mid = ry + rowH * 0.5f;
+        const std::string label = cs::Label(rows[i]);
+        Text(M14, cx, mid - 4.0f, kBone, label.c_str());
+        // < value >
+        const float rx = cx + colW - 32.0f, lx = cx + colW - 220.0f;
+        const bool hvL = In(d, lx, mid - 16, 32, 32), hvR = In(d, rx, mid - 16, 32, 32);
+        for (int b = 0; b < 2; ++b) {
+            const float bx = b ? rx : lx;
+            const bool bh = b ? hvR : hvL;
+            const Rc br = Box(bx, mid - 16, 32, 32);
+            Fill(br, 16, bh ? 0xF7F2E81F : 0xF7F2E80D);
+            Border(br, 16, bh ? 0xF2B13499 : kCardBorder, 1.0f);
+            Text(B14, bx + 16, mid - 5.0f, bh ? kAmber : kCream, b ? ">" : "<", 0.0f, kCenter);
+        }
+        const std::string val = cs::Value(dr.ch.look, rows[i]);
+        Text(B14, (lx + 32.0f + rx) * 0.5f, mid - 5.0f, kCream, val.c_str(), 0.0f, kCenter, true);
+        const float fr = cs::Fraction(dr.ch.look, rows[i]);
+        if (fr >= 0.0f) {
+            const float tx = cx, tw = colW - 240.0f, ty = ry + 6.0f;
+            Fill(Box(tx, ty, tw, 3), 2, kTrack);
+            Fill(Box(tx, ty, std::max(2.0f, tw * fr), 3), 2, kAmber);
+        }
+        int dir = 0;
+        if (clicked && !c.clickUsed && (hvL || hvR)) {
+            dir = hvL ? -1 : 1;
+            c.clickUsed = true;
+        } else if (hv && io.MouseWheel != 0.0f) {
+            dir = io.MouseWheel > 0.0f ? 1 : -1;
+        }
+        if (dir && cs::Step(dr.ch.look, rows[i], dir))
+            ++dr.rev;
+    }
+    // the bottom bar: why it cannot be saved yet / the status, CANCEL, SAVE / CREATE
+    const chr::Code chk = cs::Check(dr);
+    const bool waiting = c.waitSeq != 0;
+    const double age = ImGui::GetTime() - c.statusAt;
+    if (waiting)
+        Text(M13, 571, 216, kMuted, "Waiting for the server...");
+    else if (!c.status.empty() && age < 10.0)
+        Text(M13, 571, 216, c.statusBad ? kEmber : kAmber, c.status.c_str());
+    else if (chk != chr::Code::Ok)
+        Text(M13, 571, 216, kMuted, chk == chr::Code::BadName ? "Type a first and a last name: 3 to 25 letters each." : chr::PlayerText(chk));
+    if (CharButton(1500, 196, 140, "CANCEL", false, !waiting, d)) {
+        CharCloseCreator();
+        return;
+    }
+    if (CharButton(1660, 196, 163, dr.mode == cs::Mode::Create ? "CREATE" : "SAVE", true, chk == chr::Code::Ok && !waiting, d)) {
+        CharSend(cs::OpOf(dr), dr.slot, chr::EncodeCharacter(dr.ch));
+        c.nameFocus = -1;
+    }
+    CharPublishDraft(true);
+}
+
+void DrawCharactersPage(const FrameIn& in)
+{
+    ChUi& c = CU();
+    c.clickUsed = false;
+    CharSync();
+    if (in.justOpened) {
+        c.confirmSlot = -1;
+        c.confirm.clear();
+        c.nameFocus = -1;
+    }
+    const ImVec2 d = DesignOf(ImGui::GetIO().MousePos);
+    if (!c.have) {
+        CharCloseCreator();
+        CharLeft(std::string(), "", "");
+        Panel(538, 172, 1318, 800, 32, kPanelGlass);
+        Text(B28, 571, 923, kCream, "CHARACTERS", 0.28f);
+        Text(M13, 1197, 560, kMuted, "This server has sent no characters.", 0.0f, kCenter);
+        return;
+    }
+    // the dialog takes the clicks first (it is drawn last, on top)
+    const bool dialog = c.confirmSlot >= 0;
+    if (dialog) c.clickUsed = true;
+    CharHints(c.creator);
+    if (c.creator)
+        DrawCharCreator(d);
+    else {
+        CharPublishDraft(false);
+        DrawCharSelect(d);
+    }
+    if (dialog) {
+        c.clickUsed = false;
+        DrawCharConfirm(d, in.W, in.H);
     }
 }
 
@@ -2875,6 +3511,21 @@ bool HandleEsc()
     return false;
 }
 
+bool CharactersAvailable()
+{
+    std::lock_guard<std::mutex> lk(CS().m);
+    return CS().on && CS().have;
+}
+
+bool HandleCharEsc()
+{
+    ChUi& c = CU();
+    if (c.confirmSlot >= 0) { c.confirmSlot = -1; c.confirm.clear(); return true; }
+    if (c.nameFocus >= 0) { c.nameFocus = -1; return true; }
+    if (c.creator) { CharCloseCreator(); return true; }
+    return false;
+}
+
 Page DrawTopTabs(const FrameIn& in)
 {
     SetGeo(in);
@@ -2917,6 +3568,15 @@ FrameOut DrawScreen(const FrameIn& in)
         g_pedViewThisFrame = PedViewFresh();
         // the overlays first take this frame's clicks (they are drawn last, on top)
         DrawDim(in);
+        if (in.page == Page::Characters) {   // 0.5.9 stage 4: the CHARACTERS page (the same dim, stamp and ped window)
+            DrawCharactersPage(in);
+            Page p = in.page;
+            TopTabsInto(g.dl, in, p);
+            out.page = p;
+            ImGui::End();
+            ImGui::PopStyleVar(2);
+            return out;
+        }
         HandleInput(in);
         DrawHintBar();
         DrawCharacter();

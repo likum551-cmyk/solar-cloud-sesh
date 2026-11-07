@@ -421,8 +421,9 @@ namespace gage::sync::chr {
         Select = 1,   // play the character in `slot`
         Create = 2,   // a new character in the empty `slot` (names + look)
         Save = 3,     // the creator's result for the character in `slot` (the look; the names too while it is not customised yet)
+        Delete = 4,   // 0.5.9 stage 4 (GI: "from the select screen, confirmed by typing the character's name"): the blob is the typed name
     };
-    constexpr uint8_t kOpLast = (uint8_t)Op::Save;
+    constexpr uint8_t kOpLast = (uint8_t)Op::Delete;
     enum class Code : uint8_t
     {
         Ok = 0,
@@ -437,8 +438,11 @@ namespace gage::sync::chr {
         NotNow = 9,       // the player cannot switch now (dead)
         RateLimited = 10,
         Failed = 11,      // the server could not save (the change was not made)
+        Playing = 12,     // Delete of the character being played (switch to another one first)
+        LastOne = 13,     // Delete of the only character (every account keeps one)
+        NotConfirmed = 14,  // Delete whose typed name is not the character's name
     };
-    constexpr uint8_t kCodeLast = (uint8_t)Code::Failed;
+    constexpr uint8_t kCodeLast = (uint8_t)Code::NotConfirmed;
     inline const char* ToString(Code c)
     {
         switch (c)
@@ -455,6 +459,9 @@ namespace gage::sync::chr {
         case Code::NotNow: return "not now";
         case Code::RateLimited: return "too fast";
         case Code::Failed: return "could not save";
+        case Code::Playing: return "character in play";
+        case Code::LastOne: return "last character";
+        case Code::NotConfirmed: return "name not confirmed";
         }
         return "?";
     }
@@ -465,8 +472,72 @@ namespace gage::sync::chr {
         case Op::Select: return "select";
         case Op::Create: return "create";
         case Op::Save: return "save";
+        case Op::Delete: return "delete";
         }
         return "?";
+    }
+    // What the player sees for a refusal (the select screen and the creator). Every code has a line (exhaustive switch, no default).
+    inline const char* PlayerText(Code c)
+    {
+        switch (c)
+        {
+        case Code::Ok: return "Done.";
+        case Code::BadSlot: return "That slot does not exist.";
+        case Code::Locked: return "This slot is locked. Buy a character slot in the Solar RP shop.";
+        case Code::SlotUsed: return "That slot already holds a character.";
+        case Code::Empty: return "That slot is empty.";
+        case Code::BadName: return "Names are 3 to 25 letters and start with a capital.";
+        case Code::NameTaken: return "Another character already has that name.";
+        case Code::BadLook: return "Part of the appearance is out of range.";
+        case Code::NameFixed: return "The name is fixed once the character has been saved in the creator.";
+        case Code::NotNow: return "Not now: you cannot switch characters while dead.";
+        case Code::RateLimited: return "Too fast. Try again in a second.";
+        case Code::Failed: return "The server could not save. Nothing was changed.";
+        case Code::Playing: return "You are playing this character. Switch to another one first.";
+        case Code::LastOne: return "Your last character cannot be deleted.";
+        case Code::NotConfirmed: return "Type the character's full name to confirm.";
+        }
+        return "Refused.";
+    }
+
+    // Delete's confirmation: the typed text (CharOp blob) split at its first space into first and last name; the names are compared by NameKey
+    // (case-insensitive), so "pia player" confirms "Pia Player". False = not two parts (the op answers NotConfirmed).
+    constexpr size_t kMaxConfirmLen = 2 * kNameMaxLen + 1;
+    inline bool ParseConfirm(const std::string& typed, Name& out)
+    {
+        if (typed.size() > kMaxConfirmLen) return false;
+        const size_t sp = typed.find(' ');
+        if (sp == std::string::npos || sp == 0 || sp + 1 >= typed.size()) return false;
+        out.first = typed.substr(0, sp);
+        out.last = typed.substr(sp + 1);
+        return out.last.find(' ') == std::string::npos;
+    }
+
+    // The name the OTHER players see (GI 2026-11-07: "the CHARACTER name"): "First Last" when it fits the protocol's 24-byte name
+    // (proto::kMaxName), else "F. Last", else "F. Lastnam" cut to 24. Letters, ". " and one space only: proto::ValidName accepts every result.
+    constexpr size_t kPublicNameMax = 24;
+    inline std::string PublicName(const Character& c)
+    {
+        std::string s = c.first + " " + c.last;
+        if (s.size() <= kPublicNameMax) return s;
+        s = std::string(1, c.first.empty() ? 'X' : c.first[0]) + ". " + c.last;
+        if (s.size() > kPublicNameMax) s.resize(kPublicNameMax);
+        return s;
+    }
+
+    // An admin's rename (console `charname`, the verified-admin chat command): any slot that holds a character, valid and free names; the
+    // customised flag is left as it is (a player's own one free rename is not used up by an admin). Codes as for Save.
+    inline Code AdminRename(Roster& r, int slot, const std::string& first, const std::string& last,
+                            const std::function<bool(const std::string&)>& taken)
+    {
+        if (slot < 0 || slot >= kMaxSlots) return Code::BadSlot;
+        if (!r.Has(slot)) return Code::Empty;
+        if (!ValidNamePart(first, NamePart::First) || !ValidNamePart(last, NamePart::Last)) return Code::BadName;
+        Character& c = r.chars[slot];
+        if (NameKey(first, last) != NameKey(c.first, c.last) && taken(NameKey(first, last))) return Code::NameTaken;
+        c.first = first;
+        c.last = last;
+        return Code::Ok;
     }
 
     // The rules of one op on a roster (the server's truth; the client may predict with it). `taken(key)` says whether ANOTHER character owns
@@ -508,6 +579,18 @@ namespace gage::sync::chr {
             }
             c.look = in.look;
             c.flags |= kCharCustomised;
+            return Code::Ok;
+        }
+        case Op::Delete:
+        {
+            // `in` carries only the typed confirmation (ParseConfirm), no look. The slot becomes free again (Create may use it).
+            if (!r.Has(slot)) return Code::Empty;
+            if (r.Count() <= 1) return Code::LastOne;          // first: the only character is also the one in play
+            if (slot == r.active) return Code::Playing;
+            const Character& c = r.chars[slot];
+            if (in.first.empty() || NameKey(in.first, in.last) != NameKey(c.first, c.last)) return Code::NotConfirmed;
+            r.chars[slot] = Character();
+            r.used &= (uint8_t)~(1u << slot);
             return Code::Ok;
         }
         }

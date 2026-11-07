@@ -3097,6 +3097,7 @@ static void TestSyncD()
 #include "ring_round_tests.h"  // 0.5.5 ring_map_round: radii, the asked box, the gate, the mask and its codecs, the blip clip pattern
 #include "world_clock_tests.h" // 0.5.7 world clock: the server's time of day and weather (pure parts and the WorldClock codec)
 #include "character_tests.h"   // 0.5.9 characters: slots, names, appearance ranges, the instant character, roster rules, codecs
+#include "char_screens_tests.h" // 0.5.9 stage 4: the character select screen and the creator (cards, drafts, rows, steppers)
 #include "ped_preview_tests.h" // 0.5.8 inv_ped_mode: the inventory's ped on GTA's frontend ped renderer (gate, probe, machine, pause-menu exclusion)
 
 int main()
@@ -3174,6 +3175,8 @@ int main()
     worldclock_t::RunPure();                        // 0.5.7 world clock (tests/world_clock_tests.h)
     std::printf("-- 0.5.9 characters (slots, names, appearance, instant character, roster rules, codecs)\n");
     chartest::RunPure();                            // 0.5.9 characters (tests/character_tests.h)
+    std::printf("-- 0.5.9 stage 4 character screens (select, creator)\n");
+    chscr::RunPure();                               // 0.5.9 stage 4 (tests/char_screens_tests.h)
     std::printf("-- 0.5.8 inventory ped preview (frontend ped renderer)\n");
     pedpreview_t::RunPure();                        // 0.5.8 inv_ped_mode (tests/ped_preview_tests.h)
 
@@ -3204,7 +3207,8 @@ int main()
                        + ringround_t::kChecks    // + 0.5.5 the ring map round mask 15, + 0.5.6 its census pick and mask shape 4, + 0.5.7 the pinned faded mask 1
                        + worldclock_t::kChecks   // + 0.5.7 the world clock 14
                        + pedpreview_t::kChecks   // + 0.5.8 the inventory ped preview 17
-                       + chartest::kChecks;      // + 0.5.9 characters 17
+                       + chartest::kChecks       // + 0.5.9 characters 17, + stage 4 6
+                       + chscr::kChecks;         // + 0.5.9 stage 4 the character screens 12
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

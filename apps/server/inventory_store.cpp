@@ -105,4 +105,46 @@ namespace gage::server {
         return AtomicWriteFile(PathFor(accountId, slot), sync::inv::EncodeForSave(ch), why);
     }
 
+    InventoryStore::Retired InventoryStore::Retire(const std::string& accountId, int slot, std::string* why)
+    {
+        if (!Enabled() || accountId.empty())
+            return Retired::None;
+        const std::string path = PathFor(accountId, slot);
+        std::error_code ec;
+        const fs::file_status st = fs::status(path, ec);
+        // MinGW reports not_found AND sets ec for a missing file: test the type first (lessons 2026-10-29).
+        if (st.type() == fs::file_type::not_found)
+            return Retired::None;
+        if (st.type() != fs::file_type::regular)
+        {
+            if (why) *why = path + ": not a readable file" + (ec ? " (" + ec.message() + ")" : std::string());
+            return Retired::Failed;
+        }
+        fs::rename(path, path + ".deleted", ec);   // replaces an older .deleted (a slot deleted twice)
+        if (ec)
+        {
+            if (why) *why = path + ": cannot set it aside: " + ec.message();
+            return Retired::Failed;
+        }
+        return Retired::SetAside;
+    }
+
+    bool InventoryStore::Restore(const std::string& accountId, int slot, std::string* why)
+    {
+        const std::string path = PathFor(accountId, slot);
+        std::error_code ec;
+        fs::rename(path + ".deleted", path, ec);
+        if (ec && why) *why = path + ".deleted: cannot put it back: " + ec.message();
+        return !ec;
+    }
+
+    bool InventoryStore::Purge(const std::string& accountId, int slot, std::string* why)
+    {
+        const std::string path = PathFor(accountId, slot) + ".deleted";
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec && why) *why = path + ": cannot remove it: " + ec.message();
+        return !ec;
+    }
+
 } // namespace gage::server

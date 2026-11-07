@@ -156,6 +156,7 @@ namespace gage::join {
         std::function<void(const proto::CharRoster&)> onCharRoster;
         std::function<void(const proto::CharResult&)> onCharResult;
         std::function<void(const proto::PeerFace&)> onPeerFace;
+        std::function<void(const proto::PeerName&)> onPeerName;   // 0.5.9 stage 4: another player is shown by another name from now on
 
         // Optional. A short text the worker appends to its 10 s heartbeat log line (the engine reports how long its
         // peer lock made the worker and the game thread wait there). Called on the worker thread once per beat;

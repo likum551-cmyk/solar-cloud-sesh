@@ -487,6 +487,10 @@ namespace {
                     if (peers.onPeerFace)
                         timed("peerFace", [&] { peers.onPeerFace(e.face); });
                     break;
+                case net::Event::Type::PeerName:
+                    if (peers.onPeerName)
+                        timed("peerName", [&] { peers.onPeerName(e.peerName); });
+                    break;
                 case net::Event::Type::Disconnected:
                     ended = true;
                     if (!joined && failure.empty())

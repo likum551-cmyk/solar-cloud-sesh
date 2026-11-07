@@ -93,16 +93,32 @@ namespace gage::sync::outfit {
 
     // What a worn item puts on the ped. n == 0: the item has no look on this sex (the ped's component is left as it is).
     // The three starter items are the spawn outfit's own pieces (engine.cpp kPlayerOutfit; the engine checks once that they still agree and
-    // logs a warning if someone changes one side only). Female looks: none yet (the engine never makes a female ped today).
+    // logs a warning if someone changes one side only). 0.5.9 female characters (mp_f_freemode_01, the engine's kPlayerOutfitFemale): the same
+    // three items as base-game female pieces, by GXT label (root-cause/v-clothingnames female_tops / female_legs / female_shoes, read
+    // 2026-11-07): U_FMF_0_6 "Blue T-Shirt" (top 0, texture 6), L_FMF_3_0 "Black Chinos" (legs 3), F_FMF_4_1 "White Sports" (shoes 4,
+    // texture 1). The arms 3/0 that pair with the female tee and these renders are NOT looked at yet (live-unverified).
     inline Parts Worn(inv::ItemId id, Sex s)
     {
         Parts r;
-        if (s != Sex::Male)
-            return r;
         const inv::ItemDef* d = inv::Find(id);
         if (!d)
             return r;
         const std::string key = d->key;
+        if (s == Sex::Female) {
+            if (key == "tshirt") {
+                r.p[0] = {11, 0, 6};    // top: U_FMF_0_6 Blue T-Shirt
+                r.p[1] = {3, 0, 0};     // arms: the short-sleeve torso (unverified pairing)
+                r.p[2] = {8, 14, 0};    // undershirt: none (female 8/14, no mesh)
+                r.n = 3;
+            } else if (key == "jeans") {
+                r.p[0] = {4, 3, 0};     // legs: L_FMF_3_0 Black Chinos
+                r.n = 1;
+            } else if (key == "sneakers") {
+                r.p[0] = {6, 4, 1};     // feet: F_FMF_4_1 White Sports
+                r.n = 1;
+            }
+            return r;
+        }
         if (key == "tshirt") {
             r.p[0] = {11, 8, 10};   // top: U_FMM_8_10 Sky Blue Tee (the branded tee: brand_apparel.h kTop*)
             r.p[1] = {3, 8, 0};     // arms: forearms, the pair of the Tee tops (v-besttorso)

@@ -384,6 +384,7 @@ static std::vector<Case> Corpus()
     { CharOp m; m.seq = 7; m.op = 2; m.slot = 1; m.blob = "character-bytes"; v.push_back(Make("CharOp", m)); }
     { CharResult m; m.seq = 7; m.op = 2; m.slot = 1; m.code = 6; m.text = "That name is taken."; v.push_back(Make("CharResult", m)); }
     { PeerFace m; m.id = 9; m.blob = "face-bytes"; v.push_back(Make("PeerFace", m)); }
+    { PeerName m; m.id = 9; m.name = "Pia Player"; v.push_back(Make("PeerName", m)); }
     for (Case& c : v)
         if (c.name.rfind("VehicleWorld", 0) == 0 || c.name.rfind("VehicleUpdate", 0) == 0 || c.name == "VehicleCmd register") c.lossy = true;
     return v;

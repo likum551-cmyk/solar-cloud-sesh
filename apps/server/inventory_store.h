@@ -47,6 +47,16 @@ namespace gage::server {
         // is a safe file name on both systems.
         std::string PathFor(const std::string& accountId, int slot = 0) const;
 
+        // 0.5.9 stage 4, a character's deletion (GI: "its inventory file is removed too, server side, atomic, logged"), in three steps around
+        // the roster save: Retire renames the slot's file to "<file>.deleted" (one rename: the file is either there or set aside, never half
+        // written), Restore puts it back when the roster could not be saved, Purge removes the set-aside file once the roster is saved.
+        // Retire: None when the slot has no file (nothing to remove, also for a guest or with saving off), Failed (with a reason) when the
+        // rename failed.
+        enum class Retired { None, SetAside, Failed };
+        Retired Retire(const std::string& accountId, int slot, std::string* why = nullptr);
+        bool Restore(const std::string& accountId, int slot, std::string* why = nullptr);
+        bool Purge(const std::string& accountId, int slot, std::string* why = nullptr);
+
     private:
         bool EnsureDir(std::string* why);
         std::string dir_;

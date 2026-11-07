@@ -444,14 +444,31 @@ the rules are `libs/sync/character.h`.
 - **Items per character.** Slot 0's inventory is the account's existing `<hex>.inv` (no migration), slots 1 and 2 are
   `<hex>.c1.inv` / `<hex>.c2.inv` in `inventoryDir`. A Select writes the old character's items first (a failed write refuses
   the switch: `Failed`) and sends the new character's.
-- **What the others see.** The active character's face (`PeerFace`) to everyone on join and after every change of it.
+- **What the others see.** The active character's face (`PeerFace`) to everyone on join and after every change of it, and
+  (stage 4, GI's decision) its NAME: `PlayerJoined` and `PeerName` carry `sync::chr::PublicName` ("First Last", "F. Last"
+  past 24 bytes), so name tags, chat, the Tab lists and the kill feed show the character. The account name stays where admins
+  need it: the log, `list` (`id name ("shown name")`), bans. `kick`, `charname` and every console / admin command that takes
+  a player accept the id, the account name, or the shown name (case-insensitive, `_` for the space). With `characters 0` the
+  shown name is the account name.
+- **Delete** (stage 4, GI's decision; the select screen, confirmed by typing the character's name): not the only character
+  (`LastOne`), not the one being played (`Playing`: switch first), and the typed text must be its full name (`NotConfirmed`).
+  The slot's inventory file is renamed to `<file>.deleted`, the roster is written (a failed write renames it back and answers
+  `Failed`), then the `.deleted` file is removed; the slot is free again. A guest's delete changes only the session's roster.
+- **Rename** (stage 4): the player renames only in the creator, while the character was never saved there (the instant
+  one), then the name is fixed. An admin renames the ACTIVE character of an online player: console `charname <id|name>
+  <First> <Last>`, or `/charname <id|name> <First> <Last>` in chat for a verified admin (a guest's or a non-admin's is
+  refused and logged). The rename keeps the name rules and the server-wide uniqueness, keeps the character customised, is
+  saved, tells the player (a notice and a new roster) and everyone else (`PeerName`).
 - **Guests** (no verified account) get one character for the session, never saved; a second slot is never theirs.
 
 Log lines (prefix `characters:`): the start line above (or `characters: off`); per join `id=N Name saved|fresh|corrupt|unreadable,
 C character(s), S slot(s)[ (the platform did not say: 1)], playing slot A "First Last"` plus `had no character: made "First Last"
-at once in slot 0 (male, parents F/M, hair H)` for an instant character; per op `id=N Name select|create|save slot S: <result>`;
-`roster corrupt|unreadable: <why>`; `save (<when>) of id=N Name failed: <why>`. Counters: `Stats::charsInstant`,
-`charOpsApplied`, `charOpsRefused`, `charSaves`, `charSaveFailures`, `facesSent`; `Server::RosterOf(target)` for tests.
+at once in slot 0 (male, parents F/M, hair H)` for an instant character; per op `id=N Name select|create|save|delete slot S: <result>`;
+`id=N Name is now shown as "First Last" (was "..."; <why>)`; `id=N deleted slot S "First Last"; its inventory <path> removed`
+(or `set aside as .deleted (could not remove it)` / `inventory NOT removed (<why>)`); `admin rename by <who> of id=N Name to
+"First Last"` and `/charname <arg> by <who> REFUSED (not a verified admin)`; `roster corrupt|unreadable: <why>`; `save (<when>)
+of id=N Name failed: <why>`. Counters: `Stats::charsInstant`, `charOpsApplied`, `charOpsRefused`, `charSaves`,
+`charSaveFailures`, `facesSent`, `charsDeleted`, `charsRenamed`, `namesSent`; `Server::RosterOf(target)` for tests.
 
 ### Settings that are not in server.json
 

@@ -15,7 +15,7 @@ namespace chartest {
     namespace chr = gage::sync::chr;
     namespace proto = gage::proto;
 
-    constexpr int kChecks = 17;
+    constexpr int kChecks = 23;   // 0.5.9 stage 4: + 6 (Delete, the confirmation, PublicName, AdminRename, the player texts, PeerName)
     constexpr uint8_t kTestLip = 3;   // a lipstick value (overlay 8 has 10)
 
     inline chr::Character Named(const char* first, const char* last, uint32_t seed = 7)
@@ -25,6 +25,108 @@ namespace chartest {
         c.last = last;
         c.look = chr::DefaultAppearance(seed);
         return c;
+    }
+
+    // 0.5.9 stage 4 (GI 2026-11-07): Delete from the select screen with a typed confirmation, the CHARACTER name shown to the others
+    // (PublicName, PeerName 60), an admin's rename, and a player-facing text for every refusal.
+    inline void RunStage4()
+    {
+        auto none = [](const std::string&) { return false; };
+        auto confirm = [](const char* typed) {
+            chr::Character in;
+            chr::Name n;
+            if (chr::ParseConfirm(typed, n)) { in.first = n.first; in.last = n.last; }
+            return in;
+        };
+        {
+            chr::Roster r;
+            r.slots = 3;
+            r.chars[0] = Named("Pia", "Player");
+            r.chars[1] = Named("Ann", "Lee");
+            r.used = 3;
+            r.active = 1;
+            chr::Roster one;
+            one.chars[0] = Named("Solo", "Only");
+            one.used = 1;
+            chr::Roster t = r;
+            const chr::Code playing = chr::Apply(t, chr::Op::Delete, 1, confirm("Ann Lee"), none);
+            const chr::Code last = chr::Apply(one, chr::Op::Delete, 0, confirm("Solo Only"), none);
+            const chr::Code wrong = chr::Apply(t, chr::Op::Delete, 0, confirm("Pia Playr"), none);
+            const chr::Code blank = chr::Apply(t, chr::Op::Delete, 0, chr::Character(), none);
+            const chr::Code empty = chr::Apply(t, chr::Op::Delete, 2, confirm("Pia Player"), none);
+            const bool unchanged = t == r && one.Count() == 1;
+            const chr::Code ok = chr::Apply(t, chr::Op::Delete, 0, confirm("PIA player"), none);
+            const chr::Code reuse = chr::Apply(t, chr::Op::Create, 0, Named("Pia", "Player"), none);
+            Check("characters: Delete refuses the only character (LastOne, before Playing), the one in play (Playing), a wrong or missing typed name "
+                  "(NotConfirmed), an empty slot (Empty) and changes nothing; with the name typed in any case it frees the slot, which takes a new "
+                  "character",
+                  playing == chr::Code::Playing && last == chr::Code::LastOne && wrong == chr::Code::NotConfirmed && blank == chr::Code::NotConfirmed &&
+                      empty == chr::Code::Empty && unchanged && ok == chr::Code::Ok && reuse == chr::Code::Ok && t.Count() == 2 && t.active == 1,
+                  std::string(chr::ToString(playing)) + " " + chr::ToString(last) + " " + chr::ToString(wrong) + " " + chr::ToString(ok));
+        }
+        {
+            chr::Name n;
+            const bool good = chr::ParseConfirm("Ann Lee", n) && n.first == "Ann" && n.last == "Lee";
+            const bool bad = !chr::ParseConfirm("AnnLee", n) && !chr::ParseConfirm(" Ann", n) && !chr::ParseConfirm("Ann ", n) &&
+                             !chr::ParseConfirm("Ann Lee Smith", n) && !chr::ParseConfirm(std::string(60, 'a') + " b", n) && !chr::ParseConfirm("", n);
+            Check("characters: the typed confirmation is exactly two words split at one space (no leading / trailing space, no third word, at most "
+                  "51 bytes)",
+                  good && bad);
+        }
+        {
+            const std::string a = chr::PublicName(Named("Pia", "Player"));
+            const std::string b = chr::PublicName(Named("Maximiliana", "Worthingtonshire"));
+            const std::string c = chr::PublicName(Named("Bob", (std::string(1, 'L') + std::string(24, 'x')).c_str()));
+            const bool valid = proto::ValidName(a) && proto::ValidName(b) && proto::ValidName(c);
+            Check("characters: the public name is \"First Last\" when it fits 24 bytes, \"F. Last\" when not, cut to 24 when even that is long; "
+                  "every result passes proto::ValidName",
+                  a == "Pia Player" && b == "M. Worthingtonshire" && c.size() == 24 && c.rfind("B. L", 0) == 0 && valid, a + " | " + b + " | " + c);
+        }
+        {
+            chr::Roster r;
+            r.chars[0] = Named("Pia", "Player");
+            r.chars[0].flags = chr::kCharCustomised;
+            r.used = 1;
+            chr::Roster t = r;
+            const chr::Code ok = chr::AdminRename(t, 0, "Anna", "Leeds", none);
+            const bool kept = t.chars[0].flags == chr::kCharCustomised && t.chars[0].look == r.chars[0].look && t.chars[0].Display() == "Anna Leeds";
+            chr::Roster u = r;
+            const chr::Code taken = chr::AdminRename(u, 0, "Ann", "Lee", [](const std::string& k) { return k == "ann_lee"; });
+            const chr::Code same = chr::AdminRename(u, 0, "Pia", "PLayer", [](const std::string& k) { return k == "pia_player"; });
+            const chr::Code badName = chr::AdminRename(u, 0, "an", "Lee", none);
+            const chr::Code empty = chr::AdminRename(u, 1, "Ann", "Lee", none);
+            Check("characters: an admin may rename a customised character (flags and look kept); a name another character owns is NameTaken, "
+                  "its own name in another case is not; a bad name or an empty slot is refused",
+                  ok == chr::Code::Ok && kept && taken == chr::Code::NameTaken && same == chr::Code::Ok && badName == chr::Code::BadName &&
+                      empty == chr::Code::Empty,
+                  std::string(chr::ToString(ok)) + " " + chr::ToString(taken) + " " + chr::ToString(same));
+        }
+        {
+            int texts = 0;
+            std::set<std::string> seen;
+            for (int c = 0; c <= chr::kCodeLast; ++c)
+            {
+                const std::string t = chr::PlayerText((chr::Code)c);
+                texts += !t.empty() && t != "Refused." ? 1 : 0;
+                seen.insert(t);
+            }
+            const bool shop = std::string(chr::PlayerText(chr::Code::Locked)).find("Solar RP shop") != std::string::npos;
+            Check("characters: every refusal code 0..14 has its own player-facing line; a locked slot points at the Solar RP shop",
+                  texts == chr::kCodeLast + 1 && (int)seen.size() == chr::kCodeLast + 1 && shop, std::to_string(texts) + " texts");
+        }
+        {
+            proto::PeerName pn{7, "Pia Player"}, back;
+            const proto::Bytes b = proto::Encode(pn);
+            const bool round = proto::Decode(b.data(), b.size(), back) && back.id == 7 && back.name == "Pia Player" && b[0] == 60;
+            proto::PeerName bad1{7, ""}, bad2{7, "Bad\x01Name"}, bad3{(uint16_t)proto::kMaxPlayers, "Pia Player"}, bad4{7, std::string(25, 'a')};
+            const bool refused = proto::Encode(bad1).empty() && proto::Encode(bad2).empty() && proto::Encode(bad3).empty() && proto::Encode(bad4).empty();
+            proto::Bytes raw = b;
+            raw.back() = 0x01;   // a control byte as the name's last character
+            const bool rawRefused = !proto::Decode(raw.data(), raw.size(), back);
+            Check("characters: PeerName (60) round-trips; Encode refuses an empty, control-character or 25-byte name and an id past kMaxPlayers; "
+                  "Decode refuses a name that fails ValidName",
+                  round && refused && rawRefused);
+        }
     }
 
     inline void RunPure()
@@ -37,9 +139,9 @@ namespace chartest {
         }
         {
             const bool ok = (uint8_t)proto::Msg::CharRoster == 56 && (uint8_t)proto::Msg::CharOp == 57 && (uint8_t)proto::Msg::CharResult == 58 &&
-                            (uint8_t)proto::Msg::PeerFace == 59 && proto::kMsgLast == (uint8_t)proto::Msg::PeerFace && proto::kCharOpLast == chr::kOpLast &&
+                            (uint8_t)proto::Msg::PeerFace == 59 && (uint8_t)proto::Msg::PeerName == 60 && proto::kMsgLast == (uint8_t)proto::Msg::PeerName && proto::kCharOpLast == chr::kOpLast &&
                             proto::kCharCodeLast == chr::kCodeLast && proto::kMaxCharBlob == chr::kMaxBlob && proto::kCharSlots == chr::kMaxSlots;
-            Check("characters: the wire constants equal the rules' (types 56..59 the last, op / code ranges, blob cap, 3 slots)", ok);
+            Check("characters: the wire constants equal the rules' (types 56..60 the last, op / code ranges, blob cap, 3 slots)", ok);
         }
         {
             using P = chr::NamePart;
@@ -358,15 +460,16 @@ namespace chartest {
             proto::CharRoster r2 = ro; r2.blob.clear(); none0(proto::Encode(r2));
             proto::CharOp o1 = op; o1.seq = 0; none0(proto::Encode(o1));
             proto::CharOp o2 = op; o2.op = 0; none0(proto::Encode(o2));
-            proto::CharOp o3 = op; o3.op = 4; none0(proto::Encode(o3));
+            proto::CharOp o3 = op; o3.op = 5; none0(proto::Encode(o3));
             proto::CharOp o4 = op; o4.slot = 3; none0(proto::Encode(o4));
-            proto::CharResult c1 = res; c1.code = 12; none0(proto::Encode(c1));
+            proto::CharResult c1 = res; c1.code = 15; none0(proto::Encode(c1));
             proto::PeerFace p1 = pf; p1.id = (uint16_t)proto::kMaxPlayers; none0(proto::Encode(p1));
             proto::PeerFace p2 = pf; p2.blob.clear(); none0(proto::Encode(p2));
             Check("characters: CharRoster / CharOp / CharResult / PeerFace round-trip; Encode refuses 9 invalid ones (an unknown roster flag, "
-                  "empty blobs, seq 0, op 0 / 4, slot 3, code 12, an id past kMaxPlayers)",
+                  "empty blobs, seq 0, op 0 / 5, slot 3, code 15, an id past kMaxPlayers)",
                   round && refused == 9, std::to_string(refused) + " refused");
         }
+        RunStage4();
     }
 
 } // namespace chartest

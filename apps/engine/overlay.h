@@ -23,6 +23,8 @@
 // outgoing queue the engine drains on the script tick (PopOutgoing) and feeds to
 // engine::SendChat, which routes /commands locally and plain text to the server.
 #pragma once
+#include "sync/character.h"   // 0.5.9 stage 4: the creator's draft (sync::chr::Appearance)
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -129,6 +131,18 @@ namespace gage::game::Overlay {
     // QuickKeyCounts: presses that sent a UseQuick / were refused by the prediction since the last call (the engine's 10 s line). Any thread.
     void SetQuickKeys(bool on);
     void QuickKeyCounts(uint32_t* sent, uint32_t* refused);
+    // 0.5.9 stage 4 char_screens (HKCU\Software\GAGE-MP, default on; 0 = no CHARACTERS page): the Tab menu's CHARACTERS page, the select screen
+    // (3 slots: play, edit, delete with the typed name, create; a locked slot points at the Solar RP shop) and the creator (overlay_inventory.cpp;
+    // rules libs/sync/char_screens.h). SetCharacterRoster: the server's CharRoster blob (sync::chr::EncodeRoster bytes). SetCharacterResult:
+    // the answer to one of the page's ops. PopCharacterOp: the next op for the engine to send as CharOp (op = sync::chr::Op, blob = the
+    // encoded character for Create / Save, the typed "First Last" for Delete). CharacterDraft: the creator's look while the creator is on
+    // screen (rev +1 per change; false when it is not drawn), for the engine's preview. ClearCharacters: the session ended. Any thread.
+    void SetCharacterScreens(bool on);
+    void SetCharacterRoster(const std::string& blob, bool guest);
+    void ClearCharacters();
+    void SetCharacterResult(uint16_t seq, uint8_t op, uint8_t slot, uint8_t code, const std::string& text);
+    bool PopCharacterOp(uint16_t* seq, uint8_t* op, uint8_t* slot, std::string* blob);
+    bool CharacterDraft(sync::chr::Appearance* look, uint32_t* rev);
 
     // 0.5.2 round-map probe: the next frame's bottom-left (the radar's quarter, before the overlay draws on it) is saved to
     // %LOCALAPPDATA%\GAGE-MP\radar_probe_<n>.bmp and logged, so the radar's landing place can be measured. D3D11 (Legacy) only; on D3D12 one line

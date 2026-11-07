@@ -1528,6 +1528,28 @@ namespace gage::proto {
         return true;
     }
 
+    Bytes Encode(const PeerName& m)
+    {
+        if (m.id >= kMaxPlayers || !ValidName(m.name)) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::PeerName);
+        w.u16(m.id);
+        if (!w.str(m.name)) return {};
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, PeerName& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::PeerName)) return false;
+        PeerName m;
+        m.id = r.u16();
+        m.name = r.str(kMaxName);
+        if (!r.done() || m.id >= kMaxPlayers || !ValidName(m.name)) return false;
+        out = std::move(m);
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, WorldClock& out)
     {
         wire::Reader r(p, n);
@@ -1914,6 +1936,7 @@ namespace gage::proto {
         case Msg::CharOp:           return "CharOp";
         case Msg::CharResult:       return "CharResult";
         case Msg::PeerFace:         return "PeerFace";
+        case Msg::PeerName:         return "PeerName";
         }
         return "?";
     }
