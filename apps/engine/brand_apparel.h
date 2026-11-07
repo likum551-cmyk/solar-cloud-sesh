@@ -73,8 +73,11 @@ namespace gage::game::brand {
         // Render thread: the game's binds of `stock` hand it `repl` (both AddRef'd, released at teardown) while the entry is active. Returns the
         // handle, or -1 (hooks not installed, `stock` already replaced, table full). active = false registers it inactive (binds counted, not swapped).
         int Replace(ID3D11ShaderResourceView* stock, ID3D11ShaderResourceView* repl, bool active = true);
-        // Any thread: start / stop handing out `repl` (the stock view is bound as the game asked while off). False = no such swap entry.
-        bool SetActive(int handle, bool on);
+        // Any thread: start / stop handing out `repl` (the stock view is bound as the game asked while off). `generation` = Generation() when
+        // the handle was issued. False = no such swap entry in this install.
+        bool SetActive(int handle, uint32_t generation, bool on);
+        // Any thread: the entry of this install is in place (the stock view's slot says "replaced by `handle`", our view registered).
+        bool Holds(int handle, uint32_t generation);
         struct SwapCounters {
             uint64_t subst = 0;         // binds the hook rewrote to `repl`
             uint64_t lastTick = 0;      // GetTickCount64() of the last one (0 = never)
@@ -126,6 +129,10 @@ namespace gage::game::brand {
         bool AddTarget(const char* name, uint64_t tailHash, bool bc3, int baseSize, int levels,
                        const std::vector<Decal>& decals);                       // register an extra fingerprint
         bool InstallOn(ID3D11Device* dev, ID3D11DeviceContext* immediateCtx);   // hook this device's vtables
+        // 0.5.5: what Poll() sets from Enabled(): false = brand_apparel=0, the hooks serve swap clients only (no tee classification, nothing
+        // queued). Default true. PendingCount = views queued for a tee readback.
+        void SetBrandOn(bool on);
+        size_t PendingCount();
         void Pump(ID3D11DeviceContext* immediateCtx);                           // the per-frame work of Poll()
     }
 

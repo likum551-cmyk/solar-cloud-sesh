@@ -678,6 +678,7 @@ static void TestSwapClient() {
     const uint32_t gen0 = swp::Generation();
     const int h = swp::Replace(stock, repl, true);
     CHECK(h >= 0, "Replace refused");
+    CHECK(swp::Holds(h, gen0) && !swp::Holds(h, gen0 + 1) && !swp::Holds(h + 1, gen0), "Holds: this handle in this install only");
     CHECK(swp::Replace(stock, repl, true) == -1, "the same stock view was accepted twice");
     ID3D11ShaderResourceView* r1 = BindAndGet(g, stock);
     CHECK(r1 == repl, "active: the context holds %p, want our %p", (void*)r1, (void*)repl);
@@ -685,25 +686,129 @@ static void TestSwapClient() {
     swp::SwapCounters c1 = swp::Counters(h);
     CHECK(c1.subst == 1 && c1.seen == 1 && c1.verified == 1 && c1.verifyMiss == 0 && c1.lastTick && c1.active,
           "after one active bind: subst %llu seen %llu verified %u missed %u", (unsigned long long)c1.subst, (unsigned long long)c1.seen, c1.verified, c1.verifyMiss);
-    CHECK(swp::SetActive(h, false), "SetActive(false)");
+    CHECK(swp::SetActive(h, gen0, false), "SetActive(false)");
     ID3D11ShaderResourceView* r2 = BindAndGet(g, stock);
     CHECK(r2 == stock, "inactive: the context holds %p, want the stock %p", (void*)r2, (void*)stock);
     if (r2) r2->Release();
     swp::SwapCounters c2 = swp::Counters(h);
     CHECK(c2.subst == 1 && c2.seen == 2 && !c2.active && c2.lastSeenTick, "inactive bind: counted as seen, not substituted (subst %llu seen %llu)",
           (unsigned long long)c2.subst, (unsigned long long)c2.seen);
-    CHECK(!swp::SetActive(h + 5, true) && !swp::SetActive(-1, true), "SetActive on a handle that does not exist");
-    CHECK(swp::SetActive(h, true), "SetActive(true)");
+    CHECK(!swp::SetActive(h + 5, gen0, true) && !swp::SetActive(-1, gen0, true) && !swp::SetActive(h, gen0 + 1, true),
+          "SetActive on a handle that does not exist (or of another install)");
+    CHECK(swp::SetActive(h, gen0, true), "SetActive(true)");
     ID3D11ShaderResourceView* r3 = BindAndGet(g, stock);
     CHECK(r3 == repl, "re-activated: %p", (void*)r3);
     if (r3) r3->Release();
     T::Reset();
     CHECK(swp::Generation() != gen0 && !swp::Installed(), "teardown bumps the generation (handles die)");
+    CHECK(!swp::Holds(h, gen0), "Holds after teardown");
+    // a handle of the old install must not reach an entry the new install puts at the same index
+    CHECK(T::InstallOn(g.dev, g.ctx), "re-install");
+    const uint32_t gen1 = swp::Generation();
+    const int h2 = swp::Replace(stock, repl, false);
+    CHECK(h2 == h && gen1 != gen0, "the new install reuses the index (h2 %d)", h2);
+    CHECK(!swp::SetActive(h, gen0, true) && !swp::Counters(h2).active, "a stale handle switched the new install's entry on");
+    ID3D11ShaderResourceView* r5 = BindAndGet(g, stock);
+    CHECK(r5 == stock, "stale SetActive leaked into the new install");
+    if (r5) r5->Release();
+    T::Reset();
     ID3D11ShaderResourceView* r4 = BindAndGet(g, stock);
     CHECK(r4 == stock, "after teardown the stock view is bound");
     if (r4) r4->Release();
     stock->Release();
     repl->Release();
+    g.ctx->Release();
+    g.dev->Release();
+}
+
+// A 512 px BC1 square with 8 mips, USAGE_DEFAULT (the game can still write it: the tee pipeline's retry path applies).
+static ID3D11ShaderResourceView* MakeTeeShaped(Gpu& g, const Mips& mips) {
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = d.Height = 512; d.MipLevels = (UINT)mips.size(); d.ArraySize = 1; d.Format = DXGI_FORMAT_BC1_UNORM;
+    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<D3D11_SUBRESOURCE_DATA> sd(mips.size());
+    for (size_t l = 0; l < mips.size(); ++l) { sd[l].pSysMem = mips[l].data(); sd[l].SysMemPitch = (UINT)(BlocksAcross(MipW(512, (int)l)) * 8); }
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g.dev->CreateTexture2D(&d, sd.data(), &tex)) || !tex) return nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    g.dev->CreateShaderResourceView(tex, nullptr, &srv);
+    tex->Release();
+    return srv;
+}
+
+// Review 0.5.5 #1: hooks installed for a swap client with brand_apparel=0 must not classify / queue (and pin) tee-shaped game views.
+static void TestBrandOffSwapOnly() {
+    std::printf("-- 0.5.5 brand_apparel=0 + a swap client: nothing classified or queued, the swap still works (WARP)\n");
+    Gpu g;
+    if (!MakeGpu(g)) { ++g_fail; std::printf("FAIL  no D3D11 device\n"); return; }
+    T::Reset();
+    const Mips tee = BuildChain(512, 8, 8, [](int l, int x, int y, float* c) { c[0] = (float)((x + l) % 200); c[1] = (float)((y * 3) % 200); c[2] = 90; });
+    CHECK(T::AddTarget("tee shape", 0x1234567890abcdefULL, false, 512, 8, {}), "AddTarget");   // makes 512 px BC1 squares candidates
+    T::SetBrandOn(false);
+    CHECK(T::InstallOn(g.dev, g.ctx), "InstallOn");
+    ID3D11ShaderResourceView* a = MakeTex(g, 512, tee, false);
+    ID3D11ShaderResourceView* b = MakeTex(g, 512, tee, false);
+    ID3D11ShaderResourceView* stock = MakeTex(g, 512, tee, false);
+    ID3D11ShaderResourceView* repl = MakeTex(g, 512, tee, false);
+    CHECK(a && b && stock && repl, "textures");
+    if (!a || !b || !stock || !repl) return;
+    const int h = swp::Replace(stock, repl, true);
+    for (int i = 0; i < 5; ++i) {
+        ID3D11ShaderResourceView* arr[3] = { a, b, stock };
+        g.ctx->PSSetShaderResources(0, 3, arr);
+    }
+    CHECK(T::PendingCount() == 0 && GetStats().candidates == 0, "brand off: %zu views queued (%u candidates), want none", T::PendingCount(), GetStats().candidates);
+    ID3D11ShaderResourceView* got = BindAndGet(g, stock);
+    CHECK(h >= 0 && got == repl, "brand off: the swap client's entry is still handed out");
+    if (got) got->Release();
+    // control: the same views with brand on ARE queued (the fixture is binding)
+    T::SetBrandOn(true);
+    ID3D11ShaderResourceView* arr[2] = { a, b };
+    g.ctx->PSSetShaderResources(0, 2, arr);
+    CHECK(T::PendingCount() == 2, "brand on: %zu queued, want 2 (the control)", T::PendingCount());
+    T::Reset();
+    CHECK(T::PendingCount() == 0, "teardown empties the queue");
+    a->Release(); b->Release(); stock->Release(); repl->Release();
+    g.ctx->Release();
+    g.dev->Release();
+}
+
+// Review 0.5.5 #2: a view in the tee pipeline (queued, or its readback running) that a swap client claims stays claimed.
+static void TestSwapClaimsTeeCandidate() {
+    std::printf("-- 0.5.5 swap::Replace of a view the tee pipeline holds (queued / readback running): the claim stands (WARP)\n");
+    Gpu g;
+    if (!MakeGpu(g)) { ++g_fail; std::printf("FAIL  no D3D11 device\n"); return; }
+    T::Reset();
+    const Mips tee = BuildChain(512, 8, 8, [](int l, int x, int y, float* c) { c[0] = (float)((x * 7 + l) % 220); c[1] = (float)((y * 5) % 180); c[2] = 40; });
+    CHECK(T::AddTarget("tee shape", 0x1234567890abcdefULL, false, 512, 8, {}), "AddTarget");   // never matches: the retry path
+    CHECK(T::InstallOn(g.dev, g.ctx), "InstallOn");
+    ID3D11ShaderResourceView* queued = MakeTeeShaped(g, tee);
+    ID3D11ShaderResourceView* running = MakeTeeShaped(g, tee);
+    ID3D11ShaderResourceView* repl = MakeTex(g, 512, tee, false);
+    CHECK(queued && running && repl, "textures");
+    if (!queued || !running || !repl) return;
+    // `running`: classified and its readback started by one pump, THEN claimed
+    { ID3D11ShaderResourceView* r = BindAndGet(g, running); if (r) r->Release(); }
+    CHECK(T::PendingCount() == 1, "running: not queued (%zu)", T::PendingCount());
+    T::Pump(g.ctx);
+    CHECK(T::PendingCount() == 0, "running: the pump did not start its readback");
+    const uint32_t gen = swp::Generation();
+    const int hr = swp::Replace(running, repl, true);
+    // `queued`: classified, claimed before any pump
+    { ID3D11ShaderResourceView* r = BindAndGet(g, queued); if (r) r->Release(); }
+    const int hq = swp::Replace(queued, repl, true);
+    CHECK(hr >= 0 && hq >= 0, "Replace refused a tee candidate (%d %d)", hr, hq);
+    for (int i = 0; i < 60; ++i) { T::Pump(g.ctx); Sleep(5); }
+    CHECK(swp::Holds(hr, gen) && swp::Holds(hq, gen), "the claim was overwritten by the tee pipeline (running %d, queued %d)", (int)swp::Holds(hr, gen),
+          (int)swp::Holds(hq, gen));
+    ID3D11ShaderResourceView* r1 = BindAndGet(g, running);
+    ID3D11ShaderResourceView* r2 = BindAndGet(g, queued);
+    CHECK(r1 == repl && r2 == repl, "after the pumps the claimed views bind %p / %p, want ours %p", (void*)r1, (void*)r2, (void*)repl);
+    if (r1) r1->Release();
+    if (r2) r2->Release();
+    CHECK(T::PendingCount() == 0, "a claimed view was queued again (%zu)", T::PendingCount());
+    T::Reset();
+    queued->Release(); running->Release(); repl->Release();
     g.ctx->Release();
     g.dev->Release();
 }
@@ -823,6 +928,8 @@ int main(int argc, char** argv) {
     if (!real.empty()) TestRealData(real, outDir); else { ++g_skip; std::printf("-- real stock texture: SKIPPED (no real_k.bin argument)\n"); }
     TestEndToEndSynthetic();      // after the real-data run: Reset() empties the production target table
     TestSwapClient();             // 0.5.5 the swap layer's client API
+    TestBrandOffSwapOnly();       // 0.5.5 review #1: brand off, hooks for the radar mask only
+    TestSwapClaimsTeeCandidate(); // 0.5.5 review #2: a claim on a view in the tee pipeline stands
     TestRadarMaskEndToEnd();      // 0.5.5 the radar round mask
     std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     return g_fail ? 1 : 0;

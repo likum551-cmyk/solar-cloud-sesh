@@ -518,7 +518,6 @@ std::string g_clipWhy;
 uint8_t*    g_clipFlag = nullptr;
 size_t      g_clipRva = 0;
 uint32_t    g_clipWrites = 0, g_clipWriteFails = 0;
-int         g_clipWanted = -1;     // the value last asked for (-1 = never)
 
 void ResolveClip() {
     const Image im = GameImage();
@@ -574,7 +573,6 @@ bool SetBlipClipRound(bool round) {
     }
     if (g_clipRes != ClipRes::Ready) return false;
     const uint8_t want = round ? 0 : 1;
-    g_clipWanted = want;
     if (!IsReadable(g_clipFlag, 1)) return false;
     if (*g_clipFlag == want) return true;
     if (g_clipWriteFails >= 3) return false;

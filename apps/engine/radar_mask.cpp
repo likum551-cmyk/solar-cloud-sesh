@@ -88,8 +88,12 @@ void Evaluate(std::vector<swap::ProbeCand>& cands, const std::vector<int>& windo
             if ((c.seen & (mine | others)) == (mine | others)) ++everywhere;
         }
         char b[420];
-        if (!mine) std::snprintf(b, sizeof(b), "no window was spent on it");
-        else if (winners == 1) std::snprintf(b, sizeof(b), "found: the one %ux%u view bound in all %d of its windows and in none of the other %d (%d views of that size seen)",
+        if (!mine) {
+            // no window of its own: nothing can prove a view is this mask (every candidate would "match" an empty window set)
+            ks.why = "no window was spent on it";
+            continue;
+        }
+        if (winners == 1) std::snprintf(b, sizeof(b), "found: the one %ux%u view bound in all %d of its windows and in none of the other %d (%d views of that size seen)",
                                              ks.w, ks.h, __builtin_popcount(mine), __builtin_popcount(others), sized);
         else if (winners > 1) std::snprintf(b, sizeof(b), "%d views of %ux%u matched its windows; not guessing which is the mask", winners, ks.w, ks.h);
         else std::snprintf(b, sizeof(b), "no %ux%u view was bound in exactly its windows (%d of that size seen, the best in %u of %d, %d bound in EVERY window: "
@@ -228,7 +232,7 @@ int FinishReadback(Readback& j) {
 }
 
 void RenderTickImpl() {
-    if (!swap::Installed()) return;
+    // the generation first: after a teardown (hooks gone) the jobs' references to the old device's views are dropped at once
     const uint32_t gen = swap::Generation();
     if (gen != g_gen) {
         // the hooks were (re)installed: every handle from before is dead
@@ -243,6 +247,7 @@ void RenderTickImpl() {
         g_gen = gen;
         g_status.generation = gen;
     }
+    if (!swap::Installed()) return;
     const Phase p = (Phase)g_phase.load();
     if (p == Phase::ArmRequested) {
         swap::ProbeSize sizes[2];
@@ -297,7 +302,7 @@ int SetActive(bool on) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_status.generation != swap::Generation()) return 0;
     for (const KindStatus& ks : g_status.k)
-        if (ks.replaced && ks.handle >= 0 && swap::SetActive(ks.handle, on)) ++changed;
+        if (ks.replaced && ks.handle >= 0 && swap::SetActive(ks.handle, g_status.generation, on)) ++changed;
     return changed;
 }
 
@@ -348,7 +353,8 @@ Status GetStatus() {
 bool Live(int kind) {
     if (kind < 0 || kind > 1) return false;
     std::lock_guard<std::mutex> lk(g_mu);
-    return g_status.k[kind].replaced && g_status.k[kind].handle >= 0 && g_status.generation == swap::Generation() && swap::Installed();
+    // the swap layer's own word: the stock view's slot really says "replaced by this handle" in the current install
+    return g_status.k[kind].replaced && g_status.k[kind].handle >= 0 && swap::Holds(g_status.k[kind].handle, g_status.generation);
 }
 
 void Poll(void* swapChain) {
