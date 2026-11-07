@@ -22,6 +22,7 @@
 #include "ambient.h"
 #include "world_clock.h"       // 0.5.7: the server's time of day and weather
 #include "characters.h"        // 0.5.9: the server's characters (roster, our face, the peers' faces)
+#include "belt_audio.h"        // 0.5.9 seatbelt sound: the player (worker thread + winmm); sync/belt_sound.h the decision and the sounds
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/smoother.h"
@@ -624,6 +625,22 @@ namespace {
         c.autoCancel = g_vcAutoCancel.load(std::memory_order_relaxed);
         c.fuelUse = g_vcFuelUse.load(std::memory_order_relaxed);
         return c;
+    }
+
+    // ---- 0.5.9 seatbelt sound (libs/sync/belt_sound.h: when, and the sounds; apps/engine/belt_audio.cpp: the player) ----
+    // GI: "add a sound for fastening unfastening a seatbelt with B". The player's own B press clicks (buckle / unbuckle); re-asserts, the exit
+    // auto-unbuckle and leaving do not. Switches (HKCU\Software\GAGE-MP, read at the engine's start and at every Welcome): belt_sound (default on,
+    // 0 = silent), belt_sound_vol (0..100, default 60). Local only: peers in the same car do not hear it (no wire change).
+    uint32_t g_beltSndSilentAuto = 0, g_beltSndSilentReassert = 0;    // script tick: belt events that did NOT click (the 10 s line)
+    void BeltSoundReadSwitches(const char* when)
+    {
+        const bool on = sync::beltsound::ParseOn(reg::Get(L"belt_sound"));
+        const sync::beltsound::Vol vol = sync::beltsound::ParseVol(reg::Get(L"belt_sound_vol"));
+        beltaudio::Engine().Configure(on, vol.pct);
+        GLOGI("engine: seatbelt sound (0.5.9) [%s]: belt_sound=%s, belt_sound_vol=%d%s; B buckle = a latch click (audible ~75 ms), B unbuckle = a release "
+              "click + the strap running back (~230 ms), synthesized in code (no game or third-party audio), played by winmm PlaySound(SND_MEMORY | "
+              "SND_ASYNC) from its own worker thread; never on a flag re-assert, the exit auto-unbuckle (F) or leaving the car; local only",
+              when, on ? "on" : "OFF (silent)", vol.pct, vol.why ? vol.why : "");
     }
 
     // ---- 0.4.27 indicator fallback (libs/sync/indicator_fallback.h; script tick) ----
@@ -2331,6 +2348,7 @@ namespace {
               g_vcAutoCancel.load() ? "on (45 degrees of turn, the wheel centred 0.4 s)" : "OFF",
               g_vcIndSync.load() ? "on (kVeh2IndicatorL / R sent and applied on copies)" : "OFF (the bits are neither sent nor applied)",
               g_vcFuelUse.load() ? "ON (an empty tank cuts the engine of our own car and it will not start)" : "off (the gauge only shows the level)");
+        BeltSoundReadSwitches("Welcome");                            // 0.5.9: belt_sound / belt_sound_vol
         {
             const sync::IndFallbackMode im = sync::IndFallbackModeFrom(reg::Get(L"veh_ind_fallback").c_str());   // 0.4.27
             g_indFallbackMode.store((int)im);
@@ -13626,7 +13644,17 @@ namespace {
                 ++g_vcx.beltFailed;
         }
         for (int i = 0; i < out.nev; ++i)
+        {
             VcLogEvent(out.ev[i], out.ev[i].kind == sync::VcEv::Left ? (int32_t)out.leftVehicle : veh);
+            g_beltSndSilentAuto += out.ev[i].kind == sync::VcEv::BeltAuto ? 1u : 0u;
+            g_beltSndSilentReassert += out.ev[i].kind == sync::VcEv::BeltReassert ? 1u : 0u;
+        }
+        // 0.5.9 seatbelt sound: the player's own B press only (sync::beltsound::ForTick); the request is a mailbox write, the worker plays it.
+        {
+            const sync::beltsound::Sound bsnd = sync::beltsound::ForTick(out);
+            if (bsnd != sync::beltsound::Sound::None)
+                beltaudio::Engine().Request(bsnd);
+        }
         // What a controller sends for the car we drive; a passenger's machine state is not a controller's.
         if (nv && in.vehicle && g_vc.Vehicle() == (uint32_t)veh && g_vc.Seat() == 0)
             nv->ctlInd = indSync ? g_vc.Indicators() : (uint8_t)0;
@@ -13708,6 +13736,23 @@ namespace {
                   lastBeltOk ? (lastBeltFlag ? "true (flies through the windscreen)" : "false (held)") : "not read", x.beltReads, x.beltReadFail, x.beltFlagTrue,
                   g_vc.Belt() ? "buckled" : "off", x.copyIndApplied, x.copyIndFailed, x.copyEngineApplied,
                   g_fuelHud.show ? "shown" : "hidden", (unsigned)(g_fuelHud.frac * 1000.0f + 0.5f));
+        }
+        {
+            // 0.5.9 seatbelt sound, the 10 s line (only when something happened, and once at the first report).
+            static bool firstBeltSnd = true;
+            const beltaudio::Counters bc = beltaudio::Engine().Take();
+            const beltaudio::Built bb = beltaudio::Engine().BuiltInfo();
+            if (firstBeltSnd || bc.requested || bc.muted || bc.failed || bc.builds || g_beltSndSilentAuto || g_beltSndSilentReassert)
+            {
+                firstBeltSnd = false;
+                GLOGI("engine: seatbelt sound (0.5.9), last 10 s: belt_sound=%s vol %d; B presses that click: buckle %u / unbuckle %u; plays requested %u, "
+                      "played %u (PlaySound accepted), FAILED %u, superseded while waiting %u, muted %u; silent by rule: exit auto-unbuckle %u, flag "
+                      "re-asserts %u; images built %u (vol %d: buckle %u bytes peak %d, unbuckle %u bytes peak %d)",
+                      beltaudio::Engine().On() ? "on" : "OFF", beltaudio::Engine().Vol(), bc.buckles, bc.unbuckles, bc.requested, bc.played, bc.failed,
+                      bc.superseded, bc.muted, g_beltSndSilentAuto, g_beltSndSilentReassert, bc.builds, bb.vol, (unsigned)bb.buckleBytes, bb.bucklePeak,
+                      (unsigned)bb.unbuckleBytes, bb.unbucklePeak);
+            }
+            g_beltSndSilentAuto = g_beltSndSilentReassert = 0;
         }
         const uint32_t keyLines = g_vcx.keyLines;
         g_vcx = VcExtraStats();
@@ -16818,6 +16863,7 @@ namespace gage::engine {
             GLOGW("engine: tick hook NOT installed (main loop unresolved); engine idle until resolved");
         g_active = true;
         StartWatchdog();
+        BeltSoundReadSwitches("start");    // 0.5.9: the player's worker starts here (off the game thread), the Welcome re-reads the switches
         EnsureConnected();
         GLOGI("engine: target server %s:%d player=%s",
             Narrow(cfg.host).c_str(), cfg.port, Narrow(cfg.player).c_str());
@@ -16832,6 +16878,7 @@ namespace gage::engine {
         game::Overlay::Shutdown(); // after the unhook: no Present detour runs a frame any more
         game::brand::Shutdown();   // same reason: puts the two D3D11 vtable slots back, drops the branded textures
         join::Disconnect(); // the session's worker is gone after this: no more peer events
+        beltaudio::Engine().Stop();   // 0.5.9: the seatbelt sound's worker stops the playback and ends (joined)
         if (g_companion && g_world)
             g_world->DeleteEntity(g_companion);
         g_companion = 0;
