@@ -41,4 +41,12 @@ namespace gage::game::minimapsize {
     // One phrase for the engine's 10 s minimap line.
     std::string Status();
 
+    // 0.5.5 ring_map_blip_clip: GTA's "the minimap is a rectangle" bool, the one FiveM's SET_MINIMAP_CLIP_TYPE writes (sync::ringround::kClipSig,
+    // pinned against both Legacy 3889 dumps). round = true writes 0 (off-radar blips clamp to the circle), false writes the game's own 1 back.
+    // Found once by its pattern (Legacy GTA5.exe only; Enhanced is refused with a reason), written only when the wanted value differs from what
+    // the byte holds, and read back. Script tick. False = not resolved / refused / the write was not read back.
+    bool SetBlipClipRound(bool round);
+    // One phrase for the 10 s ring map round line: resolved or why not, the value the byte holds now, writes so far.
+    std::string BlipClipStatus();
+
 } // namespace gage::game::minimapsize

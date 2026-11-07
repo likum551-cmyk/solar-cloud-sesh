@@ -99,6 +99,16 @@ namespace gage::sync::hudring {
     inline float MapSquarePx(float displayH) { return (kDiscR - kMapCornerClear) * Scale(displayH) * 1.41421356f; }
     inline float MapRadiusPx(float displayH) { return MapSquarePx(displayH) * 0.5f; }
     inline Pt MapCentrePx(float displayH) { return ToScreen({kCx, kCy}, displayH); }
+    // The amber map ring's width in screen px: the spec's 1.5 px, never under one pixel.
+    inline float MapRingWidthPx(float displayH) { const float w = kMapRingW * Scale(displayH); return w < 1.0f ? 1.0f : w; }
+
+    // 0.5.5 ring_map_round (GI 2026-11-07: "fill out the current design HUD circle to the point where it doesn't go over hp and satiety and there's
+    // no gap either"): with GTA's radar clipped round by its own mask (libs/sync/ring_round.h), the hole grows to the arcs. The amber ring's OUTER
+    // edge sits exactly on the arcs' inner edge (kArcR - kArcW / 2 = r 125): both strokes are antialiased by half a pixel about that one radius
+    // (overlay_ui.cpp RadialBand / CrispProfile), so their edge pixels add up to full coverage, no gap, no overlap. The hole is that minus the
+    // ring's width: r 123.5 design px at 1080p and up (the ring is 1.5 design px), 123.2 at 720p (the ring is held at one screen px).
+    constexpr float kMapRoundEdge = kArcR - kArcW * 0.5f;   // r 125
+    inline float MapRoundRadiusPx(float displayH) { return kMapRoundEdge * Scale(displayH) - MapRingWidthPx(displayH); }
 
     struct GaugeLook
     {

@@ -234,6 +234,12 @@ namespace gage::game {
         // 0.5.4 ring_map_zoom. alloc8or HUD::SET_RADAR_ZOOM 0x096EF57A0C999BBA void (int zoomLevel), "0 to 1400 in R* Scripts"; 3889 hash in
         // kCrossmap3889 (natlookup.mjs 2026-11-07: YimMenu b3889 idx 1539 and YimMenuV2 enhanced idx 1579 AGREE).
         constexpr uint64_t SET_RADAR_ZOOM                                   = 0x096EF57A0C999BBA;  // void (int zoomLevel)
+        // 0.5.5 ring_map_round (the radar-mask probe, apps/engine/radar_mask.h). alloc8or GRAPHICS::GET_TEXTURE_RESOLUTION 0x35736EE65BD00C11
+        // Vector3 (const char* textureDict, const char* textureName) and GRAPHICS::DRAW_SPRITE 0xE7FFAE5EBF23D890 void (const char* textureDict,
+        // const char* textureName, float screenX, float screenY, float width, float height, float heading, int red, int green, int blue, int alpha,
+        // BOOL p11, Any p12); natlookup.mjs 2026-11-07: YimMenu b3889 (idx 1119 / 1079) and YimMenuV2 enhanced (idx 1131 / 1090) AGREE.
+        constexpr uint64_t GET_TEXTURE_RESOLUTION                           = 0x35736EE65BD00C11;  // Vector3 (const char* dict, const char* name)
+        constexpr uint64_t DRAW_SPRITE                                      = 0xE7FFAE5EBF23D890;  // void (dict, name, x, y, w, h, heading, r, g, b, a, p11, p12)
 
         // remote-player ped driving (GTA Network / RAGECOOP style: a locomotion task, a per-frame
         // velocity steer and a rare hard snap), the local-state readers the sender needs, and the
@@ -953,6 +959,11 @@ namespace gage::game {
         bool     SetBigmap(bool on);
         // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM(level), 0 = the game's own zoom, up to 1400 = furthest. False when the native does not resolve.
         bool     SetRadarZoom(int level);
+        // 0.5.5 ring_map_round: GET_TEXTURE_RESOLUTION(dict, name) as w x h (false when the native does not resolve; a missing texture reads
+        // as the game's own answer, which the caller judges), and DRAW_SPRITE(dict, name, x, y, w, h, 0, r, g, b, alpha, false, 0) in screen
+        // fractions (the probe draws a mask sprite at alpha 1 under the ring's glass). False when the native does not resolve.
+        bool     TextureResolution(const char* dict, const char* name, float& w, float& h);
+        bool     DrawSprite(const char* dict, const char* name, float x, float y, float w, float h, int alpha);
         bool     SafeZoneSize(float& out);
         // Diagnostic: log every live GTA script thread (id + script-name hash, resolved to a
         // readable name when known, else hex) to gage.log. `when` tags the line (e.g. "pristine"

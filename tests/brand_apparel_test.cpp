@@ -10,6 +10,7 @@
 // Runs on a WARP (software) D3D11 device: no GPU, no game. It exercises the same two vtable hooks the engine
 // installs, against a device it created itself.
 #include "../apps/engine/brand_apparel.h"
+#include "../apps/engine/radar_mask.h"
 
 #include "common/logger.h"
 
@@ -586,6 +587,227 @@ static void TestRealData(const std::string& realPath, const std::string& outDir)
     g.dev->Release();
 }
 
+// ---- 0.5.5: the shared swap layer's client API and the radar round mask (apps/engine/radar_mask.cpp), end to end on WARP -----------------
+// No window is created: a bare WARP device and its immediate context, the probe's "frames" are ProbeFrame() calls.
+namespace RR = gage::sync::ringround;
+namespace swp = gage::game::brand::swap;
+namespace rmask = gage::game::radarmask;
+
+static RR::Rgba Grey(uint8_t v) { return RR::Rgba{ v, v, v, 255 }; }
+
+// A soft grey rectangle (a stock-like mask): `in` inside, fading to 0 over `ramp` texels at the box's edge.
+static std::vector<RR::Rgba> SoftRectPx(int w, int h, int in, int ramp) {
+    std::vector<RR::Rgba> v((size_t)w * (size_t)h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const int dx = x < w - 1 - x ? x : w - 1 - x, dy = y < h - 1 - y ? y : h - 1 - y, d = dx < dy ? dx : dy;
+            const float t = d >= ramp ? 1.0f : (float)d / (float)ramp;
+            v[(size_t)y * (size_t)w + (size_t)x] = Grey((uint8_t)(in * t + 0.5f));
+        }
+    return v;
+}
+
+// A BC1 chain of w x h from a per-level texel generator; returns the tightly packed levels.
+template <class Gen>
+static Mips RectChainBC1(int w, int h, int levels, Gen gen) {
+    Mips m((size_t)levels);
+    for (int l = 0; l < levels; ++l) {
+        const int lw = RR::LevelDim(w, l), lh = RR::LevelDim(h, l);
+        RR::EncodeLevel(RR::TexFmt::BC1, gen(l, lw, lh), lw, lh, m[(size_t)l]);
+    }
+    return m;
+}
+
+static ID3D11ShaderResourceView* MakeRectTex(Gpu& g, int w, int h, const Mips& mips) {
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = (UINT)w; d.Height = (UINT)h; d.MipLevels = (UINT)mips.size(); d.ArraySize = 1; d.Format = DXGI_FORMAT_BC1_UNORM;
+    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    std::vector<D3D11_SUBRESOURCE_DATA> sd(mips.size());
+    for (size_t l = 0; l < mips.size(); ++l) {
+        sd[l].pSysMem = mips[l].data();
+        sd[l].SysMemPitch = (UINT)RR::RowBytes(RR::TexFmt::BC1, RR::LevelDim(w, (int)l));
+    }
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(g.dev->CreateTexture2D(&d, sd.data(), &tex)) || !tex) return nullptr;
+    ID3D11ShaderResourceView* srv = nullptr;
+    g.dev->CreateShaderResourceView(tex, nullptr, &srv);
+    tex->Release();
+    return srv;
+}
+
+// Level 0 of a BC1 view, decoded; also its description.
+static bool ReadRectLevel0(Gpu& g, ID3D11ShaderResourceView* srv, D3D11_TEXTURE2D_DESC& desc, std::vector<RR::Rgba>& px) {
+    ID3D11Resource* res = nullptr;
+    srv->GetResource(&res);
+    ID3D11Texture2D* tex = nullptr;
+    if (!res || FAILED(res->QueryInterface(IID_ID3D11Texture2D, (void**)&tex))) { if (res) res->Release(); return false; }
+    res->Release();
+    tex->GetDesc(&desc);
+    D3D11_TEXTURE2D_DESC sd = desc;
+    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &st))) { tex->Release(); return false; }
+    g.ctx->CopyResource(st, tex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    bool ok = SUCCEEDED(g.ctx->Map(st, 0, D3D11_MAP_READ, 0, &m));
+    if (ok) {
+        const int w = (int)desc.Width, h = (int)desc.Height;
+        const size_t rb = RR::RowBytes(RR::TexFmt::BC1, w);
+        std::vector<uint8_t> lv(rb * (size_t)RR::Rows(RR::TexFmt::BC1, h));
+        for (int r = 0; r < RR::Rows(RR::TexFmt::BC1, h); ++r) std::memcpy(lv.data() + (size_t)r * rb, (const uint8_t*)m.pData + (size_t)r * m.RowPitch, rb);
+        g.ctx->Unmap(st, 0);
+        ok = RR::DecodeLevel(RR::TexFmt::BC1, lv.data(), lv.size(), w, h, px);
+    }
+    st->Release();
+    tex->Release();
+    return ok;
+}
+
+static void TestSwapClient() {
+    std::printf("-- 0.5.5 swap layer: Replace / SetActive / Counters (WARP)\n");
+    Gpu g;
+    if (!MakeGpu(g)) { ++g_fail; std::printf("FAIL  no D3D11 device\n"); return; }
+    T::Reset();
+    CHECK(T::InstallOn(g.dev, g.ctx), "InstallOn");
+    const Mips a = RectChainBC1(64, 32, 1, [](int, int w, int h) { return SoftRectPx(w, h, 200, 4); });
+    const Mips b = RectChainBC1(64, 32, 1, [](int, int w, int h) { return std::vector<RR::Rgba>((size_t)w * h, Grey(30)); });
+    ID3D11ShaderResourceView* stock = MakeRectTex(g, 64, 32, a);
+    ID3D11ShaderResourceView* repl = MakeRectTex(g, 64, 32, b);
+    CHECK(stock && repl, "textures");
+    if (!stock || !repl) return;
+    const uint32_t gen0 = swp::Generation();
+    const int h = swp::Replace(stock, repl, true);
+    CHECK(h >= 0, "Replace refused");
+    CHECK(swp::Replace(stock, repl, true) == -1, "the same stock view was accepted twice");
+    ID3D11ShaderResourceView* r1 = BindAndGet(g, stock);
+    CHECK(r1 == repl, "active: the context holds %p, want our %p", (void*)r1, (void*)repl);
+    if (r1) r1->Release();
+    swp::SwapCounters c1 = swp::Counters(h);
+    CHECK(c1.subst == 1 && c1.seen == 1 && c1.verified == 1 && c1.verifyMiss == 0 && c1.lastTick && c1.active,
+          "after one active bind: subst %llu seen %llu verified %u missed %u", (unsigned long long)c1.subst, (unsigned long long)c1.seen, c1.verified, c1.verifyMiss);
+    CHECK(swp::SetActive(h, false), "SetActive(false)");
+    ID3D11ShaderResourceView* r2 = BindAndGet(g, stock);
+    CHECK(r2 == stock, "inactive: the context holds %p, want the stock %p", (void*)r2, (void*)stock);
+    if (r2) r2->Release();
+    swp::SwapCounters c2 = swp::Counters(h);
+    CHECK(c2.subst == 1 && c2.seen == 2 && !c2.active && c2.lastSeenTick, "inactive bind: counted as seen, not substituted (subst %llu seen %llu)",
+          (unsigned long long)c2.subst, (unsigned long long)c2.seen);
+    CHECK(!swp::SetActive(h + 5, true) && !swp::SetActive(-1, true), "SetActive on a handle that does not exist");
+    CHECK(swp::SetActive(h, true), "SetActive(true)");
+    ID3D11ShaderResourceView* r3 = BindAndGet(g, stock);
+    CHECK(r3 == repl, "re-activated: %p", (void*)r3);
+    if (r3) r3->Release();
+    T::Reset();
+    CHECK(swp::Generation() != gen0 && !swp::Installed(), "teardown bumps the generation (handles die)");
+    ID3D11ShaderResourceView* r4 = BindAndGet(g, stock);
+    CHECK(r4 == stock, "after teardown the stock view is bound");
+    if (r4) r4->Release();
+    stock->Release();
+    repl->Release();
+    g.ctx->Release();
+    g.dev->Release();
+}
+
+static void TestRadarMaskEndToEnd() {
+    std::printf("-- 0.5.5 radar round mask end to end (probe windows -> identification -> readback -> our circle, WARP)\n");
+    Gpu g;
+    if (!MakeGpu(g)) { ++g_fail; std::printf("FAIL  no D3D11 device\n"); return; }
+    T::Reset();
+    CHECK(T::InstallOn(g.dev, g.ctx), "InstallOn");
+    // the game's two masks (soft grey rectangles), a same-size view the radar binds every frame, and one bound in the small mask's windows AND
+    // in one empty window (both must lose), and an unrelated size
+    const int kSmLevels = 10, kLgLevels = 10;
+    const Mips smChain = RectChainBC1(512, 256, kSmLevels, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (13 >> l) > 0 ? (13 >> l) : 1); });
+    const Mips lgChain = RectChainBC1(512, 512, kLgLevels, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (13 >> l) > 0 ? (13 >> l) : 1); });
+    const Mips noise = RectChainBC1(512, 256, 1, [](int, int w, int h) {
+        std::vector<RR::Rgba> v((size_t)w * h);
+        for (size_t i = 0; i < v.size(); ++i) v[i] = Grey((uint8_t)((i * 37) % 251));
+        return v;
+    });
+    ID3D11ShaderResourceView* sm = MakeRectTex(g, 512, 256, smChain);
+    ID3D11ShaderResourceView* lg = MakeRectTex(g, 512, 512, lgChain);
+    ID3D11ShaderResourceView* always = MakeRectTex(g, 512, 256, noise);
+    ID3D11ShaderResourceView* stray = MakeRectTex(g, 512, 256, noise);
+    CHECK(sm && lg && always && stray, "textures");
+    if (!sm || !lg || !always || !stray) return;
+
+    rmask::Enable(true);
+    CHECK(rmask::RequestArm(512, 256, 512, 512), "RequestArm");
+    rmask::testing::RenderTick();
+    CHECK(rmask::GetStatus().phase == rmask::Phase::Armed, "phase after arming: %s", rmask::PhaseName(rmask::GetStatus().phase));
+    int plan[12];
+    int n = 0;
+    for (int rep = 0; rep < 3; ++rep) { plan[n++] = rmask::kSmall; plan[n++] = -1; plan[n++] = rmask::kBig; plan[n++] = -1; }
+    for (int w = 0; w < n; ++w) {
+        swp::ProbeSetWindow((uint32_t)w + 1);
+        for (int f = 0; f < 6; ++f) {
+            swp::ProbeFrame();
+            ID3D11ShaderResourceView* arr[2] = { always, plan[w] == rmask::kSmall ? sm : plan[w] == rmask::kBig ? lg : nullptr };
+            g.ctx->PSSetShaderResources(0, 2, arr);
+            if (plan[w] == rmask::kSmall || w == 3) { ID3D11ShaderResourceView* s1[1] = { stray }; g.ctx->PSSetShaderResources(2, 1, s1); }
+        }
+    }
+    CHECK(rmask::RequestFinish(plan, n), "RequestFinish");
+    rmask::testing::RenderTick();     // evaluate + start the readbacks
+    const ULONGLONG t0 = GetTickCount64();
+    while (GetTickCount64() - t0 < 4000 && !(rmask::Live(rmask::kSmall) && rmask::Live(rmask::kBig))) { rmask::testing::RenderTick(); Sleep(5); }
+    const rmask::Status st = rmask::GetStatus();
+    CHECK(st.phase == rmask::Phase::Done, "phase %s (%s)", rmask::PhaseName(st.phase), st.why.c_str());
+    CHECK(st.k[0].found && rmask::Live(rmask::kSmall), "radarmasksm not identified / replaced: %s", st.k[0].why.c_str());
+    CHECK(st.k[1].found && rmask::Live(rmask::kBig), "radarmasklg not identified / replaced: %s", st.k[1].why.c_str());
+    uint64_t want = 0xcbf29ce484222325ULL;
+    for (const auto& lv : smChain) want = RR::Fnv64(lv.data(), lv.size(), want);
+    CHECK(st.k[0].stockHash == want && st.k[0].w == 512 && st.k[0].h == 256 && st.k[0].mips == (uint32_t)kSmLevels && st.k[0].fmt == RR::TexFmt::BC1,
+          "small: hash %016llx (want %016llx) %ux%u %u mips fmt %s", (unsigned long long)st.k[0].stockHash, (unsigned long long)want, st.k[0].w, st.k[0].h,
+          st.k[0].mips, RR::TexFmtName(st.k[0].fmt));
+
+    // registered INACTIVE: the radar keeps the game's mask, its binds are counted
+    ID3D11ShaderResourceView* b0 = BindAndGet(g, sm);
+    CHECK(b0 == sm, "inactive replacement handed out");
+    if (b0) b0->Release();
+    const swp::SwapCounters c0 = swp::Counters(st.k[0].handle);
+    CHECK(c0.seen >= 1 && c0.subst == 0, "inactive: seen %llu subst %llu", (unsigned long long)c0.seen, (unsigned long long)c0.subst);
+    ID3D11ShaderResourceView* a0 = BindAndGet(g, always);
+    CHECK(a0 == always, "the every-frame view of the same size was swapped");
+    if (a0) a0->Release();
+
+    // handed out: the context holds our circle (512 x 256 BC1, the same chain), centre = the stock centre, corners black
+    CHECK(rmask::SetActive(true) == 2, "SetActive(true) did not switch both masks");
+    ID3D11ShaderResourceView* b1 = BindAndGet(g, sm);
+    CHECK(b1 && b1 != sm, "active: still the stock mask");
+    if (b1 && b1 != sm) {
+        D3D11_TEXTURE2D_DESC d = {};
+        std::vector<RR::Rgba> px;
+        CHECK(ReadRectLevel0(g, b1, d, px), "read back our mask");
+        CHECK(d.Width == 512 && d.Height == 256 && d.MipLevels == (UINT)kSmLevels && d.Format == DXGI_FORMAT_BC1_UNORM, "our mask's desc %ux%u %u mips fmt %d",
+              d.Width, d.Height, d.MipLevels, (int)d.Format);
+        if (px.size() == 512u * 256u) {
+            auto at = [&](int x, int y) { return (int)px[(size_t)y * 512 + (size_t)x].r; };
+            const bool centre = at(256, 128) >= 250, corners = at(0, 0) == 0 && at(511, 255) == 0 && at(40, 20) == 0;
+            const bool inner = at(256 + 230, 128) >= 250 && at(256, 128 + 115) >= 250;
+            // the stock was a rectangle: at 0.75 of both semi-axes (1.06 on the diagonal) it was bright, ours is black there
+            const bool round = at(448, 224) < 10;
+            CHECK(centre && corners && inner && round, "our circle: centre %d corners %d %d %d inner %d %d diagonal %d", at(256, 128), at(0, 0), at(511, 255),
+                  at(40, 20), at(486, 128), at(256, 243), at(448, 224));
+        }
+    }
+    if (b1) b1->Release();
+    const swp::SwapCounters c1 = swp::Counters(st.k[0].handle);
+    CHECK(c1.subst >= 1 && c1.verified >= 1 && c1.verifyMiss == 0, "active: subst %llu verified %u missed %u", (unsigned long long)c1.subst, c1.verified, c1.verifyMiss);
+    CHECK(rmask::SetActive(false) == 2, "SetActive(false)");
+    ID3D11ShaderResourceView* b2 = BindAndGet(g, sm);
+    CHECK(b2 == sm, "withdrawn: still our circle");
+    if (b2) b2->Release();
+
+    T::Reset();
+    CHECK(!rmask::Live(rmask::kSmall) && !rmask::Live(rmask::kBig), "a replacement outlived the teardown");
+    rmask::Reset();
+    rmask::Enable(false);
+    sm->Release(); lg->Release(); always->Release(); stray->Release();
+    g.ctx->Release();
+    g.dev->Release();
+}
+
 int main(int argc, char** argv) {
     const std::string real = argc > 1 ? argv[1] : "";
     const std::string outDir = argc > 2 ? argv[2] : ".";
@@ -600,6 +822,8 @@ int main(int argc, char** argv) {
     TestComposite();
     if (!real.empty()) TestRealData(real, outDir); else { ++g_skip; std::printf("-- real stock texture: SKIPPED (no real_k.bin argument)\n"); }
     TestEndToEndSynthetic();      // after the real-data run: Reset() empties the production target table
+    TestSwapClient();             // 0.5.5 the swap layer's client API
+    TestRadarMaskEndToEnd();      // 0.5.5 the radar round mask
     std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     return g_fail ? 1 : 0;
 }

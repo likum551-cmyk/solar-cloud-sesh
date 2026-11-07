@@ -699,6 +699,9 @@ const HashMapping kCrossmap3889[] = {
     {native::GET_SAFE_ZONE_SIZE,                               0x897B441FF18ECBBB},
     // 0.5.4 ring_map_zoom: natlookup.mjs 2026-11-07, YimMenu b3889 and YimMenuV2 enhanced AGREE.
     {native::SET_RADAR_ZOOM,                                   0x4D2F1CB87CBF249D},
+    // 0.5.5 ring_map_round: natlookup.mjs 2026-11-07, YimMenu b3889 and YimMenuV2 enhanced AGREE.
+    {native::GET_TEXTURE_RESOLUTION,                           0x32D86930C15E1159},
+    {native::DRAW_SPRITE,                                      0xFFA2B456A81EA1EB},
     // freemode look (ApplyPedOutfit), same YimMenu b3889 source: natives.hpp enum index 4134 / 4135 /
     // 4140 -> crossmap.hpp[index]. Each also equals YimMenuV2 `enhanced` g_Crossmap[Natives.hpp index
     // 4214 / 4215 / 4220] (two separately indexed lists agreeing by native name). Not live-checked
@@ -4704,6 +4707,30 @@ bool World::SetBigmap(bool on) {
 bool World::SetRadarZoom(int level) {
     uint64_t arg[] = { (uint64_t)(uint32_t)level };   // SET_RADAR_ZOOM(zoomLevel)
     return CallNative(native::SET_RADAR_ZOOM, arg, 1, nullptr);
+}
+
+bool World::TextureResolution(const char* dict, const char* name, float& w, float& h) {
+    w = h = 0.0f;
+    if (!dict || !name) return false;
+    uint64_t args[] = { (uint64_t)(uintptr_t)dict, (uint64_t)(uintptr_t)name };
+    uint64_t ret[4] = {};
+    if (!CallNative(native::GET_TEXTURE_RESOLUTION, args, 2, ret))
+        return false;
+    // a Vector3 through the vectorSpace fixup, as GET_ENTITY_COORDS: ret[0..2] hold the float components
+    memcpy(&w, &ret[0], 4);
+    memcpy(&h, &ret[1], 4);
+    return true;
+}
+
+bool World::DrawSprite(const char* dict, const char* name, float x, float y, float w, float h, int alpha) {
+    if (!dict || !name) return false;
+    uint64_t args[] = {
+        (uint64_t)(uintptr_t)dict, (uint64_t)(uintptr_t)name,
+        FloatArg(x), FloatArg(y), FloatArg(w), FloatArg(h), FloatArg(0.0f),
+        255, 255, 255, (uint64_t)(uint32_t)alpha,
+        0, 0,   // p11 false, p12 0
+    };
+    return CallNative(native::DRAW_SPRITE, args, 13, nullptr);
 }
 
 bool World::SafeZoneSize(float& out) {

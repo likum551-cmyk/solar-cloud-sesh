@@ -317,26 +317,32 @@ namespace gage::sync {
     // Table space (above): the visible map spans x 0..wv, y -hv..0 (it sits ON the safe zone's bottom edge, y down), so its centre is (wv / 2, -hv / 2);
     // the safe zone's left / bottom edges are at inset / 1 - inset of the screen, so a screen point (x, y) (fractions, y down) is (x - inset, y - 1 + inset).
     // Round-1 assumption, measured by the radar probe: the frame getter's aspect step (+0x2c342c) is the identity on a 16:9 display.
-    inline MinimapPlacement RingPlacement(float displayW, float displayH, float safeZone, bool safeZoneOk, float cxPx, float cyPx, float squarePx)
+    // 0.5.5 ring_map_round: the same with the visible map mapped onto a w x h px RECTANGLE (ringround::RoundAskPx asks a different size per axis,
+    // so the radar's real box comes out square; libs/sync/ring_round.h). RingPlacement is the square case.
+    inline MinimapPlacement RingPlacementBox(float displayW, float displayH, float safeZone, bool safeZoneOk, float cxPx, float cyPx, float wPx, float hPx)
     {
         MinimapPlacement p;
-        if (!(displayW > 0.0f) || !(displayH > 0.0f) || !(squarePx > 0.0f))
+        if (!(displayW > 0.0f) || !(displayH > 0.0f) || !(wPx > 0.0f) || !(hPx > 0.0f))
             return p;
         const float sz = SafeZoneClamped(safeZone, safeZoneOk);
         const float inset = 0.05f * std::fabs(sz - 1.0f) * 10.0f;   // as RadarKeepOut: the same fraction of W (x) and of H (y)
         const float wv = displayH / 4.0f / displayW, hv = 1.0f / 5.674f;
         p.ax = wv * 0.5f;
         p.ay = -hv * 0.5f;
-        p.sx = squarePx / displayW / wv;
-        p.sy = squarePx / displayH / hv;
+        p.sx = wPx / displayW / wv;
+        p.sy = hPx / displayH / hv;
         p.tx = cxPx / displayW - inset;
         p.ty = cyPx / displayH - 1.0f + inset;
         p.blurToVisible = true;
-        p.vw = squarePx / displayW;
-        p.vh = squarePx / displayH;
+        p.vw = wPx / displayW;
+        p.vh = hPx / displayH;
         p.vx = p.tx - p.vw * 0.5f;
         p.vy = p.ty + p.vh * 0.5f;   // the bottom edge, y down
         return p;
+    }
+    inline MinimapPlacement RingPlacement(float displayW, float displayH, float safeZone, bool safeZoneOk, float cxPx, float cyPx, float squarePx)
+    {
+        return RingPlacementBox(displayW, displayH, safeZone, safeZoneOk, cxPx, cyPx, squarePx, squarePx);
     }
 
     // ---- 0.5.4 ring map round 2 (GI 2026-11-07: "map is just a square over the hp and sat bar, not a circle inside of it + make it more zoomed out") ----
