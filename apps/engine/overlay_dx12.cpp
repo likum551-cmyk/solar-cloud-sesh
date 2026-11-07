@@ -35,6 +35,7 @@
 #include "overlay_internal.h"
 #include "common/logger.h"
 #include "common/registry.h"
+#include "sync/ped_preview.h"   // 0.5.8: the probe's Verdict
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -632,6 +633,17 @@ void RenderFrame(IDXGISwapChain* scBase)
     ++g.frameNo;
     if (const int probe = detail::TakeProbeRequest())
         GLOGI("overlay: radar probe %d skipped on D3D12 (the probe reads a D3D11 back buffer only)", probe);
+    {
+        // 0.5.8 inv_ped_mode: the CHARACTER window probe reads a D3D11 back buffer only; answer Unavailable (the slot stays unverified)
+        uint32_t seq = 0;
+        int slot = 0;
+        if (detail::TakePedProbeRequest(&seq, &slot)) {
+            PedProbe p;
+            p.seq = seq;
+            p.verdict = (int)gage::sync::pedpreview::Verdict::Unavailable;
+            detail::PutPedProbe(p);
+        }
+    }
     detail::UiFrame();
     {
         // An open panel owns the keyboard and mouse even where ImGui has no widget under the pointer.
