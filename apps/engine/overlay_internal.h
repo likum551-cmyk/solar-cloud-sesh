@@ -2,6 +2,10 @@
 // Not part of the engine's interface: only the two overlay sources include it.
 #pragma once
 
+#include "overlay.h"   // Overlay::PedProbe (0.5.8)
+
+#include <cstdint>
+
 namespace gage::game::Overlay::detail {
 
     // THE brand-art switch. The old GAGE "G" art is retired; the Solar RP NOON art is
@@ -58,6 +62,10 @@ namespace gage::game::Overlay::detail {
     // 0.5.2 round-map probe: the pending Overlay::RequestRadarProbe number (0 = none), cleared by the read. The D3D11 backend saves the
     // frame; the D3D12 backend takes it and logs a skip. Defined in overlay.cpp.
     int TakeProbeRequest();
+    // 0.5.8 inv_ped_mode: the pending Overlay::RequestPedProbe (false = none), cleared by the read; PutPedProbe stores the answer
+    // TakePedProbe hands the engine. The D3D11 backend reads the window back; the D3D12 backend answers Unavailable. Defined in overlay.cpp.
+    bool TakePedProbeRequest(uint32_t* seq, int* slot);
+    void PutPedProbe(const PedProbe& p);
 }
 
 // DX12 backend (overlay_dx12.cpp), for GTA V Enhanced. The public Overlay::Init/Render/

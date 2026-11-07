@@ -12,6 +12,7 @@
 #include "common/logger.h"
 #include "sync/inventory.h"
 #include "sync/ped_view.h"      // 0.5.4 inv_ped_view: the CHARACTER panel's window (shared with the engine's camera framing)
+#include "sync/ped_preview.h"   // 0.5.8 inv_ped_mode: the backdrop colour behind the frontend ped
 #include "overlay_sofia3b.h"   // kOverlaySofia3BoldTtf: Sofia Sans Bold (REV3's conversion, SIL OFL 1.1, brand/fonts/rev3)
 #include "overlay_sofia3s.h"    // kOverlaySofia3SemiTtf: SemiBold
 #include "overlay_sofia3m.h"    // kOverlaySofia3MediumTtf: Medium
@@ -195,6 +196,10 @@ constexpr uint32_t kGlassBorder = 0xF7F2E824;
 // panels 0xE6 (3 % of the world: its variation falls under a slot border's step), overlays 0xF7 (the panel-to-overlay step stays), the world
 // dim 0xB0 (the margins still show the game). Back to 0xBD / 0xE6 / 0x73 when the blur lands.
 constexpr uint32_t kPanelGlass = 0x0A0907E6, kOverlayGlass = 0x0A0907F7, kDim = 0x0A0907B0;
+// 0.5.8: the engine's backdrop rect behind the frontend ped is the panel's own colour (the window then reads as part of the panel)
+static_assert(gage::sync::pedpreview::kBackdrop[0] == (int)((kGround >> 24) & 0xFFu) && gage::sync::pedpreview::kBackdrop[1] == (int)((kGround >> 16) & 0xFFu) &&
+                  gage::sync::pedpreview::kBackdrop[2] == (int)((kGround >> 8) & 0xFFu),
+              "ped_preview.h kBackdrop must be kGround");
 constexpr uint32_t kCardFill = 0xF7F2E80D, kCardBorder = 0xF7F2E81F, kTrack = 0xF7F2E829;
 constexpr float kPi = 3.14159265358979f;
 
@@ -1537,7 +1542,8 @@ void DrawWeightPill()
 // ---- 0.5.4 inv_ped_view: the CHARACTER panel with a window onto the player's own ped --------------------------------------------------------------
 // While the engine's scripted camera renders (Overlay::SetInventoryPedView), the panel and the world dim leave out the window
 // (libs/sync/ped_view.h kHole*): the game draws the ped there. Otherwise (switch off, camera not rendering yet, in a vehicle, dead) the panel is
-// the 0.6 one with the mannequin.
+// the 0.6 one with the mannequin. 0.5.8 inv_ped_mode: the same window, but the engine opens it for GTA's frontend ped (libs/sync/ped_preview.h)
+// drawn on its own backdrop rect in the panel's colour (kGround), so the window shows only the character, in any seat.
 namespace pv = gage::sync::pedview;
 bool g_pedViewThisFrame = false;   // read once per frame (DrawScreen): the dim and the panel agree even if the engine flips it mid-frame
 bool PedViewLive() { return g_pedViewThisFrame; }

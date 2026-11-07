@@ -682,6 +682,33 @@ namespace gage::game {
         constexpr uint64_t DISABLE_PLAYER_FIRING                        = 0x5E6CC07646BBEAB8;
         constexpr uint64_t HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME = 0x0AFC4AF510774B47;
         constexpr uint64_t GET_FRAME_COUNT                              = 0xFC8202EFC642E6F2;
+        // 0.5.8 inv_ped_mode (libs/sync/ped_preview.h): the inventory's ped preview on GTA's frontend ped renderer. Lookup tool natlookup.mjs
+        // 2026-11-07: YimMenu b3889 crossmap and YimMenuV2 enhanced AGREE for all 11 (legacy V2 has the same 3889 hash); public hashes and
+        // signatures from alloc8or natives.json:
+        //   CLONE_PED                            public 0xEF29A16337FACADB  3889 0xEA797D2F13BCD0AA  Ped (Ped, BOOL isNetwork, BOOL bScriptHostPed,
+        //                                        BOOL copyHeadBlendFlag)
+        //   GIVE_PED_TO_PAUSE_MENU               public 0xAC0BFBDC3BE00E14  3889 0x1D16BFDD94C0AE8F  void (Ped, int p1); p1 the slot ("1 or 2 in
+        //                                        the PC scripts"; RAGE MP wiki: 0 left, 1 centre, 2 right)
+        //   CLEAR_PED_IN_PAUSE_MENU              public 0x5E62BE5DC58E9E06  3889 0x86CB46F43269108A  void ()
+        //   SET_PAUSE_MENU_PED_LIGHTING          public 0x3CA6050692BC61B0  3889 0xA6B472383DA6AE23  void (BOOL)
+        //   SET_PAUSE_MENU_PED_SLEEP_STATE       public 0xECF128344E9FF9F1  3889 0xE98A31D3C1927ED6  void (BOOL); 1 = wakes up slowly
+        //   SET_FRONTEND_ACTIVE                  public 0x745711A75AB09277  3889 0x7946F7681E9E1D79  void (BOOL)
+        //   GET_CURRENT_FRONTEND_MENU_VERSION    public 0x2309595AD6145265  3889 0x470CC97DB37CB63B  Hash ()
+        //   SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU public 0xC6372ECD45D73BCD  3889 0xA66AC5949E305457  void (BOOL)
+        //   SET_MOUSE_CURSOR_VISIBLE             public 0x98215325A695E78A  3889 0x26BBBC01C3E132A7  void (BOOL); the frontend's own cursor
+        //   GET_HUD_COLOUR                       public 0x7C9C91AB74A0360F  3889 0xA306E6FD2A6558E6  void (int, int* r, int* g, int* b, int* a)
+        //   REPLACE_HUD_COLOUR_WITH_RGBA         public 0xF314CF4F0211894E  3889 0x2BC0725CAF2E0D6B  void (int, int r, int g, int b, int a)
+        constexpr uint64_t CLONE_PED                                    = 0xEF29A16337FACADB;
+        constexpr uint64_t GIVE_PED_TO_PAUSE_MENU                       = 0xAC0BFBDC3BE00E14;
+        constexpr uint64_t CLEAR_PED_IN_PAUSE_MENU                      = 0x5E62BE5DC58E9E06;
+        constexpr uint64_t SET_PAUSE_MENU_PED_LIGHTING                  = 0x3CA6050692BC61B0;
+        constexpr uint64_t SET_PAUSE_MENU_PED_SLEEP_STATE               = 0xECF128344E9FF9F1;
+        constexpr uint64_t SET_FRONTEND_ACTIVE                          = 0x745711A75AB09277;
+        constexpr uint64_t GET_CURRENT_FRONTEND_MENU_VERSION            = 0x2309595AD6145265;
+        constexpr uint64_t SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU         = 0xC6372ECD45D73BCD;
+        constexpr uint64_t SET_MOUSE_CURSOR_VISIBLE                     = 0x98215325A695E78A;
+        constexpr uint64_t GET_HUD_COLOUR                               = 0x7C9C91AB74A0360F;
+        constexpr uint64_t REPLACE_HUD_COLOUR_WITH_RGBA                 = 0xF314CF4F0211894E;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -1149,6 +1176,23 @@ namespace gage::game {
         int      IsCamRendering(int32_t cam);                   // 1 yes, 0 no, -1 cannot call
         int      FollowPedCamViewMode();                        // 4 = first person; -1 cannot call
         bool     IsPedGettingIntoVehicle(int32_t ped);
+
+        // -- 0.5.8 inv_ped_mode: the inventory's ped preview on GTA's frontend ped renderer (script tick) --------------------------------------
+        // Same conventions: a setter returns "the native could be called". ClonePed: CLONE_PED(ped, isNetwork false, bScriptHostPed false,
+        // copyHeadBlend true), 0 = cannot call / no ped. HidePreviewClone puts a clone out of the world's way: invisible, frozen, no
+        // collision, invincible, deaf to events, at (x, y, z); returns how many of those 6 calls could NOT be made.
+        int32_t  ClonePed(int32_t ped);
+        int      HidePreviewClone(int32_t ped, float x, float y, float z);
+        bool     GivePedToPauseMenu(int32_t ped, int slot);
+        bool     ClearPedInPauseMenu();
+        bool     SetPauseMenuPedLighting(bool on);
+        bool     SetPauseMenuPedSleepState(bool awake);
+        bool     SetFrontendActive(bool on);
+        bool     CurrentFrontendMenuVersion(uint32_t& out);     // GET_CURRENT_FRONTEND_MENU_VERSION; false = cannot call
+        bool     SetScriptGfxDrawBehindPauseMenu(bool on);
+        bool     SetMouseCursorVisible(bool on);
+        bool     GetHudColour(int index, int& r, int& g, int& b, int& a);   // false = cannot call (outputs untouched)
+        bool     ReplaceHudColour(int index, int r, int g, int b, int a);    // REPLACE_HUD_COLOUR_WITH_RGBA
 
         // -- vehicle sync (script tick) ----------------------------------------
         // Every bool is "the native could be called" (false for handle 0 or an unresolved

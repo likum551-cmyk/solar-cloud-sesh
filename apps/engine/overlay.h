@@ -135,6 +135,23 @@ namespace gage::game::Overlay {
     // says it was skipped. Any thread.
     void RequestRadarProbe(int n);
 
+    // 0.5.8 inv_ped_mode (libs/sync/ped_preview.h): read the CHARACTER window (ped_view.h Hole) back from the next frame the game made, before
+    // the overlay draws on it, and analyse it (sync::pedpreview::AnalyzeWindow); a half-size copy of the whole frame goes to
+    // %LOCALAPPDATA%\GAGE-MP\inv_ped_probe_<slot + 1>.bmp so a miss can be pinned by eye. TakePedProbe gives the latest answer once: its seq and
+    // the AnalyzeWindow numbers (verdict Unavailable on D3D12 / an unreadable back buffer); false = none since the last take. Any thread.
+    struct PedProbe {
+        uint32_t seq = 0;
+        int verdict = 0;                     // sync::pedpreview::Verdict
+        int w = 0, h = 0, pedPx = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        int bg[3] = {0, 0, 0};
+        bool cutTop = false, cutBottom = false, cutLeft = false, cutRight = false;
+        int winX = 0, winY = 0;              // the window's top-left on the back buffer (px)
+        int bbW = 0, bbH = 0;                // the back buffer
+        bool bmpSaved = false;
+    };
+    void RequestPedProbe(uint32_t seq, int slot);
+    bool TakePedProbe(PedProbe* out);
+
     // 0.4.22 vehicle controls (libs/sync/vehicle_controls.h). The keys are read in UiFrame from ImGui's key events, the same source as Tab / T /
     // Enter: Left / Right Arrow (indicators), Down Arrow (hazards), Y (engine), B (seatbelt); H is GTA's own headlight control and is not read here.
     // Nothing is taken while the chat, the Tab menu, a text box or the quit card has the keyboard. TakeVehicleKeys returns the bits pressed since

@@ -48,6 +48,11 @@ namespace gage::sync {
         bool   menuActive = false;          // IS_PAUSE_MENU_ACTIVE
         bool   openPressed = false;         // IS_DISABLED_CONTROL_JUST_PRESSED(0, 199) or (0, 200); read only when ControlsHeld
         bool   overlayInteractive = false;  // a chat / palette panel owns the keyboard
+        // 0.5.8 inv_ped_mode (sync/ped_preview.h): the inventory's ped preview owns the frontend (from its claim, before it activates, until
+        // the frontend reads closed again). That frontend is not the player's pause menu: it is never blocked (DISABLE_FRONTEND_THIS_FRAME
+        // would eat the preview's activation), never counted as opened, and no press opens the pause menu over it. The engine passes
+        // menuActive false meanwhile, so 199 / 200 stay held.
+        bool   frontendIsOurs = false;
     };
 
     struct PauseMenuOut
@@ -72,6 +77,14 @@ namespace gage::sync {
         {
             PauseMenuOut out;
             if (!in.connected)
+            {
+                if (wasActive_)
+                    out.justClosed = true;
+                wasActive_ = false;
+                graceUntilMs_ = 0;
+                return out;
+            }
+            if (in.frontendIsOurs)
             {
                 if (wasActive_)
                     out.justClosed = true;
