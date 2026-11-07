@@ -588,7 +588,7 @@ static void TestRealData(const std::string& realPath, const std::string& outDir)
 }
 
 // ---- 0.5.5: the shared swap layer's client API and the radar round mask (apps/engine/radar_mask.cpp), end to end on WARP -----------------
-// No window is created: a bare WARP device and its immediate context, the probe's "frames" are ProbeFrame() calls.
+// No window is created: a bare WARP device and its immediate context; a "frame" is a round of PSSetShaderResources calls and one RenderTick.
 namespace RR = gage::sync::ringround;
 namespace swp = gage::game::brand::swap;
 namespace rmask = gage::game::radarmask;
@@ -813,104 +813,223 @@ static void TestSwapClaimsTeeCandidate() {
     g.dev->Release();
 }
 
-static void TestRadarMaskEndToEnd() {
-    std::printf("-- 0.5.5 radar round mask end to end (probe windows -> identification -> readback -> our circle, WARP)\n");
-    Gpu g;
-    if (!MakeGpu(g)) { ++g_fail; std::printf("FAIL  no D3D11 device\n"); return; }
-    T::Reset();
-    CHECK(T::InstallOn(g.dev, g.ctx), "InstallOn");
-    // the game's two masks (soft grey rectangles), a same-size view the radar binds every frame, and one bound in the small mask's windows AND
-    // in one empty window (both must lose), and an unrelated size
-    const int kSmLevels = 10, kLgLevels = 10;
-    const Mips smChain = RectChainBC1(512, 256, kSmLevels, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (13 >> l) > 0 ? (13 >> l) : 1); });
-    const Mips lgChain = RectChainBC1(512, 512, kLgLevels, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (13 >> l) > 0 ? (13 >> l) : 1); });
-    const Mips noise = RectChainBC1(512, 256, 1, [](int, int w, int h) {
-        std::vector<RR::Rgba> v((size_t)w * h);
-        for (size_t i = 0; i < v.size(); ++i) v[i] = Grey((uint8_t)((i * 37) % 251));
-        return v;
-    });
-    ID3D11ShaderResourceView* sm = MakeRectTex(g, 512, 256, smChain);
-    ID3D11ShaderResourceView* lg = MakeRectTex(g, 512, 512, lgChain);
-    ID3D11ShaderResourceView* always = MakeRectTex(g, 512, 256, noise);
-    ID3D11ShaderResourceView* stray = MakeRectTex(g, 512, 256, noise);
-    CHECK(sm && lg && always && stray, "textures");
-    if (!sm || !lg || !always || !stray) return;
+// ---- 0.5.6 the census: every same-size view bound every frame (the live log's shape), picked by content -----------------------------------
+// Fixture: the game's two masks (soft grey rectangles with full mip chains) among 12 other 512 x 256 views and 80 other 512 x 512 views (noise,
+// colour, a lopsided rectangle, a grey Gaussian blob), plus a 512 x 512 view in a format we cannot rebuild, ALL bound in every frame. 0.5.5's
+// windowed probe kept 64 of these and could not tell them apart; the census must keep all 94, read them back, and pick exactly the two masks.
+static std::vector<RR::Rgba> OtherPx(int kind, int w, int h) {
+    std::vector<RR::Rgba> v((size_t)w * (size_t)h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            RR::Rgba c = Grey(0);
+            if (kind == 0) c = Grey((uint8_t)(((size_t)y * (size_t)w + (size_t)x) * 37 % 251));                      // noise
+            else if (kind == 1) c = RR::Rgba{ 200, 60, 60, 255 };                                                       // colour
+            else if (kind == 2) {                                                                                       // lopsided
+                const int dl = x, dr = w - 1 - x, dy = y < h - 1 - y ? y : h - 1 - y;
+                float t = dl >= 13 ? 1.0f : dl / 13.0f;
+                const float tr = dr >= w / 3 ? 1.0f : dr / (float)(w / 3), ty = dy >= 13 ? 1.0f : dy / 13.0f;
+                t = t < tr ? t : tr;
+                t = t < ty ? t : ty;
+                c = Grey((uint8_t)(255.0f * t + 0.5f));
+            } else {                                                                                                    // blob
+                const double rx = (x - (w - 1) / 2.0) / (w / 2.0), ry = (y - (h - 1) / 2.0) / (h / 2.0);
+                c = Grey((uint8_t)(255.0 * std::exp(-(rx * rx + ry * ry) / (2.0 * 0.3 * 0.3)) + 0.5));
+            }
+            v[(size_t)y * (size_t)w + (size_t)x] = c;
+        }
+    return v;
+}
 
-    rmask::Enable(true);
-    CHECK(rmask::RequestArm(512, 256, 512, 512), "RequestArm");
-    rmask::testing::RenderTick();
-    CHECK(rmask::GetStatus().phase == rmask::Phase::Armed, "phase after arming: %s", rmask::PhaseName(rmask::GetStatus().phase));
-    int plan[12];
-    int n = 0;
-    for (int rep = 0; rep < 3; ++rep) { plan[n++] = rmask::kSmall; plan[n++] = -1; plan[n++] = rmask::kBig; plan[n++] = -1; }
-    for (int w = 0; w < n; ++w) {
-        swp::ProbeSetWindow((uint32_t)w + 1);
-        for (int f = 0; f < 6; ++f) {
-            swp::ProbeFrame();
-            ID3D11ShaderResourceView* arr[2] = { always, plan[w] == rmask::kSmall ? sm : plan[w] == rmask::kBig ? lg : nullptr };
-            g.ctx->PSSetShaderResources(0, 2, arr);
-            if (plan[w] == rmask::kSmall || w == 3) { ID3D11ShaderResourceView* s1[1] = { stray }; g.ctx->PSSetShaderResources(2, 1, s1); }
+struct CensusFixture {
+    Gpu g;
+    Mips smChain, lgChain, smAlt;
+    ID3D11ShaderResourceView* sm = nullptr;
+    ID3D11ShaderResourceView* lg = nullptr;
+    ID3D11ShaderResourceView* smAltView = nullptr;    // a second mask-like 512 x 256 view (another ramp: another hash)
+    std::vector<ID3D11ShaderResourceView*> smOthers, lgOthers;
+    ID3D11ShaderResourceView* otherFmt = nullptr;
+    bool ok = false;
+    bool Make() {
+        if (!MakeGpu(g)) return false;
+        smChain = RectChainBC1(512, 256, 10, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (13 >> l) > 0 ? (13 >> l) : 1); });
+        lgChain = RectChainBC1(512, 512, 10, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (13 >> l) > 0 ? (13 >> l) : 1); });
+        smAlt = RectChainBC1(512, 256, 10, [](int l, int w, int h) { return SoftRectPx(w, h, 255, (20 >> l) > 0 ? (20 >> l) : 1); });
+        sm = MakeRectTex(g, 512, 256, smChain);
+        lg = MakeRectTex(g, 512, 512, lgChain);
+        smAltView = MakeRectTex(g, 512, 256, smAlt);
+        Mips smO[4], lgO[4];
+        for (int k = 0; k < 4; ++k) {
+            smO[k] = RectChainBC1(512, 256, 1, [k](int, int w, int h) { return OtherPx(k, w, h); });
+            lgO[k] = RectChainBC1(512, 512, 1, [k](int, int w, int h) { return OtherPx(k, w, h); });
+        }
+        for (int i = 0; i < 12; ++i) smOthers.push_back(MakeRectTex(g, 512, 256, smO[i % 4]));
+        for (int i = 0; i < 80; ++i) lgOthers.push_back(MakeRectTex(g, 512, 512, lgO[i % 4]));
+        D3D11_TEXTURE2D_DESC d = {};
+        d.Width = d.Height = 512; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ID3D11Texture2D* t = nullptr;
+        if (SUCCEEDED(g.dev->CreateTexture2D(&d, nullptr, &t)) && t) { g.dev->CreateShaderResourceView(t, nullptr, &otherFmt); t->Release(); }
+        ok = sm && lg && smAltView && otherFmt;
+        for (auto* v : smOthers) ok = ok && v;
+        for (auto* v : lgOthers) ok = ok && v;
+        return ok;
+    }
+    // one game frame: every view bound, 16 slots per call, the 512 x 256 ones first (so a small cap fills with them)
+    void BindAll(bool withAlt) {
+        std::vector<ID3D11ShaderResourceView*> all(smOthers);
+        all.push_back(sm);
+        if (withAlt) all.push_back(smAltView);
+        all.insert(all.end(), lgOthers.begin(), lgOthers.end());
+        all.push_back(lg);
+        all.push_back(otherFmt);
+        for (size_t i = 0; i < all.size(); i += 16) {
+            const UINT n = (UINT)((all.size() - i) < 16 ? (all.size() - i) : 16);
+            g.ctx->PSSetShaderResources(0, n, &all[i]);
         }
     }
-    CHECK(rmask::RequestFinish(plan, n), "RequestFinish");
-    rmask::testing::RenderTick();     // evaluate + start the readbacks
-    const ULONGLONG t0 = GetTickCount64();
-    while (GetTickCount64() - t0 < 4000 && !(rmask::Live(rmask::kSmall) && rmask::Live(rmask::kBig))) { rmask::testing::RenderTick(); Sleep(5); }
-    const rmask::Status st = rmask::GetStatus();
+    // a census start to finish: frames of BindAll + RenderTick until Done / Failed (or 30 s)
+    rmask::Status Run(uint32_t ws, uint32_t hs, uint32_t wb, uint32_t hb, bool withAlt) {
+        rmask::testing::RenderTick();                  // a fresh install's generation is taken up before the request
+        CHECK(rmask::RequestCensus(ws, hs, wb, hb, false), "RequestCensus");
+        const ULONGLONG t0 = GetTickCount64();
+        rmask::Status st;
+        int frames = 0;
+        while (GetTickCount64() - t0 < 30000) {
+            BindAll(withAlt);
+            rmask::testing::RenderTick();
+            ++frames;
+            st = rmask::GetStatus();
+            if (st.phase == rmask::Phase::Done || st.phase == rmask::Phase::Failed) break;
+            Sleep(2);
+        }
+        std::printf("      census: %s after %d frames, %.1f s (%s)\n", rmask::PhaseName(st.phase), frames, (GetTickCount64() - t0) / 1000.0, st.why.c_str());
+        return st;
+    }
+    ~CensusFixture() {
+        for (auto* v : smOthers) if (v) v->Release();
+        for (auto* v : lgOthers) if (v) v->Release();
+        if (sm) sm->Release();
+        if (lg) lg->Release();
+        if (smAltView) smAltView->Release();
+        if (otherFmt) otherFmt->Release();
+        if (g.ctx) g.ctx->Release();
+        if (g.dev) g.dev->Release();
+    }
+};
+
+static uint64_t ChainHash(const Mips& m) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (const auto& lv : m) h = RR::Fnv64(lv.data(), lv.size(), h);
+    return h;
+}
+
+static void TestRadarMaskCensus() {
+    std::printf("-- 0.5.6 radar round mask census: 94 same-size views bound every frame -> exactly the two masks, by content (WARP)\n");
+    CensusFixture f;
+    if (!f.Make()) { ++g_fail; std::printf("FAIL  census fixture\n"); return; }
+    T::Reset();
+    CHECK(T::InstallOn(f.g.dev, f.g.ctx), "InstallOn");
+    rmask::Enable(true);
+    const rmask::Status st = f.Run(512, 256, 512, 512, false);
     CHECK(st.phase == rmask::Phase::Done, "phase %s (%s)", rmask::PhaseName(st.phase), st.why.c_str());
-    CHECK(st.k[0].found && rmask::Live(rmask::kSmall), "radarmasksm not identified / replaced: %s", st.k[0].why.c_str());
-    CHECK(st.k[1].found && rmask::Live(rmask::kBig), "radarmasklg not identified / replaced: %s", st.k[1].why.c_str());
-    uint64_t want = 0xcbf29ce484222325ULL;
-    for (const auto& lv : smChain) want = RR::Fnv64(lv.data(), lv.size(), want);
-    CHECK(st.k[0].stockHash == want && st.k[0].w == 512 && st.k[0].h == 256 && st.k[0].mips == (uint32_t)kSmLevels && st.k[0].fmt == RR::TexFmt::BC1,
-          "small: hash %016llx (want %016llx) %ux%u %u mips fmt %s", (unsigned long long)st.k[0].stockHash, (unsigned long long)want, st.k[0].w, st.k[0].h,
-          st.k[0].mips, RR::TexFmtName(st.k[0].fmt));
+    CHECK(st.k[0].views == 13 && st.k[1].views == 81 && st.k[0].read == 13 && st.k[1].read == 81 && st.k[0].notRecorded == 0 && st.k[1].notRecorded == 0,
+          "every view kept and read back: sm %d/%d lg %d/%d not recorded %u/%u (more than 0.5.5's 64 in all)", st.k[0].read, st.k[0].views, st.k[1].read,
+          st.k[1].views, st.k[0].notRecorded, st.k[1].notRecorded);
+    CHECK(st.k[1].otherFormat == 1, "the R16G16B16A16 view counted as another format (%u)", st.k[1].otherFormat);
+    CHECK(st.k[0].verdict == RR::PickVerdict::Found && st.k[1].verdict == RR::PickVerdict::Found && st.k[0].shapes == 1 && st.k[1].shapes == 1,
+          "verdicts: %s | %s", st.k[0].why.c_str(), st.k[1].why.c_str());
+    CHECK(rmask::Live(rmask::kSmall) && rmask::Live(rmask::kBig), "both masks replaced: %s | %s", st.k[0].why.c_str(), st.k[1].why.c_str());
+    CHECK(st.k[0].stockHash == ChainHash(f.smChain) && st.k[1].stockHash == ChainHash(f.lgChain) && st.k[0].mips == 10 && st.k[0].fmt == RR::TexFmt::BC1,
+          "the chosen views are the masks: hash %016llx / %016llx", (unsigned long long)st.k[0].stockHash, (unsigned long long)st.k[1].stockHash);
 
     // registered INACTIVE: the radar keeps the game's mask, its binds are counted
-    ID3D11ShaderResourceView* b0 = BindAndGet(g, sm);
-    CHECK(b0 == sm, "inactive replacement handed out");
+    ID3D11ShaderResourceView* b0 = BindAndGet(f.g, f.sm);
+    CHECK(b0 == f.sm, "inactive replacement handed out");
     if (b0) b0->Release();
     const swp::SwapCounters c0 = swp::Counters(st.k[0].handle);
     CHECK(c0.seen >= 1 && c0.subst == 0, "inactive: seen %llu subst %llu", (unsigned long long)c0.seen, (unsigned long long)c0.subst);
-    ID3D11ShaderResourceView* a0 = BindAndGet(g, always);
-    CHECK(a0 == always, "the every-frame view of the same size was swapped");
-    if (a0) a0->Release();
 
-    // handed out: the context holds our circle (512 x 256 BC1, the same chain), centre = the stock centre, corners black
+    // handed out: exactly the two masks are swapped, none of the 92 others
     CHECK(rmask::SetActive(true) == 2, "SetActive(true) did not switch both masks");
-    ID3D11ShaderResourceView* b1 = BindAndGet(g, sm);
-    CHECK(b1 && b1 != sm, "active: still the stock mask");
-    if (b1 && b1 != sm) {
+    int swappedOthers = 0;
+    for (auto* v : f.smOthers) { ID3D11ShaderResourceView* r = BindAndGet(f.g, v); if (r != v) ++swappedOthers; if (r) r->Release(); }
+    for (auto* v : f.lgOthers) { ID3D11ShaderResourceView* r = BindAndGet(f.g, v); if (r != v) ++swappedOthers; if (r) r->Release(); }
+    CHECK(swappedOthers == 0, "%d of the 92 other views were swapped", swappedOthers);
+    ID3D11ShaderResourceView* b1 = BindAndGet(f.g, f.sm);
+    ID3D11ShaderResourceView* bl = BindAndGet(f.g, f.lg);
+    CHECK(b1 && b1 != f.sm && bl && bl != f.lg, "active: a stock mask still bound");
+    if (b1 && b1 != f.sm) {
         D3D11_TEXTURE2D_DESC d = {};
         std::vector<RR::Rgba> px;
-        CHECK(ReadRectLevel0(g, b1, d, px), "read back our mask");
-        CHECK(d.Width == 512 && d.Height == 256 && d.MipLevels == (UINT)kSmLevels && d.Format == DXGI_FORMAT_BC1_UNORM, "our mask's desc %ux%u %u mips fmt %d",
-              d.Width, d.Height, d.MipLevels, (int)d.Format);
+        CHECK(ReadRectLevel0(f.g, b1, d, px), "read back our mask");
+        CHECK(d.Width == 512 && d.Height == 256 && d.MipLevels == 10u && d.Format == DXGI_FORMAT_BC1_UNORM, "our mask's desc %ux%u %u mips fmt %d", d.Width,
+              d.Height, d.MipLevels, (int)d.Format);
         if (px.size() == 512u * 256u) {
             auto at = [&](int x, int y) { return (int)px[(size_t)y * 512 + (size_t)x].r; };
             const bool centre = at(256, 128) >= 250, corners = at(0, 0) == 0 && at(511, 255) == 0 && at(40, 20) == 0;
             const bool inner = at(256 + 230, 128) >= 250 && at(256, 128 + 115) >= 250;
-            // the stock was a rectangle: at 0.75 of both semi-axes (1.06 on the diagonal) it was bright, ours is black there
-            const bool round = at(448, 224) < 10;
+            const bool round = at(448, 224) < 10;   // the stock rectangle was bright there
             CHECK(centre && corners && inner && round, "our circle: centre %d corners %d %d %d inner %d %d diagonal %d", at(256, 128), at(0, 0), at(511, 255),
                   at(40, 20), at(486, 128), at(256, 243), at(448, 224));
         }
     }
     if (b1) b1->Release();
+    if (bl) bl->Release();
     const swp::SwapCounters c1 = swp::Counters(st.k[0].handle);
     CHECK(c1.subst >= 1 && c1.verified >= 1 && c1.verifyMiss == 0, "active: subst %llu verified %u missed %u", (unsigned long long)c1.subst, c1.verified, c1.verifyMiss);
     CHECK(rmask::SetActive(false) == 2, "SetActive(false)");
-    ID3D11ShaderResourceView* b2 = BindAndGet(g, sm);
-    CHECK(b2 == sm, "withdrawn: still our circle");
+    ID3D11ShaderResourceView* b2 = BindAndGet(f.g, f.sm);
+    CHECK(b2 == f.sm, "withdrawn: still our circle");
     if (b2) b2->Release();
-
     T::Reset();
     CHECK(!rmask::Live(rmask::kSmall) && !rmask::Live(rmask::kBig), "a replacement outlived the teardown");
-    rmask::Reset();
+}
+
+// The cap can never overflow into an answer: with room for 40 views, the 13 small ones fit (found), the 81 big ones do not (incomplete: nothing
+// replaced, although the census holds no second mask-like view).
+static void TestRadarMaskCensusOverflow() {
+    std::printf("-- 0.5.6 census past its cap: the overflowing size is INCOMPLETE (no pick), the size that fits is still found (WARP)\n");
+    CensusFixture f;
+    if (!f.Make()) { ++g_fail; std::printf("FAIL  census fixture\n"); return; }
+    T::Reset();
+    T::SetCensusCap(40);
+    CHECK(T::InstallOn(f.g.dev, f.g.ctx), "InstallOn");
+    rmask::Enable(true);
+    const rmask::Status st = f.Run(512, 256, 512, 512, false);
+    CHECK(st.phase == rmask::Phase::Done, "phase %s (%s)", rmask::PhaseName(st.phase), st.why.c_str());
+    CHECK(st.k[0].verdict == RR::PickVerdict::Found && rmask::Live(rmask::kSmall), "small (fits the cap): %s", st.k[0].why.c_str());
+    CHECK(st.k[1].verdict == RR::PickVerdict::Incomplete && st.k[1].notRecorded == 54 && st.k[1].views == 27 && !rmask::Live(rmask::kBig),
+          "big (54 past the cap): %s (views %d, not recorded %u, live %d)", st.k[1].why.c_str(), st.k[1].views, st.k[1].notRecorded, (int)rmask::Live(rmask::kBig));
+    T::Reset();
+}
+
+// Two mask-like views of the same size: no guess. Then the same with one of them pinned by its stock hash: that one is taken.
+static void TestRadarMaskCensusAmbiguous() {
+    std::printf("-- 0.5.6 census with two mask-like 512 x 256 views: AMBIGUOUS (nothing replaced); with a pinned stock hash: that one (WARP)\n");
+    CensusFixture f;
+    if (!f.Make()) { ++g_fail; std::printf("FAIL  census fixture\n"); return; }
+    T::Reset();
+    CHECK(T::InstallOn(f.g.dev, f.g.ctx), "InstallOn");
+    rmask::Enable(true);
+    const rmask::Status st = f.Run(512, 256, 0, 0, true);
+    CHECK(st.phase == rmask::Phase::Done && st.k[0].verdict == RR::PickVerdict::Ambiguous && st.k[0].shapes == 2 && !rmask::Live(rmask::kSmall),
+          "two masks: %s (live %d)", st.k[0].why.c_str(), (int)rmask::Live(rmask::kSmall));
+    CHECK(!st.k[1].probed && st.k[1].views == 0, "radarmasklg was not looked for (0 x 0)");
+    rmask::testing::SetPins(rmask::kSmall, { ChainHash(f.smChain) });
+    const rmask::Status sp = f.Run(512, 256, 0, 0, true);
+    CHECK(sp.k[0].verdict == RR::PickVerdict::FoundPinned && rmask::Live(rmask::kSmall) && sp.k[0].stockHash == ChainHash(f.smChain), "pinned: %s",
+          sp.k[0].why.c_str());
+    CHECK(rmask::SetActive(true) == 1, "SetActive(true)");
+    ID3D11ShaderResourceView* a = BindAndGet(f.g, f.smAltView);
+    ID3D11ShaderResourceView* m = BindAndGet(f.g, f.sm);
+    CHECK(a == f.smAltView && m && m != f.sm, "pinned: the pinned view is swapped (%d), the other mask-like one is not (%d)", (int)(m != f.sm), (int)(a == f.smAltView));
+    if (a) a->Release();
+    if (m) m->Release();
+    rmask::SetActive(false);
+    rmask::testing::SetPins(rmask::kSmall, {});
+    T::Reset();
+    rmask::testing::RenderTick();
     rmask::Enable(false);
-    sm->Release(); lg->Release(); always->Release(); stray->Release();
-    g.ctx->Release();
-    g.dev->Release();
 }
 
 int main(int argc, char** argv) {
@@ -930,7 +1049,9 @@ int main(int argc, char** argv) {
     TestSwapClient();             // 0.5.5 the swap layer's client API
     TestBrandOffSwapOnly();       // 0.5.5 review #1: brand off, hooks for the radar mask only
     TestSwapClaimsTeeCandidate(); // 0.5.5 review #2: a claim on a view in the tee pipeline stands
-    TestRadarMaskEndToEnd();      // 0.5.5 the radar round mask
+    TestRadarMaskCensus();        // 0.5.6 the radar round mask: census of every same-size view, picked by content
+    TestRadarMaskCensusOverflow();   // 0.5.6 past the census cap: incomplete, never a pick
+    TestRadarMaskCensusAmbiguous();  // 0.5.6 two mask-like views: no guess; a pinned hash decides
     std::printf("\n%d passed, %d failed, %d skipped\n", g_pass, g_fail, g_skip);
     return g_fail ? 1 : 0;
 }

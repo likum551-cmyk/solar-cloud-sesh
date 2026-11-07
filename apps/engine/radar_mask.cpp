@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,31 +23,78 @@ namespace swap = gage::game::brand::swap;
 
 namespace {
 
+// The stock masks' FNV-1a 64 (over every mip, as logged by "radar mask census (0.5.6): ... stock FNV-1a 64 ..."), once a live census has read
+// them back: a view carrying one of these AND looking like a mask is the mask even when the census is incomplete or ambiguous (PickMask).
+// None yet: 0.5.6 is the first build that reads the masks back. Only hashes go here, never pixels.
+const std::vector<uint64_t> kPinned[2] = {{}, {}};
+
+// The formats a stock mask can be in that we can rebuild (ring_round.h TexFmt); the census keeps no other view.
+constexpr uint32_t kFormats[] = {
+    DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC3_UNORM,
+    DXGI_FORMAT_BC3_UNORM_SRGB, DXGI_FORMAT_BC4_TYPELESS, DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8_TYPELESS,
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_A8_UNORM,
+};
+static_assert(sizeof(kFormats) / sizeof(kFormats[0]) <= (size_t)swap::kCensusMaxFormats, "census format list too long");
+
 std::atomic<bool> g_enabled{ false };
 std::atomic<bool> g_active{ false };          // SetActive's last word (a replacement registered later starts in this state)
 std::atomic<int>  g_phase{ (int)Phase::Idle };
-std::mutex        g_mu;                    // guards g_status, g_req*
+std::atomic<bool> g_cancel{ false };
+std::mutex        g_mu;                       // guards g_status, g_req*, g_pins
 Status            g_status;
-swap::ProbeSize   g_reqSizes[2] = {};
-std::vector<int>  g_reqWindows;
-uint32_t          g_gen = 0;               // render thread: the swap generation our handles belong to
+uint32_t          g_reqSize[2][2] = {};
+bool              g_reqVerbose = true;
+std::vector<uint64_t> g_pins[2];              // testing::SetPins; empty = kPinned
+uint32_t          g_gen = 0;                  // render thread: the swap generation our handles belong to
 
-struct Readback {
+// render thread only
+struct Item {                                 // one census view on its way through the readback
     int kind = -1;
-    ID3D11ShaderResourceView* srv = nullptr;   // the stock view (AddRef'd)
-    ID3D11Texture2D* tex = nullptr;            // its texture (AddRef'd)
+    int ordinal = 0;                          // 1-based within its kind ("candidate 17 of 64")
+    ID3D11ShaderResourceView* srv = nullptr;  // the stock view (the census's reference)
+    ID3D11Texture2D* tex = nullptr;
     ID3D11Texture2D* staging = nullptr;
     D3D11_TEXTURE2D_DESC desc = {};
     TexFmt fmt = TexFmt::Unknown;
     ULONGLONG started = 0;
+    uint64_t binds = 0;
 };
-std::vector<Readback> g_jobs;              // render thread only
+struct Seen {                                 // what the readback found, per candidate (index = ordinal - 1)
+    CensusEntry e;
+    ID3D11ShaderResourceView* srv = nullptr;  // kept only for a mask-like view, until the pick
+    D3D11_TEXTURE2D_DESC desc = {};
+    TexFmt fmt = TexFmt::Unknown;
+    StockMask sm;
+};
+std::deque<Item>  g_queue;
+std::vector<Item> g_flight;
+std::vector<Seen> g_seen[2];
+int               g_total[2] = {};
+bool              g_verbose = true;
+ULONGLONG         g_censusStart = 0;
+uint32_t          g_censusFrames = 0;
+int               g_kindOfSize[swap::kCensusMaxSizes] = {-1, -1, -1, -1};
+bool              g_inRun[2] = {};            // the kinds this census looks for (asked, and not live already)
 
-void ReleaseJob(Readback& j) {
+void ReleaseItem(Item& j) {
     if (j.staging) j.staging->Release();
     if (j.tex) j.tex->Release();
     if (j.srv) j.srv->Release();
-    j = Readback{};
+    j = Item{};
+}
+
+void DropAll() {
+    for (Item& j : g_queue) ReleaseItem(j);
+    g_queue.clear();
+    for (Item& j : g_flight) ReleaseItem(j);
+    g_flight.clear();
+    for (std::vector<Seen>& v : g_seen) {
+        for (Seen& s : v)
+            if (s.srv) { s.srv->Release(); s.srv = nullptr; }
+        v.clear();
+    }
+    g_total[0] = g_total[1] = 0;
 }
 
 TexFmt FromDxgi(DXGI_FORMAT f) {
@@ -62,101 +110,82 @@ TexFmt FromDxgi(DXGI_FORMAT f) {
     }
 }
 
-void SetKindWhy(int kind, const std::string& why) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_status.k[kind].why = why;
+// A candidate that could not be read: its entry stays unread, so the census for its kind is incomplete (PickMask refuses to pick).
+void Unread(Item& j, const char* why) {
+    if (j.kind >= 0 && j.ordinal >= 1 && j.ordinal <= (int)g_seen[j.kind].size()) g_seen[j.kind][(size_t)j.ordinal - 1].e.read = false;
+    GLOGW("radar mask census (0.5.6): %s candidate %d of %d (%ux%u, bound %llu times): NOT READ BACK (%s): the census is incomplete", kTexName[j.kind < 0 ? 0 : j.kind],
+          j.ordinal, j.kind >= 0 ? g_total[j.kind] : 0, j.desc.Width, j.desc.Height, (unsigned long long)j.binds, why);
+    ReleaseItem(j);
 }
 
-// Pick each kind's view: bound in ALL of its windows and in NONE of the others (another kind's or an empty one).
-void Evaluate(std::vector<swap::ProbeCand>& cands, const std::vector<int>& windows, uint32_t overflow) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    bool anyFound = false;
-    for (int k = 0; k < 2; ++k) {
-        KindStatus& ks = g_status.k[k];
-        if (!ks.probed) continue;
-        uint32_t mine = 0, others = 0;
-        for (size_t i = 0; i < windows.size() && i < 32; ++i) (windows[i] == k ? mine : others) |= 1u << i;
-        int sized = 0, winners = 0, everywhere = 0;
-        swap::ProbeCand* win = nullptr;
-        uint32_t bestHits = 0;
-        for (swap::ProbeCand& c : cands) {
-            if (c.w != ks.w || c.h != ks.h) continue;
-            ++sized;
-            const uint32_t hits = (uint32_t)__builtin_popcount(c.seen & mine);
-            if (hits > bestHits) bestHits = hits;
-            if ((c.seen & mine) == mine && (c.seen & others) == 0) { ++winners; win = &c; }
-            if ((c.seen & (mine | others)) == (mine | others)) ++everywhere;
-        }
-        char b[420];
-        if (!mine) {
-            // no window of its own: nothing can prove a view is this mask (every candidate would "match" an empty window set)
-            ks.why = "no window was spent on it";
-            continue;
-        }
-        if (winners == 1) std::snprintf(b, sizeof(b), "found: the one %ux%u view bound in all %d of its windows and in none of the other %d (%d views of that size seen)",
-                                             ks.w, ks.h, __builtin_popcount(mine), __builtin_popcount(others), sized);
-        else if (winners > 1) std::snprintf(b, sizeof(b), "%d views of %ux%u matched its windows; not guessing which is the mask", winners, ks.w, ks.h);
-        else std::snprintf(b, sizeof(b), "no %ux%u view was bound in exactly its windows (%d of that size seen, the best in %u of %d, %d bound in EVERY window: "
-                           "does the game bind it with the radar hidden, or did DRAW_SPRITE draw nothing?)%s",
-                           ks.w, ks.h, sized, bestHits, __builtin_popcount(mine), everywhere, overflow ? " (candidate table overflowed)" : "");
-        ks.why = b;
-        if (winners != 1) continue;
-        ks.found = true;
-        anyFound = true;
-        // the readback: a staging copy now, mapped on a later frame
-        Readback j;
-        j.kind = k;
-        j.srv = win->srv;
-        win->srv = nullptr;                                     // the reference moves into the job
+void TakeCensus() {
+    swap::Census c = swap::CensusTake();
+    for (int k = 0; k < 2; ++k) { g_total[k] = 0; g_seen[k].clear(); }
+    for (swap::CensusCand& cand : c.cands) {
+        const int kind = cand.size >= 0 && cand.size < swap::kCensusMaxSizes ? g_kindOfSize[cand.size] : -1;
+        if (kind < 0) { if (cand.srv) cand.srv->Release(); continue; }
+        Item it;
+        it.kind = kind;
+        it.ordinal = ++g_total[kind];
+        it.srv = cand.srv;
+        it.binds = cand.binds;
         ID3D11Resource* res = nullptr;
-        j.srv->GetResource(&res);
+        it.srv->GetResource(&res);
         if (res) {
-            res->QueryInterface(IID_ID3D11Texture2D, (void**)&j.tex);
+            res->QueryInterface(IID_ID3D11Texture2D, (void**)&it.tex);
             res->Release();
         }
-        ID3D11Device* dev = swap::Device();
-        ID3D11DeviceContext* ctx = swap::Context();
-        if (!j.tex || !dev || !ctx) { ks.why += "; its texture could not be read"; ReleaseJob(j); continue; }
-        j.tex->GetDesc(&j.desc);
-        j.fmt = FromDxgi(j.desc.Format);
-        ks.mips = j.desc.MipLevels;
-        ks.fmt = j.fmt;
-        if (j.fmt == TexFmt::Unknown) {
-            std::snprintf(b, sizeof(b), "; its format (DXGI %d) is not one we can rebuild", (int)j.desc.Format);
-            ks.why += b;
-            ReleaseJob(j);
-            continue;
+        if (it.tex) {
+            it.tex->GetDesc(&it.desc);
+            it.fmt = FromDxgi(it.desc.Format);
+        } else {
+            it.desc.Width = cand.w;
+            it.desc.Height = cand.h;
         }
-        D3D11_TEXTURE2D_DESC sd = j.desc;
-        sd.Usage = D3D11_USAGE_STAGING;
-        sd.BindFlags = 0;
-        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        sd.MiscFlags = 0;
-        if (FAILED(dev->CreateTexture2D(&sd, nullptr, &j.staging)) || !j.staging) { ks.why += "; no staging texture"; ReleaseJob(j); continue; }
-        ctx->CopyResource(j.staging, j.tex);
-        j.started = GetTickCount64();
-        g_jobs.push_back(j);
+        g_queue.push_back(it);
     }
-    for (swap::ProbeCand& c : cands)
-        if (c.srv) { c.srv->Release(); c.srv = nullptr; }
-    g_status.why = anyFound ? "probe done" : "probe found no mask";
+    std::lock_guard<std::mutex> lk(g_mu);
+    const double secs = (double)(GetTickCount64() - g_censusStart) / 1000.0;
+    for (int k = 0; k < 2; ++k) {
+        KindStatus& ks = g_status.k[k];
+        if (!g_inRun[k]) continue;
+        g_seen[k].assign((size_t)g_total[k], Seen{});
+        int z = -1;
+        for (int q = 0; q < swap::kCensusMaxSizes; ++q)
+            if (g_kindOfSize[q] == k) z = q;
+        ks.views = g_total[k];
+        ks.read = 0;
+        ks.shapes = 0;
+        ks.notRecorded = (z >= 0 ? c.overflow[z] : 0) + c.lost;   // a bind it could not classify could have been this size
+        ks.otherFormat = z >= 0 ? c.otherFormat[z] : 0;
+        char b[200];
+        std::snprintf(b, sizeof(b), "census: %d view(s) of %ux%u kept, %u not recorded, reading them back", ks.views, ks.w, ks.h, (unsigned)ks.notRecorded);
+        ks.why = b;
+        GLOGI("radar mask census (0.5.6): %s %ux%u: %d view(s) kept in %u frames / %.1f s (%llu binds seen), %u past the cap of %u, %u in formats we cannot "
+              "rebuild (not kept), %u binds not classifiable (any size); reading them back",
+              kTexName[k], ks.w, ks.h, ks.views, g_censusFrames, secs, (unsigned long long)c.binds, z >= 0 ? (unsigned)c.overflow[z] : 0u, (unsigned)c.cap,
+              (unsigned)ks.otherFormat, (unsigned)c.lost);
+    }
+    g_status.lost = c.lost;
+    g_status.censusBinds = c.binds;
+    g_status.censusFrames = g_censusFrames;
+    g_status.why = "census taken, reading back";
 }
 
-// 0 = still waiting for the GPU, 1 = done (job released either way)
-int FinishReadback(Readback& j) {
-    ID3D11Device* dev = swap::Device();
+// 0 = still waiting for the GPU, 1 = done (the item released either way)
+int FinishItem(Item& j) {
     ID3D11DeviceContext* ctx = swap::Context();
-    if (!dev || !ctx) { ReleaseJob(j); return 1; }
+    if (!ctx) { Unread(j, "no device context"); return 1; }
     const int w = (int)j.desc.Width, h = (int)j.desc.Height, levels = (int)j.desc.MipLevels;
     std::vector<std::vector<uint8_t>> stock((size_t)levels);
     for (int l = 0; l < levels; ++l) {
         D3D11_MAPPED_SUBRESOURCE m = {};
         const HRESULT hr = ctx->Map(j.staging, (UINT)l, D3D11_MAP_READ, l == 0 ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0, &m);
         if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-            if (GetTickCount64() - j.started > 4000) { SetKindWhy(j.kind, "the readback stayed busy for 4 s"); ReleaseJob(j); return 1; }
+            if (GetTickCount64() - j.started > kReadbackTimeoutMs) { Unread(j, "the staging copy stayed busy for 4 s"); return 1; }
             return 0;
         }
-        if (FAILED(hr) || !m.pData) { SetKindWhy(j.kind, "mapping the staging copy failed"); ReleaseJob(j); return 1; }
+        if (FAILED(hr) || !m.pData) { Unread(j, "mapping the staging copy failed"); return 1; }
         const int lw = LevelDim(w, l), lh = LevelDim(h, l);
         const size_t rb = RowBytes(j.fmt, lw);
         const int rows = Rows(j.fmt, lh);
@@ -170,27 +199,79 @@ int FinishReadback(Readback& j) {
     StockMask sm;
     if (!DecodeLevel(j.fmt, stock[0].data(), stock[0].size(), w, h, px)) sm.why = "level 0 could not be decoded";
     else sm = AnalyzeStockMask(j.fmt, px, w, h);
+    Seen& s = g_seen[j.kind][(size_t)j.ordinal - 1];
+    s.e.hash = hash;
+    s.e.read = true;
+    s.e.shape = sm.ok;
+    s.desc = j.desc;
+    s.fmt = j.fmt;
+    if (sm.ok) { s.srv = j.srv; j.srv = nullptr; }          // kept for the pick
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        g_status.k[j.kind].stockHash = hash;
+        KindStatus& ks = g_status.k[j.kind];
+        ++ks.read;
+        if (sm.ok) ++ks.shapes;
     }
-    GLOGI("radar mask (0.5.5): %s read back: %dx%d %s, %d mip(s), stock FNV-1a 64 %016llx; %s: %s", kTexName[j.kind], w, h, TexFmtName(j.fmt), levels,
-          (unsigned long long)hash, sm.ok ? "looks like a mask" : "NOT a mask, left alone", sm.why.c_str());
-    if (!sm.ok) { SetKindWhy(j.kind, "the found view does not look like a mask: " + sm.why); ReleaseJob(j); return 1; }
+    if (g_verbose || sm.ok)
+        GLOGI("radar mask census (0.5.6): %s candidate %d of %d: %dx%d %s %d mip(s), bound %llu times, stock FNV-1a 64 %016llx: %s: %s", kTexName[j.kind], j.ordinal,
+              g_total[j.kind], w, h, TexFmtName(j.fmt), levels, (unsigned long long)j.binds, (unsigned long long)hash, sm.ok ? "LOOKS LIKE A MASK" : "not a mask",
+              sm.why.c_str());
+    s.sm = std::move(sm);
+    ReleaseItem(j);
+    return 1;
+}
 
-    // our circle, the same chain
+void Pump() {
+    ID3D11Device* dev = swap::Device();
+    ID3D11DeviceContext* ctx = swap::Context();
+    int starts = 0;
+    while ((int)g_flight.size() < kMaxInFlight && starts < kStartsPerFrame && !g_queue.empty()) {
+        Item it = g_queue.front();
+        g_queue.pop_front();
+        if (!it.tex) { Unread(it, "its texture could not be reached"); continue; }
+        if (it.fmt == TexFmt::Unknown) { Unread(it, "a format we cannot read"); continue; }
+        if (!dev || !ctx) { Unread(it, "no device"); continue; }
+        D3D11_TEXTURE2D_DESC sd = it.desc;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        if (FAILED(dev->CreateTexture2D(&sd, nullptr, &it.staging)) || !it.staging) { Unread(it, "no staging texture"); continue; }
+        ctx->CopyResource(it.staging, it.tex);
+        it.started = GetTickCount64();
+        g_flight.push_back(it);
+        ++starts;
+    }
+    int analysed = 0;
+    for (size_t i = 0; i < g_flight.size() && analysed < kAnalysesPerFrame;) {
+        if (FinishItem(g_flight[i]) == 0) { ++i; continue; }
+        ++analysed;
+        g_flight.erase(g_flight.begin() + (std::ptrdiff_t)i);
+    }
+}
+
+// Our circle for the chosen stock view: same size / format / mips / view description, registered with the swap (inactive unless SetActive).
+void Replace(int kind, Seen& s) {
+    ID3D11Device* dev = swap::Device();
+    const int w = (int)s.desc.Width, h = (int)s.desc.Height, levels = (int)s.desc.MipLevels;
+    auto fail = [&](const std::string& why) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_status.k[kind].why += "; NOT replaced: " + why;
+        GLOGW("radar mask census (0.5.6): %s NOT replaced: %s", kTexName[kind], why.c_str());
+    };
+    if (!dev) { fail("no device"); return; }
     std::vector<std::vector<Rgba>> mips;
-    BuildRoundMask(w, h, levels, sm.inside, MaskOutside(sm), mips);
+    BuildRoundMask(w, h, levels, s.sm.inside, MaskOutside(s.sm), mips);
     std::vector<std::vector<uint8_t>> enc((size_t)levels);
     std::vector<D3D11_SUBRESOURCE_DATA> sd((size_t)levels);
     for (int l = 0; l < levels; ++l) {
         const int lw = LevelDim(w, l), lh = LevelDim(h, l);
-        if (!EncodeLevel(j.fmt, mips[(size_t)l], lw, lh, enc[(size_t)l])) { SetKindWhy(j.kind, "encoding our mask failed"); ReleaseJob(j); return 1; }
+        if (!EncodeLevel(s.fmt, mips[(size_t)l], lw, lh, enc[(size_t)l])) { fail("encoding our mask failed"); return; }
         sd[(size_t)l].pSysMem = enc[(size_t)l].data();
-        sd[(size_t)l].SysMemPitch = (UINT)RowBytes(j.fmt, lw);
+        sd[(size_t)l].SysMemPitch = (UINT)RowBytes(s.fmt, lw);
         sd[(size_t)l].SysMemSlicePitch = 0;
     }
-    D3D11_TEXTURE2D_DESC rd = j.desc;
+    D3D11_TEXTURE2D_DESC rd = s.desc;
     rd.Usage = D3D11_USAGE_IMMUTABLE;
     rd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     rd.CPUAccessFlags = 0;
@@ -198,82 +279,147 @@ int FinishReadback(Readback& j) {
     ID3D11Texture2D* tex = nullptr;
     HRESULT hr = dev->CreateTexture2D(&rd, sd.data(), &tex);
     if (FAILED(hr) || !tex) {
-        char b[120];
+        char b[80];
         std::snprintf(b, sizeof(b), "CreateTexture2D for our mask failed (0x%08lx)", (unsigned long)hr);
-        SetKindWhy(j.kind, b);
-        ReleaseJob(j);
-        return 1;
+        fail(b);
+        return;
     }
     D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
-    j.srv->GetDesc(&vd);
+    s.srv->GetDesc(&vd);
     ID3D11ShaderResourceView* ours = nullptr;
     hr = dev->CreateShaderResourceView(tex, &vd, &ours);
     tex->Release();                                             // the view keeps the texture alive
-    if (FAILED(hr) || !ours) { SetKindWhy(j.kind, "CreateShaderResourceView for our mask failed"); ReleaseJob(j); return 1; }
-    const int handle = swap::Replace(j.srv, ours, g_active.load());
+    if (FAILED(hr) || !ours) { fail("CreateShaderResourceView for our mask failed"); return; }
+    const int handle = swap::Replace(s.srv, ours, g_active.load());
     ours->Release();                                            // swap holds its own reference
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        KindStatus& ks = g_status.k[j.kind];
-        ks.handle = handle;
-        ks.replaced = handle >= 0;
-        char b[400];
-        std::snprintf(b, sizeof(b), "%s: %dx%d %s %d mip(s) (stock centre value %d, corners %d) -> our circle (inside = the stock centre texel, outside black, "
-                      "a %.0f %% ramp inside the edge)%s",
-                      handle >= 0 ? "REPLACED" : "the swap refused it", w, h, TexFmtName(j.fmt), levels, sm.insideValue, sm.outsideValue, (double)(kFeather * 100.0f),
-                      handle >= 0 ? "" : " (already replaced, or the table is full)");
-        ks.why = b;
-        g_status.generation = swap::Generation();
+    if (handle < 0) { fail("the swap refused it (already replaced, or its table is full)"); return; }
+    std::lock_guard<std::mutex> lk(g_mu);
+    KindStatus& ks = g_status.k[kind];
+    ks.handle = handle;
+    ks.replaced = true;
+    char b[240];
+    std::snprintf(b, sizeof(b), "; REPLACED: %dx%d %s %d mip(s) (stock centre value %d, corners %d) -> our circle (registered; handed out only with the grown map)",
+                  w, h, TexFmtName(s.fmt), levels, s.sm.insideValue, s.sm.outsideValue);
+    ks.why += b;
+    g_status.generation = swap::Generation();
+    GLOGI("radar mask census (0.5.6): %s replaced by our circle (stock FNV-1a 64 %016llx; registered inactive: the bind hook hands it out while the engine's gate "
+          "has the map grown)", kTexName[kind], (unsigned long long)ks.stockHash);
+}
+
+void Decide() {
+    for (int k = 0; k < 2; ++k) {
+        std::vector<uint64_t> pins;
+        bool probed = false;
+        uint32_t notRecorded = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            probed = g_inRun[k];
+            notRecorded = g_status.k[k].notRecorded;
+            pins = g_pins[k].empty() ? kPinned[k] : g_pins[k];
+        }
+        if (!probed) continue;
+        std::vector<CensusEntry> entries;
+        entries.reserve(g_seen[k].size());
+        for (const Seen& s : g_seen[k]) entries.push_back(s.e);
+        const CensusPick p = PickMask(entries, notRecorded, pins.empty() ? nullptr : pins.data(), (int)pins.size());
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            KindStatus& ks = g_status.k[k];
+            ks.picked = true;
+            ks.verdict = p.verdict;
+            ks.views = p.views;
+            ks.read = p.read;
+            ks.shapes = p.shapes;
+            ks.found = p.Ok();
+            ks.why = PickText(p);
+            if (p.Ok()) {
+                const Seen& s = g_seen[k][(size_t)p.index];
+                ks.stockHash = s.e.hash;
+                ks.mips = s.desc.MipLevels;
+                ks.fmt = s.fmt;
+                char b[120];
+                std::snprintf(b, sizeof(b), " -> candidate %d (stock FNV-1a 64 %016llx)", p.index + 1, (unsigned long long)s.e.hash);
+                ks.why += b;
+            }
+        }
+        if (p.Ok()) GLOGI("radar mask census (0.5.6): %s: %s -> candidate %d", kTexName[k], PickText(p).c_str(), p.index + 1);
+        else GLOGW("radar mask census (0.5.6): %s: %s: nothing replaced", kTexName[k], PickText(p).c_str());
+        if (p.Ok()) Replace(k, g_seen[k][(size_t)p.index]);
     }
-    GLOGI("radar mask (0.5.5): %s %s", kTexName[j.kind],
-          handle >= 0 ? "replaced by our circle (registered; the bind hook hands it out while the engine's gate has the map grown)" : "NOT replaced (swap refused)");
-    ReleaseJob(j);
-    return 1;
+    DropAll();
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_status.why = "census decided";
 }
 
 void RenderTickImpl() {
-    // the generation first: after a teardown (hooks gone) the jobs' references to the old device's views are dropped at once
+    // the generation first: after a teardown (hooks gone) every reference to the old device's views is dropped at once
     const uint32_t gen = swap::Generation();
     if (gen != g_gen) {
-        // the hooks were (re)installed: every handle from before is dead
-        for (Readback& j : g_jobs) ReleaseJob(j);
-        g_jobs.clear();
+        DropAll();
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_gen != 0) {
             for (KindStatus& ks : g_status.k) { ks.replaced = false; ks.handle = -1; ks.found = false; }
-            g_status.why = "the D3D11 device changed: probe again";
-            g_phase.store((int)Phase::Idle);
+            // a census in progress belonged to the old device (Teardown dropped its views): it failed; a request not armed yet stands
+            const Phase p = (Phase)g_phase.load();
+            if (p == Phase::Recording || p == Phase::Reading) {
+                g_status.why = "the D3D11 device changed during the census";
+                g_phase.store((int)Phase::Failed);
+            } else if (p != Phase::Requested) {
+                g_status.why = "the D3D11 device changed: census again";
+            }
         }
         g_gen = gen;
         g_status.generation = gen;
     }
     if (!swap::Installed()) return;
+    if (g_cancel.exchange(false)) {
+        DropAll();
+        swap::Census c = swap::CensusTake();                     // an armed census: release what it holds
+        for (swap::CensusCand& cand : c.cands)
+            if (cand.srv) cand.srv->Release();
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_status.why = "cancelled";
+        g_phase.store((int)Phase::Idle);
+        return;
+    }
     const Phase p = (Phase)g_phase.load();
-    if (p == Phase::ArmRequested) {
-        swap::ProbeSize sizes[2];
+    if (p == Phase::Requested) {
+        swap::CensusSize sizes[2];
         int n = 0;
         {
             std::lock_guard<std::mutex> lk(g_mu);
-            for (int k = 0; k < 2; ++k)
-                if (g_reqSizes[k].w && g_reqSizes[k].h) sizes[n++] = g_reqSizes[k];
+            for (int& z : g_kindOfSize) z = -1;
+            for (int k = 0; k < 2; ++k) {
+                g_inRun[k] = g_status.k[k].probed && !g_status.k[k].replaced && g_reqSize[k][0] && g_reqSize[k][1];
+                if (g_inRun[k]) {
+                    g_kindOfSize[n] = k;
+                    sizes[n++] = { g_reqSize[k][0], g_reqSize[k][1] };
+                }
+            }
+            g_verbose = g_reqVerbose;
         }
-        const bool ok = n > 0 && swap::ProbeArm(sizes, n);
-        g_phase.store((int)(ok ? Phase::Armed : Phase::Failed));
-        if (!ok) { std::lock_guard<std::mutex> lk(g_mu); g_status.why = "the probe recorder could not be armed"; }
-    } else if (p == Phase::FinishRequested) {
-        uint32_t overflow = 0;
-        std::vector<swap::ProbeCand> cands = swap::ProbeTake(&overflow);
-        std::vector<int> windows;
-        {
+        const bool ok = n > 0 && swap::CensusArm(sizes, n, kFormats, (int)(sizeof(kFormats) / sizeof(kFormats[0])));
+        g_censusStart = GetTickCount64();
+        g_censusFrames = 0;
+        g_phase.store((int)(ok ? Phase::Recording : Phase::Failed));
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_status.why = ok ? "census recording" : "the census could not be armed";
+    } else if (p == Phase::Recording) {
+        ++g_censusFrames;
+        if (!swap::CensusArmed()) {                              // torn down under us (Teardown clears it): nothing to read
             std::lock_guard<std::mutex> lk(g_mu);
-            windows = g_reqWindows;
+            g_status.why = "the census was disarmed by a teardown";
+            g_phase.store((int)Phase::Failed);
+        } else if (g_censusFrames >= kCensusMinFrames && GetTickCount64() - g_censusStart >= kCensusMinMs) {
+            TakeCensus();
+            g_phase.store((int)Phase::Reading);
         }
-        Evaluate(cands, windows, overflow);
-        g_phase.store((int)Phase::Done);
-    }
-    for (size_t i = 0; i < g_jobs.size();) {
-        if (FinishReadback(g_jobs[i]) == 0) { ++i; continue; }
-        g_jobs.erase(g_jobs.begin() + (std::ptrdiff_t)i);
+    } else if (p == Phase::Reading) {
+        Pump();
+        if (g_queue.empty() && g_flight.empty()) {
+            Decide();
+            g_phase.store((int)Phase::Done);
+        }
     }
 }
 
@@ -282,9 +428,9 @@ void RenderTickImpl() {
 const char* PhaseName(Phase p) {
     switch (p) {
     case Phase::Idle: return "idle";
-    case Phase::ArmRequested: return "arming";
-    case Phase::Armed: return "probing";
-    case Phase::FinishRequested: return "evaluating";
+    case Phase::Requested: return "requested";
+    case Phase::Recording: return "recording";
+    case Phase::Reading: return "reading back";
     case Phase::Done: return "done";
     case Phase::Failed: return "failed";
     }
@@ -306,40 +452,30 @@ int SetActive(bool on) {
     return changed;
 }
 
-bool RequestArm(uint32_t wSmall, uint32_t hSmall, uint32_t wBig, uint32_t hBig) {
+bool RequestCensus(uint32_t wSmall, uint32_t hSmall, uint32_t wBig, uint32_t hBig, bool verbose) {
     const Phase p = (Phase)g_phase.load();
     if (p != Phase::Idle && p != Phase::Done && p != Phase::Failed) return false;
     std::lock_guard<std::mutex> lk(g_mu);
-    g_reqSizes[0] = { wSmall, hSmall };
-    g_reqSizes[1] = { wBig, hBig };
+    g_reqSize[0][0] = wSmall; g_reqSize[0][1] = hSmall;
+    g_reqSize[1][0] = wBig;   g_reqSize[1][1] = hBig;
+    g_reqVerbose = verbose;
+    int probed = 0;
     for (int k = 0; k < 2; ++k) {
         KindStatus& ks = g_status.k[k];
         if (ks.replaced && swap::Generation() == g_status.generation) continue;   // a live replacement stays
         ks = KindStatus{};
-        ks.probed = g_reqSizes[k].w && g_reqSizes[k].h;
-        ks.w = g_reqSizes[k].w;
-        ks.h = g_reqSizes[k].h;
+        ks.probed = g_reqSize[k][0] && g_reqSize[k][1];
+        ks.w = g_reqSize[k][0];
+        ks.h = g_reqSize[k][1];
+        if (ks.probed) ++probed;
     }
-    g_status.why = "probe requested";
-    g_phase.store((int)Phase::ArmRequested);
+    if (!probed) return false;
+    g_status.why = "census requested";
+    g_phase.store((int)Phase::Requested);
     return true;
 }
 
-bool RequestFinish(const int* kindOfWindow, int n) {
-    if ((Phase)g_phase.load() != Phase::Armed || !kindOfWindow || n <= 0 || n > 32) return false;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        g_reqWindows.assign(kindOfWindow, kindOfWindow + n);
-    }
-    swap::ProbeSetWindow(0);
-    g_phase.store((int)Phase::FinishRequested);
-    return true;
-}
-
-void Reset() {
-    swap::ProbeSetWindow(0);
-    g_phase.store((int)Phase::Idle);
-}
+void Cancel() { g_cancel.store(true); }
 
 Status GetStatus() {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -364,6 +500,11 @@ void Poll(void* swapChain) {
 
 namespace testing {
 void RenderTick() { RenderTickImpl(); }
+void SetPins(int kind, const std::vector<uint64_t>& hashes) {
+    if (kind < 0 || kind > 1) return;
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_pins[kind] = hashes;
+}
 }
 
 }  // namespace gage::game::radarmask

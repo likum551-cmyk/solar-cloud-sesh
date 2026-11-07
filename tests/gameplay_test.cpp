@@ -3192,7 +3192,7 @@ int main()
                        + outfitt::kChecks     // + 0.5.4 outfit items 9
                        + pedview_t::kChecks   // + 0.5.4 inventory ped view 7
                        + invworld::kChecks    // + 0.5.4 the inventory world 14
-                       + ringround_t::kChecks;   // + 0.5.5 the ring map round mask 15
+                       + ringround_t::kChecks;   // + 0.5.5 the ring map round mask 15, + 0.5.6 its census pick and mask shape 4
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

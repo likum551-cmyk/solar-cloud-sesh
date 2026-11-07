@@ -88,14 +88,26 @@ namespace gage::game::brand {
             bool active = false;
         };
         SwapCounters Counters(int handle);   // any thread
-        // The probe recorder (render thread, except ProbeSetWindow): while armed, every 2D view of one of `sizes` that the game binds is kept
-        // with the set of windows (1..32) it was bound in, counting only render frames 3+ of a window.
-        struct ProbeSize { uint32_t w, h; };
-        bool ProbeArm(const ProbeSize* sizes, int n);          // clears the last probe; false = hooks not installed / bad sizes
-        void ProbeSetWindow(uint32_t window);                  // any thread (the script tick): 0 = none, 1..32
-        void ProbeFrame();                                     // render thread, once per Present (Poll calls it)
-        struct ProbeCand { ID3D11ShaderResourceView* srv = nullptr; uint32_t w = 0, h = 0; uint32_t seen = 0; uint64_t binds = 0; };
-        std::vector<ProbeCand> ProbeTake(uint32_t* overflow = nullptr);   // disarm; each srv is AddRef'd for the caller
+        // 0.5.6 census (render thread): while armed, every DISTINCT 2D view (ArraySize 1, not a cube, not multisampled) of one of `sizes` in one of
+        // `formats` (DXGI_FORMAT values) that the game binds is kept, AddRef'd, with its bind count (no windows, no timing: the client tells the
+        // views apart by content). Bounded, and never silently: a view past the cap is counted in overflow[size], a view of the size in another
+        // format in otherFormat[size], and a bind the census could not classify at all (its dedupe table full, an entry claimed but never filled)
+        // in lost (any size: the client must treat it as a possibly missed view of every size).
+        constexpr int kCensusMaxSizes = 4, kCensusMaxFormats = 24;
+        constexpr uint32_t kCensusDefaultCap = 512, kCensusMaxCap = 1024;
+        struct CensusSize { uint32_t w, h; };
+        bool CensusArm(const CensusSize* sizes, int n, const uint32_t* formats, int nFormats);   // clears the last census; false = not installed / bad args
+        bool CensusArmed();
+        struct CensusCand { ID3D11ShaderResourceView* srv = nullptr; uint32_t w = 0, h = 0, format = 0, mips = 0; int size = -1; uint64_t binds = 0; };
+        struct Census {
+            std::vector<CensusCand> cands;               // each srv AddRef'd for the caller, in first-bind order
+            uint32_t overflow[kCensusMaxSizes] = {};     // views of that size (asked format) past the cap: seen, not kept
+            uint32_t otherFormat[kCensusMaxSizes] = {};  // views of that size in a format not asked for: not kept
+            uint32_t lost = 0;                           // binds of views it could not classify: ANY size
+            uint32_t cap = 0;
+            uint64_t binds = 0;                          // views bound while armed (every slot of every PSSetShaderResources call)
+        };
+        Census CensusTake();                             // disarm and hand over (an unarmed census returns an empty one)
     }
 
     struct Stats {
@@ -133,6 +145,7 @@ namespace gage::game::brand {
         // queued). Default true. PendingCount = views queued for a tee readback.
         void SetBrandOn(bool on);
         size_t PendingCount();
+        void SetCensusCap(uint32_t cap);                                        // 0.5.6: 0 = swap::kCensusDefaultCap (Reset restores it)
         void Pump(ID3D11DeviceContext* immediateCtx);                           // the per-frame work of Poll()
     }
 
