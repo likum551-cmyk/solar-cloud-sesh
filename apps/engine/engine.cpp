@@ -195,6 +195,11 @@ namespace {
     // unset = the shipped 6 s. Both re-read at every Welcome. Blend only (the anchor and straight configs never had a grace).
     std::atomic<bool> g_locoBlendGrace{true};
     std::atomic<int>  g_locoPlacedMs{-1};     // -1 = unset (shipped); 0 = the round-4 30 s; N > 0 = N ms
+    // 0.5.7: loco_swing_walk (default on) = a peer's upper-body / secondary melee clip (SwingVariant Upper, UpperHard, Looped, once seen playing)
+    // no longer holds the gait task: the go-straight / stand-still issue follows the pose through the swing and its 700 ms hold (repairs stay
+    // held, a full-body / plain clip or the melee task still holds everything). Live 0.5.5 08:00:51: a standing attacker punched and walked off,
+    // the puppet kept its stand-still task, IS_PED_STILL read true on 179 of 179 asks and our velocity writes slid it 1.7 m. 0 = the 0.5.6 hold.
+    std::atomic<bool> g_locoSwingWalk{true};
     sync::LevelWitness g_locoDegrade;     // script tick only
     std::atomic<bool> g_locoDegradeReset{false};   // OnWelcome (join worker) asks, the next DrivePeer clears
     sync::LocoConfig LocoCfg()
@@ -215,6 +220,7 @@ namespace {
         if (!g_locoRepair.load())
             c.maxRepairs = 0;
         c.blendGaitClip = g_locoGaitClip.load();
+        c.swingWalkThrough = g_locoSwingWalk.load();
         return c;
     }
 
@@ -260,6 +266,9 @@ namespace {
         int recipe = 0;
         int repairsDone = 0;
         sync::GaitDiag gaitDiag;
+        // 0.5.7: the still-slide read-backs by cause and the clip read after a walk-through issue ("engine: on-foot swing walk (0.5.7)")
+        sync::SwingWalkDiag swingWalkDiag;
+        double swingWalkClipAtMs = -1.0;   // NowMs() of a walk-through issue whose clip read is still due (-1 = none)
         uint32_t verdictLogged = 0;
         bool capLogged = false;
 
@@ -493,6 +502,11 @@ namespace {
         uint32_t driveResetSeq = 0, appliedDriveResetSeq = 0;   // Sync D: VehNet::driveResetSeq and the one the tick has handled
         uint32_t syncDPersistentSeen = 0, syncDUnderFloorSeen = 0, syncDBlendsSeen = 0, syncDGracesSeen = 0;   // drive stats at the last "(D)" line
         sync::DriveErrWindow errWin;  // Sync D: this copy's drive error against the sender's, per 10 s (the "vehicle drive (D)" line)
+        // 0.5.7: the copy at rest against our commands (the "vehicle rest (0.5.7)" line) and the commands of the previous drive frame
+        sync::VehRestDiag restDiag;
+        bool restCmdYaw = false, restCmdVel = false;
+        double restYawRate = 0, restLastMs = 0;
+        sync::DriveVec restVel;
         sync::shake::CopyMeter shake; // 0.4.22: this copy's high-frequency error and error flips against its owner's stream (the "vehicle shake (0.4.22)" line)
         uint32_t angWrites = 0;       // 0.4.22: angular commands written to this copy (every kShakeAngCheckEvery-th is read back)
         int32_t handle = 0;           // the local entity (0 = not spawned)
@@ -2115,6 +2129,10 @@ namespace {
         GLOGI("engine: on-foot facing (0.4.29): loco_face=%s", g_locoFace.load()
                   ? "on (a walking Blend puppet's heading is written every frame toward the sender's; the 'R5: ... heading error' numbers are the proof)"
                   : "OFF (SET_PED_DESIRED_HEADING with the ped's own heading plus a step, as 0.4.28)");
+        g_locoSwingWalk.store(reg::Get(L"loco_swing_walk") != L"0");
+        GLOGI("engine: on-foot swing walk (0.5.7): loco_swing_walk=%s", g_locoSwingWalk.load()
+                  ? "on (an upper-body / secondary melee clip seen playing no longer holds the gait task: the puppet walks off through the swing; full-body / plain clips and repairs stay held)"
+                  : "OFF (every melee swing holds the gait task for the swing + 700 ms, as 0.5.6)");
         {
             // R5: the grace window after a task-changing Reset and the shorter Placed hold (Blend only)
             g_locoBlendGrace.store(reg::Get(L"loco_blend_grace") != L"0");
@@ -6547,6 +6565,11 @@ namespace {
             pe.swingProbe.Begin(nowMs, idx, g_meleeFollowWanted.load(std::memory_order_relaxed), att.durationMs,
                                 var == sync::SwingVariant::MeleeTask ? kSwingMs + 200.0 : att.stopAfterMs > 0 ? att.stopAfterMs + 60.0 : -1.0);
             pe.swingResetPending = sync::SwingVariantReplacesGait(var);   // a whole-body clip replaced the gait task: the controller re-issues it when the swing is over
+            if (pe.swingWalkClipAtMs >= 0.0)
+            {
+                pe.swingWalkClipAtMs = -1.0;
+                pe.swingWalkDiag.ClipRead(-1);         // 0.5.7: a new swing began before the previous clip read was due
+            }
             if (att.stopAfterMs > 0 && var != sync::SwingVariant::MeleeTask)
             {
                 pe.loopStop.Arm(nowMs, att.stopAfterMs);   // R5: a looped clip is ended by us (PeerSwingService)
@@ -6735,6 +6758,11 @@ namespace {
             pe.swingResetPending = false;
             pe.loco.Reset();                           // R4 T3: the whole-body clip took the gait task: re-issue it now that the swing is over
         }
+        if (!swingActive && pe.swingWalkClipAtMs >= 0.0)
+        {
+            pe.swingWalkClipAtMs = -1.0;
+            pe.swingWalkDiag.ClipRead(-1);             // 0.5.7: the swing ended before the clip read after a walk-through issue was due
+        }
         if (!swingActive)
             return;
         SwingSet& set = pe.swingProbeArmed ? g_swingSetArmed : g_swingSetUnarmed;
@@ -6742,6 +6770,11 @@ namespace {
         SwingClip& c = set.list[ci];
         const bool viaMelee = pe.swingVariant == sync::SwingVariant::MeleeTask;
         const int playing = viaMelee ? g_world->IsPedInMeleeCombat(pe.ped) : g_world->IsEntityPlayingAnim(pe.ped, c.dict, c.clip);
+        if (pe.swingWalkClipAtMs >= 0.0 && nowMs - pe.swingWalkClipAtMs >= 100.0)
+        {
+            pe.swingWalkClipAtMs = -1.0;
+            pe.swingWalkDiag.ClipRead(viaMelee ? -1 : playing);   // 0.5.7: the clip 100+ ms after our gait task went out under it
+        }
         float animCur = -1.0f, animTotal = -1.0f;
         if (!viaMelee && playing == 1)
             g_world->GetEntityAnimTimes(pe.ped, c.dict, c.clip, animCur, animTotal);   // neutral (-1) until GET_ENTITY_ANIM_CURRENT_TIME / _TOTAL_TIME exist
@@ -8275,6 +8308,26 @@ namespace {
         return line;
     }
 
+    // 0.5.7: the per-puppet swing-walk line (every 10 s with a moving gait asked or a walk-through issue): metres the puppet moved while
+    // IS_PED_STILL read true with a moving gait commanded, by cause (a swing hold the walk-through did not apply to = the 0.5.6 slide; one it
+    // applied to; no swing), and what IS_ENTITY_PLAYING_ANIM said 100+ ms after a walk-through gait task went out under the clip.
+    std::string SwingWalkLine(int id, const Peer& pe)
+    {
+        const sync::SwingWalkSummary& s = pe.swingWalkDiag.Summary();
+        if (!s.Any())
+            return std::string();
+        using C = sync::SwingWalkSummary;
+        char buf[720];
+        std::snprintf(buf, sizeof(buf),
+                      "engine: on-foot swing walk (0.5.7) id=%d (%s): loco_swing_walk=%s; moved while IS_PED_STILL read true with a moving gait commanded: "
+                      "in a held swing %.2f m (%u of %u asks), in a walk-through swing %.2f m (%u of %u asks), no swing %.2f m (%u of %u asks); "
+                      "walk-through task issues %u; the swing clip 100+ ms after such an issue: still playing %u, NOT playing %u, unread %u",
+                      id, pe.name.c_str(), g_locoSwingWalk.load() ? "on" : "OFF", s.slideM[C::Held], s.slideFrames[C::Held], s.askedFrames[C::Held],
+                      s.slideM[C::Through], s.slideFrames[C::Through], s.askedFrames[C::Through], s.slideM[C::Other], s.slideFrames[C::Other],
+                      s.askedFrames[C::Other], s.walkIssued, s.clipSurvived, s.clipCut, s.clipUnread);
+        return buf;
+    }
+
     // T2: a puppet's controller moved to another level of the degradation ladder: say so (the numbers that decided it are in the
     // line), count it, and tell the witness (two puppets finding the same failure make it machine-wide).
     void NoteLocoLevel(Peer& pe, int id, const sync::LocoOutput& o, const sync::LocoInput& in, double nowMs)
@@ -8842,6 +8895,11 @@ namespace {
         }
         in.repairsDone = pe.repairsDone;                   // R3 T2
         in.swingActive = pe.swingProbe.Active();           // R4 T1: no movement task / repair while the swing's clip is being read back (task 3's interface)
+        // 0.5.7 loco_swing_walk: the newest swing's clip runs on the secondary slot (upper body; not a full-body / plain clip, not the melee
+        // task) AND the read-back has seen it playing (until then the hold stays, so SwingRetryDue's "a task replaced it" logic is untouched).
+        // First() keeps its sighting until the next swing's Begin, so this also covers the controller's 700 ms hold after the probe.
+        in.swingSecondary = pe.swingProbe.First().taken && pe.swingVariant != sync::SwingVariant::MeleeTask &&
+                            !sync::SwingVariantReplacesGait(pe.swingVariant);
         // T2: a failure two puppets' controllers found is imposed on this one too (the game is one game), until its timer runs out.
         if (g_locoDegradeReset.exchange(false))
             g_locoDegrade.Reset();
@@ -8889,6 +8947,19 @@ namespace {
                 gf.pedStill = g_world->IsPedStill(pe.ped) ? 1 : 0;
             }
             pe.gaitDiag.Observe(gf);
+            // 0.5.7: the same IS_PED_STILL read and position, split by the swing cause of the frame
+            sync::SwingWalkFrame sw;
+            sw.dtMs = dtMs;
+            sw.commandedMoving = gf.commanded != sync::Gait::Still;
+            sw.pedStill = gf.pedStill;
+            sw.pedPos = in.pedPos;
+            sw.snapped = o.snap || in.teleported;
+            sw.swingWindow = o.swingWindow;
+            sw.swingThrough = o.swingThrough;
+            sw.walkIssued = o.swingWalk;
+            pe.swingWalkDiag.Observe(sw);
+            if (o.swingWalk && pe.swingProbe.Active() && pe.swingWalkClipAtMs < 0.0)
+                pe.swingWalkClipAtMs = nowMs;               // the swing tick reads the clip >= 100 ms later: did our gait task cut it?
         }
         if (o.repair != sync::LocoRepair::None)
             ApplyLocoRepair(pe, id, o, in, nowMs);         // R3 T2 (after the diagnostic: the frame is judged on the ped it was read from)
@@ -9525,6 +9596,7 @@ namespace {
                         pe.pedModel = model;
                         pe.spawnSinceMs = 0;
                         pe.loco.ResetForNewPed();       // a new ped: snap, re-issue, fresh jump / ragdoll edges
+                        pe.swingWalkDiag.Break();       // 0.5.7: no position delta across a respawn
                         pe.weaponShown = 0;             // a fresh ped holds nothing yet
                         pe.aimTask = false;
                         pe.haveLastTarget = false;
@@ -9590,21 +9662,27 @@ namespace {
                             // Sync pipeline review: the rhythm of this player's stored snapshots and what the smoother did with the rest.
                             const sync::SmootherStats& ps = pe.syncStats;
                             const sync::SmootherStats& pv = pe.pipeSeen;
+                            // (a new smoother restarts its counters below the last ones seen: 0.5.5 logged "repeats 4294965501"; count from the restart)
+                            const auto since = [](uint32_t now, uint32_t seen) { return now >= seen ? now - seen : now; };
                             char pl[440];
                             std::snprintf(pl, sizeof(pl),
                                           "engine: pipe id=%d (%s): %u snapshots stored in 10 s (arrival gap ms mean %.0f p95 %.0f max %.0f), repeats %u identical + %u earlier-placed, "
                                           "%u stale, %u denoised; delay %.0f ms (class %d, extra %.0f ms, %u class changes); %u extrapolating frames (longest %.0f ms), "
                                           "%u holding, %u snaps, %u bridge resets, %u resyncs",
                                           it->first, pe.name.c_str(), pe.pipeArrivals.n + 1, pe.pipeArrivals.MeanMs(), pe.pipeArrivals.PercentileMs(0.95),
-                                          pe.pipeArrivals.maxMs, ps.repeatsIdentical - pv.repeatsIdentical, ps.repeatsEarlier - pv.repeatsEarlier, ps.stale - pv.stale,
-                                          ps.denoised - pv.denoised, pe.syncDelayMs, pe.pipeClass, pe.pipeExtraMs, ps.extraChanges - pv.extraChanges, pe.extrapolated,
-                                          pe.pipeLongestExtrapMs, pe.held, pe.snaps, ps.bridgeResets - pv.bridgeResets, ps.resyncs - pv.resyncs);
+                                          pe.pipeArrivals.maxMs, since(ps.repeatsIdentical, pv.repeatsIdentical), since(ps.repeatsEarlier, pv.repeatsEarlier),
+                                          since(ps.stale, pv.stale), since(ps.denoised, pv.denoised), pe.syncDelayMs, pe.pipeClass, pe.pipeExtraMs,
+                                          since(ps.extraChanges, pv.extraChanges), pe.extrapolated, pe.pipeLongestExtrapMs, pe.held, pe.snaps,
+                                          since(ps.bridgeResets, pv.bridgeResets), since(ps.resyncs, pv.resyncs));
                             report.emplace_back(pl);
                             pe.pipeSeen = ps;
                         }
                         report.emplace_back(LocoLine(it->first, pe));   // W8: why the controller issued tasks, what was last applied
                         report.emplace_back(LocoSlideLine(it->first, pe));   // Sync A: the slide metric
                         report.emplace_back(GaitLine(it->first, pe));        // R3 T2: what the game says the ped does next to the pose
+                        const std::string swl = SwingWalkLine(it->first, pe);   // 0.5.7: the still slide by cause, the clip after a walk-through
+                        if (!swl.empty())
+                            report.emplace_back(swl);
                     }
                     {
                         // R3 T3: one cover line per puppet with cover activity in the last 10 s (the window is taken either way)
@@ -9621,6 +9699,7 @@ namespace {
                     }
                     pe.slide.Reset();
                     pe.gaitDiag.Reset();
+                    pe.swingWalkDiag.ResetCounters();
                     pe.shootingFrames = 0;
                     const sync::LocoStats& ls = pe.loco.Stats();
                     pe.locoGoSeen = ls.goStraight;
@@ -10987,6 +11066,40 @@ namespace {
                                 g_t4.divMax = std::max(g_t4.divMax, (double)o.posErrorM);
                             }
                             v.errWin.Add(o.posErrorM, o.rotErrorDeg, sync::LateralErrorM(s.pos, s.rot, in.localPos), s.mode, o.snap);   // Sync D
+                            {
+                                // 0.5.7: the copy at rest against the commands of the previous frame (read-backs: in.localRot / localPos / localVel)
+                                sync::VehRestDiag::Frame rf;
+                                rf.dtMs = v.restLastMs > 0.0 ? nowMs - v.restLastMs : 0.0;
+                                rf.targetSpeed = std::sqrt((double)s.vel.x * s.vel.x + (double)s.vel.y * s.vel.y + (double)s.vel.z * s.vel.z);
+                                double dyaw = sync::vq::HeadingDeg(s.rot) - sync::vq::HeadingDeg(in.localRot);
+                                while (dyaw > 180.0) dyaw -= 360.0;
+                                while (dyaw <= -180.0) dyaw += 360.0;
+                                rf.yawErrDeg = std::fabs(dyaw);
+                                const sync::DriveVec ut = sync::vq::Rotate(s.rot, sync::DriveVec{ 0.0f, 0.0f, 1.0f });
+                                const sync::DriveVec ul = sync::vq::Rotate(in.localRot, sync::DriveVec{ 0.0f, 0.0f, 1.0f });
+                                const double cosT = std::max(-1.0, std::min(1.0, (double)ut.x * ul.x + (double)ut.y * ul.y + (double)ut.z * ul.z));
+                                rf.tiltErrDeg = std::acos(cosT) * (180.0 / 3.14159265358979323846);
+                                const double ex = (double)s.pos.x - in.localPos.x, ey = (double)s.pos.y - in.localPos.y;
+                                rf.horizErrM = std::sqrt(ex * ex + ey * ey);
+                                rf.vertErrM = std::fabs((double)s.pos.z - in.localPos.z);
+                                rf.headingDeg = sync::vq::HeadingDeg(in.localRot);
+                                rf.haveCmdYaw = v.restCmdYaw;
+                                rf.cmdYawRate = v.restYawRate;
+                                rf.haveCmdVel = v.restCmdVel;
+                                if (v.restCmdVel)
+                                {
+                                    const double dx = (double)in.localVel.x - v.restVel.x, dy = (double)in.localVel.y - v.restVel.y, dz = (double)in.localVel.z - v.restVel.z;
+                                    rf.velDevMs = std::sqrt(dx * dx + dy * dy + dz * dz);
+                                }
+                                rf.snapped = o.snap;
+                                v.restDiag.Add(rf);
+                                v.restLastMs = nowMs;
+                                // what goes out this frame (after the adoption above may have cancelled it): the next frame's reference
+                                v.restCmdYaw = o.setAngularVelocity && !o.setQuaternion && !o.snap;
+                                v.restYawRate = o.angularVelocity.z;
+                                v.restCmdVel = o.setVelocity && !o.snap;
+                                v.restVel = o.velocity;
+                            }
                             if (o.contactOpened)
                             {
                                 if (o.contactOpened == 1)
@@ -14471,6 +14584,18 @@ namespace {
             NetVeh& v = kv.second;
             const sync::VehicleDriveStats& ds = v.drive.Stats();
             const sync::DriveErrWindow::Window w = v.errWin.Take();
+            {
+                // 0.5.7: a copy whose owner is at rest: does it obey the yaw we command? (read-backs only; one line per car with >= 30 rest frames)
+                const sync::VehRestDiag::Window r = v.restDiag.Take();
+                if (r.restFrames >= 30)
+                    GLOGI("engine: vehicle rest (0.5.7) id=%u, last 10 s: %u of %u drive frames with the owner at rest (< %.1f m/s); error yaw mean %.1f / max %.1f deg, "
+                          "tilt mean %.1f / max %.1f deg, horizontal mean %.2f m, vertical mean %.2f m; yaw rate commanded on %u frames (mean |%.2f| rad/s) -> the "
+                          "read-back heading turned at mean |%.2f| rad/s, honoured %.2f (1 obeyed, 0 ignored, < 0 the other way); read-back velocity vs the one "
+                          "written the frame before: mean %.2f m/s, over 1 m/s on %u of %u; steady yaw error over %.0f deg for > %.0f ms: %u episodes, longest %.0f ms",
+                          (unsigned)kv.first, r.restFrames, r.frames, sync::VehRestDiag::kRestSpeed, r.yawMeanDeg, r.yawMaxDeg, r.tiltMeanDeg, r.tiltMaxDeg,
+                          r.horizMeanM, r.vertMeanM, r.cmdFrames, r.cmdMeanRad, r.achievedMeanRad, r.honoured, r.velDevMeanMs, r.velDevOver1, r.velDevN,
+                          sync::VehRestDiag::kSteadyDeg, sync::VehRestDiag::kSteadyMs, r.episodes, r.longestSteadyMs);
+            }
             persistent += ds.persistentSnaps - v.syncDPersistentSeen;
             underFloor += ds.underFloorSnaps - v.syncDUnderFloorSeen;
             blends += ds.blends - v.syncDBlendsSeen;
