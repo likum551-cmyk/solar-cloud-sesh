@@ -143,7 +143,9 @@ else
   while IFS= read -r ref; do
     refs=$((refs + 1))
     [ -f "$DIST$ref" ] || { warn "index.html names $ref, which is not in dist"; missing=$((missing + 1)); }
-  done < <(grep -o -E '"/(assets|media|shots)/[^"?#]+"' "$DIST/index.html" | tr -d '"' | sort -u)
+  # every path token, inside src/href AND inside a srcset list ("/media/a.webp 960w, /media/b.webp 1600w"):
+  # the token ends at a quote, a query, a fragment, a comma or a space
+  done < <(grep -o -E '/(assets|media|shots)/[^"?#, ]+' "$DIST/index.html" | sort -u)
   [ "$refs" -gt 0 ] || fail_check "index.html names no /assets, /media or /shots file: the check would pass on nothing"
   [ "$missing" = 0 ] || fail_check "$missing file(s) named by index.html are missing from dist"
   # the release manifest is served by /update; a copy inside the site would shadow nothing but would mislead
