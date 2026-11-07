@@ -624,7 +624,7 @@ namespace gage::sync::inv {
         Drop,       // src, qty (0 = whole): round 1 discards (no ground yet)
         Bind,       // quick slot di <- the item in src (a reference, nothing moves)
         Unbind,     // quick slot di cleared
-        UseQuick,   // Use on whatever quick slot si resolves to (keys 1..4)
+        UseQuick,   // Use on whatever quick slot si resolves to (keys 1..4, page open or closed); 0.5.6: the slot of the weapon in hand holsters it
     };
     constexpr int kOpKinds = 8;
     struct Op
@@ -872,6 +872,12 @@ namespace gage::sync::inv {
                 return out;
             }
             QuickRef& q = ch.quick[op.si];
+            // 0.5.6: the key of the weapon in hand puts it away (with weapon_keys on GTA's own "1 = unarmed" is held disabled, so this is
+            // how a player holsters without opening the page). Checked before Resolve: the bound weapon left the pockets for the hand.
+            if (q.item != 0 && !ch.hand.Empty() && ch.hand.item == q.item) {
+                out.r = HolsterAnywhere(ch);
+                return out;
+            }
             if (!Resolve(ch, q)) {
                 out.r = Result::NotUsable;
                 return out;

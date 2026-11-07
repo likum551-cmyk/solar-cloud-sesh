@@ -999,6 +999,10 @@ const HashMapping kCrossmap3889[] = {
     {native::IS_CAM_RENDERING,                                    0x8DE2438443E6A145},
     {native::GET_FOLLOW_PED_CAM_VIEW_MODE,                        0x3B5989D5DB08A155},
     {native::IS_PED_GETTING_INTO_A_VEHICLE,                       0x9D6DF8F3584AAC2B},
+    // 0.5.6 overlay_fire_block / weapon_keys (hook.h: natlookup, YimMenu b3889 and YimMenuV2 enhanced AGREE)
+    {native::DISABLE_PLAYER_FIRING,                               0xEF387B90B8B97EDA},
+    {native::HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME,        0xF25C7C5177203507},
+    {native::GET_FRAME_COUNT,                                     0x8034325BF6D6E41F},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -6090,6 +6094,22 @@ bool World::IsDisabledControlJustPressed(int pad, int control) {
     return CallNative(native::IS_DISABLED_CONTROL_JUST_PRESSED, args, 2, r) && (uint32_t)r[0];
 }
 
+// 0.5.6 (libs/sync/overlay_input.h): one frame each.
+bool World::DisableLocalPlayerFiring() {
+    uint64_t player[4] = {};
+    if (!CallNative(native::PLAYER_ID, nullptr, 0, player)) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)player[0], 1 };   // DISABLE_PLAYER_FIRING(PLAYER_ID(), true)
+    return CallNative(native::DISABLE_PLAYER_FIRING, args, 2, nullptr);
+}
+bool World::SuppressWeaponWheelResults() {
+    return CallNative(native::HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME, nullptr, 0, nullptr);
+}
+int64_t World::GetFrameCount() {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_FRAME_COUNT, nullptr, 0, r)) return -1;
+    return (int64_t)(uint32_t)r[0];
+}
+
 bool World::DisableFrontendThisFrame() {
     return CallNative(native::DISABLE_FRONTEND_THIS_FRAME, nullptr, 0, nullptr);
 }
@@ -7134,6 +7154,10 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(IS_CAM_RENDERING),
         GAGE_NEW_NATIVE(GET_FOLLOW_PED_CAM_VIEW_MODE),
         GAGE_NEW_NATIVE(IS_PED_GETTING_INTO_A_VEHICLE),
+        // 0.5.6 overlay_fire_block / weapon_keys
+        GAGE_NEW_NATIVE(DISABLE_PLAYER_FIRING),
+        GAGE_NEW_NATIVE(HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME),
+        GAGE_NEW_NATIVE(GET_FRAME_COUNT),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));

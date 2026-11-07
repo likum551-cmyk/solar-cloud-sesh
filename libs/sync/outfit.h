@@ -32,6 +32,7 @@
 #include "sync/inventory.h"
 
 #include <cstdint>
+#include <string>
 
 namespace gage::sync::outfit {
 
@@ -176,6 +177,44 @@ namespace gage::sync::outfit {
             if (w.want[c] && (drawable[c] != w.drawable[c] || texture[c] != w.texture[c]))
                 m |= 1u << c;
         return m;
+    }
+
+    // ---- 0.5.6: where the engine gets the server's worn items ---------------------------------------------------------------------------
+    // The server sends our inventory in TWO forms: InvState (0.6 codec v1) until the client answers the inventory-world offer, InvSnap (codec v2,
+    // weapons and the hand) from then on. 0.5.4 / 0.5.5 fed the outfit from InvState only, so on a 0.5.4 server (inventory world on: GI's
+    // 0.5.5 log has "first InvSnap ... rev 1" 0.1 s after our first report answered the offer) the ped kept the join-time items for the whole session: taking the shirt off
+    // in the menu changed the server's inventory and never the ped (no outfit line after the starter check). Both handlers feed this one
+    // source; tests/outfit_tests.h and tests/inventory_world_net_tests.h replay the message order a 0.5.4 server really sends.
+    struct WornFeed
+    {
+        inv::Character ch;           // the server's newest inventory (never the overlay's prediction)
+        bool have = false;           // a server inventory exists (false: none yet, or the session ended)
+        uint32_t seq = 0;            // +1 per inventory taken (and per End): the engine re-checks the ped when it moves
+        uint32_t states = 0, snaps = 0, undecodable = 0;
+        bool OnInvState(const std::string& blob) { ++states; return Take(blob); }
+        bool OnInvSnap(const std::string& blob) { ++snaps; return Take(blob); }
+        void End() { have = false; ++seq; }
+
+    private:
+        bool Take(const std::string& blob)
+        {
+            inv::Character c;
+            if (!inv::Decode(blob, c)) {
+                ++undecodable;       // the ped keeps the last good one
+                return false;
+            }
+            ch = c;
+            have = true;
+            ++seq;
+            return true;
+        }
+    };
+
+    // The item key worn in a managed slot ("bare" for none), for the log lines.
+    inline const char* WornKey(const inv::Character& ch, inv::Equip e)
+    {
+        const inv::ItemDef* d = inv::Find(ch.equip[inv::EquipIndex(e)].item);
+        return d ? d->key : "bare";
     }
 
 }  // namespace gage::sync::outfit

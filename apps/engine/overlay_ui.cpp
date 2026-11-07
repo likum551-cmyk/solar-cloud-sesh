@@ -35,6 +35,7 @@
 #include "sync/vehicle_state_row.h"   // 0.4.27 the vehicle state row: where it goes, its cells, the change pulse
 #include "sync/hud_ring.h"            // 0.4.31 the vitals ring (GI's REV1 design): geometry, colours, state rules, the critical pulse
 #include "sync/hud_car.h"             // 0.4.31 the car cluster (GI's REV2 design): dial, fuel, blinkers, chips
+#include "sync/overlay_input.h"       // 0.5.6 weapon_keys: the number keys 1-4 -> quick slots
 #include "overlay_sofia.h"            // kOverlaySofiaBoldTtf: Sofia Sans Bold (SIL OFL 1.1), the ring's labels and numerals
 #include "overlay_inventory.h"        // 0.6 the Tab menu's inventory page (GI's REV3 design); the old menu is its ADMIN page
 
@@ -577,6 +578,9 @@ void OpenInventory()
     u.invOpen = true;
     u.invJustOpened = true;
     u.invA = 0.0f;
+    // 0.5.6 (GI: "tab ... our server menu (default inv page)"): Tab always opens on the inventory; an admin reaches ADMIN with Ctrl+Tab or the pill.
+    if (g_invRev3.load())
+        u.invPage = detail::inv3::Page::Inventory;
     const bool cars = MenuPage() == detail::inv3::Page::Admin && u.invTab == 1;
     u.searchFocusFrames = cars ? 3 : 0;   // the cars page opens ready to type...
     u.searchSelectAll = cars;             // ...over the last query, which the first key replaces
@@ -3912,6 +3916,14 @@ void UiFrame()
             OpenInventory();
         } else if (enter || tKey) {
             OpenChat(now);
+        } else if (detail::inv3::QuickKeysOn() && !io.WantTextInput && !io.KeyCtrl && !io.KeyAlt && g_quitPromptAt.load() == 0) {
+            // 0.5.6 weapon_keys: 1-4 are the quick slots in the world too (the engine holds GTA's own number-key weapon categories disabled)
+            static const ImGuiKey kDigits[4] = {ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4};
+            for (int k = 0; k < 4; ++k)
+                if (ImGui::IsKeyPressed(kDigits[k], false)) {
+                    detail::inv3::QuickKey(gage::sync::overlayinput::QuickSlotOfDigit(k + 1));
+                    break;
+                }
         }
     }
 

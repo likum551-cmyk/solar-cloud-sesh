@@ -663,6 +663,14 @@ namespace gage::game {
         constexpr uint64_t IS_CAM_RENDERING                             = 0x02EC0AF5C5A49B7A;
         constexpr uint64_t GET_FOLLOW_PED_CAM_VIEW_MODE                 = 0x8D4D46230B2C353A;
         constexpr uint64_t IS_PED_GETTING_INTO_A_VEHICLE                = 0xBB062B2B5722478E;
+        // 0.5.6 overlay_fire_block / weapon_keys (libs/sync/overlay_input.h). Natlookup tool 2026-11-07 against the YimMenu b3889 crossmap AND
+        // the YimMenuV2 enhanced crossmap: AGREE for all three (Legacy and Enhanced share the 3889 column). alloc8or signatures:
+        //   DISABLE_PLAYER_FIRING                         public 0x5E6CC07646BBEAB8  3889 0xEF387B90B8B97EDA  void (Player, BOOL toggle); one frame
+        //   HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME  public 0x0AFC4AF510774B47  3889 0xF25C7C5177203507  void (); one frame
+        //   GET_FRAME_COUNT                               public 0xFC8202EFC642E6F2  3889 0x8034325BF6D6E41F  int (): game frames (the cadence probe)
+        constexpr uint64_t DISABLE_PLAYER_FIRING                        = 0x5E6CC07646BBEAB8;
+        constexpr uint64_t HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME = 0x0AFC4AF510774B47;
+        constexpr uint64_t GET_FRAME_COUNT                              = 0xFC8202EFC642E6F2;
     }
 
     // One slot of a ped's look: SET_PED_COMPONENT_VARIATION(ped, component, drawable, texture, palette).
@@ -1319,6 +1327,11 @@ namespace gage::game {
         bool     IsPauseMenuActive();                        // false also when uncallable
         // IS_DISABLED_CONTROL_JUST_PRESSED(pad, control): still reads a control that was disabled this frame.
         bool     IsDisabledControlJustPressed(int pad, int control);
+        // 0.5.6 (libs/sync/overlay_input.h). DISABLE_PLAYER_FIRING(PLAYER_ID(), true) and HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME() last one
+        // frame: false when uncallable. GetFrameCount: GET_FRAME_COUNT(), -1 when uncallable.
+        bool     DisableLocalPlayerFiring();
+        bool     SuppressWeaponWheelResults();
+        int64_t  GetFrameCount();
         // False when the native cannot be called (the caller falls back to SetPauseMenuActive(false)).
         bool     DisableFrontendThisFrame();
         bool     SetPauseMenuActive(bool on);
