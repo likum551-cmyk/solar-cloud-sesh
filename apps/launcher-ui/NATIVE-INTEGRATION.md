@@ -86,6 +86,7 @@ Status key:
 | `{"type":"tokenSet","token":S}` | **NEW** | Store the session token with DPAPI (`CryptProtectData`, user scope, `CRYPTPROTECT_UI_FORBIDDEN`) in `%LOCALAPPDATA%\GAGE-MP\session.bin`. Write atomically: temp file, then `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`. Reply `tokenSaved`. Refuse an empty token or one over 512 chars with `ok:false`. Never log the token. |
 | `{"type":"tokenClear"}` | **NEW** | Delete `session.bin` and reply `tokenSaved` (`ok:true` when the file is gone, including when it never existed). |
 | `{"type":"openExternal","url":S}` | **NEW** | Only `https://` URLs of at most 2048 chars: `ShellExecuteW(nullptr, L"open", url, …)`, then reply `opened`. Refuse anything else with `ok:false`. Used for checkout pages, the Discord log-in authorize page, quest pages, and two website pages: sign-up (`https://solar-rp.com/signup/`; the launcher creates no accounts) and the account page (`https://solar-rp.com/account/`), where Discord is linked and unlinked behind the password. The launcher calls neither `POST /v1/me/discord/link` nor `DELETE /v1/me/discord`. |
+| `{"type":"queryServers","servers":[{"host":S,"port":N},…]}` | **NEW** (0.5.6) | The servers to ask by UDP query every 5 s; each round answers with `serverStatus`. The UI sends every listed server with a host, each host:port once, at most 16, whenever that set changes (`src/state/serverStatus.ts`); `[]` stops the queries. Validation, logging and the demo-mode behaviour are in BRIDGE.md. |
 | `fetch`, `refresh`, `ping`, `addFavorite`, `removeFavorite`, `clearFavorites`, `addRecent`, `clearRecents` | legacy, **unused** | The new UI never sends these: the server list comes from the platform API (`GET /v1/servers`). Keep them if the legacy SPA must still run. |
 
 ### 3.2 native → JS
@@ -104,6 +105,7 @@ Status key:
 | `{"type":"opened","ok":B,"url":S}` | **NEW** | Reply to `openExternal`. |
 | `{"type":"deepLink","url":S}` | **NEW** | A `gage-mp://…` URL Windows handed to the exe. See 3.4. At most 2048 chars. |
 | `{"type":"discordCallback","flowId":S}` | NEW, optional | Send it if a `gage-mp://discord/…` link is ever registered. It makes the UI poll the Discord flow at once (`flowId` may be omitted). Without it the UI polls every 2 s on its own. |
+| `{"type":"serverStatus","servers":[{"host":S,"port":N,"online":B,"pingMs":N,"players":N,"maxPlayers":N,"protocol":N},…]}` | **NEW** | One UDP query round every 5 s (`-1` = unknown). Platform mode: the servers of the last `queryServers`, and the UI takes only `pingMs` (the player's own ping; the API's `status.pingMs` is never shown, a failed query nulls the ping and leaves the API's state and counts). Demo mode: the build's test server, whose answer replaces the demo counts. |
 | `{"type":"update",…}`, `{"type":"copied",…}` | legacy | Unchanged. |
 | `servers`, `ping`, `pings`, `favorites`, `recents` | legacy, **ignored** | The new UI drops them as unknown types. Sending them is harmless. |
 

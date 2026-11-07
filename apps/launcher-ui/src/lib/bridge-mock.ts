@@ -186,6 +186,7 @@ export function createMockBridge(opts: MockBridgeOptions = {}): Bridge & { emit(
       case 'close':
       case 'quit':
       case 'toggleMaximize':
+      case 'queryServers': // a browser has no UDP: the demo list keeps its labelled demo status
         break;
     }
   }

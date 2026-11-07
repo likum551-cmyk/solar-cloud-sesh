@@ -49,7 +49,13 @@ export type OutMsg =
   /** NEW: maximize / restore (double-click on the drag region already does this natively). */
   | { type: 'toggleMaximize' }
   /** NEW: an uncaught UI error or console.error, written to gage.log by native. */
-  | { type: 'log'; level: 'error' | 'warn'; message: string };
+  | { type: 'log'; level: 'error' | 'warn'; message: string }
+  /**
+   * NEW (0.5.6): the servers native asks by UDP query every 5 s (answered by `serverStatus`): every listed server
+   * with a host, each host:port once, at most 16 (state/serverStatus.ts). Sent when the set changes; [] stops it.
+   * A demo-mode host ignores it and keeps querying its test server.
+   */
+  | { type: 'queryServers'; servers: Array<{ host: string; port: number }> };
 
 /** Where the native updater stands (BRIDGE.md `update`). */
 export const UPDATE_STATES = ['idle', 'checking', 'downloading', 'verifying', 'ready', 'installing', 'deferred', 'error'] as const;
@@ -102,9 +108,10 @@ export const inMsgSchema = z.discriminatedUnion('type', [
   /** NEW: a `gage-mp://` link Windows handed to SolarLauncher.exe (email verification, password reset). */
   z.object({ type: z.literal('deepLink'), url: z.string().max(2048) }),
   /**
-   * NEW: real GAGE server status from a native UDP query (phase P2). In demo mode the native
-   * host polls the live GAGE server and sends this; the UI overlays it onto the matching server
-   * (by host:port), replacing the fabricated demo counts. `pingMs`/`players`/`maxPlayers` are -1
+   * NEW: real GAGE server status from a native UDP query (phase P2), one round every 5 s. Platform
+   * mode: the servers `queryServers` named, and only `pingMs` is used (the player's own ping; the
+   * API's state and counts stand). Demo mode: the build's test server, and the UI replaces the
+   * fabricated demo counts with it (state/serverStatus.ts). `pingMs`/`players`/`maxPlayers` are -1
    * when the server did not answer (`online` false).
    */
   z.object({
