@@ -195,6 +195,9 @@ struct Opt {
     double disturbMs = 2500;      // after a teleport / an outage's end the error is not scored this long
     double traceFromMs = -1, traceToMs = -1;
     double swingFromMs = -1, swingToMs = -1;    // LocoInput::swingActive in this window
+    // 0.5.7: the swing's clip is on the secondary slot (LocoInput::swingSecondary for the whole window); swingCutByTask = the game model in
+    // which a movement task issued during the swing ends the clip (its visible length is then measured up to that issue)
+    bool swingSecondary = false, swingCutByTask = false;
     int repairsDone0 = 0;
 };
 
@@ -229,6 +232,11 @@ struct Res {
     int tasksInSwing = 0;                                  // task issues inside the swing window
     double msPlaced = 0;                                   // R5: time spent at the rigid follow (level 3)
     double errMaxAfterEvent = 0;                           // R5: the largest pose-ped error in the 8 s after an event
+    // 0.5.7: metres the ped travelled while the game would read it STILL (no gait task) and the pose moved (> 0.5 m/s): the slide in a stand
+    // pose, carried by our velocity writes / nudges; and how long the swing's clip stayed on (the window, or up to the task that cut it)
+    double stillTravelM = 0;
+    double swingClipMs = -1;
+    SwingWalkSummary sw;                                   // 0.5.7: the engine's SwingWalkDiag fed as DrivePeer feeds it (IS_PED_STILL = the game's Still gait)
 };
 
 static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& op, bool gaitRead = true) {
@@ -236,6 +244,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
     Rng rng(op.seed);
     LocomotionController lc(cfg);
     LocoDiag diag;
+    SwingWalkDiag swd;
     GamePed ped;
     ped.g = gm;
     struct Smp { double t, arr; LocoVec pos, vel; float heading; bool tele; };
@@ -334,6 +343,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
         in.noAnchor = true;       // no anchor entity: R4 compares straight and blend (the anchor task never moved a puppet live)
         in.repairsDone = repairs;
         in.swingActive = op.swingFromMs >= 0 && now >= op.swingFromMs && now < op.swingToMs;
+        in.swingSecondary = op.swingSecondary && op.swingFromMs >= 0 && now >= op.swingFromMs;
         for (size_t ei = 0; ei < op.events.size(); ++ei) {
             const Event& ev = op.events[ei];
             if (evDone[ei] || now < ev.atMs) continue;
@@ -354,6 +364,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
         if ((o.task == LocoTask::GoStraight || o.task == LocoTask::StandStill)) {
             res.issueAtMs.push_back(now);
             if (in.swingActive) ++res.tasksInSwing;
+            if (in.swingActive && op.swingCutByTask && res.swingClipMs < 0) res.swingClipMs = now - op.swingFromMs;
         }
         if (o.levelChanged) {
             res.changes.push_back({o.level, o.levelWhy});
@@ -402,6 +413,14 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
         df.rateSet = o.setMoveRate; df.rate = o.moveRate; df.rateClamped = o.rateClamped; df.selfSpeed = lc.SelfSpeed();
         df.blend = o.blend; df.blendPlaced = o.level == LocoLevel::Placed;
         diag.Observe(df);
+        {
+            SwingWalkFrame sw;
+            sw.dtMs = dt; sw.commandedMoving = o.gait != Gait::Still;
+            sw.pedStill = sw.commandedMoving ? (ped.GameGait() == Gait::Still ? 1 : 0) : -1;
+            sw.pedPos = in.pedPos; sw.snapped = o.snap || in.teleported;
+            sw.swingWindow = o.swingWindow; sw.swingThrough = o.swingThrough; sw.walkIssued = o.swingWalk;
+            swd.Observe(sw);
+        }
         if (op.traceFromMs >= 0 && now >= op.traceFromMs && now < op.traceToMs)
             std::printf("    t=%6.0f pose (%.2f,%.2f) sp %.2f ped (%.2f,%.2f) real %.2f err %.2f gait %d task %d why %d mbr %.2f write %.2f lvl %d\n", now,
                         ppos.x, ppos.y, poseSp, in.pedPos.x, in.pedPos.y, std::hypot(ped.vReal.x, ped.vReal.y),
@@ -412,6 +431,10 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
                         ped.vTask.x, ped.vTask.y, o.velocity.x, o.velocity.y, ped.vReal.x, ped.vReal.y, lc.BlendTrim(), lc.BlendMeanCorr(), lc.FightShare());
         // the ped moves for the frame that FOLLOWS (the next Update's dtMs is exactly this interval, as in the game)
         const double dtNext = dtBase * (0.8 + 0.4 * rng.Uniform());
+        if (ped.GameGait() == Gait::Still && poseSp > 0.5) {
+            res.stillTravelM += std::hypot(double(ped.vReal.x), double(ped.vReal.y)) * dtNext / 1000.0;
+            if (o.nudge && !o.snap) res.stillTravelM += std::hypot(double(o.nudgeDelta.x), double(o.nudgeDelta.y));
+        }
         ped.pos.x = float(ped.pos.x + ped.vReal.x * dtNext / 1000.0);
         ped.pos.y = float(ped.pos.y + ped.vReal.y * dtNext / 1000.0);
         (void)pedBefore;
@@ -443,6 +466,7 @@ static Res Run(const Scn& sc, const Game& gm, const LocoConfig& cfg, const Opt& 
     }
     res.st = lc.Stats();
     res.d = diag.Summary();
+    res.sw = swd.Summary();
     std::sort(errs.begin(), errs.end());
     if (!errs.empty()) { res.p50 = errs[errs.size() / 2]; res.p95 = errs[size_t(errs.size() * 0.95)]; res.maxErr = errs.back(); }
     res.speedRatio = poseDist > 0 ? pedDist / poseDist : 0;
@@ -889,6 +913,121 @@ static void TestSwing() {
     }
 }
 
+// 0.5.7 (live 0.5.5, 08:00:51: an upper-body punch (flags 16|32, the whole 1.8 s clip) by a STANDING attacker who then walked away: the
+// puppet kept its stand-still task through the swing + its 700 ms hold, IS_PED_STILL read true on 179 of 179 asks while our velocity writes
+// carried it 1.7 m = the slide GI saw). An upper-body / secondary clip does not replace the gait task (SwingVariantReplacesGait), so with
+// swingWalkThrough the gait task may follow the pose through such a swing; FullBody / Plain / the melee task stay held (TestSwing).
+static Scn PunchThenGo(double sp, double goAtMs) {
+    Scn s{sp < 3.0 ? "stand, punch (upper body), walk 1.5 away" : "stand, punch (upper body), run 4.5 away",
+          [sp, goAtMs](double t) { return t * 1000.0 < goAtMs ? 0.0 : sp; }, [](double) { return 0.0; }};
+    s.durMs = 11000;
+    return s;
+}
+static void TestSwingWalk() {
+    const double swingAt = 4000.0, swingEnd = swingAt + 1100.0;       // kWholeClipHoldMs: the probe holds a whole-clip swing 1100 ms
+    LocoConfig oldC = CfgBlend(); oldC.swingWalkThrough = false;
+    const LocoConfig newC = CfgBlend();
+    struct Row { std::string cell, scn; Res o, n, nCut; };
+    std::vector<Row> rows;
+    bool reproOk = true, fixOk = true, errOk = true, clipOk = true;
+    double oldD = 0, newMax = 0;
+    std::string why;
+    for (const Game& g : Cells()) {
+        if (g.src == GaitSrc::None) continue;                          // no gait source: the ped reads still whatever is issued (both configs)
+        for (double sp : {1.5, 4.5}) {
+            const Scn sc = PunchThenGo(sp, swingAt + 250.0);
+            Opt op; op.swingFromMs = swingAt; op.swingToMs = swingEnd; op.swingSecondary = true;
+            Row r; r.cell = g.name; r.scn = sc.name;
+            r.o = Run(sc, g, oldC, op);
+            r.n = Run(sc, g, newC, op);
+            Opt cut = op; cut.swingCutByTask = true;
+            r.nCut = Run(sc, g, newC, cut);
+            // the old code must show the slide where the writes are honoured (D: at least the walk's 1.5 m/s over most of the 1.55 s held)
+            if (g.auth >= 1.0) { oldD = std::max(oldD, r.o.stillTravelM); if (r.o.stillTravelM < 0.8 * sp) { reproOk = false; why += F(" old %s %s %.2f m;", g.name, sc.name, r.o.stillTravelM); } }
+            newMax = std::max(newMax, r.n.stillTravelM);
+            if (r.n.stillTravelM > 0.25 * sp * 0.5 + 0.05) { fixOk = false; why += F(" new %s %s %.2f m;", g.name, sc.name, r.n.stillTravelM); }
+            if (r.n.p95 > r.o.p95 + 0.10 || r.n.maxErrAny > r.o.maxErrAny + 0.3) { errOk = false; why += F(" err %s %s p95 %.2f->%.2f max %.2f->%.2f;", g.name, sc.name, r.o.p95, r.n.p95, r.o.maxErrAny, r.n.maxErrAny); }
+            if (r.n.tasksInSwing > 2) { clipOk = false; why += F(" %s %s %d tasks in the swing;", g.name, sc.name, r.n.tasksInSwing); }
+            rows.push_back(r);
+        }
+    }
+    if (std::getenv("R4T1_SWINGWALK"))
+        for (const Row& r : rows)
+            std::printf("  %-7s %-42s still-travel old %.2f new %.2f m | p95 %.2f/%.2f max %.2f/%.2f | tasks in swing %d/%d | clip shown (task cuts it) %.0f ms | walks %u\n",
+                        r.cell.c_str(), r.scn.c_str(), r.o.stillTravelM, r.n.stillTravelM, r.o.p95, r.n.p95, r.o.maxErrAny, r.n.maxErrAny, r.o.tasksInSwing, r.n.tasksInSwing,
+                        r.nCut.swingClipMs, r.n.st.swingWalks);
+    Check("R4 T1 swing walk (0.5.7): a standing attacker punches (upper-body clip, swingActive 1.1 s + the 700 ms hold) and walks / runs away 250 ms later: the 0.5.6 hold leaves the "
+          "stand-still task on and the writes carry a still ped (>= 0.8 x speed metres in every D cell); swingWalkThrough lets the gait task follow (<= 0.125 x speed + 0.05 m in every B / S cell), "
+          "never worse in p95 (+0.10) / max (+0.3), at most 2 task issues inside the swing",
+          reproOk && fixOk && errOk && clipOk && newC.swingWalkThrough && !rows.empty(),
+          F("old D worst %.2f m, new worst %.2f m, rows %zu;%s", oldD, newMax, rows.size(), why.c_str()));
+    // the 10 s line's read-backs (SwingWalkDiag, fed per frame as DrivePeer feeds it) tell the two apart in the same runs: 0.5.6's slide is booked
+    // under "held swing", 0.5.7's walk-through frames move a ped that reads walking, and the walk-through issues are counted
+    {
+        bool ok = true;
+        std::string w;
+        for (const Row& r : rows) {
+            const bool honoured = r.cell.find("/D") != std::string::npos;
+            const double sp = r.scn.find("walk") != std::string::npos ? 1.5 : 4.5;
+            const bool oldOk = !honoured || (r.o.sw.slideM[SwingWalkSummary::Held] >= 0.8 * sp && r.o.sw.slideM[SwingWalkSummary::Through] == 0.0 && r.o.sw.walkIssued == 0);
+            const bool newOk = r.n.sw.slideM[SwingWalkSummary::Held] + r.n.sw.slideM[SwingWalkSummary::Through] <= 0.125 * sp + 0.05 && r.n.sw.walkIssued >= 1 &&
+                               r.n.sw.askedFrames[SwingWalkSummary::Through] >= 30;
+            if (!oldOk || !newOk) {
+                ok = false;
+                w += F(" %s %s: old held %.2f through %.2f issued %u; new held %.2f through %.2f (asks %u) issued %u;", r.cell.c_str(), r.scn.c_str(), r.o.sw.slideM[0], r.o.sw.slideM[1],
+                       r.o.sw.walkIssued, r.n.sw.slideM[0], r.n.sw.slideM[1], r.n.sw.askedFrames[1], r.n.sw.walkIssued);
+            }
+        }
+        const SwingWalkSummary& a = rows.empty() ? SwingWalkSummary() : rows[0].o.sw;
+        Check("R4 T1 swing walk (0.5.7) diag: the 'on-foot swing walk (0.5.7)' read-backs book 0.5.6's slide under 'in a held swing' (>= 0.8 x speed m in the D cells, nothing under walk-through), "
+              "and 0.5.7's walk-through swing as asked frames that barely move a still-reading ped (<= 0.125 x speed + 0.05 m) with >= 1 walk-through issue",
+              ok && !rows.empty(), F("rows %zu, first row old: held %.2f m (%u of %u asks);%s", rows.size(), a.slideM[0], a.slideFrames[0], a.askedFrames[0], w.c_str()));
+    }
+    // a punch that stays put issues nothing in the swing (the clip is never cut by us), in both configs
+    {
+        Scn st{"stand and punch", [](double) { return 0.0; }, [](double) { return 0.0; }};
+        st.durMs = 9000;
+        Opt op; op.swingFromMs = swingAt; op.swingToMs = swingEnd; op.swingSecondary = true;
+        int worst = 0;
+        for (const Game& g : Cells()) worst = std::max(worst, Run(st, g, newC, op).tasksInSwing);
+        Check("R4 T1 swing walk (0.5.7): an attacker who punches standing still gets 0 task issues inside the swing in all 12 cells (walk-through only acts when the pose moves)", worst == 0,
+              F("most task issues inside the swing %d", worst));
+    }
+    // the ablation over the whole model x scenario matrix: the same upper-body swing (8.0 .. 9.1 s) in every scenario of every cell, 0.5.6 vs 0.5.7
+    {
+        // A swing at 8 s lands on the scenarios' events (the 1 s outage, the teleport); one at 13 s is clear of them. The bar for a run is the
+        // better of 0.5.6 under the same swing and the controller with no swing at all (the walk-through hands the frames back to the normal
+        // controller, so where the 0.5.6 hold happened to help (it kept a run task going through a 1 s outage) the no-swing run is the reference).
+        int worse = 0, runs = 0, holdHelped = 0;
+        double oldTravel = 0, newTravel = 0, worstP95 = 0;
+        std::string w;
+        const bool show = std::getenv("R4T1_SWINGWALK") != nullptr;
+        for (const Game& g : Cells())
+            for (const Scn& sc : Scenarios()) {
+                const Res ns = Run(sc, g, newC, Opt());
+                for (double at : {8000.0, 13000.0}) {
+                    Opt op; op.swingFromMs = at; op.swingToMs = at + 1100.0; op.swingSecondary = true;
+                    const Res o = Run(sc, g, oldC, op), n = Run(sc, g, newC, op);
+                    ++runs;
+                    if (g.src != GaitSrc::None) { oldTravel += o.stillTravelM; newTravel += n.stillTravelM; }   // A reads still whatever is issued
+                    worstP95 = std::max(worstP95, n.p95 - o.p95);
+                    const double maxBar = std::max(o.maxErrAny, ns.maxErrAny) + 0.3;
+                    if (n.maxErrAny > o.maxErrAny + 0.3 && n.maxErrAny <= maxBar) ++holdHelped;
+                    const bool bad = n.p95 > o.p95 + 0.10 || n.maxErrAny > maxBar || n.flaps > std::max(o.flaps, ns.flaps) || n.st.hardSnaps > std::max(o.st.hardSnaps, ns.st.hardSnaps);
+                    if (bad) { ++worse; w += F(" %s / %s @%.0f;", g.name, sc.name, at); }
+                    if (bad || show)
+                        std::printf("    %s %-7s %-56s @%5.0f: p95 %.2f->%.2f max %.2f->%.2f (no swing %.2f) flaps %u->%u snaps %u->%u still-travel %.2f->%.2f walks %u\n", bad ? "WORSE" : "abl  ",
+                                    g.name, sc.name, at, o.p95, n.p95, o.maxErrAny, n.maxErrAny, ns.maxErrAny, o.flaps, n.flaps, o.st.hardSnaps, n.st.hardSnaps, o.stillTravelM, n.stillTravelM, n.st.swingWalks);
+                }
+            }
+        Check("R4 T1 swing walk (0.5.7) ablation: an upper-body swing at 8 s (on the events) and at 13 s in every scenario x every cell (264 runs): 0.5.7 is never worse than 0.5.6 in p95 (+0.10) "
+              "nor than the better of 0.5.6 / no swing in max (+0.3), flaps and snaps; a still-reading ped (cells with a gait source) moves less in total",
+              runs == 264 && worse == 0 && newTravel < oldTravel,
+              F("runs %d, worse %d, max above 0.5.6 but within the no-swing run %d, still-travel total (B / S) %.1f -> %.1f m, worst p95 delta %+.2f;%s", runs, worse, holdHelped, oldTravel, newTravel,
+                worstP95, w.c_str()));
+    }
+}
+
 static void TestDiag() {
     // 7. The summary the 10 s line prints: error percentiles, the largest correction on top of the pose velocity, snaps, read-back vs write fights.
     LocoDiag d;
@@ -979,6 +1118,7 @@ static void R4T1Tests() {
     r4::TestWitness();
     r4::TestTarget();
     r4::TestSwing();
+    r4::TestSwingWalk();
     r4::TestDiag();
     r4::TestConfig();
     r4::TestSenderClip();

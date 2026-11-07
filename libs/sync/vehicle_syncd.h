@@ -132,6 +132,107 @@ namespace gage::sync {
         double posSum_ = 0, rotSum_ = 0, latSum_ = 0, posMax_ = 0, rotMax_ = 0, latMax_ = 0;
     };
 
+    // 0.5.7 (live 0.5.5, 07:44:29 - 07:45:19): a parked / slow copy (the owner at rest) held a STEADY heading error of 17-44 deg (max ~54)
+    // for 50 s while the controller kept commanding the correction, with "deviation from our last velocity command over 1 m/s" on 848 of 861
+    // frames and the collision flag up 99 %. The simulated car honours every angular write, so offline nothing reproduces it: whether GTA
+    // ignores SET_ENTITY_ANGULAR_VELOCITY on a car at rest (wheels / handbrake / a contact holding it), or the copy is pinned against
+    // something, is a game-side question. This window answers it from read-backs only, over the frames where the TARGET is at rest
+    // (speed < kRestSpeed): the error split into yaw and tilt (the total rotErrorDeg mixes them), position into horizontal and vertical, the
+    // yaw rate we commanded the frame before next to the yaw rate the read-back heading actually turned at (honoured = sum(achieved along the
+    // command) / sum(|commanded|), 1 = obeyed, ~0 = ignored, < 0 = turned the other way), the read-back velocity against the velocity
+    // written the frame before, and steady episodes (yaw error over kSteadyDeg without a break for over kSteadyMs).
+    class VehRestDiag
+    {
+    public:
+        static constexpr double kRestSpeed = 0.5, kSteadyDeg = 5.0, kSteadyMs = 1000.0, kCmdMin = 0.05;
+        struct Frame
+        {
+            double dtMs = 0;
+            double targetSpeed = 0;                    // |target velocity| m/s
+            double yawErrDeg = 0, tiltErrDeg = 0;       // |target heading - read-back heading|, angle between the up axes
+            double horizErrM = 0, vertErrM = 0;
+            double headingDeg = 0;                      // the read-back heading this frame (GET_ENTITY_ROTATION / quaternion)
+            bool haveCmdYaw = false; double cmdYawRate = 0;   // the yaw rate (rad/s) written the PREVIOUS frame, if any
+            bool haveCmdVel = false; double velDevMs = 0;     // |read-back velocity - the velocity written the previous frame|
+            bool snapped = false;
+        };
+        struct Window
+        {
+            uint32_t frames = 0, restFrames = 0, cmdFrames = 0, episodes = 0;
+            double yawMeanDeg = 0, yawMaxDeg = 0, tiltMeanDeg = 0, tiltMaxDeg = 0, horizMeanM = 0, vertMeanM = 0;
+            double cmdMeanRad = 0, achievedMeanRad = 0, honoured = 0;   // over frames with |cmd| > kCmdMin
+            double velDevMeanMs = 0; uint32_t velDevOver1 = 0, velDevN = 0;
+            double longestSteadyMs = 0;
+        };
+        void Add(const Frame& f)
+        {
+            ++w_.frames;
+            const bool valid = std::isfinite(f.yawErrDeg) && std::isfinite(f.tiltErrDeg) && std::isfinite(f.horizErrM) && std::isfinite(f.vertErrM) && std::isfinite(f.headingDeg);
+            const bool rest = valid && !f.snapped && f.targetSpeed < kRestSpeed;
+            if (rest && havePrev_ && f.dtMs > 0.0 && f.dtMs <= 250.0)
+            {
+                ++w_.restFrames;
+                yawSum_ += f.yawErrDeg; tiltSum_ += f.tiltErrDeg; horizSum_ += f.horizErrM; vertSum_ += f.vertErrM;
+                w_.yawMaxDeg = std::max(w_.yawMaxDeg, f.yawErrDeg);
+                w_.tiltMaxDeg = std::max(w_.tiltMaxDeg, f.tiltErrDeg);
+                if (f.haveCmdYaw && std::fabs(f.cmdYawRate) > kCmdMin)
+                {
+                    double dh = f.headingDeg - prevHeading_;
+                    while (dh > 180.0) dh -= 360.0;
+                    while (dh <= -180.0) dh += 360.0;
+                    const double achieved = dh * (3.14159265358979323846 / 180.0) / (f.dtMs / 1000.0);
+                    ++w_.cmdFrames;
+                    cmdAbs_ += std::fabs(f.cmdYawRate);
+                    achAbs_ += std::fabs(achieved);
+                    along_ += f.cmdYawRate > 0.0 ? achieved : -achieved;
+                }
+                if (f.haveCmdVel && std::isfinite(f.velDevMs))
+                {
+                    ++w_.velDevN;
+                    velDevSum_ += f.velDevMs;
+                    if (f.velDevMs > 1.0) ++w_.velDevOver1;
+                }
+                if (f.yawErrDeg > kSteadyDeg)
+                {
+                    steadyMs_ += f.dtMs;
+                    if (steadyMs_ > kSteadyMs && !inEpisode_) { inEpisode_ = true; ++w_.episodes; }
+                    w_.longestSteadyMs = std::max(w_.longestSteadyMs, steadyMs_);
+                }
+                else { steadyMs_ = 0; inEpisode_ = false; }
+            }
+            else if (!rest) { steadyMs_ = 0; inEpisode_ = false; }
+            if (valid) { prevHeading_ = f.headingDeg; havePrev_ = true; }
+            else havePrev_ = false;
+        }
+        // the window so far (the counters restart; the running episode and the previous heading carry over)
+        Window Take()
+        {
+            Window w = w_;
+            if (w.restFrames)
+            {
+                w.yawMeanDeg = yawSum_ / w.restFrames; w.tiltMeanDeg = tiltSum_ / w.restFrames;
+                w.horizMeanM = horizSum_ / w.restFrames; w.vertMeanM = vertSum_ / w.restFrames;
+            }
+            if (w.cmdFrames)
+            {
+                w.cmdMeanRad = cmdAbs_ / w.cmdFrames; w.achievedMeanRad = achAbs_ / w.cmdFrames;
+                w.honoured = cmdAbs_ > 0.0 ? along_ / cmdAbs_ : 0.0;
+            }
+            if (w.velDevN) w.velDevMeanMs = velDevSum_ / w.velDevN;
+            w_ = Window();
+            yawSum_ = tiltSum_ = horizSum_ = vertSum_ = cmdAbs_ = achAbs_ = along_ = velDevSum_ = 0.0;
+            if (inEpisode_) w_.longestSteadyMs = steadyMs_;
+            return w;
+        }
+        void Break() { havePrev_ = false; steadyMs_ = 0; inEpisode_ = false; }
+
+    private:
+        Window w_;
+        double yawSum_ = 0, tiltSum_ = 0, horizSum_ = 0, vertSum_ = 0, cmdAbs_ = 0, achAbs_ = 0, along_ = 0, velDevSum_ = 0;
+        double prevHeading_ = 0, steadyMs_ = 0;
+        bool havePrev_ = false, inEpisode_ = false;
+    };
+
     // Where a puppet that should sit in (vehicle, seat) is found when the engine's "already there" check fails.
     enum class SeatDisplacement : uint8_t
     {

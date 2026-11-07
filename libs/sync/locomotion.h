@@ -479,6 +479,13 @@ namespace gage::sync {
         // R4 T1, all modes: LocoInput::swingActive (a melee swing animation plays) holds every task re-issue and repair for as long as it is set
         // and swingHoldMs after (the engine's probe goes false the moment the clip is SEEN playing, the clip plays on for ~0.5 s).
         float swingHoldMs = 700.0f;
+        // 0.5.7 loco_swing_walk (false = 0.5.6): while the swing's clip runs on the SECONDARY task slot (LocoInput::swingSecondary: the
+        // upper-body 16|32 variants, which the engine already treats as not replacing the gait task, SwingVariantReplacesGait), a gait or
+        // stand-still issue is NOT held: the primary task carries the walk under the upper-body punch. Only an issue that is due anyway
+        // (the task kind changed, or a forced re-issue) goes out; the rule evaluation (turn / drift / arrival / stall) and every repair stay
+        // held. Live 0.5.5 (GI's log, 08:00:51): an upper-body swing held the go-straight task for 1.8 s while the sender walked away; the
+        // puppet read IS_PED_STILL on 179 of 179 asks and was carried 1.7 m in a stand pose by the velocity drive (the slide).
+        bool swingWalkThrough = true;
 
         float velTauMs = 120.0f;       // one-pole low-pass of the pose velocity (W1 item 4)
         float steerDeadbandM = 0.08f;  // no steering under this horizontal error
@@ -556,6 +563,9 @@ namespace gage::sync {
         // R4 T1 (task 3's interface): a melee swing animation plays on this puppet. No movement task is issued and no repair (ClearPedTasks) is
         // asked while it is set (and swingHoldMs after); pending re-issues go out afterwards. The velocity drive and the snap are unaffected.
         bool swingActive = false;
+        // 0.5.7: the newest swing's clip is on the secondary task slot (TASK_PLAY_ANIM flag 32, upper body) AND it has been seen playing:
+        // with LocoConfig::swingWalkThrough a due gait / stand-still issue is not held by swingActive or its swingHoldMs tail (see there).
+        bool swingSecondary = false;
     };
 
     // Why a GoStraight was issued (LocoOutput::why; the per-trigger counters of LocoStats). W8 item 3: the live test
@@ -635,6 +645,10 @@ namespace gage::sync {
         bool blend = false;
         float corrMs = 0;
         bool swingHeld = false;
+        // 0.5.7: this frame's task issue went out under a secondary-slot swing (loco_swing_walk) instead of being held
+        bool swingWalk = false;
+        // 0.5.7: the frame is inside a swing's hold (swingActive or its swingHoldMs tail) / ... and the walk-through applies to it
+        bool swingWindow = false, swingThrough = false;
     };
 
     struct LocoStats
@@ -666,6 +680,7 @@ namespace gage::sync {
         // blend degradations to Placed; the largest correction (m/s); stall re-issues of a task that never showed a gait
         uint32_t blendFrames = 0, fightVelFrames = 0, fightPosFrames = 0, fightCmpFrames = 0, satFrames = 0, hardSnaps = 0, swingHeld = 0;
         uint32_t blendDegrades = 0, deadStalls = 0;
+        uint32_t swingWalks = 0;          // 0.5.7: task issues let through a secondary-slot swing (loco_swing_walk)
         double maxCorrMs = 0;
         // R5: grace windows opened (a task-changing event in Blend), frames inside one on which the round-4 self-check WOULD have accrued failure
         // (the error was up and not closing / the writes were fought: each is a frame of a fall to the rigid follow that was not taken), windows
@@ -1062,6 +1077,66 @@ namespace gage::sync {
         bool havePrev_ = false;
         LocoVec prevPos_;
         double prevNowMs_ = 0;
+    };
+
+    // 0.5.7 (loco_swing_walk): the read-backs that say whether a puppet slid in a stand pose and why. A "still slide" frame is one where a
+    // moving gait is commanded and IS_PED_STILL reads TRUE while GET_ENTITY_COORDS moved (no snap): the ped is carried by our velocity writes
+    // in a standing animation. Its metres are split by the cause the controller reported for the frame: inside a swing hold the walk-through
+    // did not apply to (Held: 0.5.6's slide), inside one it did apply to (Through: should be ~0 if the gait task carries the walk), or no
+    // swing (Other: a different cause, e.g. a car exit or a ragdoll). The clip reads say whether a gait task issued by the walk-through
+    // cut the swing's clip: IS_ENTITY_PLAYING_ANIM at >= 100 ms after the issue (1 survived, 0 cut, -1 unreadable / the swing ended first).
+    struct SwingWalkFrame
+    {
+        double dtMs = 0;
+        bool commandedMoving = false;   // LocoOutput::gait != Still
+        int pedStill = -1;              // IS_PED_STILL on this frame: 1 / 0, -1 = not asked
+        LocoVec pedPos;                 // GET_ENTITY_COORDS this frame
+        bool snapped = false;           // a coordinate write placed the ped this frame (its movement is ours, not a slide)
+        bool swingWindow = false;       // LocoOutput::swingWindow
+        bool swingThrough = false;      // LocoOutput::swingThrough
+        bool walkIssued = false;        // LocoOutput::swingWalk (a command: logged as "issued")
+    };
+    struct SwingWalkSummary
+    {
+        enum Cause { Held = 0, Through = 1, Other = 2, kCauses = 3 };
+        double slideM[kCauses] = { 0, 0, 0 };          // metres moved while IS_PED_STILL read true with a moving gait commanded
+        uint32_t slideFrames[kCauses] = { 0, 0, 0 };
+        uint32_t askedFrames[kCauses] = { 0, 0, 0 };   // frames IS_PED_STILL was asked with a moving gait commanded
+        uint32_t walkIssued = 0;
+        uint32_t clipSurvived = 0, clipCut = 0, clipUnread = 0;
+        bool Any() const { return askedFrames[0] + askedFrames[1] + askedFrames[2] + walkIssued + clipSurvived + clipCut + clipUnread > 0; }
+    };
+    class SwingWalkDiag
+    {
+    public:
+        void Observe(const SwingWalkFrame& f)
+        {
+            const int cause = !f.swingWindow ? SwingWalkSummary::Other : f.swingThrough ? SwingWalkSummary::Through : SwingWalkSummary::Held;
+            if (f.walkIssued) ++s_.walkIssued;
+            const double dx = double(f.pedPos.x) - prev_.x, dy = double(f.pedPos.y) - prev_.y, d = std::sqrt(dx * dx + dy * dy);
+            // (a frame gap over 250 ms or a 2 m step is a hiccup / a placement, not a slide: no delta across it)
+            if (havePrev_ && !f.snapped && f.commandedMoving && f.pedStill >= 0 && f.dtMs <= 250.0 && d <= 2.0)
+            {
+                ++s_.askedFrames[cause];
+                if (f.pedStill == 1)
+                {
+                    ++s_.slideFrames[cause];
+                    s_.slideM[cause] += d;
+                }
+            }
+            prev_ = f.pedPos;
+            havePrev_ = true;
+        }
+        // the clip read after a walk-through issue: 1 still playing, 0 not playing, -1 unreadable or not read
+        void ClipRead(int playing) { if (playing == 1) ++s_.clipSurvived; else if (playing == 0) ++s_.clipCut; else ++s_.clipUnread; }
+        // a ped respawn / a teleport: the next frame has no previous position
+        void Break() { havePrev_ = false; }
+        const SwingWalkSummary& Summary() const { return s_; }
+        void ResetCounters() { s_ = SwingWalkSummary(); }
+    private:
+        SwingWalkSummary s_;
+        LocoVec prev_;
+        bool havePrev_ = false;
     };
 
     // T2: the game is one game for every puppet. A failure two DIFFERENT puppets' controllers report within witnessMs (the anchor

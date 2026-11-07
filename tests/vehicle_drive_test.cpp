@@ -2304,6 +2304,45 @@ static void TestCopySteer()
           F("field %.3f, old %.3f, player %.3f, refused -> %d, nan %.3f", fieldCar.angle, oldCar.angle, playerCar.angle, (int)d, nanCar.angle));
 }
 
+// 0.5.7 vehicle rest diagnostic (no behaviour change): the "vehicle rest (0.5.7)" line must tell a copy at rest that obeys the yaw we
+// command from one that ignores it or turns the other way, and leave the frames of a moving owner out. A copy is fed the controller-like
+// command (yaw rate toward the target, 3 x the error) and turns by k x the command the frame before (k 1 / 0 / -1).
+constexpr int kRestDiagChecks = 2;
+static void TestRestDiag()
+{
+    std::printf("-- 0.5.7 vehicle rest diagnostic\n");
+    auto run = [](double k, double targetSpeed) {
+        VehRestDiag d;
+        double heading = 30.0, cmdPrev = 0.0;
+        bool havePrev = false;
+        const double dt = 1000.0 / 60.0;
+        for (int i = 0; i < 600; ++i) {
+            if (havePrev) heading += k * cmdPrev * (dt / 1000.0) * (180.0 / 3.14159265358979323846);
+            VehRestDiag::Frame f;
+            f.dtMs = dt; f.targetSpeed = targetSpeed;
+            f.yawErrDeg = std::fabs(heading); f.tiltErrDeg = 0.5; f.horizErrM = 0.4; f.vertErrM = 0.05;
+            f.headingDeg = heading;
+            f.haveCmdYaw = havePrev; f.cmdYawRate = cmdPrev;
+            f.haveCmdVel = true; f.velDevMs = k == 1.0 ? 0.2 : 2.0;
+            d.Add(f);
+            cmdPrev = -3.0 * heading * (3.14159265358979323846 / 180.0);   // toward heading 0 (the target)
+            if (std::fabs(cmdPrev) > 4.0) cmdPrev = cmdPrev > 0 ? 4.0 : -4.0;
+            havePrev = true;
+        }
+        return d.Take();
+    };
+    const VehRestDiag::Window obey = run(1.0, 0.0), ignore = run(0.0, 0.0), wrong = run(-1.0, 0.0), moving = run(0.0, 5.0);
+    Check("0.5.7 rest diag: a copy at rest that obeys the yaw command reads honoured ~1 with no steady episode; one that ignores it reads ~0 with one "
+          "steady episode of ~10 s at its 30 deg error; one that turns the other way reads < 0",
+          obey.restFrames >= 590 && obey.cmdFrames >= 30 &&   // (the obeying copy closes the error in about a second: then |cmd| < kCmdMin) std::fabs(obey.honoured - 1.0) < 0.05 && obey.episodes == 0 &&
+              ignore.cmdFrames >= 590 && std::fabs(ignore.honoured) < 0.01 && ignore.episodes == 1 && ignore.longestSteadyMs > 9000.0 &&
+              std::fabs(ignore.yawMeanDeg - 30.0) < 0.1 && wrong.honoured < -0.5 && ignore.velDevOver1 == ignore.velDevN && obey.velDevOver1 == 0,
+          F("obey: honoured %.2f (%u cmd frames, %u episodes); ignore: honoured %.2f, episodes %u longest %.0f ms, yaw mean %.1f; wrong way: honoured %.2f",
+            obey.honoured, obey.cmdFrames, obey.episodes, ignore.honoured, ignore.episodes, ignore.longestSteadyMs, ignore.yawMeanDeg, wrong.honoured));
+    Check("0.5.7 rest diag: frames whose owner moves (5 m/s) are left out (0 rest frames, no episode)", moving.restFrames == 0 && moving.episodes == 0 && moving.frames == 600,
+          F("rest frames %u of %u, episodes %u", moving.restFrames, moving.frames, moving.episodes));
+}
+
 int main() {
     if (std::getenv("R4T2_REPORT")) { r4t2::Report(); return 0; }   // R4 T2: the scratch report (no checks)
     std::printf("-- quaternion math\n");
@@ -2345,10 +2384,11 @@ int main() {
 
     TestOmegaGuard();
     TestCopySteer();
+    TestRestDiag();
 
     // quat 6 + interpolation 2 + extrapolation 6 + snap 5 + framerate 3 + closed loop 3 + steer 5 + W6 7 + W7 typical gap 1
     // + hyper tune kHyperTuneChecks (4 + the profiles and assists) + W9 11 + Sync B 8 (kSyncBChecks as listed in its header) + Sync D kSyncDChecks
-    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks + shaketests::kShakeChecks + ridefree::kRideChecks + kOmegaChecks + kCopySteerChecks;
+    const int expected = 6 + 2 + 6 + 5 + 3 + 3 + 5 + 7 + 1 + kHyperTuneChecks + 11 + 8 + kSyncDChecks + t4::kT4Checks + r3t5::kR3T5Checks + r4t2::kR4T2Checks + shaketests::kShakeChecks + ridefree::kRideChecks + kOmegaChecks + kCopySteerChecks + kRestDiagChecks;
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected) {
         std::printf("FAIL  ran %d checks, expected %d\n", g_run, expected);

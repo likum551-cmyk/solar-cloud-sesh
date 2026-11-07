@@ -430,6 +430,11 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
     if (in.swingActive) swingHoldLeftMs_ = cfg_.swingHoldMs;
     else if (swingHoldLeftMs_ > 0.0) swingHoldLeftMs_ = swingHoldLeftMs_ > dt ? swingHoldLeftMs_ - dt : 0.0;
     const bool swingBlocks = swingHoldLeftMs_ > 0.0;
+    // 0.5.7 loco_swing_walk: a swing on the secondary task slot does not hold a due gait / stand-still issue (the primary task carries the walk)
+    // (swingSecondary describes the newest swing: it also covers the swingHoldMs tail after the probe let go)
+    const bool swingThrough = swingBlocks && cfg_.swingWalkThrough && in.swingSecondary;
+    o.swingWindow = swingBlocks;
+    o.swingThrough = swingThrough;
     const bool blendCfg = cfg_.mode == LocoMode::Blend;
     // R3 T2: a fallback timer that runs out is a level change UP (Recovered): it waits for the hold after the last change and never
     // happens once the cap froze the ladder (the timer then rests at 1 ms: the level stays).
@@ -1035,13 +1040,18 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         mismatchMs_ = 0;
         reevaluate_ = false;      // nothing to keep or re-issue: the stand-still task is the running one
         gaitShown_ = Gait::Still;
-        if (swingBlocks && (lastTask_ != LocoTask::StandStill || forceIssue_))
+        if (swingBlocks && !swingThrough && (lastTask_ != LocoTask::StandStill || forceIssue_))
         {
             o.swingHeld = true;       // R4 T1: held while a melee swing plays (forceIssue_ stays: it goes out afterwards)
             ++stats_.swingHeld;
         }
         else if (lastTask_ != LocoTask::StandStill || forceIssue_)
         {
+            if (swingThrough)
+            {
+                o.swingWalk = true;   // 0.5.7: the primary stand-still under a secondary-slot swing
+                ++stats_.swingWalks;
+            }
             o.task = LocoTask::StandStill;
             o.standStillMs = cfg_.standStillMs;
             lastTask_ = LocoTask::StandStill;
@@ -1265,7 +1275,10 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
 
     // R4 T1: a melee swing animation plays: no task is issued and no stall / turn / drift rule is evaluated (their side effects would repeat on
     // every frame of the swing); forceIssue_ and a pending SoftReset stay, so the task goes out right after
-    if (swingBlocks)
+    // 0.5.7 loco_swing_walk: under a secondary-slot swing only an issue that is due anyway (the task kind changed, a forced re-issue) goes out;
+    // no rule is evaluated (nothing can ask for a repair) and anything else is held as before.
+    const bool swingWalkNow = swingThrough && (forceIssue_ || lastTask_ != (anchorMode ? LocoTask::GoToAnchor : LocoTask::GoStraight));
+    if (swingBlocks && !swingWalkNow)
     {
         o.swingHeld = true;
         ++stats_.swingHeld;
@@ -1302,6 +1315,17 @@ LocoOutput LocomotionController::UpdateImpl(const LocoInput& in)
         issue = false;
         why = LocoWhy::None;
         ++stats_.issuesHeld;
+    }
+    if (swingWalkNow && !issue)
+    {
+        o.swingHeld = true;           // the spacing held it: the swing's hold goes on (no rule evaluation under a swing)
+        ++stats_.swingHeld;
+        return o;
+    }
+    if (swingWalkNow)
+    {
+        o.swingWalk = true;
+        ++stats_.swingWalks;
     }
     // A SoftReset() evaluates the rules now (no minReissueMs wait) but only the position rules: turn, drift, arrival.
     const bool soft = reevaluate_;
