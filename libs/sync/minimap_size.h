@@ -378,7 +378,8 @@ namespace gage::sync {
     // ring_map_zoom (HKCU\Software\GAGE-MP): the SET_RADAR_ZOOM level held every tick while the ring map shows. alloc8or: "zoomLevel ranges from 0 to
     // 1400 in R* Scripts" (0 = the game's own, speed-driven zoom; larger = further out). Unset = kRingMapZoomDefault; "0" = the game's own zoom (no
     // call, the 0.5.3 behaviour); 1..1400 as given; above 1400 held to 1400; anything else the default (why says so).
-    constexpr int kRingMapZoomDefault = 1100, kRingMapZoomMax = 1400;
+    // 0.5.7: default 600 (was 1100). GI after 0.5.3 (the game's own zoom): "make it more zoomed out"; after 0.5.6 at 1100: "too zoomed out".
+    constexpr int kRingMapZoomDefault = 600, kRingMapZoomMax = 1400;
     struct RingZoom
     {
         int level = kRingMapZoomDefault;

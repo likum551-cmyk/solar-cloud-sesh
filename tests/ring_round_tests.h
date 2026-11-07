@@ -24,7 +24,7 @@ namespace ringround_t {
     using namespace gage::sync::ringround;
     namespace hr = gage::sync::hudring;
 
-    constexpr int kChecks = 19;
+    constexpr int kChecks = 20;   // 0.5.7: + F4 (the pinned top-faded mask)
 
     inline bool NearF(double a, double b, double tol) { return std::fabs(a - b) <= tol; }
 
@@ -435,6 +435,40 @@ namespace ringround_t {
                       pn.verdict == PickVerdict::NoMaskShape && !pn.Ok() && p2.verdict == PickVerdict::Ambiguous && !p2.Ok() &&
                       pz.verdict == PickVerdict::Ambiguous && p2i.verdict == PickVerdict::Ambiguous && !p2i.Ok(),
                   PickText(pa) + " | " + PickText(pi) + " | " + PickText(pn) + " | " + PickText(p2) + " | " + PickText(pz) + " | " + PickText(p2i));
+        }
+        // F4. (0.5.7) GI's 0.5.6 census: the small radar's real mask (grey, centre 186, dark edges, 1 mip) failed only the symmetry rule. A mask
+        //     that fades along its top (left-right symmetric, top-bottom not) is refused by shape but passes the basic test, with the asymmetry
+        //     in the top-bottom figure; a pinned hash on such a view picks it (alone, in a census where nothing looks like a mask by shape),
+        //     a pinned hash on a view that fails the basic test (not grey) still does not, and without pins the same census finds no mask
+        {
+            std::vector<Rgba> fade((size_t)512 * 256);
+            for (int y = 0; y < 256; ++y)
+                for (int x = 0; x < 512; ++x)
+                {
+                    const int dl = x < 511 - x ? x : 511 - x, db = 255 - y;
+                    const float tx = dl >= 13 ? 1.0f : dl / 13.0f, tb = db >= 13 ? 1.0f : db / 13.0f, tt = y >= 120 ? 1.0f : y / 120.0f;
+                    float t = tx < tb ? tx : tb;
+                    t = t < tt ? t : tt;
+                    const uint8_t g = (uint8_t)(186.0f * t + 0.5f);
+                    fade[(size_t)y * 512 + (size_t)x] = {g, g, g, 255};
+                }
+            const StockMask f = AnalyzeStockMask(TexFmt::BC1, fade, 512, 256);
+            const bool analysed = !f.ok && f.basic && f.why.find("symmetric") != std::string::npos && f.symX < 0.5 && f.symY > SymTol(f.insideValue) &&
+                                  f.why.find("bands top->bottom") != std::string::npos;
+            const uint64_t pins[1] = {0xdca3116aa8bc65a7ULL};
+            std::vector<CensusEntry> e(12);
+            for (int i = 0; i < 12; ++i)
+                e[(size_t)i] = {0x4000u + (uint64_t)i, true, false, false};
+            e[8].hash = pins[0];
+            e[8].basic = f.basic;
+            std::vector<CensusEntry> notGrey = e;
+            notGrey[8].basic = false;
+            const CensusPick pp = PickMask(e, 0, pins, 1), pg = PickMask(notGrey, 0, pins, 1), pz = PickMask(e, 0, nullptr, 0);
+            Check("ring map round 0.5.7: a top-faded mask is refused by shape but passes the basic test (asymmetry top-bottom, not left-right); a pinned "
+                  "hash picks it from 12 views where none looks like a mask by shape; pinned but not grey -> no mask; no pins -> no mask (the control)",
+                  analysed && pp.verdict == PickVerdict::FoundPinned && pp.index == 8 && pg.verdict == PickVerdict::NoMaskShape && !pg.Ok() &&
+                      pz.verdict == PickVerdict::NoMaskShape && !pz.Ok(),
+                  f.why + " | " + PickText(pp) + " | " + PickText(pg) + " | " + PickText(pz));
         }
         // E1. the blip clip pattern on a synthetic image: unique hit, the flag resolved through the rip-relative displacement; a changed check
         //     byte is refused (the pin is binding)

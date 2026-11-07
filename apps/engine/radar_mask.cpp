@@ -24,9 +24,13 @@ namespace swap = gage::game::brand::swap;
 namespace {
 
 // The stock masks' FNV-1a 64 (over every mip, as logged by "radar mask census (0.5.6): ... stock FNV-1a 64 ..."), once a live census has read
-// them back: a view carrying one of these AND looking like a mask is the mask even when the census is incomplete or ambiguous (PickMask).
-// None yet: 0.5.6 is the first build that reads the masks back. Only hashes go here, never pixels.
-const std::vector<uint64_t> kPinned[2] = {{}, {}};
+// them back: a view carrying one of these AND passing the basic mask test (StockMask::basic: grey, bright centre, dark edges) is the mask even
+// when the census is incomplete or ambiguous (PickMask). Only hashes go here, never pixels.
+// 0.5.7, from GI's 0.5.6 census (gage.log 2026-11-07 08:42-08:43, Legacy, 3 runs agreeing):
+//   radarmasksm: candidate 9 of 12, 512x256 BC1, 1 mip (the only 1-mip view of that size), centre 186, corners 0, edges 0, mirror error 32.3:
+//                refused by the symmetry rule, which is why all three runs kept the 0.5.4 square;
+//   radarmasklg: candidate 137 of 161, 512x512 BC1, 1 mip, centre 181, corners 0, edges 0, mirror error 0.7: found by shape in every run.
+const std::vector<uint64_t> kPinned[2] = {{0xdca3116aa8bc65a7ULL}, {0xe4fd0e88300a76deULL}};
 
 // The formats a stock mask can be in that we can rebuild (ring_round.h TexFmt); the census keeps no other view.
 constexpr uint32_t kFormats[] = {
@@ -203,18 +207,20 @@ int FinishItem(Item& j) {
     s.e.hash = hash;
     s.e.read = true;
     s.e.shape = sm.ok;
+    s.e.basic = sm.basic;
     s.desc = j.desc;
     s.fmt = j.fmt;
-    if (sm.ok) { s.srv = j.srv; j.srv = nullptr; }          // kept for the pick
+    if (sm.basic) { s.srv = j.srv; j.srv = nullptr; }       // kept for the pick (basic: a pinned hash may pick it)
     {
         std::lock_guard<std::mutex> lk(g_mu);
         KindStatus& ks = g_status.k[j.kind];
         ++ks.read;
         if (sm.ok) ++ks.shapes;
     }
-    if (g_verbose || sm.ok)
+    if (g_verbose || sm.basic)
         GLOGI("radar mask census (0.5.6): %s candidate %d of %d: %dx%d %s %d mip(s), bound %llu times, stock FNV-1a 64 %016llx: %s: %s", kTexName[j.kind], j.ordinal,
-              g_total[j.kind], w, h, TexFmtName(j.fmt), levels, (unsigned long long)j.binds, (unsigned long long)hash, sm.ok ? "LOOKS LIKE A MASK" : "not a mask",
+              g_total[j.kind], w, h, TexFmtName(j.fmt), levels, (unsigned long long)j.binds, (unsigned long long)hash,
+              sm.ok ? "LOOKS LIKE A MASK" : (sm.basic ? "not a mask by shape, but grey / bright / dark-edged (a pinned hash may still pick it, 0.5.7)" : "not a mask"),
               sm.why.c_str());
     s.sm = std::move(sm);
     ReleaseItem(j);

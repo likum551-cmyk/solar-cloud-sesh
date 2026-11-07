@@ -569,7 +569,13 @@ namespace gage::sync::ringround {
         Rgba inside, outside;     // the centre's and the corners' average texel
         int insideValue = 0, outsideValue = 0, edgeValue = 0;   // the edge: the mean value along the four sides
         double symErr = 0.0;      // 0.5.6: mean |value - its mirror image's|, left-right and top-bottom averaged (0..255)
+        double symX = 0.0, symY = 0.0;   // 0.5.7: the same, left-right and top-bottom apart (symErr is their mean)
         double flat = 0.0;        // 0.5.6: share of texels at >= kFlatLevel of the centre value (the mask's flat inside)
+        // 0.5.7: grey, a bright centre, dark edges and corners: the part of the shape a PINNED hash still needs. GI's 0.5.6 census (2026-11-07,
+        // Legacy): radarmasksm candidate 9 of 12 (512x256 BC1, 1 mip, the only 1-mip view, like the big mask) read centre 186, corners 0, edges
+        // 0, flat 34 %, mirror error 32.3: the small radar's mask is not mirror-symmetric (GTA fades the small radar along one side), so the
+        // full shape rule refused the real mask and the 0.5.4 square stayed.
+        bool basic = false;
     };
     // 0.5.6 (the census reads back EVERY same-size view the game binds, dozens of 512 x 512 ones): the radar mask is also mirror-symmetric (the
     // 0.5.4 probes: its contour centred within 1.5 px on both axes) and flat inside (a 13 px ramp on a ~190 px box: about 75 % of it at full
@@ -654,26 +660,56 @@ namespace gage::sync::ringround {
                         ++flatN;
                 }
             const double n = (double)w * (double)h;
+            m.symX = sx / n;
+            m.symY = sy / n;
             m.symErr = (sx + sy) / (2.0 * n);
             m.flat = (double)flatN / n;
         }
-        char buf[240];
-        std::snprintf(buf, sizeof(buf), "centre %d (rgba %u %u %u %u), corners %d, edges %d, mirror error %.1f, flat %.0f %%", m.insideValue, m.inside.r,
-                      m.inside.g, m.inside.b, m.inside.a, m.outsideValue, m.edgeValue, m.symErr, m.flat * 100.0);
+        // 0.5.7: where the bright part sits, as the mean value of 8 horizontal bands (top to bottom) and 8 vertical bands (left to right): a
+        // coarse profile so a log line tells which side fades (a few numbers, no pixels)
+        std::string prof;
+        {
+            long rows[8] = {}, cols[8] = {}, rn[8] = {}, cn[8] = {};
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                {
+                    const int v = TexelValue(f, at(x, y));
+                    const int ry = y * 8 / h, cx = x * 8 / w;
+                    rows[ry] += v; ++rn[ry];
+                    cols[cx] += v; ++cn[cx];
+                }
+            char pb[160];
+            int o = std::snprintf(pb, sizeof(pb), ", bands top->bottom");
+            for (int i = 0; i < 8 && o > 0 && o < (int)sizeof(pb); ++i)
+                o += std::snprintf(pb + o, sizeof(pb) - (size_t)o, " %ld", rn[i] ? rows[i] / rn[i] : 0L);
+            if (o > 0 && o < (int)sizeof(pb))
+                o += std::snprintf(pb + o, sizeof(pb) - (size_t)o, ", left->right");
+            for (int i = 0; i < 8 && o > 0 && o < (int)sizeof(pb); ++i)
+                o += std::snprintf(pb + o, sizeof(pb) - (size_t)o, " %ld", cn[i] ? cols[i] / cn[i] : 0L);
+            prof = pb;
+        }
+        char buf[400];
+        std::snprintf(buf, sizeof(buf), "centre %d (rgba %u %u %u %u), corners %d, edges %d, mirror error %.1f (left-right %.1f, top-bottom %.1f), flat %.0f %%%s",
+                      m.insideValue, m.inside.r, m.inside.g, m.inside.b, m.inside.a, m.outsideValue, m.edgeValue, m.symErr, m.symX, m.symY, m.flat * 100.0,
+                      prof.c_str());
         if (!grey(m.inside) || !grey(m.outside))
             m.why = std::string("not grey: ") + buf;
         else if (m.insideValue < 64)
             m.why = std::string("centre too dark for a mask: ") + buf;
         else if (m.outsideValue * 10 > m.insideValue * 6 || m.edgeValue * 10 > m.insideValue * 6)
             m.why = std::string("edges not dark (not a mask shape): ") + buf;
-        else if (m.symErr > SymTol(m.insideValue))
-            m.why = std::string("not mirror-symmetric (not a mask shape): ") + buf;
-        else if (m.flat < kFlatMin)
-            m.why = std::string("not flat inside (a blob, not a mask): ") + buf;
         else
         {
-            m.ok = true;
-            m.why = buf;
+            m.basic = true;
+            if (m.symErr > SymTol(m.insideValue))
+                m.why = std::string("not mirror-symmetric (not a mask shape): ") + buf;
+            else if (m.flat < kFlatMin)
+                m.why = std::string("not flat inside (a blob, not a mask): ") + buf;
+            else
+            {
+                m.ok = true;
+                m.why = buf;
+            }
         }
         return m;
     }
@@ -735,7 +771,8 @@ namespace gage::sync::ringround {
     // Legacy) every view of the masks' sizes was bound in EVERY window, render frames outnumber script ticks ~70 : 1, and 62 + 2 views of those
     // sizes overflowed the 64-entry table: nothing found, the radar hidden for 2.9 s and 1.4 s for nothing. 0.5.6 picks by CONTENT: the bind hook
     // keeps every distinct view of the mask's size (radar_mask.cpp reads each back, no stall) and this rule picks the one that looks like a mask.
-    //   - pinned: a view whose stock hash is a known radar-mask hash AND looks like a mask wins on its own (content identity), even when the census
+    //   - pinned: a view whose stock hash is a known radar-mask hash AND passes the basic mask test (grey, bright centre, dark edges: 0.5.7, the
+    //     symmetry and flatness are not asked of a pinned view, see StockMask::basic) wins on its own (content identity), even when the census
     //     is incomplete or other views look like masks too; two such views = ambiguous;
     //   - otherwise the census must be COMPLETE (no view of that size left unrecorded: past the cap, unplaceable, or not read back), because an
     //     unread view could be a second mask-like one: incomplete = no pick, however many matches;
@@ -745,6 +782,7 @@ namespace gage::sync::ringround {
         uint64_t hash = 0;     // FNV-1a 64 over its mips (valid when read)
         bool read = false;     // read back and analysed
         bool shape = false;    // AnalyzeStockMask says it looks like a mask
+        bool basic = false;    // 0.5.7: StockMask::basic (implied by shape): enough for a view with a pinned hash
     };
     enum class PickVerdict
     {
@@ -790,17 +828,18 @@ namespace gage::sync::ringround {
             if (!e.read)
                 continue;
             ++p.read;
+            if (e.shape || e.basic)
+                for (int k = 0; k < nPins && pins; ++k)
+                    if (pins[k] == e.hash)
+                    {
+                        ++p.pinned;
+                        pinAt = i;
+                        break;
+                    }
             if (!e.shape)
                 continue;
             ++p.shapes;
             shapeAt = i;
-            for (int k = 0; k < nPins && pins; ++k)
-                if (pins[k] == e.hash)
-                {
-                    ++p.pinned;
-                    pinAt = i;
-                    break;
-                }
         }
         if (p.pinned == 1)
         {

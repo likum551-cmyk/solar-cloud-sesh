@@ -892,7 +892,7 @@ namespace minimapsizetest {
                   ok && SameGeometry(m, geo) && !SameGeometry(m, geo2));
         }
         {
-            // ring_map_zoom: unset = 1100, "0" = the game's own zoom, 1..1400 as given (spaces trimmed), above 1400 held, junk = the default.
+            // ring_map_zoom: unset = 600 (0.5.7; 1100 before), "0" = the game's own zoom, 1..1400 as given (spaces trimmed), above 1400 held, junk = the default.
             const RingZoom u = ParseRingMapZoom(L""), z = ParseRingMapZoom(L"0"), a = ParseRingMapZoom(L" 800 "), top = ParseRingMapZoom(L"1400"),
                            hi = ParseRingMapZoom(L"2000");
             const wchar_t* junk[] = {L"abc", L"-5", L"1.5", L"1234567", L"12a"};
@@ -902,8 +902,8 @@ namespace minimapsizetest {
                 const RingZoom r = ParseRingMapZoom(j);
                 junkOk = junkOk && r.level == kRingMapZoomDefault && r.why != nullptr;
             }
-            Check("ring_map_zoom (0.5.4): unset = 1100, 0 = off, ' 800 ' = 800, 1400 = 1400, 2000 held to 1400 (reported), junk = 1100 (reported)",
-                  u.level == 1100 && !u.why && z.level == 0 && !z.why && a.level == 800 && !a.why && top.level == 1400 && !top.why && hi.level == 1400 &&
+            Check("ring_map_zoom (0.5.4, default 0.5.7): unset = 600, 0 = off, ' 800 ' = 800, 1400 = 1400, 2000 held to 1400 (reported), junk = 600 (reported)",
+                  u.level == 600 && !u.why && z.level == 0 && !z.why && a.level == 800 && !a.why && top.level == 1400 && !top.why && hi.level == 1400 &&
                       hi.why && junkOk,
                   Fs("u %d z %d a %d hi %d", u.level, z.level, a.level, hi.level));
         }
