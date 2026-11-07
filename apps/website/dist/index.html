@@ -21,10 +21,10 @@
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="preload" href="/media/still-beach.webp" as="image" fetchpriority="high" />
   <script src="/enter.js"></script>
-  <script type="module" crossorigin src="/assets/main-mTIVRtNb.js"></script>
+  <script type="module" crossorigin src="/assets/main-Dytz01RD.js"></script>
   <link rel="modulepreload" crossorigin href="/assets/store-1fxLXhI_.js">
   <link rel="stylesheet" crossorigin href="/assets/store-Dp7eIqJ-.css">
-  <link rel="stylesheet" crossorigin href="/assets/main-CcPoTIk2.css">
+  <link rel="stylesheet" crossorigin href="/assets/main-BwNR_pUL.css">
 </head>
 <body class="home">
   <a class="skip" href="#download">Skip to download</a>
@@ -92,20 +92,25 @@
       </div>
     </section>
 
-    <!-- 2. What the client and the server do: two rows, picture and text alternating -->
+    <!-- 2. What the client and the server do: three rows, picture and text alternating -->
     <section class="features" id="features" aria-labelledby="features-title">
       <div class="wrap">
         <h2 class="section__title" id="features-title">How SOL plays</h2>
 
         <article class="feat" data-reveal>
-          <figure class="feat__media"><img src="/media/reel-car.webp" alt="A red sports car parked on a Los Santos street at night" width="960" height="540" loading="lazy" decoding="async" /></figure>
+          <figure class="feat__media"><img src="/media/reel-car.webp" srcset="/media/reel-car.webp 960w, /media/vehicle.webp 1600w" sizes="(max-width: 860px) 100vw, 56vw" alt="A red sports car parked on a Los Santos street at dusk" width="960" height="540" loading="lazy" decoding="async" /></figure>
           <div class="feat__text">
             <h3 class="feat__title">Cars look the same on every screen</h3>
             <p>The server checks what every client sends and passes each car's state to everyone near it.</p>
-            <ul class="feat__list">
-              <li>Headlights, high beams, sirens and the horn</li>
-              <li>Steering, tyres, windows and brake lights</li>
+            <ul class="feat__list feat__list--2">
+              <li>Headlights and high beams</li>
+              <li>Sirens and the horn</li>
+              <li>Steering</li>
+              <li>Tyres</li>
+              <li>Windows</li>
+              <li>Brake lights</li>
               <li>Body damage</li>
+              <li>Who sits where</li>
             </ul>
           </div>
         </article>
@@ -120,6 +125,20 @@
               <li>Pockets, a backpack and car trunks</li>
               <li>Drop an item and anyone nearby can pick it up</li>
               <li>The clothes you wear are items too</li>
+            </ul>
+          </div>
+        </article>
+
+        <article class="feat feat--wide" data-reveal>
+          <figure class="feat__media"><img src="/media/still-canal.webp" alt="The Los Santos storm drain at golden hour, empty, the downtown towers ahead" width="1920" height="1080" loading="lazy" decoding="async" /></figure>
+          <div class="feat__text">
+            <h3 class="feat__title">Only players on these streets</h3>
+            <p>The client switches off the game's own crowd for everyone on SOL, so the city is as busy as its players make it.</p>
+            <ul class="feat__list">
+              <li>No pedestrians spawned by the game</li>
+              <li>No AI traffic on the roads</li>
+              <li>No police the game sends after you</li>
+              <li>No trains or random events</li>
             </ul>
           </div>
         </article>
@@ -191,7 +210,7 @@
           </details>
           <details>
             <summary>How does the launcher update?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
-            <p>It updates itself from solar-rp.com and checks the signature of every update before installing it. The SHA-256 of the current installer is listed under the download button below.</p>
+            <p>It updates itself from solar-rp.com and checks the signature of every update before installing it. The SHA-256 of the current installer is listed in the download panel below.</p>
           </details>
           <details>
             <summary>When do LUNA and TERRA open?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
@@ -203,7 +222,7 @@
 
     <!-- 5. Download: one panel on the ground -->
     <section class="download" id="download" aria-labelledby="download-title">
-      <img class="download__bg" src="/media/still-beach.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
+      <img class="download__bg" src="/media/still-skyline.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
       <div class="wrap">
         <div class="close">
           <svg class="close__mark" viewBox="0 0 50 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f3f4f6"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/></svg>
@@ -215,6 +234,11 @@
             <a class="btn btn--xl js-download js-download-main" href="#download" aria-disabled="true"><svg class="btn__icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z" fill="currentColor"/></svg><span class="js-download-label">Download for Windows</span></a>
             <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
             <p class="cta__status js-release-status" role="status"></p>
+          </div>
+          <div class="close__news js-news" hidden>
+            <h3 class="close__news-title"><span class="js-news-title">What's new</span> <time class="close__news-date js-news-date"></time></h3>
+            <ul class="close__news-list js-news-list"></ul>
+            <details class="close__news-more js-news-more" hidden><summary class="js-news-more-label">More</summary><ul class="close__news-list js-news-rest"></ul></details>
           </div>
           <p class="close__hash js-release-hash" hidden>SHA-256 <code class="js-sha"></code></p>
         </div>
@@ -230,7 +254,7 @@
         <a class="js-foot-guest" href="/login/">Log in</a>
         <a class="js-foot-member" href="/account/" hidden>Your account</a>
       </nav>
-      <p class="foot__legal">Solar RP is not affiliated with Rockstar Games or Take-Two Interactive. Footage and artwork: Grand Theft Auto V, &copy; Rockstar Games.</p>
+      <p class="foot__legal">Solar RP is not affiliated with Rockstar Games or Take-Two Interactive. Screenshots: Grand Theft Auto V, &copy; Rockstar Games.</p>
     </div>
   </footer>
 

@@ -1,6 +1,6 @@
 import './base.css';
 import './styles.css';
-import { formatSize, loadRelease, type Release } from './release';
+import { formatIssued, formatSize, loadRelease, splitNotes, type Release } from './release';
 import { describeAge, describeStatus, findServer, loadFraction, loadServers, STATIC_STATUS, type ServerInfo } from './servers';
 import { browserTokenStore } from './account/store';
 import { wireAccountLink } from './account/ui';
@@ -31,6 +31,8 @@ if (MOTION && 'IntersectionObserver' in window) {
 }
 
 /* ---------------------------------------------------------------- release / download */
+
+const NEWS_SHOWN = 5;
 
 function showRelease(r: Release | null) {
   const buttons = $$<HTMLAnchorElement>('.js-download');
@@ -65,6 +67,33 @@ function showRelease(r: Release | null) {
   if (hash && sha) {
     sha.textContent = r.sha256;
     hash.hidden = false;
+  }
+  // the signed release notes, the same text the launcher shows; textContent only (never parsed as markup)
+  // as a list: the first NEWS_SHOWN items, the rest behind "N more", so long notes never stretch the panel
+  const news = $<HTMLElement>('.js-news');
+  const items = splitNotes(r.notes);
+  if (news && items.length > 0) {
+    const title = $<HTMLElement>('.js-news-title', news);
+    const date = $<HTMLTimeElement>('.js-news-date', news);
+    if (title) title.textContent = `What's new in v${r.version}`;
+    if (date) {
+      date.textContent = r.issued ? formatIssued(r.issued) : '';
+      if (r.issued) date.dateTime = r.issued.toISOString();
+    }
+    const fill = (ul: HTMLElement | null, list: string[]) => {
+      if (!ul) return;
+      ul.replaceChildren(...list.map((t) => Object.assign(document.createElement('li'), { textContent: t })));
+    };
+    fill($<HTMLElement>('.js-news-list', news), items.slice(0, NEWS_SHOWN));
+    const rest = items.slice(NEWS_SHOWN);
+    const more = $<HTMLElement>('.js-news-more', news);
+    if (more) {
+      more.hidden = rest.length === 0;
+      fill($<HTMLElement>('.js-news-rest', news), rest);
+      const label = $<HTMLElement>('.js-news-more-label', news);
+      if (label) label.textContent = `${rest.length} more`;
+    }
+    news.hidden = false;
   }
   if (status) status.textContent = '';
 }
