@@ -65,6 +65,19 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
       (`ms` -1 = no reply, or no such row) and updates its own copy of the list; it does
       not re-send the list, so the SPA patches that row itself. A reply whose list was
       refetched meanwhile is dropped. Returns on the first reply (worst case ~1.6 s).
+  `{"type":"queryServers","servers":[{"host":"<string>","port":<int>},...]}`   (0.5.6)
+      The servers native asks with the Solar RP UDP query (net::QueryServer, 1.5 s timeout), all at once, every 5 s,
+      answering each round with one `serverStatus` (below). The player's ping must be measured from the player's PC:
+      the platform's `status.pingMs` is measured from the VPS to a game server on the same VPS, so the SPA never shows
+      it. The SPA sends every listed server with a host, each `host:port` once, whenever that set changes; `[]` stops
+      the queries (native then waits, it does not poll). The list replaces the previous one. Validated at the boundary
+      (apps/launcher/query_targets.h; tests/version_gate_test.cpp): only the first 16 entries are looked at; `host` must
+      be a string that is a DNS name or IPv4 literal (labels of 1..63 `[A-Za-z0-9-]`, at most 253 characters) or a bare
+      IPv6 literal (no brackets), `port` a whole number in 1..65535; a case-insensitive duplicate is dropped. Every
+      dropped entry is logged (`queryServers: entry #<i>: <reason>; dropped`; the entries past 16 in one line,
+      `entry #16-#<last>: <n> over the limit of 16 servers; dropped`) and the rest are kept; a message whose
+      `servers` is not an array is ignored (logged). Demo mode (no API base) ignores the message (logged) and keeps
+      asking the build's test server (`test_server`), as it does from `ready`. Native answers nothing directly.
   `{"type":"launch","server":<serverObj>,"gamePath":"<string>","playerName":"<string>","serverId":"<string>","launchOptions":"<string>"}`
       `serverId` (v8, NATIVE-INTEGRATION 3.3) is the platform's id of the server (`^[a-z0-9][a-z0-9-]{1,31}$`);
       with an API base configured (`settings.apiBase` non-empty) native asks for a join token for it right before
@@ -196,6 +209,16 @@ Alt+Tab, Win11 snap, the minimize animation, the DWM shadow and rounded corners.
   `{"type":"launchStage","stage":"preflight|starting_store|waiting_for_game|injecting|injected"}`   (v8, see `launch`)
   `{"type":"joinTokenNeeded","serverId":"<id>"}`   (v8, see `launch`; the SPA answers `joinToken`)
   `{"type":"game","running":<bool>}`   (true after a successful injection, false when that game exits)
+  `{"type":"serverStatus","servers":[{"host":"<string>","port":<int>,"online":<bool>,"pingMs":<int>,"players":<int>,
+      "maxPlayers":<int>,"protocol":<int>},...]}`
+      One round of UDP queries, every 5 s: the servers of the last `queryServers` (platform mode) or the build's test
+      server (demo mode, from `ready`). `pingMs`, `players`, `maxPlayers` and `protocol` are -1 when `online` is false
+      (no reply within 1.5 s). The SPA matches a result to its list by `host:port` (apps/launcher-ui
+      src/state/serverStatus.ts). Platform mode: the shown ping is `pingMs` only (null until a result, null after a
+      failed one); the API's state and counts stand, because a player who blocks UDP must not see a running server as
+      offline. Demo mode: a result replaces the labelled demo counts and ping; a failed one shows the server offline.
+      gage.log names each server's first result and every online/offline flip: `server status: <host>:<port> online —
+      <n>/<max> players, <ms> ms (proto <p>)` or `server status: <host>:<port> not answering (no UDP reply within 1500 ms)`.
   `settings` also carries `"apiBase":"<url>"` (v8): the platform API base the SPA calls (`<apiBase>/v1/...`): a
       `gage_mp.cfg` `api_base=` line, else the build's `GAGE_API_BASE` (CMake, default `https://solar-rp.com/api`;
       `OFF` builds none). An https origin with an optional plain path, or loopback http; `api_base=off` in the cfg,

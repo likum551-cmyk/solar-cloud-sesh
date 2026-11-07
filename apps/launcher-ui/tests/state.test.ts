@@ -4,7 +4,7 @@ import { authReducer, initialAuth, isLocked, signedOut, type AuthState } from '.
 import { initialLaunch, isBusy, launchReducer, stageLabel, STAGES, type LaunchState } from '../src/state/launch';
 import { formatMoney, showroomModelFor, spentByCurrency, stampFor, vipWindow } from '../src/state/shop';
 import { renderActive } from '../src/ui/hooks';
-import { overlayNativeStatus, type NativeServerStatus } from '../src/state/AppState';
+import { createQueryServersSync, MAX_QUERY_TARGETS, mergeServerStatus, overlayNativeStatus, queryTargets, type NativeServerStatus } from '../src/state/serverStatus';
 import type { Server } from '../src/lib/schemas';
 
 const account: Account = {
@@ -229,31 +229,119 @@ describe('render-pause policy', () => {
   });
 });
 
-describe('server status overlay (real native UDP query over demo counts)', () => {
+describe('server status overlay, demo mode (real native UDP query over demo counts; unchanged by 0.5.6)', () => {
   // The fabricated demo status the mock gives the live server.
   const demo: Server['status'] = { state: 'online', players: 128, maxPlayers: 300, pingMs: 24, protocol: 3, checkedAt: '2026-10-29T12:00:00.000Z' };
   const base: NativeServerStatus = { host: '5.175.253.187', port: 24800, online: true, pingMs: 42, players: 1, maxPlayers: 8, protocol: 3 };
 
   it('replaces the demo counts with the measured ones and marks them live (chip hides)', () => {
-    const s = overlayNativeStatus(demo, base);
+    const s = overlayNativeStatus('demo', demo, base);
     expect(s).toMatchObject({ state: 'online', pingMs: 42, players: 1, maxPlayers: 8, protocol: 3, live: true });
     expect(demo.live).toBeUndefined(); // the demo status is still demo until overlaid
   });
 
   it('an empty server (0 players) is a real count, not "unknown"', () => {
-    const s = overlayNativeStatus(demo, { ...base, players: 0, maxPlayers: 8 });
+    const s = overlayNativeStatus('demo', demo, { ...base, players: 0, maxPlayers: 8 });
     expect(s.players).toBe(0);
     expect(s.live).toBe(true);
   });
 
   it('an offline result clears the counts and goes offline, still marked measured', () => {
-    const s = overlayNativeStatus(demo, { ...base, online: false, pingMs: -1, players: -1, maxPlayers: -1 });
+    const s = overlayNativeStatus('demo', demo, { ...base, online: false, pingMs: -1, players: -1, maxPlayers: -1 });
     expect(s).toMatchObject({ state: 'offline', pingMs: null, players: null, maxPlayers: null, live: true });
   });
 
   it('a field the server did not report (-1) keeps the prior value', () => {
-    const s = overlayNativeStatus(demo, { ...base, players: -1, pingMs: -1 });
+    const s = overlayNativeStatus('demo', demo, { ...base, players: -1, pingMs: -1 });
     expect(s.players).toBe(128); // kept from prev
     expect(s.pingMs).toBeNull(); // online but ping not measured -> null, not a stale demo 24
+  });
+
+  it('(d) with no native measurement the demo status (and its demo ping) is shown as it was', () => {
+    expect(overlayNativeStatus('demo', demo, undefined)).toBe(demo);
+    const list = [server('sol', '5.175.253.187', 24800, demo)];
+    expect(mergeServerStatus('demo', list, {})[0]!.status).toEqual(demo);
+    expect(mergeServerStatus('demo', list, { '5.175.253.187:24800': base })[0]!.status).toMatchObject({ pingMs: 42, players: 1, maxPlayers: 8, live: true });
+  });
+});
+
+/** A listed server with the given status (the rest of the shape does not matter here). */
+function server(id: string, host: string, port: number, status: Server['status']): Server {
+  return { id, name: id.toUpperCase(), region: 'EU', host, port, tags: [], sort: 0, maintenance: { enabled: false, message: null }, comingSoon: false, status };
+}
+
+describe('server status, platform mode (0.5.6: the ping is the player\'s own, never the API\'s)', () => {
+  // What GET /api/v1/servers returns live: the platform pings the game server from the same VPS.
+  const api: Server['status'] = { state: 'online', players: 5, maxPlayers: 1024, pingMs: 3, protocol: 8, checkedAt: '2026-11-07T10:00:00.000Z', live: true };
+  const sol = server('sol', '5.175.253.187', 24800, api);
+  const luna = server('luna', 'luna.solar-rp.com', 24801, { ...api, pingMs: 0 });
+  const soon = server('terra', '', 0, { state: 'unknown', players: null, maxPlayers: null, pingMs: 7, protocol: null, checkedAt: null });
+  const measured: NativeServerStatus = { host: '5.175.253.187', port: 24800, online: true, pingMs: 61, players: 4, maxPlayers: 300, protocol: 8 };
+
+  it('(a) the API pingMs is never shown: null until the launcher measured it, for every server', () => {
+    const out = mergeServerStatus('platform', [sol, luna, soon], {});
+    expect(out.map((s) => s.status.pingMs)).toEqual([null, null, null]);
+    // A measurement for one server does not leak the API ping into the others.
+    const one = mergeServerStatus('platform', [sol, luna], { '5.175.253.187:24800': measured });
+    expect(one.map((s) => s.status.pingMs)).toEqual([61, null]);
+    expect(overlayNativeStatus('platform', api, undefined).pingMs).toBeNull();
+  });
+
+  it('(b) a native result sets the ping; state, players and maxPlayers stay the API\'s', () => {
+    const s = overlayNativeStatus('platform', api, measured);
+    expect(s).toMatchObject({ state: 'online', pingMs: 61, players: 5, maxPlayers: 1024, protocol: 8 });
+    const out = mergeServerStatus('platform', [sol], { '5.175.253.187:24800': measured });
+    expect(out[0]!.status).toMatchObject({ state: 'online', pingMs: 61, players: 5, maxPlayers: 1024 });
+    // An answer with no round trip (-1) is no ping, not a stale API one.
+    expect(overlayNativeStatus('platform', api, { ...measured, pingMs: -1 }).pingMs).toBeNull();
+  });
+
+  it('(c) a failed native query keeps the API\'s state and counts and only nulls the ping', () => {
+    const failed: NativeServerStatus = { ...measured, online: false, pingMs: -1, players: -1, maxPlayers: -1, protocol: -1 };
+    const s = overlayNativeStatus('platform', api, failed);
+    expect(s).toEqual({ ...api, pingMs: null });
+    const offlineApi: Server['status'] = { ...api, state: 'offline', players: null, maxPlayers: null };
+    expect(overlayNativeStatus('platform', offlineApi, measured)).toEqual({ ...offlineApi, pingMs: 61 }); // the API's offline stands too
+  });
+});
+
+describe('queryServers (0.5.6: which servers the launcher pings, sent only when the set changes)', () => {
+  function sink() {
+    const sent: Array<{ type: 'queryServers'; servers: Array<{ host: string; port: number }> }> = [];
+    return { sent, sync: createQueryServersSync((m) => sent.push(m)) };
+  }
+  const api: Server['status'] = { state: 'online', players: 5, maxPlayers: 1024, pingMs: 3, protocol: 8, checkedAt: null };
+
+  it('(e) sends the list\'s host:port pairs (no host, no send; each pair once)', () => {
+    const { sent, sync } = sink();
+    sync([server('sol', '5.175.253.187', 24800, api), server('luna', '', 0, api), server('terra', 'terra.solar-rp.com', 24802, api), server('sol2', '5.175.253.187', 24800, api)]);
+    expect(sent).toEqual([{ type: 'queryServers', servers: [{ host: '5.175.253.187', port: 24800 }, { host: 'terra.solar-rp.com', port: 24802 }] }]);
+  });
+
+  it('(e) re-sends only when the host:port set changes, not on every refetch or reorder', () => {
+    const { sent, sync } = sink();
+    sync([]); // the list before the first fetch
+    expect(sent).toHaveLength(0);
+    const a = server('sol', '5.175.253.187', 24800, api);
+    const b = server('luna', 'luna.solar-rp.com', 24801, api);
+    sync([a]);
+    sync([server('sol', '5.175.253.187', 24800, { ...api, players: 9 })]); // a refetch: same server, new objects and counts
+    sync([a]);
+    expect(sent).toHaveLength(1);
+    sync([b, a]);            // LUNA goes live
+    sync([a, b]);            // the same set in another order
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.servers).toEqual([{ host: '5.175.253.187', port: 24800 }, { host: 'luna.solar-rp.com', port: 24801 }]);
+    sync([{ ...b, port: 24811 }, a]); // a port change is a change
+    expect(sent).toHaveLength(3);
+    sync([]);                // the list emptied: native stops asking
+    expect(sent).toHaveLength(4);
+    expect(sent[3]!.servers).toEqual([]);
+  });
+
+  it('caps the list at 16 and skips a port native would refuse', () => {
+    const many = Array.from({ length: 20 }, (_, i) => server(`s${i}`, `s${String(i).padStart(2, '0')}.solar-rp.com`, 24800, api));
+    expect(queryTargets(many)).toHaveLength(MAX_QUERY_TARGETS);
+    expect(queryTargets([server('x', 'x.com', 0, api), server('y', 'y.com', 70000, api)])).toEqual([]);
   });
 });

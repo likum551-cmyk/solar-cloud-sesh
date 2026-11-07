@@ -9,6 +9,7 @@ import { createMockFetch, scenarioFromQuery } from '../lib/mock-api';
 import type { Server } from '../lib/schemas';
 import { authReducer, initialAuth, type AuthState, type AuthEvent } from './auth';
 import { initialLaunch, isBusy, launchReducer, type LaunchState } from './launch';
+import { createQueryServersSync, mergeServerStatus, statusKey, type NativeServerStatus, type StatusMode } from './serverStatus';
 import { deriveUpdateView, initialUpdateGate, updateGateReducer, type UpdateView } from './updatePopup';
 
 // The app's single state owner: bridge, API client, auth, launch, local settings, window state
@@ -77,30 +78,6 @@ export function useApp(): AppValue {
 
 const DEMO_TOKEN = 'demo-session-token-0123456789abcdef';
 
-/** One server's real status from a native UDP query (bridge `serverStatus`), keyed by host:port. */
-export type NativeServerStatus = { host: string; port: number; online: boolean; pingMs: number; players: number; maxPlayers: number; protocol?: number };
-
-/**
- * Overlay a real native measurement onto a server's status, replacing the fabricated demo counts.
- * `live: true` marks the numbers as really measured so the UI drops the "Demo counts" chip. A
- * field the server did not report (-1) keeps its prior value; an offline result clears the counts.
- */
-export function overlayNativeStatus(prev: Server['status'], r: NativeServerStatus): Server['status'] {
-  if (!r.online) {
-    return { ...prev, state: 'offline', pingMs: null, players: null, maxPlayers: null, protocol: null, checkedAt: new Date().toISOString(), detail: 'timeout', live: true };
-  }
-  return {
-    ...prev,
-    state: 'online',
-    pingMs: r.pingMs >= 0 ? r.pingMs : null,
-    players: r.players >= 0 ? r.players : prev.players,
-    maxPlayers: r.maxPlayers >= 0 ? r.maxPlayers : prev.maxPlayers,
-    protocol: r.protocol ?? prev.protocol,
-    checkedAt: new Date().toISOString(),
-    live: true,
-  };
-}
-
 function makeBridge(search: string): Bridge {
   const wv = nativeWebView();
   if (wv) return createNativeBridge(wv);
@@ -146,7 +123,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [windowState, setWindowState] = useState<WindowState>({ focused: true, visible: true, maximized: false });
   const [gameRunning, setGameRunning] = useState(false);
   const [servers, setServers] = useState<ServersState>({ status: 'loading', servers: [], error: null, offline: false, fetchedAt: null });
-  // Real server status from native UDP queries (demo mode), overlaid onto the list by host:port.
+  // Real server status from native UDP queries, overlaid onto the list by host:port (state/serverStatus.ts).
   const [nativeStatus, setNativeStatus] = useState<Record<string, NativeServerStatus>>({});
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   const [bootNonce, setBootNonce] = useState(0);
@@ -175,7 +152,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           if (m.servers.length === 0) break;
           setNativeStatus((prev) => {
             const next = { ...prev };
-            for (const r of m.servers) next[`${r.host}:${r.port}`] = r;
+            for (const r of m.servers) next[statusKey(r.host, r.port)] = r;
             return next;
           });
           break;
@@ -399,17 +376,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     bridge.send({ type: 'openExternal', url });
   }, [bridge]);
 
-  // The list screens read: the fetched servers with any real native status overlaid by host:port
-  // (demo mode). Nothing to overlay (no native host, or a coming-soon server with no host) is a
-  // no-op, so platform mode and the browser are unaffected.
-  const mergedServers = useMemo(() => {
-    if (Object.keys(nativeStatus).length === 0) return servers.servers;
-    return servers.servers.map((s) => {
-      if (!s.host) return s;
-      const r = nativeStatus[`${s.host}:${s.port}`];
-      return r ? { ...s, status: overlayNativeStatus(s.status, r) } : s;
-    });
-  }, [servers.servers, nativeStatus]);
+  // Ask native to UDP-query every listed server (bridge `queryServers`) whenever the list's host:port set changes:
+  // the ping a player sees is measured from this PC (native `serverStatus`), never the platform's own.
+  const syncQueryServers = useMemo(() => createQueryServersSync((m) => bridge.send(m)), [bridge]);
+  useEffect(() => { syncQueryServers(servers.servers); }, [syncQueryServers, servers.servers]);
+
+  // The list screens read: the fetched servers with the native measurements applied by host:port (state/serverStatus.ts):
+  // in platform mode only the ping comes from native (null until measured), in demo mode an answer replaces the demo counts.
+  const statusMode: StatusMode = demo ? 'demo' : 'platform';
+  const mergedServers = useMemo(() => mergeServerStatus(statusMode, servers.servers, nativeStatus), [statusMode, servers.servers, nativeStatus]);
   const mergedServersState = useMemo<ServersState>(() => ({ ...servers, servers: mergedServers }), [servers, mergedServers]);
 
   const value: AppValue = {

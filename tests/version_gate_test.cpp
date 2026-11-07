@@ -17,6 +17,7 @@
 
 #include "../apps/launcher/version_gate.h"
 #include "../apps/launcher/api_base.h"
+#include "../apps/launcher/query_targets.h"
 #include "protocol/protocol.h"
 #include "protocol/query.h"
 
@@ -266,7 +267,64 @@ int main() {
               ab::IsOff(L"off") && ab::IsOff(L"OFF") && ab::IsOff(L"None") && !ab::IsOff(L"") && !ab::IsOff(L"https://solar-rp.com/api"));
     }
 
+    // ---- 0.5.6: the servers the status worker queries (bridge queryServers, apps/launcher/query_targets.h) ------------
+    {
+        namespace qt = gage::qtargets;
+        auto raw = [](const std::string& host, double port) { qt::Raw r; r.hostIsString = true; r.host = host; r.portIsNumber = true; r.port = port; return r; };
+        auto keys = [](const qt::Result& r) { std::string s; for (const qt::Target& t : r.targets) s += t.Key() + " "; return s; };
+
+        const qt::Result ok = qt::Validate({raw("5.175.253.187", 24800), raw("luna.solar-rp.com", 24801), raw("2001:db8::1", 24802),
+                                            raw("::1", 1), raw("::ffff:10.0.0.1", 65535)});
+        Check("query targets: an IPv4 literal, a DNS name, bare IPv6 literals and the port bounds 1 / 65535 are kept, in order",
+              ok.dropped.empty() && keys(ok) == "5.175.253.187:24800 luna.solar-rp.com:24801 2001:db8::1:24802 ::1:1 ::ffff:10.0.0.1:65535 ");
+
+        // 63 + 1 + 63 + 1 + 63 + 1 + 61 = 253 characters, every label legal; one more letter in the last label is 254.
+        const std::string name253 = std::string(250, 'a').insert(63, ".").insert(127, ".").insert(191, ".");
+        const qt::Result longHost = qt::Validate({raw(name253, 24800), raw(name253 + "a", 24800), raw(std::string(64, 'a') + ".com", 24800)});
+        Check("query targets: a 253-character name of legal labels is kept; the same name at 254 characters and a 64-character label are dropped",
+              name253.size() == 253 && longHost.targets.size() == 1 && longHost.targets[0].host.size() == 253 && longHost.dropped.size() == 2 &&
+                  longHost.dropped[0].rfind("#1: host", 0) == 0 && longHost.dropped[1].rfind("#2: host", 0) == 0);
+
+        const qt::Result badHost = qt::Validate({raw("", 1), raw("evil host", 1), raw("a..b", 1), raw(".a", 1), raw("a.", 1), raw("-a.com", 1),
+                                                 raw("a-.com", 1), raw("[::1]", 1), raw(":::1", 1), raw("1::2::3", 1), raw("1:2:3:4:5:6:7:8:9", 1),
+                                                 raw("g::1", 1), raw("host:24800", 1), raw("a/b", 1), raw(std::string("caf") + (char)0xC3 + (char)0xA9, 1),
+                                                 raw(std::string("a\0b", 3), 1), raw("http://x.com", 1)});
+        Check("query targets: an empty host, a space, an empty / edge-hyphen label, brackets, a bad IPv6 shape, host:port, a slash, non-ASCII, NUL and a URL are dropped",
+              badHost.targets.empty() && badHost.dropped.size() == 17);
+
+        qt::Raw notString = raw("x.com", 1); notString.hostIsString = false;
+        qt::Raw notNumber = raw("x.com", 1); notNumber.portIsNumber = false;
+        const qt::Result badPort = qt::Validate({raw("x.com", 0), raw("x.com", 65536), raw("x.com", -1), raw("x.com", 24800.5),
+                                                 raw("x.com", std::nan("")), raw("x.com", 1e300), notString, notNumber});
+        Check("query targets: port 0, 65536, -1, 24800.5, NaN, 1e300, a non-string host and a non-number port are dropped",
+              badPort.targets.empty() && badPort.dropped.size() == 8 && badPort.dropped[6] == "#6: host is not a string" &&
+                  badPort.dropped[7] == "#7: port is not a whole number in 1..65535");
+
+        std::vector<qt::Raw> many;
+        for (int i = 0; i < 20; ++i) many.push_back(raw("s" + std::to_string(i) + ".solar-rp.com", 24800));
+        const qt::Result capped = qt::Validate(many);
+        Check("query targets: 20 entries keep the first 16 and drop the last 4 as over the limit, in one log line",
+              capped.targets.size() == qt::kMaxTargets && capped.targets.back().host == "s15.solar-rp.com" && capped.dropped.size() == 1 &&
+                  capped.dropped[0] == "#16-#19: 4 over the limit of 16 servers");
+        std::vector<qt::Raw> flood(5000, raw("x.com", 1));
+        Check("query targets: a 5000-entry list of one server is one target and 16 log lines (15 duplicates, one over-limit line), not 5000",
+              qt::Validate(flood).targets.size() == 1 && qt::Validate(flood).dropped.size() == 16 &&
+                  qt::Validate(flood).dropped.back() == "#16-#4999: 4984 over the limit of 16 servers");
+
+        std::vector<qt::Raw> badFirst(16, raw("bad host", 1));
+        badFirst.push_back(raw("late.solar-rp.com", 24800));
+        const qt::Result late = qt::Validate(badFirst);
+        Check("query targets: the cap counts entries, not valid ones (16 bad, then a good 17th: nothing kept)", late.targets.empty() && late.dropped.size() == 17);
+
+        const qt::Result dups = qt::Validate({raw("SOL.solar-rp.com", 24800), raw("sol.solar-rp.com", 24800), raw("sol.solar-rp.com", 24801)});
+        Check("query targets: a case-insensitive duplicate host:port is dropped; the same host on another port is kept",
+              keys(dups) == "SOL.solar-rp.com:24800 sol.solar-rp.com:24801 " && dups.dropped.size() == 1 && dups.dropped[0] == "#1: a duplicate of an earlier server");
+
+        Check("query targets: an empty list is valid and empty (the SPA clears what the worker polls)",
+              qt::Validate({}).targets.empty() && qt::Validate({}).dropped.empty());
+    }
+
     std::printf("CHECKS %d FAILED %d\n", g_run, g_fail);
-    if (g_run < 66) { std::printf("FAIL  expected at least 66 checks, ran %d\n", g_run); return 1; }
+    if (g_run < 75) { std::printf("FAIL  expected at least 75 checks, ran %d\n", g_run); return 1; }
     return g_fail == 0 ? 0 : 1;
 }

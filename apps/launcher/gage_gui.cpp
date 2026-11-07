@@ -57,6 +57,7 @@
 #include "updater.h"
 #include "pack_sync.h"
 #include "api_base.h"     // v8: the platform API base check (pure; tests/version_gate_test.cpp)
+#include "query_targets.h"  // 0.5.6: the queryServers boundary check (pure; tests/version_gate_test.cpp)
 #include "version_gate.h"  // the lockstep policy: protocol gate, every update mandatory, check timing (pure; tests/version_gate_test.cpp)
 #include "build_config.h"  // generated: GAGE_UPDATE_URL, GAGE_UPDATE_PUBKEY
 #include "ui_html.h"  // generated: embedded SPA bytes (kUiHtml / kUiHtmlLen)
@@ -1517,56 +1518,146 @@ static bool UpdateBlocksLaunch(std::wstring* text) {
     return true;
 }
 
-// Real server status (demo mode): the SPA's live server (servers.ts) is the GAGE VPS, whose
-// counts and ping a TCP ping cannot read (ENet/UDP). A background thread sends the real GAGE
-// UDP query (net::QueryServer) to the test server every few seconds and marshals the result to
-// the SPA as {"type":"serverStatus",...}, which the UI overlays onto the matching server,
-// replacing the fabricated demo counts. A configured platform API supplies its own status, so
-// this runs in demo mode only. Started once from the SPA's `ready`; the thread lives with the
-// process (detached), and a post to a gone window simply drops (PostJsonFromWorker).
+// Real server status by the GAGE UDP query (net::QueryServer): the player's own ping to each server, which only this
+// PC can measure (the platform API's status.pingMs is measured from the VPS, to a game server on the same VPS). One
+// background thread for the process asks every server in g_status.targets at once, every kServerStatusPeriodMs, and
+// marshals the round to the SPA as {"type":"serverStatus",...}; the SPA overlays it by host:port (BRIDGE.md).
+//   * platform mode (an API base): the targets are the SPA's own list, sent with `queryServers` whenever its host:port
+//     set changes (validated in query_targets.h). The SPA shows only this ping; the API's state and counts stand.
+//   * demo mode: the target is the build's test server (set on `ready`, as before 0.5.6) and `queryServers` is
+//     ignored; the result replaces the fabricated demo counts, and an answer also feeds the update ping
+//     (WM_SERVER_PROTO), as before.
+// The thread waits on g_status.cv while the list is empty (no polling), wakes early when the list changes, lives with
+// the process (detached), and a post to a gone window simply drops (PostJsonFromWorker).
 static const int kServerStatusPeriodMs = 5000;
+static const int kServerStatusTimeoutMs = 1500;
+static struct {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<qtargets::Target> targets;   // guarded by mu
+    uint64_t gen = 0;                         // bumped on every change of targets (guarded by mu)
+    bool demo = false;                        // the list is the demo test server (guarded by mu)
+    bool started = false;                     // the worker thread exists (guarded by mu)
+} g_status;
+
+static void ServerStatusWorker() {
+    std::map<std::string, bool> lastOnline;   // per host:port, for the first-result / flip log lines
+    for (;;) {
+        std::vector<qtargets::Target> targets;
+        uint64_t gen = 0;
+        bool demo = false;
+        {
+            std::unique_lock<std::mutex> lk(g_status.mu);
+            g_status.cv.wait(lk, [] { return !g_status.targets.empty(); });
+            targets = g_status.targets;
+            gen = g_status.gen;
+            demo = g_status.demo;
+        }
+        // Every server at once (at most qtargets::kMaxTargets threads, each at most kServerStatusTimeoutMs), so one
+        // silent server never delays the others' ping by a whole timeout.
+        std::vector<net::QueryResult> res(targets.size());
+        std::vector<char> ok(targets.size(), 0);
+        std::vector<std::thread> asks;
+        asks.reserve(targets.size());
+        for (size_t i = 0; i < targets.size(); ++i)
+            asks.emplace_back([&targets, &res, &ok, i]() {
+                ok[i] = net::QueryServer(Widen(targets[i].host), targets[i].port, kServerStatusTimeoutMs, res[i]) ? 1 : 0;
+            });
+        for (std::thread& t : asks) t.join();
+
+        std::string json = "{\"type\":\"serverStatus\",\"servers\":[";
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const qtargets::Target& t = targets[i];
+            const net::QueryResult& q = res[i];
+            const bool up = ok[i] != 0;
+            // Log the first result and every online<->offline flip per server (not every poll), so gage.log proves
+            // the real ping without reading the UI.
+            auto seen = lastOnline.find(t.Key());
+            if (seen == lastOnline.end() || seen->second != up) {
+                if (up)
+                    GLOGI("server status: %s online — %d/%d players, %d ms (proto %d)", t.Key().c_str(), q.players, q.maxPlayers, q.ms, q.protocol);
+                else
+                    GLOGW("server status: %s not answering (no UDP reply within %d ms)", t.Key().c_str(), kServerStatusTimeoutMs);
+                lastOnline[t.Key()] = up;
+            }
+            if (i) json += ",";
+            json += "{\"host\":" + jEsc(t.host) +
+                    ",\"port\":" + numStr(t.port) +
+                    ",\"online\":" + std::string(up ? "true" : "false") +
+                    ",\"pingMs\":" + numStr(up ? q.ms : -1) +
+                    ",\"players\":" + numStr(up ? q.players : -1) +
+                    ",\"maxPlayers\":" + numStr(up ? q.maxPlayers : -1) +
+                    ",\"protocol\":" + numStr(up ? q.protocol : -1) + "}";
+            // Demo mode (unchanged): the UI thread compares the protocol and the latest client the test server reports
+            // (the update ping) with ours; a server ahead of this launcher in either starts an update check (rate limited
+            // there). Platform mode keeps its update checks to the 2-minute poll and PLAY, as in 0.5.3-0.5.5.
+            if (demo && up && q.protocol > 0 && g_hwnd) PostMessageW(g_hwnd, WM_SERVER_PROTO, (WPARAM)q.protocol, (LPARAM)q.latestClient);
+        }
+        json += "]}";
+        PostJsonFromWorker(json);
+
+        std::unique_lock<std::mutex> lk(g_status.mu);
+        g_status.cv.wait_for(lk, std::chrono::milliseconds(kServerStatusPeriodMs), [gen] { return g_status.gen != gen; });
+    }
+}
+
+// Replace what the worker polls (UI thread), starting the worker on the first non-empty list.
+static void SetStatusTargets(std::vector<qtargets::Target> targets, bool demo) {
+    std::string list;
+    for (const qtargets::Target& t : targets) list += (list.empty() ? "" : ", ") + t.Key();
+    {
+        std::lock_guard<std::mutex> lk(g_status.mu);
+        g_status.targets = std::move(targets);
+        g_status.demo = demo;
+        ++g_status.gen;
+        if (!g_status.targets.empty() && !g_status.started) {
+            g_status.started = true;
+            std::thread(ServerStatusWorker).detach();
+        }
+    }
+    g_status.cv.notify_all();
+    if (list.empty()) GLOGI("server status: no server to query (%s)", demo ? "demo" : "platform");
+    else GLOGI("server status: polling %s by UDP query every %d ms (%s)", list.c_str(), kServerStatusPeriodMs, demo ? "demo test server" : "the SPA's list");
+}
+
+// `ready`: demo mode polls the build's test server, as before 0.5.6. Platform mode waits for the SPA's `queryServers`.
 static void StartServerStatusWorker() {
-    if (!GetApiBase().empty()) return;   // platform mode: status comes from the API
+    if (!GetApiBase().empty()) return;   // platform mode: the SPA names the servers (queryServers)
     ServerInfo test;
     if (!GetTestServer(&test)) return;   // nothing live to query in this build
-    static std::atomic<bool> started{false};
-    if (started.exchange(true)) return;  // one worker for the process, survives SPA reloads
-    const std::wstring host = test.host;
-    const int port = test.port;
-    GLOGI("server status: polling %s:%d by UDP query every %d ms", Narrow(host).c_str(), port, kServerStatusPeriodMs);
-    std::thread([host, port]() {
-        bool firstResult = true, lastOnline = false;
-        for (;;) {
-            net::QueryResult q;
-            const bool ok = net::QueryServer(host, port, 1500, q);
-            // Log the first result and every online<->offline flip (not every poll),
-            // so the log proves the real ping without reading the UI.
-            if (firstResult || ok != lastOnline) {
-                if (ok)
-                    GLOGI("server status: %s:%d online — %d/%d players, %d ms (proto %d)",
-                          Narrow(host).c_str(), port, q.players, q.maxPlayers, q.ms, q.protocol);
-                else
-                    GLOGW("server status: %s:%d not answering (no UDP reply within 1500 ms)",
-                          Narrow(host).c_str(), port);
-                firstResult = false;
-                lastOnline = ok;
-            }
-            std::string json = "{\"type\":\"serverStatus\",\"servers\":[{"
-                "\"host\":" + jStrW(host) +
-                ",\"port\":" + numStr(port) +
-                ",\"online\":" + std::string(ok ? "true" : "false") +
-                ",\"pingMs\":" + numStr(ok ? q.ms : -1) +
-                ",\"players\":" + numStr(ok ? q.players : -1) +
-                ",\"maxPlayers\":" + numStr(ok ? q.maxPlayers : -1) +
-                ",\"protocol\":" + numStr(ok ? q.protocol : -1) +
-                "}]}";
-            PostJsonFromWorker(json);
-            // The UI thread compares the protocol and the latest client the server reports (the update ping) with ours;
-            // a server ahead of this launcher in either starts an update check (rate limited there).
-            if (ok && q.protocol > 0 && g_hwnd) PostMessageW(g_hwnd, WM_SERVER_PROTO, (WPARAM)q.protocol, (LPARAM)q.latestClient);
-            Sleep(kServerStatusPeriodMs);
+    {
+        std::lock_guard<std::mutex> lk(g_status.mu);
+        if (g_status.demo && !g_status.targets.empty()) return;   // already polling it; survives SPA reloads
+    }
+    SetStatusTargets({qtargets::Target{Narrow(test.host), test.port}}, true);
+}
+
+// `queryServers` (BRIDGE.md): the SPA's list of servers to ask by UDP query, validated at the boundary (query_targets.h).
+static void OnQueryServers(const JVal* servers) {
+    if (!GetApiBase().empty()) {
+        if (!servers || servers->t != JVal::Arr) {
+            GLOGW("queryServers: `servers` is not an array; ignored");
+            return;
         }
-    }).detach();
+        std::vector<qtargets::Raw> raw;
+        raw.reserve(std::min(servers->a.size(), qtargets::kMaxTargets + 1));
+        for (size_t i = 0; i < servers->a.size(); ++i) {
+            const JVal& e = servers->a[i];
+            qtargets::Raw r;
+            const JVal* h = jGet(&e, "host");
+            const JVal* p = jGet(&e, "port");
+            r.hostIsString = h && h->t == JVal::Str;
+            if (r.hostIsString) r.host = h->s;
+            r.portIsNumber = p && p->t == JVal::Num;
+            if (r.portIsNumber) r.port = p->n;
+            raw.push_back(std::move(r));
+        }
+        qtargets::Result v = qtargets::Validate(raw);
+        for (const std::string& why : v.dropped) GLOGW("queryServers: entry %s; dropped", why.c_str());
+        SetStatusTargets(std::move(v.targets), false);
+        return;
+    }
+    GLOGI("queryServers: demo mode polls the test server only; ignored");
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,6 +1978,8 @@ static void Dispatch(const std::string& json) {
         else KickUpdate();
     } else if (type == "fetch" || type == "refresh") {
         KickFetch();
+    } else if (type == "queryServers") {
+        OnQueryServers(jGet(&v, "servers"));
     } else if (type == "ping") {
         StartPing((int)jNum(jGet(&v, "row"), -1));
     } else if (type == "launch") {
