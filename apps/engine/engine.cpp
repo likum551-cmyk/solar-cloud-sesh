@@ -850,7 +850,7 @@ namespace {
     std::atomic<bool>  g_ringMapBig{true};            // 0.5.4 ring_map_big: the placement also written to the big radar's slots (MinimapReadSwitches)
     std::atomic<int>   g_ringMapZoom{sync::kRingMapZoomDefault};   // 0.5.4 ring_map_zoom: SET_RADAR_ZOOM level each tick, 0 = the game's own zoom
     std::atomic<bool>  g_ringMapRound{true};          // 0.5.5 ring_map_round: GTA's radar clipped round by our mask, the map grown to the arcs
-    std::atomic<bool>  g_ringBlipClip{true};          // 0.5.5 ring_map_blip_clip: off-radar blips clamp to the circle while the map is round
+    std::atomic<bool>  g_ringBlipClip{false};          // 0.5.5 ring_map_blip_clip: off-radar blips clamp to the circle while the map is round
     std::atomic<float> g_ringFitX{sync::ringround::kBoxFitX}, g_ringFitY{sync::ringround::kBoxFitY};   // 0.5.5 ring_map_round_fit
     std::atomic<bool>  g_overlayCombatBlock{true};    // 0.5.4 overlay_combat_block (sync/overlay_input.h)
     bool               g_overlayCombatLogged = false; // script tick only
@@ -897,10 +897,11 @@ namespace {
         }
         // 0.5.5 (GI 2026-11-07: "fill out the current design HUD circle to the point where it doesn't go over hp and satiety and there's no gap
         // either"). ring_map_round (default on; 0 = the 0.5.4 map): the radar's own mask texture is swapped for a circle (radar_mask.h) and, only
-        // while that swap is confirmed by the bind hook, the map grows to the arcs. ring_map_blip_clip (default on; 0 = blips clamp to the square's
-        // edge as before): FiveM's minimapIsRect flag set to round while the map is round. ring_map_round_fit = "fx,fy": the radar box fit.
+        // while that swap is confirmed by the bind hook, the map grows to the arcs. ring_map_blip_clip (default OFF for the first live round, one
+        // live-unverified change at a time; 1 = FiveM's minimapIsRect flag set to round while the map is round, so blips clamp to the circle
+        // instead of the square's edge). ring_map_round_fit = "fx,fy": the radar box fit.
         g_ringMapRound.store(reg::Get(L"ring_map_round") != L"0");
-        g_ringBlipClip.store(reg::Get(L"ring_map_blip_clip") != L"0");
+        g_ringBlipClip.store(reg::Get(L"ring_map_blip_clip") == L"1");
         const sync::ringround::BoxFit fit = sync::ringround::ParseBoxFit(reg::Get(L"ring_map_round_fit"));
         g_ringFitX.store(fit.fx);
         g_ringFitY.store(fit.fy);
@@ -909,7 +910,7 @@ namespace {
         GLOGI("engine: ring map round mask (0.5.5): ring_map_round=%s; ring_map_blip_clip=%s; ring_map_round_fit=%.3f,%.3f (%s%s)",
               g_ringMapRound.load() ? "on (the radar's mask swapped for a circle, the map grown to the arcs once the swap is confirmed; LIVE-UNVERIFIED)"
                                     : "OFF (the 0.5.4 map: the square's inscribed circle)",
-              g_ringBlipClip.load() ? "on (blips clamp to the circle while the map is round; LIVE-UNVERIFIED)" : "OFF",
+              g_ringBlipClip.load() ? "on (blips clamp to the circle while the map is round; LIVE-UNVERIFIED)" : "off (default; 1 = blips clamp to the circle)",
               (double)fit.fx, (double)fit.fy, fit.overridden ? "override" : "default, from the 0.5.4 radar probes", fit.why ? fit.why : "");
         g_overlayCombatBlock.store(reg::Get(L"overlay_combat_block") != L"0");
         GLOGI("engine: overlay input (0.5.4): overlay_combat_block=%s", g_overlayCombatBlock.load()
