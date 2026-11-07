@@ -1013,6 +1013,18 @@ const HashMapping kCrossmap3889[] = {
     {native::DISABLE_PLAYER_FIRING,                               0xEF387B90B8B97EDA},
     {native::HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME,        0xF25C7C5177203507},
     {native::GET_FRAME_COUNT,                                     0x8034325BF6D6E41F},
+    // 0.5.8 inv_ped_mode: YimMenu b3889 crossmap, each AGREEING with YimMenuV2 enhanced (and legacy) by name and signature; public hashes in hook.h.
+    {native::CLONE_PED,                                           0xEA797D2F13BCD0AA},
+    {native::GIVE_PED_TO_PAUSE_MENU,                              0x1D16BFDD94C0AE8F},
+    {native::CLEAR_PED_IN_PAUSE_MENU,                             0x86CB46F43269108A},
+    {native::SET_PAUSE_MENU_PED_LIGHTING,                         0xA6B472383DA6AE23},
+    {native::SET_PAUSE_MENU_PED_SLEEP_STATE,                      0xE98A31D3C1927ED6},
+    {native::SET_FRONTEND_ACTIVE,                                 0x7946F7681E9E1D79},
+    {native::GET_CURRENT_FRONTEND_MENU_VERSION,                   0x470CC97DB37CB63B},
+    {native::SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU,                0xA66AC5949E305457},
+    {native::SET_MOUSE_CURSOR_VISIBLE,                            0x26BBBC01C3E132A7},
+    {native::GET_HUD_COLOUR,                                      0xA306E6FD2A6558E6},
+    {native::REPLACE_HUD_COLOUR_WITH_RGBA,                        0x2BC0725CAF2E0D6B},
     // Probes for the table dump report only.
     {0x1090044AD1DA76FA /* TERMINATE_THIS_THREAD */, 0xBBC29EBE6E1A48FA},
     {0x7239B21A38F536BA /* DOES_ENTITY_EXIST */,     0xFC8BFE4B41177C22},
@@ -5274,6 +5286,78 @@ int World::FollowPedCamViewMode() {
 bool World::IsPedGettingIntoVehicle(int32_t ped) { return callPedBool(*this, native::IS_PED_GETTING_INTO_A_VEHICLE, ped); }
 
 // ---------------------------------------------------------------------------
+// 0.5.8 inv_ped_mode: the inventory's ped preview on GTA's frontend ped renderer (libs/sync/ped_preview.h). Script tick only.
+// ---------------------------------------------------------------------------
+int32_t World::ClonePed(int32_t ped) {
+    if (!ped) return 0;
+    // CLONE_PED(ped, isNetwork false: our netcode is our own, bScriptHostPed false, copyHeadBlendFlag true: the same face)
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, 0, 0, 1 };
+    uint64_t r[4] = {};
+    if (!CallNative(native::CLONE_PED, args, 4, r)) return 0;
+    return (int32_t)(uint32_t)r[0];
+}
+int World::HidePreviewClone(int32_t ped, float x, float y, float z) {
+    if (!ped) return 6;
+    const uint64_t h = (uint64_t)(uint32_t)ped;
+    int failed = 0;
+    failed += !SetEntityVisible(ped, false);
+    failed += !FreezeEntityPosition(ped, true);
+    { uint64_t a[] = { h, 0, 1 }; failed += !CallNative(native::SET_ENTITY_COLLISION, a, 3, nullptr); }   // off, keepPhysics
+    failed += !SetEntityInvincible(ped, true);
+    { uint64_t a[] = { h, 1 }; failed += !CallNative(native::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, a, 2, nullptr); }
+    { uint64_t a[] = { h, FloatArg(x), FloatArg(y), FloatArg(z), 0, 0, 0 }; failed += !CallNative(native::SET_ENTITY_COORDS_NO_OFFSET, a, 7, nullptr); }
+    return failed;
+}
+bool World::GivePedToPauseMenu(int32_t ped, int slot) {
+    if (!ped) return false;
+    uint64_t args[] = { (uint64_t)(uint32_t)ped, (uint64_t)(uint32_t)slot };
+    return CallNative(native::GIVE_PED_TO_PAUSE_MENU, args, 2, nullptr);
+}
+bool World::ClearPedInPauseMenu() { return CallNative(native::CLEAR_PED_IN_PAUSE_MENU, nullptr, 0, nullptr); }
+bool World::SetPauseMenuPedLighting(bool on) {
+    uint64_t a[] = { (uint64_t)(on ? 1 : 0) };
+    return CallNative(native::SET_PAUSE_MENU_PED_LIGHTING, a, 1, nullptr);
+}
+bool World::SetPauseMenuPedSleepState(bool awake) {
+    uint64_t a[] = { (uint64_t)(awake ? 1 : 0) };
+    return CallNative(native::SET_PAUSE_MENU_PED_SLEEP_STATE, a, 1, nullptr);
+}
+bool World::SetFrontendActive(bool on) {
+    uint64_t a[] = { (uint64_t)(on ? 1 : 0) };
+    return CallNative(native::SET_FRONTEND_ACTIVE, a, 1, nullptr);
+}
+bool World::CurrentFrontendMenuVersion(uint32_t& out) {
+    uint64_t r[4] = {};
+    if (!CallNative(native::GET_CURRENT_FRONTEND_MENU_VERSION, nullptr, 0, r)) return false;
+    out = (uint32_t)r[0];
+    return true;
+}
+bool World::SetScriptGfxDrawBehindPauseMenu(bool on) {
+    uint64_t a[] = { (uint64_t)(on ? 1 : 0) };
+    return CallNative(native::SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU, a, 1, nullptr);
+}
+bool World::SetMouseCursorVisible(bool on) {
+    uint64_t a[] = { (uint64_t)(on ? 1 : 0) };
+    return CallNative(native::SET_MOUSE_CURSOR_VISIBLE, a, 1, nullptr);
+}
+bool World::GetHudColour(int index, int& r, int& g, int& b, int& a) {
+    // int* outputs: one 8-byte slot each (the native writes the low 4 bytes)
+    alignas(8) uint64_t out[4] = {};
+    uint64_t args[] = { (uint64_t)(uint32_t)index, (uint64_t)(uintptr_t)&out[0], (uint64_t)(uintptr_t)&out[1], (uint64_t)(uintptr_t)&out[2],
+                        (uint64_t)(uintptr_t)&out[3] };
+    if (!CallNative(native::GET_HUD_COLOUR, args, 5, nullptr)) return false;
+    r = (int)(int32_t)(uint32_t)out[0];
+    g = (int)(int32_t)(uint32_t)out[1];
+    b = (int)(int32_t)(uint32_t)out[2];
+    a = (int)(int32_t)(uint32_t)out[3];
+    return true;
+}
+bool World::ReplaceHudColour(int index, int r, int g, int b, int a) {
+    uint64_t args[] = { (uint64_t)(uint32_t)index, (uint64_t)(uint32_t)r, (uint64_t)(uint32_t)g, (uint64_t)(uint32_t)b, (uint64_t)(uint32_t)a };
+    return CallNative(native::REPLACE_HUD_COLOUR_WITH_RGBA, args, 5, nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // Vehicle sync, weapons/shots/damage, camera/aim. Script tick only. Same conventions as the
 // remote-ped block: bool = "the native could be called" unless hook.h says otherwise.
 // ---------------------------------------------------------------------------
@@ -7230,6 +7314,18 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(DISABLE_PLAYER_FIRING),
         GAGE_NEW_NATIVE(HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME),
         GAGE_NEW_NATIVE(GET_FRAME_COUNT),
+        // 0.5.8 inv_ped_mode
+        GAGE_NEW_NATIVE(CLONE_PED),
+        GAGE_NEW_NATIVE(GIVE_PED_TO_PAUSE_MENU),
+        GAGE_NEW_NATIVE(CLEAR_PED_IN_PAUSE_MENU),
+        GAGE_NEW_NATIVE(SET_PAUSE_MENU_PED_LIGHTING),
+        GAGE_NEW_NATIVE(SET_PAUSE_MENU_PED_SLEEP_STATE),
+        GAGE_NEW_NATIVE(SET_FRONTEND_ACTIVE),
+        GAGE_NEW_NATIVE(GET_CURRENT_FRONTEND_MENU_VERSION),
+        GAGE_NEW_NATIVE(SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU),
+        GAGE_NEW_NATIVE(SET_MOUSE_CURSOR_VISIBLE),
+        GAGE_NEW_NATIVE(GET_HUD_COLOUR),
+        GAGE_NEW_NATIVE(REPLACE_HUD_COLOUR_WITH_RGBA),
     };
 #undef GAGE_NEW_NATIVE
     constexpr int total = (int)(sizeof(kNew) / sizeof(kNew[0]));

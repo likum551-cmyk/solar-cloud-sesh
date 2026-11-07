@@ -63,6 +63,7 @@
 #include "sync/inventory.h"    // 0.5.4 outfit_items: the server's inventory, decoded for the ped's clothes
 #include "sync/outfit.h"       // 0.5.4 outfit_items: worn items -> ped components
 #include "sync/ped_view.h"     // 0.5.4 inv_ped_view: the CHARACTER panel's camera
+#include "sync/ped_preview.h"  // 0.5.8 inv_ped_mode: the CHARACTER panel's ped on GTA's frontend ped renderer
 #include "sync/inventory_world.h"   // 0.5.4 inventory world: PlanSnapshot / PlanRestore / BuildReport
 #include "common/registry.h"
 
@@ -1350,7 +1351,15 @@ namespace {
     // (libs/sync/ped_view.h, TickInvPedView). Both are read with the session's switches (InvCReadSwitches).
     std::atomic<bool> g_outfitItems{true};
     std::atomic<bool> g_invPedView{true};
-    std::mutex g_outfitMtx;                        // the join worker writes the server's inventory, the script tick reads it
+    // 0.5.8 inv_ped_mode (default on; 0 = the 0.5.4 camera) and inv_ped_slot (0 / 1 / 2 forced; unset = search): the ped preview on GTA's
+    // frontend ped renderer (libs/sync/ped_preview.h, TickInvPedPreview). g_ppClone is the hidden clone (script tick only): declared here so the
+    // ambient clean-up's exemption list (AmbientGatherExempt) can keep it.
+    std::atomic<bool> g_invPedPreview{true};
+    std::atomic<int> g_invPedSlot{-1};
+    int32_t g_ppClone = 0;
+    int32_t g_ppCloneOld = 0;                      // the clone a look change replaced, kept until the new one is given
+    bool g_ppOwnsFrontend = false;                // the preview owns the active frontend (TickPauseMenu must not treat it as the pause menu)
+    std::mutex g_outfitMtx;                       // the join worker writes the server's inventory, the script tick reads it
     sync::outfit::WornFeed g_outfitFeed;           // 0.5.6: fed by InvState AND InvSnap (0.5.4 / 0.5.5 read InvState only: GI's shirt stayed on)
     std::atomic<bool> g_outfitRecheck{false};      // DressPlayer re-dressed the ped: compare at once, not at the next 1 s check
 
@@ -1390,8 +1399,19 @@ namespace {
               ? "on (the server's worn shirt / pants / shoes items decide the ped's components; an empty slot is bare; LIVE-UNVERIFIED)"
               : "OFF (the 0.5.3 behaviour: the items change nothing on the ped)");
         GLOGI("engine: inventory ped view (0.5.4): inv_ped_view=%s", g_invPedView.load()
-              ? "on (a scripted camera frames our ped in the CHARACTER panel while the page is open; LIVE-UNVERIFIED)"
-              : "OFF (the 0.5.3 mannequin)");
+              ? "on (a ped in the CHARACTER panel while the page is open; how: inv_ped_mode below)"
+              : "OFF (the 0.5.3 mannequin; inv_ped_mode does nothing)");
+        g_invPedPreview.store(reg::Get(L"inv_ped_mode") != L"0");
+        const std::wstring slot = reg::Get(L"inv_ped_slot");
+        g_invPedSlot.store(sync::pedpreview::ParseSlot(slot));
+        GLOGI("engine: inventory ped preview (0.5.8): inv_ped_mode=%s; inv_ped_slot=%s%s", g_invPedPreview.load()
+              ? "on (a hidden clone on GTA's frontend ped renderer, FE_MENU_VERSION_EMPTY_NO_BACKGROUND without pausing, our backdrop behind it: "
+                "only the character, in any seat; torn down while dead or dying and while the player's own pause menu is up; a ragdoll does not "
+                "matter (the clone stands); after 3 failed opens or no slot that puts the ped in the window: the 0.5.4 camera for the session; "
+                "LIVE-UNVERIFIED)"
+              : "OFF (the 0.5.4 scripted camera: on foot only, the world behind the ped)",
+              g_invPedSlot.load() < 0 ? "auto (search 0, 1, 2 by reading the window back; D3D12: slot 0 unverified)" : "forced ",
+              g_invPedSlot.load() < 0 ? "" : (g_invPedSlot.load() == 0 ? "0" : g_invPedSlot.load() == 1 ? "1" : "2"));
     }
     // Join worker thread (OnInvState and, since 0.5.6, OnInvSnap): keep the server's inventory for the outfit. One line per change of the
     // worn shirt / pants / shoes the server sent (at most 200 a session): the live proof that a take-off reached the engine.
@@ -2992,6 +3012,8 @@ namespace {
         for (const auto& kv : g_vehs)
             g_ambExempt.Add(kv.second.handle);         // server vehicles (their occupants are the puppets above)
         g_ambExempt.Add(g_companion);                  // the render-thread test ped
+        g_ambExempt.Add(g_ppClone);                    // 0.5.8: the inventory preview's hidden clone (10 m under us, inside every sweep's reach)
+        g_ambExempt.Add(g_ppCloneOld);                 // ... and the one a look change replaced, until the new one is given
         for (const int32_t v : g_ownedVehicles)
             g_ambExempt.Add(v);                        // /car vehicles
         if (lp)
@@ -4648,15 +4670,20 @@ namespace {
     // still readable from the disabled control, opens it with ACTIVATE_FRONTEND_MENU(
     // FE_MENU_VERSION_SP_PAUSE, togglePause=false, -1). While it is open nothing is disabled so Esc /
     // P / Backspace close it, and one proof line per 2 s shows the world keeps running.
+    // 0.5.8: while the inventory's ped preview owns the frontend (g_ppOwnsFrontend, from its claim until the frontend reads closed again)
+    // that frontend is not the player's pause menu: menuActive stays false (199 / 200 stay held, g_pauseMenuActive stays false for the
+    // radar, the name tags and the input holds) and the gate neither blocks it nor counts it (PauseMenuIn::frontendIsOurs).
     void TickPauseMenu(double nowMs)
     {
         const bool connected = join::IsConnected();
-        const bool menuActive = (connected || g_pauseMenuActive) && g_world->IsPauseMenuActive();
+        const bool ours = g_ppOwnsFrontend;
+        const bool menuActive = !ours && (connected || g_pauseMenuActive) && g_world->IsPauseMenuActive();
         sync::PauseMenuIn in;
         in.nowMs = nowMs;
         in.connected = connected;
         in.canOpen = ServerMode();
         in.menuActive = menuActive;
+        in.frontendIsOurs = ours;
         // The Alt+F4 card counts as a panel here only: its Esc must not also open the pause menu (the
         // gate's debounce covers the tick after the WndProc closed it). It takes no game controls.
         in.overlayInteractive = game::Overlay::Interactive() || game::Overlay::QuitPromptOpen();
@@ -5783,6 +5810,350 @@ namespace {
             g_pv.rendering = r;
         }
         game::Overlay::SetInventoryPedView(r == 1);
+    }
+
+    // ===== 0.5.8 inv_ped_mode: the CHARACTER panel's ped on GTA's frontend ped renderer (script tick) =====
+    // GI 2026-11-07 after 0.5.7: "the character in inventory should be only char no BG" and "that preview doesn't work in cars". The rules,
+    // the sources and the slot search are in libs/sync/ped_preview.h; this is the glue: every native call, its read-back and the log.
+    struct PedPreviewState
+    {
+        sync::pedpreview::Machine m;
+        sync::pedpreview::LookWatch look;
+        sync::pedpreview::Gate gate = sync::pedpreview::Gate::Closed;
+        int forcedSeen = -2;                       // the inv_ped_slot the machine was given
+        bool colourChanged = false;                // HUD colour 117 is ours (transparent) until restored
+        bool colourRead = false;                   // ... and `colour` was read from the game (else the documented default)
+        int colour[4] = {0, 0, 0, 0};
+        bool behind = false;                       // SET_SCRIPT_GFX_DRAW_BEHIND_PAUSEMENU(true) is set on our thread
+        uint32_t probeSeq = 0;
+        bool probeWaiting = false;
+        double lookAtMs = -1e9, openAtMs = 0, activeAtMs = -1, teardownAtMs = 0;
+        int givesThisOpen = 0;
+        uint32_t opens = 0, clones = 0, gives = 0;
+        // the 10 s line, from read-backs (a name says what read it)
+        double logAtMs = 0;
+        uint32_t ticks = 0, menuActiveTicks = 0, menuOursTicks = 0, menuOtherTicks = 0, versionUnread = 0, cloneExistsTicks = 0, vehicleTicks = 0;
+        uint32_t windowTicks = 0, backdropDraws = 0, behindFailed = 0, cursorFailed = 0, reclones = 0;
+    };
+    PedPreviewState g_pp;
+
+    // The ped's look as one signature (components, props; the head blend does not change in a session).
+    bool PedPreviewLookSig(int32_t ped, uint64_t& sig)
+    {
+        game::PedLook look{};
+        if (!g_world->ReadPedLook(ped, look))
+            return false;
+        int v[1 + 12 * 3 + 8 * 2];
+        int n = 0;
+        v[n++] = (int)look.model;
+        for (int i = 0; i < 12; ++i) { v[n++] = look.drawable[i]; v[n++] = look.texture[i]; v[n++] = look.palette[i]; }
+        for (int i = 0; i < 8; ++i) { v[n++] = look.propDrawable[i]; v[n++] = look.propTexture[i]; }
+        sig = sync::pedpreview::SigOf(v, n);
+        return true;
+    }
+
+    void PedPreviewDeleteClone(int32_t& handle, const char* why)
+    {
+        if (!handle)
+            return;
+        int32_t c = handle;
+        const int32_t was = c;
+        bool del = g_world->DeleteEntity(c);
+        int exists = g_world->EntityExists(was);
+        if (exists == 1) {
+            // DELETE_ENTITY needs a mission entity of this script: claim it and try once more
+            uint64_t args[] = { (uint64_t)(uint32_t)was, 1, 1 };
+            g_world->CallNative(game::native::SET_ENTITY_AS_MISSION_ENTITY, args, 3, nullptr);
+            c = was;
+            del = g_world->DeleteEntity(c) || del;
+            exists = g_world->EntityExists(was);
+        }
+        GLOGI("engine: inventory ped preview (0.5.8): clone %d deleted (%s): DELETE_ENTITY %s, DOES_ENTITY_EXIST after: %s", was, why,
+              del ? "called" : "CANNOT CALL", exists == 0 ? "no" : (exists == 1 ? "YES (left in the world, hidden)" : "unreadable"));
+        handle = 0;
+    }
+
+    void PedPreviewTeardown(const char* why, double now)
+    {
+        const bool cleared = g_world->ClearPedInPauseMenu();
+        const bool off = g_world->SetFrontendActive(false);
+        bool behindOff = true;
+        if (g_pp.behind) {
+            behindOff = g_world->SetScriptGfxDrawBehindPauseMenu(false);
+            g_pp.behind = false;
+        }
+        const char* colour = "untouched";
+        if (g_pp.colourChanged) {
+            const bool ok = g_world->ReplaceHudColour(sync::pedpreview::kPauseBgHudColour, g_pp.colour[0], g_pp.colour[1], g_pp.colour[2], g_pp.colour[3]);
+            colour = ok ? (g_pp.colourRead ? "restored to the value read at the open" : "set to the documented default (31, 31, 31, 100)") : "NOT RESTORED (cannot call)";
+            g_pp.colourChanged = !ok;
+        }
+        g_pp.teardownAtMs = now;
+        g_pp.probeWaiting = false;
+        GLOGI("engine: inventory ped preview (0.5.8): closed (%s) after %.1f s: CLEAR_PED_IN_PAUSE_MENU %s, SET_FRONTEND_ACTIVE(false) %s, "
+              "draw-behind flag %s, HUD colour 117 %s", why, (now - g_pp.openAtMs) / 1000.0, cleared ? "called" : "CANNOT CALL",
+              off ? "called" : "CANNOT CALL", behindOff ? "reset" : "NOT RESET (cannot call)", colour);
+        PedPreviewDeleteClone(g_ppCloneOld, why);
+        PedPreviewDeleteClone(g_ppClone, why);
+        g_pp.look.Reset();
+    }
+
+    void PedPreviewOpen(double now)
+    {
+        namespace pp = sync::pedpreview;
+        ++g_pp.opens;
+        g_pp.openAtMs = now;
+        if (now - g_pp.logAtMs >= 10000.0)
+            g_pp.logAtMs = now;                    // the first 10 s line comes 10 s after the open, not on its first tick
+        g_pp.activeAtMs = -1;
+        g_pp.givesThisOpen = 0;
+        const char* colour = "already ours";
+        if (!g_pp.colourChanged) {
+            int r = 0, g = 0, b = 0, a = 0;
+            g_pp.colourRead = g_world->GetHudColour(pp::kPauseBgHudColour, r, g, b, a);
+            if (g_pp.colourRead) {
+                g_pp.colour[0] = r; g_pp.colour[1] = g; g_pp.colour[2] = b; g_pp.colour[3] = a;
+            } else
+                for (int i = 0; i < 4; ++i) g_pp.colour[i] = pp::kDefaultPauseBg[i];
+            g_pp.colourChanged = g_world->ReplaceHudColour(pp::kPauseBgHudColour, 0, 0, 0, 0);
+            colour = g_pp.colourChanged ? "-> transparent" : "NOT CHANGED (cannot call)";
+        }
+        const bool act = g_world->ActivateFrontendMenu(pp::kFeMenuEmptyNoBackground, false, -1);
+        GLOGI("engine: inventory ped preview (0.5.8): open #%u: ACTIVATE_FRONTEND_MENU(0x%08x FE_MENU_VERSION_EMPTY_NO_BACKGROUND, togglePause=false, -1) "
+              "%s; HUD colour 117 was %d,%d,%d,%d (%s) %s; slot %d (%s)", g_pp.opens, (unsigned)pp::kFeMenuEmptyNoBackground,
+              act ? "called" : "CANNOT CALL", g_pp.colour[0], g_pp.colour[1], g_pp.colour[2], g_pp.colour[3],
+              g_pp.colourRead ? "read" : "unreadable, the default assumed", colour, g_pp.m.Slot(),
+              g_invPedSlot.load() >= 0 ? "forced" : (g_pp.m.SearchDone() ? "found by this session's search" : "searching"));
+    }
+
+    void PedPreviewClone(int32_t lp, double now, bool again)
+    {
+        // A new clone for a changed look: the old one stays until the new one is given (the frontend may still draw from it); otherwise any
+        // leftover goes now.
+        PedPreviewDeleteClone(g_ppCloneOld, "an older clone left over");
+        if (again) {
+            g_ppCloneOld = g_ppClone;
+            g_ppClone = 0;
+        } else
+            PedPreviewDeleteClone(g_ppClone, "a leftover at a new open");
+        float x = 0, y = 0, z = 0;
+        const bool at = g_world->GetEntityCoords(lp, x, y, z);
+        const bool inVeh = g_world->IsPedInVehicle(lp);
+        const int32_t c = g_world->ClonePed(lp);
+        g_ppClone = c;
+        ++g_pp.clones;
+        int failed = 6;
+        if (c)
+            failed = g_world->HidePreviewClone(c, x, y, z - 10.0f);
+        const int exists = c ? g_world->EntityExists(c) : 0;
+        uint64_t sig = 0;
+        const bool sigOk = PedPreviewLookSig(lp, sig);
+        if (sigOk)
+            g_pp.look.Cloned(sig, now);
+        static int lines = 0;
+        if (lines < 60) {
+            ++lines;
+            GLOGI("engine: inventory ped preview (0.5.8): clone #%u (%s): CLONE_PED -> %d, DOES_ENTITY_EXIST %s; the player is %s; hidden 10 m under "
+                  "%s (%d of 6 hide calls could not be made); look signature %s",
+                  g_pp.clones, again ? "the look changed" : "open", c, exists == 1 ? "yes" : (exists == 0 ? "NO" : "unreadable"),
+                  inVeh ? "IN A VEHICLE" : "on foot", at ? "the player" : "an UNREADABLE position", failed, sigOk ? "read" : "UNREADABLE (no re-clone on look changes)");
+        }
+    }
+
+    void PedPreviewGive(int slot, bool searching)
+    {
+        const bool cleared = g_pp.givesThisOpen > 0 ? g_world->ClearPedInPauseMenu() : true;
+        const bool give = g_world->GivePedToPauseMenu(g_ppClone, slot);
+        const bool light = g_world->SetPauseMenuPedLighting(true);
+        const bool wake = g_world->SetPauseMenuPedSleepState(true);
+        ++g_pp.givesThisOpen;
+        ++g_pp.gives;
+        static int lines = 0;
+        if (lines < 60) {
+            ++lines;
+            GLOGI("engine: inventory ped preview (0.5.8): GIVE_PED_TO_PAUSE_MENU(clone %d, slot %d) %s%s; SET_PAUSE_MENU_PED_LIGHTING(true) %s, "
+                  "SET_PAUSE_MENU_PED_SLEEP_STATE(true = wake) %s%s", g_ppClone, slot, give ? "called" : "CANNOT CALL",
+                  g_pp.givesThisOpen > 1 ? (cleared ? " (after CLEAR_PED_IN_PAUSE_MENU)" : " (CLEAR_PED_IN_PAUSE_MENU CANNOT CALL)") : "",
+                  light ? "called" : "CANNOT CALL", wake ? "called" : "CANNOT CALL",
+                  searching ? "; the window is read back in 1.5 s" : "");
+        }
+        PedPreviewDeleteClone(g_ppCloneOld, "replaced by the clone just given");
+    }
+
+    void TickInvPedPreview(int32_t lp)
+    {
+        namespace pp = sync::pedpreview;
+        const double now = NowMs();
+        if (g_invPedSlot.load() != g_pp.forcedSeen) {
+            g_pp.forcedSeen = g_invPedSlot.load();
+            g_pp.m.SetForcedSlot(g_pp.forcedSeen);
+        }
+        float W = 0, H = 0;
+        double ago = 1e9;
+        const bool drawn = game::Overlay::InventoryPedViewFrame(&W, &H, &ago);
+        pp::GateIn gi;
+        gi.switchOn = g_invPedView.load() && g_invPedPreview.load();
+        gi.pageOpen = game::Overlay::InventoryOpen();
+        gi.drawnAgoMs = drawn ? ago : 1e9;
+        gi.ped = lp != 0;
+        if (gi.switchOn && gi.pageOpen && lp)
+            gi.dead = g_life != Life::Alive || g_world->IsPedDeadOrDying(lp);
+        gi.playerPauseMenu = g_pauseMenuActive;     // TickPauseMenu ran first this tick and never counts our own frontend
+        gi.gaveUp = g_pp.m.GaveUp();
+        const pp::Gate gate = pp::Decide(gi);
+        if (gate != g_pp.gate) {
+            if (gate == pp::Gate::Live || g_pp.gate == pp::Gate::Live || gi.pageOpen)
+                GLOGI("engine: inventory ped preview (0.5.8): %s -> %s", pp::GateName(g_pp.gate), pp::GateName(gate));
+            g_pp.gate = gate;
+        }
+
+        pp::MachineIn in;
+        in.nowMs = now;
+        in.want = gate == pp::Gate::Live;
+        in.W = W;
+        in.H = H;
+        const pp::Step step = g_pp.m.StepNow();
+        if (step != pp::Step::Idle && step != pp::Step::Claim) {
+            in.menuActive = g_world->IsPauseMenuActive();
+            ++g_pp.ticks;
+            if (in.menuActive) {
+                ++g_pp.menuActiveTicks;
+                if (g_pp.activeAtMs < 0) {
+                    g_pp.activeAtMs = now;
+                    uint32_t ver = 0;
+                    const bool vr = g_world->CurrentFrontendMenuVersion(ver);
+                    GLOGI("engine: inventory ped preview (0.5.8): IS_PAUSE_MENU_ACTIVE yes %.0f ms after the open; GET_CURRENT_FRONTEND_MENU_VERSION %s",
+                          now - g_pp.openAtMs, !vr ? "unreadable" : (ver == pp::kFeMenuEmptyNoBackground ? "is ours" : "is ANOTHER menu"));
+                }
+                uint32_t ver = 0;
+                if (!g_world->CurrentFrontendMenuVersion(ver))
+                    ++g_pp.versionUnread;
+                else if (ver == pp::kFeMenuEmptyNoBackground)
+                    ++g_pp.menuOursTicks;
+                else
+                    ++g_pp.menuOtherTicks;
+            }
+        }
+        if (g_ppClone) {
+            in.cloneExists = g_world->EntityExists(g_ppClone) == 1;
+            g_pp.cloneExistsTicks += in.cloneExists ? 1u : 0u;
+        }
+        if (step == pp::Step::Showing && lp && now - g_pp.lookAtMs >= pp::kLookSampleMs) {
+            g_pp.lookAtMs = now;
+            uint64_t sig = 0;
+            if (PedPreviewLookSig(lp, sig))
+                in.lookDue = g_pp.look.Feed(sig, now);
+        }
+        if (g_pp.probeWaiting) {
+            game::Overlay::PedProbe p;
+            if (game::Overlay::TakePedProbe(&p) && p.seq == g_pp.probeSeq) {
+                g_pp.probeWaiting = false;
+                in.probeAnswered = true;
+                in.probe.verdict = (pp::Verdict)p.verdict;
+                in.probe.w = p.w; in.probe.h = p.h; in.probe.pedPx = p.pedPx;
+                in.probe.x0 = p.x0; in.probe.y0 = p.y0; in.probe.x1 = p.x1; in.probe.y1 = p.y1;
+                // the box in design px (1920 x 1080, y down) too, so a miss can be laid against the layout
+                const float s = sync::pedview::DesignScale((float)p.bbW, (float)p.bbH);
+                const float ox = std::floor(((float)p.bbW - 1920.0f * s) * 0.5f), oy = std::floor(((float)p.bbH - 1080.0f * s) * 0.5f);
+                const auto dx = [&](int v) { return ((float)(p.winX + v) - ox) / s; };
+                const auto dy = [&](int v) { return ((float)(p.winY + v) - oy) / s; };
+                GLOGI("engine: inventory ped preview (0.5.8): probe #%u slot %d on a %dx%d back buffer: window %dx%d at %d,%d; background %d,%d,%d "
+                      "(our backdrop %d,%d,%d); ped pixels %d (%.1f %%), box x %d..%d y %d..%d (design x %.0f..%.0f y %.0f..%.0f from the top)%s%s%s%s; "
+                      "%s; inv_ped_probe_%d.bmp %s",
+                      p.seq, g_pp.m.Slot(), p.bbW, p.bbH, p.w, p.h, p.winX, p.winY, p.bg[0], p.bg[1], p.bg[2], pp::kBackdrop[0], pp::kBackdrop[1],
+                      pp::kBackdrop[2], p.pedPx, p.w * p.h > 0 ? 100.0 * p.pedPx / ((double)p.w * p.h) : 0.0, p.x0, p.x1, p.y0, p.y1, dx(p.x0), dx(p.x1),
+                      dy(p.y0), dy(p.y1), p.cutTop ? ", touches the TOP" : "", p.cutBottom ? ", touches the BOTTOM" : "", p.cutLeft ? ", touches the LEFT" : "",
+                      p.cutRight ? ", touches the RIGHT" : "", pp::VerdictName((pp::Verdict)p.verdict), g_pp.m.Slot() + 1,
+                      p.bmpSaved ? "saved (%LOCALAPPDATA%\\GAGE-MP)" : "not saved");
+            }
+        }
+
+        const pp::MachineOut o = g_pp.m.Tick(in);
+        if (o.teardown)
+            PedPreviewTeardown(o.why, now);
+        if (o.open)
+            PedPreviewOpen(now);
+        if (o.nudge) {
+            const bool ok = g_world->SetFrontendActive(true);
+            GLOGI("engine: inventory ped preview (0.5.8): IS_PAUSE_MENU_ACTIVE still no %.0f ms after the open: SET_FRONTEND_ACTIVE(true) %s",
+                  now - g_pp.openAtMs, ok ? "called" : "CANNOT CALL");
+        }
+        if (o.clone) {
+            const bool again = g_pp.m.StepNow() == pp::Step::Cloning && g_pp.givesThisOpen > 0;
+            if (again)
+                ++g_pp.reclones;
+            PedPreviewClone(lp, now, again);
+        }
+        if (o.give)
+            PedPreviewGive(o.slot, !g_pp.m.SearchDone() && g_invPedSlot.load() < 0);
+        if (o.probe) {
+            ++g_pp.probeSeq;
+            g_pp.probeWaiting = true;
+            game::Overlay::TakePedProbe(nullptr);   // drop a stale answer
+            game::Overlay::RequestPedProbe(g_pp.probeSeq, o.slot);
+        }
+        if (o.forceClose) {
+            const bool ok = g_world->SetPauseMenuActive(false);
+            GLOGW("engine: inventory ped preview (0.5.8): the frontend still read active %.0f ms after the teardown: SET_PAUSE_MENU_ACTIVE(false) %s",
+                  now - g_pp.teardownAtMs, ok ? "called" : "CANNOT CALL");
+        } else if (o.released) {
+            GLOGI("engine: inventory ped preview (0.5.8): IS_PAUSE_MENU_ACTIVE no %.0f ms after the teardown (the frontend is released)",
+                  now - g_pp.teardownAtMs);
+        }
+        if (o.gaveUpNow)
+            GLOGW("engine: inventory ped preview (0.5.8): GAVE UP for this session (%s; %d failures, last probe: %s): the 0.5.4 camera from now on; "
+                  "send the probe lines and %%LOCALAPPDATA%%\\GAGE-MP\\inv_ped_probe_*.bmp", o.why, g_pp.m.Failures(), pp::VerdictName(g_pp.m.LastVerdict()));
+
+        // while the frontend is ours and not being released: its cursor hidden and our backdrop behind it, every tick
+        g_ppOwnsFrontend = g_pp.m.OwnsFrontend();
+        const pp::Step now2 = g_pp.m.StepNow();
+        if (now2 == pp::Step::Opening || now2 == pp::Step::Cloning || now2 == pp::Step::Showing) {
+            if (!g_world->SetMouseCursorVisible(false))
+                ++g_pp.cursorFailed;
+            const pp::NormRect r = pp::BackdropRect(W, H);
+            if (r.ok) {
+                if (g_world->SetScriptGfxDrawBehindPauseMenu(true))
+                    g_pp.behind = true;
+                else
+                    ++g_pp.behindFailed;
+                g_world->DrawRect(r.cx, r.cy, r.w, r.h, pp::kBackdrop[0], pp::kBackdrop[1], pp::kBackdrop[2], 255);
+                ++g_pp.backdropDraws;
+            }
+            if (lp && g_world->IsPedInVehicle(lp))
+                ++g_pp.vehicleTicks;
+        }
+        const bool window = g_pp.m.WindowOpen();
+        g_pp.windowTicks += window ? 1u : 0u;
+        game::Overlay::SetInventoryPedView(window);
+
+        if (g_pp.ticks && now - g_pp.logAtMs >= 10000.0) {
+            g_pp.logAtMs = now;
+            GLOGI("engine: inventory ped preview (0.5.8), last 10 s: step %s, slot %d (%s, verdict %s); %u ticks with the frontend ours: "
+                  "IS_PAUSE_MENU_ACTIVE yes %u, GET_CURRENT_FRONTEND_MENU_VERSION ours %u / another %u / unreadable %u; DOES_ENTITY_EXIST(clone) yes %u; "
+                  "in a vehicle %u; window open %u; backdrop rects %u (draw-behind flag failed %u), cursor hide failed %u; re-clones for a look change %u; "
+                  "totals: opens %u, clones %u, gives %u",
+                  pp::StepName(g_pp.m.StepNow()), g_pp.m.Slot(), g_invPedSlot.load() >= 0 ? "forced" : (g_pp.m.SearchDone() ? "searched" : "searching"),
+                  pp::VerdictName(g_pp.m.LastVerdict()), g_pp.ticks, g_pp.menuActiveTicks, g_pp.menuOursTicks, g_pp.menuOtherTicks, g_pp.versionUnread,
+                  g_pp.cloneExistsTicks, g_pp.vehicleTicks, g_pp.windowTicks, g_pp.backdropDraws, g_pp.behindFailed, g_pp.cursorFailed, g_pp.reclones,
+                  g_pp.opens, g_pp.clones, g_pp.gives);
+            g_pp.ticks = g_pp.menuActiveTicks = g_pp.menuOursTicks = g_pp.menuOtherTicks = g_pp.versionUnread = g_pp.cloneExistsTicks = 0;
+            g_pp.vehicleTicks = g_pp.windowTicks = g_pp.backdropDraws = g_pp.behindFailed = g_pp.cursorFailed = g_pp.reclones = 0;
+        }
+    }
+
+    // The CHARACTER panel's ped, either way (script tick, every tick, before GameWork's early returns): the 0.5.8 preview while inv_ped_mode
+    // is on and it has not given up this session, else the 0.5.4 camera. Exactly one of them reports SetInventoryPedView each tick.
+    void TickInvPed(int32_t lp)
+    {
+        const bool preview = g_invPedView.load() && g_invPedPreview.load() && !g_pp.m.GaveUp();
+        if (preview || g_pp.m.OwnsFrontend()) {
+            if (g_pv.cam)
+                PedViewRestore("inv_ped_mode: the preview instead");
+            TickInvPedPreview(lp);              // also finishes a release after a give-up
+            if (preview)
+                return;
+        }
+        TickInvPedView(lp);
     }
 
     // WEAPON_UNARMED by GET_HASH_KEY (script tick), checked once against the known constant.
@@ -15632,7 +16003,7 @@ namespace {
         int32_t lp = g_world->LocalPlayer();
         TickAmbient(inScript, lp, probe);              // T5: no ambient NPCs / traffic, every tick, before the connection / entry gates
         if (inScript && g_world->spawnMode != 0)
-            TickInvPedView(lp);                        // 0.5.4 inv_ped_view: before every early return below, so a closed page always restores the camera
+            TickInvPed(lp);                            // 0.5.8 preview / 0.5.4 camera: before every early return below, so a closed page always restores them
         if (!lp) {
             // Player not spawned yet (the overlay's own loader is up). Heartbeat so a stuck load is diagnosable from gage.log: PLAYER_PED_ID stays 0 while GTA
             // is still loading its world, or if our script-tick context never goes live (then GameWork
