@@ -1429,6 +1429,127 @@ namespace gage::proto {
         return w.take();
     }
 
+    // ---- v8, 0.5.9 characters ----
+    Bytes Encode(const CharRoster& m)
+    {
+        if (m.blob.empty() || m.blob.size() > kMaxCharBlob || (m.flags & ~kCharRosterGuest)) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::CharRoster);
+        w.u8(m.flags);
+        if (!w.str(m.blob)) return {};
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, CharRoster& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::CharRoster)) return false;
+        CharRoster m;
+        m.flags = r.u8();
+        m.blob = r.str(kMaxCharBlob);
+        if (!r.done() || m.blob.empty() || (m.flags & ~kCharRosterGuest)) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    Bytes Encode(const CharOp& m)
+    {
+        if (m.seq == 0 || m.op < 1 || m.op > kCharOpLast || m.slot >= kCharSlots || m.blob.size() > kMaxCharBlob) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::CharOp);
+        w.u16(m.seq);
+        w.u8(m.op);
+        w.u8(m.slot);
+        if (!w.str(m.blob)) return {};
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, CharOp& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::CharOp)) return false;
+        CharOp m;
+        m.seq = r.u16();
+        m.op = r.u8();
+        m.slot = r.u8();
+        m.blob = r.str(kMaxCharBlob);
+        if (!r.done() || m.seq == 0 || m.op < 1 || m.op > kCharOpLast || m.slot >= kCharSlots) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    Bytes Encode(const CharResult& m)
+    {
+        if (m.op < 1 || m.op > kCharOpLast || m.code > kCharCodeLast || m.slot >= kCharSlots || m.text.size() > kMaxRefuseText) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::CharResult);
+        w.u16(m.seq);
+        w.u8(m.op);
+        w.u8(m.slot);
+        w.u8(m.code);
+        if (!w.str(m.text)) return {};
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, CharResult& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::CharResult)) return false;
+        CharResult m;
+        m.seq = r.u16();
+        m.op = r.u8();
+        m.slot = r.u8();
+        m.code = r.u8();
+        m.text = r.str(kMaxRefuseText);
+        if (!r.done() || m.op < 1 || m.op > kCharOpLast || m.code > kCharCodeLast || m.slot >= kCharSlots) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    Bytes Encode(const PeerFace& m)
+    {
+        if (m.id >= kMaxPlayers || m.blob.empty() || m.blob.size() > kMaxCharBlob) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::PeerFace);
+        w.u16(m.id);
+        if (!w.str(m.blob)) return {};
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, PeerFace& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::PeerFace)) return false;
+        PeerFace m;
+        m.id = r.u16();
+        m.blob = r.str(kMaxCharBlob);
+        if (!r.done() || m.id >= kMaxPlayers || m.blob.empty()) return false;
+        out = std::move(m);
+        return true;
+    }
+
+    Bytes Encode(const PeerName& m)
+    {
+        if (m.id >= kMaxPlayers || !ValidName(m.name)) return {};
+        wire::Writer w;
+        w.u8((uint8_t)Msg::PeerName);
+        w.u16(m.id);
+        if (!w.str(m.name)) return {};
+        return w.take();
+    }
+
+    bool Decode(const uint8_t* p, size_t n, PeerName& out)
+    {
+        wire::Reader r(p, n);
+        if (!Begin(r, Msg::PeerName)) return false;
+        PeerName m;
+        m.id = r.u16();
+        m.name = r.str(kMaxName);
+        if (!r.done() || m.id >= kMaxPlayers || !ValidName(m.name)) return false;
+        out = std::move(m);
+        return true;
+    }
+
     bool Decode(const uint8_t* p, size_t n, WorldClock& out)
     {
         wire::Reader r(p, n);
@@ -1811,6 +1932,11 @@ namespace gage::proto {
         case Msg::InvNearby:        return "InvNearby";
         case Msg::InvReport:        return "InvReport";
         case Msg::WorldClock:       return "WorldClock";
+        case Msg::CharRoster:       return "CharRoster";
+        case Msg::CharOp:           return "CharOp";
+        case Msg::CharResult:       return "CharResult";
+        case Msg::PeerFace:         return "PeerFace";
+        case Msg::PeerName:         return "PeerName";
         }
         return "?";
     }

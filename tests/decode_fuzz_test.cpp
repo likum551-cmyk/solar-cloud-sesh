@@ -379,6 +379,12 @@ static std::vector<Case> Corpus()
     // 0.5.7 world clock: a transition (CLOUDS -> RAIN, 12 s of 45 in) at 18:30:15, GTA's own rate, from the cycle
     { WorldClock m; m.rev = 3; m.gameMs = 66615000; m.scaleMilli = 30000; m.weatherFrom = 2; m.weatherTo = 6; m.transElapsedMs = 12000;
       m.transTotalMs = 45000; m.flags = kClockCycle; v.push_back(Make("WorldClock", m)); }
+    // 0.5.9 characters: the protocol frames opaque blobs (libs/sync/character.h decodes them), so any bytes do as a sample
+    { CharRoster m; m.flags = kCharRosterGuest; m.blob = std::string("\x01\x01\x00\x01", 4) + "roster-bytes"; v.push_back(Make("CharRoster", m)); }
+    { CharOp m; m.seq = 7; m.op = 2; m.slot = 1; m.blob = "character-bytes"; v.push_back(Make("CharOp", m)); }
+    { CharResult m; m.seq = 7; m.op = 2; m.slot = 1; m.code = 6; m.text = "That name is taken."; v.push_back(Make("CharResult", m)); }
+    { PeerFace m; m.id = 9; m.blob = "face-bytes"; v.push_back(Make("PeerFace", m)); }
+    { PeerName m; m.id = 9; m.name = "Pia Player"; v.push_back(Make("PeerName", m)); }
     for (Case& c : v)
         if (c.name.rfind("VehicleWorld", 0) == 0 || c.name.rfind("VehicleUpdate", 0) == 0 || c.name == "VehicleCmd register") c.lossy = true;
     return v;

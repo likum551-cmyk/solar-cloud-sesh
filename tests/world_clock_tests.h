@@ -240,8 +240,9 @@ namespace worldclock_t {
             const bool ok = b.size() == proto::kWorldClockBytes && b.size() == 22 && b[0] == 55 && proto::PeekType(b.data(), b.size(), t) &&
                             t == proto::Msg::WorldClock && proto::Decode(b.data(), b.size(), o) && o.rev == 3 && o.gameMs == 66615000 &&
                             o.scaleMilli == 30000 && o.weatherFrom == wc::kClouds && o.weatherTo == wc::kRain && o.transElapsedMs == 12000 &&
-                            o.transTotalMs == 45000 && o.flags == proto::kClockCycle && proto::kMsgLast == (uint8_t)proto::Msg::WorldClock;
-            Check("world clock: WorldClock (55) is 22 bytes and round-trips every field; it is the protocol's last message type", ok,
+                            o.transTotalMs == 45000 && o.flags == proto::kClockCycle && (uint8_t)proto::Msg::WorldClock == 55 &&
+                            proto::kMsgLast >= (uint8_t)proto::Msg::WorldClock;   // 0.5.9 appended the character messages 56-59 after it
+            Check("world clock: WorldClock (55) is 22 bytes and round-trips every field; it is a defined message type", ok,
                   F("%d bytes", (int)b.size()));
         }
         {

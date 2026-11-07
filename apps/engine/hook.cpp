@@ -767,6 +767,15 @@ const HashMapping kCrossmap3889[] = {
     {native::SET_PED_PROP_INDEX,                               0x7F08C4791E6D6969},
     {native::CLEAR_PED_PROP,                                   0x09397806857F5DFB},
     {native::GET_PED_HEAD_BLEND_DATA,                          0x5CB7287FD7611BC7},
+    // 0.5.9 characters: YimMenu b3889 natives.hpp index 4164 / 4145 / 4148 / 4149 / 4143 / 4144 / 4146, each AGREES with YimMenuV2
+    // enhanced and legacy by name (natlookup.mjs); not live-checked yet: logNewNativeResolution reports them.
+    {native::SET_PED_MICRO_MORPH,                              0xAAF9B08B469F707F},
+    {native::SET_PED_HEAD_OVERLAY,                             0xE5B6C9B29510B84E},
+    {native::SET_PED_HEAD_OVERLAY_TINT,                        0x94965BB62753D4D6},
+    {native::SET_PED_HAIR_TINT,                                0x894EE2587C8D8D1E},
+    {native::SET_HEAD_BLEND_EYE_COLOR,                         0x348FF3E632DCB635},
+    {native::GET_HEAD_BLEND_EYE_COLOR,                         0x795C9AE513FFEF5F},
+    {native::GET_PED_HEAD_OVERLAY,                             0x8E73BECF421D257E},
     // vehicle sync, weapons/shots/damage, camera/aim. Same sourcing as the block above (YimMenu
     // crossmap at the natives.hpp index, AGREES with YimMenuV2 `enhanced` by name); not live-checked
     // yet: logNewNativeResolution reports them.
@@ -5236,6 +5245,66 @@ int World::SetPedComponentChecked(int32_t ped, int component, int drawable, int 
 // ---------------------------------------------------------------------------
 // 0.5.4 inv_ped_view: the scripted camera of the inventory's CHARACTER panel (libs/sync/ped_view.h). Script tick only.
 // ---------------------------------------------------------------------------
+bool World::ApplyCharacterFace(int32_t ped, const FaceArgs& f, FaceResult* out) {
+    FaceResult r;
+    if (!ped) {
+        if (out) *out = r;
+        return false;
+    }
+    const uint64_t h = (uint64_t)(uint32_t)ped;
+    auto call = [&](uint64_t n, uint64_t* args, int count) {
+        ++r.calls;
+        if (!CallNative(n, args, count, nullptr)) ++r.failed;
+    };
+    // The head blend first: on a freemode ped it (re)builds the head the morphs and overlays are laid on.
+    PedHeadBlend head = { f.shapeFirst, f.shapeSecond, 0, f.skinFirst, f.skinSecond, 0, f.shapeMix, f.skinMix, 0.0f };
+    ++r.calls;
+    if (!applyHeadBlend(*this, h, head)) ++r.failed;
+    for (int i = 0; i < ::gage::sync::chr::kFeatures; ++i) {
+        uint64_t a[] = { h, (uint64_t)(uint32_t)i, FloatArg(f.morph[i]) };
+        call(native::SET_PED_MICRO_MORPH, a, 3);
+    }
+    for (int i = 0; i < ::gage::sync::chr::kOverlays; ++i) {
+        const FaceArgs::OverlayCall& o = f.overlay[i];
+        uint64_t a[] = { h, (uint64_t)(uint32_t)i, (uint64_t)(uint32_t)o.index, FloatArg(o.opacity) };
+        call(native::SET_PED_HEAD_OVERLAY, a, 4);
+        if (o.colorType != 0 && o.index != ::gage::sync::chr::kOverlayNone) {
+            uint64_t t[] = { h, (uint64_t)(uint32_t)i, (uint64_t)(uint32_t)o.colorType, (uint64_t)(uint32_t)o.color, (uint64_t)(uint32_t)o.color2 };
+            call(native::SET_PED_HEAD_OVERLAY_TINT, t, 5);
+        }
+    }
+    const int hair = SetPedComponentChecked(ped, 2, f.hairDrawable, 0);
+    ++r.calls;
+    if (hair < 0) ++r.failed;
+    r.hairSet = hair == 1;
+    {
+        uint64_t a[] = { h, (uint64_t)(uint32_t)f.hairColor, (uint64_t)(uint32_t)f.hairHighlight };
+        call(native::SET_PED_HAIR_TINT, a, 3);
+    }
+    {
+        uint64_t a[] = { h, (uint64_t)(uint32_t)f.eyeColor };
+        call(native::SET_HEAD_BLEND_EYE_COLOR, a, 2);
+    }
+    // Read-backs: what the game says it now shows (a call that "worked" proves nothing about the ped).
+    {
+        uint64_t a[] = { h };
+        uint64_t v[4] = {};
+        if (CallNative(native::GET_HEAD_BLEND_EYE_COLOR, a, 1, v)) r.eyeRead = (int)(int32_t)(uint32_t)v[0];
+    }
+    {
+        uint64_t a[] = { h, 2 };
+        uint64_t v[4] = {};
+        if (CallNative(native::GET_PED_HEAD_OVERLAY, a, 2, v)) r.browsRead = (int)(int32_t)(uint32_t)v[0];
+    }
+    {
+        uint64_t a[] = { h, 2 };
+        uint64_t v[4] = {};
+        if (CallNative(native::GET_PED_DRAWABLE_VARIATION, a, 2, v)) r.hairRead = (int)(int32_t)(uint32_t)v[0];
+    }
+    if (out) *out = r;
+    return r.failed == 0;
+}
+
 int32_t World::CreateScriptCam(float x, float y, float z, float pitch, float yaw, float fov) {
     static const char kName[] = "DEFAULT_SCRIPTED_CAMERA";   // R*'s scripts always pass this name (alloc8or)
     uint64_t args[] = { (uint64_t)(uintptr_t)kName, FloatArg(x), FloatArg(y), FloatArg(z), FloatArg(pitch), FloatArg(0.0f), FloatArg(yaw),
@@ -7119,6 +7188,13 @@ static void logNewNativeResolution() {
         GAGE_NEW_NATIVE(SET_PED_PROP_INDEX),
         GAGE_NEW_NATIVE(CLEAR_PED_PROP),
         GAGE_NEW_NATIVE(GET_PED_HEAD_BLEND_DATA),
+        GAGE_NEW_NATIVE(SET_PED_MICRO_MORPH),
+        GAGE_NEW_NATIVE(SET_PED_HEAD_OVERLAY),
+        GAGE_NEW_NATIVE(SET_PED_HEAD_OVERLAY_TINT),
+        GAGE_NEW_NATIVE(SET_PED_HAIR_TINT),
+        GAGE_NEW_NATIVE(SET_HEAD_BLEND_EYE_COLOR),
+        GAGE_NEW_NATIVE(GET_HEAD_BLEND_EYE_COLOR),
+        GAGE_NEW_NATIVE(GET_PED_HEAD_OVERLAY),
         // vehicle sync, weapons/shots/damage, camera/aim.
         GAGE_NEW_NATIVE(GET_ENTITY_QUATERNION),
         GAGE_NEW_NATIVE(SET_ENTITY_QUATERNION),

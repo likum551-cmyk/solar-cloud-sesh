@@ -130,7 +130,7 @@ export function registerPlayerRoutes(r: Router, deps: Deps): void {
       method: 'post', path: '/v1/shop/checkout', summary: 'Create an order and a checkout at the payment provider', auth: 'session', tags: ['shop'], body: checkoutSchema,
       description: 'Send an Idempotency-Key header (8-64 chars of [A-Za-z0-9_-]) so a retry returns the same order. Open checkoutUrl in the browser; the order becomes paid when the provider\'s webhook arrives.',
       response: '201 { order }', successStatus: 201,
-      errors: ['email_not_verified', 'account_banned', 'product_not_found', 'product_inactive', 'quantity_exceeds_limit', 'mixed_currency', 'idempotency_mismatch', 'payment_unavailable'],
+      errors: ['email_not_verified', 'account_banned', 'product_not_found', 'product_inactive', 'quantity_exceeds_limit', 'character_slots_full', 'mixed_currency', 'idempotency_mismatch', 'payment_unavailable'],
       limits: [{ name: 'checkout-ip', scope: 'ip', limit: 60, windowSeconds: 3600 }],
     },
     async (c, { body }) => {

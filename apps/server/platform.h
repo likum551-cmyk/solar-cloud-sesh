@@ -47,6 +47,9 @@ namespace gage::server {
         std::string accountId, username, sessionId;
         std::vector<std::string> roles;
         std::string banReason, banExpiresAt;
+        // 0.5.9 characters: the account's character slots (1 + the `character_slot` entitlements, at most 3). 0 = the platform did not say
+        // (an older platform): the server plays it as 1 (sync::chr::SlotsFor).
+        int characterSlots = 0;
     };
 
     inline const char* ToString(VerifyResult::Outcome o)
@@ -152,6 +155,10 @@ namespace gage::server {
             }
             r.accountId = Clean(r.accountId, 64);
             r.sessionId = Clean(r.sessionId, 64);
+            // Optional (0.5.9): a whole number 1..3; anything else (absent, not a number, out of range) is 0 = "not said".
+            if (const JVal* slots = Field(p.v, "characterSlots"))
+                if (slots->t == JVal::Num && slots->n >= 1 && slots->n <= 3 && slots->n == (double)(int)slots->n)
+                    r.characterSlots = (int)slots->n;
             r.outcome = VerifyResult::Outcome::Ok;
             return r;
         }

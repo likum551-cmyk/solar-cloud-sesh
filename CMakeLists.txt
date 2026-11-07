@@ -357,6 +357,7 @@ add_library(gage_mp SHARED
     apps/engine/minimap_size.cpp
     apps/engine/radar_mask.cpp
     apps/engine/world_clock.cpp
+    apps/engine/characters.cpp
 )
 target_link_libraries(gage_mp PRIVATE gage_common gage_netclient gage_sync gage_overlay winhttp ws2_32)
 set_target_properties(gage_mp PROPERTIES
@@ -380,6 +381,7 @@ add_executable(gage_mp_test
     apps/engine/minimap_size.cpp
     apps/engine/radar_mask.cpp
     apps/engine/world_clock.cpp
+    apps/engine/characters.cpp
 )
 target_link_libraries(gage_mp_test PRIVATE gage_common gage_netclient gage_sync gage_overlay ws2_32)
 set_target_properties(gage_mp_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/selftest)

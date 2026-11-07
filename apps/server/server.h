@@ -105,10 +105,18 @@
 //    `weather`, or the chat commands /time /timescale /weather of a VERIFIED ADMIN only: they change the world for everybody, so a guest is
 //    never allowed, unlike the self-only AdminCmds), when the cycle starts or ends a blend, and every 30 s as a resync. Not persisted: a start
 //    begins at clockStart.
+//  * 0.5.9 characters (libs/sync/character.h, character_store.h; Config::characters / characterDir, docs/api/server.md "Characters"):
+//    every player plays a character. A verified account's roster is loaded before its inventory (each character has its own inventory
+//    save); one with no playable character gets one AT ONCE (sync::chr::DefaultAppearance + DefaultName from the account name), saved
+//    before the burst. The platform's verify `characterSlots` (1..3) says how many slots it owns. After the WorldClock the player gets its
+//    CharRoster, then a PeerFace (the full appearance) for every other player; the others get its PeerFace after its PlayerJoined. CharOp
+//    Select / Create / Save are applied by sync::chr::Apply on a copy, saved, then answered with CharRoster + CharResult (a refusal with
+//    CharResult only); a Select also saves the old character's items and sends the new one's. A guest's character is never saved.
 #pragma once
 
 #include "announce.h"
 #include "banlist.h"
+#include "character_store.h"
 #include "config.h"
 #include "inventory_store.h"
 #include "metrics.h"
@@ -202,6 +210,16 @@ namespace gage::server {
         uint64_t invWorldOps = 0;      // ops on a ground pile or trunk applied
         uint64_t invWorldRefused = 0;  // ... refused (out of reach, locked, gone, the rules)
         uint64_t invNearbySent = 0;    // InvNearby messages
+        // 0.5.9 characters
+        uint64_t charsInstant = 0;     // characters made at once on a join (a player with none)
+        uint64_t charOpsApplied = 0;   // CharOps sync::chr::Apply accepted (and, for a saved roster, written)
+        uint64_t charOpsRefused = 0;   // ... refused (the rules, dead, over the rate, a failed write)
+        uint64_t charSaves = 0;        // rosters written
+        uint64_t charSaveFailures = 0; // rosters that could not be written (logged)
+        uint64_t facesSent = 0;        // PeerFace messages (replays and broadcasts)
+        uint64_t charsDeleted = 0;     // stage 4: Delete ops applied
+        uint64_t charsRenamed = 0;     // stage 4: admin renames applied
+        uint64_t namesSent = 0;        // stage 4: PeerName broadcasts (a switch or a rename changed the shown name)
         uint64_t statesAccepted = 0;
         uint64_t statesStale = 0;      // seq not newer than the last accepted
         uint64_t statesInvalid = 0;    // decoded, but outside the world box / limits
@@ -290,6 +308,7 @@ namespace gage::server {
     {
         uint16_t id = 0;
         std::string name;
+        std::string shownName; // 0.5.9 stage 4: what the other players see (the active character's PublicName; `name` with characters off)
         std::string address; // dotted IPv4
         bool hasState = false; // false until the player has sent a PlayerState
         proto::Kinematics k;   // the last accepted state (meaningful only when hasState)
@@ -424,6 +443,16 @@ namespace gage::server {
         // invGroundExpireSeconds had passed), so the next world pass removes them.
         const sync::invw::World& InventoryWorld() const { return invWorld_; }
         void ExpireGround();
+        // 0.5.9 characters (tests, the console's `chars`): the player's roster as the server holds it; false for an unknown player or a
+        // server with characters 0.
+        bool RosterOf(const std::string& target, sync::chr::Roster& out) const;
+        // Names the name index holds (saved rosters plus the online guests'), and the start's scan of characterDir.
+        size_t CharacterNamesIndexed() const { return charStore_.IndexedNames(); }
+        // Stage 4 (GI: "an admin can rename (console + verified-admin command, logged)"): the active character of an ONLINE player
+        // (`target` = id, account name or shown character name) gets `first` `last` (ValidNamePart, free); saved, the player's roster
+        // resent, the others told (PeerName). `by` names the admin in the log. Console `charname`, chat `/charname` (verified admins).
+        bool RenameCharacter(const std::string& target, const std::string& first, const std::string& last, const std::string& by,
+                             std::string* msg = nullptr);
 
         // ---- 0.5.7 world clock (libs/sync/world_clock.h; Config::worldClock, docs/api/server.md "World clock") ----
         // The console's `time HH:MM[:SS]`, `timescale X` and `weather NAME|cycle` (and the chat commands /time /timescale /weather of a
@@ -524,6 +553,15 @@ namespace gage::server {
         void TickInventoryWorld(uint64_t nowMs);          // every 250 ms: sweep, then every 0.5.4 player's InvNearby
         void LogInventoryWorld(uint64_t nowMs);           // the `inventory world:` line, every 60 s while something happened
         sync::invw::World invWorld_;
+        // ---- 0.5.9 characters ----
+        void LoadCharacters(Conn& c);                     // at Accept, before LoadInventory: the roster, the instant character if none
+        bool SaveCharacters(Conn& c, const sync::chr::Roster& r, const char* when);   // when allowed; false = a write failed (logged)
+        void SendCharRoster(Conn& c);
+        void SendFaces(Conn& c);                          // every other player's PeerFace to `c` (the join burst)
+        void BroadcastFace(Conn& c);                      // `c`'s PeerFace to everyone else
+        void UpdateShownName(Conn& c, const char* why);   // stage 4: recompute shownName; a change of a joined player goes out as PeerName
+        void OnCharOp(Conn& c, const uint8_t* data, size_t len);
+        CharacterStore charStore_;
         struct VehClass { uint64_t born = 0; int cls = -1; };
         std::vector<VehClass> vehClass_;                  // per vehicle id: the GTA class a client reported (for the trunk size)
         uint64_t invWorldAtMs_ = 0, invWorldLogAtMs_ = 0;

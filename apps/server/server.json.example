@@ -18,6 +18,8 @@
   "invTrunkReach": 4,
   "invGroundExpireSeconds": 600,
   "invMaxPiles": 2048,
+  "characters": 1,
+  "characterDir": "characters",
   "worldClock": 1,
   "clockStart": "12:00",
   "clockScale": 30,

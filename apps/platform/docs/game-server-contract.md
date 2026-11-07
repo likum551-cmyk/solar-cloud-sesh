@@ -46,7 +46,7 @@ POST /internal/game/verify
 
 | body | meaning | game server action |
 | --- | --- | --- |
-| `{ "ok": true, "accountId", "username", "roles", "emailVerified", "sessionId", "ban": null }` | token valid, now consumed | let the player in, use `username` as the in-game name, keep `accountId` and `sessionId` |
+| `{ "ok": true, "accountId", "username", "roles", "emailVerified", "sessionId", "characterSlots", "ban": null }` | token valid, now consumed | let the player in, use `username` as the in-game name, keep `accountId` and `sessionId`; `characterSlots` (1..3) is how many characters the account may have |
 | `{ "ok": false, "reason": "invalid_token" }` | unknown, malformed, or issued for another server | refuse the connection |
 | `{ "ok": false, "reason": "expired" }` | older than 60 s | refuse; the player joins again from the launcher |
 | `{ "ok": false, "reason": "used" }` | already redeemed (replay, or a second connect attempt) | refuse |
@@ -59,6 +59,7 @@ Rules the game server can rely on:
 - **One session per account.** A successful verify opens the account's game session on this server and closes any older open session of that account (on this or another server) as `superseded`. The same account cannot be in two places. The platform does not tell the old server: it learns of it only because that player's grant and wallet calls start answering 409 `no_active_session`. Treat that answer for a player you believe is connected as "this player has joined elsewhere" and disconnect them (or, at least, stop selling to them).
 - **Roles** come from the database at verify time. A role change while the player is connected is not pushed; read it again at the next verify.
 - **Username** is unique case-insensitively and is the in-game name. This API version has no rename, but key your own persistent data by `accountId`, never by name, so a future rename cannot orphan it.
+- **Character slots** (`characterSlots`, 1..3): every account has 1 character; each paid `character_slot` entitlement (`{ "type": "entitlement", "key": "character_slot" }`, permanent) adds one, at most 2. The platform applies these grants itself at payment (they never appear in the grants queue) and takes them back on a refund or chargeback. The number is read at verify time: a slot bought while the player is connected counts from the next join. A server that does not know the field treats the account as having 1 slot. Characters themselves live on the game server (Solar RP: `apps/server/character_store.*`, docs/api/server.md "Characters").
 - `emailVerified` is informational; the platform already refuses to issue join tokens to unverified accounts while `REQUIRE_VERIFIED_EMAIL=1`.
 
 ## 3. A player leaves: session-end

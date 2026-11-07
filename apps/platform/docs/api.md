@@ -137,6 +137,8 @@ Game server credentials. Each server has an id, a secret (`gss_` + random bits, 
 | `{ "type": "entitlement", "key": "vip", "durationDays": 30 }` | a named status for the game server to apply; no `durationDays` = permanent | the game server, through the grants queue |
 | `{ "type": "item", "key": "hat.red", "quantity": 1 }` | an item or cosmetic (x line quantity) | the game server, through the grants queue |
 
+**Character slots.** The entitlement key `character_slot` is the platform's own: `{ "type": "entitlement", "key": "character_slot" }` (permanent; a `durationDays` is refused) unlocks one more in-game character (every account has 1, at most 2 more can be bought, so sell it as a `vip` or `bundle` product with `maxQuantity` 1 or 2). The platform applies it at payment like a wallet credit (the grant is born acknowledged by `platform`, nothing waits for a game server) and takes it back on a refund or chargeback; a checkout that would pass 2 owned slots is 409 `character_slots_full`. The game server reads the total in the verify answer (`characterSlots`).
+
 A currency pack may only contain wallet credits, a VIP only entitlements, a cosmetic only items; a bundle may mix. The payload is validated when a product is created or edited, and **copied onto the order line at checkout**: later edits or deactivation never change what an existing order delivers, and a product with orders cannot be deleted.
 
 **Orders** move through a state machine that the database enforces with a trigger:
@@ -1350,7 +1352,7 @@ Send an Idempotency-Key header (8-64 chars of [A-Za-z0-9_-]) so a retry returns 
 - **Listener:** public
 - **Rate limits:** `checkout-ip` per client IP (IPv6: /64): 60 per 1 h
 - **Success:** HTTP 201, { order }
-- **Errors:** `email_not_verified`, `account_banned`, `product_not_found`, `product_inactive`, `quantity_exceeds_limit`, `mixed_currency`, `idempotency_mismatch`, `payment_unavailable`
+- **Errors:** `email_not_verified`, `account_banned`, `product_not_found`, `product_inactive`, `quantity_exceeds_limit`, `character_slots_full`, `mixed_currency`, `idempotency_mismatch`, `payment_unavailable`
 
 **Request body (JSON)**
 
@@ -2803,7 +2805,7 @@ HTTP 200
 
 Redeem a join token.
 
-Consumes the token (single use) and opens the account's game session on this server. A ban deletes the account's unused tokens, so those come back invalid_token. 200 { ok: true, accountId, username, roles, emailVerified, sessionId, ban: null } or 200 { ok: false, reason: invalid_token | expired | used } or 200 { ok: false, reason: banned, accountId, username, ban: { reason, expiresAt } }.
+Consumes the token (single use) and opens the account's game session on this server. A ban deletes the account's unused tokens, so those come back invalid_token. 200 { ok: true, accountId, username, roles, emailVerified, sessionId, characterSlots, ban: null } (characterSlots 1..3: the characters the account may have in game) or 200 { ok: false, reason: invalid_token | expired | used } or 200 { ok: false, reason: banned, accountId, username, ban: { reason, expiresAt } }.
 
 - **Auth:** game server (`X-Gage-Server-Id` + `X-Gage-Server-Secret`, from an allowlisted IP)
 - **Listener:** internal
@@ -2842,11 +2844,12 @@ HTTP 200
   ],
   "emailVerified": true,
   "sessionId": "3f2a8c1e-91b4-4d7a-b6c5-2e8f1a0d9c33",
+  "characterSlots": 1,
   "ban": null
 }
 ```
 
-Refusals are also HTTP 200: `{ "ok": false, "reason": "invalid_token" | "expired" | "used" }`, or `{ "ok": false, "reason": "banned", "accountId", "username", "ban": { "reason", "expiresAt" } }`.
+`characterSlots` (1..3) is how many characters the account may have in game: 1 + its bought `character_slot` entitlements. Refusals are also HTTP 200: `{ "ok": false, "reason": "invalid_token" | "expired" | "used" }`, or `{ "ok": false, "reason": "banned", "accountId", "username", "ban": { "reason", "expiresAt" } }`.
 
 ### POST /internal/game/session-end
 
@@ -3168,6 +3171,7 @@ HTTP 200
 | `already_has_discord` | This account already has a Discord account linked. Unlink it first. | `POST /v1/me/discord/link` |
 | `already_verified` | The email address is already verified. | `POST /v1/auth/resend-verification` |
 | `busy` | The server is busy checking passwords (ARGON2_MAX_CONCURRENT running, ARGON2_MAX_QUEUE waiting). Nothing was counted against you; retry after `Retry-After` seconds. | `POST /v1/auth/register`<br>`POST /v1/auth/login`<br>`POST /v1/auth/reset-password`<br>`POST /v1/me/discord/link`<br>`DELETE /v1/me/discord`<br>`POST /v1/me/password` |
+| `character_slots_full` | The order would take the account past 2 bought character slots (3 characters); `details` has `owned` and `max`. | `POST /v1/shop/checkout` |
 | `current_password_required` | The account has a password, so the current one must be sent. | `POST /v1/me/password` |
 | `database_unavailable` | The database did not answer (health check). | `GET /health` |
 | `discord_already_claimed` | The Discord account linked here already claimed this quest on another Solar RP account (one Discord account, one claim). | `POST /v1/me/quests/:slug/claim` |

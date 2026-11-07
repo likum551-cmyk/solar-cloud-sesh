@@ -213,7 +213,7 @@ export const EXAMPLES: Record<string, Example> = {
   'POST /v1/admin/orders/:id/refund': { path: `/v1/admin/orders/${ORDER_ID}/refund`, request: { reason: 'customer request' }, response: { order: { ...order, status: 'refunded', checkoutUrl: null, paidAt: NOW, refundedAt: NOW } } },
 
   // --- game server (internal)
-  'POST /internal/game/verify': { request: { token: JOIN_TOKEN }, response: { ok: true, accountId: ACCOUNT_ID, username: 'Speedy_Gonzo', roles: ['player'], emailVerified: true, sessionId: SESSION_ID, ban: null }, note: 'Refusals are also HTTP 200: `{ "ok": false, "reason": "invalid_token" | "expired" | "used" }`, or `{ "ok": false, "reason": "banned", "accountId", "username", "ban": { "reason", "expiresAt" } }`.' },
+  'POST /internal/game/verify': { request: { token: JOIN_TOKEN }, response: { ok: true, accountId: ACCOUNT_ID, username: 'Speedy_Gonzo', roles: ['player'], emailVerified: true, sessionId: SESSION_ID, characterSlots: 1, ban: null }, note: '`characterSlots` (1..3) is how many characters the account may have in game: 1 + its bought `character_slot` entitlements. Refusals are also HTTP 200: `{ "ok": false, "reason": "invalid_token" | "expired" | "used" }`, or `{ "ok": false, "reason": "banned", "accountId", "username", "ban": { "reason", "expiresAt" } }`.' },
   'POST /internal/game/session-end': { request: { accountId: ACCOUNT_ID, reason: 'quit' }, response: { ended: 1 } },
   'GET /internal/game/grants': { path: `/internal/game/grants?accountId=${ACCOUNT_ID}`, response: { grants: [grantEntry] } },
   'POST /internal/game/grants/pull': { request: { accountId: ACCOUNT_ID }, response: { grants: [grantEntry] } },
@@ -267,6 +267,7 @@ export const ERROR_CODES: Record<string, string> = {
   product_in_use: 'Orders reference the product: deactivate it instead of deleting it.',
   sku_exists: 'A product with that SKU already exists.',
   quantity_exceeds_limit: 'More than the product\'s `maxQuantity` in one order.',
+  character_slots_full: 'The order would take the account past 2 bought character slots (3 characters); `details` has `owned` and `max`.',
   mixed_currency: 'The basket mixes currencies.',
   idempotency_mismatch: 'The Idempotency-Key (checkout, 422) or idempotencyKey (spend, 409) was already used for a different request.',
   payment_unavailable: 'The payment provider could not create the checkout. The order is marked failed; try again.',

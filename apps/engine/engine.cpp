@@ -21,6 +21,7 @@
 #include "quit_gate.h"
 #include "ambient.h"
 #include "world_clock.h"       // 0.5.7: the server's time of day and weather
+#include "characters.h"        // 0.5.9: the server's characters (roster, our face, the peers' faces)
 #include "common/common.h"
 #include "common/logger.h"
 #include "sync/smoother.h"
@@ -281,6 +282,11 @@ namespace {
         bool lookModelFailed = false; // look.model did not stream in: the kCompanionModel stand-in, retried
         double lookFailedAtMs = 0;    // when it failed / the last retry gave up (NowMs)
         uint32_t pedModel = 0;
+        // 0.5.9 characters: the player's face (PeerNet::face, copied by SyncNet); faceDirty until it is on the ped. Put on right after
+        // every look (ApplyPeerLook) and on its own when only the face changed (characters::ApplyPeer).
+        sync::chr::Appearance face;
+        bool hasFace = false, faceDirty = false;
+        uint32_t netFaceSeq = 0;
         double spawnSinceMs = 0;  // NowMs() of the first spawn attempt of the current ped (0 = none)
         // A model we asked GTA to stream (SpawnRemotePed's REQUEST_MODEL, or a stand-in retry) and
         // have not handed back: released (SET_MODEL_AS_NO_LONGER_NEEDED) whenever we stop trying it.
@@ -425,6 +431,10 @@ namespace {
         int16_t  reactBone = -1;     // ... the newest bone
         uint16_t reactAttacker = proto::kNoPlayer; // ... the newest attacker
         uint32_t epoch = 0;          // bumped when a new player takes over an id before the tick removed the old one
+        sync::chr::Appearance face;  // 0.5.9: the newest PeerFace (the player's active character), decoded
+        bool hasFace = false;
+        bool faceBadLogged = false;  // ... one "does not decode" line per peer entry
+        uint32_t faceSeq = 0;        // bumped when `face` changed
     };
 
     // g_peersMtx guards g_peerNet, g_vehNet, g_sync (with the connection's one render clock, g_sync.Clock(), which the
@@ -2349,6 +2359,7 @@ namespace {
         LogDoorsSeatsSwitches();                                       // 0.4.22 (defined with the F / G entry)
         InvCReadSwitches();                                            // 0.5.4: outfit_items / inv_ped_view
         game::worldclock::ReadSwitch();                                // 0.5.7: world_clock
+        game::characters::ReadSwitch();                                // 0.5.9: char_face
         {
             // R3 T3: cover_sync=task (default: verified TASK_PUT_PED_DIRECTLY_INTO_COVER, crouch-pose fallback) | pose (never a cover task) | off.
             const sync::CoverSyncMode cm = sync::ParseCoverSync(reg::Get(L"cover_sync"));
@@ -2457,6 +2468,7 @@ namespace {
             // tick removed the old entry: none of the old player's look or ped carries over (SyncNet
             // resets the tick's side when it sees the epoch change).
             pe.hasLook = false;
+            pe.hasFace = false;                        // 0.5.9: nor its character's face
             pe.despawn = true;
             pe.killedAtMs = 0;                         // nor its death or emote
             pe.emoteKind = 0;
@@ -2498,6 +2510,7 @@ namespace {
             g_adminParked.clear();
         }
         game::worldclock::OnEnded();       // 0.5.7: the next script tick gives the clock and the weather back to the game
+        game::characters::OnEnded();       // 0.5.9: no roster until the next server sends one
         game::Overlay::ClearInventory();   // 0.6: the inventory page shows "unavailable" until the next server sends one
         OutfitClear();                     // 0.5.4: no server inventory, no opinion about the clothes (the next entry dresses the ped in full)
         g_satietyAdd.store(0);
@@ -2585,6 +2598,58 @@ namespace {
         pe.look = pl.look;
         pe.hasLook = true;
         ++pe.lookSeq;                                  // SyncNet: lookDirty, and a new model gets another try
+    }
+
+    // 0.5.9: another player's character face (PeerFace). Decoded here; a blob that does not decode is dropped with one line per peer
+    // and session (the server only sends what it validated, so that is a version skew). The script tick puts it on the ped.
+    void OnPeerFace(const proto::PeerFace& pf)
+    {
+        if (pf.id >= proto::kMaxPlayers || pf.id == join::MyId())
+            return;
+        sync::chr::Appearance a;
+        const bool ok = sync::chr::DecodeLook(pf.blob, a);
+        PeersLock lk(g_peersMtx, false);
+        if (!IsJoinedPeer(pf.id))
+            return;                                    // PeerFace follows its PlayerJoined on the same reliable channel
+        PeerNet& pe = g_peerNet[pf.id];
+        if (!ok)
+        {
+            if (!pe.faceBadLogged)
+                GLOGW("engine: character face (0.5.9): peer id=%u (%s): a face of %u bytes does not decode; ignored", (unsigned)pf.id,
+                      pe.name.c_str(), (unsigned)pf.blob.size());
+            pe.faceBadLogged = true;
+            return;
+        }
+        if (pe.hasFace && pe.face == a)
+            return;
+        pe.face = a;
+        pe.hasFace = true;
+        ++pe.faceSeq;
+    }
+
+    // 0.5.9 stage 4: another player's shown name changed (PeerName: a character switch, a creator save, an admin rename). The name tags, the
+    // kill feed and the chat read PeerNet::name (SyncNet copies it to the tick's Peer), so they follow at once.
+    void OnPeerName(const proto::PeerName& pn)
+    {
+        if (pn.id >= proto::kMaxPlayers || pn.id == join::MyId())
+            return;
+        PeersLock lk(g_peersMtx, false);
+        if (!IsJoinedPeer(pn.id))
+            return;                                    // PeerName follows its PlayerJoined on the same reliable channel
+        PeerNet& pe = g_peerNet[pn.id];
+        if (pe.name == pn.name)
+            return;
+        static std::atomic<int> lines{0};
+        if (lines.fetch_add(1) < 40)
+            GLOGI("engine: characters (0.5.9): peer id=%u is now shown as \"%s\" (was \"%s\")", (unsigned)pn.id, pn.name.c_str(), pe.name.c_str());
+        pe.name = pn.name;
+    }
+
+    // 0.5.9 stage 4: our own name as the others see it (the active character's public name; the player name with no roster).
+    std::string OwnShownName()
+    {
+        std::string s = game::characters::ShownName();
+        return s.empty() ? join::SanitizeName(g_cfg.player) : s;
     }
 
     // ---- protocol v4 sinks (join worker) ----------------------------------------------------
@@ -2839,7 +2904,7 @@ namespace {
         if (fromId != proto::kServerId)
         {
             if (fromId == join::MyId())
-                who = join::SanitizeName(g_cfg.player);
+                who = OwnShownName();      // 0.5.9: the character's name, as the others see our line
             else
             {
                 PeersLock lk(g_peersMtx, false);
@@ -2895,6 +2960,36 @@ namespace {
         { 11,  8, 10, "top: Sky Blue Tee" },                    // U_FMM_8_10: raglan tee, blue body, grey sleeves
     };
 
+    // 0.5.9 stage 4 (char_female): a female character is played on mp_f_freemode_01 with the same three starter pieces as base-game female
+    // items (libs/sync/outfit.h Worn: the two tables must agree, TickOutfitItems checks it once per sex). Item names by GXT label from
+    // root-cause/v-clothingnames female_tops / female_legs / female_shoes: U_FMF_0_6 "Blue T-Shirt", L_FMF_3_0 "Black Chinos", F_FMF_4_1
+    // "White Sports". NOT looked at in GTA or on a render yet: the arms 3/0 that pair with that tee, and the hair (the character's own hair
+    // replaces it at once). No branded tee on this model (brand_apparel.cpp fingerprints the male item only). The head blend is the first
+    // female parent (face ids 21..41 are the female non-DLC parents); the active character's face replaces it (characters::TickLocal).
+    const uint32_t kFreemodeFemale = 0x9C9EFFD8;  // mp_f_freemode_01
+    const game::PedHeadBlend kPlayerHeadFemale = {
+        21, 21, 0,
+        21, 21, 0,
+        0.0f, 0.0f, 0.0f
+    };
+    const game::PedComponent kPlayerOutfitFemale[] = {
+        {  0,  0,  0, "head: default face" },
+        {  1,  0,  0, "mask: none" },
+        {  2,  1,  0, "hair: a base-game cut (the character's hair replaces it)" },
+        {  3,  0,  0, "arms: pairing with the tee unverified" },
+        {  4,  3,  0, "legs: Black Chinos" },                   // L_FMF_3_0
+        {  5,  0,  0, "bag: none" },
+        {  6,  4,  1, "shoes: White Sports" },                  // F_FMF_4_1
+        {  7,  0,  0, "neck: none" },
+        {  8, 14,  0, "undershirt: none" },                     // female 8/14 = no mesh (outfit.h Bare)
+        {  9,  0,  0, "armor: none" },
+        { 10,  0,  0, "decal: none" },
+        { 11,  0,  6, "top: Blue T-Shirt" },                    // U_FMF_0_6
+    };
+
+    // The model our ped must be: the active character's (characters::WantedModel: female only with char_face and char_female on).
+    uint32_t WantedPlayerModel() { return game::characters::WantedModel(); }
+
     // The ped maximum health is 100 + the server playerHealth (Welcome.playerHealth, protocol v5): the death line
     // is 100, so a ped left at the game default of 200 would hold a server value of 150+ only after the vitals tracker
     // clamped it to 100. Set at the entry, on every respawn, after a model swap and whenever the vitals units start
@@ -2943,27 +3038,36 @@ namespace {
         const int32_t ped = g_world->LocalPlayer();
         if (!ped)
             return;
-        // Only a ped that is verifiably the freemode male takes this look: the head blend and the
-        // indices mean nothing on any other model.
+        // Only a ped that is verifiably a freemode model takes a look: the head blend and the
+        // indices mean nothing on any other model. 0.5.9 stage 4: the female model has its own table.
         const uint32_t model = g_world->GetEntityModel(ped);
-        if (model != kFreemodeMale)
+        if (model != kFreemodeMale && model != kFreemodeFemale)
         {
             static bool loggedWrongModel = false;
             if (!loggedWrongModel)
             {
                 loggedWrongModel = true;
-                GLOGW("engine: outfit (%s) skipped: local ped model is 0x%08x, not freemode 0x%08x",
-                      when, (unsigned)model, (unsigned)kFreemodeMale);
+                GLOGW("engine: outfit (%s) skipped: local ped model is 0x%08x, not freemode 0x%08x / 0x%08x",
+                      when, (unsigned)model, (unsigned)kFreemodeMale, (unsigned)kFreemodeFemale);
             }
             return;
         }
-        const bool dressed = g_world->ApplyPedOutfit(ped, kPlayerHead, kPlayerOutfit,
-                                                     sizeof(kPlayerOutfit) / sizeof(kPlayerOutfit[0]));
+        const bool female = model == kFreemodeFemale;
+        const bool dressed = female ? g_world->ApplyPedOutfit(ped, kPlayerHeadFemale, kPlayerOutfitFemale,
+                                                              sizeof(kPlayerOutfitFemale) / sizeof(kPlayerOutfitFemale[0]))
+                                    : g_world->ApplyPedOutfit(ped, kPlayerHead, kPlayerOutfit,
+                                                              sizeof(kPlayerOutfit) / sizeof(kPlayerOutfit[0]));
         static int logged = 0;
         if (logged < 10)
         {
             ++logged;
-            GLOGI("engine: outfit (%s): %s", when, dressed ? "applied" : "not applied (see the hook log line above)");
+            GLOGI("engine: outfit (%s, %s): %s", when, female ? "female" : "male", dressed ? "applied" : "not applied (see the hook log line above)");
+        }
+        if (dressed && female)
+        {
+            g_outfitRecheck.store(true);
+            game::characters::NoteRedressed();
+            return;                          // no branded tee on the female model
         }
         if (dressed)
         {
@@ -2988,6 +3092,7 @@ namespace {
                     game::brand::NoteDressed(when);
             }
             g_outfitRecheck.store(true);   // 0.5.4 outfit_items: the full outfit is back on; the worn items decide again at once
+            game::characters::NoteRedressed();   // 0.5.9: the fixed head is back on; the active character's face goes on again
         }
     }
 
@@ -3399,7 +3504,7 @@ namespace {
             const ULONG waited = now - started;
             if (wait && waited < kEntryReadyMaxMs)
             {
-                g_world->RequestModel(kFreemodeMale);
+                g_world->RequestModel(WantedPlayerModel());   // 0.5.9: the active character's model (male with no roster yet)
                 // Kill the SP mission flow before it runs. A fresh Story Mode boot's flow_controller
                 // launches the Prologue (North Yankton), which forces a story character and teleports
                 // there -- so terminate flow_controller + prologue1 every tick from the first live
@@ -3430,7 +3535,7 @@ namespace {
 
         // The model streams in over a few frames; past kModelStreamMaxMs from readiness keep the
         // story ped (the default-ped guard keeps retrying the swap after the entry).
-        const bool modelOk = g_world->SetPlayerModel(kFreemodeMale);
+        const bool modelOk = g_world->SetPlayerModel(WantedPlayerModel());
         if (!modelOk && GetTickCount64() - g_entryReadyAt.load() < kModelStreamMaxMs)
             return false;
         if (modelOk)
@@ -3481,8 +3586,8 @@ namespace {
             return false;
         const ULONG since = now - g_entryDoneAt;
         auto logPed = [&](const char* when) {
-            GLOGI("engine: ped %s after entry: model 0x%08x (freemode 0x%08x), health %d / max %d",
-                  when, (unsigned)g_world->GetEntityModel(lp), (unsigned)kFreemodeMale,
+            GLOGI("engine: ped %s after entry: model 0x%08x (wanted 0x%08x), health %d / max %d",
+                  when, (unsigned)g_world->GetEntityModel(lp), (unsigned)WantedPlayerModel(),
                   g_world->GetEntityHealth(lp), g_world->GetEntityMaxHealth(lp));
         };
         if (!(g_entryLogged & 1) && since >= 1000) { g_entryLogged |= 1; logPed("1 s"); }
@@ -3504,9 +3609,18 @@ namespace {
             }
             return false;
         }
-        if (model == kFreemodeMale)
+        // 0.5.9 stage 4: the wanted model is the active character's (a switch to a character of the other sex is a swap here).
+        const uint32_t wanted = WantedPlayerModel();
+        if (model == wanted)
             return false;
-        const bool swapped = g_world->SetPlayerModel(kFreemodeMale);  // also re-sets the default components
+        if (model == kFreemodeMale || model == kFreemodeFemale)
+        {
+            static int sexSwaps = 0;
+            if (sexSwaps++ < 10)
+                GLOGI("engine: characters (0.5.9): the active character needs model 0x%08x, our ped is 0x%08x: swapping", (unsigned)wanted,
+                      (unsigned)model);
+        }
+        const bool swapped = g_world->SetPlayerModel(wanted);  // also re-sets the default components
         if (swapped)
         {
             DressPlayer("ped guard");       // the new ped needs the GAGE-MP look again
@@ -3914,7 +4028,8 @@ namespace {
 
     // 0.6, join worker thread: our inventory as the server holds it (after each of our ops, and after a console give / clear).
     void OnInvState(const proto::InvState& s) {
-        std::string name;
+        std::string name = game::characters::ActiveDisplay();   // 0.5.9: the character played (the account name with no roster)
+        if (name.empty())
         {
             std::lock_guard<std::mutex> lk(g_invMtx);
             name = g_invName;
@@ -3936,7 +4051,8 @@ namespace {
     // takes it like an InvState; the script tick applies its weapons to the ped (TickInventoryWorld). A snapshot the tick has not applied yet
     // is replaced by the newer one, keeping its strip list and its "not from our report" (both must still reach the ped).
     void OnInvSnap(const proto::InvSnap& s) {
-        std::string name;
+        std::string name = game::characters::ActiveDisplay();   // 0.5.9: the character played (the account name with no roster)
+        if (name.empty())
         {
             std::lock_guard<std::mutex> lk(g_invMtx);
             name = g_invName;
@@ -4240,10 +4356,31 @@ namespace {
         }
     }
 
+    // 0.5.9 stage 4, script tick: the CHARACTERS page's ops (select, create, save, delete) to the server as CharOp. An op the session cannot
+    // send is answered on the page at once (SetCharacterResult NotNow), so its buttons do not wait 10 s for nothing.
+    void PumpCharacterOps() {
+        uint16_t seq = 0;
+        uint8_t op = 0, slot = 0;
+        std::string blob;
+        while (game::Overlay::PopCharacterOp(&seq, &op, &slot, &blob)) {
+            proto::CharOp m;
+            m.seq = seq;
+            m.op = op;
+            m.slot = slot;
+            m.blob = blob;
+            const bool sent = join::SendCharOp(m);
+            GLOGI("engine: characters (0.5.9): page op %s slot %u seq %u %s", op >= 1 && op <= sync::chr::kOpLast ? sync::chr::ToString((sync::chr::Op)op) : "?",
+                  (unsigned)slot + 1, (unsigned)seq, sent ? "sent" : "NOT SENT (no live session, no roster yet, or the queue is full)");
+            if (!sent)
+                game::Overlay::SetCharacterResult(seq, op, slot, (uint8_t)sync::chr::Code::NotNow, "not sent");
+        }
+    }
+
     // Run any queued commands and advance a pending vehicle spawn. Script tick only.
     // lp is the local ped, now is GetTickCount().
     void RunCommands(int32_t lp, ULONG now) {
         PumpInventoryOps();
+        PumpCharacterOps();   // 0.5.9 stage 4
         std::vector<Command> cmds;
         {
             std::lock_guard<std::mutex> lk(g_cmdMtx);
@@ -5511,7 +5648,7 @@ namespace {
     }
 
     // ---- appearance (protocol v3 Look) <-> game::PedLook -------------------------
-    const uint32_t kFreemodeFemale = 0x9C9EFFD8;  // mp_f_freemode_01
+    // (kFreemodeFemale is defined with the female spawn outfit, near kFreemodeMale)
     // The wire has no "has a head blend" bit: a freemode model always has one, anything else none.
     bool IsFreemodeModel(uint32_t model) { return model == kFreemodeMale || model == kFreemodeFemale; }
 
@@ -5622,18 +5759,22 @@ namespace {
             // The starter items ARE the spawn outfit's pieces: say so once, loudly if someone changed one side only.
             starterChecked = true;
             int checked = 0, differ = 0;
+            for (int sx = 0; sx < 2; ++sx)   // 0.5.9: the female table (kPlayerOutfitFemale) too
             for (const char* key : {"tshirt", "jeans", "sneakers"}) {
                 const sync::inv::ItemDef* d = sync::inv::FindKey(key);
-                const sync::outfit::Parts p = sync::outfit::Worn(d ? d->id : 0, sync::outfit::Sex::Male);
+                const sync::outfit::Parts p = sync::outfit::Worn(d ? d->id : 0, sx ? sync::outfit::Sex::Female : sync::outfit::Sex::Male);
+                const game::PedComponent* table = sx ? kPlayerOutfitFemale : kPlayerOutfit;
+                const size_t tableN = sx ? sizeof(kPlayerOutfitFemale) / sizeof(kPlayerOutfitFemale[0]) : sizeof(kPlayerOutfit) / sizeof(kPlayerOutfit[0]);
                 for (int i = 0; i < p.n; ++i)
-                    for (const game::PedComponent& c : kPlayerOutfit)
-                        if (c.component == p.p[i].component) {
+                    for (size_t t = 0; t < tableN; ++t)
+                        if (const game::PedComponent& c = table[t]; c.component == p.p[i].component) {
                             ++checked;
                             if (c.drawable != p.p[i].drawable || c.texture != p.p[i].texture) {
                                 ++differ;
-                                GLOGW("engine: outfit items (0.5.4): item %s sets component %d to %d/%d but the spawn outfit has %d/%d (%s): the two "
-                                      "must agree (libs/sync/outfit.h Worn, engine.cpp kPlayerOutfit)",
-                                      key, (int)p.p[i].component, (int)p.p[i].drawable, (int)p.p[i].texture, c.drawable, c.texture, c.what);
+                                GLOGW("engine: outfit items (0.5.4): item %s (%s) sets component %d to %d/%d but the spawn outfit has %d/%d (%s): the "
+                                      "two must agree (libs/sync/outfit.h Worn, engine.cpp kPlayerOutfit / kPlayerOutfitFemale)",
+                                      key, sx ? "female" : "male", (int)p.p[i].component, (int)p.p[i].drawable, (int)p.p[i].texture, c.drawable,
+                                      c.texture, c.what);
                             }
                         }
             }
@@ -5886,6 +6027,60 @@ namespace {
         return true;
     }
 
+    // 0.5.9 stage 4 (char_screens): while the CHARACTERS page's creator is open the preview shows its DRAFT. The signature then also carries
+    // the draft's revision, its sex and whether that sex's model has streamed in, so the 0.5.8 look watch re-clones after a change (its own
+    // settle / gap rules: about a second); PedPreviewClone picks the source (PreviewSource).
+    bool PreviewSig(int32_t lp, uint64_t& sig)
+    {
+        if (!PedPreviewLookSig(lp, sig))
+            return false;
+        sync::chr::Appearance a;
+        uint32_t rev = 0;
+        if (game::Overlay::CharacterDraft(&a, &rev)) {
+            const uint32_t m = sync::chr::ModelOf(a.sex);
+            const bool ready = m == g_world->GetEntityModel(lp) || g_world->HasModelLoaded(m);
+            const int v[4] = {(int)rev, (int)a.sex, ready ? 1 : 0, 0x5eed};
+            sig ^= sync::pedpreview::SigOf(v, 4) * 1099511628211ull;
+        }
+        return true;
+    }
+
+    // The preview's ped: a clone of ours (0.5.8), with the creator's draft face when a draft of our sex is open; for a draft of the OTHER sex a
+    // new ped of that model (once streamed in; until then the clone of ours, and the signature re-clones when the model arrives), dressed in
+    // that sex's spawn outfit and the draft face. `what` names the source for the log.
+    int32_t PreviewSource(int32_t lp, float x, float y, float z, const char*& what)
+    {
+        sync::chr::Appearance a;
+        uint32_t rev = 0;
+        const bool draft = game::Overlay::CharacterDraft(&a, &rev);
+        what = "CLONE_PED of our ped";
+        int32_t c = 0;
+        const uint32_t ours = g_world->GetEntityModel(lp), want = sync::chr::ModelOf(a.sex);
+        if (draft && want != ours) {
+            if (g_world->HasModelLoaded(want)) {
+                c = g_world->SpawnPed((int)want, x, y, z);
+                if (c) {
+                    const bool female = want == kFreemodeFemale;
+                    g_world->ApplyPedOutfit(c, female ? kPlayerHeadFemale : kPlayerHead, female ? kPlayerOutfitFemale : kPlayerOutfit,
+                                            female ? sizeof(kPlayerOutfitFemale) / sizeof(kPlayerOutfitFemale[0]) : sizeof(kPlayerOutfit) / sizeof(kPlayerOutfit[0]));
+                    what = female ? "a new mp_f_freemode_01 ped (the creator's female draft)" : "a new mp_m_freemode_01 ped (the creator's male draft)";
+                }
+            } else {
+                g_world->RequestModel(want);
+                what = "CLONE_PED of our ped (the draft's model is still streaming in)";
+            }
+        }
+        if (!c)
+            c = g_world->ClonePed(lp);
+        if (c && draft && g_world->GetEntityModel(c) == want) {
+            game::World::FaceResult r;
+            g_world->ApplyCharacterFace(c, sync::chr::PlanFace(a), &r);
+            if (want == ours)
+                what = "CLONE_PED of our ped with the creator's draft face";
+        }
+        return c;
+    }
+
     void PedPreviewDeleteClone(int32_t& handle, const char* why)
     {
         if (!handle)
@@ -5973,7 +6168,8 @@ namespace {
         float x = 0, y = 0, z = 0;
         const bool at = g_world->GetEntityCoords(lp, x, y, z);
         const bool inVeh = g_world->IsPedInVehicle(lp);
-        const int32_t c = g_world->ClonePed(lp);
+        const char* what = "CLONE_PED of our ped";
+        const int32_t c = PreviewSource(lp, x, y, z - 10.0f, what);   // 0.5.9 stage 4: the creator's draft when one is open
         g_ppClone = c;
         ++g_pp.clones;
         int failed = 6;
@@ -5981,7 +6177,12 @@ namespace {
             failed = g_world->HidePreviewClone(c, x, y, z - 10.0f);
         const int exists = c ? g_world->EntityExists(c) : 0;
         uint64_t sig = 0;
-        const bool sigOk = PedPreviewLookSig(lp, sig);
+        const bool sigOk = PreviewSig(lp, sig);
+        if (std::strcmp(what, "CLONE_PED of our ped") != 0) {
+            static int srcLines = 0;
+            if (srcLines++ < 40)
+                GLOGI("engine: character creator (0.5.9): preview source %d = %s", c, what);
+        }
         if (sigOk)
             g_pp.look.Cloned(sig, now);
         static int lines = 0;
@@ -6075,7 +6276,7 @@ namespace {
         if (step == pp::Step::Showing && lp && now - g_pp.lookAtMs >= pp::kLookSampleMs) {
             g_pp.lookAtMs = now;
             uint64_t sig = 0;
-            if (PedPreviewLookSig(lp, sig))
+            if (PreviewSig(lp, sig))   // 0.5.9 stage 4: the creator's draft too
                 in.lookDue = g_pp.look.Feed(sig, now);
         }
         if (g_pp.probeWaiting) {
@@ -6226,7 +6427,16 @@ namespace {
         pe.weaponShown = weapon;
     }
 
-    // Puts the peer's stored look on its ped (its model must be look.model). Script tick.
+    // 0.5.9: the peer's character face on its ped (characters::ApplyPeer: nothing when char_face=0 or the ped's model is not the freemode
+    // model of the face's sex). Script tick.
+    void ApplyPeerFace(Peer& pe, int id)
+    {
+        pe.faceDirty = false;
+        if (pe.hasFace && pe.ped)
+            game::characters::ApplyPeer(*g_world, pe.ped, pe.pedModel, pe.face, id, pe.name);
+    }
+
+    // Puts the peer's stored look on its ped (its model must be look.model), then its face. Script tick.
     void ApplyPeerLook(Peer& pe, int id)
     {
         pe.lookDirty = false;
@@ -6236,6 +6446,7 @@ namespace {
             PeerLog(true, "engine: remote peer id=%d (%s): look not applied (model 0x%08x)", id, pe.name.c_str(),
                     (unsigned)pe.look.model);
         }
+        ApplyPeerFace(pe, id);                         // 0.5.9: the look's fixed head and hair are replaced by the character's
     }
 
     // peer_drive=place (stage 1): the ped is set onto the smoothed pose, every frame. No tasks, so
@@ -9704,6 +9915,7 @@ namespace {
                 // player's look or death carries over (its emote was ended by the bumped emoteSeq).
                 pe.netEpoch = n.epoch;
                 pe.hasLook = pe.lookDirty = pe.lookModelFailed = false;
+                pe.hasFace = pe.faceDirty = false;     // 0.5.9
                 pe.killedAtMs = 0;
                 // ... and its ped and model are the old player's: OnJoined's id-reuse branch asked for a despawn, but
                 // OnWorld clears that request when the new player shows up in relevance, so ask again here (W4 review).
@@ -9718,6 +9930,13 @@ namespace {
                 pe.lookDirty = true;
                 pe.lookFailLogged = false;
                 pe.lookModelFailed = false;
+            }
+            if (pe.netFaceSeq != n.faceSeq)
+            {
+                pe.netFaceSeq = n.faceSeq;             // 0.5.9: a new character face
+                pe.face = n.face;
+                pe.hasFace = n.hasFace;
+                pe.faceDirty = n.hasFace;
             }
             if (n.killedAtMs != 0)
             {
@@ -10041,6 +10260,9 @@ namespace {
                     else
                         pe.lookDirty = false;          // its model did not load: the stand-in stays for now
                 }
+                // 0.5.9: only the face changed (a character switch or edit with the same look), or the ped has no look to wait for.
+                if (pe.ped && pe.faceDirty && !pe.lookDirty)
+                    ApplyPeerFace(pe, it->first);
                 if (!pe.poseOk)
                 {
                     // No data (yet), out of relevance or silent. A spawn in progress stops here: its
@@ -10099,6 +10321,7 @@ namespace {
                         pe.haveLastTarget = false;
                         pe.lastMove = proto::kMoveIdle;
                         SetupPeerPed(pe, it->first);    // v4: hit pool, shot / death / seat / emote edges
+                        pe.faceDirty = pe.hasFace;      // 0.5.9: a fresh ped has the default head (ApplyPeerLook or the face path puts it on)
                         if (pe.hasLook && model == pe.look.model)
                             ApplyPeerLook(pe, it->first);
                         else
@@ -16327,6 +16550,9 @@ namespace {
             if (lp && g_life == Life::Alive && g_entry.load() == Entry::Done)
             {
                 WorkSection s(probe, kSecReadSend);
+                const uint32_t lpModel = g_world->GetEntityModel(lp);
+                game::characters::TickDraft(*g_world, lp, lpModel);   // 0.5.9 stage 4: the creator's draft on our ped while it is open
+                game::characters::TickLocal(*g_world, lp, lpModel);   // 0.5.9: our active character's face (on a change only)
                 TickOutfitItems(lp, now);   // 0.5.4 outfit_items: the worn items' clothes first, so the look sent below already has them
                 PublishLook(lp, now);
             }
@@ -16571,6 +16797,10 @@ namespace gage::engine {
         sinks.onInvSnap = OnInvSnap;               // 0.5.4 inventory world
         sinks.onInvNearby = OnInvNearby;
         sinks.onWorldClock = game::worldclock::OnClock;   // 0.5.7 world clock
+        sinks.onCharRoster = game::characters::OnRoster;  // 0.5.9 characters
+        sinks.onCharResult = game::characters::OnResult;
+        sinks.onPeerFace = OnPeerFace;
+        sinks.onPeerName = OnPeerName;                    // 0.5.9 stage 4
         sinks.onDamage = OnDamage;
         sinks.onKilled = OnKilled;
         sinks.onRespawnOk = OnRespawnOk;

@@ -114,6 +114,7 @@ struct Rig
         c.maxConnectionsPerIp = 0;
         c.bansFile = "";
         c.inventoryDir = "";   // 0.6: no inventory saves from the rig; the save tests (inventory_net_tests.h) give their own scratch folder
+        c.characterDir = "";   // 0.5.9: likewise no roster saves (characters stay on); tests/character_net_tests.h gives its own folder
         // The authority rules that count per address or judge invented positions would trip over a rig in
         // which every client is 127.0.0.1 and Place() teleports at will; they are off here and the tests
         // of those rules switch them on (netcode_test AuthorityNetworkTests, server_test J).
@@ -329,10 +330,14 @@ struct Probe
             if (e.type == ET::PlayerLeft && e.left.id == id && e.left.reason == r) return true;
         return false;
     }
+    // 0.5.9 stage 4: PlayerJoined carries the CHARACTER name; a player's instant character is "<account name> <surname>", so `name` matches
+    // the account name exactly (characters 0) or as the first word of the character name.
     bool SawJoined(uint16_t id, const std::string& name) const
     {
         for (const net::Event& e : events)
-            if (e.type == ET::PlayerJoined && e.joined.id == id && e.joined.name == name) return true;
+            if (e.type == ET::PlayerJoined && e.joined.id == id &&
+                (e.joined.name == name || e.joined.name.compare(0, name.size() + 1, name + " ") == 0))
+                return true;
         return false;
     }
     // This client's latest full-detail view of another player, or null (never seen, or it left the
@@ -362,8 +367,9 @@ struct Probe
                                       "VehicleResult", "Damage",       "Killed",       "RespawnOk",  "PeerAnim",
                                       "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact", "LinkInfo",
                                       "AccountInfo",  "AdminResult", "InvState",   "InvUsed",    "InvSnap",
-                                      "InvNearby",    "WorldClock"};
-        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::WorldClock + 1, "a name per event type");
+                                      "InvNearby",    "WorldClock",  "CharRoster", "CharResult", "PeerFace",
+                                      "PeerName"};
+        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::PeerName + 1, "a name per event type");
         std::string out;
         for (const net::Event& e : events) out += std::string(names[(int)e.type]) + " ";
         return out;

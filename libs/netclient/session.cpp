@@ -20,7 +20,8 @@ namespace gage::net {
         uint8_t ChannelFor(proto::Msg t)
         {
             // Everything not listed here is reliable, including the 0.5.4 inventory world's InvSnap, InvNearby (S->C) and
-            // InvReport (C->S): each carries a whole state the receiver must not miss. So is 0.5.7's WorldClock (an admin change must arrive).
+            // InvReport (C->S): each carries a whole state the receiver must not miss. So is 0.5.7's WorldClock (an admin change must arrive),
+            // and 0.5.9's CharRoster / CharOp / CharResult / PeerFace / PeerName (a character change, a face or a name must not be lost).
             return t == proto::Msg::WorldState || t == proto::Msg::WorldCoarse || t == proto::Msg::VehicleWorld ||
                            t == proto::Msg::PlayerState || t == proto::Msg::VehicleUpdate || t == proto::Msg::LinkInfo   // R3 T5: LinkInfo rides the state channel
                        ? proto::kChanState
@@ -186,6 +187,7 @@ namespace gage::net {
         seq_ = 0;
         vehSeq_ = 0;
         lookSent_ = false; // a new connection: the server knows no look of ours
+        charOffered_ = false;
         worldReceived_ = worldDropped_ = malformed_ = 0;
         decoder_.Reset();
         counters_ = Counters();
@@ -497,6 +499,27 @@ namespace gage::net {
             if (!proto::Decode(data, len, e.worldClock)) { malformed_++; return; }
             e.type = Event::Type::WorldClock;
             break;
+        case proto::Msg::CharRoster:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.charRoster)) { malformed_++; return; }
+            charOffered_ = true;
+            e.type = Event::Type::CharRoster;
+            break;
+        case proto::Msg::CharResult:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.charResult)) { malformed_++; return; }
+            e.type = Event::Type::CharResult;
+            break;
+        case proto::Msg::PeerFace:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.face)) { malformed_++; return; }
+            e.type = Event::Type::PeerFace;
+            break;
+        case proto::Msg::PeerName:
+            if (!joined) return;
+            if (!proto::Decode(data, len, e.peerName)) { malformed_++; return; }
+            e.type = Event::Type::PeerName;
+            break;
         case proto::Msg::ResourceManifest:
         case proto::Msg::ResourceChunk:
             return; // server-to-client types this session does not surface yet: ignored, not an error
@@ -516,6 +539,7 @@ namespace gage::net {
         case proto::Msg::AdminCmd:
         case proto::Msg::InvOp:
         case proto::Msg::InvReport:
+        case proto::Msg::CharOp:
             malformed_++; // client-to-server types never arrive here
             return;
         }
@@ -707,6 +731,14 @@ namespace gage::net {
         if (state_ != SessionState::Joined)
             return false;
         const proto::Bytes b = proto::Encode(r);
+        return !b.empty() && SendBytes(proto::kChanReliable, b, true);
+    }
+
+    bool ClientSession::SendCharOp(const proto::CharOp& o)
+    {
+        if (state_ != SessionState::Joined || !charOffered_)
+            return false;
+        const proto::Bytes b = proto::Encode(o);
         return !b.empty() && SendBytes(proto::kChanReliable, b, true);
     }
 

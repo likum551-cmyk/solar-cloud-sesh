@@ -607,6 +607,8 @@ detail::inv3::Page MenuPage()
         return detail::inv3::Page::Admin;
     if (u.invPage == detail::inv3::Page::Admin && !IsAdmin())
         return detail::inv3::Page::Inventory;
+    if (u.invPage == detail::inv3::Page::Characters && !detail::inv3::CharactersAvailable())
+        return detail::inv3::Page::Inventory;   // 0.5.9 stage 4: no roster this session (or char_screens=0)
     return u.invPage;
 }
 void SetMenuPage(detail::inv3::Page p)
@@ -3894,11 +3896,15 @@ void UiFrame()
             const detail::inv3::Page page = MenuPage();
             if (tab && io.KeyCtrl) {
                 // Ctrl+Tab turns the page (ImGui's own Ctrl+Tab window switch is off: UiInit). 0.6: an admin cycles INVENTORY -> ADMIN
-                // quick actions -> ADMIN cars -> INVENTORY; everyone else has one page.
+                // quick actions -> ADMIN cars -> INVENTORY; everyone else has one page. 0.5.9 stage 4: CHARACTERS comes after INVENTORY
+                // whenever the server sent a roster (for everyone).
+                const bool chars = detail::inv3::CharactersAvailable();
                 if (!g_invRev3.load())
                     SwitchInvTab(1 - u.invTab);
-                else if (IsAdmin()) {
-                    if (page == detail::inv3::Page::Inventory) {
+                else if (page == detail::inv3::Page::Inventory && chars) {
+                    SetMenuPage(detail::inv3::Page::Characters);
+                } else if (IsAdmin()) {
+                    if (page == detail::inv3::Page::Inventory || page == detail::inv3::Page::Characters) {
                         SwitchInvTab(0);
                         SetMenuPage(detail::inv3::Page::Admin);
                     } else if (u.invTab == 0) {
@@ -3906,9 +3912,13 @@ void UiFrame()
                     } else {
                         SetMenuPage(detail::inv3::Page::Inventory);
                     }
+                } else if (page == detail::inv3::Page::Characters) {
+                    SetMenuPage(detail::inv3::Page::Inventory);
                 }
             } else if (esc && page == detail::inv3::Page::Inventory && inv3::HandleEsc()) {
                 // Esc closed a drag, the split dialog, the context menu or the search box: the menu stays open
+            } else if (esc && page == detail::inv3::Page::Characters && inv3::HandleCharEsc()) {
+                // 0.5.9 stage 4: Esc closed the delete dialog, a name field's focus or the creator: the menu stays open
             } else if (tab || esc) {
                 CloseInventory();
             }
@@ -3949,7 +3959,7 @@ void UiFrame()
     // (after a click on the pager or a tab, or while the arrows steer the rows): the characters are held and the box
     // is focused again, caret kept (no select-all, which would eat the query on the next key).
     const detail::inv3::Page menuPage = MenuPage();
-    const bool rev3Page = menuPage == detail::inv3::Page::Inventory;
+    const bool rev3Page = menuPage == detail::inv3::Page::Inventory || menuPage == detail::inv3::Page::Characters;   // 0.5.9: both REV3 screens
     const bool carsPage = u.invOpen && !u.chatOpen && !rev3Page && u.invTab == 1;
     if (carsPage && !u.searchActive) {
         bool printable = false;
@@ -4040,6 +4050,7 @@ void UiFrame()
             fi.a = u.invA * u.hudA;
             fi.justOpened = u.invJustOpened;
             fi.isAdmin = IsAdmin();
+            fi.characters = detail::inv3::CharactersAvailable();   // 0.5.9 stage 4
             fi.page = menuPage;
             if (rev3Page) {
                 const detail::inv3::FrameOut fo = inv3::DrawScreen(fi);

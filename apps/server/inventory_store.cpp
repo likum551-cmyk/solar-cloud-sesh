@@ -22,16 +22,18 @@ namespace gage::server {
         return "?";
     }
 
-    std::string InventoryStore::PathFor(const std::string& accountId) const
+    std::string InventoryStore::PathFor(const std::string& accountId, int slot) const
     {
         static const char* const kHex = "0123456789abcdef";
         std::string name;
-        name.reserve(accountId.size() * 2 + 4);
+        name.reserve(accountId.size() * 2 + 8);
         for (unsigned char c : accountId)
         {
             name.push_back(kHex[c >> 4]);
             name.push_back(kHex[c & 15]);
         }
+        if (slot > 0)
+            name += ".c" + std::to_string(slot);
         name += ".inv";
         return (fs::path(dir_) / name).string();
     }
@@ -54,14 +56,14 @@ namespace gage::server {
         return true;
     }
 
-    InventoryStore::Loaded InventoryStore::Load(const std::string& accountId, sync::inv::Character& out, std::string* why)
+    InventoryStore::Loaded InventoryStore::Load(const std::string& accountId, sync::inv::Character& out, std::string* why, int slot)
     {
         if (!Enabled() || accountId.empty())
         {
             out = sync::inv::StarterKit();
             return Loaded::Fresh;
         }
-        const std::string path = PathFor(accountId);
+        const std::string path = PathFor(accountId, slot);
         std::string bytes, err;
         bool missing = false;
         if (!ReadWholeFile(path, bytes, &err, &missing))
@@ -86,7 +88,7 @@ namespace gage::server {
         return ec ? Loaded::Unreadable : Loaded::Corrupt;
     }
 
-    bool InventoryStore::Save(const std::string& accountId, const sync::inv::Character& ch, std::string* why)
+    bool InventoryStore::Save(const std::string& accountId, const sync::inv::Character& ch, std::string* why, int slot)
     {
         if (!Enabled())
         {
@@ -100,7 +102,49 @@ namespace gage::server {
         }
         if (!EnsureDir(why))
             return false;
-        return AtomicWriteFile(PathFor(accountId), sync::inv::EncodeForSave(ch), why);
+        return AtomicWriteFile(PathFor(accountId, slot), sync::inv::EncodeForSave(ch), why);
+    }
+
+    InventoryStore::Retired InventoryStore::Retire(const std::string& accountId, int slot, std::string* why)
+    {
+        if (!Enabled() || accountId.empty())
+            return Retired::None;
+        const std::string path = PathFor(accountId, slot);
+        std::error_code ec;
+        const fs::file_status st = fs::status(path, ec);
+        // MinGW reports not_found AND sets ec for a missing file: test the type first (lessons 2026-10-29).
+        if (st.type() == fs::file_type::not_found)
+            return Retired::None;
+        if (st.type() != fs::file_type::regular)
+        {
+            if (why) *why = path + ": not a readable file" + (ec ? " (" + ec.message() + ")" : std::string());
+            return Retired::Failed;
+        }
+        fs::rename(path, path + ".deleted", ec);   // replaces an older .deleted (a slot deleted twice)
+        if (ec)
+        {
+            if (why) *why = path + ": cannot set it aside: " + ec.message();
+            return Retired::Failed;
+        }
+        return Retired::SetAside;
+    }
+
+    bool InventoryStore::Restore(const std::string& accountId, int slot, std::string* why)
+    {
+        const std::string path = PathFor(accountId, slot);
+        std::error_code ec;
+        fs::rename(path + ".deleted", path, ec);
+        if (ec && why) *why = path + ".deleted: cannot put it back: " + ec.message();
+        return !ec;
+    }
+
+    bool InventoryStore::Purge(const std::string& accountId, int slot, std::string* why)
+    {
+        const std::string path = PathFor(accountId, slot) + ".deleted";
+        std::error_code ec;
+        fs::remove(path, ec);
+        if (ec && why) *why = path + ": cannot remove it: " + ec.message();
+        return !ec;
     }
 
 } // namespace gage::server

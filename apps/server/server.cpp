@@ -77,6 +77,9 @@ namespace gage::server {
         // The inventory world's pass (sweep + every 0.5.4 player's InvNearby) and its log line.
         constexpr uint64_t kInvWorldEveryMs = 250;
         constexpr uint64_t kInvWorldLogEveryMs = 60000;
+        // 0.5.9 CharOp per player: the creator saves once per confirm, a select is a click; 5 at once, then 1 a second. Over it the op is
+        // answered RateLimited.
+        constexpr double kCharBurst = 5.0, kCharPerSec = 1.0;
         // A VehicleCmd over its rate limit is answered RateLimited at most this often per player ...
         constexpr uint64_t kRateLimitedReplyEveryMs = 1000;
         // ... and every one over the limit also draws on this bucket (burst, per second): a client that keeps
@@ -159,6 +162,21 @@ namespace gage::server {
         sync::invw::AmmoTypes invAmmo;
         proto::Bytes invNearSent;
         TokenBucket invReportRate;
+
+        // 0.5.9 characters (valid once Joined, Config::characters 1): `charOn` = this player has a roster; `charOwner` names it in the
+        // name index (the account id, or "guest:" + the name key); `charSave` = the roster may be written (verified, characterDir set,
+        // the save was not Unreadable); `charSlots` = the platform's verify answer (0 = not said); `invSlot` = the slot whose items `inv` is.
+        bool charOn = false;
+        sync::chr::Roster roster;
+        std::string charOwner;
+        bool charSave = false;
+        int charSlots = 0;
+        uint8_t invSlot = 0;
+        TokenBucket charRate;
+        // Stage 4 (GI: "the name shown to other players is the CHARACTER name"): what PlayerJoined / PeerName tell the others
+        // (sync::chr::PublicName of the active character; the account name when characters are off). `name` stays the account name
+        // (logs, bans, the console, the platform).
+        std::string shownName;
 
         // valid once Joined
         uint16_t id = 0;
@@ -410,6 +428,19 @@ namespace gage::server {
         cfg_ = cfg;
         if (!bans_.Load(cfg_.bansFile, &why)) return fail("ban list: " + why);
         invStore_.SetDir(cfg_.inventoryDir);
+        charStore_.SetDir(cfg_.characters ? cfg_.characterDir : std::string());
+        if (cfg_.characters)
+        {
+            std::string scanWhy;
+            const CharacterStore::ScanReport sr = charStore_.Scan(&scanWhy);
+            Log("characters: on, " + (charStore_.Enabled() ? "saved in " + charStore_.Dir() : std::string("characterDir empty: not saved")) +
+                "; name index: " + std::to_string(sr.characters) + " names from " + std::to_string(sr.files) + " rosters" +
+                (sr.unreadable ? ", " + std::to_string(sr.unreadable) + " unreadable" : std::string()) +
+                (sr.duplicates ? ", " + std::to_string(sr.duplicates) + " duplicate names (the first file keeps each)" : std::string()) +
+                (scanWhy.empty() ? std::string() : " (" + scanWhy + ")"));
+        }
+        else
+            Log("characters: off (characters 0: no roster, one inventory per account)");
         {
             sync::invw::Rules r;
             r.groundReach = (float)cfg_.invGroundReach;
@@ -1034,6 +1065,8 @@ namespace gage::server {
             OnInvOp(c, data, len);
         else if (type == proto::Msg::InvReport && rel)
             OnInvReport(c, data, len);   // 0.5.4: a client sends it only after the server's InvNearby offer (an older server refuses it here)
+        else if (type == proto::Msg::CharOp && rel)
+            OnCharOp(c, data, len);      // 0.5.9: a client sends it only after the server's CharRoster (an older server refuses it here)
         else
             Refuse(c, proto::RefuseReason::Protocol,
                    std::string("unexpected ") + proto::ToString(type) + " on channel " + std::to_string(channel));
@@ -1231,6 +1264,7 @@ namespace gage::server {
         c.accountId = r.accountId;
         c.sessionId = r.sessionId;
         c.roles = r.roles;
+        c.charSlots = r.characterSlots;
         c.isAdmin = false;
         for (const std::string& role : r.roles)
             if (std::find(cfg_.adminRoles.begin(), cfg_.adminRoles.end(), role) != cfg_.adminRoles.end()) c.isAdmin = true;
@@ -1373,7 +1407,7 @@ namespace gage::server {
     {
         std::string why;
         const std::string account = c.verified ? c.accountId : std::string();
-        const InventoryStore::Loaded l = invStore_.Load(account, c.inv, &why);
+        const InventoryStore::Loaded l = invStore_.Load(account, c.inv, &why, c.invSlot);
         // Unreadable: the real save is still there and must not be written over. A guest is never saved; Fresh and Corrupt save at
         // once (the kit, or the empty start after a corrupt save) so a restart does not hand out a second kit.
         c.invSave = c.verified && invStore_.Enabled() && l != InventoryStore::Loaded::Unreadable;
@@ -1382,6 +1416,7 @@ namespace gage::server {
             Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " save " + InventoryStore::ToString(l) + ": " + why);
         else if (c.verified)
             Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " " + InventoryStore::ToString(l) +
+                (c.charOn ? " (character slot " + std::to_string(c.invSlot) + ")" : std::string()) +
                 (invStore_.Enabled() ? "" : " (inventoryDir empty: not saved)"));
         SendInventory(c, 0);
         // 0.5.4: the offer of the inventory world (what is in reach, usually nothing yet). A 0.5.3 client ignores the unknown type;
@@ -1502,7 +1537,7 @@ namespace gage::server {
     {
         if (!c.invSave || !c.invDirty) return;
         std::string why;
-        if (invStore_.Save(c.accountId, c.inv, &why))
+        if (invStore_.Save(c.accountId, c.inv, &why, c.invSlot))
         {
             c.invDirty = false;
             stats_.invSaves++;
@@ -1564,6 +1599,313 @@ namespace gage::server {
         Conn* c = const_cast<Server*>(this)->FindPlayer(target);
         if (!c) return false;
         out = c->inv;
+        return true;
+    }
+
+    // ---- 0.5.9 characters ------------------------------------------------------------------------------------
+
+    bool Server::RosterOf(const std::string& target, sync::chr::Roster& out) const
+    {
+        Conn* c = const_cast<Server*>(this)->FindPlayer(target);
+        if (!c || !c->charOn) return false;
+        out = c->roster;
+        return true;
+    }
+
+    void Server::LoadCharacters(Conn& c)
+    {
+        namespace chr = sync::chr;
+        c.invSlot = 0;
+        c.charOn = cfg_.characters != 0;
+        c.shownName = c.name;
+        if (!c.charOn) return;
+        c.charRate.Configure(kCharBurst, kCharPerSec);
+        c.charOwner = c.verified ? c.accountId : "guest:" + c.key;
+        const std::string who = "id=" + std::to_string(c.id) + " " + c.name;
+        std::string why;
+        const CharacterStore::Loaded l = charStore_.Load(c.verified ? c.accountId : std::string(), c.roster, &why);
+        c.charSave = c.verified && charStore_.Enabled() && l != CharacterStore::Loaded::Unreadable;
+        if (l == CharacterStore::Loaded::Corrupt || l == CharacterStore::Loaded::Unreadable)
+            Log("characters: " + who + " roster " + CharacterStore::ToString(l) + ": " + why);
+        // The slots are the platform's word on every join (a slot bought since the last join counts now; a refunded one locks its
+        // character, which stays stored). A guest has the base slot.
+        c.roster.slots = (uint8_t)chr::SlotsFor(c.verified ? c.charSlots : 0);
+        bool changed = l != CharacterStore::Loaded::Saved;   // a fresh or corrupt roster is written at once
+        if (!chr::Normalise(c.roster))
+        {
+            // No playable character: one now, in slot 0 (always owned, and empty here: a character in it would be playable).
+            const uint32_t seed = chr::SeedOf(c.verified ? c.accountId : c.key);
+            chr::Character ch;
+            ch.look = chr::DefaultAppearance(seed);
+            chr::Name n;
+            const std::string owner = c.charOwner;
+            if (!chr::DefaultName(c.name, seed, [this, &owner](const std::string& k) { return charStore_.Taken(k, owner, 0); }, n))
+                n = {"Solar", "Citizen"};   // unreachable in practice: 17 x 20 list names and 17 576 suffixed ones all taken
+            ch.first = n.first;
+            ch.last = n.last;
+            c.roster.chars[0] = ch;
+            c.roster.used |= 1;
+            c.roster.active = 0;
+            changed = true;
+            stats_.charsInstant++;
+            Log("characters: " + who + " had no character: made \"" + ch.Display() + "\" at once in slot 0 (" +
+                (ch.look.sex == chr::Sex::Female ? "female" : "male") + ", parents " + std::to_string(ch.look.father) + "/" +
+                std::to_string(ch.look.mother) + ", hair " + std::to_string(ch.look.hair) + ")" +
+                (c.verified ? std::string() : " for this guest session"));
+        }
+        c.invSlot = c.roster.active;
+        charStore_.Index(c.charOwner, c.roster);
+        if (changed && c.charSave) SaveCharacters(c, c.roster, "join");
+        UpdateShownName(c, "join");   // not in players_ yet: nothing is broadcast, the join's PlayerJoined carries it
+        const chr::Character* act = c.roster.Active();
+        Log("characters: " + who + " " + CharacterStore::ToString(l) + ", " + std::to_string(c.roster.Count()) + " character(s), " +
+            std::to_string(c.roster.slots) + " slot(s)" + (c.verified && c.charSlots == 0 ? " (the platform did not say: 1)" : "") +
+            ", playing slot " + std::to_string(c.roster.active) + " \"" + (act ? act->Display() : std::string("?")) + "\"" +
+            (c.charSave ? std::string() : c.verified ? " (not saved: " + std::string(charStore_.Enabled() ? "unreadable roster" : "characterDir empty") + ")"
+                                                     : " (guest: not saved)"));
+    }
+
+    bool Server::SaveCharacters(Conn& c, const sync::chr::Roster& r, const char* when)
+    {
+        if (!c.charSave) return true;
+        std::string why;
+        if (charStore_.Save(c.accountId, r, &why))
+        {
+            stats_.charSaves++;
+            return true;
+        }
+        stats_.charSaveFailures++;
+        Log(std::string("characters: save (") + when + ") of id=" + std::to_string(c.id) + " " + c.name + " failed: " + why);
+        return false;
+    }
+
+    void Server::SendCharRoster(Conn& c)
+    {
+        if (!c.charOn) return;
+        proto::CharRoster m;
+        m.flags = c.verified ? 0 : proto::kCharRosterGuest;
+        m.blob = sync::chr::EncodeRoster(c.roster);
+        SendTo(c, proto::kChanReliable, proto::Encode(m), true);
+    }
+
+    void Server::SendFaces(Conn& c)
+    {
+        if (!c.charOn) return;
+        for (const auto& kv : players_)
+        {
+            const Conn& o = *kv.second;
+            if (&o == &c || !o.charOn) continue;
+            const sync::chr::Character* act = o.roster.Active();
+            if (!act) continue;
+            proto::PeerFace f;
+            f.id = o.id;
+            f.blob = sync::chr::EncodeLook(act->look);
+            SendTo(c, proto::kChanReliable, proto::Encode(f), true);
+            stats_.facesSent++;
+        }
+    }
+
+    void Server::BroadcastFace(Conn& c)
+    {
+        if (!c.charOn) return;
+        const sync::chr::Character* act = c.roster.Active();
+        if (!act) return;
+        proto::PeerFace f;
+        f.id = c.id;
+        f.blob = sync::chr::EncodeLook(act->look);
+        const proto::Bytes bytes = proto::Encode(f);
+        for (const auto& kv : players_)
+        {
+            if (kv.second == &c) continue;
+            SendTo(*kv.second, proto::kChanReliable, bytes, true);
+            stats_.facesSent++;
+        }
+    }
+
+    void Server::OnCharOp(Conn& c, const uint8_t* data, size_t len)
+    {
+        namespace chr = sync::chr;
+        proto::CharOp m;
+        if (!proto::Decode(data, len, m))
+        {
+            Refuse(c, proto::RefuseReason::Protocol, "malformed CharOp");
+            return;
+        }
+        const chr::Op op = (chr::Op)m.op;
+        const std::string who = "id=" + std::to_string(c.id) + " " + c.name;
+        auto answer = [&](chr::Code code, const std::string& text) {
+            proto::CharResult r;
+            r.seq = m.seq;
+            r.op = m.op;
+            r.slot = m.slot;
+            r.code = (uint8_t)code;
+            r.text = text.size() > proto::kMaxRefuseText ? text.substr(0, proto::kMaxRefuseText) : text;
+            if (code == chr::Code::Ok)
+            {
+                stats_.charOpsApplied++;
+                SendCharRoster(c);
+            }
+            else
+                stats_.charOpsRefused++;
+            SendTo(c, proto::kChanReliable, proto::Encode(r), true);
+            Log("characters: " + who + " " + chr::ToString(op) + " slot " + std::to_string(m.slot) + ": " + chr::ToString(code) +
+                (text.empty() ? std::string() : " (" + text + ")"));
+        };
+        if (!c.charOn)
+        {
+            answer(chr::Code::NotNow, "characters are off on this server");
+            return;
+        }
+        if (!c.charRate.Take(net::NowMs()))
+        {
+            answer(chr::Code::RateLimited, std::string());
+            return;
+        }
+        chr::Character in;
+        if (op == chr::Op::Delete)
+        {
+            // the blob is the typed confirmation; one that does not parse leaves `in` empty and Apply answers NotConfirmed
+            chr::Name typed;
+            if (chr::ParseConfirm(m.blob, typed))
+            {
+                in.first = typed.first;
+                in.last = typed.last;
+            }
+        }
+        else if (op != chr::Op::Select && !chr::DecodeCharacter(m.blob, in))
+        {
+            answer(chr::Code::BadLook, "the character does not decode");
+            return;
+        }
+        const int slot = m.slot;
+        const bool switching = op == chr::Op::Select && slot != c.roster.active;
+        if (switching && c.dead)
+        {
+            answer(chr::Code::NotNow, "not while dead");
+            return;
+        }
+        chr::Roster next = c.roster;
+        const std::string owner = c.charOwner;
+        const chr::Code code = chr::Apply(next, op, slot, in, [this, &owner, slot](const std::string& k) { return charStore_.Taken(k, owner, slot); });
+        if (code != chr::Code::Ok)
+        {
+            answer(code, std::string());
+            return;
+        }
+        if (switching)
+        {
+            // The old character's items are written before anything changes; a write that fails keeps the player on it (the items would be
+            // lost otherwise).
+            SaveInventory(c, "switch");
+            if (c.invSave && c.invDirty)
+            {
+                answer(chr::Code::Failed, "your items could not be saved");
+                return;
+            }
+        }
+        // Delete: the slot's items are set aside first (one rename), the roster is saved, then the set-aside file is removed; a roster that
+        // cannot be saved puts the items back and changes nothing.
+        const std::string deletedName = op == chr::Op::Delete ? c.roster.chars[slot].Display() : std::string();
+        InventoryStore::Retired retired = InventoryStore::Retired::None;
+        std::string invWhy;
+        if (op == chr::Op::Delete && c.verified)
+        {
+            retired = invStore_.Retire(c.accountId, slot, &invWhy);
+            if (retired == InventoryStore::Retired::Failed)
+            {
+                answer(chr::Code::Failed, "the character's items could not be removed");
+                Log("characters: " + who + " delete slot " + std::to_string(slot) + " \"" + deletedName + "\": inventory NOT removed (" + invWhy +
+                    "); nothing deleted");
+                return;
+            }
+        }
+        if (!SaveCharacters(c, next, chr::ToString(op)))
+        {
+            if (retired == InventoryStore::Retired::SetAside && !invStore_.Restore(c.accountId, slot, &invWhy))
+                Log("characters: " + who + " delete slot " + std::to_string(slot) + ": the roster save failed AND " + invWhy);
+            answer(chr::Code::Failed, std::string());
+            return;
+        }
+        if (op == chr::Op::Delete)
+        {
+            const char* inv = "none saved";
+            if (retired == InventoryStore::Retired::SetAside)
+                inv = invStore_.Purge(c.accountId, slot, &invWhy) ? "removed" : "set aside as .deleted (could not remove it)";
+            stats_.charsDeleted++;
+            Log("characters: " + who + " deleted slot " + std::to_string(slot) + " \"" + deletedName + "\"; its inventory " +
+                (c.verified ? invStore_.PathFor(c.accountId, slot) + " " + inv : std::string("(guest: never saved)")) +
+                (retired == InventoryStore::Retired::SetAside && std::string(inv) != "removed" ? " (" + invWhy + ")" : std::string()));
+        }
+        const chr::Appearance before = c.roster.Active() ? c.roster.Active()->look : chr::Appearance();
+        const uint8_t beforeSlot = c.roster.active;
+        c.roster = next;
+        charStore_.Index(c.charOwner, c.roster);
+        if (switching)
+        {
+            c.invSlot = c.roster.active;
+            LoadInventory(c);
+        }
+        answer(chr::Code::Ok, op == chr::Op::Select ? std::string("now playing \"") + c.roster.chars[slot].Display() + "\""
+                              : op == chr::Op::Delete ? std::string("deleted \"") + deletedName + "\""
+                                                      : std::string("\"") + c.roster.chars[slot].Display() + "\"");
+        const chr::Character* act = c.roster.Active();
+        if (act && (c.roster.active != beforeSlot || act->look != before)) BroadcastFace(c);
+        UpdateShownName(c, chr::ToString(op));
+    }
+
+    void Server::UpdateShownName(Conn& c, const char* why)
+    {
+        const sync::chr::Character* act = c.charOn ? c.roster.Active() : nullptr;
+        std::string shown = act ? sync::chr::PublicName(*act) : c.name;
+        if (!proto::ValidName(shown)) shown = c.name;   // never: PublicName is letters, ". " and a space; the account name is valid
+        if (shown == c.shownName) return;
+        const std::string was = c.shownName;
+        c.shownName = shown;
+        if (players_.find(c.id) == players_.end() || players_.at(c.id) != &c) return;   // the join: PlayerJoined carries it
+        proto::PeerName pn;
+        pn.id = c.id;
+        pn.name = shown;
+        SendToAll(proto::Encode(pn), &c);
+        stats_.namesSent++;
+        Log("characters: id=" + std::to_string(c.id) + " " + c.name + " is now shown as \"" + shown + "\" (was \"" + was + "\"; " + why + ")");
+    }
+
+    bool Server::RenameCharacter(const std::string& target, const std::string& first, const std::string& last, const std::string& by,
+                                 std::string* msg)
+    {
+        namespace chr = sync::chr;
+        Conn* c = FindPlayer(target);
+        if (!c || !c->charOn)
+        {
+            if (msg) *msg = c ? "characters are off on this server" : "no player \"" + target + "\"";
+            return false;
+        }
+        chr::Roster next = c->roster;
+        const int slot = next.active;
+        const std::string old = next.chars[slot].Display();
+        const std::string owner = c->charOwner;
+        const chr::Code code = chr::AdminRename(next, slot, first, last, [this, &owner, slot](const std::string& k) { return charStore_.Taken(k, owner, slot); });
+        if (code != chr::Code::Ok)
+        {
+            if (msg) *msg = std::string("rename refused: ") + chr::ToString(code);
+            Log("characters: admin rename by " + by + " of id=" + std::to_string(c->id) + " " + c->name + " to \"" + first + " " + last +
+                "\" REFUSED (" + chr::ToString(code) + ")");
+            return false;
+        }
+        if (!SaveCharacters(*c, next, "admin rename"))
+        {
+            if (msg) *msg = "rename refused: could not save";
+            return false;
+        }
+        c->roster = next;
+        charStore_.Index(c->charOwner, c->roster);
+        SendCharRoster(*c);
+        Notice(*c, "An admin renamed your character to " + next.chars[slot].Display() + ".");
+        stats_.charsRenamed++;
+        Log("characters: admin rename by " + by + ": id=" + std::to_string(c->id) + " " + c->name + " slot " + std::to_string(slot) + " \"" +
+            old + "\" -> \"" + next.chars[slot].Display() + "\"");
+        UpdateShownName(*c, "admin rename");
+        if (msg) *msg = "renamed \"" + old + "\" to \"" + next.chars[slot].Display() + "\"";
         return true;
     }
 
@@ -1835,7 +2177,7 @@ namespace gage::server {
         {
             proto::PlayerJoined pj;
             pj.id = kv.second->id;
-            pj.name = kv.second->name;
+            pj.name = kv.second->shownName;   // stage 4: the character's name (the account name with characters off)
             SendTo(c, proto::kChanReliable, proto::Encode(pj), true);
         }
         for (const auto& kv : players_)
@@ -1878,14 +2220,20 @@ namespace gage::server {
             if (c.verified) ai.username = c.name;
             SendTo(c, proto::kChanReliable, proto::Encode(ai), true);
         }
+        // 0.5.9: its characters first (the active one decides which inventory loads; a player with none gets one now), sent below.
+        LoadCharacters(c);
         // 0.6: then its inventory.
         LoadInventory(c);
         // 0.5.7: then the world's time of day and weather (an older client drops the unknown type).
         SendWorldClock(c);
+        // 0.5.9: then its roster and the others' faces (an older client drops the unknown types).
+        SendCharRoster(c);
+        SendFaces(c);
         proto::PlayerJoined self;
         self.id = c.id;
-        self.name = c.name;
+        self.name = c.shownName;
         SendToAll(proto::Encode(self), &c);
+        BroadcastFace(c);
 
         players_[c.id] = &c;
         nameKeys_[c.key] = c.id;
@@ -2204,9 +2552,36 @@ namespace gage::server {
         std::string cmd = text.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
         for (char& ch : cmd)
             if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
-        if (cmd != "time" && cmd != "timescale" && cmd != "weather") return false;
+        if (cmd != "time" && cmd != "timescale" && cmd != "weather" && cmd != "charname") return false;
         const std::string arg = sp == std::string::npos ? std::string() : Trim(text.substr(sp + 1));
         const std::string who = "id=" + std::to_string(c.id) + " " + c.name;
+        if (cmd == "charname")
+        {
+            // 0.5.9 stage 4: /charname <id|name> <First> <Last>, a verified admin only (renames someone else's character)
+            if (!c.adminRate.Take(net::NowMs()))
+            {
+                Notice(c, "Too many commands. Wait a moment.");
+                return true;
+            }
+            if (!c.isAdmin)
+            {
+                stats_.adminRefused++;
+                Log("characters: /charname " + arg + " by " + who + " REFUSED (not a verified admin)");
+                Notice(c, "Only admins can rename characters.");
+                return true;
+            }
+            stats_.adminAllowed++;
+            const size_t a = arg.find(' ');
+            const size_t b = a == std::string::npos ? std::string::npos : arg.find(' ', a + 1);
+            std::string out;
+            if (b == std::string::npos)
+                out = "usage: /charname <id|name> <First> <Last>";
+            else
+                RenameCharacter(arg.substr(0, a), arg.substr(a + 1, b - a - 1), Trim(arg.substr(b + 1)), who + " (admin)", &out);
+            if (out.size() > proto::kMaxChat) out.resize(proto::kMaxChat);
+            Notice(c, out);
+            return true;
+        }
         if (!c.adminRate.Take(net::NowMs()))
         {
             Notice(c, "Too many commands. Wait a moment.");
@@ -3672,6 +4047,8 @@ namespace gage::server {
     {
         if (players_.erase(c.id) == 0) return;
         SaveInventory(c, "leave");
+        // 0.5.9: a roster that is not kept gives its names back (a guest's, or any while characterDir is empty); a saved one keeps them.
+        if (c.charOn && !c.charSave) charStore_.Unindex(c.charOwner);
         // v8: the platform closes the account's game session (purchases stop being delivered here).
         EndPlatformSession(c, why == proto::LeaveReason::Quit ? "quit" : why == proto::LeaveReason::Timeout ? "timeout" : "kicked");
         repl_.RemovePlayer(c.id);
@@ -3763,6 +4140,7 @@ namespace gage::server {
             p.isAdmin = c.isAdmin;
             p.accountId = c.accountId;
             p.roles = c.roles;
+            p.shownName = c.shownName;
             out.push_back(p);
         }
         return out;
@@ -3780,9 +4158,24 @@ namespace gage::server {
             return it == players_.end() ? nullptr : it->second;
         }
         auto it = nameKeys_.find(proto::NameKey(target));
-        if (it == nameKeys_.end()) return nullptr;
-        auto p = players_.find(it->second);
-        return p == players_.end() ? nullptr : p->second;
+        if (it != nameKeys_.end())
+        {
+            auto p = players_.find(it->second);
+            return p == players_.end() ? nullptr : p->second;
+        }
+        // 0.5.9 stage 4: the character name the others see, typed with a space or an underscore ("Pia Player", "pia_player"); the
+        // account name above wins when both match.
+        std::string want = proto::NameKey(target);
+        for (char& ch : want)
+            if (ch == '_') ch = ' ';
+        for (const auto& kv : players_)
+        {
+            std::string shown = proto::NameKey(kv.second->shownName);
+            for (char& ch : shown)
+                if (ch == '_') ch = ' ';
+            if (!shown.empty() && shown == want) return kv.second;
+        }
+        return nullptr;
     }
 
     bool Server::Kick(const std::string& target, std::string* err)
@@ -3927,7 +4320,7 @@ namespace gage::server {
                 char pos[96] = "no state yet";
                 if (p.hasState)
                     std::snprintf(pos, sizeof(pos), "pos %.1f %.1f %.1f", p.k.x, p.k.y, p.k.z);
-                output += "\n  " + std::to_string(p.id) + "  " + p.name + "  " + p.address + "  rtt " +
+                output += "\n  " + std::to_string(p.id) + "  " + p.name + (p.shownName != p.name ? " (\"" + p.shownName + "\")" : std::string()) + "  " + p.address + "  rtt " +
                           std::to_string(p.rttMs) + " ms  " + pos + "  hp " + std::to_string(p.health) + " armor " +
                           std::to_string(p.armor) + (p.dead ? " DEAD" : "") + (p.untrusted ? " UNTRUSTED" : "") +
                           (p.vehicle != VehicleStore::kNone
@@ -4014,6 +4407,19 @@ namespace gage::server {
             const uint32_t qty = qtyS.empty() ? 1u : (uint32_t)std::strtoul(qtyS.c_str(), nullptr, 10);
             return GiveItem(arg1, item, qty, &output) ? CommandResult::Ok : CommandResult::Error;
         }
+        if (cmd == "charname")
+        {
+            // charname <id|name> <First> <Last>: the player's active character (0.5.9 stage 4)
+            const size_t sp = argRest.find(' ');
+            const std::string first = argRest.substr(0, sp);
+            const std::string last = sp == std::string::npos ? std::string() : Trim(argRest.substr(sp + 1));
+            if (arg1.empty() || first.empty() || last.empty())
+            {
+                output = "usage: charname <id|name> <First> <Last>";
+                return CommandResult::Error;
+            }
+            return RenameCharacter(arg1, first, last, "the console", &output) ? CommandResult::Ok : CommandResult::Error;
+        }
         if (cmd == "clearinv")
         {
             if (arg.empty())
@@ -4087,7 +4493,7 @@ namespace gage::server {
         {
             output = "commands: list | stats [json] | kick <id|name> | say <text> | ban <id|name> [reason] | "
                      "banip <ip> [reason] | unban <name|ip> | bans | heal <id|name> | kill <id|name> | "
-                     "armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | time [HH:MM[:SS]] | "
+                     "armor <id|name> <0..255> | give <id|name> <item> [qty] | clearinv <id|name> | charname <id|name> <First> <Last> | time [HH:MM[:SS]] | "
                      "timescale [0..3600] | weather [NAME|cycle] | vehicles | quit";
             return CommandResult::Ok;
         }

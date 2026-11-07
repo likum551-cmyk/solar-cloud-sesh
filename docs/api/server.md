@@ -76,6 +76,8 @@ working directory the server is started in.
 | `invTrunkReach` | integer | `4` | 1..20 m. A vehicle's trunk is in reach within this distance of the vehicle's position (any side: the server knows the car's centre), and always for a player seated in it. The trunk is listed once a 0.5.4 client within 6 m reported the car's GTA class (its size comes from the class; bicycles, boats, aircraft and trains have none). A locked car's trunk is listed locked to everyone outside it except its key holders (spawner, last driver). |
 | `invGroundExpireSeconds` | integer | `600` | 10..86400. A pile vanishes this long after something was last put in it, or at once when emptied. Piles and trunks live in memory only: a restart clears them; a trunk's contents land in a pile where the vehicle last stood when it goes. |
 | `invMaxPiles` | integer | `2048` | 16..65536. Past this many piles a drop that would open a new one is refused (the item stays with the player) and a gone vehicle's trunk stacks that find no pile are lost (logged). |
+| `characters` | integer | `1` | 0 or 1. 0.5.9 [characters](#characters-059): every player plays a character (names + a freemode appearance); one with none gets one at once on join; the platform's `characterSlots` says how many a verified account may hold (1..3); each character has its own inventory. `0` = the 0.5.8 behaviour: no roster or faces sent, one inventory per account. |
+| `characterDir` | string | `"characters"` | At most 200 bytes. 0.5.9: the folder of the rosters, one file per verified platform account (`<hex of the account id>.chr`, written atomically at the join that made the instant character and after every applied change; created on the first save). `""` = nothing is saved (a verified player gets a fresh instant character every session). Guests are never saved. A roster that does not decode is renamed to `.chr.corrupt` and the account gets a new instant character; one that cannot be read is left alone and that session is not saved. |
 | `worldClock` | integer | `1` | 0 or 1. 0.5.7 world clock (docs/api/protocol.md "0.5.7"): the server owns the time of day and the weather and sends them (`WorldClock` 55) on join, on every change and every 30 s, so every player sees the same sky. `0` = never sent: each client keeps the game's own clock and weather (the 0.5.6 behaviour), and the `time` / `timescale` / `weather` commands answer an error. Older clients drop the message unread. |
 | `clockStart` | string | `"12:00"` | `"HH:MM"` or `"HH:MM:SS"`, 00:00..23:59:59. The time of day when the server starts. The clock is **not saved**: every start begins here. |
 | `clockScale` | number | `30` | 0..3600, fractions allowed (kept in thousandths). Game ms per real ms: `30` = GTA's own rate (1 game minute per 2 real seconds, a 48-minute day), `0` = frozen, `60` = twice as fast. |
@@ -416,6 +418,57 @@ joiners (`animsSanitized`). `playbackRate` (x100) is clamped to 10..200. The fla
 documentation of the game's flags, not verified against its scripts.
 
 Counters for all of this are in `Server::stats()` (section 12); they are not part of the `stats` console command.
+
+### Characters (0.5.9)
+
+GI 2026-11-07: "1 character min insta creation if not created on server join. can buy additional 2 char slots". The old
+gamemode's system this ports is `docs/porting/character-creation-old-gamemode.md`; the wire is docs/api/protocol.md "0.5.9";
+the rules are `libs/sync/character.h`.
+
+- **Slots.** An account has 1 slot plus the `character_slot` entitlements it bought on the platform, at most 3. The platform
+  says the number in its verify answer (`characterSlots`, apps/platform/docs/game-server-contract.md); the server reads it on
+  every join, so a slot bought during a session counts from the next join. A platform that does not send it means 1. A slot
+  that was refunded locks its character (stored, not playable); if that was the active one the player starts on slot 0.
+- **The instant character.** A player with no playable character gets one during the join, before anything is sent: a male
+  freemode face from the account id (a male and a female parent half way, short hair in a natural colour, eyebrows, a
+  natural eye colour; `sync::chr::DefaultAppearance`) and a name from the account name (`Pia_Player` -> Pia Player; a part
+  that is not a valid name is replaced from a list; a taken name moves to the next one; `sync::chr::DefaultName`). It is
+  saved at once. The player can rename it ONCE in the creator (its first Save) and change its look any time.
+- **Names** are 3..25 ASCII letters, the first upper case, at most 1 capital in a first name and 2 in a last name, and unique
+  on the whole server regardless of case. The server builds the name index at start from `characterDir` (log:
+  `characters: on, saved in <dir>; name index: N names from M rosters`); a guest's or an unsaved roster's names are held only
+  while that player is online.
+- **Ops** (`CharOp`): Create in an empty owned slot, Save (the look; the name while never customised), Select (needs a live
+  player). Each is checked on a copy, the roster written, then applied and answered (`CharRoster` + `CharResult` Ok), or
+  refused with the reason (`CharResult`), 5 at once then 1 a second.
+- **Items per character.** Slot 0's inventory is the account's existing `<hex>.inv` (no migration), slots 1 and 2 are
+  `<hex>.c1.inv` / `<hex>.c2.inv` in `inventoryDir`. A Select writes the old character's items first (a failed write refuses
+  the switch: `Failed`) and sends the new character's.
+- **What the others see.** The active character's face (`PeerFace`) to everyone on join and after every change of it, and
+  (stage 4, GI's decision) its NAME: `PlayerJoined` and `PeerName` carry `sync::chr::PublicName` ("First Last", "F. Last"
+  past 24 bytes), so name tags, chat, the Tab lists and the kill feed show the character. The account name stays where admins
+  need it: the log, `list` (`id name ("shown name")`), bans. `kick`, `charname` and every console / admin command that takes
+  a player accept the id, the account name, or the shown name (case-insensitive, `_` for the space). With `characters 0` the
+  shown name is the account name.
+- **Delete** (stage 4, GI's decision; the select screen, confirmed by typing the character's name): not the only character
+  (`LastOne`), not the one being played (`Playing`: switch first), and the typed text must be its full name (`NotConfirmed`).
+  The slot's inventory file is renamed to `<file>.deleted`, the roster is written (a failed write renames it back and answers
+  `Failed`), then the `.deleted` file is removed; the slot is free again. A guest's delete changes only the session's roster.
+- **Rename** (stage 4): the player renames only in the creator, while the character was never saved there (the instant
+  one), then the name is fixed. An admin renames the ACTIVE character of an online player: console `charname <id|name>
+  <First> <Last>`, or `/charname <id|name> <First> <Last>` in chat for a verified admin (a guest's or a non-admin's is
+  refused and logged). The rename keeps the name rules and the server-wide uniqueness, keeps the character customised, is
+  saved, tells the player (a notice and a new roster) and everyone else (`PeerName`).
+- **Guests** (no verified account) get one character for the session, never saved; a second slot is never theirs.
+
+Log lines (prefix `characters:`): the start line above (or `characters: off`); per join `id=N Name saved|fresh|corrupt|unreadable,
+C character(s), S slot(s)[ (the platform did not say: 1)], playing slot A "First Last"` plus `had no character: made "First Last"
+at once in slot 0 (male, parents F/M, hair H)` for an instant character; per op `id=N Name select|create|save|delete slot S: <result>`;
+`id=N Name is now shown as "First Last" (was "..."; <why>)`; `id=N deleted slot S "First Last"; its inventory <path> removed`
+(or `set aside as .deleted (could not remove it)` / `inventory NOT removed (<why>)`); `admin rename by <who> of id=N Name to
+"First Last"` and `/charname <arg> by <who> REFUSED (not a verified admin)`; `roster corrupt|unreadable: <why>`; `save (<when>)
+of id=N Name failed: <why>`. Counters: `Stats::charsInstant`, `charOpsApplied`, `charOpsRefused`, `charSaves`,
+`charSaveFailures`, `facesSent`, `charsDeleted`, `charsRenamed`, `namesSent`; `Server::RosterOf(target)` for tests.
 
 ### Settings that are not in server.json
 

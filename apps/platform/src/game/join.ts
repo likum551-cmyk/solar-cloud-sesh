@@ -5,6 +5,7 @@ import { accounts, gameSessions, joinTokens, type Role } from '../db/schema.js';
 import { assertNotBanned, getActiveBan, getRoles, hasRole, type AccountRow } from '../auth/accounts.js';
 import { enforce } from '../auth/throttle.js';
 import { getServer, type GameServerRow } from '../servers/service.js';
+import { characterSlots } from '../shop/service.js';
 import { ApiError } from '../util/errors.js';
 import { hashToken, randomToken } from '../util/tokens.js';
 
@@ -69,6 +70,8 @@ export type VerifyResult =
       roles: Role[];
       emailVerified: boolean;
       sessionId: string;
+      /** Characters the account may have in game: 1 + the bought character slots, at most 3 (shop/payload.ts CHARACTER_SLOT_KEY). */
+      characterSlots: number;
       /** Always null on success (a banned account is refused with reason "banned"). */
       ban: null;
     }
@@ -114,7 +117,7 @@ export async function verifyJoinToken(deps: Deps, server: GameServerRow, token: 
       .values({ accountId: account.id, serverId: server.id, joinTokenId: consumed.id, startedAt: now })
       .returning({ id: gameSessions.id });
     if (!session) throw new Error('game session insert returned no row');
-    return { kind: 'ok' as const, account, sessionId: session.id, roles: await getRoles(tx, account.id) };
+    return { kind: 'ok' as const, account, sessionId: session.id, roles: await getRoles(tx, account.id), characterSlots: await characterSlots(tx, account.id) };
   });
 
   if (outcome.kind === 'banned') {
@@ -134,6 +137,7 @@ export async function verifyJoinToken(deps: Deps, server: GameServerRow, token: 
       roles: outcome.roles,
       emailVerified: outcome.account.emailVerifiedAt !== null,
       sessionId: outcome.sessionId,
+      characterSlots: outcome.characterSlots,
       ban: null,
     };
   }
