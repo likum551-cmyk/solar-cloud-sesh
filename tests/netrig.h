@@ -114,6 +114,7 @@ struct Rig
         c.maxConnectionsPerIp = 0;
         c.bansFile = "";
         c.inventoryDir = "";   // 0.6: no inventory saves from the rig; the save tests (inventory_net_tests.h) give their own scratch folder
+        c.characterDir = "";   // 0.5.9: likewise no roster saves (characters stay on); tests/character_net_tests.h gives its own folder
         // The authority rules that count per address or judge invented positions would trip over a rig in
         // which every client is 127.0.0.1 and Place() teleports at will; they are off here and the tests
         // of those rules switch them on (netcode_test AuthorityNetworkTests, server_test J).
@@ -362,8 +363,8 @@ struct Probe
                                       "VehicleResult", "Damage",       "Killed",       "RespawnOk",  "PeerAnim",
                                       "PeerScenario", "PeerAnimStop", "SeatNotice", "VehicleImpact", "LinkInfo",
                                       "AccountInfo",  "AdminResult", "InvState",   "InvUsed",    "InvSnap",
-                                      "InvNearby",    "WorldClock"};
-        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::WorldClock + 1, "a name per event type");
+                                      "InvNearby",    "WorldClock",  "CharRoster", "CharResult", "PeerFace"};
+        static_assert(sizeof(names) / sizeof(names[0]) == (size_t)ET::PeerFace + 1, "a name per event type");
         std::string out;
         for (const net::Event& e : events) out += std::string(names[(int)e.type]) + " ";
         return out;

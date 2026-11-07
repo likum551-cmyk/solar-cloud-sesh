@@ -37,12 +37,15 @@ namespace gage::server {
 
         // The save for a verified account (accountId non-empty) or the starter kit for a guest (accountId empty). *why (when non-null) gets a
         // one-line reason for Corrupt / Unreadable.
-        Loaded Load(const std::string& accountId, sync::inv::Character& out, std::string* why = nullptr);
+        // 0.5.9: `slot` is the character's roster slot (0..2): every character has its own items. Slot 0 is the account's pre-0.5.9 file,
+        // so an existing save becomes the first character's without a migration.
+        Loaded Load(const std::string& accountId, sync::inv::Character& out, std::string* why = nullptr, int slot = 0);
         // Writes the save. False (with a reason) when saving is off, the account is a guest, or the write failed.
-        bool Save(const std::string& accountId, const sync::inv::Character& ch, std::string* why = nullptr);
+        bool Save(const std::string& accountId, const sync::inv::Character& ch, std::string* why = nullptr, int slot = 0);
 
-        // "<dir>/<hex of the account id>.inv": hex so any id the platform hands out is a safe file name on both systems.
-        std::string PathFor(const std::string& accountId) const;
+        // "<dir>/<hex of the account id>.inv" (slot 0) or "<dir>/<hex>.c<slot>.inv" (slots 1, 2): hex so any id the platform hands out
+        // is a safe file name on both systems.
+        std::string PathFor(const std::string& accountId, int slot = 0) const;
 
     private:
         bool EnsureDir(std::string* why);

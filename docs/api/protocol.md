@@ -1624,3 +1624,93 @@ Tests: `tests/world_clock_tests.h` (in `gameplay_test`: the clock line, the weat
 round trips, the holds, the codec), `tests/world_clock_net_tests.h` (in `server_test`: join, console and admin chat
 changes through the real server and session, guests refused, `worldClock 0`, the server.json keys), and the decode
 fuzz corpus. The engine half (the natives in the game) is live-unverified.
+
+## 0.5.9: characters (`CharRoster` 56, `CharOp` 57, `CharResult` 58, `PeerFace` 59; still v8)
+
+Every player plays a character: a first and a last name and a freemode appearance (GI 2026-11-07: "1 character min insta
+creation if not created on server join. can buy additional 2 char slots"). What this ports from the old gamemode is
+`docs/porting/character-creation-old-gamemode.md`. The rules and the blob codec are `libs/sync/character.h` (`sync::chr`);
+the server side is `apps/server/character_store.{h,cpp}` and `Server::LoadCharacters` / `OnCharOp` / `SendCharRoster` /
+`SendFaces` / `BroadcastFace`; slots come from the platform (verify `characterSlots`, apps/platform/docs/game-server-contract.md).
+
+**Compatibility.** No version bump. An older client's `PeekType` refuses 56..59 (above its `kMsgLast`): the packets count
+as malformed and are dropped, no event, no disconnect (as for 55). The server sends the roster and the faces to every client
+with no gate. An older SERVER refuses an unknown client type with `Refuse(Protocol)`, so a 0.5.9 client sends `CharOp` only
+after this connection received a `CharRoster` (`ClientSession::SendCharOp` returns false before that,
+`charactersOffered()`). A server with `characters 0` (docs/api/server.md) sends none of them.
+
+**Blobs** (`sync::chr`, version byte 1 first; every integer is a byte; percent = GTA's 0.0..1.0, features -100..100 = -1.0..1.0):
+
+| Blob | Layout |
+|---|---|
+| appearance (81 bytes) | sex (0 male `mp_m_freemode_01`, 1 female `mp_f_freemode_01`), father, mother (head ids 0..45), shapeMix, skinMix (0..100), 20 x `i8` face feature, 13 x (overlay index or 255 none, opacity 0..100, colour, colour2 0..63), hair (component 2 drawable from the creator's list), hair colour, highlight (0..63), eye colour (0..31) |
+| character body | flags (bit 0 = customised: saved in the creator, the name is fixed), `u8` length + first name, `u8` length + last name, appearance |
+| roster (`CharRoster`, saves) | version, slots (1..3), active (0..2), used (bit s = slot s holds a character), one body per set bit in slot order; at most 406 bytes |
+| character (`CharOp` Create / Save) | version, body |
+| face (`PeerFace`) | version, appearance |
+
+Decoding refuses an unknown version, a value out of its range (`ValidAppearance`), a stored name that breaks the name rules,
+an unknown flag, slots outside 1..3, an active slot past 2, a fourth slot bit, a short or a long blob. A `CharOp` body may
+carry any name up to 25 bytes: the rules answer a bad one with `BadName`, not the decoder.
+
+### 56 `CharRoster` (server to client, reliable): 4 + n bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 56 |
+| 1 | `u8` flags: bit 0 `kCharRosterGuest` (a guest's roster, never saved); other bits refused |
+| 2 + n | `str` the roster blob (1..512 bytes) |
+
+Sent to a joiner after its `WorldClock` (so after `AccountInfo` and the inventory) and after every applied `CharOp`.
+
+### 57 `CharOp` (client to server, reliable): 7 + n bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 57 |
+| 2 | `u16` seq, non-zero; echoed in the answer |
+| 1 | `u8` op: 1 Select (play the character in `slot`), 2 Create (a new character in the empty `slot`), 3 Save (the creator's result for the character in `slot`) |
+| 1 | `u8` slot 0..2 |
+| 2 + n | `str` the character blob (Create, Save; empty for Select), at most 512 bytes |
+
+A malformed one (seq 0, op outside 1..3, slot 3 or more, a short or a long packet) ends the connection (`Protocol`), like
+every malformed reliable message. Over 5 at once / 1 a second the op is answered `RateLimited`.
+
+### 58 `CharResult` (server to client, reliable): 8 + n bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 58 |
+| 2 | `u16` seq of the `CharOp` |
+| 1 | `u8` op (as sent) |
+| 1 | `u8` slot (as sent) |
+| 1 | `u8` code: 0 Ok, 1 BadSlot, 2 Locked (slot not owned: buy one on the platform), 3 SlotUsed, 4 Empty, 5 BadName, 6 NameTaken, 7 BadLook (out of range, or the blob did not decode), 8 NameFixed, 9 NotNow (a switch while dead), 10 RateLimited, 11 Failed (the server could not save; nothing changed) |
+| 2 + n | `str` text for the player or the log (at most 200 bytes) |
+
+An Ok is preceded by the new `CharRoster`; a refusal changes nothing and sends only this.
+
+### 59 `PeerFace` (server to client, reliable): 5 + n bytes
+
+| Size | Field |
+|---|---|
+| 1 | type 59 |
+| 2 | `u16` id of the player (below `kMaxPlayers`) |
+| 2 + n | `str` the face blob (the active character's appearance) |
+
+A joiner gets one per player with a character right after its own `CharRoster`; everyone else gets the joiner's after its
+`PlayerJoined`, and a player's again after a Select of another character or a Save that changed its look. The model, the
+hair drawable and the head blend also travel in `PeerLook` (17), as before; `PeerFace` adds the face features, the
+overlays, the hair colours and the eye colour.
+
+**The rules** (`sync::chr::Apply` on a copy, then the save, then the change; docs/api/server.md "Characters"): names are
+3..25 ASCII letters, the first upper case, at most 1 capital in a first name and 2 in a last name, unique on the server
+regardless of case. Create fills an empty owned slot (customised at once). Save always takes a new look; it renames only a
+character that was never customised (the instant one), once. Select needs an owned slot that holds a character and a live
+player; it saves the old character's items first and sends the new one's (`InvState` / `InvSnap`): every character has its
+own inventory. Delete is not offered (the old gamemode had none either).
+
+Tests: `tests/character_tests.h` (in `gameplay_test`: slots, names, the overlay and hair tables, ranges, the instant look and
+name, Normalise, Apply, the codecs, the four messages), `tests/character_net_tests.h` (in `server_test`: the join burst, the
+faces, Save / Create / Select through the real server and session, refusals, the rate, guests, the saves, slots from the
+platform, per-character items, a restart, a corrupt roster, `characters 0`, the verify field, the server.json keys), and the
+decode fuzz corpus.

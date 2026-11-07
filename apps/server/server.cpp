@@ -77,6 +77,9 @@ namespace gage::server {
         // The inventory world's pass (sweep + every 0.5.4 player's InvNearby) and its log line.
         constexpr uint64_t kInvWorldEveryMs = 250;
         constexpr uint64_t kInvWorldLogEveryMs = 60000;
+        // 0.5.9 CharOp per player: the creator saves once per confirm, a select is a click; 5 at once, then 1 a second. Over it the op is
+        // answered RateLimited.
+        constexpr double kCharBurst = 5.0, kCharPerSec = 1.0;
         // A VehicleCmd over its rate limit is answered RateLimited at most this often per player ...
         constexpr uint64_t kRateLimitedReplyEveryMs = 1000;
         // ... and every one over the limit also draws on this bucket (burst, per second): a client that keeps
@@ -159,6 +162,17 @@ namespace gage::server {
         sync::invw::AmmoTypes invAmmo;
         proto::Bytes invNearSent;
         TokenBucket invReportRate;
+
+        // 0.5.9 characters (valid once Joined, Config::characters 1): `charOn` = this player has a roster; `charOwner` names it in the
+        // name index (the account id, or "guest:" + the name key); `charSave` = the roster may be written (verified, characterDir set,
+        // the save was not Unreadable); `charSlots` = the platform's verify answer (0 = not said); `invSlot` = the slot whose items `inv` is.
+        bool charOn = false;
+        sync::chr::Roster roster;
+        std::string charOwner;
+        bool charSave = false;
+        int charSlots = 0;
+        uint8_t invSlot = 0;
+        TokenBucket charRate;
 
         // valid once Joined
         uint16_t id = 0;
@@ -410,6 +424,19 @@ namespace gage::server {
         cfg_ = cfg;
         if (!bans_.Load(cfg_.bansFile, &why)) return fail("ban list: " + why);
         invStore_.SetDir(cfg_.inventoryDir);
+        charStore_.SetDir(cfg_.characters ? cfg_.characterDir : std::string());
+        if (cfg_.characters)
+        {
+            std::string scanWhy;
+            const CharacterStore::ScanReport sr = charStore_.Scan(&scanWhy);
+            Log("characters: on, " + (charStore_.Enabled() ? "saved in " + charStore_.Dir() : std::string("characterDir empty: not saved")) +
+                "; name index: " + std::to_string(sr.characters) + " names from " + std::to_string(sr.files) + " rosters" +
+                (sr.unreadable ? ", " + std::to_string(sr.unreadable) + " unreadable" : std::string()) +
+                (sr.duplicates ? ", " + std::to_string(sr.duplicates) + " duplicate names (the first file keeps each)" : std::string()) +
+                (scanWhy.empty() ? std::string() : " (" + scanWhy + ")"));
+        }
+        else
+            Log("characters: off (characters 0: no roster, one inventory per account)");
         {
             sync::invw::Rules r;
             r.groundReach = (float)cfg_.invGroundReach;
@@ -1034,6 +1061,8 @@ namespace gage::server {
             OnInvOp(c, data, len);
         else if (type == proto::Msg::InvReport && rel)
             OnInvReport(c, data, len);   // 0.5.4: a client sends it only after the server's InvNearby offer (an older server refuses it here)
+        else if (type == proto::Msg::CharOp && rel)
+            OnCharOp(c, data, len);      // 0.5.9: a client sends it only after the server's CharRoster (an older server refuses it here)
         else
             Refuse(c, proto::RefuseReason::Protocol,
                    std::string("unexpected ") + proto::ToString(type) + " on channel " + std::to_string(channel));
@@ -1231,6 +1260,7 @@ namespace gage::server {
         c.accountId = r.accountId;
         c.sessionId = r.sessionId;
         c.roles = r.roles;
+        c.charSlots = r.characterSlots;
         c.isAdmin = false;
         for (const std::string& role : r.roles)
             if (std::find(cfg_.adminRoles.begin(), cfg_.adminRoles.end(), role) != cfg_.adminRoles.end()) c.isAdmin = true;
@@ -1373,7 +1403,7 @@ namespace gage::server {
     {
         std::string why;
         const std::string account = c.verified ? c.accountId : std::string();
-        const InventoryStore::Loaded l = invStore_.Load(account, c.inv, &why);
+        const InventoryStore::Loaded l = invStore_.Load(account, c.inv, &why, c.invSlot);
         // Unreadable: the real save is still there and must not be written over. A guest is never saved; Fresh and Corrupt save at
         // once (the kit, or the empty start after a corrupt save) so a restart does not hand out a second kit.
         c.invSave = c.verified && invStore_.Enabled() && l != InventoryStore::Loaded::Unreadable;
@@ -1382,6 +1412,7 @@ namespace gage::server {
             Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " save " + InventoryStore::ToString(l) + ": " + why);
         else if (c.verified)
             Log("inventory: id=" + std::to_string(c.id) + " " + c.name + " " + InventoryStore::ToString(l) +
+                (c.charOn ? " (character slot " + std::to_string(c.invSlot) + ")" : std::string()) +
                 (invStore_.Enabled() ? "" : " (inventoryDir empty: not saved)"));
         SendInventory(c, 0);
         // 0.5.4: the offer of the inventory world (what is in reach, usually nothing yet). A 0.5.3 client ignores the unknown type;
@@ -1502,7 +1533,7 @@ namespace gage::server {
     {
         if (!c.invSave || !c.invDirty) return;
         std::string why;
-        if (invStore_.Save(c.accountId, c.inv, &why))
+        if (invStore_.Save(c.accountId, c.inv, &why, c.invSlot))
         {
             c.invDirty = false;
             stats_.invSaves++;
@@ -1565,6 +1596,215 @@ namespace gage::server {
         if (!c) return false;
         out = c->inv;
         return true;
+    }
+
+    // ---- 0.5.9 characters ------------------------------------------------------------------------------------
+
+    bool Server::RosterOf(const std::string& target, sync::chr::Roster& out) const
+    {
+        Conn* c = const_cast<Server*>(this)->FindPlayer(target);
+        if (!c || !c->charOn) return false;
+        out = c->roster;
+        return true;
+    }
+
+    void Server::LoadCharacters(Conn& c)
+    {
+        namespace chr = sync::chr;
+        c.invSlot = 0;
+        c.charOn = cfg_.characters != 0;
+        if (!c.charOn) return;
+        c.charRate.Configure(kCharBurst, kCharPerSec);
+        c.charOwner = c.verified ? c.accountId : "guest:" + c.key;
+        const std::string who = "id=" + std::to_string(c.id) + " " + c.name;
+        std::string why;
+        const CharacterStore::Loaded l = charStore_.Load(c.verified ? c.accountId : std::string(), c.roster, &why);
+        c.charSave = c.verified && charStore_.Enabled() && l != CharacterStore::Loaded::Unreadable;
+        if (l == CharacterStore::Loaded::Corrupt || l == CharacterStore::Loaded::Unreadable)
+            Log("characters: " + who + " roster " + CharacterStore::ToString(l) + ": " + why);
+        // The slots are the platform's word on every join (a slot bought since the last join counts now; a refunded one locks its
+        // character, which stays stored). A guest has the base slot.
+        c.roster.slots = (uint8_t)chr::SlotsFor(c.verified ? c.charSlots : 0);
+        bool changed = l != CharacterStore::Loaded::Saved;   // a fresh or corrupt roster is written at once
+        if (!chr::Normalise(c.roster))
+        {
+            // No playable character: one now, in slot 0 (always owned, and empty here: a character in it would be playable).
+            const uint32_t seed = chr::SeedOf(c.verified ? c.accountId : c.key);
+            chr::Character ch;
+            ch.look = chr::DefaultAppearance(seed);
+            chr::Name n;
+            const std::string owner = c.charOwner;
+            if (!chr::DefaultName(c.name, seed, [this, &owner](const std::string& k) { return charStore_.Taken(k, owner, 0); }, n))
+                n = {"Solar", "Citizen"};   // unreachable in practice: 17 x 20 list names and 17 576 suffixed ones all taken
+            ch.first = n.first;
+            ch.last = n.last;
+            c.roster.chars[0] = ch;
+            c.roster.used |= 1;
+            c.roster.active = 0;
+            changed = true;
+            stats_.charsInstant++;
+            Log("characters: " + who + " had no character: made \"" + ch.Display() + "\" at once in slot 0 (" +
+                (ch.look.sex == chr::Sex::Female ? "female" : "male") + ", parents " + std::to_string(ch.look.father) + "/" +
+                std::to_string(ch.look.mother) + ", hair " + std::to_string(ch.look.hair) + ")" +
+                (c.verified ? std::string() : " for this guest session"));
+        }
+        c.invSlot = c.roster.active;
+        charStore_.Index(c.charOwner, c.roster);
+        if (changed && c.charSave) SaveCharacters(c, c.roster, "join");
+        const chr::Character* act = c.roster.Active();
+        Log("characters: " + who + " " + CharacterStore::ToString(l) + ", " + std::to_string(c.roster.Count()) + " character(s), " +
+            std::to_string(c.roster.slots) + " slot(s)" + (c.verified && c.charSlots == 0 ? " (the platform did not say: 1)" : "") +
+            ", playing slot " + std::to_string(c.roster.active) + " \"" + (act ? act->Display() : std::string("?")) + "\"" +
+            (c.charSave ? std::string() : c.verified ? " (not saved: " + std::string(charStore_.Enabled() ? "unreadable roster" : "characterDir empty") + ")"
+                                                     : " (guest: not saved)"));
+    }
+
+    bool Server::SaveCharacters(Conn& c, const sync::chr::Roster& r, const char* when)
+    {
+        if (!c.charSave) return true;
+        std::string why;
+        if (charStore_.Save(c.accountId, r, &why))
+        {
+            stats_.charSaves++;
+            return true;
+        }
+        stats_.charSaveFailures++;
+        Log(std::string("characters: save (") + when + ") of id=" + std::to_string(c.id) + " " + c.name + " failed: " + why);
+        return false;
+    }
+
+    void Server::SendCharRoster(Conn& c)
+    {
+        if (!c.charOn) return;
+        proto::CharRoster m;
+        m.flags = c.verified ? 0 : proto::kCharRosterGuest;
+        m.blob = sync::chr::EncodeRoster(c.roster);
+        SendTo(c, proto::kChanReliable, proto::Encode(m), true);
+    }
+
+    void Server::SendFaces(Conn& c)
+    {
+        if (!c.charOn) return;
+        for (const auto& kv : players_)
+        {
+            const Conn& o = *kv.second;
+            if (&o == &c || !o.charOn) continue;
+            const sync::chr::Character* act = o.roster.Active();
+            if (!act) continue;
+            proto::PeerFace f;
+            f.id = o.id;
+            f.blob = sync::chr::EncodeLook(act->look);
+            SendTo(c, proto::kChanReliable, proto::Encode(f), true);
+            stats_.facesSent++;
+        }
+    }
+
+    void Server::BroadcastFace(Conn& c)
+    {
+        if (!c.charOn) return;
+        const sync::chr::Character* act = c.roster.Active();
+        if (!act) return;
+        proto::PeerFace f;
+        f.id = c.id;
+        f.blob = sync::chr::EncodeLook(act->look);
+        const proto::Bytes bytes = proto::Encode(f);
+        for (const auto& kv : players_)
+        {
+            if (kv.second == &c) continue;
+            SendTo(*kv.second, proto::kChanReliable, bytes, true);
+            stats_.facesSent++;
+        }
+    }
+
+    void Server::OnCharOp(Conn& c, const uint8_t* data, size_t len)
+    {
+        namespace chr = sync::chr;
+        proto::CharOp m;
+        if (!proto::Decode(data, len, m))
+        {
+            Refuse(c, proto::RefuseReason::Protocol, "malformed CharOp");
+            return;
+        }
+        const chr::Op op = (chr::Op)m.op;
+        const std::string who = "id=" + std::to_string(c.id) + " " + c.name;
+        auto answer = [&](chr::Code code, const std::string& text) {
+            proto::CharResult r;
+            r.seq = m.seq;
+            r.op = m.op;
+            r.slot = m.slot;
+            r.code = (uint8_t)code;
+            r.text = text.size() > proto::kMaxRefuseText ? text.substr(0, proto::kMaxRefuseText) : text;
+            if (code == chr::Code::Ok)
+            {
+                stats_.charOpsApplied++;
+                SendCharRoster(c);
+            }
+            else
+                stats_.charOpsRefused++;
+            SendTo(c, proto::kChanReliable, proto::Encode(r), true);
+            Log("characters: " + who + " " + chr::ToString(op) + " slot " + std::to_string(m.slot) + ": " + chr::ToString(code) +
+                (text.empty() ? std::string() : " (" + text + ")"));
+        };
+        if (!c.charOn)
+        {
+            answer(chr::Code::NotNow, "characters are off on this server");
+            return;
+        }
+        if (!c.charRate.Take(net::NowMs()))
+        {
+            answer(chr::Code::RateLimited, std::string());
+            return;
+        }
+        chr::Character in;
+        if (op != chr::Op::Select && !chr::DecodeCharacter(m.blob, in))
+        {
+            answer(chr::Code::BadLook, "the character does not decode");
+            return;
+        }
+        const int slot = m.slot;
+        const bool switching = op == chr::Op::Select && slot != c.roster.active;
+        if (switching && c.dead)
+        {
+            answer(chr::Code::NotNow, "not while dead");
+            return;
+        }
+        chr::Roster next = c.roster;
+        const std::string owner = c.charOwner;
+        const chr::Code code = chr::Apply(next, op, slot, in, [this, &owner, slot](const std::string& k) { return charStore_.Taken(k, owner, slot); });
+        if (code != chr::Code::Ok)
+        {
+            answer(code, std::string());
+            return;
+        }
+        if (switching)
+        {
+            // The old character's items are written before anything changes; a write that fails keeps the player on it (the items would be
+            // lost otherwise).
+            SaveInventory(c, "switch");
+            if (c.invSave && c.invDirty)
+            {
+                answer(chr::Code::Failed, "your items could not be saved");
+                return;
+            }
+        }
+        if (!SaveCharacters(c, next, chr::ToString(op)))
+        {
+            answer(chr::Code::Failed, std::string());
+            return;
+        }
+        const chr::Appearance before = c.roster.Active() ? c.roster.Active()->look : chr::Appearance();
+        const uint8_t beforeSlot = c.roster.active;
+        c.roster = next;
+        charStore_.Index(c.charOwner, c.roster);
+        if (switching)
+        {
+            c.invSlot = c.roster.active;
+            LoadInventory(c);
+        }
+        answer(chr::Code::Ok, op == chr::Op::Select ? std::string("now playing \"") + c.roster.chars[slot].Display() + "\""
+                                                   : std::string("\"") + c.roster.chars[slot].Display() + "\"");
+        const chr::Character* act = c.roster.Active();
+        if (act && (c.roster.active != beforeSlot || act->look != before)) BroadcastFace(c);
     }
 
     // ---- 0.5.4 inventory world ------------------------------------------------------------------------------
@@ -1878,14 +2118,20 @@ namespace gage::server {
             if (c.verified) ai.username = c.name;
             SendTo(c, proto::kChanReliable, proto::Encode(ai), true);
         }
+        // 0.5.9: its characters first (the active one decides which inventory loads; a player with none gets one now), sent below.
+        LoadCharacters(c);
         // 0.6: then its inventory.
         LoadInventory(c);
         // 0.5.7: then the world's time of day and weather (an older client drops the unknown type).
         SendWorldClock(c);
+        // 0.5.9: then its roster and the others' faces (an older client drops the unknown types).
+        SendCharRoster(c);
+        SendFaces(c);
         proto::PlayerJoined self;
         self.id = c.id;
         self.name = c.name;
         SendToAll(proto::Encode(self), &c);
+        BroadcastFace(c);
 
         players_[c.id] = &c;
         nameKeys_[c.key] = c.id;
@@ -3672,6 +3918,8 @@ namespace gage::server {
     {
         if (players_.erase(c.id) == 0) return;
         SaveInventory(c, "leave");
+        // 0.5.9: a roster that is not kept gives its names back (a guest's, or any while characterDir is empty); a saved one keeps them.
+        if (c.charOn && !c.charSave) charStore_.Unindex(c.charOwner);
         // v8: the platform closes the account's game session (purchases stop being delivered here).
         EndPlatformSession(c, why == proto::LeaveReason::Quit ? "quit" : why == proto::LeaveReason::Timeout ? "timeout" : "kicked");
         repl_.RemovePlayer(c.id);

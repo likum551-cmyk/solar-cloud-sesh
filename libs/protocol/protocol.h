@@ -76,6 +76,8 @@
 //   * 0.5.4 inventory world (still v8, additive and negotiated): InvSnap (52, S->C), InvNearby (53, S->C), InvReport (54, C->S),
 //     all reliable, and InvOp's op may be 19 bytes (a ground pile or trunk side). A 0.5.3 client counts 52/53 as malformed
 //     and ignores them; the server sends InvSnap / the 19-byte form only to a client that answered with an InvReport.
+//   * 0.5.9 characters (still v8, additive and negotiated): CharRoster (56, S->C), CharOp (57, C->S), CharResult (58, S->C), PeerFace (59,
+//     S->C), all reliable; the blobs are libs/sync/character.h's. A client sends CharOp only after the server's CharRoster.
 //   * 0.5.7 world clock (still v8, additive): Msg::WorldClock (55, S->C reliable), the server's time of day, its rate and the weather
 //     (libs/sync/world_clock.h). A 0.5.6 or older client's PeekType refuses type 55 (above its kMsgLast), so its session counts the
 //     packet as malformed and drops it, and nothing in the engine acts on that counter: the message is safe to send to everybody.
@@ -230,8 +232,12 @@ namespace gage::proto {
         InvNearby        = 53, // S->C reliable (v8, 0.5.4): the world containers in reach (a ground pile, a trunk); empty = none
         InvReport        = 54, // C->S reliable (v8, 0.5.4): the ped's weapons, current weapon and nearby vehicle classes
         WorldClock       = 55, // S->C reliable (v8, 0.5.7): the server's time of day, its rate and the weather (join, every change, every 30 s)
+        CharRoster       = 56, // S->C reliable (v8, 0.5.9 characters): the account's characters, slots and the active one
+        CharOp           = 57, // C->S reliable (v8, 0.5.9): select / create / save a character (only after a CharRoster)
+        CharResult       = 58, // S->C reliable (v8, 0.5.9): the answer to one CharOp
+        PeerFace         = 59, // S->C reliable (v8, 0.5.9): another player's character appearance (face, overlays, hair colour, eyes)
     };
-    constexpr uint8_t kMsgLast = (uint8_t)Msg::WorldClock;
+    constexpr uint8_t kMsgLast = (uint8_t)Msg::PeerFace;
 
     // Wire compatibility: values 1..6 are the original v1 set. Banned (7) and
     // TooManyConnections (8) were added without bumping kVersion, because they only
@@ -994,6 +1000,25 @@ namespace gage::proto {
         uint8_t flags = 0;
     };
 
+    // ---- v8, 0.5.9 characters (docs/api/protocol.md "0.5.9 characters"; the rules and the blob codec are libs/sync/character.h) ----
+    // Like the inventory, the protocol only frames and caps the blobs, so this library does not depend on the character rules.
+    // CharRoster (S->C reliable): sent after the join's WorldClock (an older client drops the unknown type) and after every applied CharOp.
+    // `blob` = sync::chr::EncodeRoster. flags: kCharRosterGuest = this roster is not saved (a guest's ephemeral character).
+    // CharOp (C->S reliable): a client sends it only after the server sent a CharRoster (an older server refuses the type as a protocol
+    // error). `op` 1..kCharOpLast (sync::chr::Op), `slot` 0..2, `blob` = sync::chr::EncodeCharacter (empty for Select).
+    // CharResult (S->C reliable): the answer to every CharOp (same seq, op, slot); `code` = sync::chr::Code, `text` for the player.
+    // PeerFace (S->C reliable): player `id`'s active character look (sync::chr::EncodeLook), after its PlayerJoined (newcomers get every
+    // player's after the join burst, after the CharRoster) and after every change.
+    constexpr size_t kMaxCharBlob = 512;
+    constexpr uint8_t kCharRosterGuest = 0x01;
+    constexpr uint8_t kCharOpLast = 3;     // == sync::chr::kOpLast (tests/character_tests.h checks)
+    constexpr uint8_t kCharCodeLast = 11;  // == sync::chr::kCodeLast
+    constexpr uint8_t kCharSlots = 3;      // == sync::chr::kMaxSlots
+    struct CharRoster { uint8_t flags = 0; std::string blob; };
+    struct CharOp { uint16_t seq = 0; uint8_t op = 0; uint8_t slot = 0; std::string blob; };
+    struct CharResult { uint16_t seq = 0; uint8_t op = 0; uint8_t slot = 0; uint8_t code = 0; std::string text; };
+    struct PeerFace { uint16_t id = 0; std::string blob; };
+
     using Bytes = std::vector<uint8_t>;
 
     // Encode never validates caps (the receiver's Decode does, so tests and
@@ -1057,6 +1082,10 @@ namespace gage::proto {
     Bytes Encode(const InvNearby& m);    // v8 0.5.4: {} for more than kMaxInvNearby boxes or a blob over kMaxInvBlob
     Bytes Encode(const InvReport& m);    // v8 0.5.4: {} for more than kMaxInvReportWeapons / kMaxInvReportVehicles
     Bytes Encode(const WorldClock& m);   // v8 0.5.7: {} for any field Decode would refuse
+    Bytes Encode(const CharRoster& m);   // v8 0.5.9: {} for an empty / over-cap blob or unknown flags
+    Bytes Encode(const CharOp& m);       // v8 0.5.9: {} for seq 0, an unknown op, a slot >= kCharSlots, an over-cap blob
+    Bytes Encode(const CharResult& m);   // v8 0.5.9: {} for an unknown op or code, a slot >= kCharSlots, a text over kMaxRefuseText
+    Bytes Encode(const PeerFace& m);     // v8 0.5.9: {} for an id >= kMaxPlayers or an empty / over-cap blob
 
     // The message type of a packet (false for an empty packet or unknown type).
     bool PeekType(const uint8_t* p, size_t n, Msg& out);
@@ -1120,6 +1149,10 @@ namespace gage::proto {
     // v8 0.5.7: exactly kWorldClockBytes; refuses gameMs >= kClockDayMs, scaleMilli over kMaxClockScaleMilli, a weather id >= kMaxWeatherId,
     // transTotalMs over kMaxWeatherTransMs, transElapsedMs over transTotalMs, a steady state (total 0) whose from and to differ, unknown flags.
     bool Decode(const uint8_t* p, size_t n, WorldClock& out);
+    bool Decode(const uint8_t* p, size_t n, CharRoster& out);  // v8 0.5.9: the same refusals as its Encode
+    bool Decode(const uint8_t* p, size_t n, CharOp& out);
+    bool Decode(const uint8_t* p, size_t n, CharResult& out);
+    bool Decode(const uint8_t* p, size_t n, PeerFace& out);
 
     // 1..kMaxName characters from [A-Za-z0-9_.-] and inner spaces. A space must
     // sit between two other characters and never doubles ("a  b" and "a b" would

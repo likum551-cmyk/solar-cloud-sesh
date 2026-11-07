@@ -3096,6 +3096,7 @@ static void TestSyncD()
 #include "inventory_world_tests.h"   // 0.5.4 inventory world: weapons as items, the hand, codec v2, ground piles, trunks, the weapon reconcile
 #include "ring_round_tests.h"  // 0.5.5 ring_map_round: radii, the asked box, the gate, the mask and its codecs, the blip clip pattern
 #include "world_clock_tests.h" // 0.5.7 world clock: the server's time of day and weather (pure parts and the WorldClock codec)
+#include "character_tests.h"   // 0.5.9 characters: slots, names, appearance ranges, the instant character, roster rules, codecs
 
 int main()
 {
@@ -3170,6 +3171,8 @@ int main()
     ringround_t::RunDump();                         // its blip clip pattern against the Legacy dumps (not counted; SKIP without them)
     std::printf("-- 0.5.7 world clock (clock line, weather plan, client copy, holds, codec)\n");
     worldclock_t::RunPure();                        // 0.5.7 world clock (tests/world_clock_tests.h)
+    std::printf("-- 0.5.9 characters (slots, names, appearance, instant character, roster rules, codecs)\n");
+    chartest::RunPure();                            // 0.5.9 characters (tests/character_tests.h)
 
     // vitals 41 (3 for the max-raise re-apply, live 0.4.3) + respawn 8 + batcher 8 + peer 13 + emote 23 + link 42 + entry 18 + drive-by 7 + more 60 + W3 52 + W6 23
     // + W8 11 (melee react 4, dead-puppet damage 1, water 1, climb 2, aim + fallback 2, site tally 1; the old melee check was reworded, not added)
@@ -3196,7 +3199,8 @@ int main()
                        + pedview_t::kChecks   // + 0.5.4 inventory ped view 7
                        + invworld::kChecks    // + 0.5.4 the inventory world 14
                        + ringround_t::kChecks    // + 0.5.5 the ring map round mask 15, + 0.5.6 its census pick and mask shape 4, + 0.5.7 the pinned faded mask 1
-                       + worldclock_t::kChecks;  // + 0.5.7 the world clock 14
+                       + worldclock_t::kChecks   // + 0.5.7 the world clock 14
+                       + chartest::kChecks;      // + 0.5.9 characters 17
     std::printf("%d/%d passed\n", g_run - g_failed, g_run);
     if (g_run != expected + anim_audit::kAnimAuditChecks + t6health::kPureChecks + r3t1::kPureChecks + t1::kPureChecks + r3cover::kPureChecks + r3t6::kClientChecks + r4t3::kClientChecks + radiooff::kPureChecks)   // + 0e animation audit; + T6 health; + R3 T1 health; + T1 seats; + R3 T3 cover; + R3 T6 melee client (tests/r3_t6_tests.h)
     {

@@ -109,6 +109,9 @@ namespace gage::net {
             InvSnap,         // v8 (0.5.4 inventory world): InvState with weapons (codec v2), its rev and a strip list
             InvNearby,       // v8 (0.5.4): the world containers in reach (empty list = none); the first one is also the offer
             WorldClock,      // v8 (0.5.7): the server's time of day, its rate and the weather (join, every change, every 30 s)
+            CharRoster,      // v8 (0.5.9): our characters (sync::chr::DecodeRoster), after the join's WorldClock and after every applied CharOp
+            CharResult,      // v8 (0.5.9): the answer to one SendCharOp
+            PeerFace,        // v8 (0.5.9): another player's character look (sync::chr::DecodeLook), after its PlayerJoined
         };
         Type type = Type::Disconnected;
 
@@ -149,6 +152,9 @@ namespace gage::net {
         proto::InvSnap invSnap;             // v8 (0.5.4): blob = sync::inv::Encode (v2), rev, flags, strip
         proto::InvNearby invNearby;         // v8 (0.5.4): blobs = sync::inv::EncodeBox
         proto::WorldClock worldClock;       // v8 (0.5.7): gameMs is the server's time of day at its send (libs/sync/world_clock.h FromWire)
+        proto::CharRoster charRoster;       // v8 (0.5.9): blob = sync::chr::EncodeRoster
+        proto::CharResult charResult;       // v8 (0.5.9): seq / op / slot of our CharOp, code = sync::chr::Code
+        proto::PeerFace face;               // v8 (0.5.9): blob = sync::chr::EncodeLook of player face.id's active character
     };
 
     class ClientSession
@@ -221,6 +227,12 @@ namespace gage::net {
         // v8 (0.5.4 inventory world): what our ped holds (reliable). The first one also tells the server we speak the inventory
         // world (it answers with InvSnap from then on). False when not Joined or over a cap.
         bool SendInvReport(const proto::InvReport& r);
+        // v8 (0.5.9 characters): select / create / save a character (reliable). Every one is answered with an Event::CharResult (same
+        // seq, op, slot) and, when applied, a new Event::CharRoster. False when not Joined, before the server sent a CharRoster (an older
+        // server refuses the type as a protocol error and would drop us), or when the op would not encode.
+        bool SendCharOp(const proto::CharOp& o);
+        // True once this connection got a CharRoster (the server speaks 0.5.9 characters).
+        bool charactersOffered() const { return charOffered_; }
         // Sends bytes as they are, bypassing every check. For tools and tests that
         // build deliberately bad packets. False when there is no live connection.
         bool SendRaw(uint8_t channel, const proto::Bytes& bytes, bool reliable);
@@ -318,6 +330,7 @@ namespace gage::net {
         uint32_t seq_ = 0;
         uint32_t vehSeq_ = 0; // VehicleUpdate numbering (its own sequence)
         bool lookSent_ = false;
+        bool charOffered_ = false;   // 0.5.9: the server sent a CharRoster on this connection
         proto::Look lastLook_;
         std::deque<Event> events_;
         uint64_t worldReceived_ = 0, worldDropped_ = 0, malformed_ = 0;

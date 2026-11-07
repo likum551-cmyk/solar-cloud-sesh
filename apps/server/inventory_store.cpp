@@ -22,16 +22,18 @@ namespace gage::server {
         return "?";
     }
 
-    std::string InventoryStore::PathFor(const std::string& accountId) const
+    std::string InventoryStore::PathFor(const std::string& accountId, int slot) const
     {
         static const char* const kHex = "0123456789abcdef";
         std::string name;
-        name.reserve(accountId.size() * 2 + 4);
+        name.reserve(accountId.size() * 2 + 8);
         for (unsigned char c : accountId)
         {
             name.push_back(kHex[c >> 4]);
             name.push_back(kHex[c & 15]);
         }
+        if (slot > 0)
+            name += ".c" + std::to_string(slot);
         name += ".inv";
         return (fs::path(dir_) / name).string();
     }
@@ -54,14 +56,14 @@ namespace gage::server {
         return true;
     }
 
-    InventoryStore::Loaded InventoryStore::Load(const std::string& accountId, sync::inv::Character& out, std::string* why)
+    InventoryStore::Loaded InventoryStore::Load(const std::string& accountId, sync::inv::Character& out, std::string* why, int slot)
     {
         if (!Enabled() || accountId.empty())
         {
             out = sync::inv::StarterKit();
             return Loaded::Fresh;
         }
-        const std::string path = PathFor(accountId);
+        const std::string path = PathFor(accountId, slot);
         std::string bytes, err;
         bool missing = false;
         if (!ReadWholeFile(path, bytes, &err, &missing))
@@ -86,7 +88,7 @@ namespace gage::server {
         return ec ? Loaded::Unreadable : Loaded::Corrupt;
     }
 
-    bool InventoryStore::Save(const std::string& accountId, const sync::inv::Character& ch, std::string* why)
+    bool InventoryStore::Save(const std::string& accountId, const sync::inv::Character& ch, std::string* why, int slot)
     {
         if (!Enabled())
         {
@@ -100,7 +102,7 @@ namespace gage::server {
         }
         if (!EnsureDir(why))
             return false;
-        return AtomicWriteFile(PathFor(accountId), sync::inv::EncodeForSave(ch), why);
+        return AtomicWriteFile(PathFor(accountId, slot), sync::inv::EncodeForSave(ch), why);
     }
 
 } // namespace gage::server

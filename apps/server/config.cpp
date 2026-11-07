@@ -204,6 +204,10 @@ namespace gage::server {
             return fail("inventoryDir path is too long");
         if (cfg.invWorld > 1)
             return fail("invWorld must be 0 or 1");
+        if (cfg.characters > 1)
+            return fail("characters must be 0 or 1");
+        if (cfg.characterDir.size() > 200)
+            return fail("characterDir path is too long");
         if (cfg.invGroundReach < 1 || cfg.invGroundReach > 20 || cfg.invTrunkReach < 1 || cfg.invTrunkReach > 20)
             return fail("invGroundReach and invTrunkReach must be 1..20");
         if (cfg.invGroundExpireSeconds < 10 || cfg.invGroundExpireSeconds > 86400)
@@ -513,6 +517,16 @@ namespace gage::server {
                 if (!WholeNumber(v, 16, 65536, n)) return fail("\"invMaxPiles\" must be a whole number 16..65536");
                 out.invMaxPiles = n;
             }
+            // ---- 0.5.9 characters ----
+            else if (key == "characters")
+            {
+                if (!WholeNumber(v, 0, 1, n)) return fail("\"characters\" must be 0 or 1");
+                out.characters = n;
+            }
+            else if (key == "characterDir")
+            {
+                if (!str(out.characterDir)) return false;
+            }
             // ---- 0.5.7 world clock ----
             else if (key == "worldClock")
             {
@@ -790,7 +804,7 @@ namespace gage::server {
             {
                 std::string known = "name, port, maxPlayers, tickHz, masterUrl, heartbeatSeconds, gamemode, lang, url, "
                                     "maxConnectionsPerIp, chatBurst, chatWindowSeconds, bansFile, inventoryDir, invWorld, invGroundReach, "
-                                    "invTrunkReach, invGroundExpireSeconds, invMaxPiles, worldClock, clockStart, clockScale, weather, weatherCycle, "
+                                    "invTrunkReach, invGroundExpireSeconds, invMaxPiles, characters, characterDir, worldClock, clockStart, clockScale, weather, weatherCycle, "
                                     "weatherTransitionSeconds, adminPort, adminToken, "
                                     "latestClientVersion, maxVehicles, vehiclesPerPlayer, vehicleEmptyDespawnSeconds, vehicleEnterDistance, "
                                     "vehicleMaxSpeed, contactLagCapMs, vehicleLocks, vehicleLockDistance, fuelDrainPerMinute, playerHealth, firearmDamagePercent, "

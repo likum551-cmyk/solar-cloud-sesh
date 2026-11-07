@@ -167,6 +167,15 @@ namespace gage::server {
         uint32_t invGroundExpireSeconds = 600;  // 10..86400
         uint32_t invMaxPiles = 2048;            // 16..65536
 
+        // ---- server.json keys: 0.5.9 characters (libs/sync/character.h, character_store.h, docs/api/server.md "Characters") ----
+        // characters 1 = every player plays a character (first + last name and a freemode appearance): a verified account's roster is
+        // saved in characterDir (one file per account), a player with none gets one at once on join, the platform's characterSlots (1..3)
+        // says how many it may hold, and each character has its own inventory save (slot 0 keeps the account's existing one). A guest gets
+        // one character for the session, never saved. 0 = the 0.5.8 behaviour (no roster sent, one inventory per account). characterDir
+        // empty = rosters are not saved (every verified player gets a fresh instant character each session).
+        uint32_t characters = 1;                // 0 | 1
+        std::string characterDir = "characters";
+
         // ---- server.json keys: 0.5.7 world clock and weather (libs/sync/world_clock.h, docs/api/server.md "World clock") ----
         // worldClock 1 = the server owns the time of day and the weather and sends them (WorldClock) to every client; 0 = never sent (each
         // client keeps the game's own clock and weather, the 0.5.6 behaviour). clockStart "HH:MM[:SS]" = the time at server start (not

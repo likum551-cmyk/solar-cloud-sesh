@@ -3183,6 +3183,7 @@ static void PipelineHealthTests()
 #include "inventory_net_tests.h" // 0.6 inventory over the wire: kit, ops, USE effects, console, saves per verified account
 #include "inventory_world_net_tests.h" // 0.5.4 inventory world over the wire: the offer, InvSnap / InvReport, ground piles, trunks, invWorld 0
 #include "world_clock_net_tests.h" // 0.5.7 world clock over the wire: join, console and admin chat changes, guests refused, worldClock 0, keys
+#include "character_net_tests.h" // 0.5.9 characters over the wire: instant character, faces, ops, slots, per-character items, saves, characters 0
 
 int main()
 {
@@ -3235,10 +3236,12 @@ int main()
     invworldnet::Tests();
     std::printf("-- 0.5.7 world clock: WorldClock on join, console / admin chat changes, guests refused, worldClock 0, server.json keys\n");
     wclocknet::Tests();
+    std::printf("-- 0.5.9 characters: CharRoster / CharOp / CharResult / PeerFace, the instant character, slots, per-character items, saves\n");
+    charnet::Tests();
 
     // A skipped section (an early return, a crash-free no-op) must fail, not pass vacuously.
     // 69 before the authority rules; + 1 anti-cheat config check + 10 unit checks of section J.
-    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks + v8acct::kAccountChecks + invnet::kChecks + invworldnet::kChecks + wclocknet::kChecks; // 0.5.7: + the world clock checks; 0.5.4: + the inventory world checks; 0.6: + the inventory checks; v8: + the account checks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
+    const int expected = 112 + t4srv::kT4ServerChecks + r3t6::kServerChecks + r4t3::kServerChecks + v8acct::kAccountChecks + invnet::kChecks + invworldnet::kChecks + wclocknet::kChecks + charnet::kChecks; // 0.5.9: + the character checks; 0.5.7: + the world clock checks; 0.5.4: + the inventory world checks; 0.6: + the inventory checks; v8: + the account checks; // 0.4.32: +1 reserved message type (ReservedTypeTest); T4: +2 (the claim, the speed cap clamp); // G: +1 admin id truncation; W8: +2 config warning / start log, +1 melee ceiling; the Check() calls on the passing path (v4: +1 vehicle / combat config; W4: +2 tick clock / sample age; W5: +1 damage config, +9 vehicle v5, +2 damage scaling); a skipped section fails the run Sync C: +4 (enet throttle model, live throttle config, per-tier counters, sync log line).
     std::printf("%d/%d passed  (%lld ms)\n", g_run - g_failed, g_run, (long long)MsSince(t0));
     if (g_run != expected)
     {
