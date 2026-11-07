@@ -23,7 +23,9 @@ import { hasOpenSession } from '../game/join.js';
 import type { GameServerRow } from '../servers/service.js';
 import { ApiError, isCheckViolation, isForeignKeyViolation, isUniqueViolation } from '../util/errors.js';
 import { errorFields } from '../util/logger.js';
-import { grantPayloadSchema, parsePayloadForKind } from './payload.js';
+import {
+  appliedByPlatform, BASE_CHARACTER_SLOTS, CHARACTER_SLOT_KEY, grantPayloadSchema, isCharacterSlot, MAX_EXTRA_CHARACTER_SLOTS, parsePayloadForKind,
+} from './payload.js';
 import { WebhookVerificationError, type PaymentProvider, type WebhookEvent } from './provider.js';
 
 type ProductRow = typeof products.$inferSelect;
@@ -272,6 +274,22 @@ export async function checkout(deps: Deps, account: AccountRow, input: z.infer<t
   }
   if (currency === null) throw new ApiError(400, 'invalid_request', 'The order has no items.');
 
+  // Character slots: at most MAX_EXTRA_CHARACTER_SLOTS can be owned, so an order that would pass the cap is refused up front
+  // (two orders paid at once can still pass it; the game server never counts more than the cap: characterSlots()).
+  let slotsWanted = 0;
+  for (const [s, qty] of wanted) {
+    const p = bySku.get(s) as ProductRow;
+    for (const g of grantPayloadSchema.parse(p.grantPayload).grants) if (isCharacterSlot(g)) slotsWanted += qty;
+  }
+  if (slotsWanted > 0) {
+    const owned = await extraCharacterSlots(deps.db, account.id);
+    if (owned + slotsWanted > MAX_EXTRA_CHARACTER_SLOTS) {
+      throw new ApiError(409, 'character_slots_full', `An account can buy ${MAX_EXTRA_CHARACTER_SLOTS} extra character slots; this one owns ${owned}.`, {
+        details: { owned, max: MAX_EXTRA_CHARACTER_SLOTS },
+      });
+    }
+  }
+
   let order: OrderRow;
   try {
     order = await deps.db.transaction(async (tx) => {
@@ -401,7 +419,7 @@ async function markPaid(tx: Db, order: OrderRow, now: Date): Promise<boolean> {
     for (let entryNo = 0; entryNo < payload.grants.length; entryNo++) {
       const entry = payload.grants[entryNo];
       if (!entry) continue;
-      const byPlatform = entry.type === 'wallet_credit';
+      const byPlatform = appliedByPlatform(entry);
       const [g] = await tx
         .insert(grants)
         .values({
@@ -417,7 +435,7 @@ async function markPaid(tx: Db, order: OrderRow, now: Date): Promise<boolean> {
           accountId: order.accountId, currency: entry.currency, delta: entry.amount * line.quantity,
           reason: 'purchase', idempotencyKey: `grant:${g.id}`, grantId: g.id, createdAt: now,
         });
-      } else {
+      } else if (!byPlatform) {
         awaitingServer++;
       }
     }
@@ -450,7 +468,7 @@ async function revokeOrder(tx: Db, order: OrderRow, to: 'refunded' | 'chargeback
 
   const original = await tx.select().from(grants).where(and(eq(grants.orderId, order.id), eq(grants.kind, 'grant'))).orderBy(asc(grants.seq));
   for (const g of original) {
-    const byPlatform = g.type === 'wallet_credit';
+    const byPlatform = appliedByPlatform({ type: g.type, key: (g.payload as { key?: unknown } | null)?.key });
     const [r] = await tx
       .insert(grants)
       .values({
@@ -460,7 +478,7 @@ async function revokeOrder(tx: Db, order: OrderRow, to: 'refunded' | 'chargeback
       })
       .returning({ id: grants.id });
     if (!r) throw new Error('revoke insert returned no row');
-    if (byPlatform) {
+    if (g.type === 'wallet_credit') {
       const entry = g.payload as { currency: string; amount: number };
       await tx.insert(walletLedger).values({
         accountId: g.accountId, currency: entry.currency, delta: -(entry.amount * g.quantity),
@@ -752,6 +770,35 @@ export async function listOwned(db: Db, accountId: string) {
     id: g.id, sku: g.sku, type: g.type, payload: g.payload, quantity: g.quantity, orderId: g.orderId,
     delivered: g.status === 'acked', createdAt: g.createdAt,
   }));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Character slots (GI 2026-11-07): 1 per account, up to MAX_EXTRA_CHARACTER_SLOTS more bought
+
+/**
+ * Extra character slots the account owns now: the line quantities of its `character_slot` entitlement grants that no revoke
+ * took back (a refund or chargeback removes them again). Not capped: an account can own more than the cap only through two
+ * orders paid at once; characterSlots() caps.
+ */
+export async function extraCharacterSlots(db: Db, accountId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`coalesce(sum(${grants.quantity}), 0)::int` })
+    .from(grants)
+    .where(
+      and(
+        eq(grants.accountId, accountId),
+        eq(grants.kind, 'grant'),
+        eq(grants.type, 'entitlement'),
+        sql`${grants.payload}->>'key' = ${CHARACTER_SLOT_KEY}`,
+        sql`not exists (select 1 from grants r where r.revokes_grant_id = ${grants.id})`,
+      ),
+    );
+  return row?.n ?? 0;
+}
+
+/** How many characters the account may have in game: BASE_CHARACTER_SLOTS + the owned extra slots, at most the cap. */
+export async function characterSlots(db: Db, accountId: string): Promise<number> {
+  return BASE_CHARACTER_SLOTS + Math.min(MAX_EXTRA_CHARACTER_SLOTS, await extraCharacterSlots(db, accountId));
 }
 
 // ---------------------------------------------------------------------------------------------

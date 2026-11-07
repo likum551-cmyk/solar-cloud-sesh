@@ -23,7 +23,7 @@ export function registerInternalRoutes(r: Router, deps: Deps): void {
   r.add(
     {
       ...common, method: 'post', path: '/internal/game/verify', summary: 'Redeem a join token', body: verifySchema,
-      description: 'Consumes the token (single use) and opens the account\'s game session on this server. A ban deletes the account\'s unused tokens, so those come back invalid_token. 200 { ok: true, accountId, username, roles, emailVerified, sessionId, ban: null } or 200 { ok: false, reason: invalid_token | expired | used } or 200 { ok: false, reason: banned, accountId, username, ban: { reason, expiresAt } }.',
+      description: 'Consumes the token (single use) and opens the account\'s game session on this server. A ban deletes the account\'s unused tokens, so those come back invalid_token. 200 { ok: true, accountId, username, roles, emailVerified, sessionId, characterSlots, ban: null } (characterSlots 1..3: the characters the account may have in game) or 200 { ok: false, reason: invalid_token | expired | used } or 200 { ok: false, reason: banned, accountId, username, ban: { reason, expiresAt } }.',
       response: '200 verdict (see description)',
     },
     async (c, { body }) => c.json(await verifyJoinToken(deps, requireServer(c), body.token)),
