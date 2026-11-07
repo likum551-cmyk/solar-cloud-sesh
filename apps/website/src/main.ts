@@ -1,61 +1,23 @@
 import './base.css';
 import './styles.css';
 import { formatSize, loadRelease, type Release } from './release';
-import { describeStatus, findServer, loadServers, STATIC_STATUS, type StatusView } from './servers';
+import { describeAge, describeStatus, findServer, loadFraction, loadServers, STATIC_STATUS, type ServerInfo } from './servers';
 import { browserTokenStore } from './account/store';
 import { wireAccountLink } from './account/ui';
 
-// GI, 2026-11-06: the trailer page ("remove this disgusting 3D S") and then the quiet hub ("grim asf", "it
-// needs more anim") are gone; the page is a warm "big RP project" home that moves. This script fills in the
-// live facts (the release and SOL's status), the account links and the bar's solid state, and runs the
-// motion that needs a script: reveals as blocks scroll in, ticking numbers, the hero stack following the
-// pointer. Everything else moves in CSS (styles.css). No video, no WebGL; reduced motion runs none of it.
+// GI, 2026-11-07: "Launcher product page" (like fivem.net / alt:V). This script fills in the live facts: the
+// release behind every download button, and the hero's server list, which is the launcher's own list,
+// refreshed every 20 s while the tab is visible. Plus the account links, the bar's solid state and the
+// one-time row reveals. No video, no WebGL; reduced motion runs no animation.
 const SITE_HOST = 'solar-rp.com';
 const $ = <T extends Element>(sel: string, el: ParentNode = document) => el.querySelector<T>(sel);
 const $$ = <T extends Element>(sel: string, el: ParentNode = document) => Array.from(el.querySelectorAll<T>(sel));
 const MOTION = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-/* ---------------------------------------------------------------- numbers that tick up */
-
-function showCount(el: HTMLElement, to: number) {
-  const dp = Number(el.dataset.dp ?? 0);
-  if (!MOTION) {
-    el.textContent = to.toFixed(dp);
-    return;
-  }
-  const start = performance.now();
-  const ms = 1600;
-  const step = (now: number) => {
-    const t = Math.min(1, (now - start) / ms);
-    const eased = 1 - Math.pow(1 - t, 4);
-    el.textContent = (to * eased).toFixed(dp);
-    if (t < 1) requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
-}
-
-// counters tick when they come into view (the markup already holds the final value, so a page without
-// this script, or one that never scrolls there, still reads right)
-const counted = new WeakSet<Element>();
-function countWhenSeen(els: HTMLElement[]) {
-  if (!MOTION || !('IntersectionObserver' in window)) return;
-  const io = new IntersectionObserver((entries) => {
-    for (const e of entries) {
-      if (!e.isIntersecting || counted.has(e.target)) continue;
-      counted.add(e.target);
-      io.unobserve(e.target);
-      const el = e.target as HTMLElement;
-      showCount(el, Number(el.dataset.to ?? 0));
-    }
-  }, { threshold: 0.6 });
-  for (const el of els) io.observe(el);
-}
-countWhenSeen($$<HTMLElement>('.js-count'));
-
 /* ---------------------------------------------------------------- reveals */
 
 if (MOTION && 'IntersectionObserver' in window) {
-  // .rv hides the blocks below the fold until they scroll in; set here, so a page whose script never ran
+  // .rv hides the rows below the fold until they scroll in; set here, so a page whose script never ran
   // keeps everything visible
   document.documentElement.classList.add('rv');
   const io = new IntersectionObserver((entries) => {
@@ -68,39 +30,20 @@ if (MOTION && 'IntersectionObserver' in window) {
   for (const el of $$('[data-reveal]')) io.observe(el);
 }
 
-/* ---------------------------------------------------------------- hero stack follows the pointer */
-
-const stack = $<HTMLElement>('.stack');
-if (stack && MOTION && window.matchMedia('(pointer: fine)').matches) {
-  let raf = 0;
-  let px = 0;
-  let py = 0;
-  window.addEventListener('pointermove', (ev) => {
-    px = (ev.clientX / window.innerWidth - 0.5) * 2;
-    py = (ev.clientY / window.innerHeight - 0.5) * 2;
-    if (raf) return;
-    raf = requestAnimationFrame(() => {
-      raf = 0;
-      if (window.scrollY > window.innerHeight) return; // the hero is off screen
-      stack.style.setProperty('--px', px.toFixed(3));
-      stack.style.setProperty('--py', py.toFixed(3));
-    });
-  }, { passive: true });
-}
-
 /* ---------------------------------------------------------------- release / download */
 
 function showRelease(r: Release | null) {
-  const plates = $$<HTMLAnchorElement>('.js-download');
+  const buttons = $$<HTMLAnchorElement>('.js-download');
   const status = $<HTMLElement>('.js-release-status');
   const label = (a: HTMLElement) => $<HTMLElement>('.js-download-label', a) ?? a;
+  const text = (a: HTMLElement) => (a.classList.contains('btn--sm') ? 'Download' : 'Download for Windows');
   if (!r) {
     // The release feed did not answer or did not check out (releases ARE published: this is a fetch or
     // feed problem, never "no build yet"). Every control leads to the download section, which says so.
-    for (const a of plates) {
+    for (const a of buttons) {
       a.href = '#download';
       a.removeAttribute('download');
-      label(a).textContent = a.classList.contains('plate--sm') ? 'Download' : 'Download Solar Launcher';
+      label(a).textContent = text(a);
       a.classList.add('is-soon'); // outlined, not gold: there is no file to hand out right now
     }
     $<HTMLAnchorElement>('.js-download-main')?.setAttribute('aria-disabled', 'true');
@@ -108,15 +51,16 @@ function showRelease(r: Release | null) {
     if (status) status.textContent = 'The download link could not be loaded. Reload the page to try again.';
     return;
   }
-  for (const a of plates) {
+  for (const a of buttons) {
     a.href = r.url;
     a.setAttribute('download', '');
     a.removeAttribute('aria-disabled');
-    label(a).textContent = a.classList.contains('plate--sm') ? 'Download' : 'Download Solar Launcher';
+    label(a).textContent = text(a);
     a.classList.remove('is-soon');
   }
-  for (const m of $$<HTMLElement>('.js-release-meta')) m.textContent = `Windows 10 and 11 · v${r.version} · ${formatSize(r.size)}`;
-  for (const v of $$<HTMLElement>('.js-release-version')) v.textContent = `Solar RP ${r.version}`;  const hash = $<HTMLElement>('.js-release-hash');
+  for (const m of $$<HTMLElement>('.js-release-meta')) m.textContent = `Windows 10 and 11 · v${r.version} · ${formatSize(r.size)} · free`;
+  for (const v of $$<HTMLElement>('.js-release-version')) v.textContent = `v${r.version}`;
+  const hash = $<HTMLElement>('.js-release-hash');
   const sha = $<HTMLElement>('.js-sha');
   if (hash && sha) {
     sha.textContent = r.sha256;
@@ -129,30 +73,64 @@ loadRelease(SITE_HOST)
   .then(showRelease)
   .catch(() => showRelease(null));
 
-/* ---------------------------------------------------------------- SOL's live status */
+/* ---------------------------------------------------------------- the live server list */
 
-function showStatus(v: StatusView) {
-  const panel = $<HTMLElement>('.js-status');
-  if (!panel) return;
-  $<HTMLElement>('.js-status-state', panel)?.setAttribute('data-tone', v.tone);
-  const set = (sel: string, text: string, el: ParentNode = panel) => {
+const row = $<HTMLElement>('.js-status');
+const age = $<HTMLElement>('.js-srv-age');
+const key = row?.dataset.server ?? 'sol';
+const POLL_MS = 20_000;
+let checkedAt = 0; // when the list last answered (0 = never)
+
+function showServer(s: ServerInfo | undefined, answered: boolean) {
+  if (!row) return;
+  const v = answered ? describeStatus(s) : STATIC_STATUS;
+  const set = (sel: string, text: string, el: ParentNode = document) => {
     const n = $<HTMLElement>(sel, el);
     if (n) n.textContent = text;
   };
-  set('.js-status-label', v.label);
+  $<HTMLElement>('.js-status-state', row)?.setAttribute('data-tone', v.tone);
+  set('.js-status-label', v.label, row);
   set('.js-status-note', v.note);
-  // the Players row exists only while the server reports a count; nothing stands in for a number
-  const players = $<HTMLElement>('.js-status-players', panel);
+  // the Players fact exists only while the server reports counts; nothing stands in for a number. The big
+  // "N playing right now" line and its capacity bar show only once someone is on (a big "0 / 1024" under an
+  // H1 that says everyone is a player read as a ghost town)
+  const players = $<HTMLElement>('.js-status-players');
+  const frac = answered ? loadFraction(s) : null;
   if (players) players.hidden = v.count === null;
   set('.js-status-count', v.count ?? '');
-  set('.js-srv-state', v.count !== null ? `Online, ${v.count} players` : v.label, document);
-  $<HTMLElement>('.js-srv-state')?.parentElement?.setAttribute('data-tone', v.tone);
+  const busy = $<HTMLElement>('.js-status-busy');
+  if (busy) busy.hidden = frac === null || frac === 0 || !s;
+  set('.js-status-busy-count', s?.players != null ? String(s.players) : '');
+  $<HTMLElement>('.js-status-fill')?.style.setProperty('--load', frac === null ? '0' : String(Math.max(frac, 0.015)));
+  if (answered) checkedAt = Date.now();
+  tickAge();
 }
 
-const key = $<HTMLElement>('.js-status')?.dataset.server ?? 'sol';
-loadServers()
-  .then((list) => showStatus(list ? describeStatus(findServer(list, key)) : STATIC_STATUS))
-  .catch(() => showStatus(STATIC_STATUS));
+function tickAge() {
+  if (age) age.textContent = checkedAt ? describeAge(Date.now() - checkedAt) : 'Live status';
+}
+
+async function refresh() {
+  try {
+    const list = await loadServers();
+    showServer(list ? findServer(list, key) : undefined, list !== null);
+  } catch {
+    showServer(undefined, false);
+  }
+}
+
+let poll = 0;
+function schedule() {
+  window.clearInterval(poll);
+  if (document.visibilityState === 'visible') poll = window.setInterval(refresh, POLL_MS);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && Date.now() - checkedAt > POLL_MS) void refresh();
+  schedule();
+});
+void refresh();
+schedule();
+window.setInterval(tickAge, 1000);
 
 /* ---------------------------------------------------------------- account links, bar */
 

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Solar RP: GTA V roleplay on our own servers</title>
   <meta name="description" content="Solar RP is GTA V roleplay on its own network: our own launcher, our own client, our own servers. Download Solar Launcher for Windows." />
-  <meta name="theme-color" content="#0c0906" />
+  <meta name="theme-color" content="#0d0e10" />
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Solar RP" />
   <meta property="og:title" content="Solar RP: GTA V roleplay on our own servers" />
@@ -19,198 +19,200 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
   <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-  <link rel="preload" href="/media/still-skyline.webp" as="image" fetchpriority="high" />
+  <link rel="preload" href="/media/still-beach.webp" as="image" fetchpriority="high" />
   <script src="/enter.js"></script>
 </head>
-<body>
+<body class="home">
   <a class="skip" href="#download">Skip to download</a>
 
   <header class="bar" id="top">
     <a class="bar__brand" href="#top" aria-label="Solar RP, back to top">
-      <svg class="lockup" viewBox="0 0 430 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f7f2e8"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/><g fill="#f7f2e8" fill-rule="evenodd"><path transform="translate(60 0)" d="M0 0L41 0L50 9L50 100L9 100L0 91ZM18 18L32 18L32 82L18 82Z"/><path transform="translate(120 0)" d="M0 0L10 0L18 8L18 82L42 82L42 100L9 100L0 91Z"/><path transform="translate(168 0)" d="M0 100L0 20L20 0L38 0L58 20L58 100L40 100L40 59L18 59L18 100ZM18 22L40 22L40 41L18 41Z"/><path transform="translate(236 0)" d="M0 0L41 0L50 9L50 100L33 100L23 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/><path transform="translate(320 0)" d="M0 0L41 0L50 9L50 100L33 100L23 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/><path transform="translate(380 0)" d="M0 0L41 0L50 9L50 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/></g></svg>
+      <svg class="lockup" viewBox="0 0 430 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f3f4f6"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/><g fill="#f3f4f6" fill-rule="evenodd"><path transform="translate(60 0)" d="M0 0L41 0L50 9L50 100L9 100L0 91ZM18 18L32 18L32 82L18 82Z"/><path transform="translate(120 0)" d="M0 0L10 0L18 8L18 82L42 82L42 100L9 100L0 91Z"/><path transform="translate(168 0)" d="M0 100L0 20L20 0L38 0L58 20L58 100L40 100L40 59L18 59L18 100ZM18 22L40 22L40 41L18 41Z"/><path transform="translate(236 0)" d="M0 0L41 0L50 9L50 100L33 100L23 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/><path transform="translate(320 0)" d="M0 0L41 0L50 9L50 100L33 100L23 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/><path transform="translate(380 0)" d="M0 0L41 0L50 9L50 59L18 59L18 100L9 100L0 91ZM18 18L32 18L32 41L18 41Z"/></g></svg>
     </a>
     <nav class="bar__nav" aria-label="Sections">
-      <a href="#servers">Servers</a>
+      <a href="#servers">Server</a>
+      <a href="#features">Features</a>
       <a href="#join">How to join</a>
-      <a href="#quests">Quests</a>
+      <a href="#faq">FAQ</a>
     </nav>
     <a class="bar__account js-account-link" href="/login/">Log in</a>
-    <a class="plate plate--sm js-download" href="#download"><span class="js-download-label">Download</span></a>
+    <a class="btn btn--sm js-download" href="#download"><span class="js-download-label">Download</span></a>
   </header>
 
   <main>
-    <!-- 1. Hero: the pitch, the button, SOL's state, and Los Santos floating beside it -->
+    <!-- 1. Hero: the pitch and the button on the left, SOL as the launcher shows it on the right -->
     <section class="hero" aria-labelledby="hero-title">
-      <img class="hero__bg" src="/media/still-skyline.webp" alt="" width="1920" height="1080" fetchpriority="high" decoding="async" />
+      <img class="hero__bg" src="/media/still-beach.webp" alt="Vespucci Beach at sunset, the pier and its Ferris wheel in the distance" width="1920" height="1080" fetchpriority="high" decoding="async" />
       <div class="wrap hero__grid">
         <div class="hero__copy">
-          <h1 class="hero__title" id="hero-title">GTA V roleplay on our own servers</h1>
-          <p class="hero__lede">No NPCs on the streets: everyone you pass on SOL is another player. Runs on GTA V Legacy and Enhanced, with cracked copies coming soon.</p>
+          <h1 class="hero__title" id="hero-title">No NPCs. Everyone on the street is a player.</h1>
+          <p class="hero__lede">Solar RP is GTA&nbsp;V roleplay on our own launcher, client and servers. Legacy and Enhanced players share one server, and playing is free.</p>
           <div class="cta">
-            <a class="plate plate--lg js-download" href="#download"><svg class="plate__icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z" fill="currentColor"/></svg><span class="js-download-label">Download Solar Launcher</span></a>
-            <a class="plate plate--lg plate--ghost js-foot-guest" href="/signup/">Create account</a>
+            <a class="btn btn--lg js-download" href="#download"><svg class="btn__icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z" fill="currentColor"/></svg><span class="js-download-label">Download for Windows</span></a>
+            <a class="btn btn--lg btn--ghost js-foot-guest" href="/signup/">Create account</a>
+            <a class="btn btn--lg btn--ghost js-foot-member" href="/account/" hidden>Your account</a>
           </div>
-          <div class="hero__under">
-            <p class="pill js-status" data-server="sol">
-              <span class="pill__state js-status-state" data-tone="open"><span class="dot" aria-hidden="true"></span><span class="js-status-label">Open</span></span>
-              <span class="pill__name">SOL</span>
-              <span class="pill__meta">Roleplay &middot; Europe<span class="js-status-players" hidden> &middot; <span class="js-status-count"></span> players</span></span>
-            </p>
-            <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
-          </div>
+          <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
         </div>
 
-        <div class="stack" aria-hidden="true">
-          <figure class="stack__card stack__card--a"><span class="frame"><img src="/media/reel-car.webp" alt="" width="960" height="540" decoding="async" /></span></figure>
-          <figure class="stack__card stack__card--b"><span class="frame"><img src="/media/reel-beach.webp" alt="" width="960" height="540" decoding="async" /></span></figure>
-          <figure class="stack__card stack__card--c"><span class="frame"><img src="/media/reel-freeway.webp" alt="" width="960" height="540" decoding="async" /></span></figure>
-        </div>
-      </div>
-    </section>
-
-    <!-- 2. Los Santos, moving: one row of stills shown nowhere else on the page -->
-    <section class="reel" aria-label="Los Santos in pictures">
-      <div class="reel__track">
-        <img src="/media/reel-boulevard.webp" alt="Vinewood Boulevard at golden hour" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-downtown.webp" alt="Downtown Los Santos at night under a full moon" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-vinewood.webp" alt="The Vinewood sign over a pink evening haze" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-observatory.webp" alt="The observatory on the hill at night" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-pool.webp" alt="A lit pool at night" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-boulevard.webp" alt="" aria-hidden="true" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-downtown.webp" alt="" aria-hidden="true" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-vinewood.webp" alt="" aria-hidden="true" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-observatory.webp" alt="" aria-hidden="true" width="960" height="540" loading="lazy" decoding="async" />
-        <img src="/media/reel-pool.webp" alt="" aria-hidden="true" width="960" height="540" loading="lazy" decoding="async" />
-      </div>
-    </section>
-
-    <!-- 3. Servers, on a sunset band: our own emblems, no key art -->
-    <section class="servers" id="servers" aria-labelledby="servers-title">
-      <div class="wrap">
-        <div class="head" data-reveal>
-          <h2 class="section__title" id="servers-title">Servers</h2>
-          <p class="section__lede">SOL is open now. LUNA and TERRA are planned and will show up in the same launcher.</p>
-        </div>
-
-        <article class="sol" data-reveal="sol">
-          <!-- the three marks share one outer ring; SOL is the full disc with the S cut out of it -->
-          <svg class="emblem emblem--xl" viewBox="0 0 120 120" aria-hidden="true">
-            <circle class="emblem__ring" cx="60" cy="60" r="56"/>
-            <circle class="emblem__body" cx="60" cy="60" r="40"/>
-            <g transform="translate(45.5 34) scale(.52)" fill="#1a1206"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z"/></g>
-          </svg>
-          <div class="sol__main">
-            <div class="sol__top">
-              <h3 class="sol__name">SOL</h3>
-              <p class="sol__state js-srv-tone" data-tone="open"><span class="dot" aria-hidden="true"></span><span class="js-srv-state">Open</span></p>
+        <aside class="srv" id="servers" aria-labelledby="srv-name">
+          <div class="srv__top js-status" data-server="sol">
+            <svg class="emblem" viewBox="0 0 120 120" aria-hidden="true">
+              <circle class="emblem__ring" cx="60" cy="60" r="56"/>
+              <circle class="emblem__body" cx="60" cy="60" r="40"/>
+              <g transform="translate(45.5 34) scale(.52)" fill="#1a1206"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z"/></g>
+            </svg>
+            <div class="srv__id">
+              <h2 class="srv__name" id="srv-name">SOL</h2>
+              <p class="srv__state js-status-state" data-tone="open"><span class="dot" aria-hidden="true"></span><span class="js-status-label">Open</span></p>
             </div>
-            <p class="sol__mode">Roleplay &middot; Europe</p>
-            <p class="sol__desc">Roleplay across Los Santos and Blaine County on our own server software. The server checks what every client sends, and every car's lights, sirens, steering and damage are shared with every player.</p>
-            <a class="plate plate--lg js-download" href="#download"><span class="js-download-label">Download Solar Launcher</span></a>
+            <p class="srv__age js-srv-age">Live status</p>
+          </div>
+          <div class="srv__load js-status-busy" hidden>
+            <p class="srv__count"><span class="js-status-busy-count"></span> playing right now</p>
+            <span class="srv__track" aria-hidden="true"><span class="srv__fill js-status-fill"></span></span>
+          </div>
+          <dl class="srv__facts">
+            <div><dt>Mode</dt><dd>Roleplay</dd></div>
+            <div><dt>Region</dt><dd>Europe</dd></div>
+            <div class="js-status-players" hidden><dt>Players</dt><dd class="js-status-count"></dd></div>
+            <div><dt>Client</dt><dd class="js-release-version">Solar RP</dd></div>
+          </dl>
+          <p class="srv__note js-status-note">Pick SOL in Solar Launcher and press PLAY.</p>
+          <p class="srv__next">
+            <svg class="emblem emblem--luna" viewBox="0 0 120 120" aria-hidden="true"><defs><clipPath id="c-luna"><circle cx="60" cy="60" r="40"/></clipPath></defs><circle class="emblem__body" cx="60" cy="60" r="40"/><circle class="emblem__shade" cx="78" cy="48" r="38" clip-path="url(#c-luna)"/></svg>
+            <svg class="emblem emblem--terra" viewBox="0 0 120 120" aria-hidden="true"><defs><clipPath id="c-terra"><circle cx="60" cy="60" r="40"/></clipPath></defs><circle class="emblem__body" cx="60" cy="60" r="40"/><g class="emblem__shade" clip-path="url(#c-terra)"><path d="M18 34h30l8 8v12H40l-8 8H18z"/><path d="M58 64h22l8 8v28H66l-8-8z"/><path d="M70 22h20l12 12v10H78l-8-8z"/></g></svg>
+            <span>LUNA and TERRA are planned and will appear in the same launcher.</span>
+          </p>
+        </aside>
+      </div>
+    </section>
+
+    <!-- 2. What the client and the server do: two rows, picture and text alternating -->
+    <section class="features" id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <h2 class="section__title" id="features-title">How SOL plays</h2>
+
+        <article class="feat" data-reveal>
+          <figure class="feat__media"><img src="/media/reel-car.webp" alt="A red sports car parked on a Los Santos street at night" width="960" height="540" loading="lazy" decoding="async" /></figure>
+          <div class="feat__text">
+            <h3 class="feat__title">Cars look the same on every screen</h3>
+            <p>The server checks what every client sends and passes each car's state to everyone near it.</p>
+            <ul class="feat__list">
+              <li>Headlights, high beams, sirens and the horn</li>
+              <li>Steering, tyres, windows and brake lights</li>
+              <li>Body damage</li>
+            </ul>
           </div>
         </article>
 
-        <ul class="next" aria-label="Planned servers">
-          <li class="moon" data-reveal style="--i:1">
-            <!-- LUNA: the same filled disc as SOL, with a crescent shadow laid over it -->
-            <svg class="emblem" viewBox="0 0 120 120" aria-hidden="true">
-              <defs><clipPath id="c-luna"><circle cx="60" cy="60" r="40"/></clipPath></defs>
-              <circle class="emblem__ring" cx="60" cy="60" r="56"/>
-              <circle class="emblem__body" cx="60" cy="60" r="40"/>
-              <circle class="emblem__shade" cx="78" cy="48" r="38" clip-path="url(#c-luna)"/>
-            </svg>
-            <h3 class="next__name">LUNA</h3>
-            <p class="next__tag">Planned</p>
-            <p class="next__desc">Shows up in the launcher's server list the day it opens.</p>
-          </li>
-          <li class="earth" data-reveal style="--i:2">
-            <!-- TERRA: the same filled disc, with land cut in the S mark's 45-degree blocks -->
-            <svg class="emblem" viewBox="0 0 120 120" aria-hidden="true">
-              <defs><clipPath id="c-terra"><circle cx="60" cy="60" r="40"/></clipPath></defs>
-              <circle class="emblem__ring" cx="60" cy="60" r="56"/>
-              <circle class="emblem__body" cx="60" cy="60" r="40"/>
-              <g class="emblem__shade" clip-path="url(#c-terra)"><path d="M18 34h30l8 8v12H40l-8 8H18z"/><path d="M58 64h22l8 8v28H66l-8-8z"/><path d="M70 22h20l12 12v10H78l-8-8z"/></g>
-            </svg>
-            <h3 class="next__name">TERRA</h3>
-            <p class="next__tag">Planned</p>
-            <p class="next__desc">The Solar RP account you make today works there too.</p>
-          </li>
-        </ul>
+        <article class="feat feat--text" data-reveal>
+          <div class="feat__text">
+            <h3 class="feat__title">The server keeps track of what you carry</h3>
+            <p>The server checks every item you carry, and the client draws its own HUD: health and hunger around the map, and a speedometer with fuel and car status.</p>
+          </div>
+          <div class="feat__text">
+            <ul class="feat__list">
+              <li>Pockets, a backpack and car trunks</li>
+              <li>Drop an item and anyone nearby can pick it up</li>
+              <li>The clothes you wear are items too</li>
+            </ul>
+          </div>
+        </article>
       </div>
     </section>
 
-    <!-- 4. How to join, on a cream band -->
+    <!-- 3. How to join: one panel, the three steps and what you need -->
     <section class="join" id="join" aria-labelledby="join-title">
       <div class="wrap">
-        <div class="head" data-reveal>
-          <h2 class="section__title" id="join-title">How to join</h2>
-        </div>
-        <ol class="steps" data-reveal="steps">
-          <li style="--i:0">
-            <p class="steps__n" aria-hidden="true">1</p>
-            <h3>Download Solar Launcher</h3>
-            <p>Install it on Windows 10 or 11. It finds your GTA V by itself, or you point it at the folder once.</p>
-          </li>
-          <li style="--i:1">
-            <p class="steps__n" aria-hidden="true">2</p>
-            <h3>Pick SOL</h3>
-            <p>The launcher lists our servers and shows which are up. Choose SOL.</p>
-          </li>
-          <li style="--i:2">
-            <p class="steps__n" aria-hidden="true">3</p>
-            <h3>Press PLAY</h3>
-            <p>The launcher starts GTA V with the Solar RP client, joins the server, and tells you every step while it does.</p>
-          </li>
-        </ol>
-      </div>
-    </section>
-
-    <!-- 5. Quests and coins: the copy and the quest on ember, the photo beside it at full strength -->
-    <section class="quests" id="quests" aria-labelledby="quests-title">
-      <div class="wrap quests__grid">
-        <div class="quests__copy" data-reveal>
-          <h2 class="section__title" id="quests-title">Quests</h2>
-          <p class="quests__lede">Quests on your Solar RP account pay coins. The first one:</p>
-          <div class="quest">
-            <svg class="coin" viewBox="0 0 120 120" aria-hidden="true">
-              <defs><linearGradient id="g-coin" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ffe7a3"/><stop offset=".5" stop-color="#f2b134"/><stop offset="1" stop-color="#b8740e"/></linearGradient></defs>
-              <circle cx="60" cy="60" r="54" fill="url(#g-coin)"/>
-              <circle cx="60" cy="60" r="44" fill="none" stroke="#7a4a08" stroke-opacity=".45" stroke-width="3"/>
-              <g transform="translate(47.5 35) scale(.5)" fill="#3d2403"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z"/></g>
-            </svg>
-            <div class="quest__main">
-              <h3 class="quest__title">Link your Discord</h3>
-              <p class="quest__desc">Connect your Discord account to your Solar RP account. Opens with Discord login on this site.</p>
-            </div>
-            <p class="quest__reward">+500 <small>coins</small></p>
-          </div>
-          <div class="cta">
-            <a class="plate plate--lg js-foot-guest" href="/signup/">Create account</a>
-            <a class="plate plate--lg js-foot-member" href="/account/" hidden>Your quests</a>
-          </div>
-        </div>
-        <figure class="quests__photo" data-reveal="photo"><span class="frame"><img src="/media/reel-office.webp" alt="A deal being counted in a Los Santos office" width="960" height="540" loading="lazy" decoding="async" /></span></figure>
-      </div>
-    </section>
-
-    <!-- 6. Download -->
-    <section class="download" id="download" aria-labelledby="download-title">
-      <img class="download__bg" src="/media/still-canal.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
-      <div class="wrap download__grid" data-reveal="close">
-        <div class="download__copy">
-          <h2 class="section__title download__title" id="download-title">Get Solar Launcher</h2>
-          <div class="cta">
-            <a class="plate plate--xl js-download js-download-main" href="#download" aria-disabled="true"><svg class="plate__icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z" fill="currentColor"/></svg><span class="js-download-label">Download Solar Launcher</span></a>
-          </div>
-          <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
-          <p class="cta__status js-release-status" role="status"></p>
-        </div>
-        <div class="download__info">
+        <h2 class="section__title" id="join-title">How to join</h2>
+        <div class="getin">
+          <ol class="steps">
+            <li>
+              <span class="steps__n" aria-hidden="true">1</span>
+              <h3>Download Solar Launcher</h3>
+              <p>Install it on Windows 10 or 11. It finds GTA&nbsp;V by itself, or you point it at the folder once.</p>
+            </li>
+            <li>
+              <span class="steps__n" aria-hidden="true">2</span>
+              <h3>Log in</h3>
+              <p>Use your Solar RP account, or make one in the launcher or on this site. It is free.</p>
+            </li>
+            <li>
+              <span class="steps__n" aria-hidden="true">3</span>
+              <h3>Pick SOL and press PLAY</h3>
+              <p>The launcher starts GTA&nbsp;V with the Solar RP client and joins the server, telling you each step.</p>
+            </li>
+          </ol>
           <dl class="needs">
             <div><dt>System</dt><dd>Windows 10 or 11, 64-bit</dd></div>
-            <div><dt>Game</dt><dd>GTA V for PC, Legacy or Enhanced, on Steam, Epic Games or the Rockstar Games Launcher</dd></div>
-            <div class="js-release-hash" hidden><dt>SHA-256</dt><dd class="hash"><code class="js-sha"></code></dd></div>
+            <div><dt>Game</dt><dd>GTA&nbsp;V for PC, Legacy or Enhanced; cracked copies coming soon</dd></div>
+            <div><dt>Store</dt><dd>Steam, Epic Games or the Rockstar Games Launcher</dd></div>
           </dl>
+        </div>
+
+        <div class="quest" id="quests">
+          <svg class="coin" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="22" fill="#f2b134"/><circle cx="24" cy="24" r="16" fill="none" stroke="#1a1206" stroke-opacity=".35" stroke-width="2.5"/><g transform="translate(18 12) scale(.24)" fill="#3d2403"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z"/></g></svg>
+          <div class="quest__main">
+            <h3 class="quest__title">Quests pay coins</h3>
+            <p class="quest__desc">The first one: link your Discord to your Solar RP account.</p>
+          </div>
+          <p class="quest__reward">+500 <span>coins</span></p>
+          <a class="btn btn--ghost js-foot-guest" href="/signup/">Create account</a>
+          <a class="btn btn--ghost js-foot-member" href="/account/" hidden>Your quests</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Answers -->
+    <section class="faq" id="faq" aria-labelledby="faq-title">
+      <div class="wrap faq__col">
+        <h2 class="section__title" id="faq-title">Questions</h2>
+        <div class="faq__list">
+          <details>
+            <summary>Do I need my own copy of GTA&nbsp;V?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
+            <p>Today, yes: GTA&nbsp;V for PC, Legacy or Enhanced, from Steam, Epic Games or the Rockstar Games Launcher. Support for cracked copies is coming soon.</p>
+          </details>
+          <details>
+            <summary>Does it cost anything?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
+            <p>No. Solar Launcher and a Solar RP account are free.</p>
+          </details>
+          <details>
+            <summary>Is this GTA Online?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
+            <p>No. Solar RP has its own servers, accounts and client. It is not made by or affiliated with Rockstar Games.</p>
+          </details>
+          <details>
+            <summary>Can Legacy and Enhanced players play together?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
+            <p>Yes. Both editions join the same SOL server.</p>
+          </details>
+          <details>
+            <summary>How does the launcher update?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
+            <p>It updates itself from solar-rp.com and checks the signature of every update before installing it. The SHA-256 of the current installer is listed under the download button below.</p>
+          </details>
+          <details>
+            <summary>When do LUNA and TERRA open?<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></summary>
+            <p>They are planned, with no date yet. They will show up in the launcher's server list when they open, and the account you make today works on them too.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. Download: one panel on the ground -->
+    <section class="download" id="download" aria-labelledby="download-title">
+      <img class="download__bg" src="/media/still-beach.webp" alt="" width="1920" height="1080" loading="lazy" decoding="async" />
+      <div class="wrap">
+        <div class="close">
+          <svg class="close__mark" viewBox="0 0 50 100" aria-hidden="true"><path d="M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z" fill="#f3f4f6"/><path d="M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z" fill="#f2b134"/></svg>
+          <div class="close__copy">
+            <h2 class="section__title" id="download-title">Get Solar Launcher</h2>
+            <p class="close__lede">One installer for Windows. The launcher keeps itself and the client up to date.</p>
+          </div>
+          <div class="close__act">
+            <a class="btn btn--xl js-download js-download-main" href="#download" aria-disabled="true"><svg class="btn__icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z" fill="currentColor"/></svg><span class="js-download-label">Download for Windows</span></a>
+            <p class="cta__meta js-release-meta">Windows 10 and 11 &middot; free download</p>
+            <p class="cta__status js-release-status" role="status"></p>
+          </div>
+          <p class="close__hash js-release-hash" hidden>SHA-256 <code class="js-sha"></code></p>
         </div>
       </div>
     </section>

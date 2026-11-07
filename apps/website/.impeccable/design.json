@@ -1,211 +1,178 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-06T23:30:00+04:00",
+  "generatedAt": "2026-11-07T18:00:00+04:00",
   "title": "Design System: Solar RP website",
   "designMd": "apps/website/DESIGN.md",
+  "scope": "The landing page (index.html, src/styles.css over src/base.css). The log-in, sign-up and account pages still use base.css and its older plates and warm tokens; they have not been redesigned into this system.",
   "extensions": {
     "colorMeta": {
-      "sun": { "role": "primary", "displayName": "Solar Gold", "canonical": "#f2b134", "tonalRamp": ["oklch(15% 0.03 75)", "oklch(27% 0.06 75)", "oklch(39% 0.09 75)", "oklch(51% 0.12 75)", "oklch(63% 0.14 75)", "oklch(75% 0.15 75)", "oklch(85% 0.12 80)", "oklch(95% 0.05 85)"] },
-      "sun-hi": { "role": "primary", "displayName": "Sun High", "canonical": "#ffc75a" },
-      "sun-lo": { "role": "primary", "displayName": "Sun Low", "canonical": "#c98d16" },
-      "on-sun": { "role": "primary", "displayName": "Burnt Ink", "canonical": "#1a1206" },
-      "ember": { "role": "secondary", "displayName": "Ember", "canonical": "#ff7a2f", "tonalRamp": ["oklch(15% 0.04 48)", "oklch(27% 0.08 48)", "oklch(39% 0.12 48)", "oklch(51% 0.16 48)", "oklch(63% 0.19 48)", "oklch(73% 0.18 48)", "oklch(84% 0.11 52)", "oklch(95% 0.04 55)"] },
-      "ember-deep": { "role": "secondary", "displayName": "Deep Ember", "canonical": "#c2410c", "tonalRamp": ["oklch(15% 0.04 40)", "oklch(27% 0.08 40)", "oklch(39% 0.13 40)", "oklch(51% 0.17 40)", "oklch(60% 0.18 40)", "oklch(72% 0.14 42)", "oklch(84% 0.08 45)", "oklch(95% 0.03 48)"] },
-      "rim-gold": { "role": "secondary", "displayName": "Rim Gold", "canonical": "#ffd27a" },
-      "band-gold": { "role": "secondary", "displayName": "Band Gold", "canonical": "#ffd166" },
-      "rose": { "role": "secondary", "displayName": "Sunset Rose", "canonical": "#ff4f6d", "tonalRamp": ["oklch(15% 0.05 15)", "oklch(27% 0.09 15)", "oklch(39% 0.14 15)", "oklch(51% 0.18 15)", "oklch(63% 0.21 15)", "oklch(73% 0.17 15)", "oklch(84% 0.10 15)", "oklch(95% 0.03 15)"] },
-      "luna": { "role": "tertiary", "displayName": "Luna Moonlight", "canonical": "#9cc2ff", "tonalRamp": ["oklch(15% 0.03 260)", "oklch(27% 0.06 260)", "oklch(39% 0.09 260)", "oklch(51% 0.11 260)", "oklch(63% 0.11 260)", "oklch(75% 0.10 260)", "oklch(85% 0.07 260)", "oklch(95% 0.02 260)"] },
-      "terra": { "role": "tertiary", "displayName": "Terra Green", "canonical": "#4fd18b", "tonalRamp": ["oklch(15% 0.04 155)", "oklch(27% 0.07 155)", "oklch(39% 0.10 155)", "oklch(51% 0.13 155)", "oklch(63% 0.15 155)", "oklch(75% 0.16 155)", "oklch(86% 0.10 155)", "oklch(95% 0.04 155)"] },
-      "ground": { "role": "neutral", "displayName": "Landing Ground", "canonical": "#0c0906", "tonalRamp": ["oklch(15% 0.01 60)", "oklch(25% 0.015 60)", "oklch(37% 0.02 60)", "oklch(49% 0.02 65)", "oklch(61% 0.02 70)", "oklch(73% 0.02 75)", "oklch(85% 0.02 80)", "oklch(95% 0.01 85)"] },
-      "ground-base": { "role": "neutral", "displayName": "Shared Ground (base.css, account pages)", "canonical": "#0a0907" },
-      "ember-dusk": { "role": "neutral", "displayName": "Ember Dusk (band seams)", "canonical": "#2a1208" },
-      "sunset-top": { "role": "neutral", "displayName": "Sunset Band Top", "canonical": "#34160a" },
-      "sunset-mid": { "role": "neutral", "displayName": "Sunset Band Mid", "canonical": "#7a2e0c" },
-      "sunset-hot": { "role": "neutral", "displayName": "Sunset Band Hot", "canonical": "#b4470f" },
-      "sunset-foot": { "role": "neutral", "displayName": "Sunset Band Foot", "canonical": "#5e250b" },
-      "ember-top": { "role": "neutral", "displayName": "Ember Band Top", "canonical": "#24100a" },
-      "ember-mid": { "role": "neutral", "displayName": "Ember Band Mid", "canonical": "#4a1d0b" },
-      "cream": { "role": "neutral", "displayName": "Cream Band", "canonical": "#f4ead8", "tonalRamp": ["oklch(15% 0.02 80)", "oklch(27% 0.03 80)", "oklch(39% 0.04 75)", "oklch(51% 0.04 75)", "oklch(63% 0.04 78)", "oklch(75% 0.04 80)", "oklch(86% 0.035 80)", "oklch(94% 0.03 80)"] },
-      "cream-ink": { "role": "neutral", "displayName": "Cream Ink", "canonical": "#1f150a" },
-      "cream-ink-2": { "role": "neutral", "displayName": "Cream Ink 2", "canonical": "#55432e" },
-      "band-ink": { "role": "neutral", "displayName": "Band Ink", "canonical": "#f0dfc6" },
-      "band-ink-bright": { "role": "neutral", "displayName": "Band Ink Bright", "canonical": "#f7ead6" },
-      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#f7f2e8" },
-      "ink-2": { "role": "neutral", "displayName": "Ink 2", "canonical": "#d9d1c3" },
-      "ink-3": { "role": "neutral", "displayName": "Ink 3", "canonical": "#b3aa9a" },
-      "ink-4": { "role": "neutral", "displayName": "Ink 4", "canonical": "#7a7266" },
-      "panel-3": { "role": "neutral", "displayName": "Disabled Panel", "canonical": "#201c16" },
-      "line": { "role": "neutral", "displayName": "Hairline", "canonical": "rgb(255 244 224 / 0.12)" },
-      "line-2": { "role": "neutral", "displayName": "Hairline 2", "canonical": "rgb(255 244 224 / 0.2)" },
-      "line-3": { "role": "neutral", "displayName": "Control Outline", "canonical": "rgb(255 244 224 / 0.38)" },
-      "alarm": { "role": "neutral", "displayName": "Alarm (errors only)", "canonical": "#ff8f6b" }
+      "sun": { "role": "primary", "displayName": "Solar Gold", "canonical": "#f2b134", "tonalRamp": ["oklch(15% 0.03 78)", "oklch(27% 0.06 78)", "oklch(39% 0.09 78)", "oklch(51% 0.12 78)", "oklch(63% 0.14 78)", "oklch(78% 0.15 78)", "oklch(86% 0.12 82)", "oklch(95% 0.05 85)"] },
+      "sun-hi": { "role": "primary", "displayName": "Noon Gold", "canonical": "#ffc75a" },
+      "sun-lo": { "role": "primary", "displayName": "Dusk Gold", "canonical": "#c98d16" },
+      "on-sun": { "role": "primary", "displayName": "Gold Ink", "canonical": "#1a1206" },
+      "ground": { "role": "neutral", "displayName": "Charcoal Ground", "canonical": "#0d0e10", "tonalRamp": ["oklch(15% 0.004 265)", "oklch(19% 0.006 265)", "oklch(23% 0.008 265)", "oklch(29% 0.009 265)", "oklch(45% 0.012 265)", "oklch(60% 0.012 265)", "oklch(80% 0.01 265)", "oklch(96% 0.004 265)"] },
+      "black": { "role": "neutral", "displayName": "Near Black", "canonical": "#08090a" },
+      "panel": { "role": "neutral", "displayName": "Panel", "canonical": "#15171b" },
+      "panel-2": { "role": "neutral", "displayName": "Panel Raised", "canonical": "#1b1e23" },
+      "panel-3": { "role": "neutral", "displayName": "Panel High", "canonical": "#272b31" },
+      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "#f3f4f6" },
+      "ink-2": { "role": "neutral", "displayName": "Ink Soft", "canonical": "#ccd0d6" },
+      "ink-3": { "role": "neutral", "displayName": "Ink Muted", "canonical": "#a2a7b0" },
+      "ink-4": { "role": "neutral", "displayName": "Ink Faint", "canonical": "#6a6f78" },
+      "line": { "role": "neutral", "displayName": "Hairline", "canonical": "rgb(255 255 255 / 0.08)" },
+      "line-2": { "role": "neutral", "displayName": "Row Divider", "canonical": "rgb(255 255 255 / 0.14)" },
+      "line-3": { "role": "neutral", "displayName": "Control Outline", "canonical": "rgb(255 255 255 / 0.28)" },
+      "fill-1": { "role": "neutral", "displayName": "Hover Fill", "canonical": "rgb(255 255 255 / 0.07)" },
+      "fill-2": { "role": "neutral", "displayName": "Press Fill", "canonical": "rgb(255 255 255 / 0.12)" },
+      "fill-3": { "role": "neutral", "displayName": "Soon Hover Fill", "canonical": "rgb(255 255 255 / 0.16)" },
+      "ok": { "role": "secondary", "displayName": "Status Green", "canonical": "#4fd18b", "tonalRamp": ["oklch(18% 0.04 155)", "oklch(30% 0.08 155)", "oklch(42% 0.11 155)", "oklch(54% 0.14 155)", "oklch(66% 0.15 155)", "oklch(77% 0.15 155)", "oklch(87% 0.1 155)", "oklch(95% 0.04 155)"] },
+      "warn": { "role": "secondary", "displayName": "Status Amber", "canonical": "#f2b134" },
+      "down": { "role": "secondary", "displayName": "Status Coral", "canonical": "#ff8f6b", "tonalRamp": ["oklch(18% 0.04 40)", "oklch(30% 0.08 40)", "oklch(42% 0.11 40)", "oklch(54% 0.14 40)", "oklch(66% 0.15 40)", "oklch(76% 0.14 40)", "oklch(86% 0.09 40)", "oklch(95% 0.03 40)"] },
+      "luna": { "role": "tertiary", "displayName": "Moonlight", "canonical": "#9cc2ff" }
     },
     "typographyMeta": {
-      "display": { "displayName": "Display", "purpose": "Hero H1 and the close title, uppercase, over photos." },
-      "headline": { "displayName": "Headline", "purpose": "Section titles, uppercase, balanced." },
-      "server-name": { "displayName": "Server Name", "purpose": "SOL on its card; next names at clamp(40px, 3.6vw, 54px)." },
-      "figure": { "displayName": "Figure", "purpose": "Counting tally numbers in gold; quest reward at clamp(60px, 5.6vw, 88px)." },
-      "title": { "displayName": "Title", "purpose": "Quest titles, uppercase." },
-      "step-title": { "displayName": "Step Title", "purpose": "Step headings on the cream band, sentence case." },
-      "body": { "displayName": "Body", "purpose": "All prose; tabular numerals." },
-      "lede": { "displayName": "Lede", "purpose": "Section and hero ledes, max 44-46ch." },
-      "label": { "displayName": "Label", "purpose": "Caps terms, tags, pill text (14-18px, 0.1-0.14em)." },
-      "action": { "displayName": "Action", "purpose": "Plate labels; 17 / 20-24 / 22-28px for sm / lg / xl." }
+      "display": { "displayName": "Display", "purpose": "The hero H1 only; 38px on phones." },
+      "headline": { "displayName": "Headline", "purpose": "Section titles." },
+      "title": { "displayName": "Title", "purpose": "Feature row titles." },
+      "subtitle": { "displayName": "Subtitle", "purpose": "Step titles (21px), quest title (19px), FAQ questions (18px)." },
+      "server-name": { "displayName": "Server name", "purpose": "The server's own name in the live card; the only capitals on the page." },
+      "figure": { "displayName": "Figure", "purpose": "Live player count (22px) and the coin reward (26px, gold); tabular figures." },
+      "lede": { "displayName": "Lede", "purpose": "Hero lede, feature text, download lede at 44-46ch." },
+      "body": { "displayName": "Body", "purpose": "Base text; tabular figures by default." },
+      "nav": { "displayName": "Nav", "purpose": "Bar and footer links, sentence case." },
+      "button": { "displayName": "Button", "purpose": "Button labels, sentence case; 15/16/17/18px for sm/default/lg/xl." },
+      "label": { "displayName": "Label", "purpose": "dt labels, the SHA-256 caption, the updated age (12-13px, ink-3)." },
+      "mono": { "displayName": "Mono", "purpose": "The installer SHA-256 only." }
     },
     "cuts": [
-      { "name": "corner-cut", "value": "polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%)", "purpose": "The S mark's 45-degree top-right cut on every plate, card, pill, number and photo." },
-      { "name": "cut-sizes", "value": "8px xs plate, 9px sm plate, 10px pill, 12px plate, 14px lg plate / step number, 16px xl plate, 18px reel still, 20px next card, 22px frame / quest card, 30px SOL card / quests photo", "purpose": "The cut scales with the object." },
-      { "name": "cut-ring", "value": "clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w))", "purpose": "Outlines and focus rings that follow the cut, drawn on ::before / ::after." }
+      { "name": "cut-btn-sm", "value": "8px", "purpose": "Small button (36px high)." },
+      { "name": "cut-btn", "value": "10px", "purpose": "Default button (46px)." },
+      { "name": "cut-btn-lg", "value": "12px", "purpose": "Large button (54px)." },
+      { "name": "cut-btn-xl", "value": "14px", "purpose": "Extra-large button (62px)." },
+      { "name": "cut-card", "value": "16px", "purpose": "The SOL server card." },
+      { "name": "cut-panel", "value": "18px", "purpose": "Panels and picture frames." },
+      { "name": "cut-close", "value": "22px", "purpose": "The download panel." },
+      { "name": "cut-shape", "value": "clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c)))", "purpose": "The S mark's corner: top-right and bottom-left at 45 degrees." }
     ],
     "shadows": [
-      { "name": "photo-float", "value": "filter: drop-shadow(0 30px 40px rgb(0 0 0 / 0.5))", "purpose": "Tilted in-game photos (0.45 on the quests photo)." },
-      { "name": "coin-glow", "value": "filter: drop-shadow(0 8px 18px rgb(242 177 52 / 0.45))", "purpose": "The quest coin." },
-      { "name": "headline-lift", "value": "text-shadow: 0 4px 30px rgb(0 0 0 / 0.35)", "purpose": "Display type over photos (0.4 on the close)." },
-      { "name": "nav-lift", "value": "text-shadow: 0 1px 12px rgb(0 0 0 / 0.7)", "purpose": "Bar links over the hero photo." },
-      { "name": "gold-breath", "value": "radial-gradient(closest-side, rgb(255 170 60 / 0.55), rgb(255 122 47 / 0.18) 60%, transparent) at inset -18px -26px", "purpose": "Breathing blob behind the primary Download only." },
-      { "name": "bar-solid", "value": "box-shadow: 0 1px 0 rgb(255 244 224 / 0.12)", "purpose": "The bar's bottom line once scrolled." }
-    ],
-    "grounds": [
-      { "name": "hero", "value": "still-skyline photo + radial gold 0.42 / rose 0.22 glow + left-to-right ground scrim 0.86 to 0.08, fading to ground at the foot" },
-      { "name": "reel", "value": "linear-gradient(180deg, ground, ember-dusk)" },
-      { "name": "sunset", "value": "radial gold 0.38 at 18% 30% + radial rose 0.22 at 88% 80% + linear-gradient(170deg, sunset-top, sunset-mid 35%, sunset-hot 68%, sunset-foot)" },
-      { "name": "cream", "value": "cream fill, cream-ink text" },
-      { "name": "ember", "value": "radial gold 0.3 at 80% 40% + linear-gradient(160deg, ember-top, ember-mid 55%, ember-dusk)" },
-      { "name": "close", "value": "still-canal photo + ember-dusk top fade + left scrim 0.82 to 0.05, full-width shade under 760px" }
+      { "name": "hero-title", "value": "text-shadow: 0 2px 24px rgb(0 0 0 / 0.35)", "purpose": "Display text over the photo only; removed on phones." },
+      { "name": "hero-lede", "value": "text-shadow: 0 1px 14px rgb(0 0 0 / 0.5)", "purpose": "Body text over the photo only; removed on phones." },
+      { "name": "nav-over-photo", "value": "text-shadow: 0 1px 10px rgb(0 0 0 / 0.55)", "purpose": "Bar links while the bar is transparent." },
+      { "name": "lockup", "value": "filter: drop-shadow(0 1px 8px rgb(0 0 0 / 0.4))", "purpose": "The lockup in the bar." },
+      { "name": "bar-edge", "value": "box-shadow: 0 1px 0 rgb(255 255 255 / 0.08)", "purpose": "Hairline under the solid bar." }
     ],
     "motion": [
-      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Every arrival, reveal and parallax." },
-      { "name": "plate-press", "value": "160ms background, 160ms transform", "purpose": "Plate hover and press." },
-      { "name": "arrive", "value": "1100ms, staggered 250 / 400 / 550ms, from translateY(60px) scale(0.92) opacity 0", "purpose": "Hero photo cards, once." },
-      { "name": "rise", "value": "900ms, from translateY(24px) opacity 0, delays 60-420ms", "purpose": "Hero copy, once." },
-      { "name": "reveal", "value": "900ms opacity + transform, stagger calc(var(--i) * 140ms); per block: rise 32px, SOL from -48px x scale 0.97, photo from +60px rotate 8deg, close rise 48px scale 0.97", "purpose": "Blocks as they scroll in (IntersectionObserver, threshold 0.04)." },
-      { "name": "steps-draw", "value": "line scale 1300ms (+200ms); numbers scale 0.4 rotate -12deg 800ms; text 700ms; stagger 220ms", "purpose": "How-to-join steps." },
-      { "name": "float", "value": "7s / 8s / 9s ease-in-out infinite, rotate +-1.5deg, translateY -10 to -18px", "purpose": "Hero photo cards." },
-      { "name": "parallax", "value": "translate by --px/--py x depth 26 / 14 / 8 px, 600ms", "purpose": "Hero stack on a fine pointer, while the hero is on screen." },
-      { "name": "breathe", "value": "3.2s (call) / 6s (stack sun), opacity and scale 1.06", "purpose": "Gold glows." },
-      { "name": "drift", "value": "14s alternate, translate3d(-3%, 2%) scale 1.08", "purpose": "Hero glow." },
-      { "name": "slide", "value": "60s linear, translateX(calc(-50% - 10px)), paused on hover", "purpose": "Reel marquee." },
-      { "name": "emblem-idle", "value": "rays spin 30s (6s on hover), sun pulse 3.6s, stars twinkle 2.6s, land 14s, coin flip 5s (1.2s on hover)", "purpose": "Server emblems and the coin." },
-      { "name": "count", "value": "1600ms, ease-out quart, on 60% visibility", "purpose": "Tally and reward figures." },
-      { "name": "reduced-motion", "value": "animation: none; transition: none; reveals forced visible", "purpose": "prefers-reduced-motion: reduce stops everything, scripts skip counters, reveals and parallax." }
+      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Every transition and entrance." },
+      { "name": "rise", "value": "900ms, translateY(16px) and opacity to rest, once on load; server card +120ms", "purpose": "Hero copy and the SOL card." },
+      { "name": "push", "value": "24s cubic-bezier(0.2, 0.6, 0.3, 1), scale 1 to 1.04, once", "purpose": "The hero photo; off at 560px and below and under reduced motion." },
+      { "name": "reveal", "value": "800ms, translateY(24px) and opacity, once on entering the viewport", "purpose": "Feature rows." },
+      { "name": "capacity", "value": "900ms scaleX", "purpose": "The capacity fill easing to a new reading." },
+      { "name": "ping", "value": "2.4s infinite, scale 1 to 2.8, opacity 0.55 to 0", "purpose": "The open server's live dot." },
+      { "name": "button", "value": "160ms background and transform", "purpose": "Button hover and press." },
+      { "name": "disclosure", "value": "200ms rotate(180deg)", "purpose": "FAQ chevron." }
     ],
     "breakpoints": [
-      { "name": "phone-nav", "value": "560px" },
-      { "name": "next-2up", "value": "700px" },
-      { "name": "phone", "value": "760px" },
-      { "name": "steps-row", "value": "860px" },
-      { "name": "split", "value": "960px" },
-      { "name": "hero-split", "value": "1000px" },
-      { "name": "sol-facts", "value": "1100px" }
-    ],
-    "sharedPages": {
-      "files": "login/, signup/, account/ import src/base.css + src/account.css, not src/styles.css",
-      "tokensRelied": ["--ground (#0a0907)", "--black", "--panel", "--panel-2", "--panel-3", "--ink", "--ink-2", "--ink-3", "--ink-4", "--line", "--line-2", "--line-3", "--sun", "--sun-hi", "--on-sun", "--alarm", "--f-display", "--f-text", "--gutter", "--bar-h", "--ease-out"],
-      "components": ["plate (all sizes, ghost, disabled, busy)", "bar", "foot"],
-      "note": "The landing-only tokens (--ember, --ember-deep, --luna, --terra, --cream*, the #0c0906 ground override) are not visible to them."
-    }
+      { "name": "stack-hero", "value": "1020px" },
+      { "name": "single-column", "value": "860px" },
+      { "name": "phone", "value": "560px" }
+    ]
   },
   "components": [
     {
-      "name": "Primary Plate",
+      "name": "Primary Button",
       "kind": "button",
-      "refersTo": "plate-primary",
-      "description": "The one gold action, cut at the top right like the S mark.",
-      "html": "<a class=\"ds-plate\" href=\"#\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" aria-hidden=\"true\"><path d=\"M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z\" fill=\"currentColor\"/></svg><span>Download Solar Launcher</span></a>",
-      "css": ".ds-plate { --c: 14px; position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 12px; height: 56px; padding: 0 30px; background: var(--sun, #f2b134); color: var(--on-sun, #1a1206); font: 800 22px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms, transform 160ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-plate:hover { background: var(--sun-hi, #ffc75a); } .ds-plate:active { background: var(--sun-lo, #c98d16); transform: translateY(1px); } .ds-plate:focus-visible { outline: none; } .ds-plate:focus-visible::before { --w: 4px; content: ''; position: absolute; inset: 0; background: #f7f2e8; clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-plate:focus-visible::after { --w: 2px; content: ''; position: absolute; inset: 0; background: #1a1206; clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); }"
+      "refersTo": "button-primary",
+      "description": "The gold action, cut like the mark. Download and the main calls to action.",
+      "html": "<a class=\"ds-btn\" href=\"#\"><svg class=\"ds-btn__icon\" viewBox=\"0 0 20 20\" aria-hidden=\"true\"><path d=\"M9 2h2v9.2l3.3-3.3 1.4 1.4L10 15 4.3 9.3l1.4-1.4L9 11.2zM3 16h14v2H3z\" fill=\"currentColor\"/></svg>Download for Windows</a>",
+      "css": ".ds-btn { --c: 10px; display: inline-flex; align-items: center; justify-content: center; gap: 10px; height: 46px; padding: 0 22px; background: #f2b134; color: #1a1206; font: 700 16px/1 'Sofia Sans', system-ui, sans-serif; text-decoration: none; white-space: nowrap; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c))); transition: background 160ms, transform 160ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn__icon { width: 18px; height: 18px; flex: none; } .ds-btn:hover { background: #ffc75a; } .ds-btn:active { background: #c98d16; transform: translateY(1px); } .ds-btn:focus-visible { outline: none; background: #f3f4f6; color: #08090a; }"
     },
     {
-      "name": "Ghost Plate",
+      "name": "Ghost Button",
       "kind": "button",
-      "refersTo": "plate-ghost",
-      "description": "The quiet action: a cut-following outline, never gold.",
-      "html": "<a class=\"ds-plate-ghost\" href=\"#\">Create account</a>",
-      "css": ".ds-plate-ghost { --c: 14px; --w: 1px; position: relative; display: inline-flex; align-items: center; height: 56px; padding: 0 30px; background: transparent; color: #f7f2e8; font: 800 22px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms; } .ds-plate-ghost::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(255 244 224 / 0.38); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-plate-ghost:hover { background: rgb(255 244 224 / 0.07); } .ds-plate-ghost:active { background: rgb(255 244 224 / 0.11); } .ds-plate-ghost:focus-visible { outline: 2px solid #ffc75a; outline-offset: 3px; }"
+      "refersTo": "button-ghost",
+      "description": "The quiet action beside the gold one: a 1px ring that follows the cut.",
+      "html": "<a class=\"ds-ghost\" href=\"#\">Create account</a>",
+      "css": ".ds-ghost { --c: 10px; position: relative; display: inline-flex; align-items: center; justify-content: center; height: 46px; padding: 0 22px; background: rgb(13 14 16 / 0.28); color: #f3f4f6; font: 700 16px/1 'Sofia Sans', system-ui, sans-serif; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c))); transition: background 160ms; } .ds-ghost::before { --w: 1px; content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(255 255 255 / 0.28); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c)), 0 0, var(--w) var(--w), var(--w) calc(100% - var(--c) - 0.4142 * var(--w)), calc(var(--c) + 0.4142 * var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-ghost:hover { background: rgb(255 255 255 / 0.07); } .ds-ghost:hover::before { background: rgb(255 255 255 / 0.5); } .ds-ghost:active { background: rgb(255 255 255 / 0.12); } .ds-ghost:focus-visible { outline: none; background: #f3f4f6; color: #08090a; }"
     },
     {
-      "name": "Status Pill",
-      "kind": "chip",
-      "refersTo": "status-pill",
-      "description": "SOL's live state under the hero CTAs; the dot shows only for a measured state.",
-      "html": "<p class=\"ds-pill\"><span class=\"ds-pill__state\"><span class=\"ds-dot\"></span>Online</span><span class=\"ds-pill__name\">SOL</span><span class=\"ds-pill__meta\">Roleplay &middot; Europe</span></p>",
-      "css": ".ds-pill { --c: 10px; --w: 1px; position: relative; display: inline-flex; align-items: center; gap: 12px; margin: 0; padding: 10px 16px 10px 14px; background: rgb(12 9 6 / 0.72); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); font: 700 16px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; } .ds-pill::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: rgb(242 177 52 / 0.45); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-pill__state { display: inline-flex; align-items: center; gap: 8px; color: #f2b134; } .ds-pill__name { color: #f7f2e8; } .ds-pill__meta { color: #d9d1c3; letter-spacing: 0.08em; } .ds-dot { width: 9px; height: 9px; border-radius: 50%; background: #f2b134; box-shadow: 0 0 0 3px rgb(242 177 52 / 0.2); }"
-    },
-    {
-      "name": "Gold-Rim Photo Frame",
-      "kind": "custom",
-      "refersTo": "frame",
-      "description": "In-game photo in a cut frame whose 3px rim is the frame's own gold-to-ember fill, so the diagonal keeps its rim.",
-      "html": "<span class=\"ds-frame\"><span class=\"ds-frame__img\"></span></span>",
-      "css": ".ds-frame { --c: 22px; display: block; width: 320px; padding: 3px; background: linear-gradient(135deg, #ffd27a, #ff7a2f); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); filter: drop-shadow(0 30px 40px rgb(0 0 0 / 0.5)); } .ds-frame__img { --c: calc(22px - 1.24px); display: block; aspect-ratio: 16 / 9; background: linear-gradient(170deg, #34160a, #b4470f 70%, #5e250b); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); }"
-    },
-    {
-      "name": "Server Card (Next)",
-      "kind": "card",
-      "refersTo": "server-card-next",
-      "description": "LUNA / TERRA card on the sunset band: own emblem, caps name, tag in the server colour, cut ring at 60% of it.",
-      "html": "<div class=\"ds-band\"><article class=\"ds-next\" style=\"--col:#9cc2ff\"><svg class=\"ds-emblem\" viewBox=\"0 0 120 120\" aria-hidden=\"true\"><defs><mask id=\"ds-m-luna\"><rect width=\"120\" height=\"120\" fill=\"#fff\"/><circle cx=\"72\" cy=\"50\" r=\"24\" fill=\"#000\"/></mask></defs><path class=\"ds-emblem__badge\" d=\"M2 2H94L118 26V118H2Z\"/><circle cx=\"58\" cy=\"62\" r=\"28\" fill=\"#9cc2ff\" mask=\"url(#ds-m-luna)\"/><g fill=\"#eef4ff\"><path d=\"M88 74l5 5-5 5-5-5z\"/><path d=\"M96 92l3.5 3.5L96 99l-3.5-3.5z\"/></g></svg><div><div class=\"ds-next__top\"><h3 class=\"ds-next__name\">LUNA</h3><p class=\"ds-next__tag\">Next</p></div><p class=\"ds-next__desc\">The moon. Opens after SOL, in the same launcher, with the same account.</p></div></article></div>",
-      "css": ".ds-band { padding: 32px; background: linear-gradient(170deg, #34160a 0%, #7a2e0c 35%, #b4470f 68%, #5e250b 100%); } .ds-next { --c: 20px; --w: 1px; position: relative; display: flex; gap: 22px; align-items: center; padding: 22px 26px; background: rgb(12 9 6 / 0.42); clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 400ms; color: #f7f2e8; } .ds-next::before { content: ''; position: absolute; inset: 0; pointer-events: none; background: color-mix(in srgb, var(--col) 60%, transparent); clip-path: polygon(evenodd, 0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%, 0 0, var(--w) var(--w), var(--w) calc(100% - var(--w)), calc(100% - var(--w)) calc(100% - var(--w)), calc(100% - var(--w)) calc(var(--c) + 0.4142 * var(--w)), calc(100% - var(--c) - 0.4142 * var(--w)) var(--w), var(--w) var(--w)); } .ds-next:hover { background: rgb(12 9 6 / 0.6); } .ds-emblem { width: 96px; height: 96px; flex: none; overflow: visible; } .ds-emblem__badge { fill: color-mix(in srgb, var(--col) 16%, rgb(12 9 6 / 0.55)); stroke: var(--col); stroke-width: 1.5; } .ds-next__top { display: flex; align-items: baseline; gap: 14px; } .ds-next__name { margin: 0; font: 800 54px/0.9 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.02em; } .ds-next__tag { margin: 0; font: 700 15px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.14em; text-transform: uppercase; color: var(--col); } .ds-next__desc { margin: 8px 0 0; font: 400 16px/1.55 'Sofia Sans', system-ui, sans-serif; color: #f0dfc6; }"
-    },
-    {
-      "name": "Step Number",
-      "kind": "custom",
-      "refersTo": "step-number",
-      "description": "How-to-join step on the cream band: gold-to-ember cut number, Sofia Sans title and text.",
-      "html": "<div class=\"ds-cream\"><div class=\"ds-step\"><span class=\"ds-step__n\">1</span><div><h3 class=\"ds-step__t\">Download Solar Launcher</h3><p class=\"ds-step__p\">Install it on Windows 10 or 11. It finds your GTA V by itself.</p></div></div></div>",
-      "css": ".ds-cream { padding: 32px; background: #f4ead8; color: #1f150a; } .ds-step { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 20px; align-items: start; } .ds-step__n { --c: 14px; display: grid; place-items: center; width: 72px; height: 72px; background: linear-gradient(135deg, #ffcf6b, #f2b134 40%, #ff7a2f); color: #1f150a; font: 800 40px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); } .ds-step__t { margin: 6px 0 8px; font: 700 23px/1.25 'Sofia Sans', system-ui, sans-serif; } .ds-step__p { margin: 0; max-width: 36ch; font: 400 16px/1.55 'Sofia Sans', system-ui, sans-serif; color: #55432e; }"
-    },
-    {
-      "name": "Tally",
-      "kind": "custom",
-      "refersTo": "figure",
-      "description": "Hero counter row: caps term, counting gold figure, short note, hairline top in gold.",
-      "html": "<dl class=\"ds-tally\"><div><dt>Servers</dt><dd>3</dd><p>SOL open, LUNA and TERRA next</p></div><div><dt>Street NPCs</dt><dd>0</dd><p>every person you meet is a player</p></div></dl>",
-      "css": ".ds-tally { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 28px; margin: 0; padding: 24px; background: #0c0906; } .ds-tally > div { padding-top: 14px; border-top: 1px solid rgb(242 177 52 / 0.4); } .ds-tally dt { font: 700 14px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.14em; text-transform: uppercase; color: #b3aa9a; } .ds-tally dd { margin: 8px 0 0; font: 800 60px/0.9 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; color: #f2b134; font-variant-numeric: tabular-nums; } .ds-tally p { margin: 6px 0 0; font: 400 14px/1.4 'Sofia Sans', system-ui, sans-serif; color: #b3aa9a; }"
-    },
-    {
-      "name": "Top Bar",
+      "name": "Navigation Bar",
       "kind": "nav",
       "refersTo": "nav",
-      "description": "Fixed bar: caps section links, account link and a small Download plate; scrim at rest, opaque once scrolled.",
-      "html": "<header class=\"ds-bar\"><nav class=\"ds-bar__nav\"><a href=\"#\">Servers</a><a href=\"#\">How to join</a><a href=\"#\">Quests</a></nav><a class=\"ds-bar__link\" href=\"#\">Log in</a><a class=\"ds-bar__plate\" href=\"#\">Download</a></header>",
-      "css": ".ds-bar { display: flex; align-items: center; gap: 32px; height: 64px; padding: 0 24px; background: #0c0906; box-shadow: 0 1px 0 rgb(255 244 224 / 0.12); } .ds-bar__nav { display: flex; gap: 28px; margin-left: auto; } .ds-bar__nav a, .ds-bar__link { font: 700 19px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; color: #d9d1c3; padding: 10px 0; } .ds-bar__nav a:hover, .ds-bar__link:hover { color: #f7f2e8; } .ds-bar a:focus-visible { outline: 2px solid #ffc75a; outline-offset: 3px; } .ds-bar__plate { --c: 9px; display: inline-flex; align-items: center; height: 38px; padding: 0 16px; background: #f2b134; color: #1a1206; font: 800 17px/1 'Sofia Sans Extra Condensed', 'Arial Narrow', sans-serif; letter-spacing: 0.06em; text-transform: uppercase; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, 0 100%); transition: background 160ms; } .ds-bar__plate:hover { background: #ffc75a; }"
+      "description": "Fixed 64px bar, solid state: sentence-case links, Log in, small gold Download.",
+      "html": "<header class=\"ds-bar\"><span class=\"ds-bar__brand\">Solar RP</span><nav class=\"ds-bar__nav\"><a href=\"#\">Server</a><a href=\"#\">Features</a><a href=\"#\">How to join</a><a href=\"#\">FAQ</a></nav><a class=\"ds-bar__link\" href=\"#\">Log in</a><a class=\"ds-bar__btn\" href=\"#\">Download</a></header>",
+      "css": ".ds-bar { display: flex; align-items: center; gap: 32px; height: 64px; padding: 0 24px; background: #0d0e10; box-shadow: 0 1px 0 rgb(255 255 255 / 0.08); } .ds-bar__brand { font: 800 20px/1 'Sofia Sans', system-ui, sans-serif; color: #f3f4f6; } .ds-bar__nav { display: flex; gap: 32px; margin-left: auto; } .ds-bar__nav a, .ds-bar__link { font: 600 15px/1 'Sofia Sans', system-ui, sans-serif; color: #ccd0d6; text-decoration: none; padding: 10px 0; } .ds-bar__nav a:hover, .ds-bar__link:hover { color: #ffc75a; } .ds-bar__btn { --c: 8px; display: inline-flex; align-items: center; height: 36px; padding: 0 16px; background: #f2b134; color: #1a1206; font: 700 15px/1 'Sofia Sans', system-ui, sans-serif; text-decoration: none; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c))); } .ds-bar__btn:hover { background: #ffc75a; }"
+    },
+    {
+      "name": "Server Card",
+      "kind": "custom",
+      "refersTo": "server-card",
+      "description": "Signature: SOL as the launcher shows it, live. Polls every 20s while visible; the capacity bar appears only when players > 0.",
+      "html": "<aside class=\"ds-srv\"><div class=\"ds-srv__top\"><svg class=\"ds-srv__emblem\" viewBox=\"0 0 120 120\" aria-hidden=\"true\"><circle cx=\"60\" cy=\"60\" r=\"56\" fill=\"none\" stroke=\"#f2b134\" stroke-width=\"3\" opacity=\".5\"/><circle cx=\"60\" cy=\"60\" r=\"40\" fill=\"#f2b134\"/><g transform=\"translate(45.5 34) scale(.52)\" fill=\"#1a1206\"><path d=\"M0 0L41 0L50 9L50 31L32 31L32 18L18 18L18 41L30 41L12 59L0 59Z\"/><path d=\"M50 100L9 100L0 91L0 69L18 69L18 82L32 82L32 59L20 59L38 41L50 41Z\"/></g></svg><div><p class=\"ds-srv__name\">SOL</p><p class=\"ds-srv__state\"><span class=\"ds-dot\"></span>Online</p></div><p class=\"ds-srv__age\">Updated 4 s ago</p></div><div class=\"ds-srv__load\"><p class=\"ds-srv__count\">12 playing right now</p><span class=\"ds-srv__track\"><span class=\"ds-srv__fill\" style=\"--load:0.3\"></span></span></div><dl class=\"ds-srv__facts\"><div><dt>Mode</dt><dd>Roleplay</dd></div><div><dt>Region</dt><dd>Europe</dd></div><div><dt>Client</dt><dd>v0.5.4</dd></div></dl><p class=\"ds-srv__note\">Pick SOL in Solar Launcher and press PLAY.</p></aside>",
+      "css": ".ds-srv { --c: 16px; max-width: 400px; padding: 22px 22px 18px; background: rgb(21 23 27 / 0.94); border-top: 2px solid #f2b134; color: #f3f4f6; font-family: 'Sofia Sans', system-ui, sans-serif; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c))); } .ds-srv__top { display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; align-items: center; column-gap: 14px; } .ds-srv__emblem { width: 48px; height: 48px; } .ds-srv__name { margin: 0; font: 800 26px/1 'Sofia Sans', system-ui, sans-serif; letter-spacing: 0.02em; } .ds-srv__state { margin: 7px 0 0; display: inline-flex; align-items: center; gap: 8px; font: 600 15px/1 'Sofia Sans', system-ui, sans-serif; } .ds-dot { position: relative; width: 9px; height: 9px; border-radius: 50%; background: #4fd18b; } .ds-dot::after { content: ''; position: absolute; inset: 0; border-radius: 50%; background: #4fd18b; animation: ds-ping 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite; } @keyframes ds-ping { from { transform: scale(1); opacity: 0.55; } to { transform: scale(2.8); opacity: 0; } } @media (prefers-reduced-motion: reduce) { .ds-dot::after { content: none; } } .ds-srv__age { margin: 0; align-self: start; font-size: 13px; color: #a2a7b0; } .ds-srv__load { margin-top: 20px; } .ds-srv__count { margin: 0; font: 800 22px/1 'Sofia Sans', system-ui, sans-serif; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; } .ds-srv__track { display: block; margin-top: 12px; height: 4px; background: #272b31; overflow: hidden; } .ds-srv__fill { display: block; height: 100%; background: #f2b134; transform-origin: 0 50%; transform: scaleX(var(--load, 0)); transition: transform 900ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-srv__facts { margin: 20px 0 0; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); border-top: 1px solid rgb(255 255 255 / 0.14); border-bottom: 1px solid rgb(255 255 255 / 0.14); } .ds-srv__facts div { padding: 12px 0; } .ds-srv__facts div + div { padding-left: 14px; border-left: 1px solid rgb(255 255 255 / 0.14); } .ds-srv__facts dt { font-size: 12px; font-weight: 600; color: #a2a7b0; } .ds-srv__facts dd { margin: 4px 0 0; font: 700 15px/1.2 'Sofia Sans', system-ui, sans-serif; } .ds-srv__note { margin: 14px 0 0; font-size: 14px; color: #ccd0d6; }"
+    },
+    {
+      "name": "Panel with Steps",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "The join panel: cut 18px, three hairline-divided steps, a raised requirements strip.",
+      "html": "<div class=\"ds-panel\"><ol class=\"ds-steps\"><li><span class=\"ds-steps__n\">1</span><h3>Download Solar Launcher</h3><p>Install it on Windows 10 or 11.</p></li><li><span class=\"ds-steps__n\">2</span><h3>Log in</h3><p>Use your Solar RP account.</p></li></ol><dl class=\"ds-needs\"><div><dt>System</dt><dd>Windows 10 or 11, 64-bit</dd></div><div><dt>Game</dt><dd>GTA V for PC</dd></div></dl></div>",
+      "css": ".ds-panel { --c: 18px; background: #15171b; color: #f3f4f6; font-family: 'Sofia Sans', system-ui, sans-serif; clip-path: polygon(0 0, calc(100% - var(--c)) 0, 100% var(--c), 100% 100%, var(--c) 100%, 0 calc(100% - var(--c))); } .ds-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .ds-steps li { padding: 30px 30px 32px; } .ds-steps li + li { border-left: 1px solid rgb(255 255 255 / 0.14); } .ds-steps__n { display: block; font: 800 15px/1 'Sofia Sans', system-ui, sans-serif; color: #a2a7b0; } .ds-steps h3 { margin: 14px 0 0; font: 700 21px/1.25 'Sofia Sans', system-ui, sans-serif; letter-spacing: -0.01em; } .ds-steps p { margin: 10px 0 0; font-size: 16px; line-height: 1.55; color: #ccd0d6; } .ds-needs { margin: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid rgb(255 255 255 / 0.14); background: #1b1e23; } .ds-needs div { padding: 20px 30px 22px; } .ds-needs div + div { border-left: 1px solid rgb(255 255 255 / 0.14); } .ds-needs dt { font-size: 13px; font-weight: 600; color: #a2a7b0; } .ds-needs dd { margin: 6px 0 0; font-size: 16px; }"
+    },
+    {
+      "name": "Disclosure Row",
+      "kind": "custom",
+      "refersTo": "faq",
+      "description": "FAQ row between hairlines with a turning chevron.",
+      "html": "<details class=\"ds-faq\"><summary>Does it cost anything?<svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><path d=\"M3.5 6l4.5 4.5L12.5 6\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\"/></svg></summary><p>No. Solar Launcher and a Solar RP account are free.</p></details>",
+      "css": ".ds-faq { border-top: 1px solid rgb(255 255 255 / 0.14); border-bottom: 1px solid rgb(255 255 255 / 0.14); font-family: 'Sofia Sans', system-ui, sans-serif; } .ds-faq summary { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 22px 0; cursor: pointer; list-style: none; font: 700 18px/1.35 'Sofia Sans', system-ui, sans-serif; color: #f3f4f6; } .ds-faq summary::-webkit-details-marker { display: none; } .ds-faq summary:hover { color: #ffc75a; } .ds-faq summary:focus-visible { outline: 2px solid #ffc75a; outline-offset: 4px; } .ds-faq summary svg { width: 16px; height: 16px; flex: none; color: #a2a7b0; transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-faq[open] summary svg { transform: rotate(180deg); } .ds-faq p { margin: 0; padding: 0 48px 24px 0; max-width: 62ch; font-size: 17px; line-height: 1.6; color: #ccd0d6; }"
+    },
+    {
+      "name": "Quest Row",
+      "kind": "custom",
+      "refersTo": "quest",
+      "description": "Coin, title, gold reward figure, ghost action; on a bottom hairline.",
+      "html": "<div class=\"ds-quest\"><svg class=\"ds-coin\" viewBox=\"0 0 48 48\" aria-hidden=\"true\"><circle cx=\"24\" cy=\"24\" r=\"22\" fill=\"#f2b134\"/><circle cx=\"24\" cy=\"24\" r=\"16\" fill=\"none\" stroke=\"#1a1206\" stroke-opacity=\".35\" stroke-width=\"2.5\"/></svg><div><p class=\"ds-quest__title\">Quests pay coins</p><p class=\"ds-quest__desc\">The first one: link your Discord.</p></div><p class=\"ds-quest__reward\">+500 <span>coins</span></p></div>",
+      "css": ".ds-quest { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 20px; padding: 20px 4px 20px 0; border-bottom: 1px solid rgb(255 255 255 / 0.14); font-family: 'Sofia Sans', system-ui, sans-serif; color: #f3f4f6; } .ds-coin { width: 44px; height: 44px; } .ds-quest__title { margin: 0; font: 700 19px/1.2 'Sofia Sans', system-ui, sans-serif; } .ds-quest__desc { margin: 4px 0 0; font-size: 15px; color: #ccd0d6; } .ds-quest__reward { margin: 0; font: 800 26px/1 'Sofia Sans', system-ui, sans-serif; color: #f2b134; white-space: nowrap; } .ds-quest__reward span { font-size: 15px; font-weight: 600; color: #ccd0d6; }"
     }
   ],
   "narrative": {
-    "northStar": "Golden Hour Over Los Santos",
-    "overview": "A big, warm RP project home that is already moving when it opens. The page never sits on one ground: it walks from a sunset photo through an ember reel, a sunset band, a cream band and a second ember band, and closes on the river at golden hour. Bands meet edge to edge, joined only by short gradient fades of the ember-dusk tone, so no viewport reads as black. Gold and ember light lives inside each band as soft radial glows; it never floats over the page as a full-window layer.\n\nImagery is in-game footage only, framed in the S mark's 45-degree top-right cut with a gold rim that follows the diagonal. The servers are drawn with the project's own SVG emblems (sun, moon, earth on a cut badge), never GTA key art. Names and numbers are tall Sofia Sans Extra Condensed 800 caps; sentences are Sofia Sans. Motion is CSS transform and opacity loops plus scroll reveals; a script only drives counters, reveals and pointer parallax, and reduced motion stops all of it.\n\nThe confirmed rejections are the owner's: the dark quiet hub (\"grim asf\"), the 3D S, hero video, and any default GTA poster as server art.",
+    "northStar": "The Launcher's Front Door",
+    "overview": "The site is the launcher seen from outside: a calm, technical product page on neutral charcoal, in the register of fivem.net and alt:V rather than a trailer or a fan poster. One in-game photo world, a bright sunset still of Vespucci Beach, opens the page full-bleed and closes it under the download panel; everything between is charcoal panels, hairlines and sentence-case Sofia Sans. The hero's right column holds SOL as the launcher shows it, live, so the first thing a visitor learns is that the server is up and how many people are on it.\n\nDensity is moderate and quiet. Copy is short, in sentence case, and sits on panels or directly on the ground; the gold of the S mark is rationed to what a visitor can act on and to the few figures that matter (capacity, the coin reward). Shapes come from the mark itself: every button, panel and picture is cut at 45 degrees on the top-right and bottom-left corners, the way the S is, and nothing is rounded.\n\nThis world replaces three rejected ones (the trailer page, the quiet community hub, and the warm \"Big RP project\" home): the warm sunset/ember/cream section grounds, floating tilted photos, photo marquees, ticking hero numbers and condensed all-caps slogans of those rounds are confirmed rejections.",
     "keyCharacteristics": [
-      "Per-section grounds: photo, ember, sunset, cream, ember, photo.",
-      "Gold and ember radial glows contained inside their band.",
-      "One silhouette everywhere: the top-right 45-degree cut (clip-path), on plates, cards, pills, numbers and photos.",
-      "Gold-rim cut frames on every in-game photo outside the reel.",
-      "Own emblems with idle loops (rays turn, stars twinkle, land drifts, coin flips).",
-      "Extra Condensed 800 caps for names and numbers; Sofia Sans for prose; tabular numerals throughout."
+      "Neutral charcoal ground with three panel steps; no warm tint anywhere in the chrome.",
+      "One accent, the mark's gold, on actions, the capacity fill, the 2 px top rule of the two key panels and the coin reward.",
+      "Sofia Sans only: 800 with negative tracking for headings, 400 for sentences, sentence case everywhere.",
+      "The S-mark cut (top-right and bottom-left, 45 degrees) on every rectangle; no border-radius.",
+      "A live server card is the signature: real status, real player count, an age that ticks.",
+      "Motion is a single rise on load, one slow push-in of the hero photo on desktop, and rows that fade in once."
     ],
     "rules": [
-      { "name": "The Ground Walks Rule", "body": "Every section owns its ground (photo, ember gradient, sunset gradient or cream). A new landing section picks one of these grounds; it never sits on bare ground with a glow on it.", "section": "colors" },
-      { "name": "The Glow Stays Home Rule", "body": "Glows are radial gradients inside a band or behind one element (the gold call's breathing blob, the stack's sun). No fixed or full-window glow, grain or blend layer.", "section": "colors" },
-      { "name": "The One Gold Action Rule", "body": "Solid gold fill means \"act\". The quiet action is the ghost plate (outlined with line-3), never a second gold.", "section": "colors" },
-      { "name": "The Caps Are For Names Rule", "body": "Extra Condensed caps carry names, numbers, labels and calls; a sentence is always Sofia Sans in sentence case.", "section": "typography" },
-      { "name": "The Light Not Lift Rule", "body": "Elements gain presence through warm light behind them and a soft drop shadow on photos; nothing uses a hard or offset shadow.", "section": "elevation" }
+      { "name": "The Rationed Gold Rule", "body": "Gold marks only what you can press, the capacity fill, the top rule of the SOL card and the download panel, the coin reward, and the brand marks. Section grounds, headings, labels and decorative lines are never gold.", "section": "colors" },
+      { "name": "The Launcher Parity Rule", "body": "Status colours are the launcher's: green up, amber maintenance, coral down. Do not invent a fourth or recolour them for the site.", "section": "colors" },
+      { "name": "The Neutral Ground Rule", "body": "The chrome is neutral charcoal. Warmth comes from the photograph and the gold, never from a tinted section band.", "section": "colors" },
+      { "name": "The Sentence Case Rule", "body": "Headings, nav, buttons and labels are sentence case at letter-spacing 0 or tighter. No condensed faces and no all-caps text on this page; server names are the only capitals, because they are names.", "section": "typography" },
+      { "name": "The Tight Heading Rule", "body": "Every heading is 700-800 with negative tracking (-0.01 to -0.03em) and `text-wrap: balance`; body text gets `text-wrap: pretty`.", "section": "typography" },
+      { "name": "The Photo-Only Shadow Rule", "body": "A shadow exists only to keep text readable over the photograph. Nothing on charcoal casts one.", "section": "elevation" },
+      { "name": "The Mark's Cut Rule", "body": "Every button, panel and picture frame is cut top-right and bottom-left at 45 degrees, depth 8-22 px by size; never rounded, never cut on one corner only.", "section": "shapes" }
     ],
     "dos": [
-      "**Do** give every new landing section one of the established grounds (photo under a scrim, ember gradient, sunset gradient, cream) and join it to its neighbour with an ember-dusk fade.",
-      "**Do** cut every plate, card, pill, number and photo at the top-right 45 degrees, scaled to the object (8-30 px), and draw outlines as cut-following rings.",
-      "**Do** frame in-game photos in the gold-rim cut frame; use in-game footage only.",
-      "**Do** keep loops on transform and opacity, start them under the `.enter` class, and stop every animation and transition under `prefers-reduced-motion: reduce` with content left in its final, visible state.",
-      "**Do** put the final value in the markup of anything that counts or reveals, so a page whose script never runs still reads right.",
-      "**Do** keep the solid gold fill for the one action; the secondary action is the ghost plate.",
-      "**Do** use Deep Ember for accents on cream and Band Gold for accents on the sunset band."
+      "**Do** keep gold to buttons, the capacity fill, the 2 px top rule of the SOL card and the download panel, the coin reward and the brand marks.",
+      "**Do** cut every button, panel and picture at the top-right and bottom-left at 45 degrees (buttons 8-14 px, panels and pictures 16-22 px).",
+      "**Do** draw a line that must follow the cut as an evenodd polygon ring on a pseudo-element, not a border or inset shadow.",
+      "**Do** set headings in Sofia Sans 800 with negative tracking, sentence case; sentences in 400.",
+      "**Do** show real data in the server card: the true player count, the bar only when someone is on, the age of the reading.",
+      "**Do** separate rows inside a panel with 1 px hairlines at white 14 %, and step depth with panel, panel-2 and panel-3.",
+      "**Do** use the launcher's status colours (green up, amber maintenance, coral down) for server state.",
+      "**Do** keep motion to transform and opacity, and switch it all off under reduced motion."
     ],
     "donts": [
-      "**Don't** use GTA key art or a default GTA poster to represent a server; servers get their own emblems.",
-      "**Don't** add a fixed or full-window glow, grain or blend layer over the page.",
-      "**Don't** use video or WebGL on the landing page.",
-      "**Don't** round corners or use box shadows on cut shapes; the clip-path cuts them off.",
-      "**Don't** use alarm for anything but errors and the maintenance state.",
-      "**Don't** use Luna or Terra outside their own server card.",
-      "**Don't** show an unmeasured number: a live dot or player count appears only when the server reports it."
+      "**Don't** use border-radius on rectangles, or cut only one corner.",
+      "**Don't** use condensed faces or all-caps text for headings, nav or buttons.",
+      "**Don't** tint section grounds with warm gradient bands (sunset, ember, cream); the chrome stays charcoal.",
+      "**Don't** float or tilt photos, run photo marquees, or tick numbers up in the hero.",
+      "**Don't** put box shadows on panels or buttons; shadows exist only for text over the photograph.",
+      "**Don't** use gold for headings, labels, section backgrounds or decorative lines.",
+      "**Don't** show a capacity bar or a player figure the server did not report."
     ]
   }
 }

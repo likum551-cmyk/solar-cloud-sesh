@@ -82,6 +82,20 @@ export function describeStatus(s: ServerInfo | undefined): StatusView {
   return STATIC_STATUS;
 }
 
+/** How full a server is, 0..1, for the capacity bar; null when it reported no counts (the bar is hidden). */
+export function loadFraction(s: ServerInfo | undefined): number | null {
+  if (!s || s.maintenance !== null || s.state !== 'online' || s.players === null || s.maxPlayers === null) return null;
+  return Math.min(1, s.players / s.maxPlayers);
+}
+
+/** "updated 12 s ago" for the server panel's age line (whole seconds, then whole minutes). */
+export function describeAge(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 5) return 'Updated just now';
+  if (s < 60) return `Updated ${s} s ago`;
+  return `Updated ${Math.floor(s / 60)} min ago`;
+}
+
 /** Fetches the list; null on any failure (the page then keeps its static claim). */
 export async function loadServers(signal?: AbortSignal): Promise<ServerInfo[] | null> {
   const res = await fetch('/api/v1/servers', { cache: 'no-store', signal, headers: { accept: 'application/json' } });

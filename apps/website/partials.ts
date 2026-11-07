@@ -19,8 +19,9 @@ export const PARTIALS: Record<string, string> = {
     <a class="bar__brand" href="/" aria-label="Solar RP home">${LOCKUP}</a>
     <nav class="bar__nav" aria-label="Site">
       <a href="/#servers">Servers</a>
+      <a href="/#features">Features</a>
       <a href="/#join">How to join</a>
-      <a href="/#quests">Quests</a>
+      <a href="/#faq">FAQ</a>
     </nav>
     <a class="bar__account js-account-link" href="/login/">Log in</a>
     <a class="plate plate--sm" href="/#download">Download</a>

@@ -7,23 +7,23 @@ related_targets: []
 
 # solar-rp.com landing page
 
-Mode: Persuade. Visitor: a GTA V PC player arriving from Discord or a video. Job: believe Solar RP is a live, warm, real RP network and press Download.
+Mode: Persuade. Visitor: a GTA V PC player arriving from Discord or a video. Job: understand what Solar RP is, see that SOL is up, press Download.
 
-History: the trailer page (rejected 3x) and the quiet community hub (GI 2026-11-06: "grim asf", "What SOL runs today is what i dont like", servers "without default gta poster", "it needs more anim"). GI chose "Big RP project" (canon, played straight, references: Majestic RP, Grand RP landing pages) and own emblems for the servers.
+History: the trailer page (rejected 3x), the quiet community hub ("grim asf"), and the warm "Big RP project" home (2026-11-07: "redo website it aint it") are all gone. GI picked "Launcher product page" (references: fivem.net, alt:V) through the structured question tool; user-pinned, no concept-seed roll.
 
 ## Direction contract
 
-THESIS: a sunset-warm RP project home that feels alive in the first second: floating in-game photos, ticking numbers, a moving photo reel, three server cards with our own sun / moon / earth emblems. Refuses the quiet dark hub and every GTA key-art poster.
+THESIS: the site is the launcher's front door: a calm, technical product page whose hero holds the same live server list the launcher shows. Refuses the warm gradient bands (sunset / ember / cream section grounds), floating tilted photos, photo marquees, ticking hero numbers, and condensed all-caps slogans of every earlier round. One in-game photo world (the hero still, reused under the close) on a charcoal page; its time of day is chosen for brightness (the round-1 night still measured luma 45 and read as the "grim" hub GI rejected).
 
-OWN-WORLD: the ground changes per section so no screen reads black (GI "grim asf"; critic: mid-page frames were 80-94% near-black): hero sunset photo, ember reel band, sunset band for the servers (#34160a to #b4470f), a cream band (#f4ead8, dark ink) for the steps, an ember band for quests, the river still for the close; bands meet edge to edge on purpose, glows (gold #f2b134, ember #ff7a2f, rose #ff4f6d) only inside a band; in-game photos in cut-corner frames with gold rims; Sofia Sans Extra Condensed 800 caps for names and numbers, Sofia Sans for sentences; the S mark's 45-degree cut on plates, cards and photos; server colours: SOL gold, LUNA moonlight blue #9cc2ff, TERRA green #4fd18b.
+OWN-WORLD: neutral charcoal ground (#0d0e10, panels #15171b / #1b1e23, hairlines at white 8-28 %), one accent: the mark's gold #f2b134 on actions (buttons), the capacity fill, the 2 px top rule of the two key panels (SOL, download) and the coin reward; status colours are the launcher's own (green up, amber maintenance, coral down), amended after review round 1 for launcher parity. Sofia Sans throughout, 800 with tight tracking in sentence case for headings, 400 for sentences; no condensed caps. Corner grammar = the S mark's 45-degree cut at top-right and bottom-left (buttons 8-14 px, panels and pictures 16-22 px), no radius. The S mark and the sun / moon / earth emblems are the server marks.
 
-STORY: GTA V roleplay on our own servers; SOL is open; three steps; quests pay coins; download now.
+STORY: no NPCs, everyone is a player (H1); our own launcher, client and servers; SOL is up (live card); how SOL plays (cars synced, server inventory under our HUD); one panel with three steps and what you need; quests pay coins; answers; download.
 
-FIRST VIEWPORT: still-skyline full-bleed under a warm glow; left: H1 (88px max), lede, gold DOWNLOAD with a breathing glow + ghost Create account, then a 3-figure counter row (3 servers ticking up, 0 street NPCs static, 2 editions ticking up; no figure repeats other page text and none is unmeasured); right: three tilted floating photo cards (car, beach, freeway) with pointer parallax; a SOL status pill and the release line under the CTAs.
+FIRST VIEWPORT: full-bleed sunset still (Vespucci Beach) under a light left scrim, copy seated low; left: H1 (74 px max), lede, gold "Download for Windows" plus a quiet "Create account", the release line under them; right: a 400 px SOL card (emblem, live status, the true player count, the bar only once someone is on, mode / region / client version, "updated N s ago", LUNA and TERRA as one planned line). Phones: the still is its own unshaded band above the copy.
 
-FORM: canon ("Big RP project", GI's pick through the structured question tool; no concept-seed roll, user-pinned). Code-led. Signature interaction: the hero's floating photo stack following the pointer; motion grammar: soft rise reveals per section (different per section), counters, reel marquee, emblem idle loops, hover lift + colour glow. GPU-cheap only (transform, opacity), no video, no WebGL, all off under reduced motion.
+FORM: canon, user-pinned ("Launcher product page"). Code-led. Signature interaction: the server panel is live: it refreshes every 20 s while the tab is visible, the "updated" age ticks, and the capacity fill eases to the new value. Motion grammar: one soft rise of the hero copy and panel on load, feature rows fade in once; transform and opacity only, none under reduced motion.
 
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
 
 ## Open items
-Discord invite (no link until it exists), server rules, RP feature list, live player counts (SOL not registered with the platform).
+Discord invite (no link until it exists), server rules, in-game screenshots of the inventory and the new round map, SOL not yet connected to the platform (guests: inventories are not saved).

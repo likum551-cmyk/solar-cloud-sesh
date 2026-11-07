@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { STATIC_STATUS, describeStatus, findServer, parseServers } from '../src/servers';
+import { STATIC_STATUS, describeAge, describeStatus, findServer, loadFraction, parseServers } from '../src/servers';
 
 // the live shape (apps/platform/src/http/routes/player.ts, GET /v1/servers)
 const row = (over: Record<string, unknown> = {}, status: Record<string, unknown> = {}, maintenance = { enabled: false, message: '' }) => ({
@@ -69,5 +69,30 @@ describe('describeStatus', () => {
     expect(m).toMatchObject({ tone: 'maintenance', note: 'Back at 20:00' });
     const blank = describeStatus(parseServers({ servers: [row({}, {}, { enabled: true, message: '' })] })![0]);
     expect(blank.note).toMatch(/maintenance/);
+  });
+});
+
+describe('loadFraction', () => {
+  const one = (status: Record<string, unknown> = {}, maintenance?: { enabled: boolean; message: string }) =>
+    parseServers({ servers: [row({}, status, maintenance)] })![0];
+  it('is players over capacity for an online server', () => {
+    expect(loadFraction(one({ players: 12, maxPlayers: 128 }))).toBeCloseTo(12 / 128);
+    expect(loadFraction(one({ players: 0, maxPlayers: 1024 }))).toBe(0);
+  });
+  it('is null when there is nothing honest to draw', () => {
+    expect(loadFraction(undefined)).toBeNull();
+    expect(loadFraction(one({ state: 'offline' }))).toBeNull();
+    expect(loadFraction(one({ players: null }))).toBeNull();
+    expect(loadFraction(one({}, { enabled: true, message: 'x' }))).toBeNull();
+  });
+});
+
+describe('describeAge', () => {
+  it('reads seconds, then minutes', () => {
+    expect(describeAge(0)).toBe('Updated just now');
+    expect(describeAge(4999)).toBe('Updated just now');
+    expect(describeAge(12_400)).toBe('Updated 12 s ago');
+    expect(describeAge(125_000)).toBe('Updated 2 min ago');
+    expect(describeAge(-50)).toBe('Updated just now');
   });
 });
