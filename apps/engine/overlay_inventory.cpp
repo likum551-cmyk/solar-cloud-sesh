@@ -117,6 +117,21 @@ void SetNearby(const std::vector<InvNearbyBox>& boxes)
     ++s.nearSeq;
 }
 
+// 0.5.6 weapon_keys: the number keys 1-4 in the world (overlay_ui.cpp UiFrame reads them, inv3::QuickKey sends the op).
+namespace {
+    std::atomic<bool> g_quickKeys{true};
+    std::atomic<uint32_t> g_quickSent{0}, g_quickRefused{0};
+}
+void SetQuickKeys(bool on) { g_quickKeys.store(on); }
+void QuickKeyCounts(uint32_t* sent, uint32_t* refused)
+{
+    if (sent) *sent = g_quickSent.exchange(0);
+    if (refused) *refused = g_quickRefused.exchange(0);
+}
+namespace detail::inv3 {
+    bool QuickKeysOn() { return g_quickKeys.load(); }
+}
+
 bool PopInventoryOp(std::string* encodedOp, uint32_t* seq)
 {
     Store& s = St();
@@ -2817,6 +2832,31 @@ void Reset()
     u.dragging = u.menuOpen = u.splitOpen = u.searchFocus = false;
     u.seenSnap = ~0u;   // re-read the store on the next frame
     B() = Baked();
+}
+
+// 0.5.6 weapon_keys: a number key 1-4 pressed while no panel is open (overlay_ui.cpp UiFrame). The same op the open page sends (UseQuick:
+// a bound weapon goes into the hand, the weapon in hand goes away, food is eaten), through the same prediction and queue.
+bool QuickKey(int k)
+{
+    Ui& u = U();
+    if (k < 0 || k > 3)
+        return false;
+    u.now = ImGui::GetTime();
+    Sync();
+    const Ref r{BoxK::Quick, k};
+    u.quickFlash[k] = u.now;
+    const bool sent = Send(MakeOp(inv::OpKind::UseQuick, r), r);
+    (sent ? g_quickSent : g_quickRefused).fetch_add(1);
+    static int lines = 0;
+    if (lines < 40) {
+        ++lines;
+        const inv::ItemDef* d = inv::Find(u.ch.quick[k].item);
+        const inv::ItemDef* h = inv::Find(u.ch.hand.item);
+        GLOGI("inventory: quick key %d (page closed): %s; slot bound to %s, hand now %s (predicted)", k + 1,
+              !u.have ? "no server inventory, nothing sent" : sent ? "UseQuick sent" : "refused by the rules (empty slot, item gone)",
+              d ? d->key : "nothing", h ? h->key : "empty");
+    }
+    return sent;
 }
 
 bool HandleEsc()

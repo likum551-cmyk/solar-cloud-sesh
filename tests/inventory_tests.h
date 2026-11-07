@@ -12,7 +12,7 @@ namespace invtest {
 
     using namespace gage::sync::inv;
 
-    constexpr int kChecks = 15;
+    constexpr int kChecks = 17;   // 0.5.6: + 2 (quick keys and the weapon in hand)
 
     inline ItemId Id(const char* key) { const ItemDef* d = FindKey(key); return d ? d->id : 0; }
 
@@ -322,6 +322,52 @@ namespace invtest {
             Check("inventory: the starter kit is a valid state (empty pockets, tee / jeans / sneakers worn, no pack); Give fills pockets then the pack "
                   "within weight (20 fuel cans: 3 without a pack, 9 with a rucksack) and never puts a pack in the pack",
                   kitOk && noPack == 3 && withPack == 9 && packInPack == 0, F("kit %d noPack %u withPack %u packInPack %u", (int)kitOk, noPack, withPack, packInPack));
+        }
+        {
+            // 0.5.6 (GI: "binding to slot and then clicking 1-2-3-4 doesn't bring the gun into active slot"). A pistol and a carbine in the
+            // pockets, bound to quick slots 1 and 2: key 1 takes the pistol into the hand, key 2 swaps the carbine in (the pistol goes back),
+            // key 2 again puts the carbine away (GTA's own "1 = unarmed" is held off with weapon_keys, so the bound key is the holster), and
+            // key 1 brings the pistol back. Before 0.5.6 the third press was refused (NotUsable): no key could empty the hand.
+            const ItemDef* pistol = FindWeapon(gage::sync::inv::Joaat("weapon_pistol"));
+            const ItemDef* carbine = FindWeapon(gage::sync::inv::Joaat("weapon_carbinerifle"));
+            Character ch = StarterKit();
+            const bool gave = pistol && carbine && Give(ch, pistol->id, 1) == 1 && Give(ch, carbine->id, 1) == 1;
+            const auto op = [&](OpKind k, Where src, int si, Where dst = Where::Pockets, int di = -1) {
+                Op o;
+                o.kind = k; o.src = src; o.si = (int16_t)si; o.dst = dst; o.di = (int16_t)di;
+                return Apply(ch, o).r;
+            };
+            const auto pocketOf = [&](ItemId id) { for (size_t i = 0; i < ch.pockets.slots.size(); ++i) if (ch.pockets.slots[i].item == id) return (int)i; return -1; };
+            const bool bound = gave && Ok(op(OpKind::Bind, Where::Pockets, pocketOf(pistol->id), Where::Quick, 0)) &&
+                               Ok(op(OpKind::Bind, Where::Pockets, pocketOf(carbine->id), Where::Quick, 1));
+            const Result r1 = bound ? op(OpKind::UseQuick, Where::Quick, 0) : Result::BadSlot;
+            const bool k1 = Ok(r1) && ch.hand.item == pistol->id && pocketOf(pistol->id) < 0;
+            const Result r2 = op(OpKind::UseQuick, Where::Quick, 1);
+            const bool k2 = Ok(r2) && ch.hand.item == carbine->id && pocketOf(pistol->id) >= 0 && pocketOf(carbine->id) < 0;
+            const Result r3 = op(OpKind::UseQuick, Where::Quick, 1);
+            const bool k3 = Ok(r3) && ch.hand.Empty() && pocketOf(carbine->id) >= 0 && pocketOf(pistol->id) >= 0;
+            const Result r4 = op(OpKind::UseQuick, Where::Quick, 0);
+            const bool k4 = Ok(r4) && ch.hand.item == pistol->id;
+            Check("inventory (0.5.6): quick keys bring a bound weapon into the hand (1: pistol, 2: the carbine swaps in), the key of the weapon in hand "
+                  "puts it away, and the next key takes the pistol again",
+                  k1 && k2 && k3 && k4, F("bound %d results %d %d %d %d", (int)bound, (int)r1, (int)r2, (int)r3, (int)r4));
+        }
+        {
+            // The toggle never fires on an item that is not in the hand (food in slot 3 is still eaten), and an empty slot is still refused.
+            Character ch = StarterKit();
+            Give(ch, Id("water"), 2);
+            Op b;
+            b.kind = OpKind::Bind; b.src = Where::Pockets; b.si = 0; b.dst = Where::Quick; b.di = 2;
+            Op q;
+            q.kind = OpKind::UseQuick; q.src = Where::Quick; q.si = 2;
+            Op e;
+            e.kind = OpKind::UseQuick; e.src = Where::Quick; e.si = 3;
+            const bool bound = Ok(Apply(ch, b).r);
+            const ApplyOut used = Apply(ch, q);
+            const Result empty = Apply(ch, e).r;
+            Check("inventory (0.5.6): a quick slot with food still uses one unit (Used, 1 water left), an unbound slot is still NotUsable",
+                  bound && used.r == Result::Used && used.used == Id("water") && ch.pockets.slots[0].qty == 1 && empty == Result::NotUsable,
+                  F("used %d empty %d", (int)used.r, (int)empty));
         }
     }
 

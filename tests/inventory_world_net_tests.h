@@ -5,15 +5,29 @@
 // the reconcile and its dupe race) are tests/inventory_world_tests.h in gameplay_test.
 
 #include "sync/inventory_world.h"
+#include "sync/outfit.h"   // 0.5.6: WornFeed, Desired (the engine's outfit source)
+
+#include <cstdarg>
+#include <cstdio>
 
 namespace invworldnet {
 
-    constexpr int kChecks = 15;
+    constexpr int kChecks = 18;   // 0.5.6: + 3 (OutfitAndQuickSlots)
     namespace inv = gage::sync::inv;
     namespace invw = gage::sync::invw;
 
     static int QtyOf(const inv::Character& ch) { return inv::UsedSlots(ch.pockets) + (ch.HasPack() ? inv::UsedSlots(ch.pack) : 0); }
     static int UsedSlotsOf(const inv::Character& ch) { return QtyOf(ch); }
+    // server_test has no F(): a small printf formatter for the check details
+    static std::string Fmt(const char* fmt, ...)
+    {
+        char buf[256];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof buf, fmt, ap);
+        va_end(ap);
+        return buf;
+    }
 
     constexpr uint32_t kPistol = 0x1B06D571u;   // WEAPON_PISTOL
     constexpr uint32_t kAdder = 0xB779A091u;    // a model hash the tests spawn (the server never interprets it)
@@ -416,12 +430,89 @@ namespace invworldnet {
               err + " | " + e2 + " | " + ana.Describe());
     }
 
+    // ---- 0.5.6: GI's two inventory bugs over the wire (the server and the session are the real ones; the engine's halves are the pure functions
+    //      it runs: sync::outfit::WornFeed + Desired for the clothes, sync::invw::PlanSnapshot for the weapon in hand) ----
+    // `wornFromSnaps` false replays the 0.5.4 / 0.5.5 engine (it fed the outfit from InvState only): the take-off check must fail with it.
+    static int OutfitAndQuickSlots(bool wornFromSnaps = true)
+    {
+        namespace of = gage::sync::outfit;
+        int failed = 0;
+        const auto check = [&](const char* what, bool ok, const std::string& detail = std::string()) {
+            Check(what, ok, detail);
+            failed += ok ? 0 : 1;
+        };
+        Rig rig;
+        if (!rig.Start()) { check("inventory 0.5.6 live: server starts", false); return 1; }
+        Probe ana(rig);
+        WClient a{rig, ana};
+        const bool in = JoinWorld(rig, ana, a, "Ana");
+
+        // 1. GI: "taking off clothing doesn't remove it off char". The shirt comes off on the server, the answer is an InvSnap (not an InvState:
+        //    the world is answered), and the engine's outfit source, fed every inventory message in arrival order, now asks for the bare torso.
+        const int shirt = inv::EquipIndex(inv::Equip::Shirt);
+        inv::Character start;
+        const bool wore = a.Latest(start) && !start.equip[shirt].Empty();
+        const int statesBefore = ana.Count(ET::InvState);
+        inv::Character off;
+        const bool took = a.Op(MkOp(inv::OpKind::Use, inv::Where::Equip, shirt), off) && off.equip[shirt].Empty();
+        of::WornFeed feed;
+        for (const net::Event& e : ana.events) {
+            if (e.type == ET::InvState) feed.OnInvState(e.invState.blob);
+            if (e.type == ET::InvSnap && wornFromSnaps) feed.OnInvSnap(e.invSnap.blob);
+        }
+        const of::Want want = feed.have ? of::Desired(feed.ch, of::Sex::Male) : of::Want();
+        check("inventory 0.5.6 live: taking the shirt off reaches the server and comes back as an InvSnap with the slot empty; the outfit source fed "
+              "every inventory message (InvState AND InvSnap) asks for the bare torso (top 11/15, arms 3/15)",
+              in && wore && took && ana.Count(ET::InvState) == statesBefore && feed.snaps > 0 && want.want[11] && want.drawable[11] == 15 &&
+                  want.want[3] && want.drawable[3] == 15,
+              Fmt("feed states %u snaps %u, top %d", feed.states, feed.snaps, (int)want.drawable[11]) + " | " + ana.Describe());
+
+        // 2. GI: "binding to slot and then clicking 1-2-3-4 doesn't bring the gun into active slot". A pistol the ped picked up (current
+        //    unarmed) lands in the pockets; bound to quick slot 1 and used, it is the hand item, and the engine's snapshot plan selects it on the
+        //    ped. The same key again holsters it (0.5.6: GTA's own "1 = unarmed" is held off now) and the plan goes back to unarmed.
+        const int s0 = ana.Count(ET::InvSnap);
+        a.Report(inv::kWeaponUnarmed, {{kPistol, 0xA1, 24}});
+        a.WaitSnap(s0);
+        inv::Character got;
+        int at = -1;
+        if (a.Latest(got))
+            for (size_t i = 0; i < got.pockets.slots.size(); ++i)
+                if (got.pockets.slots[i].item == inv::FindWeapon(kPistol)->id) at = (int)i;
+        inv::Character bound, held, put;
+        const bool b = at >= 0 && a.Op(MkOp(inv::OpKind::Bind, inv::Where::Pockets, at, inv::Where::Quick, 0), bound) &&
+                       bound.quick[0].item == inv::FindWeapon(kPistol)->id;
+        const bool h = b && a.Op(MkOp(inv::OpKind::UseQuick, inv::Where::Quick, 0), held) && held.hand.item == inv::FindWeapon(kPistol)->id;
+        invw::PedState ped;
+        ped.valid = true;
+        ped.current = inv::kWeaponUnarmed;
+        ped.have.push_back({kPistol, 0xA1, 24});
+        invw::AmmoTypes types;
+        types.Learn(kPistol, 0xA1);
+        bool selects = false;
+        for (const invw::Act& x : invw::PlanSnapshot(&bound, held, false, {}, ped, types))
+            selects |= x.k == invw::ActK::Select && x.hash == kPistol;
+        check("inventory 0.5.6 live: a picked-up pistol bound to quick slot 1 and used (UseQuick) becomes the hand item on the server, and the "
+              "engine's snapshot plan selects it on the ped",
+              at >= 0 && b && h && selects, Fmt("pocket %d", at) + " | " + ana.Describe());
+
+        ped.current = kPistol;
+        bool unarms = false;
+        const bool p = h && a.Op(MkOp(inv::OpKind::UseQuick, inv::Where::Quick, 0), put) && put.hand.Empty() && invw::Carries(put, kPistol);
+        for (const invw::Act& x : invw::PlanSnapshot(&held, put, false, {}, ped, types))
+            unarms |= x.k == invw::ActK::Select && x.hash == inv::kWeaponUnarmed;
+        check("inventory 0.5.6 live: quick slot 1 again with the pistol in hand puts it away (back in the pockets, the hand empty) and the plan "
+              "selects unarmed",
+              p && unarms, ana.Describe());
+        return failed;
+    }
+
     static void Tests()
     {
         HandshakeAndWeapons();
         Ground();
         Trunks();
         Off();
+        OutfitAndQuickSlots();
     }
 
 }  // namespace invworldnet

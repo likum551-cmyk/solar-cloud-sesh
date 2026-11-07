@@ -1336,13 +1336,39 @@ namespace {
     std::atomic<bool> g_outfitItems{true};
     std::atomic<bool> g_invPedView{true};
     std::mutex g_outfitMtx;                        // the join worker writes the server's inventory, the script tick reads it
-    sync::inv::Character g_outfitChar;             // the server's latest (never the overlay's prediction)
-    bool g_outfitHave = false;                     // a server inventory exists (false: none sent yet / the session ended)
-    uint32_t g_outfitSeq = 0;                      // +1 per InvState
+    sync::outfit::WornFeed g_outfitFeed;           // 0.5.6: fed by InvState AND InvSnap (0.5.4 / 0.5.5 read InvState only: GI's shirt stayed on)
     std::atomic<bool> g_outfitRecheck{false};      // DressPlayer re-dressed the ped: compare at once, not at the next 1 s check
+
+    // ===== 0.5.6 overlay_fire_block + weapon_keys (libs/sync/overlay_input.h; GI 2026-11-07) =====
+    // overlay_fire_block (HKCU\Software\GAGE-MP, default on; 0 = 0.5.5): an open panel also calls DISABLE_PLAYER_FIRING every tick.
+    // weapon_keys (default on; 0 = 0.5.5): once the server owns the weapons, GTA's own weapon selection (Tab, 1-9, the mouse wheel) is held
+    // disabled every tick and the number keys 1-4 use our quick slots with the page closed too. Both read with the session's switches.
+    std::atomic<bool> g_overlayFireBlock{true};
+    std::atomic<bool> g_weaponKeys{true};
+    struct InputHoldDiag                           // script tick only; the 10 s line "engine: input holds (0.5.6)"
+    {
+        sync::overlayinput::FrameCadence cadence;  // GET_FRAME_COUNT per tick, every tick
+        sync::overlayinput::SwitchWatch sw;        // the ped's selected weapon, attributed
+        uint32_t panelTicks = 0, panelFrames = 0, fireCalls = 0, fireFailed = 0, lmbHeld = 0, shotsOpen = 0, meleeOpen = 0;
+        uint32_t keyTicks = 0, wheelFailed = 0, foreignFrom = 0, foreignTo = 0;
+        bool logged = false;                       // the first weapon-keys tick of the session was logged
+        double lastLogMs = 0;
+        int64_t panelFrameAt = -1;
+    };
+    InputHoldDiag g_inHold;
 
     void InvCReadSwitches()
     {
+        g_overlayFireBlock.store(reg::Get(L"overlay_fire_block") != L"0");
+        g_weaponKeys.store(reg::Get(L"weapon_keys") != L"0");
+        game::Overlay::SetQuickKeys(g_weaponKeys.load());
+        GLOGI("engine: input holds (0.5.6): overlay_fire_block=%s; weapon_keys=%s", g_overlayFireBlock.load()
+              ? "on (an open panel also calls DISABLE_PLAYER_FIRING every tick: no shot or punch through a click; LIVE-UNVERIFIED)"
+              : "OFF (the panel's control list only, as 0.5.5)",
+              g_weaponKeys.load()
+              ? "on (once the server owns the weapons: GTA's weapon wheel / Tab / number keys 1-9 / mouse-wheel switch held disabled every tick, "
+                "the wheel's result suppressed; keys 1-4 use the quick slots with the page closed; LIVE-UNVERIFIED)"
+              : "OFF (GTA's own weapon selection, quick slots only on the open page, as 0.5.5)");
         g_outfitItems.store(reg::Get(L"outfit_items") != L"0");
         g_invPedView.store(reg::Get(L"inv_ped_view") != L"0");
         GLOGI("engine: outfit items (0.5.4): outfit_items=%s", g_outfitItems.load()
@@ -1352,22 +1378,37 @@ namespace {
               ? "on (a scripted camera frames our ped in the CHARACTER panel while the page is open; LIVE-UNVERIFIED)"
               : "OFF (the 0.5.3 mannequin)");
     }
-    // Join worker thread (OnInvState): keep the server's inventory for the outfit.
-    void OutfitNoteInventory(const std::string& blob)
+    // Join worker thread (OnInvState and, since 0.5.6, OnInvSnap): keep the server's inventory for the outfit. One line per change of the
+    // worn shirt / pants / shoes the server sent (at most 200 a session): the live proof that a take-off reached the engine.
+    void OutfitNoteInventory(const std::string& blob, bool snap)
     {
-        sync::inv::Character c;
-        if (!sync::inv::Decode(blob, c))
-            return;                                // the overlay logs the undecodable snapshot; the ped keeps the last good one
-        std::lock_guard<std::mutex> lk(g_outfitMtx);
-        g_outfitChar = c;
-        g_outfitHave = true;
-        ++g_outfitSeq;
+        namespace of = sync::outfit;
+        std::string before, after;
+        uint32_t states = 0, snaps = 0;
+        bool took = false;
+        {
+            std::lock_guard<std::mutex> lk(g_outfitMtx);
+            const auto trio = [](const sync::inv::Character& c) {
+                return std::string("shirt=") + of::WornKey(c, sync::inv::Equip::Shirt) + " pants=" + of::WornKey(c, sync::inv::Equip::Pants) +
+                       " shoes=" + of::WornKey(c, sync::inv::Equip::Shoes);
+            };
+            if (g_outfitFeed.have)
+                before = trio(g_outfitFeed.ch);
+            took = snap ? g_outfitFeed.OnInvSnap(blob) : g_outfitFeed.OnInvState(blob);   // undecodable: the overlay logs it, the ped keeps the last
+            if (took)
+                after = trio(g_outfitFeed.ch);
+            states = g_outfitFeed.states;
+            snaps = g_outfitFeed.snaps;
+        }
+        static std::atomic<int> lines{0};
+        if (took && after != before && lines.fetch_add(1) < 200)
+            GLOGI("engine: outfit items (0.5.6): the server's worn items %s %s (from %s; %u InvState / %u InvSnap so far)",
+                  before.empty() ? "are" : "changed to", after.c_str(), snap ? "an InvSnap" : "an InvState", states, snaps);
     }
     void OutfitClear()
     {
         std::lock_guard<std::mutex> lk(g_outfitMtx);
-        g_outfitHave = false;
-        ++g_outfitSeq;
+        g_outfitFeed.End();
     }
 
     // 0.5.4 inventory world (libs/sync/inventory_world.h, docs/api/protocol.md "0.5.4"): weapons are inventory items (the ped's weapon wheel
@@ -3828,7 +3869,7 @@ namespace {
         if (g_invStates.fetch_add(1) == 0)
             GLOGI("engine: inventory (0.6): first InvState, %zu bytes", s.blob.size());
         game::Overlay::SetInventory(s.blob, s.ackSeq, name.c_str());
-        OutfitNoteInventory(s.blob);       // 0.5.4 outfit_items: the ped follows the server's worn items
+        OutfitNoteInventory(s.blob, false);   // 0.5.4 outfit_items: the ped follows the server's worn items
     }
 
     // 0.6, join worker thread: food the server used for us.
@@ -3850,6 +3891,7 @@ namespace {
         if (g_invwSnaps.fetch_add(1) == 0)
             GLOGI("engine: inventory world (0.5.4): first InvSnap, %zu bytes, rev %u", s.blob.size(), (unsigned)s.rev);
         game::Overlay::SetInventory(s.blob, s.ackSeq, name.c_str());
+        OutfitNoteInventory(s.blob, true);    // 0.5.6: an InvSnap REPLACES InvState once the world is answered: the outfit must follow it too
         std::lock_guard<std::mutex> lk(g_invwMtx);
         if (g_invwSnapFresh) {
             proto::InvSnap merged = s;
@@ -3950,6 +3992,8 @@ namespace {
     }
 
     void InvwExecute(int32_t lp, const std::vector<sync::invw::Act>& acts) {
+        if (!acts.empty())
+            g_inHold.sw.OursNow(NowMs());   // 0.5.6: a weapon change the next ticks see is the inventory's, not GTA's own selection
         for (const sync::invw::Act& a : acts) {
             switch (a.k) {
             case sync::invw::ActK::Remove: g_world->RemoveWeaponFromPed(lp, a.hash); g_invwRemoves.fetch_add(1); break;
@@ -4425,6 +4469,8 @@ namespace {
     int g_pauseTimerBase = -1;            // GET_GAME_TIMER when the menu was first seen open (-1 unreadable)
     double g_pauseOpenedAtMs = 0;         // NowMs() then
 
+    void TickInputHolds(int32_t lp);   // 0.5.6, below
+
     void UiTick(int32_t lp)
     {
         // Speedometer: shown only while the player is in a vehicle.
@@ -4450,8 +4496,8 @@ namespace {
         }
 
         // An open panel owns the keyboard and mouse: hold the game's pad-0 controls disabled (this
-        // frame only, so it is repeated every tick). The natives that would read a key press or
-        // disable everything in one call are not in the 3889 crossmap, hence the loop.
+        // frame only, so it is repeated every tick). The loop (not DISABLE_ALL_CONTROL_ACTIONS, which the
+        // 0.5.6 natlookup run found in both crossmaps after all) keeps the pause menu's keys exempt below.
         // While the pause menu (opened by TickPauseMenu, not pausing) is up, 199 / 200 / 202 stay
         // enabled: Esc, P and Backspace are how the player closes it.
         // 0.5.4 overlay_combat_block (sync/overlay_input.h): the same loop also holds the attack / melee / weapon controls above 226 (INPUT_ATTACK2
@@ -4474,6 +4520,85 @@ namespace {
                                                   : "OFF: 0-226 only, the 0.5.3 set");
             }
         }
+        TickInputHolds(lp);
+    }
+
+    // 0.5.6 (libs/sync/overlay_input.h), script tick, right after the panel's control loop: the player-level fire block while a panel is open,
+    // GTA's own weapon selection held while the server owns the weapons, and the counters that prove both live (and say how many game frames
+    // each script tick covers: the per-frame natives above hold nothing on a frame the tick skipped).
+    void TickInputHolds(int32_t lp)
+    {
+        namespace oi = sync::overlayinput;
+        InputHoldDiag& d = g_inHold;
+        const double nowMs = NowMs();
+        const bool panel = game::Overlay::Interactive();
+        const oi::TickPlan plan = oi::Plan(panel, g_overlayFireBlock.load(), g_weaponKeys.load(), g_invWorldLive.load());
+        const int64_t frame = g_world->GetFrameCount();
+        d.cadence.Note(frame);
+        if (plan.disableFiring) {
+            ++d.fireCalls;
+            if (!g_world->DisableLocalPlayerFiring())
+                ++d.fireFailed;
+        }
+        if (plan.holdPanel) {
+            ++d.panelTicks;
+            if (frame >= 0 && d.panelFrameAt >= 0 && frame > d.panelFrameAt)
+                d.panelFrames += (uint32_t)std::min<int64_t>(frame - d.panelFrameAt, 1000);
+            d.panelFrameAt = frame;
+            // What got through anyway: a left click the game saw (read from the disabled control), a shot, a melee move.
+            if (g_world->IsDisabledControlJustPressed(0, 24))
+                ++d.lmbHeld;
+            if (g_world->IsPedShooting(lp))
+                ++d.shotsOpen;
+            if (g_world->IsPedPerformingMeleeAction(lp))
+                ++d.meleeOpen;
+        } else {
+            d.panelFrameAt = -1;
+        }
+        if (plan.holdWeaponKeys) {
+            ++d.keyTicks;
+            for (int i = 0; i < oi::kGameWeaponSelectCount; ++i) {
+                uint64_t args[] = { 0, (uint64_t)oi::kGameWeaponSelect[i], 1 };   // DISABLE_CONTROL_ACTION(0, control, true)
+                g_world->CallNative(game::native::DISABLE_CONTROL_ACTION, args, 3, nullptr);
+            }
+            if (!g_world->SuppressWeaponWheelResults())
+                ++d.wheelFailed;
+            if (!d.logged) {
+                d.logged = true;
+                GLOGI("engine: input holds (0.5.6): the server owns the weapons: %d GTA weapon-select controls held every tick (Tab 37, wheel 12-17, "
+                      "number keys 157-165, vehicle 99 / 100 / 115 / 116, mouse wheel 261 / 262) + HUD_SUPPRESS_WEAPON_WHEEL_RESULTS_THIS_FRAME; "
+                      "1-4 are the quick slots", oi::kGameWeaponSelectCount);
+            }
+        }
+        else {
+            d.logged = false;                      // the next session that hands the weapons to the server logs it again
+        }
+        const uint32_t from = d.sw.last;
+        if (d.sw.Note(g_world->GetSelectedPedWeapon(lp), nowMs)) {
+            d.foreignFrom = from;
+            d.foreignTo = d.sw.last;
+        }
+        if (nowMs - d.lastLogMs < 10000)
+            return;
+        d.lastLogMs = nowMs;
+        uint32_t qSent = 0, qRefused = 0;
+        game::Overlay::QuickKeyCounts(&qSent, &qRefused);
+        if (d.panelTicks || d.keyTicks || d.sw.foreign || d.sw.ours || qSent || qRefused) {
+            char last[48] = "";
+            if (d.sw.foreign)
+                std::snprintf(last, sizeof last, " (last 0x%08X -> 0x%08X)", (unsigned)d.foreignFrom, (unsigned)d.foreignTo);
+            GLOGI("engine: input holds (0.5.6), last 10 s: cadence %u script ticks over %u game frames (ticks covering more than 1 frame %u, most "
+                  "%u, GET_FRAME_COUNT unreadable %u); panel open %u ticks / %u frames: DISABLE_PLAYER_FIRING %u (%u failed), left clicks the game "
+                  "saw held %u, got through: shots %u, melee %u; weapon keys held %u ticks (wheel suppress failed %u); ped weapon switches: ours %u, "
+                  "FOREIGN %u%s; quick keys (page closed) sent %u, refused %u",
+                  d.cadence.ticks, d.cadence.frames, d.cadence.gapsOver1, d.cadence.maxGap, d.cadence.unreadable, d.panelTicks, d.panelFrames,
+                  d.fireCalls, d.fireFailed, d.lmbHeld, d.shotsOpen, d.meleeOpen, d.keyTicks, d.wheelFailed, d.sw.ours, d.sw.foreign, last, qSent,
+                  qRefused);
+        }
+        d.cadence.ResetWindow();
+        d.panelTicks = d.panelFrames = d.fireCalls = d.fireFailed = d.lmbHeld = d.shotsOpen = d.meleeOpen = 0;
+        d.keyTicks = d.wheelFailed = 0;
+        d.sw.ours = d.sw.foreign = 0;
     }
 
     // Held disabled on pad 0 every script tick, from the very first one (before the player or the
@@ -5437,10 +5562,10 @@ namespace {
         uint32_t seq;
         {
             std::lock_guard<std::mutex> lk(g_outfitMtx);
-            have = g_outfitHave;
-            seq = g_outfitSeq;
+            have = g_outfitFeed.have;
+            seq = g_outfitFeed.seq;
             if (have)
-                ch = g_outfitChar;
+                ch = g_outfitFeed.ch;
         }
         if (!have)
             return;                                // no server inventory: the spawn outfit stands (0.5.3)
@@ -5473,8 +5598,18 @@ namespace {
         if (!g_world->ReadPedLook(lp, pl))
             return;
         const uint32_t mismatch = sync::outfit::Mismatch(want, pl.drawable, pl.texture);
-        if (!mismatch)
+        static bool awaitingReadBack = false;      // 0.5.6: the components set by the last pass, not yet seen on the ped
+        if (!mismatch) {
+            if (awaitingReadBack && lines < 200) {
+                ++lines;
+                GLOGI("engine: outfit items (0.5.6): read back: the ped wears what the items ask for (shirt=%s pants=%s shoes=%s, %d components "
+                      "checked)", sync::outfit::WornKey(ch, sync::inv::Equip::Shirt), sync::outfit::WornKey(ch, sync::inv::Equip::Pants),
+                      sync::outfit::WornKey(ch, sync::inv::Equip::Shoes), want.Count());
+            }
+            awaitingReadBack = false;
             return;
+        }
+        awaitingReadBack = true;
         if (tries >= 3) {
             if (tries++ == 3)
                 GLOGW("engine: outfit items (0.5.4): components 0x%03x still differ after 3 tries; left alone until the inventory or the ped changes",

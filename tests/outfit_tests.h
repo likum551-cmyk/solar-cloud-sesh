@@ -15,7 +15,9 @@ namespace outfitt {
     namespace inv = gage::sync::inv;
     namespace of = gage::sync::outfit;
 
-    constexpr int kChecks = 9;
+    constexpr int kChecks = 11;   // 0.5.6: + 2 (RunFeed)
+
+    inline void RunFeed(bool snapsFeed = true);
 
     // The engine's spawn outfit (apps/engine/engine.cpp kPlayerOutfit), drawable / texture per component 0..11.
     constexpr int kSpawnD[12] = {0, 0, 1, 8, 10, 0, 8, 0, 15, 0, 0, 8};
@@ -217,6 +219,42 @@ namespace outfitt {
             const of::Want a = of::Desired(ch, of::Sex::Male), b = of::Desired(back, of::Sex::Male);
             Check("outfit: Desired over the server's encoded snapshot equals Desired over the character; a worn cap adds no component (5 wanted)",
                   capOn && decoded && a == b && a.Count() == 5 && !a.want[0] && !a.want[1]);
+        }
+        RunFeed();
+    }
+
+    // ---- 0.5.6: the engine's outfit source (WornFeed) over the message order a 0.5.4 server sends ----
+    // The join's InvState (codec v1, the starter kit), then, once the client answered the inventory-world offer, InvSnap only (codec v2):
+    // here the shirt comes off in an InvSnap. `snapsFeed` false = the 0.5.4 / 0.5.5 engine (OnInvSnap never reached the outfit): the ped must
+    // stay dressed with it, which is GI's report.
+    inline void RunFeed(bool snapsFeed)
+    {
+        {
+            inv::Character ch = inv::StarterKit();
+            of::WornFeed feed;
+            feed.OnInvState(inv::EncodeLegacy(ch));
+            const uint32_t seqJoin = feed.seq;
+            inv::Apply(ch, TakeOff(inv::Equip::Shirt));
+            if (snapsFeed)
+                feed.OnInvSnap(inv::Encode(ch));
+            SimPed ped;
+            const int changed = feed.have ? Tick(ped, feed.ch, of::Sex::Male) : 0;
+            Check("outfit (0.5.6): the shirt taken off in an InvSnap (the server's only form once the inventory world is answered) reaches the "
+                  "outfit source: the next tick puts top 15 / arms 15 on the ped (0.5.4 / 0.5.5 read InvState only: the ped stayed dressed)",
+                  feed.have && feed.seq == seqJoin + 1 && feed.snaps == 1 && changed == 2 && ped.d[11] == 15 && ped.d[3] == 15 &&
+                      std::string(of::WornKey(feed.ch, inv::Equip::Shirt)) == "bare",
+                  F("seq %u snaps %u changed %d top %d", feed.seq, feed.snaps, changed, (int)ped.d[11]));
+        }
+        {
+            // an undecodable snapshot keeps the last good one (and counts it); the session's end clears it and moves seq
+            of::WornFeed feed;
+            feed.OnInvSnap(inv::Encode(inv::StarterKit()));
+            const uint32_t s1 = feed.seq;
+            const bool bad = !feed.OnInvSnap(std::string("\x07garbage", 8));
+            const bool kept = feed.have && feed.seq == s1 && feed.undecodable == 1 && std::string(of::WornKey(feed.ch, inv::Equip::Shirt)) == "tshirt";
+            feed.End();
+            Check("outfit (0.5.6): an undecodable inventory keeps the last good one (counted), the session's end drops it and moves seq",
+                  bad && kept && !feed.have && feed.seq == s1 + 1);
         }
     }
 

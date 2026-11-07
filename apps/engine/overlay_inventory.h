@@ -45,5 +45,9 @@ namespace gage::game::Overlay::detail::inv3 {
     FrameOut DrawScreen(const FrameIn& in);
     // Esc while the screen is open: closes the innermost thing (drag, split dialog, menu, search focus). false = nothing was open.
     bool HandleEsc();
+    // 0.5.6 weapon_keys: quick slot k (0..3) used while no panel is open (the number keys 1-4 in the world); true = a UseQuick was sent.
+    // QuickKeysOn: the switch (Overlay::SetQuickKeys). Render thread.
+    bool QuickKey(int k);
+    bool QuickKeysOn();
 
 }  // namespace gage::game::Overlay::detail::inv3

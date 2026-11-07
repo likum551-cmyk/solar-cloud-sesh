@@ -124,6 +124,11 @@ namespace gage::game::Overlay {
     };
     void SetInventoryWorld(bool on);
     void SetNearby(const std::vector<InvNearbyBox>& boxes);
+    // 0.5.6 weapon_keys (libs/sync/overlay_input.h): the number keys 1-4 use quick slots 1-4 also while no panel is open (before 0.5.6 only
+    // the open inventory page read them, so a press in the world reached GTA's own weapon categories instead). Off = the 0.5.5 behaviour.
+    // QuickKeyCounts: presses that sent a UseQuick / were refused by the prediction since the last call (the engine's 10 s line). Any thread.
+    void SetQuickKeys(bool on);
+    void QuickKeyCounts(uint32_t* sent, uint32_t* refused);
 
     // 0.5.2 round-map probe: the next frame's bottom-left (the radar's quarter, before the overlay draws on it) is saved to
     // %LOCALAPPDATA%\GAGE-MP\radar_probe_<n>.bmp and logged, so the radar's landing place can be measured. D3D11 (Legacy) only; on D3D12 one line
